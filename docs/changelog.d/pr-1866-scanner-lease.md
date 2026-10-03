@@ -40,13 +40,15 @@ size, so adding workers to clear a backlog added database load in proportion.
   its start. The index scan applies the creation bound, so a refill never
   reads newer rows, and they cannot stretch a sweep or displace older rows.
   Each predicate reads the page, not the table, so no predicate index can
-  scan past it.
+  scan past it. The page holds only the columns the predicates read, not
+  task payloads.
   A row that matches two reasons gets the first one, as in the full scan,
   if that reason's sweep can still claim it: the row is ahead of its cursor
   or in its queue. Otherwise the later reason takes it. A lane keeps its
   clock until its last queue drains. A queued row keeps its reason when an
   earlier one starts to match. If its reason stops matching, it moves to the
-  back of the queue of the first other reason that still matches. No
+  first other reason that still matches. It waits there in a moved list of
+  at most one batch, which shares each batch with the queue. No
   later lane hands it out under its own reason in the same pass. The
   lanes give up their batch ids only after every load of the pass succeeds. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.

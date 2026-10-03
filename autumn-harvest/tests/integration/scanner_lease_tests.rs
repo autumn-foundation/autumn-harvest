@@ -1751,17 +1751,20 @@ async fn moved_rows_count_against_their_new_reasons_limit() {
         .await
         .expect("heartbeat");
 
+    // The test enforces nothing, so a new sweep can hand a row out again.
+    // Count the moved rows, not their hand-outs.
     let mut most = 0;
-    let mut moved = 0;
+    let mut moved = std::collections::HashSet::new();
     for _ in 0..3 {
         let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 2)
             .await
             .expect("batch scan");
         most = most.max(start_to_close_ids(&page).len());
-        moved += start_to_close_ids(&page)
-            .iter()
-            .filter(|id| both.contains(id))
-            .count();
+        moved.extend(
+            start_to_close_ids(&page)
+                .into_iter()
+                .filter(|id| both.contains(id)),
+        );
     }
 
     diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
@@ -1773,7 +1776,7 @@ async fn moved_rows_count_against_their_new_reasons_limit() {
         most <= 2,
         "a pass handed out {most} start-to-close rows at a limit of 2"
     );
-    assert_eq!(moved, 2, "both moved rows must still be handed out");
+    assert_eq!(moved.len(), 2, "both moved rows must still be handed out");
 }
 
 /// Inserts a live RUNNING row in `queue` whose schedule-to-close deadline

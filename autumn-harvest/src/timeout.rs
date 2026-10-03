@@ -528,8 +528,8 @@ const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:0
 /// applies that bound and the keyset bound itself. So the page reads at most
 /// `LIMIT` index entries, and rows created later are never visited.
 ///
-/// The page holds whole rows. Each predicate then reads the page, not the
-/// table, so no predicate can fall back to its own index and scan past the
+/// The page holds the columns the predicates read. Each predicate then reads
+/// the page, not the table, so no predicate can fall back to its own index and scan past the
 /// page. A row is left to an earlier reason only when that reason's lane can
 /// still claim it. The query returns the expired ids, oldest first. It also returns the
 /// key and id of the last row of the page, and the number of rows read. So
@@ -585,7 +585,7 @@ fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String
         );
     }
     format!(
-        "WITH page AS MATERIALIZED (SELECT harvest_task_queue.*, {LIVE_ROW_KEY} AS row_key \
+        "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS}, {LIVE_ROW_KEY} AS row_key \
          FROM harvest_task_queue \
          WHERE state IN ('PENDING', 'RUNNING') AND {LIVE_ROW_KEY} <= {clock}{keyset} \
          ORDER BY {LIVE_ROW_KEY}, id LIMIT {limit}), \
@@ -595,6 +595,16 @@ fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String
          ARRAY(SELECT e.id FROM ({expired}) e ORDER BY e.row_key, e.id) AS expired"
     )
 }
+
+/// The columns of a refill page (issue #1795).
+///
+/// These are the id and the columns that the four predicates read. Payload
+/// columns stay out, so a refill does not copy task inputs. The bounded
+/// batch query loads whole rows. A unit test checks the list against the
+/// predicates.
+const TIMEOUT_PAGE_COLUMNS: &str = "id, state, queue_name, task_type, activity_name, \
+     workflow_exec_id, scheduled_at, started_at, last_heartbeat_at, heartbeat_timeout, \
+     start_to_close, schedule_to_start, schedule_to_close_at";
 
 /// Points a timeout predicate at the refill page instead of the table.
 ///
@@ -633,14 +643,14 @@ struct LaneClaim {
     clock: Option<chrono::DateTime<chrono::Utc>>,
     /// The last row the lane has read. `None` means every row is ahead.
     read_to: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
-    /// The ids in the lane's queue and retry list.
+    /// The ids in the lane's queue, moved list and retry list.
     queued: Vec<uuid::Uuid>,
 }
 
 impl TimeoutScanLane {
     /// What this lane can still claim after a batch of `limit`.
     fn claim(&self, limit: usize) -> LaneClaim {
-        let (_, queued_taken) = self.batch_split(limit);
+        let (_, _, queued_taken) = self.batch_split(limit);
         let open = self.after.is_some() || self.queued.len() > queued_taken;
         let over = LaneClaim {
             clock: None,
@@ -654,6 +664,7 @@ impl TimeoutScanLane {
             queued: self
                 .queued
                 .iter()
+                .chain(&self.moved)
                 .copied()
                 .chain(self.retry.iter().map(|(id, _)| *id))
                 .collect(),
@@ -698,6 +709,12 @@ struct TimeoutScanLane {
     retry: Vec<(uuid::Uuid, u32)>,
     /// The retried ids of the last loaded batch, with their tries.
     loaded_retries: std::collections::HashMap<uuid::Uuid, u32>,
+    /// Ids that moved here from another reason. They stay out of `queued`,
+    /// so moves never hold back a refill. At most one batch of them waits.
+    moved: std::collections::VecDeque<uuid::Uuid>,
+    /// Which of moved and queued ids gets the odd slot of the next batch.
+    /// It flips each pass that has both, so neither can starve the other.
+    favor_moved: bool,
 }
 
 /// Most passes in a row that try one failing row.
@@ -710,13 +727,14 @@ const MAX_ROW_TRIES: u32 = 3;
 impl TimeoutScanLane {
     /// The ids of the next batch, without taking them.
     ///
-    /// Retried ids come first. Retried and queued ids share one `limit`, so
-    /// the load of a pass stays bounded.
+    /// Retried ids come first. Moved and queued ids share the rest. All
+    /// three share one `limit`, so the load of a pass stays bounded.
     fn next_batch(&self, limit: usize) -> Vec<uuid::Uuid> {
-        let (retries, queued) = self.batch_split(limit);
+        let (retries, moved, queued) = self.batch_split(limit);
         self.retry[..retries]
             .iter()
             .map(|(id, _)| *id)
+            .chain(self.moved.iter().take(moved).copied())
             .chain(self.queued.iter().take(queued).copied())
             .collect()
     }
@@ -725,15 +743,31 @@ impl TimeoutScanLane {
     ///
     /// Ids that the batch did not load stay for the next pass.
     fn commit_batch(&mut self, limit: usize) {
-        let (retries, queued) = self.batch_split(limit);
+        let (retries, moved, queued) = self.batch_split(limit);
+        if !self.moved.is_empty() && !self.queued.is_empty() {
+            self.favor_moved = !self.favor_moved;
+        }
         self.loaded_retries = self.retry.drain(..retries).collect();
+        self.moved.drain(..moved);
         self.queued.drain(..queued);
     }
 
-    /// The retried and queued ids that a batch of `limit` takes.
-    fn batch_split(&self, limit: usize) -> (usize, usize) {
+    /// The retried, moved and queued ids that a batch of `limit` takes.
+    ///
+    /// When both have ids, moved and queued ids split the slots after the
+    /// retries. A slot one of them leaves unused goes to the other.
+    fn batch_split(&self, limit: usize) -> (usize, usize, usize) {
         let retries = limit.min(self.retry.len());
-        (retries, (limit - retries).min(self.queued.len()))
+        let rest = limit - retries;
+        let share = if self.favor_moved {
+            rest.div_ceil(2)
+        } else {
+            rest / 2
+        };
+        let mut moved = self.moved.len().min(share);
+        let queued = self.queued.len().min(rest - moved);
+        moved = self.moved.len().min(rest - queued);
+        (retries, moved, queued)
     }
 
     /// Queues the expired ids of a refill.
@@ -742,9 +776,14 @@ impl TimeoutScanLane {
     /// count as a first try, so the row could hold the batch past
     /// [`MAX_ROW_TRIES`].
     fn queue_refill(&mut self, expired: impl IntoIterator<Item = uuid::Uuid>) {
-        let retried: HashSet<uuid::Uuid> = self.retry.iter().map(|(id, _)| *id).collect();
+        let held: HashSet<uuid::Uuid> = self
+            .retry
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(self.moved.iter().copied())
+            .collect();
         self.queued
-            .extend(expired.into_iter().filter(|id| !retried.contains(id)));
+            .extend(expired.into_iter().filter(|id| !held.contains(id)));
     }
 
     /// Tries `id` again on the next pass, unless it has had its tries.
@@ -771,8 +810,9 @@ impl TimeoutScanLane {
 /// after the sweep starts, or that expires later, waits for the next sweep.
 /// So new rows cannot stretch a sweep or push an older row out of it. A
 /// queued row that stops matching moves to the first other reason that
-/// matches when its batch loads. It joins the back of that lane's queue. A
-/// row that matches none is dropped.
+/// matches when its batch loads. It waits in that lane's moved list, which
+/// holds at most one batch and shares each batch with the queue. A row that
+/// matches none is dropped.
 ///
 /// Each refill reads at most one page of index entries, and each pass loads
 /// at most one batch. So the work of a pass does not grow with the backlog.
@@ -1008,16 +1048,17 @@ pub async fn find_timed_out_tasks_batch(
     for lane in &mut cursor.lanes {
         lane.commit_batch(take);
     }
-    admit_moves(&mut cursor.lanes, moves);
+    admit_moves(&mut cursor.lanes, moves, take);
     Ok(results)
 }
 
-/// Queues each moved row in the lane of its new reason.
+/// Hands each moved row to the lane of its new reason.
 ///
-/// A moved row waits behind the rows already queued there. So a steady
-/// stream of moves cannot starve that queue. A row already queued or
-/// waiting for a retry in that lane is skipped.
-fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>) {
+/// Moved rows wait in their own list, first in, first out. A lane holds at
+/// most `limit` of them, so steady moves cannot grow it. A row past that,
+/// or one the lane already holds, is left out. That lane's next sweep finds
+/// a row that still matches.
+fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>, limit: usize) {
     if moves.is_empty() {
         return;
     }
@@ -1026,14 +1067,15 @@ fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>
         .map(|lane| {
             lane.queued
                 .iter()
+                .chain(&lane.moved)
                 .copied()
                 .chain(lane.retry.iter().map(|(id, _)| *id))
                 .collect()
         })
         .collect();
     for (other, id) in moves {
-        if held[other].insert(id) {
-            lanes[other].queued.push_back(id);
+        if lanes[other].moved.len() < limit && held[other].insert(id) {
+            lanes[other].moved.push_back(id);
         }
     }
 }
@@ -6647,7 +6689,7 @@ mod tests {
         // The first page of a sweep is bounded only by the clock.
         let first = timeout_refill_query(predicate, &[], false);
         assert!(first.starts_with(&format!(
-            "WITH page AS MATERIALIZED (SELECT harvest_task_queue.*, {LIVE_ROW_KEY} AS row_key \
+            "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS}, {LIVE_ROW_KEY} AS row_key \
              FROM harvest_task_queue WHERE state IN ('PENDING', 'RUNNING') \
              AND {LIVE_ROW_KEY} <= $2 ORDER BY {LIVE_ROW_KEY}, id LIMIT $1)"
         )));
@@ -6669,6 +6711,53 @@ mod tests {
         assert!(next.contains("AS last_key"));
         assert!(next.contains("AS last_id"));
         assert!(next.contains("(SELECT COUNT(*) FROM page) AS rows_read"));
+    }
+
+    /// The column names of `harvest_task_queue`, read from the schema.
+    fn task_queue_columns() -> Vec<String> {
+        let schema = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/schema.rs"))
+            .expect("read the schema");
+        let start = schema
+            .find("harvest_task_queue (id)")
+            .expect("the task queue table");
+        let body = &schema[start..];
+        let body = &body[..body.find("\n    }").expect("the end of the table")];
+        body.lines()
+            .filter_map(|line| line.split_once("->"))
+            .map(|(name, _)| name.trim().to_owned())
+            .filter(|name| !name.is_empty() && !name.contains(' '))
+            .collect()
+    }
+
+    /// Whether `sql` names `column` as a whole word.
+    fn names_column(sql: &str, column: &str) -> bool {
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        sql.match_indices(column).any(|(at, _)| {
+            let before = sql[..at].chars().next_back();
+            let after = sql[at + column.len()..].chars().next();
+            !before.is_some_and(word) && !after.is_some_and(word)
+        })
+    }
+
+    #[test]
+    fn the_refill_page_holds_only_the_columns_its_predicates_read() {
+        let columns = task_queue_columns();
+        assert!(columns.len() > 20, "{columns:?}");
+        let sql = timeout_refill_query(start_to_close_timeout_query(), &[], true);
+        let page = &sql[..sql.find("), tail AS").expect("the page CTE")];
+        // Payload columns such as `input` and `context_headers` stay out of
+        // the page. The bounded batch query loads whole rows.
+        assert!(!page.contains("harvest_task_queue.*"), "{page}");
+        assert!(!names_column(page, "input"), "{page}");
+        // Every column that a predicate reads is on the page.
+        for (_, predicate) in task_timeout_scans() {
+            for column in columns.iter().filter(|c| names_column(predicate, c)) {
+                assert!(
+                    names_column(page, column),
+                    "the page must hold `{column}`: {page}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6858,15 +6947,54 @@ mod tests {
     }
 
     #[test]
+    fn moved_rows_do_not_hold_back_a_refill() {
+        let mut lanes: [TimeoutScanLane; 4] = Default::default();
+        admit_moves(&mut lanes, vec![(3, uuid::Uuid::new_v4())], 1);
+        // The lane refills when its queue runs empty. A move must not fill
+        // that queue, or steady moves would stop the lane's sweep.
+        assert!(lanes[3].queued.is_empty());
+        assert_eq!(lanes[3].moved.len(), 1);
+        // A lane holds at most one batch of moved rows.
+        admit_moves(&mut lanes, vec![(3, uuid::Uuid::new_v4())], 1);
+        assert_eq!(lanes[3].moved.len(), 1);
+    }
+
+    #[test]
+    fn moved_and_queued_rows_share_each_batch() {
+        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
+        let mut lane = TimeoutScanLane {
+            queued: ids(10).into(),
+            moved: ids(10).into(),
+            ..TimeoutScanLane::default()
+        };
+        // Two each at a limit of 4.
+        assert_eq!(lane.batch_split(4), (0, 2, 2));
+        // At a limit of 1, the slot alternates between them.
+        let mut picks = Vec::new();
+        for _ in 0..4 {
+            let (_, moved, queued) = lane.batch_split(1);
+            picks.push((moved, queued));
+            lane.commit_batch(1);
+        }
+        assert_eq!(picks, [(0, 1), (1, 0), (0, 1), (1, 0)]);
+        // A slot one list leaves unused goes to the other.
+        let lane = TimeoutScanLane {
+            moved: ids(5).into(),
+            ..TimeoutScanLane::default()
+        };
+        assert_eq!(lane.batch_split(4), (0, 4, 0));
+    }
+
+    #[test]
     fn moved_rows_wait_behind_the_rows_already_queued() {
         let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
         let waiting = ids(2);
         let moved = ids(2);
         let mut lanes: [TimeoutScanLane; 4] = Default::default();
-        lanes[3].queued = waiting.clone().into();
-        admit_moves(&mut lanes, moved.iter().map(|id| (3, *id)).collect());
-        // First in, first out: a stream of moves cannot starve the queue.
-        let order: Vec<_> = lanes[3].queued.iter().copied().collect();
+        lanes[3].moved = waiting.clone().into();
+        admit_moves(&mut lanes, moved.iter().map(|id| (3, *id)).collect(), 4);
+        // First in, first out among moved rows.
+        let order: Vec<_> = lanes[3].moved.iter().copied().collect();
         assert_eq!(order, [waiting, moved].concat());
     }
 
@@ -6898,6 +7026,8 @@ mod tests {
             queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
             retry: vec![(uuid::Uuid::new_v4(), 1)],
             loaded_retries: [(uuid::Uuid::new_v4(), 1)].into(),
+            moved: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
+            favor_moved: true,
         };
         let mid_sweep = cursor.clone();
         // A leader that ran the last tick goes on with its sweep.
