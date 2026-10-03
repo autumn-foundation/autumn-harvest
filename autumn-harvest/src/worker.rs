@@ -20835,6 +20835,12 @@ async fn emit_history_bloat_warning_if_crossed(
     if !should_warn {
         return;
     }
+    tracing::warn!(
+        exec_id = %exec_id,
+        workflow = %workflow_name,
+        "workflow history crossed the early-warning threshold; \
+         the run fails at the event hard cap unless it calls continue_as_new"
+    );
     telemetry
         .metrics
         .record_workflow_history_bloat(workflow_name);
@@ -20849,6 +20855,33 @@ async fn emit_history_bloat_warning_if_crossed(
     }
 }
 
+/// Which history hard cap a run reached (issue #1804).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryCapBreach {
+    /// The durable or prospective event count reached the event cap.
+    Events { count: u64, cap: u64 },
+    /// The stored history bytes reached the byte cap.
+    Bytes { bytes: u64, cap: u64 },
+}
+
+impl HistoryCapBreach {
+    /// The typed DLQ reason for this breach.
+    fn dead_letter_reason(self, workflow_type: String) -> DeadLetterReason {
+        match self {
+            Self::Events { count, cap } => DeadLetterReason::HistoryCapExceeded {
+                count,
+                cap,
+                workflow_type,
+            },
+            Self::Bytes { bytes, cap } => DeadLetterReason::HistoryBytesCapExceeded {
+                bytes,
+                cap,
+                workflow_type,
+            },
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
@@ -20860,16 +20893,15 @@ async fn fail_workflow_for_history_cap(
     next_event_id: i32,
     worker_id: &str,
     started_at: std::time::Instant,
-    event_count: u64,
-    cap: u64,
+    breach: HistoryCapBreach,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
     let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
 
     // Issue #704 (PR #1139 review, second round): decide the crossing from
     // `terminal_count` -- the DURABLE post-failure event count, computed
     // above from `next_event_id` (the running count of events actually
-    // appended so far this cycle) -- never from the `event_count` parameter.
-    // `event_count` is whatever value tripped the HARD cap at the call
+    // appended so far this cycle) -- never from the `breach` count.
+    // That count is whatever value tripped the HARD cap at the call
     // site, and for the `WorkflowOutcome::Suspended` preflight branch that
     // value can be purely PROSPECTIVE: `suspended_command_event_count`
     // predicts how many events a batch of still-pending commands (e.g. a
@@ -20883,15 +20915,23 @@ async fn fail_workflow_for_history_cap(
     // is exactly what WILL be durably recorded once the `WorkflowFailed`
     // event below is appended, so it is the only value this decision can
     // correctly be based on -- at every other call site (a genuinely
-    // already-appended batch) `terminal_count` and `event_count` coincide,
+    // already-appended batch) `terminal_count` and the breach count coincide,
     // so this is a strict correctness fix with no behavior change there.
+    //
+    // Issue #1804: a byte-cap breach can also cross the event warning, so
+    // the check reads the event cap from the policy, not from `breach`.
     let should_warn_history_bloat = !crate::canary::is_canary_workflow(&execution.workflow_name)
-        && history_bloat_threshold_crossed(
-            terminal_count,
-            cap,
-            registry.history_policy().history_bloat_warn_fraction(),
-            execution.history_bloat_warned_at.is_some(),
-        );
+        && registry
+            .history_policy()
+            .event_hard_cap()
+            .is_some_and(|event_cap| {
+                history_bloat_threshold_crossed(
+                    terminal_count,
+                    event_cap,
+                    registry.history_policy().history_bloat_warn_fraction(),
+                    execution.history_bloat_warned_at.is_some(),
+                )
+            });
 
     // Issue #1184 (Codex review round 5): captured here, before the DLQ
     // transaction below, not after it returns. `record_workflow_completed`
@@ -20904,11 +20944,13 @@ async fn fail_workflow_for_history_cap(
     // measurement moves, not the emission.
     let duration_secs = started_at.elapsed().as_secs_f64();
 
-    let reason = DeadLetterReason::HistoryCapExceeded {
-        count: event_count,
-        cap,
-        workflow_type: execution.workflow_name.clone(),
-    };
+    tracing::warn!(
+        exec_id = %exec_id,
+        workflow = %execution.workflow_name,
+        breach = ?breach,
+        "workflow history reached a hard cap; failing the run and moving it to the DLQ"
+    );
+    let reason = breach.dead_letter_reason(execution.workflow_name.clone());
     let (deferred, closed_children, pending_cancel_metrics) = move_workflow_to_dlq_for_history_cap(
         conn,
         task,
@@ -21008,6 +21050,40 @@ async fn fail_workflow_for_history_cap(
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// Stored history bytes below `prepared.next_event_id` (issue #1804).
+///
+/// A warm decision adds only the events at or after the cached mark. A cold
+/// decision sums the whole history. A codec rotation can change stored sizes
+/// in place, so a mark can drift until its cache entry goes.
+async fn measure_history_bytes(
+    conn: &mut AsyncPgConnection,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    prepared: &PreparedWorkflowTask,
+) -> HarvestResult<crate::cache::HistoryBytesMark> {
+    let through = prepared.next_event_id;
+    let cached = if prepared.was_cache_hit {
+        workflow_cache
+            .lock()
+            .await
+            .history_bytes(&prepared.exec_id.as_uuid())
+    } else {
+        None
+    };
+    let base =
+        cached
+            .filter(|mark| mark.through <= through)
+            .unwrap_or(crate::cache::HistoryBytesMark {
+                bytes: 0,
+                through: 0,
+            });
+    let delta =
+        store::sum_history_bytes_between(conn, prepared.exec_id, base.through, through).await?;
+    Ok(crate::cache::HistoryBytesMark {
+        bytes: base.bytes.saturating_add(delta),
+        through,
+    })
+}
+
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -21122,6 +21198,14 @@ async fn process_workflow_task(
             .metrics
             .record_workflow_cache_miss(&prepared.execution.workflow_name, &task.queue_name);
     }
+
+    // Issue #1804: stored history bytes at the start of this decision. The
+    // byte cap is checked once, at the hard-cap preflight below.
+    let history_bytes = if registry.history_policy().byte_hard_cap().is_some() {
+        Some(measure_history_bytes(conn, &workflow_cache, &prepared).await?)
+    } else {
+        None
+    };
 
     let trace_carrier = task
         .trace_context
@@ -21598,8 +21682,10 @@ async fn process_workflow_task(
                                 next_event_id,
                                 worker_id,
                                 started_at,
-                                current_history_event_count,
-                                cap,
+                                HistoryCapBreach::Events {
+                                    count: current_history_event_count,
+                                    cap,
+                                },
                             )
                             .await?;
                             for start in deferred {
@@ -21730,11 +21816,13 @@ async fn process_workflow_task(
                             next_event_id,
                             worker_id,
                             started_at,
-                            event_count,
-                            registry
-                                .history_policy()
-                                .event_hard_cap()
-                                .expect("HistoryCapReached requires a configured hard cap"),
+                            HistoryCapBreach::Events {
+                                count: event_count,
+                                cap: registry
+                                    .history_policy()
+                                    .event_hard_cap()
+                                    .expect("HistoryCapReached requires a configured hard cap"),
+                            },
                         )
                         .await?;
                         for start in deferred {
@@ -21779,8 +21867,10 @@ async fn process_workflow_task(
                         next_event_id,
                         worker_id,
                         started_at,
-                        current_history_event_count,
-                        cap,
+                        HistoryCapBreach::Events {
+                            count: current_history_event_count,
+                            cap,
+                        },
                     )
                     .await?;
                     for start in deferred {
@@ -21944,8 +22034,10 @@ async fn process_workflow_task(
                         next_event_id,
                         worker_id,
                         started_at,
-                        current_history_event_count,
-                        cap,
+                        HistoryCapBreach::Events {
+                            count: current_history_event_count,
+                            cap,
+                        },
                     )
                     .await?;
                     for start in deferred {
@@ -22227,8 +22319,10 @@ async fn process_workflow_task(
                         next_event_id,
                         worker_id,
                         started_at,
-                        current_history_event_count,
-                        cap,
+                        HistoryCapBreach::Events {
+                            count: current_history_event_count,
+                            cap,
+                        },
                     )
                     .await?;
                     for start in deferred {
@@ -22684,8 +22778,41 @@ async fn process_workflow_task(
             next_event_id,
             worker_id,
             started_at,
-            current_history_event_count,
-            cap,
+            HistoryCapBreach::Events {
+                count: current_history_event_count,
+                cap,
+            },
+        )
+        .await?;
+        for start in deferred {
+            start.spawn();
+        }
+        return Ok(());
+    }
+
+    // Issue #1804: the byte cap uses the bytes stored when the decision
+    // started. One decision's own appends can overshoot the cap.
+    if let (Some(cap), Some(mark)) = (registry.history_policy().byte_hard_cap(), history_bytes)
+        && mark.bytes >= cap
+        && !continue_as_new_exempt_from_history_cap(
+            &outcome,
+            resolved_abandoned_dispatch_event_count,
+        )
+    {
+        let deferred = fail_workflow_for_history_cap(
+            conn,
+            registry,
+            &telemetry,
+            task,
+            &prepared.execution,
+            prepared.exec_id,
+            next_event_id,
+            worker_id,
+            started_at,
+            HistoryCapBreach::Bytes {
+                bytes: mark.bytes,
+                cap,
+            },
         )
         .await?;
         for start in deferred {
@@ -22935,10 +23062,26 @@ async fn process_workflow_task(
     // it contributes to no `harvest.workflow.*` business signal, matching the
     // sibling `record_workflow_completed`/`history_size`/`continue_as_new`
     // gates right above.
+    //
+    // Issue #1804: the warning is on by default now, so the durable
+    // `COUNT(*)` below runs only when the prospective count crosses too.
+    // That count is built to over-count this decision's appends. An append
+    // by another writer can still make it low. The warning then fires one
+    // decision later, because the next decision loads that append.
+    let history_bloat_already_warned = prepared.execution.history_bloat_warned_at.is_some();
     let may_warn_history_bloat = !is_canary
         && matches!(&outcome, WorkflowOutcome::Suspended { .. })
-        && registry.history_policy().event_hard_cap().is_some();
-    let history_bloat_already_warned = prepared.execution.history_bloat_warned_at.is_some();
+        && registry
+            .history_policy()
+            .event_hard_cap()
+            .is_some_and(|cap| {
+                history_bloat_threshold_crossed(
+                    current_history_event_count,
+                    cap,
+                    registry.history_policy().history_bloat_warn_fraction(),
+                    history_bloat_already_warned,
+                )
+            });
     let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
@@ -23283,9 +23426,10 @@ async fn process_workflow_task(
     if let Some(update) = pending_cache_update {
         let exec_uuid = prepared.exec_id.as_uuid();
         let mut guard = workflow_cache.lock().await;
-        match update {
-            Some(state) => guard.insert(exec_uuid, state),
-            None => {
+        match (update, history_bytes) {
+            (Some(state), Some(mark)) => guard.insert_with_history_bytes(exec_uuid, state, mark),
+            (Some(state), None) => guard.insert(exec_uuid, state),
+            (None, _) => {
                 guard.remove(&exec_uuid);
             }
         }
@@ -33257,6 +33401,20 @@ mod tests {
     // consumes it.
 
     // ── Operator early-warning for workflow history bloat (issue #704) ───────
+
+    #[test]
+    fn history_bloat_threshold_crossed_default_policy_warns_at_ten_thousand() {
+        // Issue #1804: the default policy warns at 10,000 events.
+        let policy = WorkflowHistoryPolicy::default();
+        let cap = policy.event_hard_cap().expect("default event cap");
+        let fraction = policy.history_bloat_warn_fraction();
+        assert!(!history_bloat_threshold_crossed(
+            9_999, cap, fraction, false
+        ));
+        assert!(history_bloat_threshold_crossed(
+            10_000, cap, fraction, false
+        ));
+    }
 
     #[test]
     fn history_bloat_threshold_crossed_fires_at_and_above_the_computed_threshold() {

@@ -262,11 +262,27 @@ let harvest = HarvestBuilder::new()
     .try_build()?;
 ```
 
-The optional hard cap is a last-resort guardrail. If an execution reaches
-`history_event_hard_cap` and the workflow does not issue `continue_as_new`, the
-worker fails the execution and moves it to the DLQ with a typed
-`HistoryCapExceeded { count, cap, workflow_type }` reason. No new workflow event
-variant is used for this guardrail.
+Two hard caps are on by default (issue #1804). They are last-resort
+guardrails against a runaway loop:
+
+| Cap | Default | Builder override | Typed DLQ reason |
+|---|---|---|---|
+| Durable events per run | `50_000` | `history_event_hard_cap(n)` | `HistoryCapExceeded { count, cap, workflow_type }` |
+| Stored history bytes per run | 50 MiB | `history_byte_hard_cap(n)` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
+
+When a run reaches a cap and does not issue `continue_as_new`, the worker
+fails the run and moves it to the DLQ with the typed reason. No new workflow
+event variant is used. The byte measure is `pg_column_size(event_data)`, the
+same measure as the tenant `max_history_bytes` quota. The Postgres worker
+enforces both caps. The SQLite backend does not.
+
+`harvest.workflow.history_bloat` fires once per run at 20% of the event cap,
+so at `10_000` events by default. The worker also logs a warning. Set
+`history_bloat_warn_fraction(..)` to move the threshold.
+
+To remove a cap, call `history_event_hard_cap_unlimited()` or
+`history_byte_hard_cap_unlimited()`. With no event cap there is no
+history-bloat warning either.
 
 Harvest emits `harvest.workflow.history_size` for terminal executions and
 `harvest.workflow.continue_as_new` when a workflow rotates. Both metrics use

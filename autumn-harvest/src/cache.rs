@@ -45,12 +45,32 @@ pub struct CachedWorkflowState {
     pub next_event_id: i32,
 }
 
+/// Stored history bytes for events with `event_id < through` (issue #1804).
+///
+/// The worker keeps this mark with the cache entry. On a cache hit it sums
+/// only the events at or after `through`. This keeps the byte check off the
+/// full history on the warm path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryBytesMark {
+    /// Sum of `pg_column_size(event_data)` below `through`.
+    pub bytes: u64,
+    /// First event id that `bytes` does not include.
+    pub through: i32,
+}
+
+/// One cache slot: the replay snapshot and its optional byte mark.
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    state: CachedWorkflowState,
+    history_bytes: Option<HistoryBytesMark>,
+}
+
 /// LRU cache mapping workflow execution IDs to their cached replay state.
 ///
 /// Thread-safety: this cache is NOT `Sync` — it should be owned by a single
 /// worker task (or wrapped in a `Mutex` if shared).
 pub struct WorkflowCache {
-    inner: LruCache<Uuid, CachedWorkflowState>,
+    inner: LruCache<Uuid, CacheEntry>,
 }
 
 impl WorkflowCache {
@@ -98,7 +118,41 @@ impl WorkflowCache {
     /// cache.insert(Uuid::new_v4(), state);
     /// ```
     pub fn insert(&mut self, exec_id: Uuid, state: CachedWorkflowState) {
-        self.inner.put(exec_id, state);
+        self.inner.put(
+            exec_id,
+            CacheEntry {
+                state,
+                history_bytes: None,
+            },
+        );
+    }
+
+    /// Insert a cached state together with its stored-history byte mark
+    /// (issue #1804).
+    pub fn insert_with_history_bytes(
+        &mut self,
+        exec_id: Uuid,
+        state: CachedWorkflowState,
+        mark: HistoryBytesMark,
+    ) {
+        self.inner.put(
+            exec_id,
+            CacheEntry {
+                state,
+                history_bytes: Some(mark),
+            },
+        );
+    }
+
+    /// The stored-history byte mark of a cached entry (issue #1804).
+    ///
+    /// Returns `None` when the entry is absent or carries no mark. Does not
+    /// change the LRU order.
+    #[must_use]
+    pub fn history_bytes(&self, exec_id: &Uuid) -> Option<HistoryBytesMark> {
+        self.inner
+            .peek(exec_id)
+            .and_then(|entry| entry.history_bytes)
     }
 
     /// Look up a cached workflow state, marking it as recently used.
@@ -116,7 +170,7 @@ impl WorkflowCache {
     /// ```
     #[must_use]
     pub fn get(&mut self, exec_id: &Uuid) -> Option<&CachedWorkflowState> {
-        self.inner.get(exec_id)
+        self.inner.get(exec_id).map(|entry| &entry.state)
     }
 
     /// Remove a cached workflow state, returning it if present.
@@ -132,7 +186,7 @@ impl WorkflowCache {
     /// assert!(cache.remove(&id).is_none());
     /// ```
     pub fn remove(&mut self, exec_id: &Uuid) -> Option<CachedWorkflowState> {
-        self.inner.pop(exec_id)
+        self.inner.pop(exec_id).map(|entry| entry.state)
     }
 
     /// Returns the number of entries currently in the cache.
@@ -244,6 +298,31 @@ mod tests {
             10
         );
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn cache_keeps_history_bytes_mark_with_its_entry() {
+        // Issue #1804: the byte mark lives and dies with its entry.
+        let mut cache = WorkflowCache::new(5);
+        let id = Uuid::new_v4();
+        let mark = HistoryBytesMark {
+            bytes: 1_234,
+            through: 7,
+        };
+
+        cache.insert_with_history_bytes(id, make_state(7), mark);
+        assert_eq!(cache.history_bytes(&id), Some(mark));
+
+        cache.insert(id, make_state(8));
+        assert_eq!(
+            cache.history_bytes(&id),
+            None,
+            "plain insert clears the mark"
+        );
+
+        cache.insert_with_history_bytes(id, make_state(9), mark);
+        assert!(cache.remove(&id).is_some());
+        assert_eq!(cache.history_bytes(&id), None);
     }
 
     #[test]

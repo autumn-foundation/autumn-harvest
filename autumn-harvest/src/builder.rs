@@ -287,6 +287,29 @@ impl std::fmt::Debug for HarvestBuilder {
     }
 }
 
+/// Log a warning when the event hard cap is at or below the soft
+/// `continue_as_new` threshold (issue #1804).
+///
+/// The run then fails at the cap before `should_continue_as_new` turns true.
+/// This is a warning, not an error: a small cap is a valid choice in tests.
+fn warn_if_history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) {
+    if history_cap_preempts_continue_as_new(policy) {
+        tracing::warn!(
+            event_hard_cap = ?policy.event_hard_cap(),
+            continue_as_new_threshold = policy.continue_as_new_threshold(),
+            "history_event_hard_cap is at or below history_continue_as_new_threshold; \
+             runs fail at the cap before should_continue_as_new turns true"
+        );
+    }
+}
+
+/// `true` when the event hard cap fires before the soft threshold can.
+fn history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) -> bool {
+    policy
+        .event_hard_cap()
+        .is_some_and(|cap| cap <= policy.continue_as_new_threshold())
+}
+
 /// Built harvest registration set produced by [`HarvestBuilder::build`].
 pub struct BuiltHarvest {
     workflows: Vec<WorkflowInfo>,
@@ -2114,10 +2137,45 @@ impl HarvestBuilder {
         self
     }
 
-    /// Configure an opt-in hard cap for workflow history event counts.
+    /// Override the hard cap on durable history events per run.
+    ///
+    /// Defaults to
+    /// [`DEFAULT_HISTORY_EVENT_HARD_CAP`](crate::context::DEFAULT_HISTORY_EVENT_HARD_CAP)
+    /// (50,000) since issue #1804. A run that reaches the cap fails and moves
+    /// to the DLQ with `HistoryCapExceeded`.
     #[must_use]
     pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
         self.history_policy = self.history_policy.with_event_hard_cap(cap);
+        self
+    }
+
+    /// Remove the history event hard cap (issue #1804).
+    ///
+    /// This also turns off the history-bloat warning, because the warning
+    /// is a fraction of the cap.
+    #[must_use]
+    pub const fn history_event_hard_cap_unlimited(mut self) -> Self {
+        self.history_policy = self.history_policy.without_event_hard_cap();
+        self
+    }
+
+    /// Override the hard cap on stored history bytes per run (issue #1804).
+    ///
+    /// Defaults to
+    /// [`DEFAULT_HISTORY_BYTE_HARD_CAP`](crate::context::DEFAULT_HISTORY_BYTE_HARD_CAP)
+    /// (50 MiB). The worker sums `pg_column_size(event_data)` once per
+    /// decision. A run that reaches the cap fails and moves to the DLQ with
+    /// `HistoryBytesCapExceeded`.
+    #[must_use]
+    pub const fn history_byte_hard_cap(mut self, cap: u64) -> Self {
+        self.history_policy = self.history_policy.with_byte_hard_cap(cap);
+        self
+    }
+
+    /// Remove the stored-history byte cap (issue #1804).
+    #[must_use]
+    pub const fn history_byte_hard_cap_unlimited(mut self) -> Self {
+        self.history_policy = self.history_policy.without_byte_hard_cap();
         self
     }
 
@@ -2481,6 +2539,8 @@ impl HarvestBuilder {
         if self.audit_export_config.webhook_is_missing_a_secret() {
             return Err(HarvestBuilderError::AuditSinkSecretMissing);
         }
+
+        warn_if_history_cap_preempts_continue_as_new(self.history_policy);
 
         if let Some(ceiling) = self.max_workflow_history_events {
             let threshold = self.history_policy.continue_as_new_threshold();
@@ -5188,7 +5248,41 @@ mod tests {
         let policy = built.history_policy();
 
         assert_eq!(policy.continue_as_new_threshold(), 10_000);
+        // Issue #1804: both hard caps are on by default.
+        assert_eq!(policy.event_hard_cap(), Some(50_000));
+        assert_eq!(policy.byte_hard_cap(), Some(50 * 1024 * 1024));
+    }
+
+    #[test]
+    fn harvest_builder_history_caps_accept_explicit_unlimited() {
+        // Issue #1804: an explicit "unlimited" turns each default cap off.
+        let built = HarvestBuilder::new()
+            .history_event_hard_cap_unlimited()
+            .history_byte_hard_cap_unlimited()
+            .build();
+        let policy = built.history_policy();
         assert_eq!(policy.event_hard_cap(), None);
+        assert_eq!(policy.byte_hard_cap(), None);
+    }
+
+    #[test]
+    fn history_cap_preempts_continue_as_new_only_at_or_below_the_threshold() {
+        let policy = WorkflowHistoryPolicy::default();
+        assert!(!history_cap_preempts_continue_as_new(policy));
+        assert!(history_cap_preempts_continue_as_new(
+            policy.with_continue_as_new_threshold(50_000)
+        ));
+        assert!(!history_cap_preempts_continue_as_new(
+            policy
+                .with_continue_as_new_threshold(60_000)
+                .without_event_hard_cap()
+        ));
+    }
+
+    #[test]
+    fn harvest_builder_accepts_history_byte_hard_cap_override() {
+        let built = HarvestBuilder::new().history_byte_hard_cap(4_096).build();
+        assert_eq!(built.history_policy().byte_hard_cap(), Some(4_096));
     }
 
     #[test]

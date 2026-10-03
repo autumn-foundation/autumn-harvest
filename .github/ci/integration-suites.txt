@@ -102,6 +102,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          external_outbox_scan_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
+linux        autumn-harvest         integration                      -                          history_default_caps_tests
 linux        autumn-harvest         integration                      -                          integration_e2e
 linux        autumn-harvest         integration                      -                          lineage_store_tests
 linux        autumn-harvest         integration                      -                          metrics_integration
