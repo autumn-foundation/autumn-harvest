@@ -75,10 +75,11 @@ These statements take a blocking lock for `lock-timeout`:
   `REINDEX`.
 
 The lint reads the history of earlier migrations. It finds the table of a
-`DROP INDEX` from the migration that created the index. It finds the foreign
-keys of a table from the migrations that added them. An index that no migration
-creates counts as hot. So does a `REINDEX` of a schema, a database or the
-system catalogs.
+`DROP INDEX` from the migration that created the index. The index sits in the
+schema of its table, and a name without a schema means `public`. It finds the
+foreign keys of a table from the migrations that added them. An index that no
+migration creates counts as hot. So does a `REINDEX` of a schema, a database or
+the system catalogs.
 
 ## 3. Bound the lock wait
 

@@ -198,10 +198,10 @@ struct Finding {
 /// What earlier migrations created, as far as the lint needs to know.
 #[derive(Clone, Debug, Default)]
 struct History {
-    /// Each index name, mapped to the tables it may sit on.
-    /// The key is the index name without its schema. The value holds every
-    /// table that a build of that name has named, so a schema can never hide
-    /// a hot index.
+    /// Each index, mapped to the tables it may sit on.
+    /// The key comes from `index_key`, so it holds the schema. The value holds
+    /// every table that a build of that name has named, so a later build cannot
+    /// hide a hot table.
     indexes: BTreeMap<String, BTreeSet<String>>,
     /// Each table, mapped to the tables that its foreign keys reference.
     references: BTreeMap<String, BTreeSet<String>>,
@@ -225,7 +225,7 @@ impl History {
 
     /// The table of index `name`. A hot table wins when the name is ambiguous.
     fn index_table(&self, name: &str) -> Option<String> {
-        let tables = self.indexes.get(base(name))?;
+        let tables = self.indexes.get(&index_key(name, name))?;
         tables
             .iter()
             .find(|t| self.is_hot(t))
@@ -690,9 +690,9 @@ fn lex(
             lex(body, line, depth + 1, body_runs, toks, comments);
             line += body.iter().filter(|c| **c == '\n').count();
             i = (body_end + len).min(chars.len());
-        } else if c.is_alphanumeric() || c == '_' {
+        } else if is_ident(c) {
             let start = i;
-            while at(i).is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+            while at(i).is_some_and(|c| is_ident(c) || c == '$') {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
@@ -731,10 +731,7 @@ fn dollar_tag_len(rest: &[char]) -> Option<usize> {
     if rest.first() != Some(&'$') {
         return None;
     }
-    let tag = rest[1..]
-        .iter()
-        .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
-        .count();
+    let tag = rest[1..].iter().take_while(|c| is_ident(**c)).count();
     if tag > 0 && rest[1].is_ascii_digit() {
         return None;
     }
@@ -980,6 +977,25 @@ impl<'a> Stmts<'a> {
     }
 }
 
+/// The history key of `index`, in the schema that `owner` names.
+///
+/// Postgres puts an index in the schema of its table. A name without a schema
+/// counts as `public`, the default `search_path`.
+fn index_key(owner: &str, index: &str) -> String {
+    let schema = owner
+        .rsplit_once('.')
+        .map_or("public", |(schema, _)| schema);
+    format!("{schema}.{}", base(index))
+}
+
+/// Whether `c` can be part of an unquoted identifier or a dollar tag.
+///
+/// Postgres accepts every non-ASCII character there, as well as letters,
+/// digits and `_`.
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || !c.is_ascii()
+}
+
 /// The last part of a name that may carry a schema.
 ///
 /// The hot-table list and the history match on this part, so a schema never
@@ -1219,7 +1235,7 @@ fn resolve(
         {
             history
                 .indexes
-                .entry(base(index).to_string())
+                .entry(index_key(table, index))
                 .or_default()
                 .insert(table.clone());
         }
@@ -1229,7 +1245,7 @@ fn resolve(
             && toks[raw.at].runs
             && unconditional[raw.at]
         {
-            history.indexes.remove(base(index));
+            history.indexes.remove(&index_key(index, index));
         }
         let hot = table.as_deref().is_none_or(|t| {
             history.is_hot(t)
@@ -3218,6 +3234,34 @@ fn a_temporary_table_is_never_new() {
         "CREATE GLOBAL TEMPORARY TABLE scratch (e UUID REFERENCES harvest_workflow_executions (id));",
     ];
     let findings = lint_with_history(&history, "DROP TABLE scratch;", true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn an_index_lives_in_the_schema_of_its_table() {
+    // Postgres puts an index in its table's schema. A drop in another schema
+    // names a different index, which the lint cannot place.
+    let history = ["CREATE INDEX idx_shared ON staging.harvest_schedules (id);"];
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    for drop in ["DROP INDEX public.idx_shared;", "DROP INDEX idx_shared;"] {
+        let findings = lint_with_history(&history, &format!("{set}{drop}"), true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::BlockingIndex],
+            "{drop}: {findings:?}"
+        );
+    }
+    let findings = lint_with_history(&history, "DROP INDEX staging.idx_shared;", true);
+    assert_eq!(findings, []);
+}
+
+#[test]
+fn a_non_ascii_dollar_tag_quotes_a_body() {
+    // A tag follows the identifier rules, so it may hold any letter.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $é$\n\
+               BEGIN NULL; PERFORM set_config('lock_timeout', '5s', false); END $é$;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
