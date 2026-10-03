@@ -34,7 +34,7 @@ page explains each part of that chapter and the parts that it leaves out.
 |---|---|---|
 | `HarvestPlugin` on an autumn-web app | Your service uses autumn-web. Every feature is available. | [Getting started, Chapter 1](getting-started/01-project-skeleton.md) |
 | `HarvestEmbedding` on plain Axum | Your service uses Axum, not autumn-web. | This page |
-| HTTP from another language | Your service is not written in Rust. | [`openapi.md`](openapi.md), [`examples/typescript-client`](../examples/typescript-client/) |
+| HTTP from another language | Your service is not written in Rust. | [`clients/typescript`](../clients/typescript/README.md), [`openapi.md`](openapi.md), [`examples/typescript-client`](../examples/typescript-client/) |
 | The `autumn-harvest` core crate alone | You need the executor and the storage layer, with no HTTP surface. | [`README.md`](../README.md#workspace) |
 
 ## What the runtime needs
