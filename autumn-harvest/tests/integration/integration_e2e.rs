@@ -8131,6 +8131,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
 /// (b) `max_active_runs = 1` with a slow handler: the second cron firing must
 /// be skipped — the in-flight run count must never exceed 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // #1798: the `resident_workflows` field tips this literal-heavy test to 101 lines
 async fn workflow_schedule_max_active_runs_enforced() {
     let (database_url, _container) = setup_test_database_url().await;
 

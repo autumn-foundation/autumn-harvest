@@ -34,8 +34,8 @@ mod e2e_bench_support;
 
 use std::sync::{Arc, Mutex};
 
-use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::context::WorkflowCommand;
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::resident::{self, ResidentWorkflow};
 use autumn_harvest::testing::WorkflowReplayer;
@@ -132,13 +132,11 @@ fn bench_decisions(
 ///
 /// - `decision_cost` measures the replay work. Its cost grows linearly with
 ///   history length, so a run of n decisions costs O(n²) in total.
-/// - `decision_wall` measures a decision that suspends. The executor waits
-///   for a fixed 100 ms suspension timeout (issue #1797), so this group
-///   reads about max(100 ms, replay). It shows that floor, not the slope.
+/// - `decision_wall` measures a cold decision that suspends. Issue #1797
+///   removed the fixed suspension timeout, so it also tracks the replay.
 ///
-/// Resident workflow state (issue #1798, step 2) would make the replay work
-/// of a warm decision roughly constant. The 100 ms floor stays until issue
-/// #1797 lands.
+/// `decision_cost_warm` measures a resident decision (issue #1798, step 2).
+/// It does not replay, so its cost stays roughly constant.
 fn bench_decision_cost(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -164,33 +162,23 @@ fn bench_decision_cost(c: &mut Criterion) {
     bench_decisions(&mut group, &rt, 0);
     group.finish();
 
-    // Each sample waits about 100 ms, so keep the sample count small.
+    // Ten samples keep this group short. It measures the same replay as
+    // `decision_cost`.
     let mut group = c.benchmark_group("decision_wall");
     group.sample_size(10);
     bench_decisions(&mut group, &rt, 1);
     group.finish();
 }
 
-/// A resident workflow at `events` history events, and its next delta.
+/// The delta that resolves the activity a suspension schedules.
 ///
-/// The cold decision replays the full history and schedules one more
-/// activity. The delta is that activity's `ActivityScheduled` and
-/// `ActivityCompleted`. Resuming with it schedules the next activity.
-fn warm_decision(
-    rt: &tokio::runtime::Runtime,
-    events: usize,
-) -> (ResidentWorkflow, Vec<WorkflowEvent>) {
-    let (exec_id, history, input) = decision_history(events / 2, 2);
-    let (outcome, resident) = rt.block_on(resident::start(
-        exec_id,
-        history,
-        sequential_workflow,
-        input,
-    ));
+/// It holds the `ActivityScheduled` event that the worker writes for the
+/// command, then its `ActivityCompleted` event.
+fn completion_delta(outcome: &WorkflowOutcome) -> Vec<WorkflowEvent> {
     let WorkflowOutcome::Suspended { commands } = outcome else {
-        panic!("a live decision at {events} events must suspend: {outcome:?}");
+        panic!("a live decision must suspend: {outcome:?}");
     };
-    let delta = commands
+    commands
         .iter()
         .find_map(|cmd| match cmd {
             WorkflowCommand::ScheduleActivity {
@@ -213,43 +201,75 @@ fn warm_decision(
             ]),
             _ => None,
         })
-        .expect("the decision schedules an activity");
+        .expect("the decision schedules an activity")
+}
+
+/// A resident workflow at `events` history events that can resume `warm`
+/// more times, and the delta of its next decision.
+///
+/// The cold decision replays the full history and schedules one more
+/// activity. Each resume completes that activity and schedules the next.
+fn warm_run(
+    rt: &tokio::runtime::Runtime,
+    events: usize,
+    warm: u64,
+) -> (ResidentWorkflow, Vec<WorkflowEvent>) {
+    let (exec_id, history, input) = decision_history(events / 2, warm + 1);
+    let (outcome, resident) = rt.block_on(resident::start(
+        exec_id,
+        history,
+        sequential_workflow,
+        input,
+    ));
+    let delta = completion_delta(&outcome);
     let resident = resident.expect("an activity suspension stays resident");
     (resident, delta)
 }
 
-/// Measures one warm decision at 1k, 5k and 10k events (issue #1798).
+/// Measures the replay work of a warm decision at 1k, 5k and 10k events
+/// (issue #1798).
 ///
 /// A warm decision resumes the resident workflow with one new result. It
 /// does not replay history, so its cost must stay roughly constant across
-/// the three sizes. Compare with `decision_cost`, which grows linearly.
+/// the three sizes. Compare with `decision_cost`, which grows linearly. The
+/// worker also loads the delta and persists the commands; this group
+/// measures neither.
+///
+/// Each sample builds one resident workflow outside the timed region, then
+/// times back-to-back resumes, as on a warm worker.
 fn bench_decision_cost_warm(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // Each size must resume and suspend again, or the group times a decline.
     for events in DECISION_COST_EVENTS {
-        let (resident, delta) = warm_decision(&rt, events);
+        let (resident, delta) = warm_run(&rt, events, 2);
         let resumed = rt.block_on(resident.resume(&delta));
         assert!(
-            matches!(
-                &resumed,
-                Ok((WorkflowOutcome::Suspended { .. }, Some(_)))
-            ),
+            matches!(&resumed, Ok((WorkflowOutcome::Suspended { .. }, Some(_)))),
             "a warm decision at {events} events must resume and suspend: {resumed:?}"
         );
     }
 
     let mut group = c.benchmark_group("decision_cost_warm");
+    group.sample_size(20);
     for events in DECISION_COST_EVENTS {
         group.bench_with_input(
             BenchmarkId::from_parameter(events),
             &events,
             |b, &events| {
-                b.iter_batched(
-                    || warm_decision(&rt, events),
-                    |(resident, delta)| rt.block_on(resident.resume(&delta)),
-                    BatchSize::SmallInput,
-                );
+                b.iter_custom(|iters| {
+                    let (mut resident, mut delta) = warm_run(&rt, events, iters + 1);
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        let started = std::time::Instant::now();
+                        let resumed = rt.block_on(resident.resume(&delta));
+                        elapsed += started.elapsed();
+                        let (outcome, next) = resumed.expect("a warm decision resumes");
+                        delta = completion_delta(&outcome);
+                        resident = next.expect("the run stays resident");
+                    }
+                    elapsed
+                });
             },
         );
     }

@@ -371,11 +371,11 @@ mod tests {
     }
 
     /// Waits for one signal.
-    fn signal_workflow<'a>(
-        ctx: &'a crate::context::WorkflowContext,
+    fn signal_workflow(
+        ctx: &crate::context::WorkflowContext,
         _input: serde_json::Value,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
     > {
         Box::pin(async move { ctx.wait_for_signal("go").await.map_err(|e| e.to_string()) })
     }

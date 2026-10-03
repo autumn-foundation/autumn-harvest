@@ -706,11 +706,11 @@ mod tests {
             history.extend(own_events(commands));
             history.push(resolution(commands));
             let delta = &history[start_len..];
-            let resumed = match resident.take() {
+            let warm_step = match resident.take() {
                 Some(live) => live.resume(delta).await.ok(),
                 None => None,
             };
-            (outcome, resident) = match resumed {
+            (outcome, resident) = match warm_step {
                 Some(next) => {
                     resumes += 1;
                     next
@@ -740,7 +740,7 @@ mod tests {
 
     /// Three activities with side effects and progress, then a timer and a
     /// signal. Returns values that depend on history length.
-    fn chain_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> HandlerFuture<'a> {
+    fn chain_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             let steps = input["steps"].as_u64().ok_or("missing steps")?;
             let mut echoes = Vec::new();
@@ -775,7 +775,7 @@ mod tests {
     }
 
     /// A long-lived signal loop, the O(n²) case of issue #1798.
-    fn signal_loop_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> HandlerFuture<'a> {
+    fn signal_loop_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             let rounds = input["rounds"].as_u64().ok_or("missing rounds")?;
             let mut seen = 0_u64;
@@ -794,10 +794,7 @@ mod tests {
     static LOOP_BODY_STARTS: AtomicUsize = AtomicUsize::new(0);
 
     /// `signal_loop_workflow` with a body-start counter.
-    fn counted_signal_loop_workflow<'a>(
-        ctx: &'a WorkflowContext,
-        input: Value,
-    ) -> HandlerFuture<'a> {
+    fn counted_signal_loop_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
         LOOP_BODY_STARTS.fetch_add(1, Ordering::SeqCst);
         signal_loop_workflow(ctx, input)
     }
@@ -824,10 +821,7 @@ mod tests {
     }
 
     /// Fails after the first activity, so the warm run must fail like the cold run.
-    fn fail_after_activity_workflow<'a>(
-        ctx: &'a WorkflowContext,
-        _input: Value,
-    ) -> HandlerFuture<'a> {
+    fn fail_after_activity_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.execute_activity_raw("step", json!({}), "default")
                 .await
@@ -843,10 +837,7 @@ mod tests {
     }
 
     /// Panics after the first activity.
-    fn panic_after_activity_workflow<'a>(
-        ctx: &'a WorkflowContext,
-        _input: Value,
-    ) -> HandlerFuture<'a> {
+    fn panic_after_activity_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.execute_activity_raw("step", json!({}), "default")
                 .await
@@ -867,10 +858,10 @@ mod tests {
     }
 
     /// Waits on a foreign future after the first activity.
-    fn foreign_wait_after_activity_workflow<'a>(
-        ctx: &'a WorkflowContext,
+    fn foreign_wait_after_activity_workflow(
+        ctx: &WorkflowContext,
         _input: Value,
-    ) -> HandlerFuture<'a> {
+    ) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.execute_activity_raw("step", json!({}), "default")
                 .await
@@ -906,7 +897,7 @@ mod tests {
     }
 
     /// Passes its replay position and history length to a second activity.
-    fn position_workflow<'a>(ctx: &'a WorkflowContext, _input: Value) -> HandlerFuture<'a> {
+    fn position_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.execute_activity_raw("a", json!({}), "default")
                 .await
@@ -929,7 +920,7 @@ mod tests {
     }
 
     /// Probes for `approve`, then waits for it in the same cycle.
-    fn probe_then_wait_workflow<'a>(ctx: &'a WorkflowContext, _input: Value) -> HandlerFuture<'a> {
+    fn probe_then_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             let early = ctx
                 .try_wait_for_signal("approve")
@@ -954,10 +945,7 @@ mod tests {
     /// A cold replay of the full history lets the probe see `late`, because
     /// no command event bounds its scan. The warm run must not resume the
     /// wait for `late`.
-    fn probe_across_cycles_workflow<'a>(
-        ctx: &'a WorkflowContext,
-        _input: Value,
-    ) -> HandlerFuture<'a> {
+    fn probe_across_cycles_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             let early = ctx.try_wait_for_signal("late").map_err(|e| e.to_string())?;
             let first = ctx
@@ -989,7 +977,7 @@ mod tests {
     // ── Shapes that must never stay resident ─────────────────────────
 
     /// Awaits two activities at once.
-    fn join_workflow<'a>(ctx: &'a WorkflowContext, _input: Value) -> HandlerFuture<'a> {
+    fn join_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             let (a, b) = futures::join!(
                 ctx.execute_activity_raw("a", json!({}), "default"),
@@ -1003,7 +991,7 @@ mod tests {
     }
 
     /// Registers a push signal handler, then awaits an activity.
-    fn handler_workflow<'a>(ctx: &'a WorkflowContext, _input: Value) -> HandlerFuture<'a> {
+    fn handler_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.register_signal_handler_raw("note", |_payload: Value| {});
             ctx.execute_activity_raw("a", json!({}), "default")
@@ -1013,7 +1001,7 @@ mod tests {
     }
 
     /// Parks on a condition, which holds a park token.
-    fn condition_workflow<'a>(ctx: &'a WorkflowContext, _input: Value) -> HandlerFuture<'a> {
+    fn condition_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.await_condition(|| false)
                 .await
@@ -1047,7 +1035,7 @@ mod tests {
     // ── Deltas that must decline ─────────────────────────────────────
 
     /// One activity, then completes with its output.
-    fn one_activity_workflow<'a>(ctx: &'a WorkflowContext, _input: Value) -> HandlerFuture<'a> {
+    fn one_activity_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.execute_activity_raw("a", json!({}), "default")
                 .await
@@ -1093,6 +1081,7 @@ mod tests {
     type DeltaBuilder = Box<dyn Fn(&[WorkflowEvent], ActivityExecId) -> Vec<WorkflowEvent>>;
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One table of decline cases.
     async fn deltas_that_replay_could_read_differently_decline() {
         let other = ActivityExecId::new();
         let cases: Vec<(&str, ResumeDeclined, DeltaBuilder)> = vec![
@@ -1260,7 +1249,7 @@ mod tests {
     }
 
     /// Reuses one timer id in a loop.
-    fn timer_loop_workflow<'a>(ctx: &'a WorkflowContext, _input: Value) -> HandlerFuture<'a> {
+    fn timer_loop_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             for _ in 0..3 {
                 ctx.timer("tick", 1).await.map_err(|e| e.to_string())?;

@@ -2087,11 +2087,17 @@ impl HistoryMatcher {
         let at_or_after_cursor = (self.cursor..self.events.len())
             .find(|&index| !self.is_consumed(index) && Self::is_command_event(&self.events[index]));
         // A request drained early into an external stash is marked consumed.
-        // It is still drift if no command claimed it from the stash.
+        // It is still drift if no command claimed it from the stash. With all
+        // stashes empty, no event can match, so the history scan is skipped.
+        // A warm cycle then stays O(1) in history length (issue #1798).
+        let any_stashed = !(self.pending_external_signals.is_empty()
+            && self.pending_external_cancels.is_empty()
+            && self.pending_external_awaits.is_empty());
         let stashed = self
             .events
             .iter()
             .enumerate()
+            .take(if any_stashed { self.events.len() } else { 0 })
             .filter(|(_, event)| self.is_unclaimed_stashed_request(event))
             .map(|(index, _)| index);
         at_or_after_cursor

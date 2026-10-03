@@ -17903,11 +17903,26 @@ async fn load_workflow_replay_state(
     Ok(Some((final_history, timers_fired, signals_delivered)))
 }
 
-/// Whether a delta load from `from_event_id` to `next_event_id` holds
-/// `events` events, one per id (issue #1798).
-const fn delta_is_contiguous(from_event_id: i32, next_event_id: i32, events: usize) -> bool {
-    let span = next_event_id as i64 - from_event_id as i64;
-    span >= 0 && span as u64 == events as u64
+/// Whether a delta load from `from_event_id` holds one event per event id it
+/// spans, with no gap (issue #1798).
+fn delta_is_contiguous(from_event_id: i32, delta: &store::EventHistory) -> bool {
+    usize::try_from(i64::from(delta.next_event_id) - i64::from(from_event_id))
+        .is_ok_and(|span| span == delta.events.len())
+}
+
+/// Puts a taken cache entry back, and drops any displaced entry outside the
+/// lock (issue #1798).
+async fn put_back_cache_entry(
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    exec_uuid: uuid::Uuid,
+    state: crate::cache::CachedWorkflowState,
+    resident: Option<crate::resident::ResidentWorkflow>,
+) {
+    let displaced = workflow_cache
+        .lock()
+        .await
+        .insert_resident(exec_uuid, state, resident);
+    drop(displaced);
 }
 
 /// Prepare the workflow task, checking the in-process LRU cache first.
@@ -17993,12 +18008,7 @@ async fn prepare_workflow_task_with_cache(
         else {
             // Nothing was appended for this task, so the entry is still
             // valid. Put it back for the re-driven task (issue #1798).
-            let displaced =
-                workflow_cache
-                    .lock()
-                    .await
-                    .insert_resident(exec_uuid, cached_state, resident);
-            drop(displaced);
+            put_back_cache_entry(workflow_cache, exec_uuid, cached_state, resident).await;
             return Ok(None);
         };
 
@@ -18017,18 +18027,9 @@ async fn prepare_workflow_task_with_cache(
         // Validate the snapshot against `next_event_id` (issue #1798). Each
         // load must hold one event per id it spans. A gap means that the
         // delta is not the plain run of events the snapshot expects.
-        let contiguous = delta_is_contiguous(
-            cached_state.next_event_id,
-            existing_delta.next_event_id,
-            existing_delta.events.len(),
-        ) && delta_is_contiguous(
-            existing_delta.next_event_id,
-            after_ingest.next_event_id,
-            after_ingest.events.len(),
-        );
-        if !contiguous {
-            resident = None;
-        }
+        let contiguous = delta_is_contiguous(cached_state.next_event_id, &existing_delta)
+            && delta_is_contiguous(existing_delta.next_event_id, &after_ingest);
+        resident = resident.filter(|_| contiguous);
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
         // ingested timer/signal events.
@@ -22940,8 +22941,8 @@ async fn process_workflow_task(
     // `true` → insert on success. A terminal outcome inserts nothing: the
     // warm hit already took the entry (issue #1798), and `remove` below
     // evicts a stale one. Skipped entirely when sticky routing is disabled.
-    let pending_cache_update =
-        (!sticky_timeout.is_zero()).then(|| matches!(&outcome, WorkflowOutcome::Suspended { .. }));
+    let pending_cache_update = (!sticky_timeout.is_zero())
+        .then_some(matches!(&outcome, WorkflowOutcome::Suspended { .. }));
 
     // Extract this run's frozen carryover (issue #488) and scheduled slot (issue #508) from
     // the decoded WorkflowStarted (history_events[0]) so a continue_as_new continuation can
