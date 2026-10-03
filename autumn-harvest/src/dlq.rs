@@ -271,6 +271,7 @@ pub enum DeadLetterReason {
     },
     /// Stored workflow history reached the byte hard cap (issue #1804).
     /// `bytes` is the sum of `pg_column_size(event_data)` for the run.
+    /// `cap` is the configured byte cap.
     HistoryBytesCapExceeded {
         bytes: u64,
         cap: u64,

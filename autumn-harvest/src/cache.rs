@@ -51,11 +51,11 @@ pub struct CachedWorkflowState {
 /// only the events at or after `through`. This keeps the byte check off the
 /// full history on the warm path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HistoryBytesMark {
+pub(crate) struct HistoryBytesMark {
     /// Sum of `pg_column_size(event_data)` below `through`.
-    pub bytes: u64,
+    pub(crate) bytes: u64,
     /// First event id that `bytes` does not include.
-    pub through: i32,
+    pub(crate) through: i32,
 }
 
 /// One cache slot: the replay snapshot and its optional byte mark.
@@ -129,7 +129,7 @@ impl WorkflowCache {
 
     /// Insert a cached state together with its stored-history byte mark
     /// (issue #1804).
-    pub fn insert_with_history_bytes(
+    pub(crate) fn insert_with_history_bytes(
         &mut self,
         exec_id: Uuid,
         state: CachedWorkflowState,
@@ -149,7 +149,7 @@ impl WorkflowCache {
     /// Returns `None` when the entry is absent or carries no mark. Does not
     /// change the LRU order.
     #[must_use]
-    pub fn history_bytes(&self, exec_id: &Uuid) -> Option<HistoryBytesMark> {
+    pub(crate) fn history_bytes(&self, exec_id: &Uuid) -> Option<HistoryBytesMark> {
         self.inner
             .peek(exec_id)
             .and_then(|entry| entry.history_bytes)

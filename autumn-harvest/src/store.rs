@@ -1558,6 +1558,63 @@ pub async fn load_history_inflated(
     })
 }
 
+/// [`load_history_inflated`] that also returns the stored history bytes
+/// (issue #1804).
+///
+/// The bytes are the sum of `pg_column_size(event_data)` over the loaded rows.
+/// The worker's cold path reads them here, so the byte cap needs no second
+/// scan of the history.
+///
+/// # Errors
+///
+/// Same as [`load_history_inflated`].
+#[cfg(feature = "db")]
+pub(crate) async fn load_history_inflated_with_bytes(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> HarvestResult<(EventHistory, u64)> {
+    use crate::models::HarvestEvent;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Integer;
+
+    let rows: Vec<(HarvestEvent, i32)> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .select((
+            HarvestEvent::as_select(),
+            sql::<Integer>("pg_column_size(event_data)"),
+        ))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows
+        .last()
+        .map_or(0, |(row, _)| row.event_id.saturating_add(1));
+
+    let mut bytes = 0_u64;
+    let mut events = Vec::with_capacity(rows.len());
+    for (row, size) in rows {
+        bytes = bytes.saturating_add(u64::try_from(size).unwrap_or(0));
+        let mut data = row.event_data;
+        if let Some(offloader) = offloader {
+            offloader.inflate_event_value(&mut data).await?;
+        }
+        events.push(codecs.decode_event(data)?);
+    }
+
+    Ok((
+        EventHistory {
+            exec_id,
+            events,
+            next_event_id,
+        },
+        bytes,
+    ))
+}
+
 /// Load only events appended since a known event-id cursor.
 ///
 /// Returns events where `event_id >= from_event_id`, ordered by `event_id ASC`.

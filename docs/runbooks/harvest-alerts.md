@@ -1545,17 +1545,17 @@ cap:** the `harvest.workflow.history_bloat` counter (issue #704) is an operator
 **early-warning**, distinct from the terminal outcome it precedes. Harvest
 enforces a hard cap on the number of recorded `harvest_events` an
 in-flight execution may accumulate. The default is 50,000 events (issue
-#1804). (`WorkflowHistoryPolicy::event_hard_cap`,
-set once via `HarvestBuilder::history_event_hard_cap` at worker-registry
-construction time — **registry-wide, not per-workflow-type**: `HandlerRegistry`
+#1804). Set it with `HarvestBuilder::history_event_hard_cap`
+(`WorkflowHistoryPolicy::event_hard_cap`) at worker-registry
+construction time. The cap is **registry-wide, not per-workflow-type**: `HandlerRegistry`
 stores a single `WorkflowHistoryPolicy`, consulted with no workflow-name
 parameter, so every workflow type registered on that worker shares the
 identical cap and warn fraction; there is no per-type override, and raising or
 lowering either value affects every workflow type that worker serves. Distinct
 from the unrelated fleet-wide `HarvestBuilder::max_workflow_history_events`
 ceiling from issue #493, which is sampled by a separate periodic scanner and
-reported via the `harvest.workflow.history_oversized` gauge). When a hard cap
-is configured,
+reported via the `harvest.workflow.history_oversized` gauge). Unless the cap
+is unlimited,
 the same still-`RUNNING` execution that would eventually hit it is instead
 warned once — the first time its recorded history crosses a configurable
 fraction of that cap (`history_bloat_warn_fraction`, default **20%**, so
@@ -1631,10 +1631,9 @@ A single crossing for a workflow type known to run long and record many
 events by design (e.g. a long-lived entity workflow deliberately operating
 close to its configured cap) is expected, not an incident — the alert fires
 once per execution and does not repeat unless the execution keeps growing
-past the point already investigated. A worker whose event cap is unlimited
-(`history_event_hard_cap_unlimited()`) will show a permanently flat,
-never-incrementing series; that is the disabled/no-op state, not a health
-signal to chase.
+past the point already investigated. A worker with an unlimited event cap
+(`history_event_hard_cap_unlimited()`) shows a flat series. That is the
+disabled state, not a health signal.
 
 ### Safe actions
 

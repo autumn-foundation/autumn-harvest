@@ -99,16 +99,44 @@ pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.2;
 /// `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`), which -- absent a further
 /// fix -- would collapse the promised "warn before the hard cap" window into
 /// "warn on the same decision cycle as the hard cap" for small caps (PR
-/// #1139 review, a later round). The actual below-`cap` guarantee is
-/// enforced in `worker.rs`'s `history_bloat_threshold_crossed`, which clamps
-/// its computed threshold to `cap - 1` unconditionally of what `fraction`
-/// resolves to -- that clamp is what keeps the signal functional for every
-/// `(cap, fraction)` combination the public builder API can produce. This
+/// #1139 review, a later round). [`history_bloat_warn_threshold`] holds the
+/// real below-`cap` guarantee. It clamps the threshold to `cap - 1` for any
+/// `fraction`. That clamp keeps the signal working for every
+/// `(cap, fraction)` pair the public builder API can build. This
 /// constant's `< 1.0` ceiling remains as an independent, secondary safety
 /// margin (and a reasonable API choice on its own: a fraction of exactly
 /// `1.0` is a confusing "wait until literally the entire cap" configuration
 /// regardless of the below-cap clamp).
 pub const MAX_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.999;
+
+/// The event count at which the history-bloat warning fires (issue #704).
+///
+/// Returns `None` when `fraction <= 0.0`, the disabled sentinel. Otherwise
+/// the threshold is `ceil(cap * fraction)`, clamped to `cap - 1`.
+///
+/// The ceiling rounds up, not down. For cap 10 and fraction 0.75 the product
+/// is 7.5. A truncating cast warns at 7 events, which is 70% of the cap. The
+/// warning must fire at or past the configured fraction, so it fires at 8.
+///
+/// The clamp keeps at least one event of warning room below the hard cap.
+/// [`MAX_HISTORY_BLOAT_WARN_FRACTION`] limits `fraction` alone and cannot see
+/// `cap`. For cap 100, `ceil(100 * 0.999)` is 100, which equals the cap. The
+/// warning would then fire in the same decision as the hard cap, with no time
+/// to act. Only a clamp that sees both values prevents that, for every
+/// `(cap, fraction)` pair the public API can build.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub fn history_bloat_warn_threshold(cap: u64, fraction: f64) -> Option<u64> {
+    if fraction <= 0.0 {
+        return None;
+    }
+    let raw_threshold = (cap as f64 * fraction).ceil() as u64;
+    Some(raw_threshold.min(cap.saturating_sub(1)))
+}
 
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
@@ -292,6 +320,15 @@ impl WorkflowHistoryPolicy {
     #[must_use]
     pub const fn history_bloat_warn_fraction(self) -> f64 {
         self.history_bloat_warn_fraction
+    }
+
+    /// The event count at which the history-bloat warning fires (issue
+    /// #1804). `None` when the event cap is unlimited or the fraction is
+    /// `0.0`. See [`history_bloat_warn_threshold`].
+    #[must_use]
+    pub fn history_bloat_warn_threshold(self) -> Option<u64> {
+        self.event_hard_cap
+            .and_then(|cap| history_bloat_warn_threshold(cap, self.history_bloat_warn_fraction))
     }
 
     /// Override the history-bloat soft-warning fraction (issue #704). The
@@ -17216,14 +17253,19 @@ mod tests {
     fn workflow_history_policy_default_warning_lands_at_ten_thousand_events() {
         // 50,000 * 0.2 = 10,000: the default soft threshold.
         let policy = WorkflowHistoryPolicy::default();
-        let cap = policy.event_hard_cap().expect("default cap");
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let threshold = (cap as f64 * policy.history_bloat_warn_fraction()).ceil() as u64;
-        assert_eq!(threshold, 10_000);
+        assert_eq!(policy.history_bloat_warn_threshold(), Some(10_000));
+        assert_eq!(
+            policy
+                .without_event_hard_cap()
+                .history_bloat_warn_threshold(),
+            None
+        );
+        assert_eq!(
+            policy
+                .with_history_bloat_warn_fraction(0.0)
+                .history_bloat_warn_threshold(),
+            None
+        );
     }
 
     #[test]

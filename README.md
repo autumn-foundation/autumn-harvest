@@ -258,7 +258,7 @@ default threshold is `10_000` events.
 let harvest = HarvestBuilder::new()
     .workflows(workflows![polling_loop])
     .history_continue_as_new_threshold(5_000)
-    .history_event_hard_cap(20_000)
+    .history_event_hard_cap(40_000)
     .try_build()?;
 ```
 
@@ -270,15 +270,17 @@ guardrails against a runaway loop:
 | Durable events per run | `50_000` | `history_event_hard_cap(n)` | `HistoryCapExceeded { count, cap, workflow_type }` |
 | Stored history bytes per run | 50 MiB | `history_byte_hard_cap(n)` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
 
-When a run reaches a cap and does not issue `continue_as_new`, the worker
-fails the run and moves it to the DLQ with the typed reason. No new workflow
-event variant is used. The byte measure is `pg_column_size(event_data)`, the
+A run that reaches a cap fails unless it calls `continue_as_new`. The worker
+moves it to the DLQ with the typed reason. The guardrail adds no workflow
+event variant. The byte measure is `pg_column_size(event_data)`, the
 same measure as the tenant `max_history_bytes` quota. The Postgres worker
 enforces both caps. The SQLite backend does not.
 
 `harvest.workflow.history_bloat` fires once per run at 20% of the event cap,
 so at `10_000` events by default. The worker also logs a warning. Set
-`history_bloat_warn_fraction(..)` to move the threshold.
+`history_bloat_warn_fraction(..)` to move the threshold. Keep the warning
+point at or above `history_continue_as_new_threshold`, or healthy runs warn
+before the advisory turns true. `try_build` logs a warning when they do.
 
 To remove a cap, call `history_event_hard_cap_unlimited()` or
 `history_byte_hard_cap_unlimited()`. With no event cap there is no

@@ -1,8 +1,8 @@
 ## Engine — Default history event cap and byte cap (issue #1804)
 
-A runaway loop used to grow `harvest_events` and replay CPU without bound.
-The only default was the advisory `should_continue_as_new` at 10,000 events.
-The worker now caps each run's history by default.
+Before this change, a runaway loop grew `harvest_events` and replay CPU
+without bound. The only default was the advisory `should_continue_as_new` at
+10,000 events. The worker now caps each run's history by default.
 
 | Setting | Before | After |
 |---|---|---|
@@ -21,7 +21,9 @@ The worker now caps each run's history by default.
   `history_byte_hard_cap_unlimited()` on `HarvestBuilder`;
   `with_byte_hard_cap`, `without_event_hard_cap` and `without_byte_hard_cap`
   on `WorkflowHistoryPolicy`. New constants
-  `DEFAULT_HISTORY_EVENT_HARD_CAP` and `DEFAULT_HISTORY_BYTE_HARD_CAP`.
+  `DEFAULT_HISTORY_EVENT_HARD_CAP` and `DEFAULT_HISTORY_BYTE_HARD_CAP`, and
+  `WorkflowHistoryPolicy::history_bloat_warn_threshold()`. The crate root
+  now re-exports the three history defaults.
 
 Design decisions:
 
@@ -29,20 +31,33 @@ Design decisions:
   The warning stays a fraction of the cap, so `0.2` puts it at 10,000.
 - The byte measure is `pg_column_size(event_data)`, the same measure as the
   tenant `max_history_bytes` quota.
-- The byte check runs once per decision, next to the event-cap preflight. It
-  uses the same `continue_as_new` exemption. It can overshoot the cap by one
-  decision's appends.
-- The byte sum is incremental. `WorkflowCache` keeps a private
+- The worker measures the stored bytes once, at the start of each decision.
+  Two gates use the measure. The first stops a run before an inline local
+  activity runs a side effect. The second sits next to the event-cap
+  preflight and uses the same `continue_as_new` exemption. The run can
+  overshoot the cap by one decision's appends.
+- The byte sum is incremental. `WorkflowCache` keeps a crate-private
   `HistoryBytesMark` with each entry. A warm decision sums only the events at
-  or after the mark, and a cold decision sums the whole history. The sum has
-  an upper event-id bound, so a concurrent append is never counted twice.
+  or after the mark, with one small indexed query. The sum has an upper
+  event-id bound, so a concurrent append is never counted twice. A cold
+  decision reads the sum from its full history load, so it scans no extra
+  rows.
+- A failed byte measure skips the byte check for that decision only. It
+  logs a warning and does not fail the task.
 - The history-bloat `COUNT(*)` now runs only when the in-memory prospective
-  count crosses the threshold. That count never under-counts the worker's own
-  appends, so small runs pay no extra query now that the warning is on by
-  default.
+  count crosses the threshold. Small runs pay no extra query now that the
+  warning is on by default. The prospective count usually over-counts. When
+  it is low, the warning fires one decision later.
 - `try_build` logs a warning when the event cap is at or below
   `history_continue_as_new_threshold`. The advisory can then never fire
-  before the cap.
+  before the cap. It also warns when the warning point is below the
+  threshold, because healthy runs then page. The README and
+  `examples/long_running.rs` now use caps that avoid both cases.
+- The warn-threshold formula moves from `worker.rs` to
+  `context::history_bloat_warn_threshold`, with its rationale. The worker,
+  the builder check and the tests share it.
+- `HistoryCapBreach` names the cap a run reached. The local-activity cap
+  gates, the preflight and `fail_workflow_for_history_cap` all pass it.
 - The scanner ceiling `max_workflow_history_events` (#493) stays opt-in. The
   worker cap covers the runaway-loop case without a per-tick scan.
 - The SQLite backend does not enforce either cap.
@@ -56,11 +71,21 @@ query that finds the runs a cap would fail.
 No migration, no new `WorkflowEvent` variant, and no `harvest_events` write.
 
 Tests: `tests/integration/history_default_caps_tests.rs` runs a real worker
-against Postgres. A run at 50,000 events fails with `HistoryCapExceeded`
-under the default policy. A run at 10,000 events emits
-`harvest.workflow.history_bloat` once and stays `RUNNING`. A signal loop
-reaches a 64 KiB byte cap on the warm cache path and fails with
-`HistoryBytesCapExceeded`; small signals in between prove the sum does not
-double-count. An explicit `unlimited` keeps a run past 50,000 events alive.
-Unit tests cover the defaults, the overrides, the new DLQ tags, the cache
-mark and the 10,000-event boundary.
+against Postgres:
+
+- Under the default policy, a run at 50,000 events fails with
+  `HistoryCapExceeded { count: 50_000, cap: 50_000 }` and emits the warning.
+- Under the default policy, a run at 10,000 events emits
+  `harvest.workflow.history_bloat` once and stays `RUNNING`. A run at 9,999
+  events does not.
+- Under the default policy, a run at 50 MiB fails with
+  `HistoryBytesCapExceeded`.
+- A signal loop reaches a 64 KiB cap on the warm path and on the cold path.
+  The reason carries exactly the stored bytes. Small signals in between
+  prove the sum does not double-count.
+- A run over the byte cap runs no inline local activity.
+- A run over the byte cap can still `continue_as_new`.
+- Explicit `unlimited` caps keep a run past 50,000 events and 50 MiB alive.
+
+Unit tests cover the defaults, the overrides, the warn threshold, both
+build-time warnings, the breach helpers, the new DLQ tags and the cache mark.

@@ -287,11 +287,12 @@ impl std::fmt::Debug for HarvestBuilder {
     }
 }
 
-/// Log a warning when the event hard cap is at or below the soft
-/// `continue_as_new` threshold (issue #1804).
+/// Log a warning when a history cap undercuts the soft `continue_as_new`
+/// threshold (issue #1804).
 ///
-/// The run then fails at the cap before `should_continue_as_new` turns true.
-/// This is a warning, not an error: a small cap is a valid choice in tests.
+/// A cap at or below the threshold fails runs before `should_continue_as_new`
+/// turns true. A warning point below the threshold pages for healthy runs.
+/// These are warnings, not errors: a small cap is a valid choice in tests.
 fn warn_if_history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) {
     if history_cap_preempts_continue_as_new(policy) {
         tracing::warn!(
@@ -300,7 +301,22 @@ fn warn_if_history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) {
             "history_event_hard_cap is at or below history_continue_as_new_threshold; \
              runs fail at the cap before should_continue_as_new turns true"
         );
+    } else if history_warning_precedes_continue_as_new(policy) {
+        tracing::warn!(
+            history_bloat_warn_threshold = ?policy.history_bloat_warn_threshold(),
+            continue_as_new_threshold = policy.continue_as_new_threshold(),
+            "the history-bloat warning fires below history_continue_as_new_threshold; \
+             healthy runs warn before should_continue_as_new turns true"
+        );
     }
+}
+
+/// `true` when the history-bloat warning fires below the soft threshold
+/// (issue #1804). Under the defaults both sit at 10,000, which is fine.
+fn history_warning_precedes_continue_as_new(policy: WorkflowHistoryPolicy) -> bool {
+    policy
+        .history_bloat_warn_threshold()
+        .is_some_and(|threshold| threshold < policy.continue_as_new_threshold())
 }
 
 /// `true` when the event hard cap fires before the soft threshold can.
@@ -2183,12 +2199,12 @@ impl HarvestBuilder {
     /// at which the operator early-warning soft threshold fires (issue #704).
     /// Clamped into `[0.0, 1.0]`; `0.0` disables the signal entirely (AC4).
     ///
-    /// Has no effect unless a hard cap is also configured -- with no hard
-    /// cap there is nothing to warn about approaching.
+    /// The signal is off when the event cap is unlimited. With no cap there
+    /// is nothing to warn about approaching.
     ///
     /// Defaults to
     /// [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`](crate::context::DEFAULT_HISTORY_BLOAT_WARN_FRACTION)
-    /// (`0.75`).
+    /// (`0.2`).
     #[must_use]
     pub const fn history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
         self.history_policy = self
@@ -5276,6 +5292,22 @@ mod tests {
             policy
                 .with_continue_as_new_threshold(60_000)
                 .without_event_hard_cap()
+        ));
+    }
+
+    #[test]
+    fn history_warning_precedes_continue_as_new_only_below_the_threshold() {
+        let policy = WorkflowHistoryPolicy::default();
+        // Defaults: the warning and the advisory both sit at 10,000.
+        assert!(!history_warning_precedes_continue_as_new(policy));
+        // Cap 20,000 at 0.2 warns at 4,000, below the 10,000 threshold.
+        assert!(history_warning_precedes_continue_as_new(
+            policy.with_event_hard_cap(20_000)
+        ));
+        assert!(!history_warning_precedes_continue_as_new(
+            policy
+                .with_event_hard_cap(20_000)
+                .with_history_bloat_warn_fraction(0.75)
         ));
     }
 
