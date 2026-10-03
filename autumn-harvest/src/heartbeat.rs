@@ -248,7 +248,7 @@ pub struct HeartbeatFlushOptions {
 ///
 /// Each payload carries the time its sender stamped. The flush writes the
 /// database clock minus the age of that time. A payload that waits in the
-/// channel thus keeps its real age.
+/// slot thus keeps its real age.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn spawn_heartbeat_flusher_with(
@@ -256,96 +256,126 @@ pub fn spawn_heartbeat_flusher_with(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
-) -> mpsc::Sender<StampedHeartbeat> {
-    let (tx, rx) = mpsc::channel(64);
+) -> HeartbeatSlot {
     let latest = LatestHeartbeat::default();
-
-    tokio::spawn(keep_newest_heartbeat(
-        rx,
+    tokio::spawn(stamped_heartbeat_loop(
+        claim,
+        pool,
         Arc::clone(&latest),
-        cancel.clone(),
+        cancel,
+        options,
     ));
-    tokio::spawn(stamped_heartbeat_loop(claim, pool, latest, cancel, options));
+    HeartbeatSlot(latest)
+}
 
-    tx
+/// The activity side of [`spawn_heartbeat_flusher_with`] (issue #1788).
+///
+/// A send puts the heartbeat in the flusher's slot before it returns. No task
+/// stands between the activity and the flush loop. The flush loop thus sees
+/// every heartbeat whose send has returned.
+#[cfg(feature = "db")]
+#[derive(Clone)]
+pub struct HeartbeatSlot(LatestHeartbeat);
+
+#[cfg(feature = "db")]
+impl HeartbeatSlot {
+    /// Send `beat` to the flusher. Returns `false` once the flusher stopped.
+    pub fn send(&self, beat: impl Into<StampedHeartbeat>) -> bool {
+        self.0.publish(beat.into())
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for HeartbeatSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeartbeatSlot").finish_non_exhaustive()
+    }
 }
 
 /// The newest heartbeat not yet taken by the flush loop.
 #[cfg(feature = "db")]
 type LatestHeartbeat = Arc<Latest>;
 
-/// The slot that `keep_newest_heartbeat` fills and the flush loop takes.
+/// The slot that the activity fills and the flush loop takes.
 #[cfg(feature = "db")]
 #[derive(Default)]
 struct Latest {
-    slot: Mutex<Option<Pending>>,
+    state: Mutex<SlotState>,
     /// Wakes a flush loop that waits after a blocked write.
     published: tokio::sync::Notify,
 }
 
 #[cfg(feature = "db")]
+#[derive(Default)]
+struct SlotState {
+    /// The newest heartbeat not yet taken.
+    pending: Option<Pending>,
+    /// The send time of the newest heartbeat seen.
+    newest_sent: Option<std::time::Instant>,
+    /// Set when the flush loop stops.
+    closed: bool,
+}
+
+#[cfg(feature = "db")]
 impl Latest {
-    /// Put `pending` in the slot and wake a waiting flush loop.
-    fn publish(&self, pending: Pending) {
-        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(pending);
+    /// Keep `beat` if it is the newest send so far (issue #1788). Then wake a
+    /// waiting flush loop. Returns `false` once the flush loop stopped.
+    ///
+    /// Newest means the latest send, not the latest call. A manual heartbeat
+    /// and the auto-heartbeat ticker stamp before they send, so they can call
+    /// out of order. A heartbeat sent before one already seen is dropped, also
+    /// when a flush already took the newer one. A write of it would move
+    /// `last_heartbeat_at` backwards.
+    ///
+    /// The order comes from the monotonic `sent_order`, not from the wall
+    /// clock. The wall clock can step back, for example after an NTP
+    /// correction. Every later heartbeat would then look older, and all of
+    /// them would be dropped.
+    fn publish(&self, beat: StampedHeartbeat) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return false;
+        }
+        if state
+            .newest_sent
+            .is_some_and(|newest| beat.sent_order < newest)
+        {
+            return true;
+        }
+        state.newest_sent = Some(beat.sent_order);
+        state.pending = Some(Pending {
+            payload: beat.details,
+            sent_order: beat.sent_order,
+        });
+        drop(state);
         self.published.notify_waiters();
+        true
     }
 
     /// Take the heartbeat from the slot.
     fn take(&self) -> Option<Pending> {
-        self.slot
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .pending
             .take()
     }
 
     /// Whether a heartbeat waits in the slot.
     fn is_full(&self) -> bool {
-        self.slot
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .pending
             .is_some()
     }
-}
 
-/// Keep only the newest heartbeat for the flush loop (issue #1788).
-///
-/// This task never waits on the database. A flush can block for its acquire or
-/// statement timeout. A heartbeat sent in that time keeps its send time, so a
-/// stalled handler cannot look alive later.
-///
-/// Newest means the latest send, not the latest arrival. A manual heartbeat
-/// and the auto-heartbeat ticker stamp before they send, so they can arrive
-/// out of order. A heartbeat sent before one already seen is dropped, also
-/// when a flush already took the newer one. A write of it would move
-/// `last_heartbeat_at` backwards.
-///
-/// The order comes from the monotonic `sent_order`, not from the wall clock.
-/// The wall clock can step back, for example after an NTP correction. Every
-/// later heartbeat would then look older, and all of them would be dropped.
-#[cfg(feature = "db")]
-async fn keep_newest_heartbeat(
-    mut rx: mpsc::Receiver<StampedHeartbeat>,
-    latest: LatestHeartbeat,
-    cancel: CancellationToken,
-) {
-    let mut newest_sent: Option<std::time::Instant> = None;
-    loop {
-        let beat = tokio::select! {
-            () = cancel.cancelled() => break,
-            received = rx.recv() => match received {
-                Some(beat) => beat,
-                None => break,
-            },
-        };
-        if newest_sent.is_some_and(|newest| beat.sent_order < newest) {
-            continue;
-        }
-        newest_sent = Some(beat.sent_order);
-        latest.publish(Pending {
-            payload: beat.details,
-            sent_order: beat.sent_order,
-        });
+    /// Mark the flush loop as stopped. Later sends return `false`.
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed = true;
     }
 }
 
@@ -552,6 +582,7 @@ async fn stamped_heartbeat_loop(
             break;
         }
     }
+    latest.close();
 }
 
 /// Whether the stamped flush loop writes the next heartbeat without the
@@ -567,9 +598,7 @@ fn write_blocked(took: Duration, interval: Duration) -> bool {
 /// Wait for the next flush after a blocked write (issue #1788).
 ///
 /// The wait ends at once when a heartbeat is in the slot. It also ends when
-/// `keep_newest_heartbeat` publishes one, or after `interval`. A heartbeat can
-/// still sit in the channel when the write ends, so one check of the slot is
-/// not enough.
+/// the activity sends one, or after `interval`.
 ///
 /// Returns `false` when `cancel` fires.
 #[cfg(feature = "db")]
@@ -688,29 +717,43 @@ mod tests {
     mod stamped {
         use super::*;
 
-        /// Run `keep_newest_heartbeat` over `beats`, sent in order. Take the slot
-        /// after the beat at `take_after`, as a flush would.
-        async fn keep_newest_of(
+        /// Send `beats` in order. Take the slot after the beat at
+        /// `take_after`, as a flush would.
+        fn keep_newest_of(
             beats: Vec<StampedHeartbeat>,
             take_after: Option<usize>,
         ) -> Option<std::time::Instant> {
-            let (tx, rx) = mpsc::channel(8);
-            let latest = LatestHeartbeat::default();
-            let cancel = CancellationToken::new();
-            let task = tokio::spawn(keep_newest_heartbeat(rx, Arc::clone(&latest), cancel));
+            let latest = Latest::default();
             for (index, beat) in beats.into_iter().enumerate() {
-                tx.send(beat).await.expect("send");
-                tokio::task::yield_now().await;
-                while !tx.capacity().eq(&tx.max_capacity()) {
-                    tokio::task::yield_now().await;
-                }
+                assert!(latest.publish(beat));
                 if take_after == Some(index) {
                     latest.take();
                 }
             }
-            drop(tx);
-            task.await.expect("join");
             latest.take().map(|beat| beat.sent_order)
+        }
+
+        /// A send puts the heartbeat in the slot before it returns (issue
+        /// #1788). A flush that checks the slot after a write thus sees every
+        /// heartbeat sent before the check.
+        #[test]
+        fn a_sent_heartbeat_is_in_the_slot_when_the_send_returns() {
+            let slot = HeartbeatSlot(LatestHeartbeat::default());
+            assert!(slot.send(beat_at(1)));
+            assert!(slot.0.is_full());
+            assert_eq!(
+                slot.0.take().map(|beat| beat.sent_order),
+                Some(beat_at(1).sent_order)
+            );
+        }
+
+        /// A send after the flush loop stops returns `false`, so the activity
+        /// learns that its heartbeats go nowhere.
+        #[test]
+        fn a_send_after_the_flusher_stops_fails() {
+            let slot = HeartbeatSlot(LatestHeartbeat::default());
+            slot.0.close();
+            assert!(!slot.send(beat_at(1)));
         }
 
         /// One process start, shared by every test beat, so their send
@@ -726,8 +769,8 @@ mod tests {
             }
         }
 
-        /// A heartbeat can still sit in the channel when a blocked write
-        /// ends. Its later publish ends the wait at once (issue #1788).
+        /// A heartbeat sent while the loop waits after a blocked write ends
+        /// the wait at once (issue #1788).
         #[tokio::test(start_paused = true)]
         async fn a_publish_after_a_blocked_write_ends_the_wait() {
             let interval = Duration::from_secs(1);
@@ -741,10 +784,7 @@ mod tests {
                 )
             };
             tokio::time::sleep(interval / 10).await;
-            latest.publish(Pending {
-                payload: Value::Null,
-                sent_order: std::time::Instant::now(),
-            });
+            assert!(latest.publish(StampedHeartbeat::now(Value::Null)));
             assert!(waiter.await.expect("join"));
             assert!(
                 start.elapsed() < interval,
@@ -765,17 +805,17 @@ mod tests {
 
         /// A heartbeat that arrives late keeps the newer one (issue #1788). Two
         /// senders stamp before they send, so they can arrive out of order.
-        #[tokio::test]
-        async fn an_older_heartbeat_does_not_replace_a_newer_one() {
-            let newest = keep_newest_of(vec![beat_at(20), beat_at(10)], None).await;
+        #[test]
+        fn an_older_heartbeat_does_not_replace_a_newer_one() {
+            let newest = keep_newest_of(vec![beat_at(20), beat_at(10)], None);
             assert_eq!(newest, Some(beat_at(20).sent_order));
         }
 
         /// An older heartbeat that arrives after a flush took the newer one is
         /// dropped. A write of it would move `last_heartbeat_at` backwards.
-        #[tokio::test]
-        async fn an_older_heartbeat_after_a_flush_is_dropped() {
-            let newest = keep_newest_of(vec![beat_at(20), beat_at(10)], Some(0)).await;
+        #[test]
+        fn an_older_heartbeat_after_a_flush_is_dropped() {
+            let newest = keep_newest_of(vec![beat_at(20), beat_at(10)], Some(0));
             assert_eq!(newest, None);
         }
 
@@ -866,14 +906,10 @@ mod tests {
                     metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
                 },
             );
-            tx.send(serde_json::json!({"p": 1}).into())
-                .await
-                .expect("send");
+            assert!(tx.send(serde_json::json!({"p": 1})));
             // The first flush starts after one interval and blocks for `bound`.
             tokio::time::sleep(Duration::from_millis(1500)).await;
-            tx.send(serde_json::json!({"p": 2}).into())
-                .await
-                .expect("send");
+            assert!(tx.send(serde_json::json!({"p": 2})));
 
             let deadline = Instant::now() + Duration::from_secs(10);
             let times = loop {
@@ -908,9 +944,7 @@ mod tests {
                     metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
                 },
             );
-            tx.send(serde_json::json!({"p": 1}).into())
-                .await
-                .expect("send");
+            assert!(tx.send(serde_json::json!({"p": 1})));
 
             let deadline = Instant::now() + Duration::from_secs(6);
             loop {

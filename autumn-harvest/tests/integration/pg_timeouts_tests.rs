@@ -1301,9 +1301,7 @@ async fn a_retried_heartbeat_keeps_its_receipt_time() {
         },
     );
     let sent_at = Utc::now();
-    tx.send(serde_json::json!({"progress": 1}).into())
-        .await
-        .expect("send the heartbeat");
+    assert!(tx.send(serde_json::json!({"progress": 1})));
 
     // Several flushes fail while the pool is full. Then the slot frees.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1380,9 +1378,7 @@ async fn a_heartbeat_keeps_its_send_time_on_a_busy_runtime() {
         },
     );
     let sent_at = Utc::now();
-    tx.send(serde_json::json!({"progress": 1}).into())
-        .await
-        .expect("send the heartbeat");
+    assert!(tx.send(serde_json::json!({"progress": 1})));
     // Synchronous handler work holds the only runtime thread.
     std::thread::sleep(std::time::Duration::from_secs(2));
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1878,15 +1874,11 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
         },
     );
-    tx.send(serde_json::json!({"progress": 1}).into())
-        .await
-        .expect("send the first heartbeat");
+    assert!(tx.send(serde_json::json!({"progress": 1})));
     // The first flush starts at about 1 s and waits until about 4 s.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let sent_at = Utc::now();
-    tx.send(serde_json::json!({"progress": 2}).into())
-        .await
-        .expect("send the second heartbeat");
+    assert!(tx.send(serde_json::json!({"progress": 2})));
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     drop(held);
     tokio::time::sleep(Duration::from_millis(2_500)).await;
@@ -1960,15 +1952,11 @@ async fn a_newer_heartbeat_follows_a_blocked_flush_at_once() {
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
         },
     );
-    tx.send(serde_json::json!({"progress": 1}).into())
-        .await
-        .expect("send the first heartbeat");
+    assert!(tx.send(serde_json::json!({"progress": 1})));
     // The first flush starts at about 1 s and blocks on the held pool.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let newer_sent_at = Utc::now();
-    tx.send(serde_json::json!({"progress": 2}).into())
-        .await
-        .expect("send the newer heartbeat");
+    assert!(tx.send(serde_json::json!({"progress": 2})));
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     drop(held);
     let released = Instant::now();
@@ -2053,15 +2041,11 @@ async fn a_scanner_behind_a_blocked_flush_sees_the_newer_heartbeat() {
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
         },
     );
-    tx.send(serde_json::json!({"progress": 1}).into())
-        .await
-        .expect("send the first heartbeat");
+    assert!(tx.send(serde_json::json!({"progress": 1})));
     // The first flush starts at about 1 s and blocks on the held pool.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let newer_sent_at = Utc::now();
-    tx.send(serde_json::json!({"progress": 2}).into())
-        .await
-        .expect("send the newer heartbeat");
+    assert!(tx.send(serde_json::json!({"progress": 2})));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // The flush waits first, so it gets the slot. The scanner waits next, so

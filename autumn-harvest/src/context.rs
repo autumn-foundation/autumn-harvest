@@ -14149,8 +14149,8 @@ impl ActivityExecutionInfo {
 
 /// A heartbeat payload and the time the activity sent it (issue #1788).
 ///
-/// The sender takes the time. A busy runtime can run the receiving task late.
-/// A time taken there would make a stale heartbeat look new.
+/// The sender takes the time. A busy runtime can run the flush loop late. A
+/// time taken there would make a stale heartbeat look new.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StampedHeartbeat {
@@ -14185,7 +14185,8 @@ pub(crate) enum HeartbeatSink {
     /// A channel of bare payloads, for tests.
     Plain(tokio::sync::mpsc::Sender<serde_json::Value>),
     /// The worker's flusher. Each payload carries its send time.
-    Stamped(tokio::sync::mpsc::Sender<StampedHeartbeat>),
+    #[cfg(feature = "db")]
+    Stamped(crate::heartbeat::HeartbeatSlot),
 }
 
 impl HeartbeatSink {
@@ -14193,7 +14194,8 @@ impl HeartbeatSink {
     async fn send(&self, details: serde_json::Value) -> bool {
         match self {
             Self::Plain(tx) => tx.send(details).await.is_ok(),
-            Self::Stamped(tx) => tx.send(StampedHeartbeat::now(details)).await.is_ok(),
+            #[cfg(feature = "db")]
+            Self::Stamped(slot) => slot.send(StampedHeartbeat::now(details)),
         }
     }
 }
@@ -14204,9 +14206,10 @@ impl From<tokio::sync::mpsc::Sender<serde_json::Value>> for HeartbeatSink {
     }
 }
 
-impl From<tokio::sync::mpsc::Sender<StampedHeartbeat>> for HeartbeatSink {
-    fn from(tx: tokio::sync::mpsc::Sender<StampedHeartbeat>) -> Self {
-        Self::Stamped(tx)
+#[cfg(feature = "db")]
+impl From<crate::heartbeat::HeartbeatSlot> for HeartbeatSink {
+    fn from(slot: crate::heartbeat::HeartbeatSlot) -> Self {
+        Self::Stamped(slot)
     }
 }
 
