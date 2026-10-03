@@ -2779,7 +2779,7 @@ pub(crate) async fn claim_held_for_update_skip_locked(
 /// `crash_strikes` (issue #1789).
 ///
 /// Such a claim passes a guard on `(worker_id, crash_strikes)`, for example
-/// [`claim_still_held_for_update`], but it is not `claim`. The read takes no
+/// the capability-miss release, but it is not `claim`. The read takes no
 /// lock.
 ///
 /// # Errors

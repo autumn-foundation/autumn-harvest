@@ -5497,7 +5497,8 @@ async fn lock_activity_claim(
 /// Check the claim epoch of an activity row under its lock (issue #1789).
 ///
 /// The guards in [`fail_task_and_execution_with_history`] key on
-/// `(worker_id, crash_strikes)`. A clean release resets `crash_strikes` to 0,
+/// `(worker_id, crash_strikes)`, and on `attempt` for workflow rows.
+/// A clean release resets `crash_strikes` to 0,
 /// so a later claim by the same worker can pass them. This check locks the
 /// row with the epoch in the same statement. The later guards then read a row
 /// that this transaction holds, so the epoch cannot move under them.
