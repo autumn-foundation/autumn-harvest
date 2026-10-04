@@ -136,6 +136,9 @@ struct InFlightClaim {
     /// process. The entry then holds the mark, so a later registration
     /// still sees it.
     token: Option<DispatchToken>,
+    /// The breaker generation when the entry was made. A confirm with no
+    /// token is fenced by it, so a reset after the mark counts nothing.
+    generation: u64,
     state: ClaimState,
 }
 
@@ -555,6 +558,16 @@ impl CircuitBreakerRegistry {
             }
             return None;
         }
+        if let Some(ClaimState::Provisional(deciding) | ClaimState::Held(_, _, deciding)) = state {
+            // Not a timeout as far as this worker knows, but an enforcer
+            // here is still deciding. Its verdict wins, so the entry keeps
+            // the token for a fenced count.
+            if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                entry.state = ClaimState::Ended(deciding);
+            }
+            apply_cancelled(st, token, now);
+            return None;
+        }
         st.in_flight_claims.remove(&claim);
         if !lost_to_timeout || state == Some(ClaimState::TimedOut) {
             apply_cancelled(st, token, now);
@@ -582,6 +595,7 @@ impl CircuitBreakerRegistry {
             .and_modify(|entry| entry.token = Some(token))
             .or_insert(InFlightClaim {
                 token: Some(token),
+                generation: token.generation,
                 state: ClaimState::Running,
             });
     }
@@ -633,8 +647,10 @@ impl CircuitBreakerRegistry {
         }
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
+        let generation = st.generation;
         let entry = st.in_flight_claims.entry(claim).or_insert(InFlightClaim {
             token: None,
+            generation,
             state: ClaimState::Running,
         });
         entry.state = match entry.state {
@@ -662,8 +678,8 @@ impl CircuitBreakerRegistry {
     /// With `count_failure`, the timeout also counts as a failure, under the
     /// same lock. A claim of this process counts through its dispatch token,
     /// so a token from before a trip or a reset counts nothing. A claim that
-    /// no worker here registered has no token, and counts as an external
-    /// failure.
+    /// no worker here registered has no token. It counts as an external
+    /// failure, fenced by the generation at its mark.
     ///
     /// A claim whose handler started was registered before the enforcer read
     /// that fact. So an entry with no token here belongs to another process,
@@ -678,33 +694,31 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        let token = match st.in_flight_claims.get(&claim).copied() {
-            Some(entry) => match (entry.state, entry.token) {
-                (ClaimState::TimedOut, _) => return None,
-                (_, None) => {
-                    st.in_flight_claims.remove(&claim);
-                    None
+        // Every enforcer marks before it confirms, and every path keeps a
+        // marked entry until its enforcers decide. So a missing entry has
+        // no generation to fence by, and counts nothing.
+        let entry = st.in_flight_claims.get(&claim).copied()?;
+        match (entry.state, entry.token) {
+            (ClaimState::TimedOut, _) => return None,
+            (ClaimState::Running | ClaimState::Provisional(_), Some(_)) => {
+                if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                    entry.state = ClaimState::TimedOut;
                 }
-                (
-                    ClaimState::Held(..) | ClaimState::LostPending(_) | ClaimState::Ended(_),
-                    token,
-                ) => {
-                    st.in_flight_claims.remove(&claim);
-                    token
-                }
-                (ClaimState::Running | ClaimState::Provisional(_), token) => {
-                    if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
-                        entry.state = ClaimState::TimedOut;
-                    }
-                    token
-                }
-            },
-            None => None,
-        };
-        if token.is_some_and(|token| apply_cancelled(st, token, now)) {
+            }
+            _ => {
+                st.in_flight_claims.remove(&claim);
+            }
+        }
+        if entry
+            .token
+            .is_some_and(|token| apply_cancelled(st, token, now))
+        {
             return Some(CircuitTransition::Tripped);
         }
-        if !count_failure || token.is_some_and(|token| token.generation != st.generation) {
+        let generation = entry
+            .token
+            .map_or(entry.generation, |token| token.generation);
+        if !count_failure || generation != st.generation {
             return None;
         }
         apply_external_failure(st, policy, now)
@@ -1450,6 +1464,69 @@ mod tests {
         reg.end_claim("send_email", claim(3));
         assert_eq!(reg.unmark_claim_timed_out("send_email", claim(3), t0), None);
         assert_eq!(rolling(&reg, t0), 1);
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// A mark on another process's claim records the generation. A reset
+    /// before the confirm fences that count too (issue #1809).
+    #[test]
+    fn an_unregistered_mark_is_fenced_by_a_reset() {
+        let reg = registry();
+        let t0 = Instant::now();
+        reg.mark_claim_timed_out("send_email", claim(1));
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        reg.force_close("send_email");
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0, "the reset fences the remote count");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // A claim that is not marked counts nothing at all.
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(2), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0);
+    }
+
+    /// A worker that sees no timeout while an enforcer here still decides
+    /// keeps the token. The enforcer's verdict counts once, fenced by
+    /// generation (issue #1809).
+    #[test]
+    fn a_loss_seen_as_no_timeout_still_waits_for_the_enforcer() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), token);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        assert_eq!(
+            reg.on_claim_lost("send_email", token, claim(1), false, t0),
+            None
+        );
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), true, t0);
+        assert_eq!(rolling(&reg, t0), 1, "the enforcer's verdict counts once");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        let stale = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(2), stale);
+        reg.mark_claim_timed_out("send_email", claim(2));
+        assert_eq!(
+            reg.on_claim_lost("send_email", stale, claim(2), false, t0),
+            None
+        );
+        for _ in 0..2 {
+            fail(&reg, t0);
+        }
+        reg.force_close("send_email");
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(2), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0, "the reset fences the stale claim");
         assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
     }
 

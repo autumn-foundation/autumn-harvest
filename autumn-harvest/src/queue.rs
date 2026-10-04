@@ -2847,12 +2847,17 @@ pub(crate) async fn record_timed_out_claim(
 ///
 /// Only the owner of the claim calls this, once, after it loses the claim.
 /// The removal keeps the list to owners that have not settled. Any other
-/// loss of the claim, and a failed write, is not a timeout.
+/// loss of the claim is not a timeout.
+///
+/// # Errors
+///
+/// Returns a database error if the update fails. The record then stays, and
+/// the answer is unknown.
 pub(crate) async fn take_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     started_at: DateTime<Utc>,
-) -> bool {
+) -> HarvestResult<bool> {
     diesel::sql_query(
         "UPDATE harvest_task_queue \
          SET timed_out_claims = array_remove(timed_out_claims, $2) \
@@ -2862,7 +2867,8 @@ pub(crate) async fn take_timed_out_claim(
     .bind::<diesel::sql_types::Timestamptz, _>(started_at)
     .execute(conn)
     .await
-    .is_ok_and(|rows| rows > 0)
+    .map(|rows| rows > 0)
+    .map_err(crate::error::database_error)
 }
 
 /// Record that the handler of `claim` started (issue #1809).

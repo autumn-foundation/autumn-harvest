@@ -15285,16 +15285,46 @@ impl Drop for CircuitProbeGuard<'_> {
 
 /// Whether the claim of `task` was lost to the timeout enforcer (issue
 /// #1809). The enforcer records the `started_at` of the claim it timed out.
-/// Any other loss, or a failed write, is not a timeout.
+/// Any other loss is not a timeout.
 ///
 /// The read also removes the record, so call it once per lost claim. Call it
 /// even when the activity has no breaker policy. Otherwise the record stays
 /// on the row until the row goes.
-async fn claim_lost_to_timeout(conn: &mut AsyncPgConnection, task: &TaskQueueItem) -> bool {
-    match task.started_at {
-        Some(started_at) => queue::take_timed_out_claim(conn, task.id, started_at).await,
-        None => false,
+///
+/// A failed write leaves the record, so a retry is safe. The retries use a
+/// fresh connection, in case the first one broke. If every try fails, the
+/// answer is unknown. The loss then counts as no timeout here, and a warning
+/// says so. The enforcing process counted the timeout in its own breaker.
+async fn claim_lost_to_timeout(
+    pool: &DbPool,
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> bool {
+    let Some(started_at) = task.started_at else {
+        return false;
+    };
+    let mut error = match queue::take_timed_out_claim(conn, task.id, started_at).await {
+        Ok(hit) => return hit,
+        Err(error) => error,
+    };
+    for backoff in [Duration::from_millis(50), Duration::from_millis(250)] {
+        tokio::time::sleep(backoff).await;
+        let retried = match pool.get().await {
+            Ok(mut fresh) => queue::take_timed_out_claim(&mut fresh, task.id, started_at).await,
+            Err(pool_error) => Err(crate::error::database_error(pool_error)),
+        };
+        match retried {
+            Ok(hit) => return hit,
+            Err(retry_error) => error = retry_error,
+        }
     }
+    tracing::warn!(
+        task_id = %task.id,
+        error = %error,
+        "could not read the timed-out claim record; the lost claim does not count \
+         against the circuit breaker in this process"
+    );
+    false
 }
 
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
@@ -16437,7 +16467,7 @@ async fn process_activity_task(
             // timeout counts against the downstream. `on_claim_lost` counts
             // one that another process enforced, and releases the slot of any
             // other loss.
-            let lost_to_timeout = claim_lost_to_timeout(&mut conn, task).await
+            let lost_to_timeout = claim_lost_to_timeout(pool, &mut conn, task).await
                 && circuit_breakers.has_policy(activity_name);
             if circuit_breakers.on_claim_lost(
                 activity_name,
@@ -16564,8 +16594,10 @@ async fn process_activity_task(
     // A failed write still releases an admitted probe, without a trip. A
     // lost claim counts only when a timeout took it (see `on_claim_lost`).
     let applied = finalized.as_ref().ok().copied();
+    // A cancelled attempt took its record above, and reports no outcome.
     let lost_to_timeout = applied == Some(false)
-        && claim_lost_to_timeout(&mut conn, task).await
+        && circuit_outcome.is_some()
+        && claim_lost_to_timeout(pool, &mut conn, task).await
         && circuit_breakers.has_policy(activity_name);
     report_outcome(applied, lost_to_timeout);
     finalized.map(|_| ())
