@@ -1676,12 +1676,8 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     // Its locks still count, which fails closed.
     let mut not_run: BTreeMap<String, usize> = BTreeMap::new();
     let unconditional = unconditional(&s);
-    // An inherited change counts from token 0. Each test uses `c <= at`, and
-    // the change token itself is a `SET`, so it holds no name or lock.
-    let local_path_change =
-        (0..toks.len()).find(|&k| s.starts[k] == k && changes_search_path(&s, k));
-    let path_change = local_path_change.or_else(|| history.search_path_changed.then_some(0));
-    history.search_path_changed |= local_path_change.is_some();
+    let opaque = opaque_points(&s, history);
+    let path_change = path_change(&s, &opaque, history);
 
     for (k, tok) in toks.iter().enumerate() {
         let start = s.starts[k] == k;
@@ -1752,7 +1748,8 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 
     function_settings(&s, &mut body_timeouts);
     foreign_do_bodies(&s, &mut raws, &mut timeouts, &mut body_timeouts);
-    unreadable_settings(&s, sql, &unconditional, path_change, history, &mut raws);
+    let settings = (path_change, opaque.as_slice());
+    unreadable_settings(&s, sql, &unconditional, settings, history, &mut raws);
     call_clears(
         &s,
         history,
@@ -1893,11 +1890,11 @@ fn unreadable_settings(
     s: &Stmts,
     sql: &str,
     unconditional: &[bool],
-    path_change: Option<usize>,
+    (path_change, opaque): (Option<usize>, &[usize]),
     history: &mut History,
     raws: &mut Vec<Raw>,
 ) {
-    nonstandard_strings(s, sql, unconditional, path_change, history, raws);
+    nonstandard_strings(s, sql, unconditional, (path_change, opaque), history, raws);
     routine_resets(s, raws);
 }
 
@@ -1917,7 +1914,7 @@ fn nonstandard_strings(
     s: &Stmts,
     sql: &str,
     unconditional: &[bool],
-    path_change: Option<usize>,
+    (path_change, opaque): (Option<usize>, &[usize]),
     history: &mut History,
     raws: &mut Vec<Raw>,
 ) {
@@ -1933,6 +1930,7 @@ fn nonstandard_strings(
     // savepoint may restore any value from the transaction.
     let mut session = history.nonstandard_strings;
     let mut local = false;
+    let mut hidden = false;
     let mut saved = session;
     let (mut any_session_off, mut any_local_off) = (session, false);
     for (k, &surely_runs) in unconditional.iter().enumerate() {
@@ -1956,13 +1954,17 @@ fn nonstandard_strings(
             }
         }
         let top_start = s.starts[k] == k && s.toks[k].depth == 0 && !s.is_punct(k, ';');
-        if top_start && (session || local) {
+        if top_start && (session || local || hidden) {
             let last = s.end(k).saturating_sub(1).max(k);
             let lines = s.toks[k].line..=s.toks[last].line;
             if backslash_lines.range(lines).next().is_some() {
                 raws.push(Raw::lock(k, NONSTANDARD_STRINGS, None));
             }
         }
+        // Code that the lint cannot read may turn the setting off. Its own
+        // finding covers that code. The doubt holds for the rest of the file,
+        // but history keeps only the values the lint can read.
+        hidden |= opaque.contains(&k);
         // A routine body may run in a later transaction, so only a top-level
         // local value ends at the commit.
         let top = s.toks[k].depth == 0;
@@ -2536,6 +2538,62 @@ impl SpanEnd {
             Self::Unqualified => !name.contains('.'),
         }
     }
+}
+
+/// The first token that may change `search_path`, and record a textual
+/// change in `history`.
+///
+/// An inherited change counts from token 0. Each test uses `c <= at`, and the
+/// change token itself is a `SET`, so it holds no name or lock. Code that the
+/// lint cannot read may change the path too, from the end of its statement
+/// on. That doubt holds for the rest of the file only. Carried into history,
+/// one such call would leave every later migration unreadable.
+fn path_change(s: &Stmts, opaque: &[usize], history: &mut History) -> Option<usize> {
+    let text = (0..s.toks.len()).find(|&k| s.starts[k] == k && changes_search_path(s, k));
+    let hidden = opaque.first().map(|&k| s.end(k));
+    history.search_path_changed |= text.is_some();
+    let local = text.into_iter().chain(hidden).min();
+    local.or_else(|| history.search_path_changed.then_some(0))
+}
+
+/// Each running token where code that the lint cannot read runs.
+///
+/// That is a `DO` in another language, an unreadable `EXECUTE`, or a call
+/// that no earlier routine in this file matches. Such code may change any
+/// session setting, such as `search_path` or `standard_conforming_strings`.
+fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
+    let routines = file_routines(s);
+    let inherited = [
+        &history.clearing_routines,
+        &history.foreign_routines,
+        &history.locking_routines,
+    ];
+    let bases: BTreeSet<&str> = routines
+        .iter()
+        .map(|r| base(&r.name))
+        .chain(inherited.into_iter().flatten().map(String::as_str))
+        .collect();
+    let resolved = |call: &Routine| {
+        routines.iter().any(|r| {
+            !r.foreign
+                && r.at < call.at
+                && r.name == call.name
+                && r.arity.is_some()
+                && r.arity == call.arity
+        })
+    };
+    (0..s.toks.len())
+        .filter(|&k| s.toks[k].runs)
+        .filter(|&k| {
+            let start = s.starts[k] == k;
+            let execute = start
+                && s.keyword(k, "execute")
+                && s.toks[k].depth > 0
+                && unreadable_execute(s, k).is_some();
+            let call = call_target(s, k, &bases).is_some_and(|c| !resolved(&c));
+            (start && foreign_do(s, k)) || execute || call
+        })
+        .collect()
 }
 
 /// Whether the statement at `k` may change `search_path`.
@@ -6404,6 +6462,41 @@ fn only_the_built_in_set_config_turns_conforming_strings_on() {
         let findings = lint_with_history(&[off], &sql, true);
         assert!(!tainted(&findings), "{sql}\n{findings:?}");
     }
+}
+
+#[test]
+fn opaque_code_may_turn_conforming_strings_off() {
+    let allow = "-- lock-safety: allow lock-timeout #1810 test fixture\n";
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    for opaque in [
+        "DO $$\nplpy.execute(\"SET standard_conforming_strings = off\")\n$$ LANGUAGE plpython3u;",
+        "CALL mystery();",
+    ] {
+        let sql = format!("{allow}{opaque}\n{hidden}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.contains("standard_conforming_strings")),
+            "{sql}\n{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn opaque_code_leaves_later_index_names_unplaced() {
+    let allow = "-- lock-safety: allow lock-timeout #1810 test fixture\n";
+    let create = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX public.idx;";
+    // The unread call may change `search_path`, so `idx` may sit in another
+    // schema, and `public.idx` stays unknown.
+    let history = format!("{allow}CALL mystery();\n{create}");
+    let findings = lint_with_history(&[&history], drop, true);
+    assert!(!findings.is_empty(), "{findings:?}");
+    // The doubt holds for that file only, so a later file places `idx`.
+    let history = [format!("{allow}CALL mystery();"), create.to_string()];
+    let history: Vec<&str> = history.iter().map(String::as_str).collect();
+    assert_eq!(lint_with_history(&history, drop, true), [], "{history:?}");
 }
 
 #[test]

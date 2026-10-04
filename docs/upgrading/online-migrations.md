@@ -302,6 +302,10 @@ that no longer matches a finding also fails the build.
   a bound or makes a table new. The lint does not read the body of a routine
   in another language as SQL, because Postgres only stores it. Avoid such code
   in a migration.
+- Code that the lint cannot read may change `search_path` or turn
+  `standard_conforming_strings` off. The lint assumes so for the rest of that
+  file, but not for later migrations. Otherwise one such call would leave
+  every later migration unreadable.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.
