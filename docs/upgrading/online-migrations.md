@@ -112,6 +112,9 @@ when something calls the function. A lock in a function body needs its own
 bound earlier in the body, because the migration's bound may not hold when
 the function runs. A `SET lock_timeout` clause in `CREATE FUNCTION` or
 `CREATE PROCEDURE` also counts, because Postgres applies it on each call.
+An `ALTER FUNCTION`, `ALTER PROCEDURE` or `ALTER ROUTINE` that resets or clears
+that setting counts as a lock that no bound covers, because each later call
+runs the body without it.
 A clear in a routine body can outlive the call. So a call ends the bound
 when the routine may clear it. A call reaches a body in the same file only
 when an earlier `CREATE` has the same name, schema included, and the same
@@ -269,7 +272,8 @@ that no longer matches a finding also fails the build.
   as code, in any quote form. Any other string is data.
 - The lint reads string literals as `standard_conforming_strings = on` does.
   A statement that may turn the setting off counts as a lock on an unknown
-  table that no bound covers.
+  table that no bound covers. The setting outlives its file, so each later
+  migration with a backslash counts the same way until a reset.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
   call of a routine in another language, counts as a lock on an unknown table.
   No bound covers that lock, because the code may clear the bound first. It

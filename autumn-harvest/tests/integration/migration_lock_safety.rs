@@ -245,6 +245,8 @@ struct History {
     /// Whether an earlier migration may have changed `search_path`. A session
     /// value outlives its file, so a later file starts after the change.
     search_path_changed: bool,
+    /// Whether an earlier migration left `standard_conforming_strings` off.
+    nonstandard_strings: bool,
 }
 
 impl History {
@@ -504,7 +506,14 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
 /// A lock that unreadable `EXECUTE` SQL takes never counts as bounded.
 fn bound_in_force(analysis: &Analysis, hit: &Hit) -> bool {
     // The hidden code may clear the bound before it locks.
-    if [UNREADABLE_EXECUTE, FOREIGN_CODE, NONSTANDARD_STRINGS].contains(&hit.verb) {
+    if [
+        UNREADABLE_EXECUTE,
+        FOREIGN_CODE,
+        NONSTANDARD_STRINGS,
+        ROUTINE_RESET,
+    ]
+    .contains(&hit.verb)
+    {
         return false;
     }
     let Some(from) = hit.body_start else {
@@ -1470,17 +1479,19 @@ impl<'a> Stmts<'a> {
         if self.is(j, "exists") { j + 1 } else { k }
     }
 
-    /// The name after the first `keyword` in the statement that holds `k`.
+    /// The name after the first unquoted `keyword` in the statement that
+    /// holds `k`.
     fn name_after(&self, k: usize, keyword: &str) -> Option<String> {
         (k..self.end(k))
-            .find(|&j| self.is(j, keyword))
+            .find(|&j| self.keyword(j, keyword))
             .and_then(|j| self.qualified_name(j + 1))
             .map(|(name, _)| name)
     }
 
-    /// Whether the statement that holds `k` has `first` directly before `second`.
+    /// Whether the statement that holds `k` has the unquoted keyword `first`
+    /// directly before `second`.
     fn has_pair(&self, k: usize, first: &str, second: &str) -> bool {
-        (self.starts[k]..self.end(k)).any(|j| self.is(j, first) && self.is(j + 1, second))
+        (self.starts[k]..self.end(k)).any(|j| self.keyword(j, first) && self.keyword(j + 1, second))
     }
 
     /// The comma-separated actions of the statement that starts at `k`, as
@@ -1533,7 +1544,7 @@ impl<'a> Stmts<'a> {
 /// statement renames it or moves it to another schema.
 fn moved_index_key(s: &Stmts, at: usize, index: &str) -> Option<String> {
     let end = s.end(at);
-    if let Some(j) = (at..end).find(|&j| s.is(j, "rename") && s.is(j + 1, "to")) {
+    if let Some(j) = (at..end).find(|&j| s.keyword(j, "rename") && s.keyword(j + 1, "to")) {
         return Some(index_key(index, s.word(j + 2)?));
     }
     let j = (at..end).find(|&j| s.is(j, "set") && s.is(j + 1, "schema"))?;
@@ -1630,7 +1641,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             }
             Some("drop") if start => drop(&s, k, history, &mut raws),
             Some("alter") if start => alter(&s, k, history, &mut raws),
-            Some("rename") if s.is(k + 1, "to") => rename(&s, k, history),
+            Some("rename") if s.keyword(k + 1, "to") => rename(&s, k, history),
             Some("lock" | "truncate") if start => raws.extend(lock_or_truncate(&s, k)),
             Some("cluster") if start => {
                 let j = if s.is(k + 1, "verbose") { k + 2 } else { k + 1 };
@@ -1686,7 +1697,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 
     function_settings(&s, &mut body_timeouts);
     foreign_do_bodies(&s, &mut raws, &mut timeouts, &mut body_timeouts);
-    nonstandard_strings(&s, &mut raws);
+    unreadable_settings(&s, sql, history, &mut raws);
     call_clears(
         &s,
         history,
@@ -1803,35 +1814,100 @@ fn language<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
 /// `standard_conforming_strings` is off.
 const NONSTANDARD_STRINGS: &str = "SQL after standard_conforming_strings is off";
 
+/// Add the locks of settings that may hide or expose a lock.
+fn unreadable_settings(s: &Stmts, sql: &str, history: &mut History, raws: &mut Vec<Raw>) {
+    nonstandard_strings(s, sql, history, raws);
+    routine_resets(s, raws);
+}
+
 /// Treat each statement that may turn `standard_conforming_strings` off as
 /// unreadable code.
 ///
 /// With the setting off, a plain `'...'` literal takes backslash escapes, as
 /// `E'...'` does. The lint then misreads every later `DO`, routine and
 /// `EXECUTE` body, so the statement counts as a lock that no bound covers.
-fn nonstandard_strings(s: &Stmts, raws: &mut Vec<Raw>) {
-    let off = |j: usize| !s.word(j).or_else(|| s.string(j)).is_some_and(pg_true);
+///
+/// A session value outlives its file. When an earlier file leaves the setting
+/// off, a file with any backslash counts as unreadable too. Without a
+/// backslash, the setting changes nothing.
+fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut Vec<Raw>) {
+    if history.nonstandard_strings && sql.contains('\\') && !s.toks.is_empty() {
+        raws.push(Raw::lock(0, NONSTANDARD_STRINGS, None));
+    }
     for k in 0..s.toks.len() {
-        let set = s.starts[k] == k && s.keyword(k, "set") && {
-            let name = if s.is(k + 1, "local") || s.is(k + 1, "session") {
-                k + 2
-            } else {
-                k + 1
-            };
-            let value = if s.is_punct(name + 1, '=') || s.is(name + 1, "to") {
-                name + 2
-            } else {
-                name + 1
-            };
-            s.is(name, "standard_conforming_strings") && off(value)
+        match conforming_change(s, k) {
+            Some(false) => {
+                raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
+                history.nonstandard_strings = true;
+            }
+            Some(true) => history.nonstandard_strings = false,
+            None => {}
+        }
+    }
+}
+
+/// The new `standard_conforming_strings` value that the token at `k` sets, if
+/// any. A value the lint cannot read counts as `false`, which fails closed.
+fn conforming_change(s: &Stmts, k: usize) -> Option<bool> {
+    let on = |j: usize| s.word(j).or_else(|| s.string(j)).is_some_and(pg_true);
+    let start = s.starts[k] == k;
+    if start && s.keyword(k, "reset") {
+        return (s.is(k + 1, "standard_conforming_strings") || s.is(k + 1, "all")).then_some(true);
+    }
+    if start && s.keyword(k, "set") {
+        let name = if s.is(k + 1, "local") || s.is(k + 1, "session") {
+            k + 2
+        } else {
+            k + 1
         };
-        let call = s.is(k, "set_config")
-            && s.is_punct(k + 1, '(')
-            && s.string(k + 2)
-                .is_some_and(|n| n.trim().eq_ignore_ascii_case("standard_conforming_strings"))
-            && (!s.is_punct(k + 3, ',') || off(k + 4));
-        if set || call {
-            raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
+        let value = if s.is_punct(name + 1, '=') || s.is(name + 1, "to") {
+            name + 2
+        } else {
+            name + 1
+        };
+        return s.is(name, "standard_conforming_strings").then(|| on(value));
+    }
+    let named = s.is(k, "set_config")
+        && s.is_punct(k + 1, '(')
+        && s.string(k + 2)
+            .is_some_and(|n| n.trim().eq_ignore_ascii_case("standard_conforming_strings"));
+    named.then(|| s.is_punct(k + 3, ',') && on(k + 4))
+}
+
+/// The verb of a lock that an `ALTER` of a routine may expose.
+const ROUTINE_RESET: &str = "ALTER of a routine that drops its lock_timeout setting";
+
+/// Treat each `ALTER FUNCTION`, `PROCEDURE` or `ROUTINE` that removes or
+/// clears a `lock_timeout` setting as a lock that no bound covers.
+///
+/// The routine body may lock a hot table, and its `CREATE` may have set the
+/// bound. After the `ALTER`, each call runs that lock without the bound.
+fn routine_resets(s: &Stmts, raws: &mut Vec<Raw>) {
+    for k in (0..s.toks.len()).filter(|&k| s.starts[k] == k && s.keyword(k, "alter")) {
+        if !["function", "procedure", "routine"]
+            .iter()
+            .any(|w| s.keyword(k + 1, w))
+        {
+            continue;
+        }
+        let depth = s.toks[k].depth;
+        let drops = (k..s.end(k))
+            .filter(|&j| s.toks[j].depth == depth)
+            .any(|j| {
+                let reset =
+                    s.keyword(j, "reset") && (s.is(j + 1, "lock_timeout") || s.is(j + 1, "all"));
+                let set = s.keyword(j, "set") && s.is(j + 1, "lock_timeout") && {
+                    let value = if s.is_punct(j + 2, '=') || s.is(j + 2, "to") {
+                        j + 3
+                    } else {
+                        j + 2
+                    };
+                    !bounds_wait(s, value)
+                };
+                reset || set
+            });
+        if drops {
+            raws.push(Raw::lock(k, ROUTINE_RESET, None));
         }
     }
 }
@@ -5579,6 +5655,69 @@ fn a_quoted_constraint_word_builds_no_index() {
     ] {
         let sql = format!("SET LOCAL lock_timeout = '5s';\nALTER TABLE harvest_events {action};");
         assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    }
+}
+
+#[test]
+fn an_alter_routine_that_drops_its_bound_is_unbounded() {
+    let create = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql SET lock_timeout = '5s' AS $$\n\
+                  BEGIN\n    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;\n";
+    for alter in [
+        "ALTER FUNCTION f() RESET lock_timeout;",
+        "ALTER FUNCTION f() SET lock_timeout = 0;",
+        "ALTER ROUTINE f() RESET ALL;",
+        "ALTER PROCEDURE f() SET lock_timeout TO DEFAULT;",
+    ] {
+        let sql = format!("{create}{alter}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        // The body may come from an earlier migration.
+        let findings = lint_with_history(&[create], alter, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{alter}");
+    }
+    let sql = format!("{create}ALTER FUNCTION f() SET lock_timeout = '10s';");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn nonstandard_strings_carry_into_later_migrations() {
+    let off = "-- lock-safety: allow lock-timeout #1810 test fixture\nSET standard_conforming_strings = off;";
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let findings = lint_with_history(&[off], hidden, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings")),
+        "{findings:?}"
+    );
+    // Without a backslash, the setting changes nothing.
+    let plain = "SET LOCAL lock_timeout = '5s';\nALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[off], plain, true), []);
+    // A later reset ends the taint.
+    let reset = format!("{off}\nRESET standard_conforming_strings;");
+    let findings = lint_with_history(&[&reset], hidden, true);
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_quoted_object_name_is_not_its_target_keyword() {
+    for sql in [
+        "CREATE TRIGGER \"on\" BEFORE INSERT ON harvest_events FOR EACH ROW EXECUTE FUNCTION f();",
+        "DROP TRIGGER \"on\" ON harvest_events;",
+        "ALTER TRIGGER \"on\" ON harvest_events RENAME TO t2;",
+        "CREATE RULE \"to\" AS ON INSERT TO harvest_events DO INSTEAD NOTHING;",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        assert!(
+            findings[0].detail.contains("harvest_events"),
+            "{findings:?}"
+        );
     }
 }
 
