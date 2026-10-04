@@ -454,7 +454,9 @@ impl KeyProvider for FileKeyProvider {
             key_id: key_id.to_string(),
         })?;
         let path = self.dir.join(format!("{key_id}.key"));
-        let text = match tokio::fs::read_to_string(&path).await {
+        // `std::fs`, not `tokio::fs`: loom and shuttle builds compile
+        // `tokio::fs` out. The read is one small file at startup.
+        let text = match std::fs::read_to_string(&path) {
             Ok(text) => Zeroizing::new(text),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(KeyProviderError::UnknownKey {
