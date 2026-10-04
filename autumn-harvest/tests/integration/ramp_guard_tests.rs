@@ -1802,6 +1802,49 @@ async fn a_reported_marker_outlives_a_late_fan_out_write() {
     );
 }
 
+/// The guard keeps a failed report of a ramp with no `ramp_id` recoverable.
+/// The clear writes a marker under a report id of its own, so a later pass
+/// still reports the abort.
+#[tokio::test]
+async fn a_failed_report_of_an_id_less_ramp_is_recovered() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // An old writer sets the ramp with no id.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+    .execute(&mut conn)
+    .await
+    .expect("old writer ramp");
+    seed_healthy_base(&mut conn, 5).await;
+    for _ in 0..5 {
+        seed(&mut conn, true, "FAILED", false).await;
+    }
+    // The first report fails: no server listens on port 1.
+    let audit_down = build_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+    let pools = [pool.clone()];
+    let aborts = guard_once(&pools, &audit_down, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(!ramp_is_active(&mut conn).await, "the clear happens");
+    assert_eq!(abort_marker_count(&mut conn).await, 1, "a marker remains");
+
+    // A later pass reports the abort from that marker.
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0].reason, RampAbortReason::Unreported);
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
+}
+
 /// A split ramp with no abort marker is not cleared.
 #[tokio::test]
 async fn a_split_ramp_without_an_abort_marker_stays() {

@@ -402,25 +402,25 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
 
 /// SQL for the compare-and-swap clear of one ramp step.
 ///
-/// The binds are the queue, the base build, the target build and the step
-/// start. The row must still hold the same step, so a verdict about an old
-/// step cannot clear a new one.
+/// The binds are the queue, the base build, the target build, the step
+/// start and a report id. The row must still hold the same step, so a
+/// verdict about an old step cannot clear a new one.
 ///
 /// The same UPDATE adds an abort marker to the front of `ramp_aborted`, so
 /// the marker commits with the clear. The marker holds `id`, `base`,
-/// `target`, `reported` and `at`, the clear time in epoch milliseconds. A
-/// newer abort keeps the older markers. A ramp with no `ramp_id` adds no
-/// marker. The new marker is always unreported. Only a committed report
+/// `target`, `reported` and `at`, the clear time in epoch milliseconds. The
+/// `id` is the `ramp_id`. A ramp with no `ramp_id` gets the report id
+/// instead, so its report stays recoverable. A newer abort keeps the older
+/// markers. The new marker is always unreported. Only a committed report
 /// marks it.
 #[must_use]
 pub const fn abort_ramp_query() -> &'static str {
     "UPDATE harvest_build_policies \
-     SET ramp_aborted = CASE WHEN ramp_id IS NULL THEN ramp_aborted ELSE \
-             jsonb_build_array(jsonb_build_object( \
-                 'id', ramp_id, 'base', build_id, 'target', target_build_id, \
+     SET ramp_aborted = jsonb_build_array(jsonb_build_object( \
+                 'id', COALESCE(ramp_id, $5), 'base', build_id, 'target', target_build_id, \
                  'reported', false, \
                  'at', (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)) \
-                 || ramp_aborted END, \
+                 || ramp_aborted, \
          ramp_id = NULL, target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
      WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
        AND updated_at = $4"
@@ -620,7 +620,8 @@ pub async fn record_abort_report(
 /// the clear at `bound`.
 ///
 /// The marker of this clear is unreported. The caller reports the abort and
-/// then calls [`mark_abort_reported`].
+/// then calls [`mark_abort_reported`]. A ramp with no `ramp_id` gets a fresh
+/// report id for its marker.
 #[cfg(feature = "db")]
 pub async fn abort_ramp(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -629,6 +630,21 @@ pub async fn abort_ramp(
     target: &str,
     step: chrono::DateTime<chrono::Utc>,
     bound: Duration,
+) -> crate::error::HarvestResult<bool> {
+    clear_ramp(conn, queue, base, target, step, bound, uuid::Uuid::new_v4()).await
+}
+
+/// [`abort_ramp`] with the report id for a ramp with no `ramp_id`. Every
+/// pool of one abort gets the same report id.
+#[cfg(feature = "db")]
+async fn clear_ramp(
+    conn: &mut diesel_async::AsyncPgConnection,
+    queue: &str,
+    base: &str,
+    target: &str,
+    step: chrono::DateTime<chrono::Utc>,
+    bound: Duration,
+    report_id: uuid::Uuid,
 ) -> crate::error::HarvestResult<bool> {
     use diesel::sql_types::{Text, Timestamptz};
     use diesel_async::{AsyncConnection, RunQueryDsl};
@@ -646,6 +662,7 @@ pub async fn abort_ramp(
             .bind::<Text, _>(base)
             .bind::<Text, _>(target)
             .bind::<Timestamptz, _>(step)
+            .bind::<diesel::sql_types::Uuid, _>(report_id)
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -1234,8 +1251,8 @@ pub async fn ramp_aborted_by_guard(
 async fn clear_on_pool(
     pool: &crate::worker::DbPool,
     index: usize,
-    key: &RampKey,
-    ramp_id: Option<uuid::Uuid>,
+    (key, ramp_id): (&RampKey, Option<uuid::Uuid>),
+    report_id: uuid::Uuid,
     step: chrono::DateTime<chrono::Utc>,
     bound: Duration,
 ) -> ClearOutcome {
@@ -1254,7 +1271,7 @@ async fn clear_on_pool(
         }
     };
     let clear = async {
-        if abort_ramp(&mut conn, queue, base, target, step, bound)
+        if clear_ramp(&mut conn, queue, base, target, step, bound, report_id)
             .await
             .map_err(|e| e.to_string())?
         {
@@ -1558,6 +1575,9 @@ const fn retry_outcome(outcome: ClearOutcome, was_ambiguous: bool) -> ClearOutco
 struct PendingAbort {
     /// The `ramp_id` of the aborted generation.
     ramp_id: Option<uuid::Uuid>,
+    /// The id of the markers and the report ledger row: the `ramp_id`, or a
+    /// fresh id for a ramp with no `ramp_id`.
+    report_id: uuid::Uuid,
     /// The pools that did not clear.
     steps: Vec<PendingStep>,
     /// The abort, while no clear of this guard has succeeded yet. The guard
@@ -1786,6 +1806,7 @@ impl RampGuard {
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<RampAbort> {
+        let report_id = ramp_id.unwrap_or_else(uuid::Uuid::new_v4);
         let mut outcomes = Vec::with_capacity(steps.len());
         let mut failed: Vec<PendingStep> = Vec::new();
         for &(index, step) in steps {
@@ -1794,7 +1815,15 @@ impl RampGuard {
             let outcome = if cancel.is_cancelled() {
                 ClearOutcome::Failed
             } else {
-                clear_on_pool(&pools[index], index, &key, ramp_id, step, bound).await
+                clear_on_pool(
+                    &pools[index],
+                    index,
+                    (&key, ramp_id),
+                    report_id,
+                    step,
+                    bound,
+                )
+                .await
             };
             if matches!(outcome, ClearOutcome::Failed | ClearOutcome::Ambiguous) {
                 failed.push((index, step, outcome == ClearOutcome::Ambiguous));
@@ -1809,6 +1838,7 @@ impl RampGuard {
                 key.clone(),
                 PendingAbort {
                     ramp_id,
+                    report_id,
                     steps: failed.clone(),
                     unreported,
                 },
@@ -1817,11 +1847,18 @@ impl RampGuard {
         match decision {
             Disposition::Report => {
                 let failed_pools: Vec<usize> = failed.iter().map(|&(index, _, _)| index).collect();
-                let outcome =
-                    report_abort(&abort, ramp_id, audit_pool, metrics, &failed_pools, bound).await;
+                let outcome = report_abort(
+                    &abort,
+                    Some(report_id),
+                    audit_pool,
+                    metrics,
+                    &failed_pools,
+                    bound,
+                )
+                .await;
                 if outcome != ReportOutcome::Failed {
                     let all: Vec<usize> = (0..pools.len()).collect();
-                    mark_reported(pools, &all, &key.0, ramp_id, bound, cancel).await;
+                    mark_reported(pools, &all, &key.0, Some(report_id), bound, cancel).await;
                 }
                 (outcome == ReportOutcome::Recorded).then_some(abort)
             }
@@ -1853,13 +1890,23 @@ impl RampGuard {
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) {
+        // A marked generation always has a `ramp_id`.
+        let report_id = ramp_id.unwrap_or_else(uuid::Uuid::new_v4);
         let mut failed: Vec<PendingStep> = Vec::new();
         for &(index, step) in steps {
             if cancel.is_cancelled() {
                 failed.push((index, step, false));
                 continue;
             }
-            let outcome = clear_on_pool(&pools[index], index, key, *ramp_id, step, bound).await;
+            let outcome = clear_on_pool(
+                &pools[index],
+                index,
+                (key, *ramp_id),
+                report_id,
+                step,
+                bound,
+            )
+            .await;
             match outcome {
                 ClearOutcome::Cleared => {
                     tracing::info!(queue = %key.0, pool = index, "ramp guard finished a marked abort");
@@ -1875,6 +1922,7 @@ impl RampGuard {
                 key.clone(),
                 PendingAbort {
                     ramp_id: *ramp_id,
+                    report_id,
                     steps: failed,
                     unreported: None,
                 },
@@ -1912,7 +1960,15 @@ impl RampGuard {
                     outcomes.push(ClearOutcome::Failed);
                     continue;
                 }
-                let raw = clear_on_pool(pool, index, &key, entry.ramp_id, step, bound).await;
+                let raw = clear_on_pool(
+                    pool,
+                    index,
+                    (&key, entry.ramp_id),
+                    entry.report_id,
+                    step,
+                    bound,
+                )
+                .await;
                 let outcome = retry_outcome(raw, was_ambiguous);
                 match outcome {
                     ClearOutcome::Cleared => {
@@ -1936,7 +1992,7 @@ impl RampGuard {
                             still_failed.iter().map(|&(index, _, _)| index).collect();
                         let outcome = report_abort(
                             &abort,
-                            entry.ramp_id,
+                            Some(entry.report_id),
                             audit_pool,
                             metrics,
                             &failed_pools,
@@ -1945,7 +2001,15 @@ impl RampGuard {
                         .await;
                         if outcome != ReportOutcome::Failed {
                             let all: Vec<usize> = (0..pools.len()).collect();
-                            mark_reported(pools, &all, &key.0, entry.ramp_id, bound, cancel).await;
+                            mark_reported(
+                                pools,
+                                &all,
+                                &key.0,
+                                Some(entry.report_id),
+                                bound,
+                                cancel,
+                            )
+                            .await;
                         }
                         if outcome == ReportOutcome::Recorded {
                             reported.push(abort);
@@ -1960,6 +2024,7 @@ impl RampGuard {
                     key,
                     PendingAbort {
                         ramp_id: entry.ramp_id,
+                        report_id: entry.report_id,
                         steps: still_failed,
                         unreported,
                     },

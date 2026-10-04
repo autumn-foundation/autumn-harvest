@@ -214,7 +214,10 @@ The guard fails safe: when it cannot read, it does not abort.
   match uses ids, not database clocks, so clock skew between pools does not
   matter. An operator ramp set after the abort has a new `ramp_id`, so the
   guard does not clear it. A ramp set before the migration has no id, and the
-  guard cannot finish its partial abort after a restart.
+  guard cannot finish its partial abort after a restart. Its clear still
+  writes a marker under a report id that the guard picks for the abort, so
+  a failed report of it stays recoverable. Two replicas that abort the same
+  ramp with no id pick two report ids, so that abort can be reported twice.
 - A pool can hold an abort marker and a newer operator ramp at the same time.
   The guard reads the marker anyway. It clears only the pools whose `ramp_id`
   matches a marker. The newer ramp stays, and the next pass judges it on its
