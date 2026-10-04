@@ -153,6 +153,7 @@ mod metrics_rs_adapter;
 mod migrate_tests;
 mod migrating_from_temporal_docs;
 mod migration_hygiene;
+mod migration_lock_safety;
 #[cfg(feature = "db")]
 mod mixed_suspension_tests;
 #[cfg(feature = "db")]

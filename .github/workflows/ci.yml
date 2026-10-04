@@ -554,6 +554,18 @@ jobs:
       - name: Run audit-export opt-in-cost guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration audit_export_docs::"
 
+      # Issue #1810: online-migration lock safety. A migration after the
+      # cutoff must have a non-zero `lock_timeout` in force when it locks a
+      # hot table. It must build or drop a hot-table index with CONCURRENTLY.
+      # The lint reads `up.sql` files only and needs no database. It reuses
+      # the test binary that the steps above build.
+      #
+      # Guarded by `migration_lock_safety::the_lint_runs_in_the_ci_lint_job`.
+      # That test fails if this step leaves the `lint` job or gains an `if:`.
+      # See docs/upgrading/online-migrations.md.
+      - name: "Online-migration lock-safety lint (issue #1810)"
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migration_lock_safety::"
+
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
       # guards above — a broken link is exactly the change class a docs-only
