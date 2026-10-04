@@ -2276,6 +2276,9 @@ struct Routine {
     at: usize,
     /// Whether the body is in a language other than PL/pgSQL or SQL.
     foreign: bool,
+    /// Whether the `CREATE` surely runs. A routine created in an uncalled body
+    /// or a branch may not exist. A call is always sure.
+    sure: bool,
 }
 
 impl Routine {
@@ -2387,10 +2390,14 @@ fn call_clears(
         // A `CALL` that no earlier `CREATE` here matches, or a call of a
         // locking routine from an earlier migration, may take any lock.
         let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c <= call.at);
+        // A call that runs now reaches only a routine that surely exists.
         let resolved = !unplaced
-            && routines
-                .iter()
-                .any(|r| r.at < call.at && r.name == call.name && r.accepts(call));
+            && routines.iter().any(|r| {
+                r.at < call.at
+                    && (r.sure || !s.toks[call.at].runs)
+                    && r.name == call.name
+                    && r.accepts(call)
+            });
         let unread = s.keyword(call.at, "call") || inherited_locking.contains(callee);
         let self_bounded = !unplaced && reaches_self_bounded(call, raws, history);
         if !foreign && !resolved && unread && !self_bounded {
@@ -2425,6 +2432,7 @@ fn call_clears(
 
 /// Each routine that the file creates.
 fn file_routines(s: &Stmts) -> Vec<Routine> {
+    let unconditional = unconditional(s);
     (0..s.toks.len())
         .filter_map(|k| {
             let keyword = routine_keyword(s, k)?;
@@ -2437,6 +2445,7 @@ fn file_routines(s: &Stmts) -> Vec<Routine> {
                 min_arity: range.map(|(fewest, _)| fewest),
                 at: k,
                 foreign,
+                sure: s.toks[k].runs && unconditional[k],
             })
         })
         .collect()
@@ -2499,7 +2508,8 @@ fn record_routines(
             break;
         }
     }
-    for r in routines.iter().filter(|r| !r.foreign) {
+    // A routine that may not exist proves nothing about the routine a call reaches.
+    for r in routines.iter().filter(|r| !r.foreign && r.sure) {
         let name = base(&r.name);
         // A call may pass any number of arguments from the required ones up
         // to all of them.
@@ -2588,7 +2598,7 @@ fn record_self_bounded(s: &Stmts, analysis: &Analysis, history: &mut History) {
         .self_bounded_routines
         .retain(|id| !unbounded.contains(base(id.split('/').next().unwrap_or(id))));
     for (r, _) in routines.iter().zip(&bounded).filter(|(_, b)| **b) {
-        if unbounded.contains(base(&r.name)) {
+        if !r.sure || unbounded.contains(base(&r.name)) {
             continue;
         }
         if let (Some(fewest), Some(most)) = (r.min_arity, r.arity) {
@@ -2627,6 +2637,7 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
             min_arity: arity,
             at: k,
             foreign: false,
+            sure: true,
         });
     }
     let callee = s.word(k)?;
@@ -2651,6 +2662,7 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
         min_arity: arity,
         at: k,
         foreign: false,
+        sure: true,
     })
 }
 
@@ -7267,6 +7279,43 @@ fn a_call_of_a_self_bounded_routine_needs_no_outside_bound() {
 }
 
 #[test]
+fn a_routine_created_in_an_uncalled_body_is_not_known() {
+    let nested = |clause: &str, body: &str| {
+        format!(
+            "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
+             CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql {clause}AS $i$\n    BEGIN\n        \
+             {body}\n    END $i$;\nEND $o$;"
+        )
+    };
+    let lock = "ALTER TABLE harvest_events ADD COLUMN y INT;";
+    // `p` exists only once `outer_f` runs. Until then, a call may reach
+    // another routine of that name, which may clear the bound and lock.
+    let bounded = nested("SET lock_timeout = '5s' ", lock);
+    let plain = nested("", lock);
+    for (history, sql) in [
+        (vec![bounded.as_str()], "CALL p();"),
+        (
+            vec![plain.as_str()],
+            "SET LOCAL lock_timeout = '5s';\nCALL p();",
+        ),
+    ] {
+        let findings = lint_with_history(&history, sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{history:?}\n{sql}\n{findings:?}"
+        );
+    }
+    // The same holds for a call in the same file.
+    let sql = format!(
+        "{}\nSET LOCAL lock_timeout = '5s';\nCALL p();",
+        nested("", "NULL;")
+    );
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}\n{findings:?}");
+}
+
+#[test]
 fn an_inner_routine_bound_does_not_cover_the_outer_body() {
     // Creating the inner routine changes nothing for the outer call.
     for (clause, setter) in [
@@ -7549,10 +7598,7 @@ fn a_call_may_omit_defaulted_parameters() {
 
 #[test]
 fn an_inner_routine_lock_is_not_the_outer_routine_lock() {
-    for (setter, expected) in [
-        ("", vec![Rule::LockTimeout]),
-        ("        SET LOCAL lock_timeout = '5s';\n", vec![]),
-    ] {
+    for setter in ["", "        SET LOCAL lock_timeout = '5s';\n"] {
         let history = [format!(
             "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
              CREATE OR REPLACE FUNCTION inner_f() RETURNS void LANGUAGE plpgsql AS $i$\n    \
@@ -7561,9 +7607,14 @@ fn an_inner_routine_lock_is_not_the_outer_routine_lock() {
         let history = [history[0].as_str()];
         // Calling `outer_f` only creates `inner_f`, so it takes no lock.
         assert_eq!(lint_with_history(&history, "SELECT outer_f();", true), []);
-        // A call of `inner_f` counts as a lock, unless `inner_f` bounds it.
+        // A call of `inner_f` counts as a lock. `inner_f` may not exist, so
+        // the call may reach another routine of that name.
         let findings = lint_with_history(&history, "SELECT inner_f();", true);
-        assert_eq!(rules(&findings), expected, "{setter}\n{findings:?}");
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{setter}\n{findings:?}"
+        );
     }
 }
 

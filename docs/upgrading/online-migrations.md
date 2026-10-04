@@ -148,6 +148,8 @@ routine must also call only routines of its file that bound their own locks.
 An annotation does not make a lock bounded. Any other definition of the same
 name, or any `ALTER` of it, removes the exemption for good. Code that the lint
 cannot read removes it too, because that code may replace the routine.
+A routine created in an uncalled body or in a branch may not exist. A call
+that runs now never reaches it, and later calls gain nothing from it.
 
 After a `search_path` change, only `pg_catalog.set_config` sets a bound,
 because another schema may hold a `set_config` that shadows the built-in. The
