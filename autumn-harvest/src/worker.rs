@@ -31839,6 +31839,16 @@ impl Worker {
                     peer_stale_secs: capability_miss_fleet_stale_secs(
                         self.config.worker_heartbeat_interval,
                     ),
+                    execution: crate::workers::ExecutionPolicy {
+                        sticky_timeout: self.config.sticky_timeout,
+                        workflow_cache_size: self.config.workflow_cache_size,
+                        resident_workflows: self.config.resident_workflows,
+                        workflow_task_timeout: self.config.workflow_task_timeout,
+                        max_local_activity_start_to_close: self
+                            .config
+                            .max_local_activity_start_to_close,
+                        workflow_panic_max_attempts: self.config.workflow_panic_max_attempts,
+                    },
                 }),
                 compare: true,
                 slot: shard_slot,

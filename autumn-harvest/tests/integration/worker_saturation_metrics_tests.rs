@@ -178,6 +178,7 @@ fn cohort(queue: &str) -> String {
         retry_budgets: &autumn_harvest::retry_budget::RetryBudgetConfig::default(),
         outcome_window: std::time::Duration::from_secs(300),
         peer_stale_secs: 120,
+        execution: workers::ExecutionPolicy::default(),
     })
 }
 
@@ -640,6 +641,7 @@ async fn a_long_cohort_key_still_stores() {
         retry_budgets: &autumn_harvest::retry_budget::RetryBudgetConfig::default(),
         outcome_window: std::time::Duration::from_secs(300),
         peer_stale_secs: 120,
+        execution: workers::ExecutionPolicy::default(),
     });
     assert!(key.len() > 10_000, "the key is long: {}", key.len());
     workers::upsert_worker_task_stats(&mut conn, &id, &key, &WorkerTaskStats::default())

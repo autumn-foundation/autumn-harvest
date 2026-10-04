@@ -3409,7 +3409,12 @@ dispatch route, because a dispatch channel ignores `queue_weights` and the
 Postgres claim applies them. So do the retry-budget policies, because a
 tighter budget defers more retries. So do the outcome window and the peer
 freshness limit, which both follow `worker_heartbeat_interval`. Workers with
-two intervals would compare two time ranges. Those decide which tasks a worker can claim, and in
+two intervals would compare two time ranges. So do the workflow cache
+settings (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`), the
+task budgets (`workflow_task_timeout`, `max_local_activity_start_to_close`)
+and `workflow_panic_max_attempts`. A worker with the cache off replays full
+histories, and a shorter budget times out tasks that its peers finish. Those
+decide which tasks a worker can claim, and in
 which mix under load. So workers of two sizes are two cohorts. A worker on a
 slow queue is not compared with workers on a fast queue. A worker that favours
 a bulk queue is not compared with one that favours an interactive queue.

@@ -899,6 +899,8 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 /// - `outcome_window_ms` and `peer_stale_secs`: both follow the heartbeat
 ///   interval. Workers with two windows compare two time ranges, and workers
 ///   with two freshness limits can disagree on the live peer set.
+/// - `execution`: the workflow cache, the task budgets and the panic limit.
+///   See [`ExecutionPolicy`].
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -920,6 +922,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         retry_budgets,
         outcome_window,
         peer_stale_secs,
+        execution,
     } = policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -959,6 +962,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "retry_budgets": budgets,
         "outcome_window_ms": outcome_window.as_millis(),
         "peer_stale_secs": peer_stale_secs,
+        "execution": execution.key(),
     })
     .to_string()
 }
@@ -1056,6 +1060,58 @@ pub struct CohortPolicy<'a> {
     pub outcome_window: std::time::Duration,
     /// How old a peer row may be and still count, in seconds.
     pub peer_stale_secs: i64,
+    /// The worker settings that decide how a claimed task runs.
+    pub execution: ExecutionPolicy,
+}
+
+/// The worker settings that decide how a claimed task runs, and so its
+/// outcome and its latency (issue #1815).
+///
+/// Each one changes what the outcome window records for the same task. The
+/// workflow cache decides whether a task replays its full history. The two
+/// budgets decide whether a task times out, and a timeout is a failure. The
+/// panic limit decides how many failing attempts run before quarantine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionPolicy {
+    /// `sticky_timeout`. Zero turns the workflow cache off.
+    pub sticky_timeout: std::time::Duration,
+    /// `workflow_cache_size`.
+    pub workflow_cache_size: usize,
+    /// `resident_workflows`.
+    pub resident_workflows: bool,
+    /// `workflow_task_timeout`.
+    pub workflow_task_timeout: std::time::Duration,
+    /// `max_local_activity_start_to_close`.
+    pub max_local_activity_start_to_close: std::time::Duration,
+    /// `workflow_panic_max_attempts`.
+    pub workflow_panic_max_attempts: u32,
+}
+
+impl Default for ExecutionPolicy {
+    /// Test defaults. A worker passes its own settings.
+    fn default() -> Self {
+        Self {
+            sticky_timeout: std::time::Duration::from_secs(10),
+            workflow_cache_size: 1000,
+            resident_workflows: false,
+            workflow_task_timeout: std::time::Duration::from_secs(10),
+            max_local_activity_start_to_close: std::time::Duration::from_secs(10),
+            workflow_panic_max_attempts: 3,
+        }
+    }
+}
+
+impl ExecutionPolicy {
+    fn key(self) -> serde_json::Value {
+        serde_json::json!({
+            "sticky_timeout_ms": self.sticky_timeout.as_millis(),
+            "workflow_cache_size": self.workflow_cache_size,
+            "resident_workflows": self.resident_workflows,
+            "workflow_task_timeout_ms": self.workflow_task_timeout.as_millis(),
+            "max_local_activity_ms": self.max_local_activity_start_to_close.as_millis(),
+            "workflow_panic_max_attempts": self.workflow_panic_max_attempts,
+        })
+    }
 }
 
 /// How a worker sizes its slots per task kind, as its cohort key records it
@@ -2998,6 +3054,7 @@ mod tests {
             retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             outcome_window: std::time::Duration::from_secs(300),
             peer_stale_secs: 120,
+            execution: super::ExecutionPolicy::default(),
         })
     }
 
@@ -3027,6 +3084,7 @@ mod tests {
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         assert_ne!(slots(10, 0), slots(0, 10));
@@ -3061,6 +3119,7 @@ mod tests {
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         assert_ne!(sessions(0), sessions(4));
@@ -3101,6 +3160,7 @@ mod tests {
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
@@ -3135,6 +3195,7 @@ mod tests {
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
@@ -3262,6 +3323,7 @@ mod tests {
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         let tracking = |threshold| {
@@ -3314,6 +3376,7 @@ mod tests {
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         assert_ne!(cohort(true), cohort(false));
@@ -3349,6 +3412,7 @@ mod tests {
                 retry_budgets: budgets,
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         let default = RetryBudgetConfig::default();
@@ -3397,6 +3461,7 @@ mod tests {
                 retry_budgets: &budgets,
                 outcome_window,
                 peer_stale_secs,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         let five_minutes = std::time::Duration::from_secs(300);
@@ -3410,6 +3475,72 @@ mod tests {
             cohort(five_minutes, 1200),
             "another freshness limit"
         );
+    }
+
+    /// Issue #1815: the workflow cache, the task budgets and the panic limit
+    /// change what the window records for the same task. Workers that differ
+    /// in any of them are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_execution_policy() {
+        use super::ExecutionPolicy;
+        use std::time::Duration;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |execution| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: false,
+                retry_budgets: &budgets,
+                outcome_window: Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution,
+            })
+        };
+        let base = ExecutionPolicy::default();
+        let variants = [
+            ExecutionPolicy {
+                sticky_timeout: Duration::ZERO,
+                ..base
+            },
+            ExecutionPolicy {
+                workflow_cache_size: 1,
+                ..base
+            },
+            ExecutionPolicy {
+                resident_workflows: true,
+                ..base
+            },
+            ExecutionPolicy {
+                workflow_task_timeout: Duration::from_secs(1),
+                ..base
+            },
+            ExecutionPolicy {
+                max_local_activity_start_to_close: Duration::from_secs(1),
+                ..base
+            },
+            ExecutionPolicy {
+                workflow_panic_max_attempts: 1,
+                ..base
+            },
+        ];
+        for variant in variants {
+            assert_ne!(cohort(base), cohort(variant), "{variant:?}");
+        }
+        assert_eq!(cohort(base), cohort(ExecutionPolicy::default()));
     }
 
     /// Issue #1815: under load, the claim gate gives each worker a task mix
@@ -3438,6 +3569,7 @@ mod tests {
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
             })
         };
         assert_ne!(slots(100, 1), slots(1, 100));

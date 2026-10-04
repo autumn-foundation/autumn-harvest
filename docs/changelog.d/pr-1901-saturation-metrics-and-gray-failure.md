@@ -57,7 +57,10 @@ heartbeat check only. A worker that was alive but sick passed that check.
   session capacity, priority aging, activity eligibility, shards, registered
   handlers, circuit-breaker policies, retry-budget policies, dispatch route
   (a dispatch channel or the Postgres claim), outcome window and peer
-  freshness limit (both follow the heartbeat interval), with
+  freshness limit (both follow the heartbeat interval), and execution policy
+  (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`,
+  `workflow_task_timeout`, `max_local_activity_start_to_close`,
+  `workflow_panic_max_attempts`), with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A
   worker on a slow queue is not compared with a fast queue. Each heartbeat
