@@ -393,6 +393,31 @@ fn index_cost(verb: &str) -> &'static str {
     }
 }
 
+/// Read the gap after a string literal at `i`. Return its newline count and
+/// the next index.
+///
+/// A literal continues only across a gap with a newline. Postgres counts a
+/// `--` comment in the gap as whitespace, but not a `/* */` comment.
+fn continuation_gap(chars: &[char], mut i: usize) -> Option<(usize, usize)> {
+    let mut newlines = 0;
+    loop {
+        match chars.get(i) {
+            Some('\n') => {
+                newlines += 1;
+                i += 1;
+            }
+            Some(c) if c.is_whitespace() => i += 1,
+            Some('-') if chars.get(i + 1) == Some(&'-') => {
+                while chars.get(i).is_some_and(|c| *c != '\n') {
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    (newlines > 0).then_some((newlines, i))
+}
+
 /// Whether a bound is in force at token `at`.
 ///
 /// A local value holds until the transaction ends. A session value outlives
@@ -743,17 +768,14 @@ fn lex(
                         i += 1;
                     }
                 }
-                let gap = chars[i..].iter().take_while(|c| c.is_whitespace()).count();
-                let newlines = chars[i..i + gap].iter().filter(|c| **c == '\n').count();
-                let next = i + gap;
-                if newlines > 0 && at(next) == Some('\'') {
+                let Some((newlines, next)) = continuation_gap(chars, i) else {
+                    break 'literal;
+                };
+                if at(next) == Some('\'') {
                     escapes = false;
                     line += newlines;
                     i = next + 1;
-                } else if newlines > 0
-                    && matches!(at(next), Some('e' | 'E'))
-                    && at(next + 1) == Some('\'')
-                {
+                } else if matches!(at(next), Some('e' | 'E')) && at(next + 1) == Some('\'') {
                     escapes = true;
                     line += newlines;
                     i = next + 2;
@@ -854,18 +876,14 @@ fn lex(
             i = end;
             // A string continues across whitespace with a newline, before
             // its escapes are decoded.
-            if quote == '\'' {
-                loop {
-                    let gap = chars[i..].iter().take_while(|c| c.is_whitespace()).count();
-                    let newlines = chars[i..i + gap].iter().filter(|c| **c == '\n').count();
-                    if newlines == 0 || at(i + gap) != Some('\'') {
-                        break;
-                    }
-                    let (more, end) = quoted(chars, i + gap + 1, quote);
-                    line += newlines + more.matches('\n').count();
-                    raw.push_str(&more);
-                    i = end;
-                }
+            while quote == '\''
+                && let Some((newlines, next)) = continuation_gap(chars, i)
+                && at(next) == Some('\'')
+            {
+                let (more, end) = quoted(chars, next + 1, quote);
+                line += newlines + more.matches('\n').count();
+                raw.push_str(&more);
+                i = end;
             }
             let escape = uescape(chars, &mut i, &mut line).unwrap_or('\\');
             let value = decode_unicode(&raw, escape);
@@ -1575,6 +1593,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         }
     }
 
+    function_settings(&s, &mut body_timeouts);
     let new_tables = new_table_spans(&s, &created);
     let hits = resolve(raws, &s, &unconditional, &new_tables, history);
 
@@ -1588,6 +1607,47 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         body_timeouts,
         statement_count,
     }
+}
+
+/// Add each `CREATE FUNCTION ... SET lock_timeout` clause to `body_timeouts`.
+///
+/// Postgres applies the clause on each call, before the body runs. So the
+/// clause counts as a session value at the first token of the body.
+fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
+    for k in (0..s.toks.len()).filter(|&k| s.starts[k] == k && s.is(k, "create")) {
+        let j = if s.is(k + 1, "or") && s.is(k + 2, "replace") {
+            k + 3
+        } else {
+            k + 1
+        };
+        if !(s.is(j, "function") || s.is(j, "procedure")) {
+            continue;
+        }
+        let depth = s.toks[k].depth;
+        let end = s.end(k);
+        let Some(body) = (k..end).find(|&b| !s.toks[b].runs && s.toks[b].depth > depth) else {
+            continue;
+        };
+        for set in (k..end)
+            .filter(|&t| s.toks[t].depth == depth && s.is(t, "set") && s.is(t + 1, "lock_timeout"))
+        {
+            let value = if s.is_punct(set + 2, '=') || s.is(set + 2, "to") {
+                set + 3
+            } else {
+                set + 2
+            };
+            let bounds = bounds_wait(s, value);
+            body_timeouts.push((
+                body,
+                Timeout::Set {
+                    bounds,
+                    local: false,
+                },
+            ));
+        }
+    }
+    // `timeout_in_force` reads the changes in token order.
+    body_timeouts.sort_by_key(|(k, _)| *k);
 }
 
 /// The token range in which each new table is exempt.
@@ -4569,6 +4629,43 @@ fn a_pg_catalog_setter_is_a_bare_call() {
     let sql = "SELECT app.set_config('lock_timeout', '5s', true);\n\
                ALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_literal_continues_across_a_line_comment() {
+    for literal in ["'ALTER TABLE harvest_'", "U&'ALTER TABLE harvest_'"] {
+        let sql = format!(
+            "DO $$\nBEGIN\n    EXECUTE {literal} -- continued\n        \
+             'events ADD COLUMN x INT';\nEND $$;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+        assert!(
+            findings[0].detail.contains("harvest_events"),
+            "{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_function_set_clause_bounds_its_body() {
+    // Postgres applies the clause each time the function runs.
+    let body = "$$\nBEGIN\n    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$";
+    for sql in [
+        format!(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql SET lock_timeout TO '5s' AS {body};"
+        ),
+        format!(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS {body} SET lock_timeout = '5s';"
+        ),
+    ] {
+        assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    }
+    let sql = format!(
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql SET lock_timeout = '0' AS {body};"
+    );
+    let findings = lint_with_history(&[], &sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 

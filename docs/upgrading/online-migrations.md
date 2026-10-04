@@ -107,7 +107,8 @@ the function, so it does not count. The same call in a
 function body does not count for the migration, because the body runs only
 when something calls the function. A lock in a function body needs its own
 bound earlier in the body, because the migration's bound may not hold when
-the function runs. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
+the function runs. A `SET lock_timeout` clause in `CREATE FUNCTION` or
+`CREATE PROCEDURE` also counts, because Postgres applies it on each call. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
 `EXIT` or `CONTINUE`, does not count either, because it may not run. Nothing in a block with an
 `EXCEPTION` handler counts, because the handler rolls the block back. A clear inside a
 branch does count, because the branch may run.
