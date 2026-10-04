@@ -72,6 +72,10 @@ mod claim_batched_tests;
 mod claim_bench_support;
 #[cfg(feature = "db")]
 mod claim_budget_tests;
+#[cfg(feature = "db")]
+mod claim_continuation_priority_tests;
+#[cfg(feature = "db")]
+mod claim_run_deadline_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod codec_rotation_db_tests;
 #[cfg(feature = "db")]

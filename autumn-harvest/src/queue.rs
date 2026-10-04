@@ -1685,6 +1685,12 @@ pub fn claim_task_query_for_kind(kind: TaskType, fenced: bool) -> &'static str {
     }
 }
 
+/// How long a new start yields to continuations at equal priority (issue #1824).
+pub const NEW_START_HANDICAP_SECS: u32 = 30;
+
+/// Error prefix of a task that the claim failed after its run deadline (issue #1824).
+pub const DEADLINE_EXCEEDED_ERROR: &str = "deadline_exceeded";
+
 /// What one claim transaction concluded.
 ///
 /// `Claimed` boxes its row on purpose. `TaskQueueItem` carries about forty
