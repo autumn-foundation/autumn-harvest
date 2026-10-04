@@ -13,6 +13,12 @@ __pycache__/
 node_modules/
 examples/typescript-client/src/harvest-api.ts
 
+# Published TypeScript client (issue #1616). The build generates the types
+# from docs/openapi.json, so they are build output, not source.
+clients/typescript/src/harvest-api.ts
+clients/typescript/dist/
+clients/typescript/*.tgz
+
 # claude-agent-daemon example runtime state (issue #1493's README). The
 # documented "Try it in one minute" walkthrough runs `agentd` from the
 # repository root, and its defaults (`agentd.db`, `agentd.sock`, both

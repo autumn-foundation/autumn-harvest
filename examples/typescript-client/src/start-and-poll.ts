@@ -20,13 +20,6 @@ const timeoutMs = Number(process.env.HARVEST_TIMEOUT_MS ?? 90_000);
 
 const client = createClient<paths>({ baseUrl });
 
-// The contract records response FIELD NAMES, not full JSON Schemas, so the
-// generated property types are `unknown`. Narrow them here rather than
-// asserting a shape the document does not promise.
-function record(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-}
-
 async function main(): Promise<void> {
   const started = await client.POST("/workflows/{workflow_name}/start", {
     params: { path: { workflow_name: workflowName } },
@@ -36,10 +29,13 @@ async function main(): Promise<void> {
     throw new Error(`start failed: ${JSON.stringify(started.error ?? started.response.status)}`);
   }
 
-  const executionId = record(started.data).execution_id;
-  if (typeof executionId !== "string") {
-    throw new Error(`start returned no execution_id: ${JSON.stringify(started.data)}`);
+  // A debounce, batch or throttle policy can defer a start. The 202 body then
+  // has no execution id, so narrow on the key (issue #1616).
+  const run = started.data;
+  if (!("execution_id" in run)) {
+    throw new Error(`the start was deferred: ${JSON.stringify(run)}`);
   }
+  const executionId = run.execution_id;
   console.log(`started ${workflowName} -> ${executionId}`);
 
   const deadline = Date.now() + timeoutMs;
@@ -51,14 +47,14 @@ async function main(): Promise<void> {
       throw new Error(`status failed: ${JSON.stringify(status.error ?? status.response.status)}`);
     }
 
-    const state = record(record(status.data).execution).state;
-    console.log(`state=${String(state)}`);
+    const state = status.data.execution.state;
+    console.log(`state=${state}`);
     if (state === "COMPLETED") {
       console.log("generated client started a workflow and read its status");
       return;
     }
     if (state === "FAILED" || state === "TERMINATED" || state === "CANCELLED" || state === "TIMED_OUT") {
-      throw new Error(`workflow reached ${String(state)}`);
+      throw new Error(`workflow reached ${state}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }

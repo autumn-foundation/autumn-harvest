@@ -5063,6 +5063,10 @@ pub async fn claim_still_held_for_update(
 /// in place would let an unrelated, already-resolved crash history count
 /// against a task that just proved itself dispatchable.
 ///
+/// Also guards on `attempt = $4` (issue #1806). A stuck-task requeue keeps
+/// `crash_strikes`, so the same worker can claim the row again with an equal
+/// strike count. Only `attempt` tells the new claim from the old one.
+///
 /// Also clears `timer_fires_at` (issue #1402). This release hands the
 /// row to a fresh dispatch attempt at the current instant, not to
 /// whatever timer last armed it. A stale marker must not outlive it.
@@ -5089,6 +5093,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
        AND state = 'RUNNING' \
        AND worker_id = $2 \
        AND crash_strikes = $3 \
+       AND attempt = $4 \
      RETURNING id, queue_name, scheduled_at, priority, task_type"
 }
 
@@ -5127,13 +5132,13 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
 /// Deliberately **not** `FOR UPDATE SKIP LOCKED`: a plain `UPDATE` blocks
 /// behind whatever transiently holds the row instead of skipping it, then
 /// re-evaluates its `WHERE` clause against the row's *post-commit* state. If
-/// ownership genuinely moved in the interim, the guard (`worker_id` +
-/// `crash_strikes`, the same claim token [`claim_still_held_for_update`]
-/// checks) no longer matches and this updates nothing -- the new owner keeps
-/// the row, exactly as if this call were never made. If it did not move, the
-/// row is released, and `wake_requested` is cleared in the very same write so
-/// a wake that landed in the contention window is reconciled rather than
-/// silently lost. This mirrors the established, doubly-reviewed
+/// ownership genuinely moved in the interim, the guard no longer matches. The
+/// guard checks `worker_id`, `crash_strikes` and `attempt`, as
+/// [`claim_still_held_for_update`] does. This call then updates nothing, and
+/// the new owner keeps the row, exactly as if this call never ran. If
+/// ownership did not move, the row is released. The same write clears
+/// `wake_requested`, so a wake that landed in the contention window is
+/// reconciled rather than silently lost. This mirrors the established, doubly-reviewed
 /// [`release_task_for_capability_miss`] fallback -- the pattern this crate
 /// already relies on whenever a `SKIP LOCKED` guard's ambiguous "not ours"
 /// answer needs an authoritative, blocking follow-up -- but touches none of
@@ -5152,8 +5157,9 @@ pub async fn release_suspended_workflow_claim(
     task_id: Uuid,
     worker_id: &str,
     crash_strikes: i32,
+    attempt: i32,
 ) -> HarvestResult<bool> {
-    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes).await
+    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes, attempt).await
 }
 
 /// [`release_suspended_workflow_claim`] under a name that does not imply
@@ -5179,8 +5185,9 @@ pub async fn release_terminal_workflow_claim(
     task_id: Uuid,
     worker_id: &str,
     crash_strikes: i32,
+    attempt: i32,
 ) -> HarvestResult<bool> {
-    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes).await
+    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes, attempt).await
 }
 
 async fn release_workflow_claim_inner(
@@ -5188,11 +5195,13 @@ async fn release_workflow_claim_inner(
     task_id: Uuid,
     worker_id: &str,
     crash_strikes: i32,
+    attempt: i32,
 ) -> HarvestResult<bool> {
     let rows: Vec<PendingHintRow> = diesel::sql_query(release_suspended_workflow_claim_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Integer, _>(crash_strikes)
+        .bind::<diesel::sql_types::Integer, _>(attempt)
         .get_results(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -6833,6 +6842,237 @@ pub async fn sweep_idle_rate_limit_buckets(
         }
     }
     Ok(counts)
+}
+
+/// Task states that end a task row (issue #1811).
+///
+/// The state check constraint also allows `PENDING` and `RUNNING`. No code
+/// path moves a row out of `COMPLETED`, `FAILED` or `CANCELLED`.
+pub const TERMINAL_TASK_STATES: &[&str] = &["COMPLETED", "FAILED", "CANCELLED"];
+
+/// Largest `LIMIT` one terminal-task sweep statement uses (issue #1811).
+///
+/// `batch_size` also sizes history retention, and it has no upper bound. The
+/// cap keeps one statement, and the row locks it holds, small.
+pub const MAX_TERMINAL_TASK_SWEEP_BATCH: usize = 10_000;
+
+/// Maximum `DELETE` batches the terminal-task sweep issues per shard per tick
+/// (issue #1811).
+///
+/// It equals [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`]. A bounded budget stops
+/// one tick from holding a pooled connection for an open-ended delete loop.
+/// At the default `batch_size` of 1000, one tick deletes at most 50k rows per
+/// shard. The next tick continues.
+pub const MAX_TERMINAL_TASK_SWEEP_BATCHES_PER_TICK: usize = 50;
+
+/// The keyset bound for every page after the first, on `(completed_at, id)`.
+const TERMINAL_TASK_CURSOR: &str = "AND (t.completed_at, t.id) > ($3, $4) ";
+
+/// Candidate predicates for the terminal-task sweep and its preview (issue
+/// #1811), on the task table aliased `t`.
+///
+/// - **State.** A positive list of terminal states. The sweep never deletes
+///   a new state until someone adds it to [`TERMINAL_TASK_STATES`].
+/// - **Age.** `completed_at` is before the cutoff `$1`. Every terminal write
+///   sets `completed_at`. A row with a NULL `completed_at` never matches, so
+///   it stays.
+/// - **Live execution.** A terminal `workflow` row stays while its execution
+///   is not terminal. The concurrency supersede scan finds a live execution
+///   through that row, in any row state. No engine path reads an old
+///   activity row.
+/// - **Dead letter.** A terminal `workflow` row also stays while a dead
+///   letter exists for its execution. A DLQ redrive can move a `FAILED`
+///   execution back to `RUNNING`, and the supersede scan then needs the row.
+#[must_use]
+fn terminal_task_predicates() -> String {
+    let terminal = crate::erase::sql_literal_list(TERMINAL_TASK_STATES);
+    let execution_terminal = crate::erase::sql_literal_list(crate::erase::TERMINAL_STATES);
+    format!(
+        "t.state IN ({terminal}) \
+         AND t.completed_at < $1 \
+         AND (t.task_type = 'activity' OR ( \
+             NOT EXISTS ( \
+                 SELECT 1 FROM harvest_workflow_executions e \
+                  WHERE e.id = t.workflow_exec_id \
+                    AND e.state NOT IN ({execution_terminal}) \
+             ) \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM harvest_dead_letters dl \
+                  WHERE dl.workflow_exec_id = t.workflow_exec_id \
+             ) \
+         ))"
+    )
+}
+
+/// The batched `DELETE` behind [`sweep_terminal_tasks`] (issue #1811).
+///
+/// - `ORDER BY t.completed_at, t.id` reads the partial index
+///   `idx_harvest_tq_terminal_completed_at` in order.
+/// - `FOR UPDATE OF t SKIP LOCKED` never waits on a row that another
+///   transaction holds. The next tick takes that row.
+/// - `DELETE ... USING victims` deletes each victim by primary key. The
+///   `IN (SELECT ... LIMIT)` form can make the planner scan the whole table.
+/// - The outer `ORDER BY` returns the page in key order. The caller takes the
+///   next cursor from the last row.
+///
+/// `after_cursor` adds the keyset bound for every page after the first. The
+/// cursor skips rows that `SKIP LOCKED` left behind in this tick.
+///
+/// Public only so `task_queue_hygiene_bench` can EXPLAIN it.
+#[doc(hidden)]
+#[must_use]
+pub fn terminal_task_sweep_sql(after_cursor: bool) -> String {
+    let predicates = terminal_task_predicates();
+    let cursor = if after_cursor {
+        TERMINAL_TASK_CURSOR
+    } else {
+        ""
+    };
+    format!(
+        "WITH victims AS ( \
+             SELECT t.id FROM harvest_task_queue t \
+              WHERE {predicates} \
+                {cursor}\
+              ORDER BY t.completed_at, t.id \
+              LIMIT $2 \
+              FOR UPDATE OF t SKIP LOCKED \
+         ), deleted AS ( \
+             DELETE FROM harvest_task_queue d \
+              USING victims v \
+              WHERE d.id = v.id \
+             RETURNING d.id, d.state, d.completed_at \
+         ) \
+         SELECT id, state, completed_at FROM deleted ORDER BY completed_at, id"
+    )
+}
+
+/// The read-only twin of [`terminal_task_sweep_sql`], for `dry_run` (issue
+/// #1811).
+///
+/// It uses the same predicates and the same order. It has no lock and no
+/// `DELETE`. It needs the cursor for every page, because it removes nothing.
+#[must_use]
+fn terminal_task_preview_sql(after_cursor: bool) -> String {
+    let predicates = terminal_task_predicates();
+    let cursor = if after_cursor {
+        TERMINAL_TASK_CURSOR
+    } else {
+        ""
+    };
+    format!(
+        "SELECT t.id, t.state, t.completed_at FROM harvest_task_queue t \
+          WHERE {predicates} \
+            {cursor}\
+          ORDER BY t.completed_at, t.id \
+          LIMIT $2"
+    )
+}
+
+/// Delete terminal task rows that finished before `cutoff`, on one shard
+/// (issue #1811).
+///
+/// See [`terminal_task_predicates`] for which rows qualify. The sweep runs in
+/// `batch_size` batches, up to [`MAX_TERMINAL_TASK_SWEEP_BATCHES_PER_TICK`].
+/// The next call continues from the oldest remaining row. Each batch is its
+/// own statement, so no transaction spans the pass.
+///
+/// With `preview` set, nothing is deleted. The counts then show what a real
+/// pass with the same budget would delete. `dry_run` uses this.
+///
+/// Returns the count per state. State names are a bounded metric label.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure. Use
+/// [`sweep_terminal_tasks_into`] to keep the counts of batches that
+/// committed before the failure.
+pub async fn sweep_terminal_tasks(
+    conn: &mut AsyncPgConnection,
+    cutoff: DateTime<Utc>,
+    batch_size: usize,
+    preview: bool,
+) -> HarvestResult<std::collections::BTreeMap<String, u64>> {
+    let mut counts = std::collections::BTreeMap::new();
+    sweep_terminal_tasks_into(conn, cutoff, batch_size, preview, &mut counts).await?;
+    Ok(counts)
+}
+
+/// [`sweep_terminal_tasks`], adding each batch's counts to `counts` as it
+/// commits (issue #1811).
+///
+/// Each batch commits on its own. When a later batch fails, `counts` still
+/// holds the rows that earlier batches deleted, so the caller can report
+/// them.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn sweep_terminal_tasks_into(
+    conn: &mut AsyncPgConnection,
+    cutoff: DateTime<Utc>,
+    batch_size: usize,
+    preview: bool,
+    counts: &mut std::collections::BTreeMap<String, u64>,
+) -> HarvestResult<()> {
+    #[derive(diesel::QueryableByName)]
+    struct SweptRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        completed_at: DateTime<Utc>,
+    }
+
+    // A `batch_size` of 0 would make `LIMIT 0` delete nothing forever.
+    let batch = i64::try_from(batch_size.clamp(1, MAX_TERMINAL_TASK_SWEEP_BATCH))
+        .expect("the cap fits in i64");
+    let (first_sql, next_sql) = if preview {
+        (
+            terminal_task_preview_sql(false),
+            terminal_task_preview_sql(true),
+        )
+    } else {
+        (
+            terminal_task_sweep_sql(false),
+            terminal_task_sweep_sql(true),
+        )
+    };
+    let mut cursor: Option<(DateTime<Utc>, Uuid)> = None;
+
+    for _ in 0..MAX_TERMINAL_TASK_SWEEP_BATCHES_PER_TICK {
+        let query = diesel::sql_query(if cursor.is_some() {
+            &next_sql
+        } else {
+            &first_sql
+        })
+        .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+        .bind::<diesel::sql_types::BigInt, _>(batch);
+        let rows: Vec<SweptRow> = match cursor {
+            Some((at, id)) => {
+                query
+                    .bind::<diesel::sql_types::Timestamptz, _>(at)
+                    .bind::<diesel::sql_types::Uuid, _>(id)
+                    .load(conn)
+                    .await
+            }
+            None => query.load(conn).await,
+        }
+        .map_err(crate::error::database_error)?;
+
+        if let Some(last) = rows.last() {
+            cursor = Some((last.completed_at, last.id));
+        }
+        let page = rows.len();
+        for row in rows {
+            *counts.entry(row.state).or_insert(0) += 1;
+        }
+        // A short page means no candidate is left.
+        if i64::try_from(page).unwrap_or(i64::MAX) < batch {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// `WHERE` clause that excludes *unbounded* rate-limit key families from the
@@ -9645,6 +9885,95 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Terminal-task janitor (issue #1811)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn terminal_task_states_are_the_three_terminal_states() {
+        assert_eq!(TERMINAL_TASK_STATES, ["COMPLETED", "FAILED", "CANCELLED"]);
+    }
+
+    #[test]
+    fn terminal_task_predicates_never_select_a_live_row() {
+        let sql = terminal_task_predicates();
+        // A positive list: a future state is never deleted by default.
+        assert!(sql.contains("t.state IN ('COMPLETED', 'FAILED', 'CANCELLED')"));
+        assert!(!sql.contains("t.state NOT IN"));
+        for live in ["'PENDING'", "'RUNNING'"] {
+            assert!(!sql.contains(live), "{live} must not appear: {sql}");
+        }
+        assert!(sql.contains("t.completed_at < $1"));
+    }
+
+    #[test]
+    fn terminal_task_predicates_keep_a_live_executions_workflow_row() {
+        // `concurrency.rs` finds a live execution through its workflow row.
+        let sql = terminal_task_predicates();
+        assert!(sql.contains("t.task_type = 'activity'"));
+        assert!(sql.contains("NOT EXISTS"));
+        assert!(sql.contains("e.id = t.workflow_exec_id"));
+        for state in crate::erase::TERMINAL_STATES {
+            assert!(sql.contains(&format!("'{state}'")), "{state}");
+        }
+    }
+
+    #[test]
+    fn terminal_task_sweep_sql_is_batched_keyset_and_lock_safe() {
+        let predicates = terminal_task_predicates();
+        for after_cursor in [false, true] {
+            let sql = terminal_task_sweep_sql(after_cursor);
+            assert!(sql.contains(&predicates));
+            assert!(sql.contains("ORDER BY t.completed_at, t.id"));
+            assert!(sql.contains("LIMIT $2"));
+            assert!(sql.contains("FOR UPDATE OF t SKIP LOCKED"));
+            assert!(sql.contains("DELETE FROM harvest_task_queue d USING victims v"));
+            assert!(sql.trim_end().ends_with("ORDER BY completed_at, id"));
+            assert_eq!(
+                sql.contains("(t.completed_at, t.id) > ($3, $4)"),
+                after_cursor,
+                "only a later page carries the cursor"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_task_preview_shares_the_predicates_and_cannot_mutate() {
+        let predicates = terminal_task_predicates();
+        for after_cursor in [false, true] {
+            let sql = terminal_task_preview_sql(after_cursor);
+            assert!(sql.contains(&predicates));
+            assert!(sql.contains("ORDER BY t.completed_at, t.id"));
+            assert!(sql.trim_end().ends_with("LIMIT $2"));
+            for mutating in ["DELETE", "UPDATE"] {
+                assert!(!sql.contains(mutating), "preview has `{mutating}`");
+            }
+            assert_eq!(sql.contains("($3, $4)"), after_cursor);
+        }
+    }
+
+    #[test]
+    fn terminal_task_predicates_keep_a_dead_lettered_executions_workflow_row() {
+        // A DLQ redrive can revive a `FAILED` execution.
+        let sql = terminal_task_predicates();
+        assert!(sql.contains("FROM harvest_dead_letters dl"));
+        assert!(sql.contains("dl.workflow_exec_id = t.workflow_exec_id"));
+    }
+
+    #[test]
+    fn terminal_task_sweep_batch_is_capped() {
+        assert_eq!(MAX_TERMINAL_TASK_SWEEP_BATCH, 10_000);
+        assert!(i64::try_from(MAX_TERMINAL_TASK_SWEEP_BATCH).is_ok());
+    }
+
+    #[test]
+    fn terminal_task_sweep_budget_matches_the_bucket_gc() {
+        assert_eq!(
+            MAX_TERMINAL_TASK_SWEEP_BATCHES_PER_TICK,
+            MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // TTL'd rate-limit / start-throttle overrides (issue #945)
     // -----------------------------------------------------------------------
 
@@ -10148,9 +10477,10 @@ mod tests {
             sql.contains("id = $1")
                 && sql.contains("state = 'RUNNING'")
                 && sql.contains("worker_id = $2")
-                && sql.contains("crash_strikes = $3"),
-            "must be guarded on the exact claim token (worker_id AND crash_strikes), \
-             the same pair claim_still_held_for_update checks",
+                && sql.contains("crash_strikes = $3")
+                && sql.contains("attempt = $4"),
+            "must be guarded on the exact claim (worker_id, crash_strikes AND \
+             attempt), as claim_still_held_for_update is (issue #1806)",
         );
         assert!(
             !sql.contains("SKIP LOCKED"),
