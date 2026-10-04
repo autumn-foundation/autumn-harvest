@@ -28887,6 +28887,21 @@ struct ClaimSets {
     /// can be abandoned claims of this instance. A replacement worker with
     /// the same id never has a claim here.
     ended: std::collections::HashSet<ClaimKey>,
+    /// The claim of each live body that the drain already gave back. Such a
+    /// claim never joins `ended`. Its release can restore `attempt`, so a
+    /// later claim may reuse the epoch.
+    settled: std::collections::HashSet<ClaimKey>,
+}
+
+/// Mark the claim `key` as given back by its own body (issue #1813).
+fn settle_claim(claims: &LiveClaims, key: Option<ClaimKey>) {
+    if let Some(key) = key {
+        claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .settled
+            .insert(key);
+    }
 }
 
 /// The claims of this worker instance, shared with its dispatch bodies.
@@ -28942,7 +28957,8 @@ impl Drop for LiveClaim {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         claims.live.remove(&key);
-        if self.shutdown.is_cancelled() {
+        let settled = claims.settled.remove(&key);
+        if self.shutdown.is_cancelled() && !settled {
             claims.ended.insert(key);
         }
     }
@@ -28953,10 +28969,14 @@ struct UnstartedClaim {
     claim: Option<queue::TaskClaim>,
     /// The bucket the claim debited a rate-limit token from, if any.
     refund_key: Option<String>,
+    /// The worker's claim sets and this claim's key. A release marks the
+    /// claim settled, so the lease keeper never counts it as abandoned.
+    claims: LiveClaims,
+    key: Option<ClaimKey>,
 }
 
 impl UnstartedClaim {
-    fn of(task: &TaskQueueItem, registry: &HandlerRegistry) -> Self {
+    fn of(task: &TaskQueueItem, registry: &HandlerRegistry, claims: &LiveClaims) -> Self {
         // A breaker-tracked activity takes no claim-time debit (issue #369).
         let debited = !task
             .activity_name
@@ -28965,6 +28985,10 @@ impl UnstartedClaim {
         Self {
             claim: queue::TaskClaim::of(task),
             refund_key: task.rate_limit_key.clone().filter(|_| debited),
+            claims: Arc::clone(claims),
+            key: task
+                .started_at
+                .map(|started_at| (task.id, task.attempt, started_at)),
         }
     }
 
@@ -28994,15 +29018,21 @@ impl UnstartedClaim {
                 }
             };
         match queue::release_unstarted_claim(&mut conn, &claim).await {
-            Ok(queue::ClaimWrite::Applied) => tracing::info!(
-                task_id = %claim.task_id,
-                worker_id = %claim.worker_id,
-                "shutdown released a claimed task that never started"
-            ),
-            Ok(queue::ClaimWrite::LeaseLost) => tracing::debug!(
-                task_id = %claim.task_id,
-                "a claim that never started was already lost"
-            ),
+            Ok(queue::ClaimWrite::Applied) => {
+                settle_claim(&self.claims, self.key);
+                tracing::info!(
+                    task_id = %claim.task_id,
+                    worker_id = %claim.worker_id,
+                    "shutdown released a claimed task that never started"
+                );
+            }
+            Ok(queue::ClaimWrite::LeaseLost) => {
+                settle_claim(&self.claims, self.key);
+                tracing::debug!(
+                    task_id = %claim.task_id,
+                    "a claim that never started was already lost"
+                );
+            }
             Err(error) => tracing::warn!(
                 task_id = %claim.task_id,
                 %error,
@@ -33262,7 +33292,7 @@ impl Worker {
         // body at the same nesting, so this change adds no reindentation to
         // the hottest file in the repo.
         let drain_cancel = self.drain_cancel.clone();
-        let unstarted = UnstartedClaim::of(&task, &self.registry);
+        let unstarted = UnstartedClaim::of(&task, &self.registry, &self.dispatched.live);
         let task_body = async move {
             chaos_point!(WORKER_DISPATCH_BEFORE_START);
             // Acquire semaphore permit — blocks if at concurrency limit. A
@@ -38459,6 +38489,24 @@ mod tests {
         let (live, ended) = snapshot();
         assert!(live.is_empty());
         assert_eq!(ended.into_iter().collect::<Vec<_>>(), vec![(task, 2, at)]);
+    }
+
+    /// A claim that the drain released never joins the ended set (issue
+    /// #1813). The release can restore `attempt`, so a later claim may reuse
+    /// the same epoch.
+    #[test]
+    fn a_settled_claim_never_joins_the_ended_set() {
+        let claims = LiveClaims::default();
+        let shutdown = CancellationToken::new();
+        let key = (uuid::Uuid::new_v4(), 1, chrono::Utc::now());
+        let held = LiveClaim::new(&claims, Some(key), &shutdown);
+        shutdown.cancel();
+        settle_claim(&claims, Some(key));
+        drop(held);
+        let sets = std::mem::take(&mut *claims.lock().expect("lock"));
+        assert!(sets.live.is_empty());
+        assert!(sets.ended.is_empty(), "a released claim is not abandoned");
+        assert!(sets.settled.is_empty(), "the drop clears the settled mark");
     }
 
     /// A failed lease refresh retries well before the lease goes stale
