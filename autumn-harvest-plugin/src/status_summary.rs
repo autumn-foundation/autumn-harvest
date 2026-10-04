@@ -861,7 +861,7 @@ async fn gather_bundle(
     let stale_secs = i64::try_from(stale_threshold.as_secs())
         .unwrap_or(i64::MAX)
         .saturating_add(i64::from(stale_threshold.subsec_nanos() > 0));
-    let task_stats = load_live_worker_task_stats(conn, stale_secs)
+    let task_stats = load_live_worker_task_stats(conn, stale_secs, None)
         .await
         .unwrap_or_else(|error| {
             tracing::warn!(error = %error, "worker task stats unavailable; outliers skipped");

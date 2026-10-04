@@ -700,6 +700,9 @@ pub struct OutlierProbe {
     pub config: OutlierConfig,
     /// A peer whose heartbeat or stats are older than this is not compared.
     pub fleet_stale_secs: i64,
+    /// This worker's cohort key, from [`worker_cohort`]. The heartbeat reads
+    /// only the peers in this cohort.
+    pub cohort: String,
     /// Whether this heartbeat compares the worker and sets the gauge.
     ///
     /// A multi-shard worker runs one heartbeat per shard, and each one
@@ -721,6 +724,7 @@ impl std::fmt::Debug for OutlierProbe {
         f.debug_struct("OutlierProbe")
             .field("config", &self.config)
             .field("fleet_stale_secs", &self.fleet_stale_secs)
+            .field("cohort", &self.cohort)
             .field("compare", &self.compare)
             .field("slot", &self.slot)
             .finish_non_exhaustive()
@@ -807,10 +811,11 @@ impl Drop for RetireOnDrop {
 pub struct LiveWorkerTaskStats {
     /// The worker id.
     pub worker_id: String,
-    /// The worker's cohort: its sorted queue list, as a JSON array.
+    /// The worker's cohort key, from [`worker_cohort`].
     ///
-    /// Workers in one cohort poll the same queues, so they do the same work.
-    /// A worker is compared only with peers in its own cohort.
+    /// Workers in one cohort poll the same queues with the same weights, so
+    /// they do the same work. A worker is compared only with peers in its own
+    /// cohort.
     pub cohort: String,
     /// The published snapshot.
     pub stats: WorkerTaskStats,
@@ -861,16 +866,31 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
         std::sync::atomic::AtomicI64::new(i64::try_from(micros).unwrap_or(0))
     });
 
-/// The cohort key for a worker's `queues` JSON: the sorted, deduplicated
-/// queue names, as a JSON array.
-fn queue_cohort(queues: &serde_json::Value) -> String {
-    let mut names: Vec<&str> = queues
-        .as_array()
-        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
-        .unwrap_or_default();
-    names.sort_unstable();
-    names.dedup();
-    serde_json::to_string(&names).unwrap_or_default()
+/// The cohort key of a worker that polls `queues` with `weights` (issue
+/// #1815).
+///
+/// Without weights, the key is the sorted queue list, as a JSON array. Such a
+/// worker claims from all its queues in one query.
+///
+/// With weights, the key is the sorted list of `[queue, weight]` pairs. Such a
+/// worker tries its queues in a weighted order, so its task mix follows the
+/// weights. A queue missing from the map has weight 1, as
+/// [`effective_queue_weights`](crate::queue_fairness::effective_queue_weights)
+/// gives. An entry for a queue the worker does not poll is ignored.
+pub fn worker_cohort<S: std::hash::BuildHasher>(
+    queues: &[String],
+    weights: &std::collections::HashMap<String, u32, S>,
+) -> String {
+    if weights.is_empty() {
+        let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        return serde_json::to_string(&names).unwrap_or_default();
+    }
+    let mut pairs = crate::queue_fairness::effective_queue_weights(queues, weights);
+    pairs.sort_unstable();
+    pairs.dedup();
+    serde_json::to_string(&pairs).unwrap_or_default()
 }
 
 /// Write one worker's task stats snapshot (issue #1815).
@@ -888,15 +908,17 @@ fn queue_cohort(queues: &serde_json::Value) -> String {
 pub async fn upsert_worker_task_stats(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
+    cohort: &str,
     stats: &WorkerTaskStats,
 ) -> HarvestResult<()> {
     let to_i32 = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
     let stored = diesel::sql_query(
         "INSERT INTO harvest_worker_task_stats \
              (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, \
-              updated_at) \
-         VALUES ($1, $2, $3, $4, $5, NOW()) \
+              cohort, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, NOW()) \
          ON CONFLICT (worker_id) DO UPDATE SET \
+             cohort = EXCLUDED.cohort, \
              window_tasks = EXCLUDED.window_tasks, \
              window_failures = EXCLUDED.window_failures, \
              p99_latency_ms = EXCLUDED.p99_latency_ms, \
@@ -914,6 +936,7 @@ pub async fn upsert_worker_task_stats(
             .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
     )
     .bind::<diesel::sql_types::BigInt, _>(next_snapshot_seq())
+    .bind::<diesel::sql_types::Text, _>(cohort)
     .get_result::<StoredSnapshotSeq>(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -958,8 +981,8 @@ pub async fn prune_worker_task_stats(
 struct TaskStatsRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     worker_id: String,
-    #[diesel(sql_type = diesel::sql_types::Jsonb)]
-    queues: serde_json::Value,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    cohort: String,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     window_tasks: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -977,33 +1000,51 @@ struct TaskStatsRow {
 /// for example from a worker that a rollback took back to an older build. Old
 /// stats then cannot move the peer median.
 ///
+/// With `cohort`, only the rows of that cohort are read. A heartbeat compares
+/// its worker only with its cohort, so it reads only those rows. Without it,
+/// every cohort is read, as `GET /admin/status` needs.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError`] on database failure.
 pub async fn load_live_worker_task_stats(
     conn: &mut AsyncPgConnection,
     worker_stale_secs: i64,
+    cohort: Option<&str>,
 ) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
     let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
-    let rows: Vec<TaskStatsRow> = diesel::sql_query(
-        "SELECT s.worker_id, w.queues, s.window_tasks, s.window_failures, s.p99_latency_ms, \
+    // A plain equality, not `$3 IS NULL OR ...`, so the cohort index applies.
+    let cohort_filter = if cohort.is_some() {
+        "AND s.cohort = $3 "
+    } else {
+        ""
+    };
+    let query = diesel::sql_query(format!(
+        "SELECT s.worker_id, s.cohort, s.window_tasks, s.window_failures, s.p99_latency_ms, \
                 s.snapshot_seq \
          FROM harvest_worker_task_stats s \
          JOIN harvest_workers w ON w.worker_id = s.worker_id \
          WHERE w.status = $1 \
            AND w.last_heartbeat_at > NOW() - ($2::bigint * INTERVAL '1 second') \
            AND s.updated_at > NOW() - ($2::bigint * INTERVAL '1 second') \
-         ORDER BY s.worker_id",
-    )
+           {cohort_filter}\
+         ORDER BY s.worker_id"
+    ))
+    .into_boxed::<diesel::pg::Pg>()
     .bind::<diesel::sql_types::Text, _>(WorkerStatus::Active.as_str())
-    .bind::<diesel::sql_types::BigInt, _>(stale)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    .bind::<diesel::sql_types::BigInt, _>(stale);
+    let query = match cohort {
+        Some(cohort) => query.bind::<diesel::sql_types::Text, _>(cohort.to_owned()),
+        None => query,
+    };
+    let rows: Vec<TaskStatsRow> = query
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
     Ok(rows
         .into_iter()
         .map(|r| LiveWorkerTaskStats {
-            cohort: queue_cohort(&r.queues),
+            cohort: r.cohort,
             worker_id: r.worker_id,
             stats: WorkerTaskStats {
                 tasks: u32::try_from(r.window_tasks).unwrap_or(0),
@@ -1040,13 +1081,14 @@ pub async fn run_outlier_tick(
     draining: bool,
 ) -> HarvestResult<Vec<OutlierDimension>> {
     let own = probe.window.snapshot();
-    upsert_worker_task_stats(conn, worker_id, &own).await?;
+    upsert_worker_task_stats(conn, worker_id, &probe.cohort, &own).await?;
     // Every shard heartbeat prunes its own database, whether it compares or not.
     prune_worker_task_stats(conn, probe.fleet_stale_secs).await?;
     if !probe.metrics.is_enabled() {
         return Ok(Vec::new());
     }
-    let live = load_live_worker_task_stats(conn, probe.fleet_stale_secs).await?;
+    let live =
+        load_live_worker_task_stats(conn, probe.fleet_stale_secs, Some(&probe.cohort)).await?;
     if !probe.compare {
         probe.shard_peers.store(probe.slot, live);
         return Ok(Vec::new());
@@ -2565,6 +2607,7 @@ mod tests {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             config: crate::worker_outlier::OutlierConfig::default(),
             fleet_stale_secs: 60,
+            cohort: "[\"q\"]".to_owned(),
             compare: true,
             slot,
             shard_peers: std::sync::Arc::clone(shard_peers),
@@ -2593,6 +2636,39 @@ mod tests {
         );
         second.clear_gauge("me");
         assert!(flags.set("peer", &[]).is_empty(), "no shard can compare");
+    }
+
+    /// Issue #1815: workers that poll the same queues with different weights
+    /// do different work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_queue_weights() {
+        let queues = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let weights = |pairs: &[(&str, u32)]| {
+            pairs
+                .iter()
+                .map(|(q, w)| ((*q).to_owned(), *w))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let unweighted = super::worker_cohort(&queues(&["b", "a", "a"]), &weights(&[]));
+        assert_eq!(
+            unweighted, "[\"a\",\"b\"]",
+            "order and duplicates do not matter"
+        );
+
+        let bulk_first = super::worker_cohort(&queues(&["a", "b"]), &weights(&[("b", 5)]));
+        let equal = super::worker_cohort(&queues(&["a", "b"]), &weights(&[("a", 1)]));
+        assert_ne!(bulk_first, unweighted, "weights change the cohort");
+        assert_ne!(bulk_first, equal, "different weights, different cohorts");
+        // An unweighted worker claims from all its queues at once. A weighted
+        // worker tries its queues in a weighted order, so even equal weights
+        // form their own cohort.
+        assert_ne!(equal, unweighted);
+        // A queue missing from the map has weight 1, and an entry for a queue
+        // the worker does not poll is ignored.
+        assert_eq!(
+            equal,
+            super::worker_cohort(&queues(&["b", "a"]), &weights(&[("b", 1), ("z", 9)]))
+        );
     }
 
     /// Records whether each gauge write ran while `views` was locked.

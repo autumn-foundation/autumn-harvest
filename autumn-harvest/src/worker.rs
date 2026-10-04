@@ -30466,6 +30466,10 @@ impl Worker {
                 fleet_stale_secs: capability_miss_fleet_stale_secs(
                     self.config.worker_heartbeat_interval,
                 ),
+                cohort: crate::workers::worker_cohort(
+                    &self.config.queues,
+                    &self.config.queue_weights,
+                ),
                 compare: true,
                 slot: shard_slot,
                 shard_peers: Arc::clone(&self.outlier_peers),

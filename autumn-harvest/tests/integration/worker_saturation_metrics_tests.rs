@@ -159,12 +159,18 @@ fn window(tasks: u32, fail_every: Option<u32>) -> Arc<TaskOutcomeWindow> {
     window
 }
 
-fn probe(window: Arc<TaskOutcomeWindow>, metrics: Arc<Recording>) -> OutlierProbe {
+/// The cohort key of a worker that polls `queue` alone, with no weights.
+fn cohort(queue: &str) -> String {
+    workers::worker_cohort(&[queue.to_owned()], &HashMap::new())
+}
+
+fn probe(queue: &str, window: Arc<TaskOutcomeWindow>, metrics: Arc<Recording>) -> OutlierProbe {
     OutlierProbe {
         window,
         metrics,
         config: OutlierConfig::default(),
         fleet_stale_secs: 60,
+        cohort: cohort(queue),
         compare: true,
         slot: 0,
         // Fresh boards keep each probe apart from other tests in the process.
@@ -197,7 +203,12 @@ async fn healthy_peers(conn: &mut AsyncPgConnection, queue: &str, n: usize) -> V
     for i in 0..n {
         let peer = unique_id(&format!("w-ok{i}"));
         register(conn, &peer, queue).await;
-        let flagged = tick(conn, &peer, &probe(window(100, None), Arc::clone(&metrics))).await;
+        let flagged = tick(
+            conn,
+            &peer,
+            &probe(queue, window(100, None), Arc::clone(&metrics)),
+        )
+        .await;
         assert!(flagged.is_empty(), "a healthy peer is not flagged");
         peers.push(peer);
     }
@@ -238,7 +249,7 @@ async fn outlier_tick_flags_the_worker_failing_half_its_tasks() {
     let flagged = tick(
         &mut conn,
         &sick,
-        &probe(window(100, Some(2)), Arc::clone(&sick_metrics)),
+        &probe(&queue, window(100, Some(2)), Arc::clone(&sick_metrics)),
     )
     .await;
     assert_eq!(flagged, vec![OutlierDimension::FailureRatio]);
@@ -262,7 +273,7 @@ async fn outlier_tick_flags_the_worker_failing_half_its_tasks() {
     let flagged = tick(
         &mut conn,
         &peers[0],
-        &probe(window(100, None), Arc::clone(&again)),
+        &probe(&queue, window(100, None), Arc::clone(&again)),
     )
     .await;
     assert_eq!(flagged, Vec::<OutlierDimension>::new());
@@ -272,7 +283,7 @@ async fn outlier_tick_flags_the_worker_failing_half_its_tasks() {
     }));
 
     // The stored row is the snapshot the sick worker published.
-    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60, None)
         .await
         .expect("load stats");
     assert_eq!(
@@ -301,11 +312,17 @@ async fn outlier_tick_compares_only_within_the_queue_cohort() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let sick = unique_id("w-sick");
-    register(&mut conn, &sick, &unique_id("cohort-slow")).await;
+    let slow = unique_id("cohort-slow");
+    register(&mut conn, &sick, &slow).await;
     healthy_peers(&mut conn, &unique_id("cohort-fast"), 3).await;
 
     let metrics = Arc::new(Recording::default());
-    let flagged = tick(&mut conn, &sick, &probe(window(100, Some(2)), metrics)).await;
+    let flagged = tick(
+        &mut conn,
+        &sick,
+        &probe(&slow, window(100, Some(2)), metrics),
+    )
+    .await;
     assert_eq!(flagged, Vec::<OutlierDimension>::new());
 }
 
@@ -322,9 +339,9 @@ async fn a_healthy_local_worker_does_not_clear_a_sick_workers_flag() {
 
     let shared = Arc::new(workers::ProcessOutlierFlags::default());
     let metrics = Arc::new(Recording::default());
-    let mut sick_probe = probe(window(100, Some(2)), Arc::clone(&metrics));
+    let mut sick_probe = probe(&queue, window(100, Some(2)), Arc::clone(&metrics));
     sick_probe.process_flags = Arc::clone(&shared);
-    let mut peer_probe = probe(window(100, None), Arc::clone(&metrics));
+    let mut peer_probe = probe(&queue, window(100, None), Arc::clone(&metrics));
     peer_probe.process_flags = Arc::clone(&shared);
 
     assert_eq!(
@@ -376,7 +393,7 @@ async fn draining_or_non_comparing_ticks_never_flag() {
     let flagged = workers::run_outlier_tick(
         &mut conn,
         &sick,
-        &probe(window(100, Some(2)), Arc::clone(&draining)),
+        &probe(&queue, window(100, Some(2)), Arc::clone(&draining)),
         true,
     )
     .await
@@ -388,12 +405,12 @@ async fn draining_or_non_comparing_ticks_never_flag() {
     }));
 
     let quiet = Arc::new(Recording::default());
-    let mut silent = probe(window(100, Some(2)), Arc::clone(&quiet));
+    let mut silent = probe(&queue, window(100, Some(2)), Arc::clone(&quiet));
     silent.compare = false;
     let flagged = tick(&mut conn, &sick, &silent).await;
     assert_eq!(flagged, Vec::<OutlierDimension>::new());
     assert_eq!(quiet.samples(), Vec::new(), "no comparison, no gauge write");
-    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60, None)
         .await
         .expect("load");
     assert_eq!(
@@ -419,10 +436,10 @@ async fn live_stats_skip_draining_workers_and_follow_worker_deletes() {
         failures: 3,
         p99_latency_ms: Some(12),
     };
-    workers::upsert_worker_task_stats(&mut conn, &active, &stats)
+    workers::upsert_worker_task_stats(&mut conn, &active, &cohort(&queue), &stats)
         .await
         .expect("upsert active");
-    workers::upsert_worker_task_stats(&mut conn, &draining, &stats)
+    workers::upsert_worker_task_stats(&mut conn, &draining, &cohort(&queue), &stats)
         .await
         .expect("upsert draining");
     diesel::sql_query("UPDATE harvest_workers SET status = 'Draining' WHERE worker_id = $1")
@@ -431,7 +448,7 @@ async fn live_stats_skip_draining_workers_and_follow_worker_deletes() {
         .await
         .expect("drain");
 
-    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60, None)
         .await
         .expect("load");
     assert!(find(&rows, &active).is_some());
@@ -442,10 +459,10 @@ async fn live_stats_skip_draining_workers_and_follow_worker_deletes() {
 
     // A second upsert replaces the row.
     let newer = WorkerTaskStats { tasks: 40, ..stats };
-    workers::upsert_worker_task_stats(&mut conn, &active, &newer)
+    workers::upsert_worker_task_stats(&mut conn, &active, &cohort(&queue), &newer)
         .await
         .expect("upsert again");
-    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60, None)
         .await
         .expect("load");
     assert_eq!(find(&rows, &active), Some(newer));
@@ -459,6 +476,48 @@ async fn live_stats_skip_draining_workers_and_follow_worker_deletes() {
         count_stats_rows(&mut conn, &active).await,
         0,
         "the FK cascade drops the stats row"
+    );
+}
+
+/// A heartbeat reads only the rows of its own cohort. Without a cohort, the
+/// read returns every cohort, as `GET /admin/status` needs.
+#[tokio::test]
+async fn the_heartbeat_reads_only_its_own_cohort() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let mine = unique_id("mine-q");
+    let other = unique_id("other-q");
+    let stats = WorkerTaskStats {
+        tasks: 30,
+        failures: 0,
+        p99_latency_ms: Some(5),
+    };
+    let mut ids = Vec::new();
+    for queue in [&mine, &mine, &other] {
+        let id = unique_id("w-cohort");
+        register(&mut conn, &id, queue).await;
+        workers::upsert_worker_task_stats(&mut conn, &id, &cohort(queue), &stats)
+            .await
+            .expect("upsert");
+        ids.push(id);
+    }
+
+    let own = workers::load_live_worker_task_stats(&mut conn, 60, Some(&cohort(&mine)))
+        .await
+        .expect("load own cohort");
+    let own_ids: Vec<&str> = own.iter().map(|r| r.worker_id.as_str()).collect();
+    assert!(own_ids.contains(&ids[0].as_str()) && own_ids.contains(&ids[1].as_str()));
+    assert!(
+        own.iter().all(|r| r.cohort == cohort(&mine)),
+        "only the own cohort is read: {own_ids:?}"
+    );
+
+    let all = workers::load_live_worker_task_stats(&mut conn, 60, None)
+        .await
+        .expect("load every cohort");
+    assert!(
+        find(&all, &ids[2]).is_some(),
+        "the full read keeps other cohorts"
     );
 }
 
@@ -478,7 +537,7 @@ async fn frozen_stats_leave_the_live_set_and_old_rows_are_pruned() {
     };
     for (id, age_secs) in [(&frozen, 120_i64), (&ancient, 7_200)] {
         register(&mut conn, id, &queue).await;
-        workers::upsert_worker_task_stats(&mut conn, id, &stats)
+        workers::upsert_worker_task_stats(&mut conn, id, &cohort(&queue), &stats)
             .await
             .expect("upsert");
         diesel::sql_query(
@@ -492,7 +551,7 @@ async fn frozen_stats_leave_the_live_set_and_old_rows_are_pruned() {
         .expect("age the row");
     }
 
-    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60, None)
         .await
         .expect("load");
     assert_eq!(find(&rows, &frozen), None, "a frozen row is not live");
@@ -539,7 +598,7 @@ async fn a_restarted_worker_outranks_the_rows_of_its_previous_process() {
         failures: 0,
         p99_latency_ms: Some(5),
     };
-    workers::upsert_worker_task_stats(&mut conn, &id, &stats)
+    workers::upsert_worker_task_stats(&mut conn, &id, &cohort(&queue), &stats)
         .await
         .expect("first upsert");
     // The previous process ran on a host whose clock was far ahead.
@@ -553,10 +612,10 @@ async fn a_restarted_worker_outranks_the_rows_of_its_previous_process() {
     .await
     .expect("seed the previous process's row");
 
-    workers::upsert_worker_task_stats(&mut conn, &id, &stats)
+    workers::upsert_worker_task_stats(&mut conn, &id, &cohort(&queue), &stats)
         .await
         .expect("upsert after the restart");
-    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60, None)
         .await
         .expect("load");
     let stored = rows
@@ -580,6 +639,7 @@ async fn stats_upsert_for_an_unknown_worker_fails() {
     let result = workers::upsert_worker_task_stats(
         &mut conn,
         &unique_id("w-ghost"),
+        &cohort("ghost-q"),
         &WorkerTaskStats::default(),
     )
     .await;

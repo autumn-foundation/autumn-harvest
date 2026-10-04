@@ -89,7 +89,7 @@ where to look next.
 
 The `workers` block lists gray failures under `outliers` (issue #1815). Each
 entry names a live worker that fails or slows far more than its peers on the
-same queues. It shows the worker's stats and the peer medians. The list holds
+same queues with the same queue weights. It shows the worker's stats and the peer medians. The list holds
 the worst 20, and `outliers_total` gives the full count. Any outlier degrades
 the block with the `worker_outlier` reason code. See
 [harvest_worker_gray_failure](#harvest_worker_gray_failure).
@@ -3393,8 +3393,10 @@ shards, so every heartbeat sees the same peers. If one shard fails, a
 healthy shard keeps the verdict live. When two workers in one process share a metrics recorder,
 the gauge reads `1` when either worker is an outlier.
 
-The peers are the live, `Active` workers that poll the same queues. A worker
-on a slow queue is not compared with workers on a fast queue.
+The peers are the live, `Active` workers that poll the same queues with the
+same `queue_weights`. A worker on a slow queue is not compared with workers on
+a fast queue. A worker that favours a bulk queue is not compared with one
+that favours an interactive queue. Each heartbeat reads only its own cohort.
 `GET /admin/status` runs the same comparison over every shard. It lists the
 worst 20 outliers under `workers.outliers`, and `workers.outliers_total`
 gives the full count.
