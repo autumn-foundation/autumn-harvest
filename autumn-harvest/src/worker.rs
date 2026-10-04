@@ -15594,8 +15594,14 @@ async fn process_activity_task(
         && activity.circuit_breaker.is_some()
         && let Some(key) = task.rate_limit_key.as_deref()
     {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        if !queue::try_consume_rate_limit_token(&mut conn, key).await? {
+        let mut conn = count_setup_failure(
+            task_outcomes,
+            pool.get().await.map_err(crate::error::database_error),
+        )?;
+        if !count_setup_failure(
+            task_outcomes,
+            queue::try_consume_rate_limit_token(&mut conn, key).await,
+        )? {
             // No token available (bucket empty, or fail-closed when the bucket
             // row is missing): defer this real call instead of running it.
             //
@@ -15649,7 +15655,10 @@ async fn process_activity_task(
     // a deferred task never records a start it did not run; serves both the
     // short-circuit path (start + CircuitOpen failure) and the real-call path.
     let started = {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = count_setup_failure(
+            task_outcomes,
+            pool.get().await.map_err(crate::error::database_error),
+        )?;
         let started_result = append_activity_started_if_pending(
             &mut conn,
             task,
@@ -15659,14 +15668,17 @@ async fn process_activity_task(
             registry.payload_codecs(),
         )
         .await;
-        let Some(started) = fail_execution_on_error(
-            &mut conn,
-            task,
-            worker_id,
-            started_result,
-            registry.payload_codecs(),
-        )
-        .await?
+        let Some(started) = count_setup_failure(
+            task_outcomes,
+            fail_execution_on_error(
+                &mut conn,
+                task,
+                worker_id,
+                started_result,
+                registry.payload_codecs(),
+            )
+            .await,
+        )?
         else {
             // The activity will not run: it already has a terminal event, or the
             // task row stopped being RUNNING (cancelled / timed out concurrently).
@@ -16317,6 +16329,23 @@ async fn process_activity_task(
     .await;
     record_outcome(finalized.is_ok());
     finalized
+}
+
+/// Count a failed activity setup step in the outlier window (issue #1815).
+///
+/// A setup step that loses its database write is a failed attempt, as a lost
+/// finalization is. A capability miss is a release, so it is not counted.
+/// The handler did not run, so the sample has no latency.
+fn count_setup_failure<T>(
+    window: &crate::worker_outlier::TaskOutcomeWindow,
+    result: HarvestResult<T>,
+) -> HarvestResult<T> {
+    if let Err(error) = &result
+        && error.handler_not_registered().is_none()
+    {
+        window.record(true, Duration::ZERO);
+    }
+    result
 }
 
 /// How an activity attempt enters the outlier window (issue #1815).
@@ -40051,6 +40080,27 @@ mod tests {
 
     /// Issue #1815: a handler success that does not finalize counts as a
     /// failed attempt. A cancelled attempt is skipped.
+    #[test]
+    fn a_failed_activity_setup_counts_but_a_capability_miss_does_not() {
+        let window = crate::worker_outlier::TaskOutcomeWindow::default();
+        assert!(count_setup_failure(&window, Ok(())).is_ok());
+        let miss: HarvestResult<()> = Err(HarvestError::HandlerNotRegistered {
+            kind: "activity",
+            name: "missing".to_owned(),
+            phase: CapabilityMissPhase::BeforeHandler,
+        });
+        assert!(count_setup_failure(&window, miss).is_err());
+        assert_eq!(window.snapshot().tasks, 0, "a capability miss is a release");
+        let lost: HarvestResult<()> = Err(crate::error::database_error("pool closed"));
+        assert!(count_setup_failure(&window, lost).is_err());
+        let snap = window.snapshot();
+        assert_eq!(
+            (snap.tasks, snap.failures),
+            (1, 1),
+            "a lost setup write fails"
+        );
+    }
+
     #[test]
     fn activity_attempt_outcome_counts_lost_finalization_and_skips_cancellation() {
         use ActivityStatus::{Completed, Failed};

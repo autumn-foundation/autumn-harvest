@@ -1608,7 +1608,7 @@
       "id": "harvest_db_query_latency_high",
       "status": "enforceable",
       "signal_source": "METRIC_DB_QUERY_DURATION / harvest.db.query.duration{op}, one sample per claim, workflow-task persist transaction, timeout-scanner pass and activity heartbeat write (issue #1815).",
-      "default_threshold": "Ticket when the p99 claim or persist duration exceeds 500 ms for 10 minutes. Scan passes are longer by design, so tune that op on its own.",
+      "default_threshold": "Ticket when the p99 claim or persist duration on any replica exceeds 500 ms for 10 minutes. The rule keeps the instance label, so one slow replica cannot hide behind healthy ones. Scan passes are longer by design, so tune that op on its own.",
       "severity": "ticket",
       "owner_persona": "service on-call",
       "description": "Database operations on the hot path are slow. The database is saturated, a lock blocks the queue table, or an index is missing. Throughput falls while worker slots look busy.",
@@ -1626,12 +1626,12 @@
         "expressions": [
           {
             "kind": "promql",
-            "expr": "histogram_quantile(0.99, sum by (le, op) (rate(harvest_db_query_duration_bucket{op=~\"claim|persist\"}[5m]))) > 0.5",
+            "expr": "histogram_quantile(0.99, sum by (le, instance, op) (rate(harvest_db_query_duration_bucket{op=~\"claim|persist\"}[5m]))) > 0.5",
             "for": "10m"
           },
           {
             "kind": "promql",
-            "expr": "sum by (op) (rate(harvest_db_query_duration_sum{op=~\"claim|persist\"}[5m])) / sum by (op) (rate(harvest_db_query_duration_count{op=~\"claim|persist\"}[5m])) > 0.25",
+            "expr": "sum by (instance, op) (rate(harvest_db_query_duration_sum{op=~\"claim|persist\"}[5m])) / sum by (instance, op) (rate(harvest_db_query_duration_count{op=~\"claim|persist\"}[5m])) > 0.25",
             "for": "10m",
             "note": "Bucket-less fallback: the average duration. Use it on the built-in scrape endpoint, which renders only _sum and _count."
           }

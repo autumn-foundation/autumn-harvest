@@ -29,6 +29,7 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - A failed activity attempt counts as a failure. So does an attempt that an
   open circuit breaker rejects, because the breaker belongs to the worker.
   An activity that succeeds but does not finalize also counts as a failure.
+  So does an activity whose setup loses its database write.
   A cancelled activity attempt is not counted.
   A workflow task counts as a failure when it returns an error or times out.
   A release is not counted.
@@ -72,7 +73,8 @@ metrics. The two histograms render as `_count` and `_sum`.
 - A new collapsed row, "Database pool, queries & pollers", with five panels.
 - Three new rules with runbook sections: `harvest_worker_gray_failure`,
   `harvest_db_pool_wait_high` and `harvest_db_query_latency_high`.
-- The two latency rules carry a bucket-less average fallback.
+- The two latency rules carry a bucket-less average fallback. Both keep the
+  `instance` label, so one slow replica cannot hide behind healthy ones.
 
 **Migration.** `20261003203735_harvest_worker_task_stats` adds one table and
 an index on `updated_at`. No `WorkflowEvent` variant, no change to

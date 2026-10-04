@@ -3500,11 +3500,13 @@ are fast.
 claim, one workflow-task persist transaction, one timeout-scanner pass and
 one activity heartbeat write. Each op is a unit of work, not one SQL
 statement. The rule watches `claim` and `persist`, because they set
-throughput.
+throughput. It keeps the `instance` label, so one slow replica fires it
+alone.
 
 ### Triage steps
 
-1. Find the slow op on **DB operation latency p99 by op**.
+1. Find the slow op on **DB operation latency p99 by op**. When only one
+   instance fires, check that replica's network path and its pool first.
 2. List long-running statements:
    `SELECT pid, wait_event_type, wait_event, now() - query_start AS age, query FROM pg_stat_activity WHERE state <> 'idle' ORDER BY age DESC LIMIT 20;`.
 3. Look for lock waits on `harvest_task_queue` and
