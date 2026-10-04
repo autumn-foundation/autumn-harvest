@@ -33,7 +33,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   open circuit breaker rejects, because the breaker belongs to the worker.
   An activity that succeeds but does not finalize also counts as a failure.
   So does an activity whose setup loses its database write.
-  A cancelled activity attempt is not counted.
+  A cancelled activity attempt is not counted, and neither is one whose
+  claim a later owner took before it finalized.
   A workflow task counts as a failure when it returns an error or times out.
   A release is not counted.
 - Every liveness heartbeat writes a snapshot to the new table

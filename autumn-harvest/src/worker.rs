@@ -13456,56 +13456,78 @@ pub async fn finalize_activity_completion(
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
+    finalize_activity_completion_write(conn, task, exec_id, activity_id, output, offloader, codecs)
+        .await
+        .map(|_| ())
+}
+
+/// [`finalize_activity_completion`], and whether the completion applied
+/// (issue #1815).
+///
+/// It returns [`queue::ClaimWrite::LeaseLost`] when this attempt no longer
+/// owns the outcome: the claim is lost, or the activity is no longer pending.
+async fn finalize_activity_completion_write(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    output: serde_json::Value,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<queue::ClaimWrite> {
     let Some(activity_name) = task.activity_name.as_deref() else {
-        return Ok(());
+        return Ok(queue::ClaimWrite::LeaseLost);
     };
     let completion_event = WorkflowEvent::ActivityCompleted {
         activity_id,
         output: output.clone(),
     };
 
-    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-        let output = output.clone();
-        let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-        if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-            return Ok(());
-        }
-        // A lost lease is a no-op, not an error (issue #1789). The later
-        // claim owns the outcome of this activity.
-        if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
-            log_lease_lost(task, "activity completion");
-            return Ok(());
-        }
-        store::append_events_offloaded_with_codecs(
-            conn,
-            exec_id,
-            &[completion_event],
-            history.next_event_id,
-            offloader,
-            codecs,
-        )
-        .await?;
-        queue::complete_claimed_task(conn, &claim_of_task(task)?, output)
-            .await?
-            .require_applied(task.id)?;
-        // Worker sessions (issue #606): a session member activity's
-        // completion pushes the session's lease forward, so a
-        // long-running but still-legitimate pipeline isn't reclaimed by
-        // the broken-session scanner's `expires_at < NOW()` check just
-        // because its steps individually outlast one sticky-timeout
-        // window. `task.session_id` is `None` for both ordinary
-        // activities and the reserved acquire/release activities
-        // themselves (neither is dispatched through `Session::
-        // execute_activity`), so this is scoped to genuine members only.
-        if let Some(session_uuid) = task.session_id {
-            crate::sessions::refresh_session_lease(
+    let result = Box::pin(
+        conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
+            let output = output.clone();
+            let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
+            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                return Ok(queue::ClaimWrite::LeaseLost);
+            }
+            // A lost lease is a no-op, not an error (issue #1789). The later
+            // claim owns the outcome of this activity.
+            if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+                log_lease_lost(task, "activity completion");
+                return Ok(queue::ClaimWrite::LeaseLost);
+            }
+            store::append_events_offloaded_with_codecs(
                 conn,
-                crate::types::SessionId::from_uuid(session_uuid),
+                exec_id,
+                &[completion_event],
+                history.next_event_id,
+                offloader,
+                codecs,
             )
             .await?;
-        }
-        queue::wake_workflow_task(conn, exec_id).await
-    }))
+            queue::complete_claimed_task(conn, &claim_of_task(task)?, output)
+                .await?
+                .require_applied(task.id)?;
+            // Worker sessions (issue #606): a session member activity's
+            // completion pushes the session's lease forward, so a
+            // long-running but still-legitimate pipeline isn't reclaimed by
+            // the broken-session scanner's `expires_at < NOW()` check just
+            // because its steps individually outlast one sticky-timeout
+            // window. `task.session_id` is `None` for both ordinary
+            // activities and the reserved acquire/release activities
+            // themselves (neither is dispatched through `Session::
+            // execute_activity`), so this is scoped to genuine members only.
+            if let Some(session_uuid) = task.session_id {
+                crate::sessions::refresh_session_lease(
+                    conn,
+                    crate::types::SessionId::from_uuid(session_uuid),
+                )
+                .await?;
+            }
+            queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(queue::ClaimWrite::Applied)
+        }),
+    )
     .await;
 
     // Settle the dispatch hints this transaction raised (issue #1312). A
@@ -13536,8 +13558,24 @@ pub async fn finalize_activity_failure(
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
+    finalize_activity_failure_write(conn, task, exec_id, activity_id, error, codecs)
+        .await
+        .map(|_| ())
+}
+
+/// [`finalize_activity_failure`], and whether the failure applied (issue
+/// #1815). A lost claim or an activity that is no longer pending gives
+/// [`queue::ClaimWrite::LeaseLost`].
+async fn finalize_activity_failure_write(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    error: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<queue::ClaimWrite> {
     let Some(activity_name) = task.activity_name.as_deref() else {
-        return Ok(());
+        return Ok(queue::ClaimWrite::LeaseLost);
     };
     let failure = parse_error_payload_full(error);
     let failed_event = WorkflowEvent::ActivityFailed {
@@ -13560,44 +13598,47 @@ pub async fn finalize_activity_failure(
     // `ActivityFailed` event (carrying `error_type`, `non_retryable`,
     // `details`) and the `WorkflowFailed` event that follows when the
     // workflow propagates the error.
-    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-        let error = error.to_string();
-        let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-        if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-            return Ok(());
-        }
-        // A lost lease is a no-op, not an error (issue #1789).
-        if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
-            log_lease_lost(task, "activity failure");
-            // If the task reached COMPLETED before the handler returned
-            // (e.g. via run_transactional) and the handler then returned
-            // Err, the error is discarded — the workflow already observed
-            // ActivityCompleted.  Emit a warning so the misuse is visible.
-            if state.as_deref() == Some("COMPLETED") {
-                tracing::warn!(
-                    task_id = %task.id,
-                    activity_name = %activity_name,
-                    "activity handler returned Err but task is already COMPLETED \
-                     (run_transactional committed it); the error is discarded and \
-                     the workflow observes ActivityCompleted — run_transactional \
-                     must be the final expression in the activity handler"
-                );
+    let result = Box::pin(
+        conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
+            let error = error.to_string();
+            let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
+            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                return Ok(queue::ClaimWrite::LeaseLost);
             }
-            return Ok(());
-        }
-        store::append_events_with_codecs(
-            conn,
-            exec_id,
-            &[failed_event],
-            history.next_event_id,
-            codecs,
-        )
-        .await?;
-        queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
-            .await?
-            .require_applied(task.id)?;
-        queue::wake_workflow_task(conn, exec_id).await
-    }))
+            // A lost lease is a no-op, not an error (issue #1789).
+            if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
+                log_lease_lost(task, "activity failure");
+                // If the task reached COMPLETED before the handler returned
+                // (e.g. via run_transactional) and the handler then returned
+                // Err, the error is discarded — the workflow already observed
+                // ActivityCompleted.  Emit a warning so the misuse is visible.
+                if state.as_deref() == Some("COMPLETED") {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        activity_name = %activity_name,
+                        "activity handler returned Err but task is already COMPLETED \
+                         (run_transactional committed it); the error is discarded and \
+                         the workflow observes ActivityCompleted — run_transactional \
+                         must be the final expression in the activity handler"
+                    );
+                }
+                return Ok(queue::ClaimWrite::LeaseLost);
+            }
+            store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[failed_event],
+                history.next_event_id,
+                codecs,
+            )
+            .await?;
+            queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
+                .await?
+                .require_applied(task.id)?;
+            queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(queue::ClaimWrite::Applied)
+        }),
+    )
     .await;
 
     // Settle the dispatch hints this transaction raised (issue #1312), for the
@@ -14777,7 +14818,7 @@ async fn handle_activity_result(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
+) -> HarvestResult<queue::ClaimWrite> {
     match activity_result {
         Ok(output) => {
             let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
@@ -14794,10 +14835,17 @@ async fn handle_activity_result(
                     ),
                 )
                 .into_error_payload();
-                return finalize_activity_failure(conn, task, exec_id, activity_id, &error, codecs)
-                    .await;
+                return finalize_activity_failure_write(
+                    conn,
+                    task,
+                    exec_id,
+                    activity_id,
+                    &error,
+                    codecs,
+                )
+                .await;
             }
-            finalize_activity_completion(
+            finalize_activity_completion_write(
                 conn,
                 task,
                 exec_id,
@@ -14842,7 +14890,9 @@ async fn handle_activity_result(
                     )
                     .await?
                     {
-                        ScheduleToCloseTimeoutOutcome::Handled => return Ok(()),
+                        ScheduleToCloseTimeoutOutcome::Handled => {
+                            return Ok(queue::ClaimWrite::Applied);
+                        }
                         // Stale claim-time snapshot: a concurrent pause/resume
                         // cycle shifted the row's deadline forward (issue #609
                         // post-review hardening) — the attempt still has
@@ -14876,10 +14926,10 @@ async fn handle_activity_result(
                 } else {
                     log_lease_lost(task, "activity retry requeue");
                 }
-                return Ok(());
+                return Ok(write);
             }
 
-            finalize_activity_failure(conn, task, exec_id, activity_id, &error, codecs).await
+            finalize_activity_failure_write(conn, task, exec_id, activity_id, &error, codecs).await
         }
     }
 }
@@ -15789,7 +15839,8 @@ async fn process_activity_task(
             registry.retry_after_ceiling,
             registry.payload_codecs(),
         )
-        .await;
+        .await
+        .map(|_| ());
     }
 
     let cancel = CancellationToken::new();
@@ -16162,7 +16213,7 @@ async fn process_activity_task(
     // finalization. A failed finalization counts as a failure, so a worker
     // that loses its writes cannot report a clean ratio. A cancelled attempt
     // is skipped, as in the circuit breaker.
-    let record_outcome = |finalized: bool| {
+    let record_outcome = |finalized: Option<queue::ClaimWrite>| {
         if let Some(failed) = activity_attempt_outcome(status, was_cancelled, finalized) {
             task_outcomes.record(failed, attempt_elapsed);
         }
@@ -16210,7 +16261,7 @@ async fn process_activity_task(
     let mut conn = match pool.get().await {
         Ok(conn) => conn,
         Err(error) => {
-            record_outcome(false);
+            record_outcome(None);
             return Err(crate::error::database_error(error));
         }
     };
@@ -16226,7 +16277,7 @@ async fn process_activity_task(
     {
         Ok(policy) => policy,
         Err(error) => {
-            record_outcome(false);
+            record_outcome(None);
             return Err(error);
         }
     };
@@ -16305,7 +16356,7 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
-        record_outcome(true);
+        record_outcome(Some(queue::ClaimWrite::Applied));
         return Ok(());
     }
 
@@ -16327,8 +16378,8 @@ async fn process_activity_task(
         registry.payload_codecs(),
     )
     .await;
-    record_outcome(finalized.is_ok());
-    finalized
+    record_outcome(finalized.as_ref().ok().copied());
+    finalized.map(|_| ())
 }
 
 /// Count a failed activity setup step in the outlier window (issue #1815).
@@ -16351,15 +16402,22 @@ fn count_setup_failure<T>(
 /// How an activity attempt enters the outlier window (issue #1815).
 ///
 /// `Some(true)` is a failure, `Some(false)` is a success, and `None` skips the
-/// attempt. A failed handler counts as a failure. A handler success that does
-/// not finalize also counts, because the work is lost. A cancelled attempt is
-/// skipped, because a cancellation says nothing about the worker.
+/// attempt. `finalized` is `None` when the finalization failed.
+///
+/// A failed handler counts as a failure. A handler success that does not
+/// finalize also counts, because the work is lost. A finalization that lost
+/// its claim is skipped, because a later owner decides the outcome. A
+/// cancelled attempt is skipped, because a cancellation says nothing about
+/// the worker.
 fn activity_attempt_outcome(
     status: ActivityStatus,
     was_cancelled: bool,
-    finalized: bool,
+    finalized: Option<queue::ClaimWrite>,
 ) -> Option<bool> {
-    (!was_cancelled).then_some(status == ActivityStatus::Failed || !finalized)
+    if was_cancelled || finalized == Some(queue::ClaimWrite::LeaseLost) {
+        return None;
+    }
+    Some(status == ActivityStatus::Failed || finalized.is_none())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -40152,20 +40210,35 @@ mod tests {
         );
     }
 
+    /// Issue #1815: a finalization that errors counts as a failure. One that
+    /// lost its claim is skipped, because a later owner decides the outcome.
+    /// A cancelled attempt is skipped too.
     #[test]
     fn activity_attempt_outcome_counts_lost_finalization_and_skips_cancellation() {
         use ActivityStatus::{Completed, Failed};
+        use queue::ClaimWrite::{Applied, LeaseLost};
         assert_eq!(
-            activity_attempt_outcome(Completed, false, true),
+            activity_attempt_outcome(Completed, false, Some(Applied)),
             Some(false)
         );
+        assert_eq!(activity_attempt_outcome(Completed, false, None), Some(true));
         assert_eq!(
-            activity_attempt_outcome(Completed, false, false),
+            activity_attempt_outcome(Failed, false, Some(Applied)),
             Some(true)
         );
-        assert_eq!(activity_attempt_outcome(Failed, false, true), Some(true));
-        assert_eq!(activity_attempt_outcome(Failed, false, false), Some(true));
-        for (status, finalized) in [(Completed, true), (Failed, true), (Failed, false)] {
+        assert_eq!(activity_attempt_outcome(Failed, false, None), Some(true));
+        for status in [Completed, Failed] {
+            assert_eq!(
+                activity_attempt_outcome(status, false, Some(LeaseLost)),
+                None,
+                "a lost claim is not this worker's outcome"
+            );
+        }
+        for (status, finalized) in [
+            (Completed, Some(Applied)),
+            (Failed, Some(Applied)),
+            (Failed, None),
+        ] {
             assert_eq!(activity_attempt_outcome(status, true, finalized), None);
         }
     }
