@@ -21,7 +21,7 @@ decision.
   `CircuitOpen` failure.
 - A timeout feeds the breaker only when the attempt's handler started.
 - A fleet that mixes 0.6 and 0.7 workers must keep timeouts terminal until
-  the upgrade ends. See the 0.7.0 upgrade guide, §1.3.
+  the upgrade ends. See the 0.7.0 upgrade guide, §1.4.
 
 **What shipped.**
 
@@ -47,7 +47,7 @@ decision.
 - Stall diagnosis says that an open breaker defers by default.
 - Docs: ADR 0004; the circuit-breaker, triage, alert and containment
   runbooks; Chapter 7; the design doc; `architecture.md` §9; `telemetry.md`;
-  the 0.7.0 upgrade guide (§1.2 to §1.4); the 0.5.0 migration table; the
+  the 0.7.0 upgrade guide (§1.2, §1.4 and §1.5); the 0.5.0 migration table; the
   SQLite crate docs, which now state that SQLite keeps terminal timeouts.
 
 **Invariants.** Migration

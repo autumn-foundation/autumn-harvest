@@ -983,7 +983,7 @@ pub struct NewHarvestWorker<'a> {
     pub max_concurrency: i32,
     pub host: &'a str,
     pub version: Option<&'a str>,
-    /// Build ID advertised by this worker (empty string = legacy/unset).
+    /// Build ID advertised by this worker (empty string = unset; claims no pinned task).
     pub build_id: &'a str,
     /// Optional deployment name for operator observability.
     pub deployment_name: Option<&'a str>,

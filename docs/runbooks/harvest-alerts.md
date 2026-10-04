@@ -193,6 +193,8 @@ count. Override them per environment with
 - The **static alert pack** (`docs/alerts/starter-pack-v0.1.0.json`, the rest of
   this runbook) owns **PUSH alerting** — it tells you *when* to look.
 - **`/api/harvest/health`** is **liveness** — is the process up — not a rollup.
+  For probes, use `/api/harvest/health/live` and `/api/harvest/health/ready`. See
+  [`../operations/kubernetes-probes.md`](../operations/kubernetes-probes.md).
 - **`/api/harvest/admin/preflight`** is **startup validation** — is this
   deployment safe to promote — run at deploy time, not during an incident.
   One exception, added by issue #797: its `scanner_liveness` check is a *live*
@@ -931,7 +933,8 @@ shows a shard the router considers writable but no worker resolves.
 
 New build policy moved starts to a build with no active workers, old workers
 were drained before in-flight executions finished, compat was not declared, or
-legacy workers with empty build IDs are masking the real routing state.
+workers with empty build IDs cannot claim pinned runs (see
+`harvest.worker.empty_build_policy`).
 
 ### False positives
 
