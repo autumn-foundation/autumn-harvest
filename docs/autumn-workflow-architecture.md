@@ -1308,6 +1308,8 @@ POST   /api/harvest/dead-letters/:id/replay       # replay a dead-lettered task
 
 GET    /api/harvest/workers                       # list connected workers
 GET    /api/harvest/health                        # scheduler + worker health
+GET    /api/harvest/health/live                   # liveness probe
+GET    /api/harvest/health/ready                  # readiness probe
 ```
 
 ### 12.4 Error Integration
@@ -1427,7 +1429,7 @@ concurrency = 32              # default: 32 — also accepts the key `batch_conc
 tick_interval_ms = 500        # default: 500
 
 [harvest.readiness]
-require_shard_readiness = false  # default: false — when true, `/health` returns 503 unless writable/candidate shards are ready
+require_shard_readiness = false  # default: false — when true, `/health` and `/health/ready` return 503 unless writable/candidate shards are ready
 
 [harvest.startup]
 orphaned_workflows = "warn"   # "off" | "warn" | "fail" — default: warn

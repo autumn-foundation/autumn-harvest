@@ -1282,10 +1282,9 @@ impl std::str::FromStr for ParentClosePolicy {
 /// a semantic version, or a CI job ID). Harvest uses this to ensure in-flight
 /// workflow executions are only resumed by workers running a compatible build.
 ///
-/// The empty string `""` is the **legacy sentinel**: workers that pre-date
-/// build routing (or operators who have not opted in) advertise an empty
-/// `BuildId` and retain the ability to claim any task regardless of the task's
-/// `required_build_id`.
+/// The empty string `""` is the **legacy sentinel**: a worker with no build
+/// identity advertises an empty `BuildId`. It claims unpinned tasks only,
+/// never one with a `required_build_id` (issue #1805).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BuildId(String);
 
@@ -1296,12 +1295,10 @@ impl BuildId {
         Self(id.into())
     }
 
-    /// The legacy sentinel used by workers that pre-date build routing.
+    /// The sentinel for a worker with no build identity.
     ///
-    /// Legacy workers advertise an empty build id and are allowed to claim any
-    /// task, including those with an explicit `required_build_id`. This
-    /// preserves backward compatibility for operators who have not yet adopted
-    /// build-aware routing.
+    /// Such a worker advertises an empty build id. It claims unpinned tasks
+    /// only, never one with a `required_build_id` (issue #1805).
     #[must_use]
     pub const fn legacy() -> Self {
         Self(String::new())

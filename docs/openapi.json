@@ -6948,6 +6948,88 @@
         "x-harvest-route-class": "public_safe"
       }
     },
+    "/health/live": {
+      "get": {
+        "description": "Liveness probe (issue #1812). Always returns 200 while the process answers HTTP. Does no I/O. draining is true during shutdown. See docs/operations/kubernetes-probes.md.",
+        "operationId": "get_health_live",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "alive": {},
+                    "draining": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          }
+        },
+        "security": [],
+        "summary": "Liveness probe (issue #1812).",
+        "tags": [
+          "health"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "public_safe"
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "description": "Readiness probe (issue #1812). Returns 200 when the runtime has started, the replica is not draining and the default shard answers SELECT 1. With require_shard_readiness, the shard verdict must also be ready. The database checks share a 1 second budget, and their result is cached for 1 second. shard_readiness is the verdict string only; GET /admin/shards/health has the detail. reasons names each failed check. See docs/operations/kubernetes-probes.md.",
+        "operationId": "get_health_ready",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "database_reachable": {},
+                    "draining": {},
+                    "ready": {},
+                    "reasons": {},
+                    "runtime_ready": {},
+                    "shard_readiness": {},
+                    "shard_readiness_enforced": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "database_reachable": {},
+                    "draining": {},
+                    "ready": {},
+                    "reasons": {},
+                    "runtime_ready": {},
+                    "shard_readiness": {},
+                    "shard_readiness_enforced": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The replica is not ready. Same body as the 200. reasons holds one or more of runtime_not_started, draining, database_unreachable, shard_not_ready, shard_report_timeout. database_reachable is null when an earlier check failed."
+          }
+        },
+        "security": [],
+        "summary": "Readiness probe (issue #1812).",
+        "tags": [
+          "health"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "public_safe"
+      }
+    },
     "/openapi.json": {
       "get": {
         "description": "Serve the OpenAPI 3.1 document for this management API (issue #694). The document is derived from this contract, so it covers every route listed here and nothing else. Read-only, and never behind the built-in admin guard: a client generator must reach it before it holds a credential. An embedder that wraps the whole router in its own auth middleware (api_with_auth) gates this route too. The identical document is checked in at docs/openapi.json.",
