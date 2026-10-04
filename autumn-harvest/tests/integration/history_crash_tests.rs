@@ -100,8 +100,7 @@ fn seed() -> u64 {
 
 /// `url` with an `application_name` that the killer task matches on.
 fn tagged(url: &str, app: &str) -> String {
-    let sep = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{sep}application_name={app}")
+    crate::throwaway_db::with_application_name(url, app)
 }
 
 /// Terminate one busy backend of `app` at random moments until `stop` is
@@ -127,10 +126,13 @@ fn spawn_killer(
         while !AtomicBool::load(&stop, Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(rng.gen_range(pause_ms.clone()))).await;
             total += diesel::sql_query(
-                "SELECT COUNT(pg_terminate_backend(pid))::bigint AS n FROM ( \
-                   SELECT pid FROM pg_stat_activity \
-                   WHERE application_name = $1 AND state IS DISTINCT FROM 'idle' \
-                   ORDER BY random() LIMIT 1) busy",
+                // Count only a `true` result. A session that ends before
+                // the call returns `false`, and no kill landed.
+                "SELECT COUNT(*) FILTER (WHERE killed)::bigint AS n FROM ( \
+                   SELECT pg_terminate_backend(pid) AS killed FROM ( \
+                     SELECT pid FROM pg_stat_activity \
+                     WHERE application_name = $1 AND state IS DISTINCT FROM 'idle' \
+                     ORDER BY random() LIMIT 1) busy) strike",
             )
             .bind::<Text, _>(app)
             .get_result::<Killed>(&mut conn)
