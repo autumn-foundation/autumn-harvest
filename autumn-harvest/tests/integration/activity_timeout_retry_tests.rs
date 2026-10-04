@@ -1298,8 +1298,8 @@ async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
         },
     )
     .await;
-    // The owner takes its own record, so the cap cannot evict the record of
-    // a slower owner.
+    // The owner takes its own record, so the row holds only unsettled
+    // owners.
     wait_until(
         "the owner takes its timeout record",
         Duration::from_secs(5),

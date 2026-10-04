@@ -26,4 +26,5 @@ COMMENT ON COLUMN harvest_task_queue.timed_out_claims IS
     'The started_at of each claim that the timeout enforcer timed out after '
     'its handler started, newest last (issue #1809). The worker that held a '
     'claim takes its own started_at out of here to tell a timeout from any '
-    'other lost claim. At most 32 entries of owners that never settled remain.';
+    'other lost claim. Each entry used one attempt, so there are at most '
+    'max_attempts entries.';

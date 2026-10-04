@@ -15289,7 +15289,7 @@ impl Drop for CircuitProbeGuard<'_> {
 ///
 /// The read also removes the record, so call it once per lost claim. Call it
 /// even when the activity has no breaker policy. Otherwise the record stays
-/// and takes a slot that a slow owner needs.
+/// on the row until the row goes.
 async fn claim_lost_to_timeout(conn: &mut AsyncPgConnection, task: &TaskQueueItem) -> bool {
     match task.started_at {
         Some(started_at) => queue::take_timed_out_claim(conn, task.id, started_at).await,

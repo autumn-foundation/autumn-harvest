@@ -2808,23 +2808,18 @@ pub(crate) async fn later_claim_shares_strikes(
         .map_err(crate::error::database_error)
 }
 
-/// How many timed-out claims a row remembers (issue #1809).
-///
-/// The owner of a claim removes its own epoch when it reads it, in
-/// [`take_timed_out_claim`]. So the list holds only claims whose owner has
-/// not settled yet. An owner that never settles, such as a crashed process,
-/// leaves its epoch behind. The cap bounds those leftovers, and it drops the
-/// oldest first.
-const TIMED_OUT_CLAIMS_KEPT: i32 = 32;
-
 /// Record that the timeout enforcer timed out the claim that started at
 /// `started_at` (issue #1809).
 ///
 /// The enforcer calls this inside its transaction, after its write applied.
 /// The epoch stays until the owner of the claim takes it with
 /// [`take_timed_out_claim`]. A worker whose handler outlives several retries
-/// can then still find its own claim. The row keeps at most
-/// [`TIMED_OUT_CLAIMS_KEPT`] epochs.
+/// can then still find its own claim.
+///
+/// The list has no cap, because a cap could drop the epoch of a live owner.
+/// Each timed-out claim used one attempt, and the enforcer never lowers
+/// `attempt`. So a row holds at most `max_attempts` epochs. Only an owner
+/// that never settles, such as a crashed process, leaves one behind.
 ///
 /// # Errors
 ///
@@ -2836,14 +2831,11 @@ pub(crate) async fn record_timed_out_claim(
 ) -> HarvestResult<()> {
     diesel::sql_query(
         "UPDATE harvest_task_queue \
-         SET timed_out_claims = \
-             (array_append(COALESCE(timed_out_claims, '{}'::timestamptz[]), $2)) \
-             [GREATEST(1, COALESCE(cardinality(timed_out_claims), 0) + 2 - $3):] \
+         SET timed_out_claims = array_append(timed_out_claims, $2) \
          WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Timestamptz, _>(started_at)
-    .bind::<diesel::sql_types::Integer, _>(TIMED_OUT_CLAIMS_KEPT)
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -2854,9 +2846,8 @@ pub(crate) async fn record_timed_out_claim(
 /// at `started_at`, and remove that record (issue #1809).
 ///
 /// Only the owner of the claim calls this, once, after it loses the claim.
-/// The removal frees the slot, so the cap of [`TIMED_OUT_CLAIMS_KEPT`] cannot
-/// evict the record of a slow owner. Any other loss of the claim, and a
-/// failed write, is not a timeout.
+/// The removal keeps the list to owners that have not settled. Any other
+/// loss of the claim, and a failed write, is not a timeout.
 pub(crate) async fn take_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
