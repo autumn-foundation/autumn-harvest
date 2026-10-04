@@ -27,8 +27,10 @@ Design decisions:
 - The abort is a compare-and-swap on the queue, both builds and the step, on
   every shard pool. It cannot clear a newer ramp or a newer step. A failed
   pool clear stays pending, and the next pass retries it with no new verdict.
-  After a restart, the guard finishes a partial clear that the audit log
-  records. A clear has a server-side timeout, so it cannot commit late.
+  The clear also sets the durable marker `ramp_aborted_target` in the same
+  UPDATE. After a restart, the guard uses the marker to finish a partial
+  clear. A clear has a server-side timeout, so it cannot commit late. After a
+  cancel, a pass starts no new clear.
 - A replica reports an abort only after it cleared a pool itself, and not
   when it lost the first pool's clear to another replica.
 - The guard fails safe. A failed or slow read aborts nothing. Every read and
@@ -36,8 +38,10 @@ Design decisions:
 
 Migration `20261003212318_harvest_ramp_guard_outcome_index` adds the partial
 index `idx_harvest_we_ramp_guard_outcome` on `harvest_workflow_executions
-(queue_name, assigned_build_id, created_at)`. It is index-only: no column
-change, no data migration, no `WorkflowEvent` variant and no replay impact.
+(queue_name, assigned_build_id, created_at)`. Migration
+`20261003235300_harvest_build_policy_ramp_aborted_target` adds the nullable
+column `harvest_build_policies.ramp_aborted_target`. Neither migrates data,
+adds a `WorkflowEvent` variant or affects replay.
 
 `build_id` label: five families now carry the build of the worker that ran
 the task. They are `harvest.workflow.terminal`, `harvest.activity.attempts`,

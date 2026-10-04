@@ -171,12 +171,16 @@ The guard fails safe: when it cannot read, it does not abort.
 - When no clear of a pass succeeds, the guard reports nothing yet. It reports
   the abort when a retry clears a pool.
 - A failed audit write logs a warning and does not undo the clear.
-- A guard keeps its pending clears in memory. After a restart, the guard
-  finds a split ramp: one pool holds the ramp, and another pool has the same
-  queue and base build with no ramp. When the audit log holds an abort of
-  that ramp since its step, the guard clears the other pools with no new
-  verdict and no new audit row. A split ramp with no such row stays, and the
-  guard judges it as usual.
+- A guard keeps its pending clears in memory. Each finished clear also sets
+  the abort marker `harvest_build_policies.ramp_aborted_target` in the same
+  `UPDATE`, so the marker cannot be lost. After a restart, a pool can still
+  hold a ramp while another pool holds a marker for it. When the marker is
+  newer than every step of the ramp, the guard clears the ramp with no new
+  verdict and no new audit row. An operator ramp set after the abort is newer
+  than the marker, so the guard does not clear it.
+- After a cancel, a pass lets the clear in flight finish and starts no new
+  clear. Shutdown therefore waits for one bounded clear at most, plus the
+  audit write of a clear that the pass made.
 
 ## `build_id` metric label
 

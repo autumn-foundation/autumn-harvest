@@ -547,6 +547,10 @@ diesel::table! {
         updated_at -> Timestamptz,
         target_build_id -> Nullable<Text>,
         ramp_percent -> Nullable<Integer>,
+        /// The target build that the ramp guard last aborted (issue #1814).
+        /// The guard's clear sets it, so a later guard can finish a partial
+        /// clear. NULL = no guard abort.
+        ramp_aborted_target -> Nullable<Text>,
     }
 }
 

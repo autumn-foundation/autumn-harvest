@@ -375,11 +375,13 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
 ///
 /// The binds are the queue, the base build, the target build and the step
 /// start. The row must still hold the same step, so a verdict about an old
-/// step cannot clear a new one.
+/// step cannot clear a new one. The same UPDATE sets the durable abort marker
+/// `ramp_aborted_target`, so the marker commits with the clear.
 #[must_use]
 pub const fn abort_ramp_query() -> &'static str {
     "UPDATE harvest_build_policies \
-     SET target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
+     SET ramp_aborted_target = target_build_id, \
+         target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
      WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
        AND updated_at = $4"
 }
@@ -458,21 +460,25 @@ struct ObservedRamp {
     /// The pool index and the step of each pool that holds the ramp, in
     /// pool order.
     steps: Vec<(usize, chrono::DateTime<chrono::Utc>)>,
-    /// `true` when another pool has the same queue and base build with no
-    /// ramp. That is the trace of a partial clear.
-    split: bool,
+    /// `true` when another pool holds a guard abort marker for this ramp
+    /// that is newer than every step of the ramp. That is the trace of a
+    /// partial clear.
+    abort_marked: bool,
 }
 
-/// What one pool holds: its active ramps, and the queue and base build of
-/// each policy with no ramp.
+/// A guard abort marker on one pool: the ramp it cleared, and when.
 #[cfg(feature = "db")]
-type PoolRead = (Vec<PoolRamp>, Vec<(String, String)>);
+type AbortMarker = (RampKey, chrono::DateTime<chrono::Utc>);
+
+/// What one pool holds: its active ramps and its guard abort markers.
+#[cfg(feature = "db")]
+type PoolRead = (Vec<PoolRamp>, Vec<AbortMarker>);
 
 /// Read the outcome counts of the two builds of one ramp step on one pool.
 #[cfg(feature = "db")]
 async fn read_step_stats(
     conn: &mut diesel_async::AsyncPgConnection,
-    policy: &crate::build_routing::BuildPolicy,
+    policy: &PolicyRow,
     target: &str,
 ) -> crate::error::HarvestResult<(BuildOutcomeStats, BuildOutcomeStats)> {
     use diesel::sql_types::{BigInt, Text, Timestamptz};
@@ -521,7 +527,25 @@ async fn read_step_stats(
     Ok((base, target_stats))
 }
 
-/// Read every active ramp and its step counts on one pool.
+/// The policy columns that the guard reads.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PolicyRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    build_id: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    updated_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    target_build_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    ramp_percent: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    ramp_aborted_target: Option<String>,
+}
+
+/// Read every active ramp, its step counts and every abort marker on one pool.
 ///
 /// The reads run in one read-only transaction with `statement_timeout` set to
 /// `bound`, so the server stops a slow scan too. A ramp to its own base build
@@ -542,14 +566,26 @@ async fn read_pool_ramps(
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
-            let policies = crate::build_routing::list_build_policies(conn).await?;
+            let policies: Vec<PolicyRow> = diesel::sql_query(
+                "SELECT queue_name, build_id, updated_at, target_build_id, ramp_percent, \
+                        ramp_aborted_target \
+                 FROM harvest_build_policies ORDER BY queue_name",
+            )
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
             let mut ramps = Vec::new();
-            let mut unramped = Vec::new();
+            let mut markers = Vec::new();
             for policy in policies {
                 let (Some(target), Some(percent)) =
                     (policy.target_build_id.clone(), policy.ramp_percent)
                 else {
-                    unramped.push((policy.queue_name.clone(), policy.build_id.clone()));
+                    if policy.target_build_id.is_none()
+                        && let Some(aborted) = policy.ramp_aborted_target.clone()
+                    {
+                        let key = (policy.queue_name.clone(), policy.build_id.clone(), aborted);
+                        markers.push((key, policy.updated_at));
+                    }
                     continue;
                 };
                 if percent <= 0 || target == policy.build_id {
@@ -564,7 +600,7 @@ async fn read_pool_ramps(
                     target: target_stats,
                 });
             }
-            Ok((ramps, unramped))
+            Ok((ramps, markers))
         })
         .await
 }
@@ -572,8 +608,11 @@ async fn read_pool_ramps(
 /// Read every active ramp on every pool and merge the counts per ramp.
 ///
 /// The pools are read at the same time. Returns `None` when any read fails,
-/// so a pass never decides on part of the fleet. A ramp is `split` when
-/// another pool has its queue and base build with no ramp.
+/// so a pass never decides on part of the fleet.
+///
+/// A ramp is `abort_marked` when a pool holds a guard abort marker for it,
+/// and the marker is newer than every step of the ramp. An operator ramp set
+/// after the abort is newer than the marker, so it is not marked.
 #[cfg(feature = "db")]
 async fn read_ramps(
     pools: &[crate::worker::DbPool],
@@ -582,14 +621,14 @@ async fn read_ramps(
     let reads = pools.iter().map(|pool| read_pool_ramps(pool, bound));
     let mut merged: std::collections::BTreeMap<RampKey, ObservedRamp> =
         std::collections::BTreeMap::new();
-    let mut unramped: std::collections::BTreeSet<(String, String)> =
-        std::collections::BTreeSet::new();
+    let mut markers: std::collections::BTreeMap<RampKey, chrono::DateTime<chrono::Utc>> =
+        std::collections::BTreeMap::new();
     for (index, result) in futures::future::join_all(reads)
         .await
         .into_iter()
         .enumerate()
     {
-        let (ramps, pool_unramped) = match result {
+        let (ramps, pool_markers) = match result {
             Ok(read) => read,
             Err(error) => {
                 tracing::warn!(pool = index, error = %error, "ramp guard read failed; no verdict this pass");
@@ -603,10 +642,17 @@ async fn read_ramps(
             slot.target = slot.target.plus(ramp.target);
             slot.steps.push((index, ramp.step));
         }
-        unramped.extend(pool_unramped);
+        for (key, at) in pool_markers {
+            let slot = markers.entry(key).or_insert(at);
+            *slot = (*slot).max(at);
+        }
     }
-    for ((queue, base, _), ramp) in &mut merged {
-        ramp.split = unramped.contains(&(queue.clone(), base.clone()));
+    for (key, ramp) in &mut merged {
+        let newest_step = ramp.steps.iter().map(|&(_, step)| step).max();
+        ramp.abort_marked = matches!(
+            (markers.get(key), newest_step),
+            (Some(marked_at), Some(step)) if *marked_at >= step
+        );
     }
     Some(merged)
 }
@@ -662,65 +708,9 @@ async fn clear_on_pool(
 }
 
 /// The part of an abort's audit summary that names its two builds.
-///
-/// [`abort_recorded_since`] finds an abort row by this text, so both use this
-/// one function.
 #[cfg(feature = "db")]
 fn abort_summary_tag(target: &str, base: &str) -> String {
     format!("target_build={target} base_build={base} ")
-}
-
-/// `true` when the audit log holds an abort of the ramp `key` since `since`.
-///
-/// A failed or slow read returns `false`, so the guard then judges the ramp
-/// as usual.
-#[cfg(feature = "db")]
-async fn abort_recorded_since(
-    audit_pool: &crate::worker::DbPool,
-    key: &RampKey,
-    since: chrono::DateTime<chrono::Utc>,
-    bound: Duration,
-) -> bool {
-    use diesel::sql_types::{Bool, Text, Timestamptz};
-    use diesel_async::RunQueryDsl;
-
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = Bool)]
-        found: bool,
-    }
-
-    let (queue, base, target) = key;
-    let read = async {
-        let mut conn = audit_pool.get().await.map_err(|e| e.to_string())?;
-        diesel::sql_query(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM harvest_audit_log \
-                 WHERE target_type = $1 AND target_id = $2 AND operation = $3 \
-                   AND occurred_at >= $4 \
-                   AND position($5 IN COALESCE(error_summary, '')) > 0 \
-             ) AS found",
-        )
-        .bind::<Text, _>(crate::audit::TARGET_BUILD_ROUTING)
-        .bind::<Text, _>(queue)
-        .bind::<Text, _>(crate::audit::OP_BUILD_RAMP_AUTO_ABORT)
-        .bind::<Timestamptz, _>(since)
-        .bind::<Text, _>(abort_summary_tag(target, base))
-        .get_result::<Row>(&mut conn)
-        .await
-        .map_err(|e| e.to_string())
-    };
-    match tokio::time::timeout(bound, read).await {
-        Ok(Ok(row)) => row.found,
-        Ok(Err(error)) => {
-            tracing::warn!(queue = %queue, error = %error, "ramp guard audit lookup failed");
-            false
-        }
-        Err(_) => {
-            tracing::warn!(queue = %queue, "ramp guard audit lookup timed out");
-            false
-        }
-    }
 }
 
 /// Write the audit row of one abort, within `bound`.
@@ -939,7 +929,9 @@ impl RampGuard {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<RampAbort> {
         let bound = self.bound();
-        let mut aborts = self.retry_pending(pools, audit_pool, metrics, bound).await;
+        let mut aborts = self
+            .retry_pending(pools, audit_pool, metrics, bound, cancel)
+            .await;
 
         let read = tokio::select! {
             () = cancel.cancelled() => return aborts,
@@ -957,11 +949,9 @@ impl RampGuard {
             if self.pending.contains_key(&key) {
                 continue;
             }
-            if ramp.split
-                && self
-                    .finish_recorded_abort(pools, audit_pool, &key, &ramp, bound)
-                    .await
-            {
+            if ramp.abort_marked {
+                self.finish_marked_abort(pools, &key, &ramp, bound, cancel)
+                    .await;
                 continue;
             }
             let RampVerdict::Abort {
@@ -988,7 +978,16 @@ impl RampGuard {
                 incomplete: false,
             };
             if let Some(abort) = self
-                .abort(pools, audit_pool, metrics, key, &ramp.steps, abort, bound)
+                .abort(
+                    pools,
+                    audit_pool,
+                    metrics,
+                    key,
+                    &ramp.steps,
+                    abort,
+                    bound,
+                    cancel,
+                )
                 .await
             {
                 aborts.push(abort);
@@ -1008,11 +1007,18 @@ impl RampGuard {
         steps: &[(usize, chrono::DateTime<chrono::Utc>)],
         mut abort: RampAbort,
         bound: Duration,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<RampAbort> {
         let mut outcomes = Vec::with_capacity(steps.len());
         let mut failed: Vec<PendingStep> = Vec::new();
         for &(index, step) in steps {
-            let outcome = clear_on_pool(&pools[index], index, &key, step, bound).await;
+            // A cancel lets the clear in flight finish and starts no new one.
+            // The skipped pool counts as a failed clear.
+            let outcome = if cancel.is_cancelled() {
+                ClearOutcome::Failed
+            } else {
+                clear_on_pool(&pools[index], index, &key, step, bound).await
+            };
             if matches!(outcome, ClearOutcome::Failed | ClearOutcome::Ambiguous) {
                 failed.push((index, step, outcome == ClearOutcome::Ambiguous));
             }
@@ -1038,34 +1044,33 @@ impl RampGuard {
         Some(abort)
     }
 
-    /// Finish a partial clear that the audit log records, with no new verdict.
+    /// Finish a partial clear that an abort marker records, with no new
+    /// verdict.
     ///
     /// A guard can stop after it cleared some pools of an abort, for example
     /// in a restart. The other pools then still hold the ramp, and their own
-    /// counts can be too few for a verdict. The audit row of the abort is
-    /// durable. When it exists for this ramp since the step, the guard clears
-    /// the other pools too and writes no new audit row. Returns `true` when
-    /// such a row exists.
-    async fn finish_recorded_abort(
+    /// counts can be too few for a verdict. The clear of each cleared pool set
+    /// its abort marker in the same UPDATE, so the marker is durable. The
+    /// guard clears the other pools too. It writes no new audit row, because
+    /// the guard that cleared the first pool reported the abort.
+    async fn finish_marked_abort(
         &mut self,
         pools: &[crate::worker::DbPool],
-        audit_pool: &crate::worker::DbPool,
         key: &RampKey,
         ramp: &ObservedRamp,
         bound: Duration,
-    ) -> bool {
-        let Some(since) = ramp.steps.iter().map(|&(_, step)| step).min() else {
-            return false;
-        };
-        if !abort_recorded_since(audit_pool, key, since, bound).await {
-            return false;
-        }
+        cancel: &tokio_util::sync::CancellationToken,
+    ) {
         let mut failed: Vec<PendingStep> = Vec::new();
         for &(index, step) in &ramp.steps {
+            if cancel.is_cancelled() {
+                failed.push((index, step, false));
+                continue;
+            }
             let outcome = clear_on_pool(&pools[index], index, key, step, bound).await;
             match outcome {
                 ClearOutcome::Cleared => {
-                    tracing::info!(queue = %key.0, pool = index, "ramp guard finished a recorded abort");
+                    tracing::info!(queue = %key.0, pool = index, "ramp guard finished a marked abort");
                 }
                 ClearOutcome::Lost => {}
                 ClearOutcome::Failed | ClearOutcome::Ambiguous => {
@@ -1082,12 +1087,12 @@ impl RampGuard {
                 },
             );
         }
-        true
     }
 
     /// Retry the clears that an earlier pass could not finish.
     ///
     /// A pool leaves the list when its clear succeeds or when its row changed.
+    /// After a cancel, the retry starts no new clear.
     /// An abort that no clear of this guard had changed yet is reported once a
     /// retry clears a pool. Returns those reports.
     async fn retry_pending(
@@ -1096,6 +1101,7 @@ impl RampGuard {
         audit_pool: &crate::worker::DbPool,
         metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
         bound: Duration,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<RampAbort> {
         let mut reported = Vec::new();
         let pending = std::mem::take(&mut self.pending);
@@ -1106,6 +1112,13 @@ impl RampGuard {
                 let Some(pool) = pools.get(index) else {
                     continue;
                 };
+                // A cancel lets the clear in flight finish and starts no new
+                // one. The skipped pool stays pending.
+                if cancel.is_cancelled() {
+                    still_failed.push((index, step, was_ambiguous));
+                    outcomes.push(ClearOutcome::Failed);
+                    continue;
+                }
                 let raw = clear_on_pool(pool, index, &key, step, bound).await;
                 let outcome = retry_outcome(raw, was_ambiguous);
                 match outcome {
@@ -1169,10 +1182,11 @@ pub async fn guard_once(
 /// Run guard passes every `config.interval()` until `cancel` fires.
 ///
 /// Returns at once when the config is disabled. A cancel stops a pass during
-/// its read, which has no side effects. A pass that has started to clear
-/// runs to its end, so a clear and its audit row are not split. Each write
-/// has a bound, so the end is near. An overdue tick fires at once, and the
-/// next tick comes one interval after it.
+/// its read, which has no side effects. After a cancel, a pass lets the clear
+/// in flight finish and starts no new clear. It still writes the audit row of
+/// a clear that it made, within its bound. A clear that it skipped stays
+/// recoverable, because each finished clear set its abort marker. An overdue
+/// tick fires at once, and the next tick comes one interval after it.
 #[cfg(feature = "db")]
 pub async fn run_ramp_guard(
     pools: Vec<crate::worker::DbPool>,

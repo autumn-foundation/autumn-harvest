@@ -1192,6 +1192,9 @@ pub struct HarvestBuildPolicy {
     pub target_build_id: Option<String>,
     /// Ramp percentage 0..=100 (issue #604). `None` = no ramp configured.
     pub ramp_percent: Option<i32>,
+    /// The target build that the ramp guard last aborted (issue #1814).
+    /// `None` = no guard abort.
+    pub ramp_aborted_target: Option<String>,
 }
 
 /// Insert struct for a new build policy.

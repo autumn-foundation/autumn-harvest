@@ -897,30 +897,11 @@ async fn a_blocked_clear_fails_on_the_server_and_changes_nothing() {
     );
 }
 
-/// Insert the audit row that a guard writes when it aborts the test ramp.
-async fn record_auto_abort(conn: &mut AsyncPgConnection) {
-    diesel::sql_query(
-        "INSERT INTO harvest_audit_log \
-             (id, actor, operation, target_type, target_id, route_or_command, status, \
-              error_summary, source) \
-         VALUES ($1, 'system', 'build_routing.ramp.auto_abort', 'build_routing', $2, \
-                 'background.ramp_guard', 'failed', $3, 'api')",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
-    .bind::<Text, _>(QUEUE)
-    .bind::<Text, _>(format!(
-        "reason=failure_rate target_build={BUILD_B} base_build={BUILD_A} ramp_percent=10; \
-         clear pending on pools 1"
-    ))
-    .execute(conn)
-    .await
-    .expect("insert audit row");
-}
-
-/// After a restart, a ramp that one pool still holds from a recorded abort is
-/// cleared with no new verdict and no new audit row.
+/// After a restart, a ramp that one pool still holds is cleared when another
+/// pool holds the abort marker. The marker commits with the clear, so this
+/// works with no audit row at all.
 #[tokio::test]
-async fn a_restarted_guard_finishes_a_recorded_partial_abort() {
+async fn a_restarted_guard_finishes_a_marked_partial_abort() {
     let (url_1, _c1) = setup().await;
     let (url_2, _c2) = setup().await;
     let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
@@ -933,7 +914,7 @@ async fn a_restarted_guard_finishes_a_recorded_partial_abort() {
     set_ramp(&mut conn_1).await;
     set_ramp(&mut conn_2).await;
 
-    // The old guard cleared pool 1, audited the abort, then stopped.
+    // The old guard cleared pool 1, then stopped before its audit write.
     let step_1 = get_build_policy(&mut conn_1, QUEUE)
         .await
         .expect("read policy")
@@ -944,27 +925,64 @@ async fn a_restarted_guard_finishes_a_recorded_partial_abort() {
             .await
             .expect("clear pool 1")
     );
-    record_auto_abort(&mut conn_1).await;
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no audit row");
 
     // Pool 2 alone has no runs, so a verdict is impossible. A new guard
-    // still finishes the clear from the audit row.
+    // still finishes the clear from the marker.
     let pools = [pool_1.clone(), pool_2.clone()];
     let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
     assert!(
         aborts.is_empty(),
-        "the abort was already reported: {aborts:?}"
+        "a finished clear reports nothing: {aborts:?}"
     );
     assert!(!ramp_is_active(&mut conn_2).await, "pool 2 is cleared");
     assert_eq!(
         auto_abort_audit_rows(&mut conn_1).await,
-        1,
+        0,
         "no new audit row"
     );
 }
 
-/// A split ramp with no recorded abort is not cleared.
+/// An operator ramp set after a guard abort is newer than the marker, so the
+/// marker does not clear it.
 #[tokio::test]
-async fn a_split_ramp_without_a_recorded_abort_stays() {
+async fn an_abort_marker_older_than_the_ramp_step_does_not_clear_it() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    set_ramp(&mut conn_1).await;
+    let step_1 = get_build_policy(&mut conn_1, QUEUE)
+        .await
+        .expect("read policy")
+        .expect("policy exists")
+        .updated_at;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // The operator ramps the same target again, but only pool 2 takes it.
+    set_ramp(&mut conn_2).await;
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "the newer operator ramp stays"
+    );
+}
+
+/// A split ramp with no abort marker is not cleared.
+#[tokio::test]
+async fn a_split_ramp_without_an_abort_marker_stays() {
     let (url_1, _c1) = setup().await;
     let (url_2, _c2) = setup().await;
     let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
@@ -984,6 +1002,6 @@ async fn a_split_ramp_without_a_recorded_abort_stays() {
     assert!(aborts.is_empty(), "{aborts:?}");
     assert!(
         ramp_is_active(&mut conn_2).await,
-        "no audit row, so the ramp stays"
+        "no marker, so the ramp stays"
     );
 }
