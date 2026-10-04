@@ -170,6 +170,9 @@ fn cohort(queue: &str) -> String {
         session_slots: 0,
         priority_aging_secs: None,
         ineligible_activities: &[],
+        shard_assignments: &[],
+        registered_workflows: &[],
+        registered_activities: &[],
     })
 }
 
@@ -624,6 +627,9 @@ async fn a_long_cohort_key_still_stores() {
         session_slots: 0,
         priority_aging_secs: None,
         ineligible_activities: &[],
+        shard_assignments: &[],
+        registered_workflows: &[],
+        registered_activities: &[],
     });
     assert!(key.len() > 10_000, "the key is long: {}", key.len());
     workers::upsert_worker_task_stats(&mut conn, &id, &key, &WorkerTaskStats::default())

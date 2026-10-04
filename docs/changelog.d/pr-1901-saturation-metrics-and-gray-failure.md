@@ -53,7 +53,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - The peers are the live `Active` workers that poll the same queues with the
   same `queue_weights`, on the same build with the same labels and the same
   slots per task kind (or the same slot-tuner band), session capacity,
-  priority aging and activity eligibility, with fresh stats. The cohort is
+  priority aging, activity eligibility, shards and registered handlers, with
+  fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A
   worker on a slow queue is not compared with a fast queue. Each heartbeat
   reads only its own cohort, so the read stays small in a large fleet.

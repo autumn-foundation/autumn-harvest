@@ -901,6 +901,9 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         session_slots,
         priority_aging_secs,
         ineligible_activities,
+        shard_assignments,
+        registered_workflows,
+        registered_activities,
     } = *policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -917,9 +920,12 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let mut ineligible: Vec<&str> = ineligible_activities.iter().map(String::as_str).collect();
-    ineligible.sort_unstable();
-    ineligible.dedup();
+    let mut shards: Vec<i32> = shard_assignments
+        .iter()
+        .map(|shard| shard.as_i32())
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
     serde_json::json!({
         "queues": routing,
         "build_id": build_id,
@@ -927,9 +933,20 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "slots": slots.key(),
         "sessions": session_slots.max(0),
         "priority_aging_secs": priority_aging_secs,
-        "ineligible_activities": ineligible,
+        "ineligible_activities": sorted_names(ineligible_activities),
+        "shards": shards,
+        "workflows": sorted_names(registered_workflows),
+        "activities": sorted_names(registered_activities),
     })
     .to_string()
+}
+
+/// `names`, sorted and deduplicated, for a cohort key.
+fn sorted_names(names: &[String]) -> Vec<&str> {
+    let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// The settings that decide which tasks a worker can claim, and in which mix
@@ -959,6 +976,13 @@ pub struct CohortPolicy<'a> {
     /// Activities the worker does not claim, because its labels do not meet
     /// their requirements.
     pub ineligible_activities: &'a [String],
+    /// The shards the worker claims from. Each shard holds its own tasks.
+    pub shard_assignments: &'a [crate::types::ShardId],
+    /// The workflows the worker has handlers for. A task without a handler is
+    /// released, so it never counts.
+    pub registered_workflows: &'a [String],
+    /// The activities the worker has handlers for.
+    pub registered_activities: &'a [String],
 }
 
 /// How a worker sizes its slots per task kind, as its cohort key records it
@@ -2893,6 +2917,9 @@ mod tests {
             session_slots: 0,
             priority_aging_secs: None,
             ineligible_activities: &[],
+            shard_assignments: &[],
+            registered_workflows: &[],
+            registered_activities: &[],
         })
     }
 
@@ -2914,6 +2941,9 @@ mod tests {
                 session_slots: 0,
                 priority_aging_secs: None,
                 ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
             })
         };
         assert_ne!(slots(10, 0), slots(0, 10));
@@ -2940,6 +2970,9 @@ mod tests {
                 session_slots: n,
                 priority_aging_secs: None,
                 ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
             })
         };
         assert_ne!(sessions(0), sessions(4));
@@ -2972,12 +3005,57 @@ mod tests {
                 session_slots: 0,
                 priority_aging_secs: aging,
                 ineligible_activities: ineligible,
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
             })
         };
         assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
         assert_ne!(cohort(Some(30), &[]), cohort(Some(60), &[]));
         assert_ne!(cohort(None, &[]), cohort(None, &gpu));
         assert_eq!(cohort(None, &gpu), cohort(None, &gpu_reordered));
+    }
+
+    /// Issue #1815: workers on other shards, or with other handlers, claim or
+    /// complete other tasks, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_shards_and_handlers() {
+        use crate::types::ShardId;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let cohort = |shards: &[ShardId], workflows: &[String], activities: &[String]| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: shards,
+                registered_workflows: workflows,
+                registered_activities: activities,
+            })
+        };
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let (one, two) = ([ShardId::new(1)], [ShardId::new(2)]);
+        let both = [ShardId::new(2), ShardId::new(1)];
+        assert_ne!(cohort(&one, &[], &[]), cohort(&two, &[], &[]));
+        assert_eq!(
+            cohort(&both, &[], &[]),
+            cohort(&[ShardId::new(1), ShardId::new(2)], &[], &[]),
+            "shard order does not matter"
+        );
+        assert_ne!(
+            cohort(&one, &names(&["order"]), &[]),
+            cohort(&one, &names(&["order", "refund"]), &[])
+        );
+        assert_ne!(
+            cohort(&one, &[], &names(&["charge"])),
+            cohort(&one, &[], &names(&["charge", "render"]))
+        );
     }
 
     /// Issue #1815: a slot tuner clamps the configured maximums into its band
@@ -3026,6 +3104,9 @@ mod tests {
                 session_slots: 0,
                 priority_aging_secs: None,
                 ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
             })
         };
         assert_ne!(slots(100, 1), slots(1, 100));

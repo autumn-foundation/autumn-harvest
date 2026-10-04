@@ -15524,6 +15524,9 @@ async fn process_activity_task(
     task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
     pool_shard: u16,
 ) -> HarvestResult<()> {
+    // Issue #1815: the outlier window times an attempt from here, so a slow
+    // setup write or pool checkout is part of the sample.
+    let outlier_clock = std::time::Instant::now();
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         return fail_task_only(&mut conn, task.id, "activity task missing workflow_exec_id").await;
@@ -15543,7 +15546,6 @@ async fn process_activity_task(
     // stub that must never actually run.
     // Issue #1815: a reserved session activity counts in the outlier window
     // when it finalizes or fails, as any activity does, with its duration.
-    let session_started = std::time::Instant::now();
     let session_result = if activity_name == crate::context::SESSION_ACQUIRE_ACTIVITY_NAME {
         Some(
             handle_session_acquire(
@@ -15575,7 +15577,7 @@ async fn process_activity_task(
     };
     if let Some(result) = session_result {
         if let Some(failed) = session_task_outcome(&result) {
-            task_outcomes.record(failed, session_started.elapsed());
+            task_outcomes.record(failed, outlier_clock.elapsed());
         }
         return result.map(|_| ());
     }
@@ -15837,7 +15839,6 @@ async fn process_activity_task(
             &task.queue_name,
             ActivityStatus::Failed,
         );
-        let rejected_at = std::time::Instant::now();
         let finalized = async {
             let mut conn = pool.get().await.map_err(crate::error::database_error)?;
             let retry_policy_result = configured_retry_policy(task);
@@ -15873,7 +15874,7 @@ async fn process_activity_task(
         // any attempt.
         let write = finalize_write_for_outcome(&finalized);
         if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write) {
-            task_outcomes.record(failed, rejected_at.elapsed());
+            task_outcomes.record(failed, outlier_clock.elapsed());
         }
         return finalized.map(|_| ());
     }
@@ -16251,7 +16252,7 @@ async fn process_activity_task(
     let record_outcome = |finalized: Option<queue::ClaimWrite>| {
         if let Some(failed) = activity_attempt_outcome(status, was_cancelled, finalized) {
             // Through finalization: a slow persist path is part of the attempt.
-            task_outcomes.record(failed, attempt_clock_start.elapsed());
+            task_outcomes.record(failed, outlier_clock.elapsed());
         }
     };
     // Parse the structured payload once and reuse for both the histogram
@@ -30556,6 +30557,9 @@ impl Worker {
         // own slot.
         shard_slot: usize,
     ) -> tokio::task::JoinHandle<()> {
+        // Issue #1815: the cohort key carries the handler names.
+        let registered_workflows: Vec<String> = self.registry.workflows.keys().cloned().collect();
+        let registered_activities: Vec<String> = self.registry.activities.keys().cloned().collect();
         // Spawn the heartbeat background task with a dedicated cancel token so
         // that liveness updates continue during the Draining phase and only stop
         // after the Stopped transition is written.
@@ -30619,6 +30623,9 @@ impl Worker {
                     session_slots: self.config.max_concurrent_sessions,
                     priority_aging_secs: self.config.priority_aging_secs,
                     ineligible_activities: &self.ineligible_activities,
+                    shard_assignments: &self.config.shard_assignments,
+                    registered_workflows: &registered_workflows,
+                    registered_activities: &registered_activities,
                 }),
                 compare: true,
                 slot: shard_slot,
