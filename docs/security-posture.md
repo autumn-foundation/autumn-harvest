@@ -704,7 +704,8 @@ Load each data key once, at startup, through a `KeyProvider`:
 | `FileKeyProvider` | `<dir>/<key_id>.key` that holds base64, for example a secret volume. |
 | `KmsKeyProvider` | A wrapped data key that a KMS unwraps (envelope encryption). |
 
-The `aws-kms` feature implements `KmsDecrypt` for `aws_sdk_kms::Client`. To
+The `autumn-harvest-plugin` `aws-kms` feature adds `aws_kms::AwsKms`, which
+implements `KmsDecrypt` for AWS KMS. The core crate has no cloud dependency. To
 make a wrapped key, call `GenerateDataKey` with the codec key id as the
 encryption context:
 
@@ -720,8 +721,9 @@ unwrap the key under another key id or another KMS key.
 
 ```rust,ignore
 use autumn_harvest::aead_codec::{AeadCodec, KmsKeyProvider};
+use autumn_harvest_plugin::aws_kms::AwsKms;
 
-let kms = aws_sdk_kms::Client::new(&aws_config::load_from_env().await);
+let kms = AwsKms::new(aws_sdk_kms::Client::new(&aws_config::load_from_env().await));
 let wrapped = std::fs::read_to_string("2026-10.wrapped.b64")?;
 let keys = KmsKeyProvider::new(kms, kms_key_arn).with_wrapped_key_base64("2026-10", &wrapped)?;
 let harvest = HarvestBuilder::new()

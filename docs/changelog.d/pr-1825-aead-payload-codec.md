@@ -13,8 +13,10 @@ rotate. This adds one.
   startup. `EnvKeyProvider` reads base64 from a mapped environment variable.
   `FileKeyProvider` reads `<dir>/<key_id>.key`. `KmsKeyProvider` unwraps a
   wrapped data key through the one-method `KmsDecrypt` trait, with the codec
-  key id as the encryption context. The new `aws-kms` feature implements
-  `KmsDecrypt` for `aws_sdk_kms::Client`. It is off by default.
+  key id as the encryption context. The new `autumn-harvest-plugin`
+  `aws-kms` feature adds `aws_kms::AwsKms`, which implements `KmsDecrypt`
+  for AWS KMS. It is off by default. The core crate keeps zero cloud
+  dependencies, as `connector_dependency_graph` requires (issue #944).
 - **Key hygiene.** `DataKey` is boxed and zeroized on drop. The `aes`,
   `ghash` and `polyval` `zeroize` features clear the cipher state. `Debug`
   output and errors never print key bytes or plaintext.

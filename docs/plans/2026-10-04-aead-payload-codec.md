@@ -20,7 +20,8 @@ Status: implementation plan (TDD: red, green, refactor).
 7. **A KMS provider hard-wired to the AWS SDK.** Rejected. It cannot be tested without
    AWS.
 8. **A one-method `KmsDecrypt` trait.** Chosen. A fake proves the provider offline. The
-   AWS binding sits behind the `aws-kms` feature.
+   AWS binding sits behind the plugin crate's `aws-kms` feature. The core crate keeps
+   zero cloud dependencies (the issue #944 rule).
 9. **A new rotation path for the AEAD codec.** Rejected. One `AeadCodec` per key id goes
    into the existing keyed registry. The issue #948 sweep then re-encrypts with no
    change.
@@ -91,7 +92,7 @@ The associated data is bytes `[0..2+n]`.
 - `EnvKeyProvider` — key id to environment variable, base64 value.
 - `FileKeyProvider` — `<dir>/<key_id>.key`, base64 content.
 - `KmsDecrypt` and `KmsKeyProvider<D>` — unwraps a wrapped data key once.
-- `aws-kms` feature — `impl KmsDecrypt for aws_sdk_kms::Client`.
+- `autumn-harvest-plugin` `aws-kms` feature — `aws_kms::AwsKms` implements `KmsDecrypt`.
 - `HarvestBuilder::aead_payload_codec_key(codec)`.
 
 ### 4.3 Tests mapped to acceptance criteria

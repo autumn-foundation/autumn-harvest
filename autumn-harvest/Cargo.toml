@@ -73,15 +73,6 @@ hot-code-swap = ["wasm-activities"]
 # const-check when this feature is off, so a non-chaos build has no hot-path
 # cost (AC2/AC6). Requires `db` (the reproducers drive real Postgres paths).
 chaos = ["db"]
-# AWS KMS binding for the AEAD payload codec key provider (issue #1825).
-# Off by default. Without it, `KmsKeyProvider` still accepts any `KmsDecrypt`.
-#
-# This feature brings in `aws-lc-rs`, which needs cmake and a C compiler. It
-# also turns on rustls's `aws_lc_rs` provider beside `ring`. Every rustls
-# config in this crate must therefore name its provider, as `pg_tls.rs` does.
-# The locked `aws-sdk-kms` 1.99.0 needs Rust 1.88, so the effective MSRV does
-# not rise at the locked version. A newer 1.x can need a newer Rust.
-aws-kms = ["dep:aws-sdk-kms"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.6.0", path = "../autumn-harvest-macros" }
@@ -152,9 +143,6 @@ schemars = { version = "0.8", optional = true }
 # propagates to downstream consumers, only the manifest constraint does).
 wasmtime = { version = "48.0.4", optional = true }
 wat = { version = "1", optional = true }
-# The `aws-kms` feature. Same feature choice as the plugin's `aws-sdk-sqs`:
-# `default-https-client` avoids the legacy hyper-0.14 TLS stack.
-aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 
 [[test]]
 name = "integration"

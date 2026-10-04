@@ -12,7 +12,8 @@
 //! - [`EnvKeyProvider`] reads a base64 key from an environment variable.
 //! - [`FileKeyProvider`] reads a base64 key from `<dir>/<key_id>.key`.
 //! - [`KmsKeyProvider`] unwraps a wrapped data key through a KMS. The
-//!   `aws-kms` feature connects it to AWS KMS.
+//!   `autumn-harvest-plugin` `aws-kms` feature connects it to AWS KMS. This
+//!   crate has no cloud dependency.
 //!
 //! ## Rotation
 //!
@@ -51,7 +52,9 @@ use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use base64::Engine as _;
 use rand::RngCore as _;
-use zeroize::Zeroizing;
+/// Re-exported so that a [`KmsDecrypt`] implementation needs no direct
+/// `zeroize` dependency.
+pub use zeroize::Zeroizing;
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::payload_codec::{CodecError, PayloadCodec, PayloadCodecs, validate_key_id};
@@ -489,9 +492,9 @@ impl KeyProvider for FileKeyProvider {
 
 /// The one KMS call that [`KmsKeyProvider`] needs.
 ///
-/// The `aws-kms` feature implements this for `aws_sdk_kms::Client`. Other
-/// KMS products can implement it too. Implement it with `#[async_trait]`, as
-/// for [`KeyProvider`].
+/// The `autumn-harvest-plugin` `aws-kms` feature implements this for AWS
+/// KMS. Other KMS products can implement it too. Implement it with
+/// `#[async_trait]`, as for [`KeyProvider`].
 pub trait KmsDecrypt: Send + Sync {
     /// Unwrap `wrapped` with the KMS key `kms_key_id`. Send `context` as
     /// the encryption context.
@@ -593,36 +596,6 @@ impl<D: KmsDecrypt> KeyProvider for KmsKeyProvider<D> {
                 reason,
             })?;
         DataKey::from_bytes(&plaintext).map_err(|err| invalid_key(key_id, err))
-    }
-}
-
-/// AWS KMS binding for [`KmsKeyProvider`] (the `aws-kms` feature).
-///
-/// Build the client with `aws-config` as usual. `kms_key_id` is the KMS key
-/// id or ARN. KMS refuses a wrapped key made under another KMS key.
-#[cfg(feature = "aws-kms")]
-#[async_trait::async_trait]
-impl KmsDecrypt for aws_sdk_kms::Client {
-    async fn decrypt(
-        &self,
-        kms_key_id: &str,
-        wrapped: &[u8],
-        context: &BTreeMap<String, String>,
-    ) -> Result<Zeroizing<Vec<u8>>, String> {
-        let mut request = Self::decrypt(self)
-            .key_id(kms_key_id)
-            .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(wrapped));
-        for (key, value) in context {
-            request = request.encryption_context(key, value);
-        }
-        let output = request
-            .send()
-            .await
-            .map_err(|err| aws_sdk_kms::error::DisplayErrorContext(&err).to_string())?;
-        output
-            .plaintext
-            .map(|blob| Zeroizing::new(blob.into_inner()))
-            .ok_or_else(|| "KMS Decrypt returned no plaintext".to_string())
     }
 }
 
