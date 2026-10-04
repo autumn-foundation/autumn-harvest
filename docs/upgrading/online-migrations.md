@@ -299,7 +299,9 @@ that no longer matches a finding also fails the build.
   call of a routine in another language, counts as a lock on an unknown table.
   No bound covers that lock, because the code may clear the bound first. It
   also ends the bound for what comes after it. Text in such a body never sets
-  a bound or makes a table new. Avoid such code in a migration.
+  a bound or makes a table new. The lint does not read the body of a routine
+  in another language as SQL, because Postgres only stores it. Avoid such code
+  in a migration.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.

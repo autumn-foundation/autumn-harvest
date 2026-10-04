@@ -1761,6 +1761,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         &mut timeouts,
         &mut body_timeouts,
     );
+    drop_foreign_body_locks(&s, &mut raws);
     let new_tables = new_table_spans(&s, &created, history);
     let hits = resolve(raws, &s, &unconditional, &new_tables, path_change, history);
 
@@ -1782,12 +1783,12 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 /// clause counts as a session value at the first token of the body.
 fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
     let mut settings = Vec::new();
-    for k in (0..s.toks.len()).filter(|&k| routine_keyword(s, k).is_some()) {
-        let depth = s.toks[k].depth;
-        let end = s.end(k);
-        let Some(body) = (k..end).find(|&b| !s.toks[b].runs && s.toks[b].depth > depth) else {
+    for k in 0..s.toks.len() {
+        // An atomic or `RETURN` body sits at the depth of its `CREATE`.
+        let Some((body, end)) = routine_body(s, k) else {
             continue;
         };
+        let depth = s.toks[k].depth;
         // A clause sits outside the parentheses of the signature, and starts
         // with an unquoted `SET`.
         let mut parens = 0_usize;
@@ -2675,18 +2676,38 @@ fn resolve(
 /// expression. A routine that another body creates has a body of its own.
 fn routine_bodies(s: &Stmts) -> Vec<(usize, usize)> {
     (0..s.toks.len())
-        .filter(|&k| routine_keyword(s, k).is_some())
-        .filter_map(|k| {
-            let depth = s.toks[k].depth;
-            let end = s.end(k);
-            let start = (k + 1..end).find(|&j| {
-                let inline =
-                    s.keyword(j, "return") || (s.keyword(j, "begin") && s.keyword(j + 1, "atomic"));
-                s.toks[j].depth > depth || (s.toks[j].depth == depth && !s.toks[j].runs && inline)
-            })?;
-            Some((start, end))
-        })
+        .filter_map(|k| routine_body(s, k))
         .collect()
+}
+
+/// Drop each lock in the body of a routine in another language.
+///
+/// Postgres only stores that source, so text in it that reads as SQL takes no
+/// lock. A call of the routine counts as foreign code instead.
+fn drop_foreign_body_locks(s: &Stmts, raws: &mut Vec<Raw>) {
+    let foreign: Vec<(usize, usize)> = (0..s.toks.len())
+        .filter(|&k| language(s, k).is_some_and(|l| l != "plpgsql" && l != "sql"))
+        .filter_map(|k| routine_body(s, k))
+        .collect();
+    raws.retain(|raw| {
+        !foreign
+            .iter()
+            .any(|&(from, to)| from <= raw.at && raw.at < to)
+    });
+}
+
+/// The first token and the end of the body of the routine that `CREATE`
+/// starts at `k`, if `k` starts one.
+fn routine_body(s: &Stmts, k: usize) -> Option<(usize, usize)> {
+    routine_keyword(s, k)?;
+    let depth = s.toks[k].depth;
+    let end = s.end(k);
+    let start = (k + 1..end).find(|&j| {
+        let inline =
+            s.keyword(j, "return") || (s.keyword(j, "begin") && s.keyword(j + 1, "atomic"));
+        s.toks[j].depth > depth || (s.toks[j].depth == depth && !s.toks[j].runs && inline)
+    })?;
+    Some((start, end))
 }
 
 /// The first token of the innermost routine body that holds the token at `at`.
@@ -5439,6 +5460,33 @@ fn a_quoted_label_does_not_end_a_branch() {
                NULL;\n        END \"if\";\n        SET LOCAL lock_timeout = '5s';\n    END IF;\n\
                END $$;\nALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_foreign_routine_body_is_not_sql() {
+    // Postgres only stores the source. A call of the routine counts instead.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpython3u AS $$\n\
+               # ; ALTER TABLE harvest_events ADD COLUMN x INT\npass\n$$;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+    let sql = format!("{sql}\nSET LOCAL lock_timeout = '5s';\nSELECT f();");
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_routine_setting_covers_an_atomic_body() {
+    // An atomic body holds no DDL, but it may call a routine that locks.
+    let history = [
+        "CREATE FUNCTION legacy_f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                    ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;",
+    ];
+    let body = "BEGIN ATOMIC\n    SELECT legacy_f();\nEND;";
+    let sql =
+        format!("CREATE FUNCTION f() RETURNS void LANGUAGE sql SET lock_timeout = '5s'\n{body}");
+    assert_eq!(lint_with_history(&history, &sql, true), [], "{sql}");
+    let sql = format!("CREATE FUNCTION f() RETURNS void LANGUAGE sql\n{body}");
+    let findings = lint_with_history(&history, &sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
