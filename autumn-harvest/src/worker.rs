@@ -17174,7 +17174,7 @@ async fn process_activity_task(
     // inside a closure argument, which is markedly harder to read than the match.
     #[cfg(feature = "wasm-activities")]
     #[allow(clippy::option_if_let_else)]
-    let constructed = match wasm_dispatch {
+    let construct = || match wasm_dispatch {
         Some(dispatch) => crate::error::catch_construct(|| {
             crate::interceptor::dispatch_with_interceptors(
                 activity_interceptors,
@@ -17227,33 +17227,36 @@ async fn process_activity_task(
     };
 
     #[cfg(not(feature = "wasm-activities"))]
-    let constructed = crate::error::catch_construct(|| {
-        crate::interceptor::dispatch_with_interceptors(
-            activity_interceptors,
-            &invocation,
-            &ctx,
-            task.input.clone(),
-            |input| (activity_handler)(&ctx, input),
-        )
-    });
+    let construct = || {
+        crate::error::catch_construct(|| {
+            crate::interceptor::dispatch_with_interceptors(
+                activity_interceptors,
+                &invocation,
+                &ctx,
+                task.input.clone(),
+                |input| (activity_handler)(&ctx, input),
+            )
+        })
+    };
 
-    let mut activity_future = {
+    // The handler is built at the first poll, after the drain check in
+    // `execute_activity_future_with_cancellation` (issue #1813). A
+    // hand-written handler can do synchronous work while it builds its
+    // future. That work must not run after the drain cancel either.
+    let mut activity_future = Box::pin(async {
         use futures::FutureExt as _;
-        match constructed {
+        match construct() {
             Ok(fut) => std::panic::AssertUnwindSafe(fut)
                 .catch_unwind()
-                .map(|caught| match caught {
-                    Ok(inner) => inner,
-                    Err(panic_payload) => Err(handler_panic_activity_envelope(
+                .await
+                .unwrap_or_else(|panic_payload| {
+                    Err(handler_panic_activity_envelope(
                         crate::error::panic_message(panic_payload),
-                    )),
-                })
-                .left_future(),
-            Err(message) => {
-                futures::future::ready(Err(handler_panic_activity_envelope(message))).right_future()
-            }
+                    ))
+                }),
+            Err(message) => Err(handler_panic_activity_envelope(message)),
         }
-    };
+    });
     let cancellation_observer = observe_task_cancellation(pool, &activity_claim);
     tokio::pin!(cancellation_observer);
 
@@ -33897,7 +33900,24 @@ impl Worker {
                 loop {
                     tokio::select! {
                         biased;
-                        () = &mut done => return,
+                        () = &mut done => {
+                            // The last body can end with a failed write. Its
+                            // claim joins the ended set as the tracker empties,
+                            // so sweep once more before the keeper stops.
+                            let swept = tokio::time::timeout(bound, async {
+                                let mut conn = crate::pool::acquire(&pool, bound).await?;
+                                release_abandoned_claims(&mut conn, &worker_id, &live_claims)
+                                    .await
+                            })
+                            .await;
+                            if !matches!(swept, Ok(Ok(_))) {
+                                tracing::warn!(
+                                    worker_id = %worker_id,
+                                    "the final sweep of abandoned claims failed; orphan reclaim recovers them"
+                                );
+                            }
+                            return;
+                        }
                         () = tokio::time::sleep_until(next) => {
                             let touched = tokio::time::timeout(bound, async {
                                 let mut conn = crate::pool::acquire(&pool, bound).await?;
