@@ -1619,6 +1619,8 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     // Its locks still count, which fails closed.
     let mut not_run: BTreeMap<String, usize> = BTreeMap::new();
     let unconditional = unconditional(&s);
+    // An inherited change counts from token 0. Each test uses `c <= at`, and
+    // the change token itself is a `SET`, so it holds no name or lock.
     let local_path_change =
         (0..toks.len()).find(|&k| s.starts[k] == k && changes_search_path(&s, k));
     let path_change = local_path_change.or_else(|| history.search_path_changed.then_some(0));
@@ -1707,7 +1709,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         &mut body_timeouts,
     );
     let new_tables = new_table_spans(&s, &created);
-    let hits = resolve(raws, &s, &unconditional, &new_tables, history);
+    let hits = resolve(raws, &s, &unconditional, &new_tables, path_change, history);
 
     let statement_count = (0..toks.len())
         .filter(|&k| s.starts[k] == k && toks[k].depth == 0 && !s.is_punct(k, ';'))
@@ -2011,7 +2013,7 @@ fn call_clears(
         let first = matches.next();
         // After a `search_path` change, an unqualified name may reach a
         // routine in another schema.
-        let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c < call.at);
+        let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c <= call.at);
         !unplaced
             && !inherited.contains(base(&call.name))
             && first.is_some()
@@ -2159,13 +2161,19 @@ fn new_table_spans(
 ) -> BTreeMap<String, (usize, usize)> {
     let toks = s.toks;
     let mut ends: Vec<(SpanEnd, usize)> = Vec::new();
+    let bases: BTreeSet<&str> = (0..toks.len())
+        .filter_map(|k| s.qualified_name(routine_keyword(s, k)? + 1))
+        .filter_map(|(_, next)| s.word(next - 1))
+        .collect();
     for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
         let commit = s.is(k, "commit") || (s.is(k, "end") && toks[k].depth == 0);
         // `DROP SCHEMA` or `DROP OWNED` may drop any new table. The lint does
         // not track schemas or owners, so it ends every range.
         let drops_any = s.is(k, "drop") && (s.is(k + 1, "schema") || s.is(k + 1, "owned"));
-        // After a commit, other sessions can see and lock the new table.
-        if s.is(k, "rollback") || s.is(k, "abort") || drops_any || commit {
+        // After a commit, other sessions can see and lock the new table. A
+        // call or unreadable code may drop or rename it.
+        let opaque = calls_or_hides(s, k, &bases);
+        if s.is(k, "rollback") || s.is(k, "abort") || drops_any || commit || opaque {
             ends.push((SpanEnd::All, k));
         } else if s.is(k, "drop") && s.is(k + 1, "table") {
             for name in s.name_list(s.skip_if_exists(k + 2)) {
@@ -2196,6 +2204,17 @@ fn new_table_spans(
             (name.clone(), (from, to))
         })
         .collect()
+}
+
+/// Whether the statement at `k` calls a routine or runs code the lint cannot
+/// read. That is a `CALL`, a call of a routine in `bases`, an unreadable
+/// `EXECUTE` or a `DO` body in another language.
+fn calls_or_hides(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> bool {
+    let calls = (k..s.end(k)).any(|j| call_target(s, j, bases).is_some());
+    let execute =
+        s.keyword(k, "execute") && s.toks[k].depth > 0 && unreadable_execute(s, k).is_some();
+    let foreign_do = s.keyword(k, "do") && language(s, k).is_some_and(|l| l != "plpgsql");
+    calls || execute || foreign_do
 }
 
 /// What a statement ends in `new_table_spans`.
@@ -2248,15 +2267,15 @@ fn resolve(
     s: &Stmts,
     unconditional: &[bool],
     new_tables: &BTreeMap<String, (usize, usize)>,
+    path_change: Option<usize>,
     history: &mut History,
 ) -> Vec<Hit> {
     let toks = s.toks;
     raws.sort_by_key(|raw| raw.at);
     // After a `search_path` change, the lint cannot tell the schema of an
     // unqualified name. Such a name is never placed or learnt.
-    let path_change = (0..toks.len()).find(|&k| s.starts[k] == k && changes_search_path(s, k));
     let unplaced =
-        |name: &str, at: usize| !name.contains('.') && path_change.is_some_and(|c| c < at);
+        |name: &str, at: usize| !name.contains('.') && path_change.is_some_and(|c| c <= at);
     let mut hits = Vec::with_capacity(raws.len());
     for raw in raws {
         // A `format()` placeholder makes a name unknown, which fails closed.
@@ -2828,7 +2847,7 @@ fn recorded_change(
 ) -> Option<Timeout> {
     let change = timeout_change(s, k)?;
     let qualified = k >= 2 && s.is_punct(k - 1, '.') && s.is(k - 2, "pg_catalog");
-    let shadowed = s.is(k, "set_config") && !qualified && path_change.is_some_and(|c| c < k);
+    let shadowed = s.is(k, "set_config") && !qualified && path_change.is_some_and(|c| c <= k);
     match change {
         Timeout::Set { bounds: true, .. } if !unconditional => None,
         Timeout::Set { .. } if shadowed => Some(Timeout::Set {
@@ -5747,6 +5766,46 @@ fn an_annotated_nonstandard_setter_cannot_hide_a_later_body() {
         findings[0].detail.contains("standard_conforming_strings"),
         "{findings:?}"
     );
+}
+
+#[test]
+fn an_inherited_path_change_leaves_index_names_unplaced() {
+    let create = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX public.idx;";
+    // Without a path change, the create teaches the history that `public.idx`
+    // sits on a cold table.
+    assert_eq!(lint_with_history(&[create], drop, true), [], "{drop}");
+    // After an inherited path change, `idx` may sit in another schema, so
+    // `public.idx` stays unknown, which counts as hot.
+    let history = ["SET search_path = scratch, public;", create];
+    let findings = lint_with_history(&history, drop, true);
+    assert!(!findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_call_or_unreadable_code_ends_a_new_table() {
+    let procedure =
+        "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n    RAISE NOTICE 'hi';\nEND $$;\n";
+    let function = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    RAISE NOTICE 'hi';\nEND $$;\n";
+    let create = "CREATE TABLE harvest_events (id BIGINT);\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    for (before, call) in [
+        (procedure, "CALL p();"),
+        (function, "SELECT f();"),
+        (
+            "",
+            "DO $$\nDECLARE v text := 'x';\nBEGIN\n    EXECUTE v;\nEND $$;",
+        ),
+    ] {
+        let sql = format!("{before}{create}{call}\n{lock}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.contains("ALTER TABLE locks harvest_events")),
+            "{sql}\n{findings:?}"
+        );
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

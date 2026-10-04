@@ -40,7 +40,8 @@ it. The exemption ends at a later `DROP TABLE`, `RENAME TO`, `SET SCHEMA`,
 table again.
 A drop or rename ends it with or without a schema in the name. A `search_path`
 change ends it for a name without a schema. A `COMMIT` ends every exemption,
-because other sessions can then see the new table and lock it.
+because other sessions can then see the new table and lock it. So does a call
+of a routine, or code the lint cannot read, because it may drop the table.
 The lock must name the table exactly as the create does, schema included.
 
 A partition of a hot table is hot too, because it takes the live writes of its
