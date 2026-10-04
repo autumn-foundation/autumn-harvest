@@ -16545,9 +16545,10 @@ async fn process_activity_task(
     pool_shard: u16,
     shutdown: &CancellationToken,
 ) -> HarvestResult<()> {
-    // Issue #1815: the outlier window times an attempt from here, so a slow
-    // setup write or pool checkout is part of the sample.
-    let outlier_clock = std::time::Instant::now();
+    // Issue #1815: the outlier window times an attempt from dispatch, before
+    // the local permit wait, as for a workflow task. A wait for a permit, a
+    // slow setup write or a slow pool checkout is then part of the sample.
+    let outlier_clock = dispatched_at;
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         return fail_task_only(&mut conn, task.id, "activity task missing workflow_exec_id").await;
