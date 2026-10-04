@@ -15283,6 +15283,20 @@ impl Drop for CircuitProbeGuard<'_> {
     }
 }
 
+/// Whether `claim` was lost to the timeout enforcer (issue #1809). The
+/// enforcer writes its timeout error to the row. Any other loss, or a failed
+/// read, is not a timeout.
+async fn claim_lost_to_timeout(
+    conn: &mut AsyncPgConnection,
+    claim: &queue::TaskClaim,
+    activity_name: &str,
+) -> bool {
+    matches!(
+        queue::task_status_for_claim(conn, claim).await,
+        Ok(Some((_, Some(error), _))) if is_attempt_timeout_error(&error, activity_name)
+    )
+}
+
 /// Whether `error`, read from a task row, is the error the timeout enforcer
 /// writes when it times out an attempt of `activity_name` (issue #1809).
 fn is_attempt_timeout_error(error: &str, activity_name: &str) -> bool {
@@ -16438,25 +16452,20 @@ async fn process_activity_task(
     let circuit_outcome = if was_cancelled {
         if let Some(token) = circuit_token {
             // The claim watcher cancels on any lost claim (issue #1809). Only a
-            // timeout, perhaps enforced by another process, fails a probe, so
-            // only that loss reports a trip. The enforcer writes its timeout
-            // error to the row. A cancellation, an operator force-fail, an
-            // orphan reclaim, a deleted row or a failed read reports none.
-            // Only a probe pays for the read.
-            let probe_timed_out = token.is_probe()
-                && matches!(
-                    queue::task_status_for_claim(&mut conn, &activity_claim).await,
-                    Ok(Some((_, Some(error), _))) if is_attempt_timeout_error(&error, activity_name)
-                );
-            let now = std::time::Instant::now();
-            if probe_timed_out {
-                if circuit_breakers.on_claim_lost(activity_name, token, claim_key, now)
-                    == Some(crate::circuit_breaker::CircuitTransition::Tripped)
-                {
-                    telemetry.metrics.record_circuit_tripped(activity_name);
-                }
-            } else {
-                circuit_breakers.on_cancelled(activity_name, token, now);
+            // timeout counts against the downstream. `on_claim_lost` counts
+            // one that another process enforced, and releases the slot of any
+            // other loss.
+            let lost_to_timeout = circuit_breakers.has_policy(activity_name)
+                && claim_lost_to_timeout(&mut conn, &activity_claim, activity_name).await;
+            if circuit_breakers.on_claim_lost(
+                activity_name,
+                token,
+                claim_key,
+                lost_to_timeout,
+                std::time::Instant::now(),
+            ) == Some(crate::circuit_breaker::CircuitTransition::Tripped)
+            {
+                telemetry.metrics.record_circuit_tripped(activity_name);
             }
         }
         None
@@ -16495,7 +16504,7 @@ async fn process_activity_task(
     // `Some(false)` when another path settled the attempt first. `None` means
     // the write failed before ownership was known: a probe slot is released,
     // and nothing counts as an outcome or a trip.
-    let report_outcome = |applied: Option<bool>| {
+    let report_outcome = |applied: Option<bool>, lost_to_timeout: bool| {
         let now = std::time::Instant::now();
         if let Some(transition) = circuit_token
             .zip(circuit_outcome)
@@ -16503,7 +16512,13 @@ async fn process_activity_task(
                 Some(true) => {
                     circuit_breakers.on_claim_result(activity_name, outcome, token, claim_key, now)
                 }
-                Some(false) => circuit_breakers.on_claim_lost(activity_name, token, claim_key, now),
+                Some(false) => circuit_breakers.on_claim_lost(
+                    activity_name,
+                    token,
+                    claim_key,
+                    lost_to_timeout,
+                    now,
+                ),
                 None => {
                     circuit_breakers.on_cancelled(activity_name, token, now);
                     None
@@ -16542,7 +16557,7 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
-        report_outcome(Some(true));
+        report_outcome(Some(true), false);
         return Ok(());
     }
 
@@ -16564,8 +16579,13 @@ async fn process_activity_task(
         registry.payload_codecs(),
     )
     .await;
-    // A failed write still releases an admitted probe, without a trip.
-    report_outcome(finalized.as_ref().ok().copied());
+    // A failed write still releases an admitted probe, without a trip. A
+    // lost claim counts only when a timeout took it (see `on_claim_lost`).
+    let applied = finalized.as_ref().ok().copied();
+    let lost_to_timeout = applied == Some(false)
+        && circuit_breakers.has_policy(activity_name)
+        && claim_lost_to_timeout(&mut conn, &activity_claim, activity_name).await;
+    report_outcome(applied, lost_to_timeout);
     finalized.map(|_| ())
 }
 

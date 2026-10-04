@@ -115,10 +115,13 @@ including an error.
 - A timeout retry keeps `crash_strikes`. A timeout does not prove that the
   attempt ended without a crash, so poison-pill quarantine (#367) still
   counts.
-- Breaker state is per process. The breaker counts a timeout in the process
-  that enforces it, not in the process that ran the attempt. That process
-  drops the attempt's late outcome, so the attempt never counts twice. A
-  shared breaker would count both in one place. It is out of scope.
+- Breaker state is per process. The enforcing process counts a timeout in
+  its breaker. The process that ran the attempt finds its claim lost and
+  reads the row. When the row carries the enforcer's timeout error and no
+  enforcer in that process marked the claim, it counts the timeout in its
+  own breaker too. So the process that dispatches the calls stops them. It
+  drops the attempt's late outcome, so no breaker counts the attempt twice.
+  A shared breaker would count once for the fleet. It is out of scope.
 - The SQLite backend keeps terminal timeouts and has no breaker feed. It
   is out of scope.
 
