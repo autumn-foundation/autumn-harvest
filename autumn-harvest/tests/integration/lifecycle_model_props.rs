@@ -21,8 +21,9 @@
 //! - the claim fence `(worker_id, attempt)`, `docs/architecture.md` section 9;
 //! - the lost-wake rule of `park_workflow_task`;
 //! - the orphan reclaim rules of `poison_pill`.
-//! The claim order is the exception. No contract states it,
-//! so the model follows the `scheduled_at` stamps that the SQL writes.
+//!
+//! The claim order is the exception. No contract states it, so the model
+//! follows the `scheduled_at` stamps that the SQL writes.
 //!
 //! # Case count
 //!
