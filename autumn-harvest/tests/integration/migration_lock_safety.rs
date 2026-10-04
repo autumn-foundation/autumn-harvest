@@ -786,8 +786,7 @@ fn lex(
                 let body: Vec<char> = value.chars().collect();
                 lex(&body, start_line, depth + 1, runs, toks, comments);
             } else if in_execute_statement(toks, depth) {
-                let body: Vec<char> = fill_placeholders(&value).chars().collect();
-                lex(&body, start_line, depth + 1, runs, toks, comments);
+                lex_execute_sql(&value, start_line, depth, runs, toks, comments);
             } else if function_body_follows(toks, depth) {
                 // A function body runs later, so it does not run now.
                 let body: Vec<char> = value.chars().collect();
@@ -846,10 +845,8 @@ fn lex(
                     .is_some_and(|t| t.tok == Tok::Word(word.to_string()))
             };
             if in_execute_statement(toks, depth) || (depth > 0 && after("execute")) {
-                let filled: Vec<char> = fill_placeholders(&body.iter().collect::<String>())
-                    .chars()
-                    .collect();
-                lex(&filled, line, depth + 1, runs, toks, comments);
+                let sql: String = body.iter().collect();
+                lex_execute_sql(&sql, line, depth, runs, toks, comments);
             } else if in_do_statement(toks, depth) || after("as") {
                 let body_runs = runs && in_do_statement(toks, depth);
                 lex(body, line, depth + 1, body_runs, toks, comments);
@@ -893,8 +890,7 @@ fn lex(
                 continue;
             }
             if quote == '\'' && in_execute_statement(toks, depth) {
-                let body: Vec<char> = fill_placeholders(&value).chars().collect();
-                lex(&body, start_line, depth + 1, runs, toks, comments);
+                lex_execute_sql(&value, start_line, depth, runs, toks, comments);
                 continue;
             }
             if quote == '\'' && function_body_follows(toks, depth) {
@@ -1101,13 +1097,42 @@ fn statement_head(toks: &[Token], depth: usize) -> Option<&Token> {
         .last()
 }
 
+/// Lex the SQL that a PL/pgSQL `EXECUTE` at `depth` runs.
+///
+/// `format()` substitutes `%s` without regard to quotes or comments. So a
+/// `%s` anywhere in the text adds the `%s` marker after the SQL, which makes
+/// the `EXECUTE` unreadable.
+fn lex_execute_sql(
+    sql: &str,
+    line: usize,
+    depth: usize,
+    runs: bool,
+    toks: &mut Vec<Token>,
+    comments: &mut Vec<Comment>,
+) {
+    let (filled, text_placeholder) = fill_placeholders(sql);
+    let body: Vec<char> = filled.chars().collect();
+    lex(&body, line, depth + 1, runs, toks, comments);
+    if text_placeholder {
+        toks.push(Token {
+            tok: Tok::Word("%s".to_string()),
+            line,
+            depth: depth + 1,
+            runs,
+            quoted: true,
+        });
+    }
+}
+
 /// Replace each `format()` placeholder in `sql` with the unknown name `"%"`.
+/// Also return whether `sql` holds a `%s` placeholder.
 ///
 /// `%%` is a literal `%`. A placeholder may carry a position, flags and a
 /// width, as in `%1$-10I`.
-fn fill_placeholders(sql: &str) -> String {
+fn fill_placeholders(sql: &str) -> (String, bool) {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = String::new();
+    let mut text_placeholder = false;
     let mut i = 0;
     while let Some(&c) = chars.get(i) {
         if c != '%' {
@@ -1132,14 +1157,15 @@ fn fill_placeholders(sql: &str) -> String {
             out.push_str("\"%\"");
             i = j + 1;
         } else if chars.get(j) == Some(&'s') {
-            out.push_str("\"%s\"");
+            out.push_str("\"%\"");
+            text_placeholder = true;
             i = j + 1;
         } else {
             out.push(c);
             i += 1;
         }
     }
-    out
+    (out, text_placeholder)
 }
 
 /// The length of a dollar-quote delimiter such as `$$` or `$body$`.
@@ -1596,7 +1622,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 } else {
                     &mut body_timeouts
                 };
-                list.extend(change.map(|change| (k, change)));
+                list.extend(change.map(|change| (execute_at(&s, k), change)));
             }
         }
     }
@@ -1664,10 +1690,14 @@ fn routine_keyword(s: &Stmts, k: usize) -> Option<usize> {
     (s.is(j, "function") || s.is(j, "procedure")).then_some(j)
 }
 
-/// The last part of the name that starts at `k`, without its schema.
-fn last_name_part<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
-    let (_, next) = s.qualified_name(k)?;
-    s.word(next - 1)
+/// One routine call, or one routine that this file creates.
+struct Routine {
+    /// The name as written, with any schema.
+    name: String,
+    /// The number of arguments or parameters. `None` when the lint cannot count them.
+    arity: Option<usize>,
+    /// The first token: the `CALL`, the called name, or the `CREATE`.
+    at: usize,
 }
 
 /// Add a session clear at each call that may clear the bound.
@@ -1675,34 +1705,52 @@ fn last_name_part<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
 /// A clear in a routine body can outlive the call. For example, a
 /// `set_config(..., true)` holds until the transaction ends. A call clears
 /// when the body in this file changes `lock_timeout` other than to set a
-/// bound, or calls such a routine. A `CALL` of a routine from another file
-/// clears too, because the lint cannot read its body.
+/// bound, or calls such a routine.
+///
+/// A call reaches a body in this file only when an earlier `CREATE` has the
+/// same name as written and the same number of parameters. Any other `CALL`
+/// clears, because it may reach a routine from another file.
 fn call_clears(
     s: &Stmts,
     timeouts: &mut Vec<(usize, Timeout)>,
     body_timeouts: &mut Vec<(usize, Timeout)>,
 ) {
-    // Each routine in this file: its name and its statement range.
-    let routines: Vec<(&str, usize, usize)> = (0..s.toks.len())
-        .filter_map(|k| Some((last_name_part(s, routine_keyword(s, k)? + 1)?, k, s.end(k))))
+    let routines: Vec<Routine> = (0..s.toks.len())
+        .filter_map(|k| {
+            let (name, open) = s.qualified_name(routine_keyword(s, k)? + 1)?;
+            let arity = arity(s, open);
+            Some(Routine { name, arity, at: k })
+        })
         .collect();
-    let known: BTreeSet<&str> = routines.iter().map(|(name, ..)| *name).collect();
-    let calls: Vec<(usize, &str)> = (0..s.toks.len())
-        .filter_map(|k| call_target(s, k, &known).map(|name| (k, name)))
+    let bases: BTreeSet<&str> = routines.iter().map(|r| base(&r.name)).collect();
+    let calls: Vec<Routine> = (0..s.toks.len())
+        .filter_map(|k| call_target(s, k, &bases))
         .collect();
+    // The latest earlier `CREATE` that matches the call, if any.
+    let target = |call: &Routine| {
+        routines.iter().rposition(|r| {
+            r.at < call.at && r.name == call.name && r.arity.is_some() && r.arity == call.arity
+        })
+    };
+    let changes = |r: &Routine| {
+        let range = r.at..s.end(r.at);
+        body_timeouts.iter().any(|(k, change)| {
+            range.contains(k) && !matches!(change, Timeout::Set { bounds: true, .. })
+        })
+    };
     // A routine that calls a clearing routine clears too.
-    let mut clearing: BTreeSet<&str> = BTreeSet::new();
+    let mut clearing: BTreeSet<usize> = (0..routines.len())
+        .filter(|&i| changes(&routines[i]))
+        .collect();
     loop {
         let before = clearing.len();
-        for &(name, from, to) in &routines {
-            let changes = body_timeouts.iter().any(|(k, change)| {
-                (from..to).contains(k) && !matches!(change, Timeout::Set { bounds: true, .. })
+        for (i, r) in routines.iter().enumerate() {
+            let range = r.at..s.end(r.at);
+            let calls_a_clearer = calls.iter().any(|call| {
+                range.contains(&call.at) && target(call).is_none_or(|t| clearing.contains(&t))
             });
-            let calls_a_clearer = calls.iter().any(|(k, callee)| {
-                (from..to).contains(k) && (!known.contains(callee) || clearing.contains(callee))
-            });
-            if changes || calls_a_clearer {
-                clearing.insert(name);
+            if calls_a_clearer {
+                clearing.insert(i);
             }
         }
         if clearing.len() == before {
@@ -1713,14 +1761,14 @@ fn call_clears(
         bounds: false,
         local: false,
     };
-    for (k, callee) in calls {
-        if known.contains(callee) && !clearing.contains(callee) {
+    for call in &calls {
+        if target(call).is_some_and(|t| !clearing.contains(&t)) {
             continue;
         }
-        if s.toks[k].runs {
-            timeouts.push((k, clear));
+        if s.toks[call.at].runs {
+            timeouts.push((call.at, clear));
         } else {
-            body_timeouts.push((k, clear));
+            body_timeouts.push((call.at, clear));
         }
     }
     // `timeout_in_force` reads the changes in token order.
@@ -1728,28 +1776,56 @@ fn call_clears(
     body_timeouts.sort_by_key(|(k, _)| *k);
 }
 
-/// The name of the routine that the token at `k` calls, if any.
+/// The routine call at `k`, if any.
 ///
-/// A `CALL` names any routine. Elsewhere, only a routine in `known` counts,
-/// and only when its name is not part of DDL such as `DROP FUNCTION f()`.
-fn call_target<'a>(s: &Stmts<'a>, k: usize, known: &BTreeSet<&str>) -> Option<&'a str> {
-    if s.starts[k] == k && s.is(k, "call") {
-        return last_name_part(s, k + 1);
+/// A `CALL` names any routine. Elsewhere, only a name whose last part is in
+/// `bases` counts, and only when it is not part of DDL such as
+/// `DROP FUNCTION f()`.
+fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
+    if s.starts[k] == k && s.keyword(k, "call") {
+        let (name, open) = s.qualified_name(k + 1)?;
+        let arity = arity(s, open);
+        return Some(Routine { name, arity, at: k });
     }
     let callee = s.word(k)?;
-    if !known.contains(callee) || !s.is_punct(k + 1, '(') {
+    if !bases.contains(callee) || !s.is_punct(k + 1, '(') {
         return None;
     }
-    let first = if k >= 2 && s.is_punct(k - 1, '.') {
-        k - 2
-    } else {
-        k
-    };
+    let schema = (k >= 2 && s.is_punct(k - 1, '.'))
+        .then(|| s.word(k - 2))
+        .flatten();
+    let first = if schema.is_some() { k - 2 } else { k };
     let ddl = first > 0
         && ["function", "procedure", "routine"]
             .iter()
             .any(|w| s.is(first - 1, w));
-    (!ddl).then_some(callee)
+    let name = schema.map_or_else(|| callee.to_string(), |schema| format!("{schema}.{callee}"));
+    let arity = arity(s, k + 1);
+    (!ddl).then_some(Routine { name, arity, at: k })
+}
+
+/// The number of comma-separated items in the parentheses that open at `open`.
+fn arity(s: &Stmts, open: usize) -> Option<usize> {
+    if !s.is_punct(open, '(') {
+        return None;
+    }
+    let close = closing_paren(s, open)?;
+    if close == open + 1 {
+        return Some(0);
+    }
+    let depth = s.toks[open].depth;
+    let mut parens = 0_usize;
+    let mut commas = 0;
+    for j in (open..close).filter(|&j| s.toks[j].depth == depth) {
+        if s.is_punct(j, '(') {
+            parens += 1;
+        } else if s.is_punct(j, ')') {
+            parens -= 1;
+        } else if s.is_punct(j, ',') && parens == 1 {
+            commas += 1;
+        }
+    }
+    Some(commas + 1)
 }
 
 /// The token range in which each new table is exempt.
@@ -2412,6 +2488,20 @@ fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     let tail_ok = rest.is_some_and(|j| j >= end || s.is(j, "into") || s.is(j, "using"));
     let text_placeholder = (k + 1..end).any(|j| toks[j].depth > depth && s.is(j, "%s"));
     (!constant || !tail_ok || text_placeholder).then(|| Raw::lock(k, UNREADABLE_EXECUTE, None))
+}
+
+/// Where a change at `k` takes effect.
+///
+/// PL/pgSQL evaluates the expression of an `EXECUTE` before it runs the SQL.
+/// So a change in the expression takes effect at the `EXECUTE` token, before
+/// the locks of the SQL.
+fn execute_at(s: &Stmts, k: usize) -> usize {
+    let start = s.starts[k];
+    if s.toks[k].depth > 0 && s.keyword(start, "execute") {
+        start
+    } else {
+        k
+    }
 }
 
 /// The verb of a lock that unreadable `EXECUTE` SQL may take.
@@ -4907,6 +4997,50 @@ fn a_quoted_name_is_not_a_keyword() {
             expected,
             "{quoted}"
         );
+    }
+}
+
+#[test]
+fn an_execute_expression_clears_before_its_sql_runs() {
+    let sql = "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    EXECUTE format(\
+               'ALTER TABLE harvest_events ADD COLUMN x INT /* %L */', \
+               set_config('lock_timeout', '0', true));\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_call_matches_a_routine_only_by_its_full_name_and_arity() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let keeps = "CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$\nBEGIN\n    RAISE NOTICE 'hi';\nEND $$;\n";
+    // Another schema, another arity, or a call before the create may reach another routine.
+    for call in ["CALL other.p(1);", "CALL p();", "CALL p(1, 2);"] {
+        let sql = format!("{set}{keeps}{call}\n{lock}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    }
+    let sql = format!("{set}CALL p(1);\n{keeps}{lock}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    // The same name and arity after the create reach the known body.
+    let sql = format!("{set}{keeps}CALL p(1);\n{lock}");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_text_placeholder_in_quoted_template_text_is_unreadable() {
+    for template in [
+        "'ALTER TABLE \"%s\"'",
+        "'ALTER TABLE t -- %s'",
+        "'ALTER TABLE t /* %1$s */'",
+    ] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    EXECUTE format({template}, 'x');\nEND $$;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        assert!(findings[0].detail.contains("cannot read"), "{findings:?}");
     }
 }
 

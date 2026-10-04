@@ -113,9 +113,11 @@ bound earlier in the body, because the migration's bound may not hold when
 the function runs. A `SET lock_timeout` clause in `CREATE FUNCTION` or
 `CREATE PROCEDURE` also counts, because Postgres applies it on each call.
 A clear in a routine body can outlive the call. So a call ends the bound
-when the routine may clear it. A `CALL` of a routine from another migration
-also ends the bound, because the lint cannot read its body. Set the bound again
-after the call. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
+when the routine may clear it. A call reaches a body in the same file only
+when an earlier `CREATE` has the same name, schema included, and the same
+number of parameters. Any other `CALL` also ends the bound, because the lint
+cannot read the body it reaches. Set the bound again after the call. A change
+in the expression of an `EXECUTE` takes effect before the SQL runs. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
 `EXIT` or `CONTINUE`, does not count either, because it may not run. Nothing in a block with an
 `EXCEPTION` handler counts, because the handler rolls the block back. A clear inside a
 branch does count, because the branch may run.
@@ -255,7 +257,8 @@ that no longer matches a finding also fails the build.
 - In a PL/pgSQL body, the lint scans the constant SQL that `EXECUTE` runs.
   That includes a `format()` template, where each placeholder is an unknown
   name. The lint cannot read SQL built with `||` or held in a variable, so
-  such an `EXECUTE` counts as a lock on an unknown table.
+  such an `EXECUTE` counts as a lock on an unknown table. So does a template
+  with `%s` anywhere in its text, even in a comment or a quoted name.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
   as code, in any quote form. Any other string is data.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
