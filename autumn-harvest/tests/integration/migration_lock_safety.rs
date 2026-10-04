@@ -2647,8 +2647,13 @@ fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     let constant = toks.get(literal).is_some_and(|t| t.depth > depth);
     // The first token after the SQL, at the depth of the statement.
     let after_literal = (literal..end).find(|&j| toks[j].depth == depth);
+    // The template of `format()` must be the literal alone, so a `,` or the
+    // closing `)` follows it. A composed template such as `'a' || 'b'` is
+    // unreadable.
     let rest = if formatted {
-        closing_paren(s, k + 2).map(|close| close + 1)
+        closing_paren(s, k + 2)
+            .filter(|&close| after_literal.is_some_and(|j| j == close || s.is_punct(j, ',')))
+            .map(|close| close + 1)
     } else {
         after_literal.or(Some(end))
     };
@@ -5410,6 +5415,31 @@ fn the_language_clause_follows_the_routine_signature() {
         "CREATE FUNCTION g(language text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\n{set}SELECT g('x');"
     );
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_composed_format_template_is_unreadable() {
+    for template in [
+        "format('ALTER TABLE harvest_' || 'events ADD COLUMN x INT')",
+        "format('ALTER TABLE harvest_' || 'events ADD COLUMN %I INT', 'x')",
+    ] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    EXECUTE {template};\nEND $$;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        assert!(findings[0].detail.contains("cannot read"), "{findings:?}");
+    }
+    // One literal, with or without arguments, stays readable.
+    for template in [
+        "format('ALTER TABLE t ADD COLUMN x INT')",
+        "format('ALTER TABLE t ADD COLUMN %I INT', 'x')",
+    ] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    EXECUTE {template};\nEND $$;"
+        );
+        assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
