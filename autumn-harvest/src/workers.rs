@@ -894,6 +894,8 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 /// - `dispatch_channel`: a channel orders delivery by priority and ignores
 ///   `queue_weights`. The Postgres claim applies the weights. So the two
 ///   routes give two task mixes under load.
+/// - `retry_budgets`: the retry-budget policy of each registered activity. A
+///   tighter budget defers more retries, so the worker runs fewer of them.
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -912,6 +914,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         registered_activities,
         circuit_breakers,
         dispatch_channel,
+        retry_budgets,
     } = policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -934,6 +937,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         .collect();
     shards.sort_unstable();
     shards.dedup();
+    let budgets = budget_policies(retry_budgets, registered_activities);
     serde_json::json!({
         "queues": routing,
         "build_id": build_id,
@@ -947,8 +951,26 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "activities": sorted_names(registered_activities),
         "circuit_breakers": breaker_policies(circuit_breakers),
         "dispatch_channel": dispatch_channel,
+        "retry_budgets": budgets,
     })
     .to_string()
+}
+
+/// The retry-budget policy of each registered activity, sorted by name, for a
+/// cohort key. An activity without a budget has `null`.
+fn budget_policies(
+    config: &crate::retry_budget::RetryBudgetConfig,
+    activities: &[String],
+) -> Vec<serde_json::Value> {
+    sorted_names(activities)
+        .into_iter()
+        .map(|name| {
+            let policy = config.policy_for(name).map(|policy| {
+                serde_json::json!([policy.ratio, policy.max_tokens, policy.min_retries_per_sec])
+            });
+            serde_json::json!([name, policy])
+        })
+        .collect()
 }
 
 /// Each activity with a circuit-breaker policy and that policy, sorted by
@@ -1019,6 +1041,9 @@ pub struct CohortPolicy<'a> {
     pub circuit_breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
     /// Whether the worker reads task references from a dispatch channel.
     pub dispatch_channel: bool,
+    /// The worker's retry budgets. The key holds the policy of each
+    /// registered activity.
+    pub retry_budgets: &'a crate::retry_budget::RetryBudgetConfig,
 }
 
 /// How a worker sizes its slots per task kind, as its cohort key records it
@@ -2958,6 +2983,7 @@ mod tests {
             registered_activities: &[],
             circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
             dispatch_channel: false,
+            retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
         })
     }
 
@@ -2984,6 +3010,7 @@ mod tests {
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             })
         };
         assert_ne!(slots(10, 0), slots(0, 10));
@@ -3015,6 +3042,7 @@ mod tests {
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             })
         };
         assert_ne!(sessions(0), sessions(4));
@@ -3052,6 +3080,7 @@ mod tests {
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             })
         };
         assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
@@ -3083,6 +3112,7 @@ mod tests {
                 registered_activities: activities,
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             })
         };
         let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
@@ -3207,6 +3237,7 @@ mod tests {
                 registered_activities: &[],
                 circuit_breakers: breakers,
                 dispatch_channel: false,
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             })
         };
         let tracking = |threshold| {
@@ -3256,9 +3287,58 @@ mod tests {
                 registered_activities: &[],
                 circuit_breakers: &breakers,
                 dispatch_channel,
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             })
         };
         assert_ne!(cohort(true), cohort(false));
+    }
+
+    /// Issue #1815: a retry budget defers retries, and a deferred retry does
+    /// not count. Workers with different budgets for an activity run
+    /// different retry mixes, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_retry_budgets() {
+        use crate::policy::RetryBudgetPolicy;
+        use crate::retry_budget::RetryBudgetConfig;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let activities = vec!["charge".to_owned()];
+        let cohort = |budgets: &RetryBudgetConfig| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &activities,
+                circuit_breakers: &breakers,
+                dispatch_channel: false,
+                retry_budgets: budgets,
+            })
+        };
+        let default = RetryBudgetConfig::default();
+        let tight = RetryBudgetConfig::default()
+            .with_activity("charge", Some(RetryBudgetPolicy::new(0.01, 1.0, 0.0)));
+        let unrelated = RetryBudgetConfig::default()
+            .with_activity("render", Some(RetryBudgetPolicy::new(0.01, 1.0, 0.0)));
+        assert_ne!(cohort(&default), cohort(&tight), "a tighter budget");
+        assert_ne!(
+            cohort(&default),
+            cohort(&RetryBudgetConfig::disabled()),
+            "no budget"
+        );
+        assert_eq!(
+            cohort(&default),
+            cohort(&unrelated),
+            "a budget for an activity the worker does not run"
+        );
     }
 
     /// Issue #1815: under load, the claim gate gives each worker a task mix
@@ -3284,6 +3364,7 @@ mod tests {
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             })
         };
         assert_ne!(slots(100, 1), slots(1, 100));

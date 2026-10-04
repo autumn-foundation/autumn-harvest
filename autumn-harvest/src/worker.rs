@@ -31832,6 +31832,7 @@ impl Worker {
                     registered_activities: &registered_activities,
                     circuit_breakers: &self.registry.circuit_breakers(),
                     dispatch_channel: self.claims_through_dispatch(),
+                    retry_budgets: self.registry.retry_budgets().config(),
                 }),
                 compare: true,
                 slot: shard_slot,
