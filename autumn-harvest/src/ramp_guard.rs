@@ -1072,13 +1072,17 @@ async fn prune_finished_markers(
 enum ClearOutcome {
     /// This call cleared the ramp.
     Cleared,
-    /// Another guard cleared the ramp first, so it owns the report. A ramp
-    /// with no `ramp_id` also gives this outcome, because the guard cannot
-    /// tell who changed it.
+    /// Another guard cleared the ramp first, so it owns the report.
     Lost,
     /// An operator changed the row first, and no guard cleared this ramp.
     /// Nothing was cleared, and the change says nothing about who reports.
     Moved,
+    /// The row changed first, and the guard cannot tell who changed it. The
+    /// ramp has no `ramp_id`, or the marker read failed. Like `Moved`, it
+    /// does not decide who reports. Like `Lost`, a retry after an ambiguous
+    /// attempt counts it as this guard's clear. A duplicate report is better
+    /// than an abort with none.
+    Changed,
     /// The server failed or stopped the clear, so nothing changed. The guard
     /// retries it.
     Failed,
@@ -1131,8 +1135,8 @@ pub async fn ramp_aborted_by_guard(
 /// a client timeout means that the server did not answer at all.
 ///
 /// When the row changed first, the marker tells a guard clear (`Lost`) from
-/// an operator change (`Moved`). A failed marker read gives `Lost`, so the
-/// guard does not report an abort that another guard can own.
+/// an operator change (`Moved`). A ramp with no `ramp_id`, or a failed
+/// marker read, gives `Changed`.
 #[cfg(feature = "db")]
 async fn clear_on_pool(
     pool: &crate::worker::DbPool,
@@ -1165,16 +1169,15 @@ async fn clear_on_pool(
             return Ok::<_, String>(ClearOutcome::Cleared);
         }
         let Some(ramp_id) = ramp_id else {
-            return Ok(ClearOutcome::Lost);
+            return Ok(ClearOutcome::Changed);
         };
-        let by_guard = ramp_aborted_by_guard(&mut conn, queue, ramp_id)
-            .await
-            .unwrap_or(true);
-        Ok(if by_guard {
-            ClearOutcome::Lost
-        } else {
-            ClearOutcome::Moved
-        })
+        Ok(
+            match ramp_aborted_by_guard(&mut conn, queue, ramp_id).await {
+                Ok(true) => ClearOutcome::Lost,
+                Ok(false) => ClearOutcome::Moved,
+                Err(_) => ClearOutcome::Changed,
+            },
+        )
     };
     match tokio::time::timeout(bound.saturating_mul(2), clear).await {
         Ok(Ok(outcome)) => outcome,
@@ -1414,7 +1417,7 @@ type PendingStep = (usize, chrono::DateTime<chrono::Utc>, bool);
 #[cfg(feature = "db")]
 const fn retry_outcome(outcome: ClearOutcome, was_ambiguous: bool) -> ClearOutcome {
     match outcome {
-        ClearOutcome::Lost if was_ambiguous => ClearOutcome::Cleared,
+        ClearOutcome::Lost | ClearOutcome::Changed if was_ambiguous => ClearOutcome::Cleared,
         other => other,
     }
 }
@@ -1739,7 +1742,7 @@ impl RampGuard {
                 ClearOutcome::Cleared => {
                     tracing::info!(queue = %key.0, pool = index, "ramp guard finished a marked abort");
                 }
-                ClearOutcome::Lost | ClearOutcome::Moved => {}
+                ClearOutcome::Lost | ClearOutcome::Moved | ClearOutcome::Changed => {}
                 ClearOutcome::Failed | ClearOutcome::Ambiguous => {
                     failed.push((index, step, outcome == ClearOutcome::Ambiguous));
                 }
@@ -1803,7 +1806,7 @@ impl RampGuard {
                     ClearOutcome::Cleared => {
                         tracing::info!(queue = %key.0, pool = index, "ramp guard finished a pending clear");
                     }
-                    ClearOutcome::Lost | ClearOutcome::Moved => {}
+                    ClearOutcome::Lost | ClearOutcome::Moved | ClearOutcome::Changed => {}
                     ClearOutcome::Failed | ClearOutcome::Ambiguous => still_failed.push((
                         index,
                         step,
@@ -2292,7 +2295,12 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn an_operator_change_on_the_first_pool_does_not_decide_the_reporter() {
-        use ClearOutcome::{Cleared, Failed, Lost, Moved};
+        use ClearOutcome::{Changed, Cleared, Failed, Lost, Moved};
+        // An unknown change, such as on a ramp with no id, behaves the same.
+        assert_eq!(disposition(&[Changed, Cleared], true), Disposition::Report);
+        assert_eq!(disposition(&[Changed], true), Disposition::Drop);
+        assert_eq!(retry_outcome(Changed, true), Cleared);
+        assert_eq!(retry_outcome(Changed, false), Changed);
         // An operator moved the first pool, and this guard cleared another.
         assert_eq!(disposition(&[Moved, Cleared], true), Disposition::Report);
         assert_eq!(disposition(&[Moved, Failed], true), Disposition::Defer);
