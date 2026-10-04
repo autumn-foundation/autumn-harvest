@@ -785,7 +785,7 @@ fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_js
 /// Key ids are persisted inside stored envelopes and echoed in the rotation
 /// census and the retirement gate's error, so they are bounded and restricted
 /// to a conservative ASCII alphabet.
-fn validate_key_id(key_id: &str) -> HarvestResult<()> {
+pub(crate) fn validate_key_id(key_id: &str) -> HarvestResult<()> {
     if key_id.is_empty() {
         return Err(HarvestError::Config(
             "codec key id must not be empty".to_string(),

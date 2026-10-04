@@ -72,6 +72,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_harvest::aead_codec::{AeadCodec, DataKey};
 use autumn_harvest::codec_rotation::{
     FleetWriteFence, activate_codec_key, load_shard_rotation_progress,
     load_shard_rotation_progress_against, refresh_active_codec_key, retire_codec_key,
@@ -287,6 +288,20 @@ fn two_key_registry() -> PayloadCodecs {
     codecs
         .register_key("k2", Arc::new(XorCodec(0x22)))
         .expect("register k2");
+    codecs.set_active_key("k1").expect("activate k1");
+    codecs
+}
+
+/// As [`two_key_registry`], with AES-256-GCM codecs (issue #1825).
+fn two_aead_key_registry() -> PayloadCodecs {
+    let codecs = PayloadCodecs::default();
+    for (key_id, byte) in [("k1", 0x11), ("k2", 0x22)] {
+        let key = DataKey::from_bytes(&[byte; 32]).expect("data key");
+        AeadCodec::new(key_id, &key)
+            .expect("aead codec")
+            .register_with(&codecs)
+            .expect("register");
+    }
     codecs.set_active_key("k1").expect("activate k1");
     codecs
 }
@@ -729,11 +744,18 @@ async fn flipping_the_active_key_starts_a_fresh_pass() {
 
 // ── AC5: the fidelity proof behind sanctioned exception #3 ───────────────────
 
+/// Runs the fidelity proof with the XOR fixture codec and with the
+/// production AES-256-GCM codec (issue #1825).
 #[tokio::test]
 async fn replay_fidelity_is_byte_identical_across_a_sweep() {
+    assert_replay_fidelity_across_a_sweep(two_key_registry()).await;
+    assert_replay_fidelity_across_a_sweep(two_aead_key_registry()).await;
+}
+
+/// Replay a fixture history, sweep it from `k1` onto `k2`, and replay again.
+async fn assert_replay_fidelity_across_a_sweep(codecs: PayloadCodecs) {
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
-    let codecs = two_key_registry();
     let exec_id = insert_execution(&mut conn, "fidelity_workflow").await;
     append_under_key(
         &mut conn,

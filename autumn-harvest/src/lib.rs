@@ -194,6 +194,8 @@ pub fn test_partitioned_layout_requested() -> bool {
 
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
+/// AES-256-GCM payload codec and data-key providers (issue #1825).
+pub mod aead_codec;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
 /// History analyzer and linter.
