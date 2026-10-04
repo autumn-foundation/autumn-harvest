@@ -48006,7 +48006,7 @@ async fn set_build_ramp_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildRampBody>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::{set_build_ramp, validate_ramp_percent};
+    use autumn_harvest::build_routing::{set_build_ramp_with_id, validate_ramp_percent};
 
     let queue_name = body.queue_name.trim();
     let target_build_id = body.target_build_id.trim();
@@ -48023,6 +48023,9 @@ async fn set_build_ramp_handler(
         Err(e) => return e.into_response(),
     };
     let (actor, source, request_id) = audit_context(&headers, &api_state);
+    // One id for this ramp on every shard. The ramp guard matches its abort
+    // markers to a ramp by this id, not by clocks (issue #1814).
+    let ramp_id = uuid::Uuid::new_v4();
 
     let mut last_policy = None;
     let mut last_conflict = None;
@@ -48035,7 +48038,15 @@ async fn set_build_ramp_handler(
                 continue;
             }
         };
-        match set_build_ramp(&mut conn, queue_name, target_build_id, body.ramp_percent).await {
+        match set_build_ramp_with_id(
+            &mut conn,
+            queue_name,
+            target_build_id,
+            body.ramp_percent,
+            ramp_id,
+        )
+        .await
+        {
             Ok(p) => last_policy = Some(p),
             Err(e @ autumn_harvest::HarvestError::Config(_)) => {
                 last_conflict = Some(e);

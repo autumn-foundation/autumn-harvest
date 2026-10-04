@@ -1886,6 +1886,15 @@ pub const BUILD_ID_LABEL_NONE: &str = "none";
 /// [`MAX_BUILD_ID_LABELS`] distinct builds, and for a build id longer than
 /// [`MAX_BUILD_ID_LABEL_LEN`] bytes.
 pub const BUILD_ID_LABEL_OTHER: &str = "__other__";
+/// `build_id` label value for a worker whose real build id is `none`
+/// (issue #1814).
+///
+/// The real id must not merge with the [`BUILD_ID_LABEL_NONE`] sentinel, so
+/// [`build_id_label`] reports it under this reserved value instead.
+pub const BUILD_ID_LABEL_REAL_NONE: &str = "build:none";
+/// `build_id` label value for a worker whose real build id is `__other__`
+/// (issue #1814). See [`BUILD_ID_LABEL_REAL_NONE`].
+pub const BUILD_ID_LABEL_REAL_OTHER: &str = "build:__other__";
 /// The maximum number of distinct `build_id` label values in one process
 /// (issue #1814).
 ///
@@ -1947,17 +1956,22 @@ impl BuildIdLabelCap {
     /// Return the label value for `raw`.
     ///
     /// An empty `raw` gets [`BUILD_ID_LABEL_NONE`]. A `raw` longer than
-    /// [`MAX_BUILD_ID_LABEL_LEN`] bytes gets [`BUILD_ID_LABEL_OTHER`]. A
-    /// sentinel value maps to itself and uses no slot, so a second cap of a
-    /// label is safe.
+    /// [`MAX_BUILD_ID_LABEL_LEN`] bytes gets [`BUILD_ID_LABEL_OTHER`]. A real
+    /// build id equal to a sentinel gets a reserved value, such as
+    /// [`BUILD_ID_LABEL_REAL_NONE`], so a sentinel always means what it says.
     #[must_use]
     pub fn label<'a>(&self, raw: &'a str) -> &'a str {
-        if raw.is_empty() || raw == BUILD_ID_LABEL_NONE {
+        if raw.is_empty() {
             return BUILD_ID_LABEL_NONE;
         }
-        if raw == BUILD_ID_LABEL_OTHER || raw.len() > MAX_BUILD_ID_LABEL_LEN {
+        if raw.len() > MAX_BUILD_ID_LABEL_LEN {
             return BUILD_ID_LABEL_OTHER;
         }
+        let raw = match raw {
+            BUILD_ID_LABEL_NONE => BUILD_ID_LABEL_REAL_NONE,
+            BUILD_ID_LABEL_OTHER => BUILD_ID_LABEL_REAL_OTHER,
+            other => other,
+        };
         let admitted = self
             .admitted
             .read()
@@ -5826,11 +5840,18 @@ mod tests {
     }
 
     #[test]
-    fn build_id_label_cap_keeps_sentinels_without_a_slot() {
-        let cap = BuildIdLabelCap::new(1);
-        assert_eq!(cap.label(BUILD_ID_LABEL_NONE), BUILD_ID_LABEL_NONE);
-        assert_eq!(cap.label(BUILD_ID_LABEL_OTHER), BUILD_ID_LABEL_OTHER);
-        assert_eq!(cap.label("v1"), "v1", "the one slot is still free");
+    fn a_real_build_id_equal_to_a_sentinel_gets_a_reserved_label() {
+        let cap = BuildIdLabelCap::new(4);
+        assert_eq!(cap.label(BUILD_ID_LABEL_NONE), BUILD_ID_LABEL_REAL_NONE);
+        assert_eq!(cap.label(BUILD_ID_LABEL_OTHER), BUILD_ID_LABEL_REAL_OTHER);
+        // The sentinels still mean "no build" and "over the cap" only.
+        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
+        assert_ne!(BUILD_ID_LABEL_REAL_NONE, BUILD_ID_LABEL_NONE);
+        assert_ne!(BUILD_ID_LABEL_REAL_OTHER, BUILD_ID_LABEL_OTHER);
+        // A reserved label uses a slot like any real build.
+        let one = BuildIdLabelCap::new(1);
+        assert_eq!(one.label(BUILD_ID_LABEL_NONE), BUILD_ID_LABEL_REAL_NONE);
+        assert_eq!(one.label("v1"), BUILD_ID_LABEL_OTHER);
     }
 
     #[test]
@@ -5845,7 +5866,6 @@ mod tests {
         // This test admits no build, so it cannot fill the process-wide cap
         // that other tests in this binary share.
         assert_eq!(build_id_label(""), BUILD_ID_LABEL_NONE);
-        assert_eq!(build_id_label(BUILD_ID_LABEL_OTHER), BUILD_ID_LABEL_OTHER);
         let long = "z".repeat(MAX_BUILD_ID_LABEL_LEN + 1);
         assert_eq!(build_id_label(&long), BUILD_ID_LABEL_OTHER);
     }

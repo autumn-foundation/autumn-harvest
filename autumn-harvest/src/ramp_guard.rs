@@ -375,12 +375,13 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
 ///
 /// The binds are the queue, the base build, the target build and the step
 /// start. The row must still hold the same step, so a verdict about an old
-/// step cannot clear a new one. The same UPDATE sets the durable abort marker
-/// `ramp_aborted_target`, so the marker commits with the clear.
+/// step cannot clear a new one. The same UPDATE copies `ramp_id` to the
+/// durable abort marker `ramp_aborted_id`, so the marker commits with the
+/// clear.
 #[must_use]
 pub const fn abort_ramp_query() -> &'static str {
     "UPDATE harvest_build_policies \
-     SET ramp_aborted_target = target_build_id, \
+     SET ramp_aborted_id = ramp_id, ramp_id = NULL, \
          target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
      WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
        AND updated_at = $4"
@@ -445,6 +446,9 @@ type RampKey = (String, String, String);
 struct PoolRamp {
     key: RampKey,
     step: chrono::DateTime<chrono::Utc>,
+    /// The ramp's identity, or `None` for a ramp set before the column
+    /// existed.
+    ramp_id: Option<uuid::Uuid>,
     ramp_percent: i32,
     base: BuildOutcomeStats,
     target: BuildOutcomeStats,
@@ -460,15 +464,16 @@ struct ObservedRamp {
     /// The pool index and the step of each pool that holds the ramp, in
     /// pool order.
     steps: Vec<(usize, chrono::DateTime<chrono::Utc>)>,
-    /// `true` when another pool holds a guard abort marker for this ramp
-    /// that is newer than every step of the ramp. That is the trace of a
-    /// partial clear.
+    /// The identities of the ramp on its pools.
+    ramp_ids: Vec<uuid::Uuid>,
+    /// `true` when another pool holds a guard abort marker for one of
+    /// `ramp_ids`. That is the trace of a partial clear.
     abort_marked: bool,
 }
 
-/// A guard abort marker on one pool: the ramp it cleared, and when.
+/// A guard abort marker on one pool: the queue and the `ramp_id` it cleared.
 #[cfg(feature = "db")]
-type AbortMarker = (RampKey, chrono::DateTime<chrono::Utc>);
+type AbortMarker = (String, uuid::Uuid);
 
 /// What one pool holds: its active ramps and its guard abort markers.
 #[cfg(feature = "db")]
@@ -541,8 +546,10 @@ struct PolicyRow {
     target_build_id: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     ramp_percent: Option<i32>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-    ramp_aborted_target: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    ramp_id: Option<uuid::Uuid>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    ramp_aborted_id: Option<uuid::Uuid>,
 }
 
 /// Read every active ramp, its step counts and every abort marker on one pool.
@@ -568,7 +575,7 @@ async fn read_pool_ramps(
                 .map_err(crate::error::database_error)?;
             let policies: Vec<PolicyRow> = diesel::sql_query(
                 "SELECT queue_name, build_id, updated_at, target_build_id, ramp_percent, \
-                        ramp_aborted_target \
+                        ramp_id, ramp_aborted_id \
                  FROM harvest_build_policies ORDER BY queue_name",
             )
             .load(conn)
@@ -581,10 +588,9 @@ async fn read_pool_ramps(
                     (policy.target_build_id.clone(), policy.ramp_percent)
                 else {
                     if policy.target_build_id.is_none()
-                        && let Some(aborted) = policy.ramp_aborted_target.clone()
+                        && let Some(aborted) = policy.ramp_aborted_id
                     {
-                        let key = (policy.queue_name.clone(), policy.build_id.clone(), aborted);
-                        markers.push((key, policy.updated_at));
+                        markers.push((policy.queue_name.clone(), aborted));
                     }
                     continue;
                 };
@@ -595,6 +601,7 @@ async fn read_pool_ramps(
                 ramps.push(PoolRamp {
                     key: (policy.queue_name.clone(), policy.build_id.clone(), target),
                     step: policy.updated_at,
+                    ramp_id: policy.ramp_id,
                     ramp_percent: percent,
                     base,
                     target: target_stats,
@@ -610,9 +617,10 @@ async fn read_pool_ramps(
 /// The pools are read at the same time. Returns `None` when any read fails,
 /// so a pass never decides on part of the fleet.
 ///
-/// A ramp is `abort_marked` when a pool holds a guard abort marker for it,
-/// and the marker is newer than every step of the ramp. An operator ramp set
-/// after the abort is newer than the marker, so it is not marked.
+/// A ramp is `abort_marked` when another pool holds a guard abort marker for
+/// one of its `ramp_id`s on the same queue. The match is by id, so clock skew
+/// between pools does not matter. An operator ramp set after the abort has a
+/// new id, so it is not marked.
 #[cfg(feature = "db")]
 async fn read_ramps(
     pools: &[crate::worker::DbPool],
@@ -621,8 +629,7 @@ async fn read_ramps(
     let reads = pools.iter().map(|pool| read_pool_ramps(pool, bound));
     let mut merged: std::collections::BTreeMap<RampKey, ObservedRamp> =
         std::collections::BTreeMap::new();
-    let mut markers: std::collections::BTreeMap<RampKey, chrono::DateTime<chrono::Utc>> =
-        std::collections::BTreeMap::new();
+    let mut markers: std::collections::BTreeSet<AbortMarker> = std::collections::BTreeSet::new();
     for (index, result) in futures::future::join_all(reads)
         .await
         .into_iter()
@@ -641,18 +648,15 @@ async fn read_ramps(
             slot.base = slot.base.plus(ramp.base);
             slot.target = slot.target.plus(ramp.target);
             slot.steps.push((index, ramp.step));
+            slot.ramp_ids.extend(ramp.ramp_id);
         }
-        for (key, at) in pool_markers {
-            let slot = markers.entry(key).or_insert(at);
-            *slot = (*slot).max(at);
-        }
+        markers.extend(pool_markers);
     }
-    for (key, ramp) in &mut merged {
-        let newest_step = ramp.steps.iter().map(|&(_, step)| step).max();
-        ramp.abort_marked = matches!(
-            (markers.get(key), newest_step),
-            (Some(marked_at), Some(step)) if *marked_at >= step
-        );
+    for ((queue, _, _), ramp) in &mut merged {
+        ramp.abort_marked = ramp
+            .ramp_ids
+            .iter()
+            .any(|id| markers.contains(&(queue.clone(), *id)));
     }
     Some(merged)
 }

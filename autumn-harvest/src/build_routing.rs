@@ -419,17 +419,39 @@ pub async fn set_build_ramp(
     target_build_id: &str,
     percent: i32,
 ) -> HarvestResult<BuildPolicy> {
+    set_build_ramp_with_id(conn, queue_name, target_build_id, percent, Uuid::new_v4()).await
+}
+
+/// [`set_build_ramp`] with a caller-chosen `ramp_id` (issue #1814).
+///
+/// A fan-out over shard pools passes one `ramp_id` to every pool. The ramp
+/// guard's abort marker records the `ramp_id` that it cleared. A later guard
+/// matches the marker to the ramp by this id, not by database clocks, so it
+/// can finish a partial abort safely.
+///
+/// # Errors
+///
+/// The same as [`set_build_ramp`].
+#[cfg(feature = "db")]
+pub async fn set_build_ramp_with_id(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    target_build_id: &str,
+    percent: i32,
+    ramp_id: Uuid,
+) -> HarvestResult<BuildPolicy> {
     validate_ramp_percent(percent)?;
 
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "UPDATE harvest_build_policies \
-         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         SET target_build_id = $2, ramp_percent = $3, ramp_id = $4, updated_at = NOW() \
          WHERE queue_name = $1 \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
     .bind::<diesel::sql_types::Text, _>(target_build_id)
     .bind::<diesel::sql_types::Integer, _>(percent)
+    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
     .load(conn)
     .await
     .map_err(database_error)?;
@@ -462,7 +484,7 @@ pub async fn clear_build_ramp(
 ) -> HarvestResult<Option<BuildPolicy>> {
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "UPDATE harvest_build_policies \
-         SET target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
+         SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, updated_at = NOW() \
          WHERE queue_name = $1 \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))

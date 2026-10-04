@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::build_routing::{
-    get_build_policy, ramp_bucket, set_build_policy, set_build_ramp,
+    get_build_policy, ramp_bucket, set_build_policy, set_build_ramp, set_build_ramp_with_id,
 };
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
@@ -897,9 +897,28 @@ async fn a_blocked_clear_fails_on_the_server_and_changes_nothing() {
     );
 }
 
+/// Set the test ramp on one pool with a given `ramp_id`, as the API fan-out
+/// does on every shard.
+async fn set_ramp_with_id(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) {
+    set_build_policy(conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp_with_id(conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id)
+        .await
+        .expect("set ramp");
+}
+
+async fn policy_step(conn: &mut AsyncPgConnection) -> chrono::DateTime<chrono::Utc> {
+    get_build_policy(conn, QUEUE)
+        .await
+        .expect("read policy")
+        .expect("policy exists")
+        .updated_at
+}
+
 /// After a restart, a ramp that one pool still holds is cleared when another
-/// pool holds the abort marker. The marker commits with the clear, so this
-/// works with no audit row at all.
+/// pool holds the abort marker for the same `ramp_id`. The marker commits
+/// with the clear, so this works with no audit row at all.
 #[tokio::test]
 async fn a_restarted_guard_finishes_a_marked_partial_abort() {
     let (url_1, _c1) = setup().await;
@@ -911,15 +930,12 @@ async fn a_restarted_guard_finishes_a_marked_partial_abort() {
     let mut conn_2 = AsyncPgConnection::establish(&url_2)
         .await
         .expect("connect 2");
-    set_ramp(&mut conn_1).await;
-    set_ramp(&mut conn_2).await;
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    set_ramp_with_id(&mut conn_2, ramp_id).await;
 
     // The old guard cleared pool 1, then stopped before its audit write.
-    let step_1 = get_build_policy(&mut conn_1, QUEUE)
-        .await
-        .expect("read policy")
-        .expect("policy exists")
-        .updated_at;
+    let step_1 = policy_step(&mut conn_1).await;
     assert!(
         abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
             .await
@@ -943,10 +959,10 @@ async fn a_restarted_guard_finishes_a_marked_partial_abort() {
     );
 }
 
-/// An operator ramp set after a guard abort is newer than the marker, so the
-/// marker does not clear it.
+/// An operator ramp set after a guard abort has a new `ramp_id`, so the old
+/// marker does not clear it. The match uses ids, so no clock is involved.
 #[tokio::test]
-async fn an_abort_marker_older_than_the_ramp_step_does_not_clear_it() {
+async fn an_abort_marker_for_another_ramp_id_does_not_clear_a_ramp() {
     let (url_1, _c1) = setup().await;
     let (url_2, _c2) = setup().await;
     let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
@@ -956,20 +972,15 @@ async fn an_abort_marker_older_than_the_ramp_step_does_not_clear_it() {
     let mut conn_2 = AsyncPgConnection::establish(&url_2)
         .await
         .expect("connect 2");
-    set_ramp(&mut conn_1).await;
-    let step_1 = get_build_policy(&mut conn_1, QUEUE)
-        .await
-        .expect("read policy")
-        .expect("policy exists")
-        .updated_at;
+    set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+    let step_1 = policy_step(&mut conn_1).await;
     assert!(
         abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
             .await
             .expect("clear pool 1")
     );
-    tokio::time::sleep(Duration::from_millis(20)).await;
     // The operator ramps the same target again, but only pool 2 takes it.
-    set_ramp(&mut conn_2).await;
+    set_ramp_with_id(&mut conn_2, uuid::Uuid::new_v4()).await;
 
     let pools = [pool_1.clone(), pool_2.clone()];
     let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;

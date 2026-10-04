@@ -171,13 +171,16 @@ The guard fails safe: when it cannot read, it does not abort.
 - When no clear of a pass succeeds, the guard reports nothing yet. It reports
   the abort when a retry clears a pool.
 - A failed audit write logs a warning and does not undo the clear.
-- A guard keeps its pending clears in memory. Each finished clear also sets
-  the abort marker `harvest_build_policies.ramp_aborted_target` in the same
-  `UPDATE`, so the marker cannot be lost. After a restart, a pool can still
-  hold a ramp while another pool holds a marker for it. When the marker is
-  newer than every step of the ramp, the guard clears the ramp with no new
-  verdict and no new audit row. An operator ramp set after the abort is newer
-  than the marker, so the guard does not clear it.
+- A guard keeps its pending clears in memory. Each operator ramp also has a
+  `ramp_id`, which the API fan-out writes to every shard pool. Each finished
+  clear copies it to the abort marker `harvest_build_policies.ramp_aborted_id`
+  in the same `UPDATE`, so the marker cannot be lost. After a restart, a pool
+  can still hold a ramp whose `ramp_id` matches a marker on another pool. The
+  guard then clears that ramp with no new verdict and no new audit row. The
+  match uses ids, not database clocks, so clock skew between pools does not
+  matter. An operator ramp set after the abort has a new `ramp_id`, so the
+  guard does not clear it. A ramp set before the migration has no id, and the
+  guard cannot finish its partial abort after a restart.
 - After a cancel, a pass lets the clear in flight finish and starts no new
   clear. Shutdown therefore waits for one bounded clear at most, plus the
   audit write of a clear that the pass made.
@@ -210,7 +213,8 @@ families, and it labels both.
 `telemetry::build_id_label` caps the label values. A process admits the first
 16 distinct build ids that it sees (`MAX_BUILD_ID_LABELS`). It never evicts a
 build. A later build id, or one longer than 128 bytes, gets `__other__`. An
-empty build id gets `none`.
+empty build id gets `none`. A real build id equal to `none` or `__other__` gets
+`build:none` or `build:__other__`, so the two sentinels keep one meaning.
 
 A worker keeps one build id for its whole life, and a process normally hosts
 one build. The cap therefore holds the active builds in practice. A process
