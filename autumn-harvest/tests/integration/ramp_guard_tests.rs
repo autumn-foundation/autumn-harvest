@@ -1272,9 +1272,10 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
     assert_eq!(marker_reported(&mut conn_2, old_id).await, Some(true));
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no new report");
 
-    // Every marker is reported and no pool holds a marked ramp, so the next
-    // pass prunes every marker.
-    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    // Every marker is reported and no pool holds a marked ramp. After the
+    // report grace, here zero, the next pass prunes every marker.
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(
         abort_marker_count(&mut conn_1).await,
@@ -1748,6 +1749,54 @@ async fn finishing_an_unreported_abort_keeps_it_unreported() {
     let aborts = guard_once(&pools, &pool_1, &config, None).await;
     assert_eq!(aborts.len(), 1, "the abort is still reported: {aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+}
+
+/// A reported marker stays for the report grace before a pass prunes it. In
+/// that window, a fan-out still in flight can write the same `ramp_id` to a
+/// later pool. The marker then still finishes that ramp.
+#[tokio::test]
+async fn a_reported_marker_outlives_a_late_fan_out_write() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    set_build_policy(&mut conn_2, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy 2");
+    // The fan-out reached pool 1, and the guard aborted and reported it.
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+    );
+    mark_abort_reported(&mut conn_1, QUEUE, ramp_id, CLEAR_BOUND)
+        .await
+        .expect("mark pool 1");
+
+    // Within the grace, a pass keeps the reported marker.
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn_1).await, 1, "the marker stays");
+
+    // The late fan-out write reaches pool 2, and the marker finishes it.
+    set_build_ramp_with_id(&mut conn_2, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id)
+        .await
+        .expect("late fan-out write");
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the late ramp is cleared"
+    );
 }
 
 /// A split ramp with no abort marker is not cleared.

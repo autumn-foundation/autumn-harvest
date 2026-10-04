@@ -926,7 +926,8 @@ async fn read_pool_ramps(
 /// no pool can still hold that ramp. The read groups the finished markers
 /// of one abort over all pools:
 ///
-/// - When every marker is reported, the markers can go.
+/// - When every marker is reported and older than `report_grace`, the
+///   markers can go. The grace lets them finish a late fan-out write.
 /// - When some are reported, a guard reported the abort and stopped while
 ///   it marked them. The rest only need the mark.
 /// - When none is reported, the abort is due for recovery once a marker is
@@ -1043,11 +1044,16 @@ fn classify_finished_markers(
     for ((queue, ramp_id), entries) in groups {
         let reported = entries.iter().filter(|(_, marker)| marker.reported).count();
         if reported == entries.len() {
-            for (index, _) in entries {
-                finished
-                    .entry((index, queue.clone()))
-                    .or_default()
-                    .push(ramp_id);
+            // A ramp fan-out that is still in flight can write this
+            // `ramp_id` to a later pool. The markers therefore stay for the
+            // report grace, so they can still finish such a late ramp.
+            if entries.iter().all(|(_, marker)| marker.age_ms >= grace_ms) {
+                for (index, _) in entries {
+                    finished
+                        .entry((index, queue.clone()))
+                        .or_default()
+                        .push(ramp_id);
+                }
             }
         } else if reported > 0 {
             // A guard reported the abort and stopped while it marked the

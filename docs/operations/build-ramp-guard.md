@@ -242,7 +242,11 @@ The guard fails safe: when it cannot read, it does not abort.
   that leaves the claim to expire, and another guard reports the abort.
 - When some markers of an abort are reported, a guard reported it and
   stopped while it marked them. A pass marks the rest and reports nothing.
-  A pass removes the markers of an abort only when all are reported.
+  A pass removes the markers of an abort only when all are reported and
+  older than `report_grace`. A ramp fan-out that is still in flight can
+  write the same `ramp_id` to a later pool. Within the grace, the markers
+  still finish that late ramp. A fan-out write that is later than the grace
+  makes a ramp with no marker, which the guard judges as usual.
 - A guard that reported but could not mark any of its markers causes a
   second report after the grace. A failed audit write also makes the counter count
   the abort twice. An extra report is better than an abort with none.
