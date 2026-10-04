@@ -760,6 +760,10 @@ struct LockedTask {
     scanned_claim: bool,
     /// The handler of the scanned claim started (issue #1809).
     handler_started: bool,
+    /// The `started_at` of the `RUNNING` claim that holds the row now, when
+    /// its handler started (issue #1809). A schedule-to-close timeout ends
+    /// this claim, which can be later than the scanned one.
+    current_started_claim: Option<chrono::DateTime<Utc>>,
     /// The heartbeat deadline has passed on the row-current values.
     heartbeat_expired: bool,
 }
@@ -812,13 +816,16 @@ async fn lock_task_for_timeout(
         .optional()
         .map_err(crate::error::database_error)?;
     Ok(row.map(|row| {
-        let scanned_claim = row.state == "RUNNING"
+        let running = row.state == "RUNNING";
+        let scanned_claim = running
             && row.worker_id == task.worker_id
             && row.attempt == task.attempt
             && row.started_at == task.started_at;
+        let current_handler_started = running && row.handler_started_attempt == Some(row.attempt);
         LockedTask {
-            handler_started: scanned_claim && row.handler_started_attempt == Some(row.attempt),
+            handler_started: scanned_claim && current_handler_started,
             scanned_claim,
+            current_started_claim: row.started_at.filter(|_| current_handler_started),
             heartbeat_expired: row.heartbeat_expired,
             crash_strikes: row.crash_strikes,
             state: row.state,
@@ -838,6 +845,8 @@ struct ActivityTimeoutOutcome {
     retried: bool,
     /// The handler of the timed-out attempt started (issue #1809).
     handler_started: bool,
+    /// The timed-out claim is the one the scan saw (issue #1809).
+    scanned_claim: bool,
 }
 
 /// SQL for [`schedule_to_start_still_expired`], exposed for shape tests.
@@ -1557,6 +1566,7 @@ async fn enforce_activity_timeout(
                 Some(ActivityTimeoutOutcome {
                     retried,
                     handler_started: locked.handler_started,
+                    scanned_claim: locked.scanned_claim,
                 })
             };
             // Timeout retry (issue #1809, ADR 0004). A start-to-close or
@@ -1592,7 +1602,12 @@ async fn enforce_activity_timeout(
                         .await?
                         {
                             queue::ClaimWrite::Applied => {
-                                record_timed_out_claim(conn, task, locked.handler_started).await?;
+                                record_timed_out_claim(
+                                    conn,
+                                    task.id,
+                                    task.started_at.filter(|_| locked.handler_started),
+                                )
+                                .await?;
                                 outcome(true)
                             }
                             queue::ClaimWrite::LeaseLost => None,
@@ -1613,7 +1628,9 @@ async fn enforce_activity_timeout(
             )
             .await?;
             queue::fail_task(conn, task.id, &error).await?;
-            record_timed_out_claim(conn, task, locked.handler_started).await?;
+            // A schedule-to-close timeout ends the claim that holds the row
+            // now, which can be later than the scanned one. Record that claim.
+            record_timed_out_claim(conn, task.id, locked.current_started_claim).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(outcome(false))
         }),
@@ -1635,7 +1652,15 @@ async fn enforce_activity_timeout(
     // neither did a `PENDING` task that timed out in the queue. Counting
     // them would let a backlog open the circuit and turn overload into
     // failure (#1785). The confirm also fences a late result of this attempt.
-    provisional.confirm(enforced.handler_started);
+    //
+    // A schedule-to-close timeout can end a later claim than the scanned
+    // one. The mark names the scanned claim, so it rolls back. The owner of
+    // the later claim finds the record and counts the timeout once.
+    if enforced.scanned_claim {
+        provisional.confirm(enforced.handler_started);
+    } else {
+        drop(provisional);
+    }
     if enforced.retried {
         metrics.record_activity_retried(activity_name, &task.queue_name);
     }
@@ -1646,19 +1671,17 @@ async fn enforce_activity_timeout(
 /// Record the timed-out claim on its row (issue #1809). The worker that held
 /// it can then tell this timeout from any other loss of its claim.
 ///
-/// Only a claim whose handler started records. Any other timeout feeds no
-/// breaker, so its owner must not count it either. A `PENDING` task holds no
-/// claim and records nothing.
+/// The caller passes `started_at` only for a claim whose handler started.
+/// Any other timeout feeds no breaker, so its owner must not count it
+/// either. A `PENDING` task holds no claim and records nothing.
 async fn record_timed_out_claim(
     conn: &mut AsyncPgConnection,
-    task: &TaskQueueItem,
-    handler_started: bool,
+    task_id: uuid::Uuid,
+    started_at: Option<chrono::DateTime<Utc>>,
 ) -> HarvestResult<()> {
-    match task.started_at {
-        Some(started_at) if handler_started => {
-            queue::record_timed_out_claim(conn, task.id, started_at).await
-        }
-        _ => Ok(()),
+    match started_at {
+        Some(started_at) => queue::record_timed_out_claim(conn, task_id, started_at).await,
+        None => Ok(()),
     }
 }
 

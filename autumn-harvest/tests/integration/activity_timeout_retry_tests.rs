@@ -615,6 +615,76 @@ async fn stale_scan_snapshot_leaves_a_later_claim_alone() {
     assert_eq!(breaker_state(&breakers, activity), ("closed", 0));
 }
 
+/// A schedule-to-close timeout ends whichever claim holds the row (issue
+/// #1809). When a later claim started its handler, that claim is the one
+/// timed out. Its owner finds the record and counts the timeout once. The
+/// enforcer, which scanned an older claim, counts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schedule_to_close_is_attributed_to_the_current_claim() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-stc-current");
+    let activity = "t1809_stc_current";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(60)),
+        schedule_to_close: Some(Duration::from_secs(3600)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+    let breakers = trip_on_first(activity);
+
+    let first = claim(&mut conn, &queue, "w-stc-current").await;
+    let stale = task_row(&mut conn, task_id).await;
+    let deferred = queue::defer_claimed_retry_for_budget(
+        &mut conn,
+        &queue::TaskClaim::of(&first).expect("claimed"),
+        chrono::Duration::zero(),
+    )
+    .await
+    .expect("defer");
+    assert_eq!(deferred, queue::ClaimWrite::Applied);
+    let second = claim(&mut conn, &queue, "w-stc-current").await;
+    start(&mut conn, &second, exec_id, activity).await;
+
+    timeout::enforce_activity_timeout_for_test(
+        &mut conn,
+        &stale,
+        &TimeoutReason::ScheduleToClose,
+        Some(&breakers),
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("enforce");
+
+    let row = task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "FAILED");
+    assert_eq!(
+        row.timed_out_claims,
+        Some(vec![second.started_at]),
+        "the record names the claim that was timed out"
+    );
+    assert_eq!(
+        breaker_state(&breakers, activity),
+        ("closed", 0),
+        "the enforcer scanned another claim, so its owner counts it"
+    );
+
+    // The owner of the current claim finds its record and counts it once.
+    let autumn_harvest::circuit_breaker::DispatchDecision::Allow { token } =
+        breakers.on_dispatch(activity, Instant::now())
+    else {
+        panic!("a closed breaker admits the dispatch");
+    };
+    let key = autumn_harvest::circuit_breaker::ClaimKey {
+        task_id,
+        attempt: second.attempt,
+        started_at: second.started_at,
+    };
+    breakers.begin_claim(activity, key, token);
+    breakers.on_claim_lost(activity, token, key, true, Instant::now());
+    assert_eq!(breaker_state(&breakers, activity).0, "open");
+}
+
 /// ADR 0004 §1: no retry starts after `schedule_to_close`. The task fails
 /// with its own timeout type.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
