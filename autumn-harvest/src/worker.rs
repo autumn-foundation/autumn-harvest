@@ -29382,6 +29382,7 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
+        self.keep_lease_while_handlers_run(vec![pool.clone()]);
 
         // A decision that parked during the drain pinned its task again.
         // Release once more. A task that outlived the drain keeps its pin.
@@ -31558,6 +31559,9 @@ impl Worker {
         }
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
         self.drain_in_flight().await;
+        self.keep_lease_while_handlers_run(
+            shard_targets.iter().map(|(_, pool)| pool.clone()).collect(),
+        );
         for (_, shard_pool) in shard_targets {
             self.release_sticky_pins(shard_pool, acquire_bound).await;
         }
@@ -32386,8 +32390,8 @@ impl Worker {
     /// One join window before the deadline, the drain cancels running
     /// activities (issue #1813). See [`drain_cancel_at`]. A handler that
     /// returns a retryable error gives its claim back. A handler that ignores
-    /// the cancel keeps its claim past the deadline. No peer takes the task
-    /// until orphan reclaim finds the worker stale.
+    /// the cancel keeps its claim past the deadline. See
+    /// [`Self::keep_lease_while_handlers_run`].
     async fn drain_in_flight(&self) {
         // Uses the actual permit count behind each semaphore (issue #548):
         // equal to `config.max_concurrent_*` when no slot tuner is
@@ -32470,8 +32474,7 @@ impl Worker {
                         worker_id = %self.config.worker_id,
                         total_permits,
                         "shutdown timeout elapsed — some tasks may still be running; \
-                         their claims stay held until each handler returns or orphan \
-                         reclaim recovers the task"
+                         their claims stay held until each handler returns"
                     );
                     return;
                 }
@@ -32482,6 +32485,61 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Keep this worker's lease alive while a drained handler still runs
+    /// (issue #1813).
+    ///
+    /// The drain keeps the claim of a handler that ignores the cancel. Orphan
+    /// reclaim judges that claim by the worker heartbeat alone. A host process
+    /// can outlive `run`, as an embedded runtime does. Without this keeper, a
+    /// peer would then start a second copy while the first one still runs.
+    ///
+    /// The keeper refreshes `last_heartbeat_at` on each pool at the heartbeat
+    /// interval. It stops when the last dispatch body ends. It also stops when
+    /// the process exits, and orphan reclaim then recovers the task.
+    fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
+        if self.dispatched.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            worker_id = %self.config.worker_id,
+            running = self.dispatched.len(),
+            "drain ended with handlers still running; the worker keeps its lease until they return"
+        );
+        let dispatched = self.dispatched.clone();
+        let worker_id = self.config.worker_id.clone();
+        let interval = self.config.worker_heartbeat_interval;
+        // Detached on purpose: the handlers it guards are detached too.
+        tokio::spawn(async move {
+            let done = dispatched.wait();
+            tokio::pin!(done);
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut done => return,
+                    _ = tick.tick() => {
+                        for pool in &pools {
+                            let touched = match pool.get().await {
+                                Ok(mut conn) => {
+                                    crate::workers::touch_worker_liveness(&mut conn, &worker_id)
+                                        .await
+                                }
+                                Err(error) => Err(crate::error::database_error(error)),
+                            };
+                            if let Err(error) = touched {
+                                tracing::warn!(
+                                    worker_id = %worker_id,
+                                    %error,
+                                    "failed to keep the worker lease for a drained handler"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Releases the cached workflows once the in-flight drain ends (issue

@@ -435,6 +435,26 @@ pub async fn register_worker_and_clear_stale_miss_evidence(
     .await
 }
 
+/// Refresh only `last_heartbeat_at` for a worker (issue #1813).
+///
+/// A drained worker calls this while a handler that ignored the cancel still
+/// runs. Orphan reclaim then keeps the claim with that handler. The stamp uses
+/// the database clock, as [`heartbeat_worker`] does.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn touch_worker_liveness(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<usize> {
+    diesel::update(harvest_workers::table.find(worker_id))
+        .set(harvest_workers::last_heartbeat_at.eq(diesel::dsl::now))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 /// Upsert `last_heartbeat_at` and `in_flight_count` for a worker.
 ///
 /// Returns the number of rows updated (1 if the worker row exists, 0 if it is

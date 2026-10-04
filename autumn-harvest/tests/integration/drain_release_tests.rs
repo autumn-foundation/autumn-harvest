@@ -111,15 +111,24 @@ struct Running {
 
 impl Running {
     fn start(worker_id: &str, queue: &str, pool: &DbPool) -> Self {
+        // A slow liveness heartbeat keeps orphan reclaim out of the test
+        // window. Only the drain may move a claim here. This holds when each
+        // test owns its database or runs alone, as in CI.
+        Self::start_with_heartbeat(worker_id, queue, pool, Duration::from_secs(15))
+    }
+
+    fn start_with_heartbeat(
+        worker_id: &str,
+        queue: &str,
+        pool: &DbPool,
+        heartbeat: Duration,
+    ) -> Self {
         let mut config = runtime_config(worker_id, 2, 2, Duration::from_secs(10));
         config.queues = vec![queue.to_string()];
         config.shutdown_timeout = SHUTDOWN_TIMEOUT;
         config.cancellation_grace_period = Duration::from_secs(1);
         config.sticky_timeout = Duration::ZERO;
-        // A slow liveness heartbeat keeps orphan reclaim out of the test
-        // window. Only the drain may move a claim here. This holds when each
-        // test owns its database or runs alone, as in CI.
-        config.worker_heartbeat_interval = Duration::from_secs(15);
+        config.worker_heartbeat_interval = heartbeat;
         let worker = Arc::new(Worker::new(config, registry()).expect("worker builds"));
         let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
         Self { worker, handle }
@@ -419,8 +428,10 @@ async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
 /// worker, so a live peer never starts a second copy. The handler's late
 /// result still lands through the claim fence.
 ///
-/// This guard passes before the fix too. It fails if a fix releases a claim
-/// whose handler did not join.
+/// The host process outlives `run`, as an embedded runtime does. Both workers
+/// use a 1 s heartbeat, so orphan reclaim judges the drained worker stale
+/// after 2 s. The test waits longer than that. The drained worker must keep
+/// its lease while the handler runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
     let (url, _container) = setup_test_database_url_or_env().await;
@@ -429,11 +440,12 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
     let exec_id = seed_workflow(&mut conn, &queue, "drain_stubborn").await;
     let pool = build_test_pool(&url);
 
+    let heartbeat = Duration::from_secs(1);
     let worker_a = format!("{queue}-a");
-    let a = Running::start(&worker_a, &queue, &pool);
+    let a = Running::start_with_heartbeat(&worker_a, &queue, &pool, heartbeat);
     wait_for_start(&url, exec_id, &worker_a, &STUBBORN_STARTS).await;
     let worker_b = format!("{queue}-b");
-    let b = Running::start(&worker_b, &queue, &pool);
+    let b = Running::start_with_heartbeat(&worker_b, &queue, &pool, heartbeat);
 
     let drain = a.stop().await;
     assert!(
@@ -445,8 +457,9 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         "the drain must end at its deadline: took {drain:?}"
     );
 
-    // Give the live peer time to poll. It must not take the claim.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Outlast the stale window (2 s) and a reclaimer tick (1 s) on the live
+    // peer. It must not take the claim.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     let row = activity_row(&url, exec_id).await.expect("activity row");
     assert_eq!(row.state, "RUNNING", "the claim stays held: {row:?}");
     assert_eq!(row.worker_id.as_deref(), Some(worker_a.as_str()), "{row:?}");

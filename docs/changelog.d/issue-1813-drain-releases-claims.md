@@ -31,8 +31,12 @@ the drain. Now:
   so a deploy never fails an activity. A handler that returns `Ok`, or a
   non-retryable error, takes the normal path.
 - A handler that ignores the cancel keeps its claim. The drain never drops
-  it. Its late result still lands through the #1789 fence. Orphan reclaim
-  recovers the task once the worker stops heartbeating.
+  it. Its late result still lands through the #1789 fence.
+- While such a handler runs, the worker keeps its lease alive through the
+  new `workers::touch_worker_liveness`, even after `run` returns. A host
+  process that outlives `run`, such as an embedded runtime, therefore never
+  lets a peer start a second copy. If the process exits, orphan reclaim
+  recovers the task.
 
 **Safety.** A claim is released only when no handler for it can still run:
 the handler never started, or it returned. The release is fenced on the

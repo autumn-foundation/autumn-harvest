@@ -169,8 +169,9 @@ handler.
   `worker shutdown:`. The heartbeat details stay, so the next attempt can
   resume from the last checkpoint.
 - A handler that returns `Ok` completes as usual.
-- A handler that ignores the cancel keeps its claim until it returns or the
-  worker goes stale.
+- A handler that ignores the cancel keeps its claim until it returns. The
+  worker keeps its lease alive meanwhile. If the process exits, orphan
+  reclaim recovers the task.
 
 ### `heartbeat_details` across a cancel signal
 

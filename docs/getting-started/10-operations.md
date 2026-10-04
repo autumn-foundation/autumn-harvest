@@ -322,9 +322,10 @@ A `SIGTERM` and a remote drain run the same drain (issue #1813):
    `max_attempts`. A handler that returns `Ok` completes as usual. A
    non-retryable error fails the activity as usual.
 6. At the deadline it stops waiting. A handler that ignored the cancel keeps
-   its claim, so no peer takes the task while the worker lives. The claim
-   fence (#1789) rejects its stale writes. Orphan reclaim recovers the task
-   after the worker stops heartbeating.
+   its claim. The worker keeps its lease alive until that handler returns,
+   even after `run` returns, so no peer starts a second copy. The claim fence
+   (#1789) rejects stale writes. If the process exits, orphan reclaim
+   recovers the task.
 
 A cancel cannot be undone. A later remote deadline does not give the
 activities back.
