@@ -1,0 +1,18 @@
+# TLA+ models that CI checks (issue #1819).
+#
+# Columns: <spec> <config> <expect>
+#   spec    the module name of formal/tla/<spec>.tla
+#   config  the TLC config in formal/tla/
+#   expect  `pass`, or `violation:<Invariant>`
+#
+# A `violation` row is a counter-example. TLC must fail on that invariant
+# and on no other. scripts/check-formal-models.sh runs every row.
+# formal_models_coverage.rs fails when a config has no row here.
+
+ActivityClaim      ActivityClaim.cfg               pass
+ActivityClaim      ActivityClaimPreFix.cfg         violation:TerminalByCurrentClaim
+ActivityClaim      ActivityClaimReach.cfg          violation:NoStaleOwnerAfterFinish
+WorkflowTaskClaim  WorkflowTaskClaim.cfg           pass
+WorkflowTaskClaim  WorkflowTaskClaimPreFix.cfg     violation:TerminalByCurrentClaim
+CodecRotation      CodecRotation.cfg               pass
+CodecRotation      CodecRotationBlindWrite.cfg     violation:ErasureIsFinal
