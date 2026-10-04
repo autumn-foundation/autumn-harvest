@@ -277,7 +277,8 @@ that no longer matches a finding also fails the build.
   That includes a `format()` template, where each placeholder is an unknown
   name. The lint cannot read SQL built with `||` or held in a variable, so
   such an `EXECUTE` counts as a lock on an unknown table. So does a template
-  with `%s` anywhere in its text, even in a comment or a quoted name.
+  with `%s` anywhere in its text, even in a comment or a quoted name. So does
+  a `%L` value that a `DO`, `EXECUTE` or function body runs as code.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
   as code, in any quote form. Any other string is data.
 - The lint reads string literals as `standard_conforming_strings = on` does.

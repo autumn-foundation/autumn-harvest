@@ -956,6 +956,16 @@ fn lex(
                 runs,
                 quoted: quote == '"',
             });
+        } else if c == LITERAL_PLACEHOLDER {
+            // A `%L` value outside a string is code that the lint cannot read.
+            toks.push(Token {
+                tok: Tok::Word("%s".to_string()),
+                line,
+                depth,
+                runs,
+                quoted: true,
+            });
+            i += 1;
         } else if is_ident(c) {
             let start = i;
             while at(i).is_some_and(|c| is_ident(c) || c == '$') {
@@ -1195,9 +1205,11 @@ fn lex_execute_sql(
     }
 }
 
-/// Replace each `format()` placeholder in `sql` with the unknown name `"%"`.
-/// Also return whether `sql` holds a `%s` placeholder.
+/// Replace each `format()` placeholder in `sql` with an unknown value. Also
+/// return whether `sql` holds a `%s` placeholder.
 ///
+/// `%I` becomes the unknown name `"%"`. `%L` becomes a string literal that
+/// holds `LITERAL_PLACEHOLDER`, so code built from it reads as unreadable.
 /// `%%` is a literal `%`. A placeholder may carry a position, flags and a
 /// width, as in `%1$-10I`.
 fn fill_placeholders(sql: &str) -> (String, bool) {
@@ -1224,8 +1236,11 @@ fn fill_placeholders(sql: &str) -> (String, bool) {
             j += 1;
         }
         // `%s` inserts any text, so `EXECUTE` marks it as SQL it cannot read.
-        if matches!(chars.get(j), Some('I' | 'L')) {
+        if chars.get(j) == Some(&'I') {
             out.push_str("\"%\"");
+            i = j + 1;
+        } else if chars.get(j) == Some(&'L') {
+            out.extend(['\'', LITERAL_PLACEHOLDER, '\'']);
             i = j + 1;
         } else if chars.get(j) == Some(&'s') {
             out.push_str("\"%\"");
@@ -1454,7 +1469,7 @@ impl<'a> Stmts<'a> {
     fn name_list(&self, mut k: usize) -> Vec<String> {
         let mut names = Vec::new();
         loop {
-            if self.is(k, "only") {
+            if self.keyword(k, "only") {
                 k += 1;
             }
             let Some((name, next)) = self.qualified_name(k) else {
@@ -1572,6 +1587,12 @@ fn index_key(owner: &str, index: &str) -> String {
 /// `"a.b"` is one name, so it must never read as schema `a` and table `b`.
 /// This character never occurs in an unquoted name.
 const QUOTED_DOT: char = '\u{2024}';
+
+/// The value of a `format()` `%L` placeholder.
+///
+/// A `DO` or `EXECUTE` may run that literal as code. This character never
+/// occurs in a migration, so the lexer finds it only where `%L` sits.
+const LITERAL_PLACEHOLDER: char = '\u{E000}';
 
 /// Whether `c` can be part of an unquoted identifier or a dollar tag.
 ///
@@ -5051,6 +5072,43 @@ fn a_format_text_placeholder_makes_execute_unreadable() {
                BEGIN\n    EXECUTE format('%s', ddl);\nEND $$;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_format_literal_placeholder_in_code_makes_execute_unreadable() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let ddl = "'BEGIN ALTER TABLE harvest_events ADD COLUMN x INT; END'";
+    // `%L` makes a string literal, and a `DO` or `EXECUTE` runs it as code.
+    for template in [
+        "'DO %L'",
+        "'DO $x$ BEGIN EXECUTE %L; END $x$'",
+        "'CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS %L'",
+    ] {
+        let sql = format!("{set}DO $$\nBEGIN\n    EXECUTE format({template}, {ddl});\nEND $$;");
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.starts_with("EXECUTE of SQL the lint cannot read")),
+            "{sql}\n{findings:?}"
+        );
+    }
+    // A `%L` value in a query is data.
+    let sql = format!(
+        "{set}DO $$\nBEGIN\n    EXECUTE format('SELECT %L', 'x');\nEND $$;\n\
+         DO $$\nBEGIN\n    EXECUTE format('DO $x$ BEGIN PERFORM %L; END $x$', 'x');\nEND $$;"
+    );
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_quoted_only_is_a_table_name() {
+    let sql = "DROP TABLE IF EXISTS \"only\", harvest_events;";
+    let findings = lint_with_history(&[], sql, true);
+    assert!(
+        findings.iter().any(|f| f.detail.contains("harvest_events")),
+        "{findings:?}"
+    );
 }
 
 #[test]
