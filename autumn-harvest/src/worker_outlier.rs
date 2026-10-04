@@ -25,6 +25,17 @@ pub const DEFAULT_WINDOW_CAPACITY: usize = 1024;
 /// Default maximum sample age in a [`TaskOutcomeWindow`].
 pub const DEFAULT_WINDOW_MAX_AGE: Duration = Duration::from_secs(300);
 
+/// The maximum sample age of a worker that heartbeats every
+/// `heartbeat_interval`: twice the interval, and at least
+/// [`DEFAULT_WINDOW_MAX_AGE`].
+///
+/// A sample must stay until a heartbeat publishes it. Liveness accepts a
+/// heartbeat up to twice the interval late, so the window keeps that long too.
+#[must_use]
+pub fn window_max_age(heartbeat_interval: Duration) -> Duration {
+    DEFAULT_WINDOW_MAX_AGE.max(heartbeat_interval.saturating_mul(2))
+}
+
 /// One dimension on which a worker can be an outlier.
 ///
 /// It is also the bounded `dimension` label on
@@ -100,6 +111,12 @@ impl Default for TaskOutcomeWindow {
 }
 
 impl TaskOutcomeWindow {
+    /// Create the window of a worker that heartbeats every `heartbeat_interval`.
+    #[must_use]
+    pub fn for_heartbeat(heartbeat_interval: Duration) -> Self {
+        Self::new(DEFAULT_WINDOW_CAPACITY, window_max_age(heartbeat_interval))
+    }
+
     /// Create a window. A `capacity` of 0 becomes 1.
     #[must_use]
     pub fn new(capacity: usize, max_age: Duration) -> Self {
@@ -597,6 +614,21 @@ mod tests {
         window.record_at(now, false, Duration::from_millis(1));
         let snap = window.snapshot_at(now);
         assert_eq!((snap.tasks, snap.failures), (3, 2));
+    }
+
+    /// Issue #1815: a heartbeat slower than the default window still sees the
+    /// outcomes of its whole interval, also when it runs late.
+    #[test]
+    fn a_slow_heartbeat_keeps_outcomes_until_its_next_tick() {
+        let interval = Duration::from_secs(600);
+        let window = TaskOutcomeWindow::for_heartbeat(interval);
+        let now = Instant::now();
+        let early = now
+            .checked_sub(Duration::from_secs(1_100))
+            .expect("the clock is past twenty minutes");
+        window.record_at(early, true, Duration::from_millis(5));
+        assert_eq!(window.snapshot_at(now).tasks, 1);
+        assert!(window_max_age(Duration::from_secs(1)) >= DEFAULT_WINDOW_MAX_AGE);
     }
 
     #[test]

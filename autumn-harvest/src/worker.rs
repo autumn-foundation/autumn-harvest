@@ -28423,6 +28423,10 @@ impl Worker {
             crate::cache::WorkflowCache::new(config.workflow_cache_size)
                 .with_resident(config.resident_workflows),
         ));
+        // The window keeps each outcome until a heartbeat can publish it.
+        let task_outcomes = crate::worker_outlier::TaskOutcomeWindow::for_heartbeat(
+            config.worker_heartbeat_interval,
+        );
         Ok(Self {
             config,
             registry,
@@ -28448,7 +28452,7 @@ impl Worker {
             workflow_panic_strikes: Arc::default(),
             workflow_deadlock_strikes: Arc::default(),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
-            task_outcomes: Arc::default(),
+            task_outcomes: Arc::new(task_outcomes),
             outlier_peers: Arc::default(),
             shard_dispatch,
             global_dispatch,

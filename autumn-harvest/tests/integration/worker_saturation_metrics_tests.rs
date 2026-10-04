@@ -497,7 +497,18 @@ async fn frozen_stats_leave_the_live_set_and_old_rows_are_pruned() {
         .expect("load");
     assert_eq!(find(&rows, &frozen), None, "a frozen row is not live");
 
-    workers::prune_worker_task_stats(&mut conn)
+    // A fleet with a slow heartbeat counts a row as live for longer than the
+    // default retention, so the prune keeps it.
+    workers::prune_worker_task_stats(&mut conn, 3 * 3_600)
+        .await
+        .expect("prune with a slow fleet");
+    assert_eq!(
+        count_stats_rows(&mut conn, &ancient).await,
+        1,
+        "inside the slow fleet's freshness window"
+    );
+
+    workers::prune_worker_task_stats(&mut conn, 60)
         .await
         .expect("prune");
     assert_eq!(

@@ -3385,7 +3385,8 @@ gray failure.
 
 Each worker keeps a window of its own task outcomes. The window holds the
 last 5 minutes and at most 1024 tasks. A busy worker therefore covers less
-than 5 minutes. The liveness heartbeat writes a snapshot to
+than 5 minutes. A worker whose heartbeat interval is longer than 150 seconds
+keeps two heartbeat intervals instead, so every outcome reaches a snapshot. The liveness heartbeat writes a snapshot to
 `harvest_worker_task_stats` on every shard. Each heartbeat then compares
 the worker with its peers. It merges the peers from all the worker's
 shards, so every heartbeat sees the same peers. If one shard fails, a

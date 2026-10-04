@@ -25,7 +25,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
 **Gray-failure signal.** New module `worker_outlier.rs`.
 
 - Each worker keeps a rolling window of its task outcomes. The window holds
-  the last 5 minutes and at most 1024 samples.
+  at most 1024 samples, from the last 5 minutes or two heartbeat intervals,
+  whichever is longer. A slow heartbeat then still publishes every outcome.
 - A failed activity attempt counts as a failure. So does an attempt that an
   open circuit breaker rejects, because the breaker belongs to the worker.
   An activity that succeeds but does not finalize also counts as a failure.
@@ -58,7 +59,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - No worker label is added. Each worker reports itself, and the scrape
   `instance` label tells them apart.
 - Every shard heartbeat deletes stats rows older than one hour, so orphan
-  rows from restarted workers do not pile up.
+  rows from restarted workers do not pile up. A fleet whose peer freshness
+  window is longer keeps rows for that window, so a live peer stays.
 
 **`GET /admin/status`.** The `workers` block gains `outliers`, the worst 20
 flagged workers with their stats and the peer medians. It also gains

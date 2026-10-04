@@ -487,7 +487,8 @@ pub async fn heartbeat_worker(
 ///
 /// A worker with a random id leaves an orphan row each time it restarts, and
 /// nothing deletes its `harvest_workers` row. The outlier tick prunes rows
-/// older than this, so the table stays bounded by the live fleet.
+/// older than this, so the table stays bounded by the live fleet. A fleet with
+/// a slower heartbeat keeps rows for its freshness window instead.
 pub const WORKER_TASK_STATS_RETENTION: Duration = Duration::from_secs(3600);
 
 /// The live peer rows that each shard heartbeat of one worker read last
@@ -929,11 +930,20 @@ struct StoredSnapshotSeq {
 /// Delete task-stats rows older than [`WORKER_TASK_STATS_RETENTION`] (issue
 /// #1815). Returns the number of rows deleted.
 ///
+/// A slow fleet can count a row as live for longer than the retention. The
+/// prune then keeps every row inside `fleet_stale_secs`, so it cannot delete a
+/// live peer's row.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError`] on database failure.
-pub async fn prune_worker_task_stats(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
-    let retention = i64::try_from(WORKER_TASK_STATS_RETENTION.as_secs()).unwrap_or(i64::MAX);
+pub async fn prune_worker_task_stats(
+    conn: &mut AsyncPgConnection,
+    fleet_stale_secs: i64,
+) -> HarvestResult<usize> {
+    let retention = i64::try_from(WORKER_TASK_STATS_RETENTION.as_secs())
+        .unwrap_or(i64::MAX)
+        .max(fleet_stale_secs);
     diesel::sql_query(
         "DELETE FROM harvest_worker_task_stats \
          WHERE updated_at < NOW() - ($1::bigint * INTERVAL '1 second')",
@@ -1032,7 +1042,7 @@ pub async fn run_outlier_tick(
     let own = probe.window.snapshot();
     upsert_worker_task_stats(conn, worker_id, &own).await?;
     // Every shard heartbeat prunes its own database, whether it compares or not.
-    prune_worker_task_stats(conn).await?;
+    prune_worker_task_stats(conn, probe.fleet_stale_secs).await?;
     if !probe.metrics.is_enabled() {
         return Ok(Vec::new());
     }
