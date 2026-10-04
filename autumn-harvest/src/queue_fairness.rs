@@ -23,9 +23,9 @@
 ///
 /// # Composition with within-queue priority (#249)
 ///
-/// Weights decide **which queue** to claim from. Once a queue is selected,
-/// `claim_task` uses its standard claim order to pick the best row in that
-/// queue: `priority`, then the claim-order due time (issue #1824).
+/// Weights decide **which queue** to claim from. `claim_task` then picks the
+/// best row in that queue by its standard claim order. That order is
+/// `priority`, then the claim-order due time (issue #1824).
 use std::collections::HashMap;
 
 /// Pair a queue name with its effective non-negative weight.

@@ -36,6 +36,10 @@ the claim takes the next eligible row.
   in that design. The second row write fired the foreign-key check. That
   check took a run-row lock, which could deadlock with the scanner. The
   claim had also already debited a rate-limit token.
+- The batched claim runs its scan and each candidate attempt in one
+  transaction, where `NOW()` stays fixed. So the attempt re-checks the run
+  deadline on its own `clock_timestamp()` read. That re-check gates both the
+  rate-limit debit and the claim.
 - The scanner then times out the run. It now prefixes each open task's
   error with `queue::DEADLINE_EXCEEDED_ERROR` (`deadline_exceeded`).
 
@@ -65,12 +69,13 @@ use the band.
   - explicit priority wins, and both ageing cases behave as documented;
   - spawned runs and retries do not yield, and the start path sets the
     marker.
-- `claim_run_deadline_tests` (11 tests) covers:
+- `claim_run_deadline_tests` (12 tests) covers:
   - workflow, activity and chain deadlines, each skipped and then recorded
     by the scanner;
   - expired rows do not block the live row behind them;
   - future and absent deadlines, and paused runs;
   - the by-id, kind-filtered and batched paths;
-  - a skipped task spends no rate-limit token.
+  - a skipped task spends no rate-limit token;
+  - the batched attempt re-checks the run on a fresh clock.
 - `shard_rebalance_db_tests` adds a staged row without the key.
 - Unit tests pin the SQL terms in every claim variant.

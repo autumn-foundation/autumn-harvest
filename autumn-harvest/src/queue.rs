@@ -7788,6 +7788,13 @@ fn candidate_still_build_and_capability_eligible(labels_expr: &str) -> String {
 /// substituted value, never the raw `NOW()`, so it can never regress to
 /// a time before what a concurrent transaction already committed.
 ///
+/// `run_expired` re-checks the run deadline of the candidate (issue #1824).
+/// The batch scan and this attempt are separate statements in one
+/// transaction, and `NOW()` stays at the transaction start. So a run can
+/// expire after the scan selected its task. The check reads the run on the
+/// `now_ts` clock and takes no lock. It gates both `rate_limit_debit` and
+/// `claimed`, so an expired run spends no token.
+///
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
@@ -7825,6 +7832,16 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
              worker_info AS ( \
                  SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
              ), \
+             run_expired AS ( \
+                 SELECT EXISTS ( \
+                     SELECT 1 FROM harvest_task_queue t \
+                     JOIN harvest_workflow_executions e ON e.id = t.workflow_exec_id \
+                     WHERE t.id = $2 \
+                       AND e.state = 'RUNNING' \
+                       AND (e.deadline_at < (SELECT ts FROM now_ts) \
+                            OR e.chain_deadline_at < (SELECT ts FROM now_ts)) \
+                 ) AS expired \
+             ), \
              rate_limit_debit AS ( \
                  UPDATE harvest_rate_limit_buckets b \
                  SET tokens = {rate_limit_available} - 1.0, \
@@ -7833,6 +7850,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                    AND NOT ($7 = ANY($8)) \
                    AND {rate_limit_available} >= 1.0 \
                    AND ($9::timestamptz IS NULL OR $9::timestamptz > (SELECT ts FROM now_ts)) \
+                   AND NOT (SELECT expired FROM run_expired) \
                    AND {debit_eligibility} \
                  RETURNING b.key AS debited_key \
              ), \
@@ -7867,6 +7885,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                        $9::timestamptz IS NULL \
                        OR $9::timestamptz > (SELECT ts FROM now_ts) \
                    ) \
+                   AND NOT (SELECT expired FROM run_expired) \
                    AND {claimed_eligibility} \
                  RETURNING harvest_task_queue.* \
              ) \
@@ -9005,6 +9024,31 @@ mod tests {
         assert!(EXPIRED_RUN_GATE_SQL.contains("NOT EXISTS"));
     }
 
+    /// The batched attempt re-checks the run deadline on its own fresh clock
+    /// and gates both the debit and the claim on it (issue #1824).
+    #[test]
+    fn batched_attempt_rechecks_the_run_deadline_on_now_ts() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("e.deadline_at < (SELECT ts FROM now_ts)"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("e.chain_deadline_at < (SELECT ts FROM now_ts)"),
+            "got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("AND NOT (SELECT expired FROM run_expired)")
+                .count(),
+            2,
+            "the debit and the claim both read the re-check; got:\n{sql}"
+        );
+        assert!(
+            sql.starts_with("WITH now_ts AS"),
+            "now_ts stays the leading CTE"
+        );
+    }
+
     /// Every claim variant carries the expired-run set and its gate exactly
     /// once, inside `candidate` (issue #1824).
     #[test]
@@ -9095,12 +9139,12 @@ mod tests {
         );
         assert_eq!(
             sql.matches("SELECT ts FROM now_ts").count(),
-            10,
+            12,
             "every real-time read in this query -- both deadline checks, \
-             started_at, last_refilled_at, and the three NOW() reads \
+             started_at, last_refilled_at, the three NOW() reads \
              inside the rate-limit formula, rendered twice (SET and \
-             WHERE) -- must read the SAME materialized timestamp; \
-             got:\n{sql}"
+             WHERE), and the two run-deadline reads of issue #1824 -- \
+             must read the SAME materialized timestamp; got:\n{sql}"
         );
     }
 

@@ -417,3 +417,57 @@ async fn a_batched_skip_spends_no_rate_limit_token() {
     assert_eq!(claim_one_batched(&mut conn, &queue).await, Some(live));
     assert_skipped(&mut conn, expired).await;
 }
+
+/// The batched scan and each candidate attempt are separate statements in
+/// one transaction. A run can expire between them. The attempt re-checks
+/// the run on a fresh clock, so it neither claims the task nor spends its
+/// token.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_batched_attempt_rechecks_the_run_deadline() {
+    let (mut conn, _container) = setup_db().await;
+    let queue = unique("dl-attempt");
+    let bucket = unique("dl-bucket-a");
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket, 0.0, 1.0)
+        .await
+        .expect("bucket");
+    let task = rate_limited(&mut conn, &queue, &bucket, Deadline::Run(EXPIRED), false).await;
+
+    let claimed: Vec<autumn_harvest::models::TaskQueueItem> =
+        diesel::sql_query(queue::claim_batched_candidate_attempt_query())
+            .bind::<diesel::sql_types::Text, _>(unique("w"))
+            .bind::<diesel::sql_types::Uuid, _>(task)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(None::<String>)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(None::<i32>)
+            .bind::<diesel::sql_types::Text, _>("activity")
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some(bucket.clone()))
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some("noop"))
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(Vec::<String>::new())
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                None::<chrono::DateTime<chrono::Utc>>,
+            )
+            .bind::<diesel::sql_types::Text, _>("")
+            .load(&mut conn)
+            .await
+            .expect("attempt");
+    assert!(
+        claimed.is_empty(),
+        "the attempt does not claim an expired run's task"
+    );
+    assert_skipped(&mut conn, task).await;
+
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    let bucket_row: Tokens =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket)
+            .get_result(&mut conn)
+            .await
+            .expect("bucket row");
+    assert!(
+        (bucket_row.tokens - 1.0).abs() < f64::EPSILON,
+        "the attempt spends no token"
+    );
+}
