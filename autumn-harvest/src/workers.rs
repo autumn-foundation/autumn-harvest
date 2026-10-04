@@ -896,6 +896,9 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   routes give two task mixes under load.
 /// - `retry_budgets`: the retry-budget policy of each registered activity. A
 ///   tighter budget defers more retries, so the worker runs fewer of them.
+/// - `outcome_window_ms` and `peer_stale_secs`: both follow the heartbeat
+///   interval. Workers with two windows compare two time ranges, and workers
+///   with two freshness limits can disagree on the live peer set.
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -915,6 +918,8 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         circuit_breakers,
         dispatch_channel,
         retry_budgets,
+        outcome_window,
+        peer_stale_secs,
     } = policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -952,6 +957,8 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "circuit_breakers": breaker_policies(circuit_breakers),
         "dispatch_channel": dispatch_channel,
         "retry_budgets": budgets,
+        "outcome_window_ms": outcome_window.as_millis(),
+        "peer_stale_secs": peer_stale_secs,
     })
     .to_string()
 }
@@ -1044,6 +1051,11 @@ pub struct CohortPolicy<'a> {
     /// The worker's retry budgets. The key holds the policy of each
     /// registered activity.
     pub retry_budgets: &'a crate::retry_budget::RetryBudgetConfig,
+    /// How long the worker keeps task outcomes: see
+    /// [`crate::worker_outlier::window_max_age`].
+    pub outcome_window: std::time::Duration,
+    /// How old a peer row may be and still count, in seconds.
+    pub peer_stale_secs: i64,
 }
 
 /// How a worker sizes its slots per task kind, as its cohort key records it
@@ -2984,6 +2996,8 @@ mod tests {
             circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
             dispatch_channel: false,
             retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+            outcome_window: std::time::Duration::from_secs(300),
+            peer_stale_secs: 120,
         })
     }
 
@@ -3011,6 +3025,8 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
             })
         };
         assert_ne!(slots(10, 0), slots(0, 10));
@@ -3043,6 +3059,8 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
             })
         };
         assert_ne!(sessions(0), sessions(4));
@@ -3081,6 +3099,8 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
             })
         };
         assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
@@ -3113,6 +3133,8 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
             })
         };
         let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
@@ -3238,6 +3260,8 @@ mod tests {
                 circuit_breakers: breakers,
                 dispatch_channel: false,
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
             })
         };
         let tracking = |threshold| {
@@ -3288,6 +3312,8 @@ mod tests {
                 circuit_breakers: &breakers,
                 dispatch_channel,
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
             })
         };
         assert_ne!(cohort(true), cohort(false));
@@ -3321,6 +3347,8 @@ mod tests {
                 circuit_breakers: &breakers,
                 dispatch_channel: false,
                 retry_budgets: budgets,
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
             })
         };
         let default = RetryBudgetConfig::default();
@@ -3338,6 +3366,49 @@ mod tests {
             cohort(&default),
             cohort(&unrelated),
             "a budget for an activity the worker does not run"
+        );
+    }
+
+    /// Issue #1815: the heartbeat interval sets the outcome window and the
+    /// peer freshness limit. Workers with two of either compare different
+    /// time ranges or different peer sets, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_window_and_freshness() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |outcome_window, peer_stale_secs| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: false,
+                retry_budgets: &budgets,
+                outcome_window,
+                peer_stale_secs,
+            })
+        };
+        let five_minutes = std::time::Duration::from_secs(300);
+        assert_ne!(
+            cohort(five_minutes, 120),
+            cohort(std::time::Duration::from_secs(1200), 120),
+            "another window"
+        );
+        assert_ne!(
+            cohort(five_minutes, 120),
+            cohort(five_minutes, 1200),
+            "another freshness limit"
         );
     }
 
@@ -3365,6 +3436,8 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: false,
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
             })
         };
         assert_ne!(slots(100, 1), slots(1, 100));

@@ -55,8 +55,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   same `queue_weights`, on the same build with the same labels and the same
   slots per task kind (or the same slot-tuner band and tuner policy),
   session capacity, priority aging, activity eligibility, shards, registered
-  handlers, circuit-breaker policies, retry-budget policies and dispatch
-  route (a dispatch channel or the Postgres claim), with
+  handlers, circuit-breaker policies, retry-budget policies, dispatch route
+  (a dispatch channel or the Postgres claim), outcome window and peer
+  freshness limit (both follow the heartbeat interval), with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A
   worker on a slow queue is not compared with a fast queue. Each heartbeat
