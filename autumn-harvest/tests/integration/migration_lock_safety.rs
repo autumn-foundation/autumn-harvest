@@ -527,10 +527,20 @@ fn bound_in_force(analysis: &Analysis, hit: &Hit) -> bool {
     let Some(from) = hit.body_start else {
         return timeout_in_force(&analysis.timeouts, hit.at);
     };
+    // A change in a nested routine body belongs to that routine, not to this one.
+    let owner = |at: usize| {
+        analysis
+            .bodies
+            .iter()
+            .filter(|&&(start, end)| start <= at && at < end)
+            .map(|&(start, _)| start)
+            .max()
+    };
+    let mine = owner(hit.at);
     let local: Vec<(usize, Timeout)> = analysis
         .body_timeouts
         .iter()
-        .filter(|(k, _)| *k >= from)
+        .filter(|(k, _)| *k >= from && owner(*k) == mine)
         .copied()
         .collect();
     // A routine setting sits at the first body token and applies before the
@@ -1346,6 +1356,8 @@ struct Analysis {
     body_timeouts: Vec<(usize, Timeout)>,
     /// The number of top-level statements.
     statement_count: usize,
+    /// The first token and the end of each routine body, from `routine_bodies`.
+    bodies: Vec<(usize, usize)>,
 }
 
 /// A view of the tokens with statement boundaries.
@@ -1771,6 +1783,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         timeouts,
         body_timeouts,
         statement_count,
+        bodies: routine_bodies(&s),
     }
 }
 
@@ -1895,7 +1908,7 @@ fn unreadable_settings(
     raws: &mut Vec<Raw>,
 ) {
     nonstandard_strings(s, sql, unconditional, (path_change, opaque), history, raws);
-    routine_resets(s, raws);
+    routine_resets(s, history, raws);
 }
 
 /// Treat each statement that may turn `standard_conforming_strings` off as
@@ -2091,7 +2104,7 @@ const ROUTINE_RESET: &str = "ALTER of a routine that drops its lock_timeout sett
 ///
 /// The routine body may lock a hot table, and its `CREATE` may have set the
 /// bound. After the `ALTER`, each call runs that lock without the bound.
-fn routine_resets(s: &Stmts, raws: &mut Vec<Raw>) {
+fn routine_resets(s: &Stmts, history: &mut History, raws: &mut Vec<Raw>) {
     for k in (0..s.toks.len()).filter(|&k| s.starts[k] == k && s.keyword(k, "alter")) {
         if !["function", "procedure", "routine"]
             .iter()
@@ -2100,24 +2113,59 @@ fn routine_resets(s: &Stmts, raws: &mut Vec<Raw>) {
             continue;
         }
         let depth = s.toks[k].depth;
-        let drops = (k..s.end(k))
-            .filter(|&j| s.toks[j].depth == depth)
-            .any(|j| {
-                let reset = s.keyword(j, "reset")
-                    && (s.is(j + 1, "lock_timeout") || s.keyword(j + 1, "all"));
-                let set = s.keyword(j, "set") && s.is(j + 1, "lock_timeout") && {
-                    let value = if s.is_punct(j + 2, '=') || s.keyword(j + 2, "to") {
-                        j + 3
-                    } else {
-                        j + 2
-                    };
-                    !bounds_wait(s, value)
+        let clause = |j: usize| s.toks[j].depth == depth;
+        let reset = (k..s.end(k)).filter(|&j| clause(j)).any(|j| {
+            s.keyword(j, "reset") && (s.is(j + 1, "lock_timeout") || s.keyword(j + 1, "all"))
+        });
+        let clears = (k..s.end(k)).filter(|&j| clause(j)).any(|j| {
+            s.keyword(j, "set") && s.is(j + 1, "lock_timeout") && {
+                let value = if s.is_punct(j + 2, '=') || s.keyword(j + 2, "to") {
+                    j + 3
+                } else {
+                    j + 2
                 };
-                reset || set
-            });
-        if drops {
+                !bounds_wait(s, value)
+            }
+        });
+        if reset || clears {
             raws.push(Raw::lock(k, ROUTINE_RESET, None));
         }
+        alter_routine_history(s, k, clears, history);
+    }
+}
+
+/// Update the routine history for the `ALTER` of a routine at `k`.
+///
+/// A setting that clears the bound makes the routine a clearing routine. A
+/// rename carries what the history knows to the new name. A rename or a
+/// schema move drops each exact identity of the old name, because another
+/// routine may now hold it.
+fn alter_routine_history(s: &Stmts, k: usize, clears: bool, history: &mut History) {
+    let Some((name, _)) = s.qualified_name(k + 2) else {
+        return;
+    };
+    let old = base(&name).to_string();
+    if clears {
+        history.clearing_routines.insert(old.clone());
+    }
+    let renamed = (k..s.end(k))
+        .find(|&j| s.keyword(j, "rename") && s.keyword(j + 1, "to"))
+        .and_then(|j| s.word(j + 2));
+    if let Some(new) = renamed {
+        for set in [
+            &mut history.clearing_routines,
+            &mut history.foreign_routines,
+            &mut history.locking_routines,
+        ] {
+            if set.contains(&old) {
+                set.insert(new.to_string());
+            }
+        }
+    }
+    if clears || renamed.is_some() || s.has_pair(k, "set", "schema") {
+        history
+            .bounded_routines
+            .retain(|id| base(id.split('/').next().unwrap_or(id)) != old);
     }
 }
 
@@ -6725,6 +6773,50 @@ fn an_inherited_call_needs_the_full_identity_to_keep_the_bound() {
     // The same name and arity reach the known body, which does not clear.
     let sql = "SET LOCAL lock_timeout = '5s';\nCALL other.p();";
     assert_eq!(lint_with_history(&history, sql, true), [], "{sql}");
+}
+
+#[test]
+fn an_inner_routine_bound_does_not_cover_the_outer_body() {
+    // Creating the inner routine changes nothing for the outer call.
+    for (clause, setter) in [
+        ("SET lock_timeout = '5s' ", ""),
+        ("", "        SET LOCAL lock_timeout = '5s';\n"),
+    ] {
+        let sql = format!(
+            "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
+             CREATE FUNCTION inner_f() RETURNS void LANGUAGE plpgsql {clause}AS $i$\n    BEGIN\n\
+             {setter}        NULL;\n    END $i$;\n    \
+             ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $o$;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}\n{findings:?}");
+    }
+}
+
+#[test]
+fn an_altered_routine_keeps_its_history() {
+    let create = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                  ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;";
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    // A known routine keeps the outer bound.
+    let sql = format!("{set}SELECT f();");
+    assert_eq!(lint_with_history(&[create], &sql, true), [], "{sql}");
+    // A zero setting clears the bound before the body locks. A rename or a
+    // schema move gives the routine a name the bound does not know.
+    for (alter, call) in [
+        ("ALTER FUNCTION f() SET lock_timeout = '0';", "SELECT f();"),
+        ("ALTER FUNCTION f() RENAME TO g;", "SELECT g();"),
+        ("ALTER FUNCTION f() SET SCHEMA other;", "SELECT other.f();"),
+        ("ALTER FUNCTION f() SET SCHEMA other;", "SELECT f();"),
+    ] {
+        let sql = format!("{set}{call}");
+        let findings = lint_with_history(&[create, alter], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{alter} {call}\n{findings:?}"
+        );
+    }
 }
 
 #[test]

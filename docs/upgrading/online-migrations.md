@@ -115,7 +115,7 @@ function body does not count for the migration, because the body runs only
 when something calls the function. That includes a `BEGIN ATOMIC` body and the
 `RETURN` body of a SQL function. A lock in a function body needs its own
 bound earlier in the body, because the migration's bound may not hold when
-the function runs. A `SET lock_timeout` clause in `CREATE FUNCTION` or
+the function runs. A bound in a nested routine counts for that routine only. A `SET lock_timeout` clause in `CREATE FUNCTION` or
 `CREATE PROCEDURE` also counts, because Postgres applies it on each call.
 An `ALTER FUNCTION`, `ALTER PROCEDURE` or `ALTER ROUTINE` that resets or clears
 that setting counts as a lock that no bound covers, because each later call
@@ -131,7 +131,10 @@ counts as a lock on an unknown table. A bound covers that lock only when the
 routine is known to lock and known not to clear. The call must also name it
 with the same schema and number of parameters. Otherwise the body may clear
 the bound before it locks, so no bound covers the call. A routine that calls a
-locking routine counts as a locking routine too.
+locking routine counts as a locking routine too. An `ALTER` that sets a
+routine's timeout to a value that does not bound makes it a clearing routine.
+A rename or a schema move carries what the lint knows to the new name, and no
+outside bound covers a call by either name.
 A call of a clearing routine that an earlier migration created ends the bound
 too. Set the bound again after the call.
 
