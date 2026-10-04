@@ -15283,6 +15283,51 @@ impl Drop for CircuitProbeGuard<'_> {
     }
 }
 
+/// The metrics of one activity attempt (issues #528, #1809). They record
+/// when this drops, so every exit counts the attempt once. An attempt whose
+/// claim a timeout took is counted by the timeout enforcer instead.
+struct AttemptMetrics<'a> {
+    metrics: &'a dyn crate::telemetry::MetricsRecorder,
+    activity_name: &'a str,
+    queue: &'a str,
+    duration_secs: f64,
+    status: ActivityStatus,
+    /// The error type and the non-retryable flag of a failed attempt.
+    failure: Option<(String, bool)>,
+    counted_by_enforcer: bool,
+}
+
+impl Drop for AttemptMetrics<'_> {
+    fn drop(&mut self) {
+        if self.counted_by_enforcer {
+            return;
+        }
+        self.metrics.record_activity_completed_with_error_type(
+            self.activity_name,
+            self.queue,
+            self.duration_secs,
+            self.status,
+            self.failure
+                .as_ref()
+                .map(|(error_type, _)| error_type.as_str()),
+        );
+        // AC1 (issue #528): single-family attempt counter for success-rate
+        // SLOs. Fires for both outcomes so `completed / (completed + failed)`
+        // is one metric family, the activity-level mirror of
+        // harvest.workflow.terminal.
+        self.metrics
+            .record_activity_attempt(self.activity_name, self.queue, self.status);
+        if let Some((error_type, non_retryable)) = self.failure.as_ref() {
+            // `workflow.type` is empty here: looking it up costs an extra
+            // `harvest_workflow_executions` query per failure. The
+            // `MetricsRecorder` trait docs allow an empty string when the
+            // workflow type is unknown at the call site.
+            self.metrics
+                .record_activity_failed(self.activity_name, "", error_type, *non_retryable);
+        }
+    }
+}
+
 /// Whether the claim of `task` was lost to the timeout enforcer (issue
 /// #1809). The enforcer records the `started_at` of the claim it timed out.
 /// Any other loss is not a timeout.
@@ -16451,29 +16496,18 @@ async fn process_activity_task(
             .err()
             .map(|payload| parse_error_payload(payload))
     };
-    telemetry.metrics.record_activity_completed_with_error_type(
+    // The attempt metrics record when this guard drops, after the outcome is
+    // known (issue #1809). A claim lost to a timeout skips them: the timeout
+    // enforcer counted that attempt as failed.
+    let mut attempt_metrics = AttemptMetrics {
+        metrics: telemetry.metrics.as_ref(),
         activity_name,
-        &task.queue_name,
+        queue: &task.queue_name,
         duration_secs,
         status,
-        failure_info.as_ref().map(|(et, _, _)| et.as_str()),
-    );
-    // AC1 (issue #528): single-family attempt counter for success-rate SLOs.
-    // Fires for both outcomes so `completed / (completed + failed)` is one
-    // metric family — the activity-level mirror of harvest.workflow.terminal.
-    telemetry
-        .metrics
-        .record_activity_attempt(activity_name, &task.queue_name, status);
-    if let Some((error_type, non_retryable, _)) = failure_info.as_ref() {
-        // `workflow.type` is intentionally empty here: looking it up requires
-        // an extra `harvest_workflow_executions` query per failure, and the
-        // `MetricsRecorder` trait docs explicitly allow an empty string when
-        // the workflow type is unknown at the call site. Plumbing it through
-        // is tracked as a follow-up.
-        telemetry
-            .metrics
-            .record_activity_failed(activity_name, "", error_type, *non_retryable);
-    }
+        failure: failure_info.map(|(error_type, non_retryable, _)| (error_type, non_retryable)),
+        counted_by_enforcer: false,
+    };
     cancel.cancel();
     drop(activity_future);
 
@@ -16512,8 +16546,10 @@ async fn process_activity_task(
             // timeout counts against the downstream. `on_claim_lost` counts
             // one that another process enforced, and releases the slot of any
             // other loss.
-            let lost_to_timeout = claim_lost_to_timeout(pool, &mut conn, task).await
-                && circuit_breakers.has_policy(activity_name);
+            attempt_metrics.counted_by_enforcer =
+                claim_lost_to_timeout(pool, &mut conn, task).await;
+            let lost_to_timeout =
+                attempt_metrics.counted_by_enforcer && circuit_breakers.has_policy(activity_name);
             if circuit_breakers.on_claim_lost(
                 activity_name,
                 token,
@@ -16640,9 +16676,11 @@ async fn process_activity_task(
     // lost claim counts only when a timeout took it (see `on_claim_lost`).
     let applied = finalized.as_ref().ok().copied();
     // A cancelled attempt took its record above, and reports no outcome.
+    if applied == Some(false) && circuit_outcome.is_some() {
+        attempt_metrics.counted_by_enforcer = claim_lost_to_timeout(pool, &mut conn, task).await;
+    }
     let lost_to_timeout = applied == Some(false)
-        && circuit_outcome.is_some()
-        && claim_lost_to_timeout(pool, &mut conn, task).await
+        && attempt_metrics.counted_by_enforcer
         && circuit_breakers.has_policy(activity_name);
     report_outcome(applied, lost_to_timeout);
     finalized.map(|_| ())

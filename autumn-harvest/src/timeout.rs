@@ -851,6 +851,9 @@ struct ActivityTimeoutOutcome {
     handler_started: bool,
     /// The timed-out claim is the one the scan saw (issue #1809).
     scanned_claim: bool,
+    /// The `started_at` of the timed-out claim, when its handler started.
+    /// The enforcer then counts that attempt as a failed one.
+    started_attempt: Option<chrono::DateTime<Utc>>,
 }
 
 /// SQL for [`schedule_to_start_still_expired`], exposed for shape tests.
@@ -1571,11 +1574,12 @@ async fn enforce_activity_timeout(
                         return Ok(None);
                     }
                 };
-            let outcome = |retried| {
+            let outcome = |retried, started_attempt| {
                 Some(ActivityTimeoutOutcome {
                     retried,
                     handler_started: locked.handler_started,
                     scanned_claim: locked.scanned_claim,
+                    started_attempt,
                 })
             };
             // Timeout retry (issue #1809, ADR 0004). A start-to-close or
@@ -1611,13 +1615,10 @@ async fn enforce_activity_timeout(
                         .await?
                         {
                             queue::ClaimWrite::Applied => {
-                                record_timed_out_claim(
-                                    conn,
-                                    task.id,
-                                    task.started_at.filter(|_| locked.handler_started),
-                                )
-                                .await?;
-                                outcome(true)
+                                let started_attempt =
+                                    task.started_at.filter(|_| locked.handler_started);
+                                record_timed_out_claim(conn, task.id, started_attempt).await?;
+                                outcome(true, started_attempt)
                             }
                             queue::ClaimWrite::LeaseLost => None,
                         },
@@ -1657,7 +1658,7 @@ async fn enforce_activity_timeout(
             queue::fail_task(conn, task.id, &error).await?;
             record_timed_out_claim(conn, task.id, locked.current_started_claim).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(outcome(false))
+            Ok(outcome(false, locked.current_started_claim))
         }),
     ))
     .await;
@@ -1695,6 +1696,29 @@ async fn enforce_activity_timeout(
     }
     if enforced.retried {
         metrics.record_activity_retried(activity_name, &task.queue_name);
+    }
+    // The timed-out attempt is a failed attempt (issue #1809). Its handler
+    // started, so it belongs in the success-rate denominator. A worker that
+    // later reports this attempt finds its record and does not count it.
+    if let Some(started_at) = enforced.started_attempt {
+        let (error_type, non_retryable, _) = crate::failure::parse_error_payload(&error);
+        let duration_secs = (Utc::now() - started_at)
+            .to_std()
+            .unwrap_or_default()
+            .as_secs_f64();
+        metrics.record_activity_completed_with_error_type(
+            activity_name,
+            &task.queue_name,
+            duration_secs,
+            crate::telemetry::ActivityStatus::Failed,
+            Some(&error_type),
+        );
+        metrics.record_activity_attempt(
+            activity_name,
+            &task.queue_name,
+            crate::telemetry::ActivityStatus::Failed,
+        );
+        metrics.record_activity_failed(activity_name, "", &error_type, non_retryable);
     }
 
     Ok(())

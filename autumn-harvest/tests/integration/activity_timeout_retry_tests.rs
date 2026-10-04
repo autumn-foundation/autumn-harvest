@@ -27,7 +27,7 @@ use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::policy::{CircuitBreakerPolicy, CircuitOpenMode, JitterPolicy};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
-use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
+use autumn_harvest::telemetry::{ActivityStatus, MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::timeout::{self, TimeoutReason};
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -264,6 +264,36 @@ async fn enforce_with(
     )
     .await
     .expect("enforce_timeouts_once");
+}
+
+/// Records `harvest.activity.attempts` outcomes (issue #1809).
+#[derive(Default)]
+struct AttemptLog(Mutex<Vec<ActivityStatus>>);
+
+impl AttemptLog {
+    fn outcomes(&self) -> Vec<ActivityStatus> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl MetricsRecorder for AttemptLog {
+    fn record_activity_attempt(&self, _activity: &str, _queue: &str, outcome: ActivityStatus) {
+        self.0.lock().unwrap().push(outcome);
+    }
+}
+
+/// A registry whose worker records its attempt outcomes in `attempts`.
+fn recording_registry(activity: ActivityInfo, attempts: Arc<AttemptLog>) -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![wf_info()],
+        vec![activity],
+        autumn_harvest::context::empty_shared_state(),
+        Arc::new(
+            TelemetryConfig::builder()
+                .metrics(attempts as Arc<dyn MetricsRecorder>)
+                .build(),
+        ),
+    ))
 }
 
 /// Counts `harvest.activity.retries` for each activity.
@@ -1367,11 +1397,13 @@ async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
     let queue = unique("t1809-late");
     let activity = "t1809_late_result";
     let policy = CircuitBreakerPolicy::new(2, Duration::from_secs(60), Duration::from_secs(60));
-    let registry = Arc::new(HandlerRegistry::new(
-        vec![wf_info()],
-        vec![act_info_with(activity, policy, gated)],
-    ));
+    let worker_attempts = Arc::new(AttemptLog::default());
+    let registry = recording_registry(
+        act_info_with(activity, policy, gated),
+        Arc::clone(&worker_attempts),
+    );
     let breakers = registry.circuit_breakers();
+    let enforcer_attempts = AttemptLog::default();
 
     let exec_id = seed_workflow(&mut conn, &queue, activity).await;
     let worker = build_worker(&queue, Arc::clone(&registry));
@@ -1405,7 +1437,7 @@ async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
         "start_to_close = INTERVAL '1 millisecond'",
     )
     .await;
-    enforce(&mut conn, Some(&breakers)).await;
+    enforce_with(&mut conn, Some(&breakers), &enforcer_attempts).await;
     assert_eq!(breaker_state(&breakers, activity), ("closed", 1));
     assert_eq!(
         task_row(&mut conn, task_id)
@@ -1415,6 +1447,17 @@ async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
         Some(1),
         "the enforcer records the claim it timed out"
     );
+    // The worker's own scanner can win the race. Either enforcer counts the
+    // timed-out attempt as failed, once.
+    wait_until(
+        "the timed-out attempt counts as failed once",
+        Duration::from_secs(5),
+        || async {
+            [enforcer_attempts.outcomes(), worker_attempts.outcomes()].concat()
+                == vec![ActivityStatus::Failed]
+        },
+    )
+    .await;
 
     // The hung attempt now returns a success, after its claim is gone.
     GATE.notify_one();
@@ -1451,6 +1494,13 @@ async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
         breaker_state(&breakers, activity),
         ("closed", 1),
         "a late success of a lost claim must not clear the counted timeout"
+    );
+    assert!(
+        !worker_attempts
+            .outcomes()
+            .contains(&ActivityStatus::Completed),
+        "the late success of the timed-out attempt is not a completed attempt: {:?}",
+        worker_attempts.outcomes()
     );
 }
 
