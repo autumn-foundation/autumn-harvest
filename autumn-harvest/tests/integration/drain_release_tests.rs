@@ -298,8 +298,8 @@ async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
 
 /// Enqueue an activity task on `queue` and mark it claimed by `worker_id`.
 ///
-/// No dispatch body holds this claim.
-async fn abandon_claim(conn: &mut AsyncPgConnection, queue: &str, worker_id: &str) -> Uuid {
+/// No dispatch body of the worker under test made this claim.
+async fn plant_claim(conn: &mut AsyncPgConnection, queue: &str, worker_id: &str) -> Uuid {
     let params = EnqueueParams::new(queue, TaskType::Activity, serde_json::json!({}));
     let task_id = queue::enqueue(conn, &params)
         .await
@@ -429,6 +429,56 @@ async fn release_unstarted_claim_restores_the_claim_and_is_fenced() {
     );
 }
 
+/// `release_abandoned_claim` gives back only the current claim, as orphan
+/// reclaim would. It keeps `attempt`, because a handler can have run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_abandoned_claim_requeues_the_claim_and_is_fenced() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("abandoned");
+    let mut conn = connect(&url).await;
+    seed_workflow(&mut conn, &queue, "drain_cooperative").await;
+    let worker = format!("{queue}-a");
+    let task = queue::claim_task(
+        &mut conn,
+        std::slice::from_ref(&queue),
+        &worker,
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("the workflow task is claimable");
+
+    for stale in [
+        queue::TaskClaim::new(task.id, "another-worker", task.attempt),
+        queue::TaskClaim::new(task.id, &worker, task.attempt + 1),
+    ] {
+        let write = queue::release_abandoned_claim(&mut conn, &stale)
+            .await
+            .expect("release");
+        assert_eq!(write, queue::ClaimWrite::LeaseLost, "{stale:?}");
+        assert_eq!(task_state(&url, task.id).await.0, "RUNNING", "{stale:?}");
+    }
+
+    let claim = queue::TaskClaim::of(&task).expect("a claimed row has a claim");
+    let write = queue::release_abandoned_claim(&mut conn, &claim)
+        .await
+        .expect("release");
+    assert_eq!(write, queue::ClaimWrite::Applied);
+    let row = harvest_task_queue::table
+        .find(task.id)
+        .select(autumn_harvest::models::TaskQueueItem::as_select())
+        .first::<autumn_harvest::models::TaskQueueItem>(&mut conn)
+        .await
+        .expect("load the row");
+    assert_eq!(row.state, "PENDING");
+    assert!(row.worker_id.is_none());
+    assert!(row.started_at.is_none());
+    assert_eq!(row.attempt, task.attempt, "the attempt counts");
+}
+
 /// A running activity that honours the cancel is joined and released. A peer
 /// then retries it at once, not after its 600 s `start_to_close`.
 ///
@@ -496,8 +546,8 @@ async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
 /// use a 1 s heartbeat, so orphan reclaim judges the drained worker stale
 /// after 2 s. The activity has a 2 s heartbeat timeout. The test waits longer
 /// than both. The drained worker must keep its lease and the task heartbeat
-/// while the handler runs. The kept lease must not hide a claim that no
-/// handler holds, so the keeper gives such a claim back.
+/// while the handler runs. The keeper must not release a claim under the same
+/// worker id that this instance never made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
     let (url, _container) = setup_test_database_url_or_env().await;
@@ -510,12 +560,10 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
     let worker_a = format!("{queue}-a");
     let a = Running::start_with_heartbeat(&worker_a, &queue, &pool, heartbeat);
     wait_for_start(&url, exec_id, &worker_a, &STUBBORN_STARTS).await;
-    let worker_b = format!("{queue}-b");
-    let b = Running::start_with_heartbeat(&worker_b, &queue, &pool, heartbeat);
 
-    // A claim that no dispatch body holds, as a failed release leaves one.
-    // No worker polls its queue, so a release leaves it `PENDING`.
-    let abandoned = abandon_claim(&mut conn, &format!("{queue}-abandoned"), &worker_a).await;
+    // A claim under the same worker id that this instance never made, as a
+    // replacement worker with that id would hold. No worker polls its queue.
+    let foreign = plant_claim(&mut conn, &format!("{queue}-foreign"), &worker_a).await;
 
     let drain = a.stop().await;
     assert!(
@@ -527,11 +575,29 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         "the drain must end at its deadline: took {drain:?}"
     );
     // A shutdown heartbeat does not re-register a missing row. The keeper
-    // must restore it, or orphan reclaim sees no worker.
+    // must restore it, or orphan reclaim sees no worker. A missing row is an
+    // orphan at once, so the peer starts only after the restore.
     diesel::delete(harvest_workers::table.find(&worker_a))
         .execute(&mut conn)
         .await
         .expect("delete the drained worker row");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harvest_workers::table
+            .find(&worker_a)
+            .select(harvest_workers::status)
+            .first::<String>(&mut conn)
+            .await
+            .optional()
+            .expect("load the worker row")
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the keeper restores the worker row");
+    let worker_b = format!("{queue}-b");
+    let b = Running::start_with_heartbeat(&worker_b, &queue, &pool, heartbeat);
 
     // Outlast the stale window (2 s), the heartbeat timeout (2 s) and a
     // reclaimer tick (1 s) on the live peer. It must not take the claim.
@@ -552,10 +618,10 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         .await
         .expect("the keeper restores the worker row");
     assert_eq!(status, "Stopped", "the restored row claims no coverage");
-    // The kept lease must not hide a claim that no handler holds.
-    let (state, worker_id) = task_state(&url, abandoned).await;
-    assert_eq!(state, "PENDING", "the keeper gives back an abandoned claim");
-    assert_eq!(worker_id, None);
+    // The keeper gives back only the claims this instance abandoned.
+    let (state, worker_id) = task_state(&url, foreign).await;
+    assert_eq!(state, "RUNNING", "the keeper leaves a foreign claim alone");
+    assert_eq!(worker_id.as_deref(), Some(worker_a.as_str()));
 
     STUBBORN_GO.notify_one();
     wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))

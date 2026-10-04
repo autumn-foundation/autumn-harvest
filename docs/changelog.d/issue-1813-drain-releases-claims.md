@@ -43,9 +43,10 @@ the drain. Now:
   coverage. If the process exits, orphan reclaim recovers the task.
 - The kept lease hides every claim of the worker from orphan reclaim. So
   each lease refresh also gives back, through the new fenced
-  `queue::release_abandoned_claim`, each `RUNNING` claim of the worker that
-  no dispatch body holds. A failed release or result write leaves such a
-  claim.
+  `queue::release_abandoned_claim`, each `RUNNING` claim whose dispatch
+  body ended after shutdown began. A failed release or result write leaves
+  such a claim. A replacement worker with the same id has other claim
+  epochs, so the keeper never touches its claims.
 
 **Safety.** A claim is released only when no handler for it can still run:
 the handler never started, or it returned. The release is fenced on the

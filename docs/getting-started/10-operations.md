@@ -324,8 +324,8 @@ A `SIGTERM` and a remote drain run the same drain (issue #1813):
 6. At the deadline it stops waiting. A handler that ignored the cancel keeps
    its claim. The worker keeps its lease and the task heartbeat alive until
    that handler returns, even after `run` returns, so no peer starts a
-   second copy. The worker also gives back each claim that no handler holds,
-   such as one whose release write failed. The claim fence
+   second copy. The worker also gives back each claim it abandoned in the
+   drain, such as one whose release write failed. The claim fence
    (#1789) rejects stale writes. If the process exits, orphan reclaim
    recovers the task.
 
