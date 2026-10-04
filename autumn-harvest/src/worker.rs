@@ -28928,21 +28928,26 @@ impl UnstartedClaim {
     /// The refund does not depend on the release. A lost claim still leaves
     /// this dispatch's debit stranded. See
     /// [`refund_capability_miss_rate_limit_token`].
+    ///
+    /// The acquire retries as a result write does, so a short pool incident
+    /// does not drop the release or the refund. The body stays live
+    /// meanwhile, so the lease keeper does not release this claim too.
     async fn release(self, pool: &DbPool) {
         let Some(claim) = self.claim else {
             return;
         };
-        let mut conn = match crate::pool::acquire_within_pool_bound(pool).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                tracing::warn!(
-                    task_id = %claim.task_id,
-                    %error,
-                    "no connection to release a claim that never started; the lease recovers it"
-                );
-                return;
-            }
-        };
+        let mut conn =
+            match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = %claim.task_id,
+                        %error,
+                        "no connection to release a claim that never started; the lease recovers it"
+                    );
+                    return;
+                }
+            };
         match queue::release_unstarted_claim(&mut conn, &claim).await {
             Ok(queue::ClaimWrite::Applied) => tracing::info!(
                 task_id = %claim.task_id,
