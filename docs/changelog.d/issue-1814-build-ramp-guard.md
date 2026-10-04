@@ -43,9 +43,9 @@ Design decisions:
   a restart, the guard matches markers to ramps by id and base build, not by
   clocks, to finish a partial clear. A clear has a server-side timeout, so it cannot commit late. After a
   cancel, a pass starts no new clear.
-- A replica reports an abort only after it cleared a pool itself, and not
-  when it lost the first pool's clear to another guard. The marker tells a
-  guard clear from an operator change.
+- A replica reports an abort only after it cleared a pool itself. The first
+  decisive clear in pool order elects the reporter, so racing replicas agree
+  on one. The marker tells a guard clear from an operator change.
 - The guard fails safe. A failed or slow read aborts nothing. Every read and
   write has a bound, and each read has a server-side `statement_timeout`.
 

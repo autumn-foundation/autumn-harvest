@@ -905,10 +905,15 @@ async fn read_pool_ramps(
 /// marked.
 ///
 /// A marker whose ramp no pool holds is finished. Every pool was read, so
-/// no pool can still hold that ramp. A finished, reported marker can go. A
-/// finished, unreported marker older than `report_grace` is an abort that
-/// a stopped guard did not report. A marker with a claim younger than
-/// `claim_lease` waits, because its guard can still be reporting.
+/// no pool can still hold that ramp. The read groups the finished markers
+/// of one abort over all pools:
+///
+/// - When every marker is reported, the markers can go.
+/// - When some are reported, a guard reported the abort and stopped while
+///   it marked them. The rest only need the mark.
+/// - When none is reported, the abort is due for recovery once a marker is
+///   older than `report_grace`. A claim younger than `claim_lease` on any
+///   pool holds the whole abort back, because its guard can still report.
 #[cfg(feature = "db")]
 async fn read_ramps(
     pools: &[crate::worker::DbPool],
@@ -957,44 +962,24 @@ async fn read_ramps(
             ramp_id.map(|ramp_id| (queue.clone(), base.clone(), ramp_id))
         })
         .collect();
-    let grace_ms = i64::try_from(report_grace.as_millis()).unwrap_or(i64::MAX);
-    let lease_ms = i64::try_from(claim_lease.as_millis()).unwrap_or(i64::MAX);
-    let mut finished: std::collections::BTreeMap<(usize, String), Vec<uuid::Uuid>> =
-        std::collections::BTreeMap::new();
-    let mut unreported: std::collections::BTreeMap<(String, uuid::Uuid), UnreportedAbort> =
-        std::collections::BTreeMap::new();
-    for (index, pool_markers) in pool_markers_by_index.into_iter().enumerate() {
-        for (queue, marker) in pool_markers {
-            if live.contains(&(queue.clone(), marker.base.clone(), marker.id)) {
-                continue;
-            }
-            if marker.reported {
-                finished.entry((index, queue)).or_default().push(marker.id);
-            } else if marker.age_ms >= grace_ms
-                && marker.claim_age_ms.is_none_or(|claim| claim >= lease_ms)
-            {
-                let entry = unreported
-                    .entry((queue.clone(), marker.id))
-                    .or_insert_with(|| UnreportedAbort {
-                        queue,
-                        base: marker.base,
-                        target: marker.target,
-                        ramp_id: marker.id,
-                        pools: Vec::new(),
-                    });
-                entry.pools.push(index);
-            }
-        }
-    }
+    let (unreported, half_marked, finished_markers) =
+        classify_finished_markers(pool_markers_by_index, &live, report_grace, claim_lease);
     Some(FleetRead {
         ramps: merged,
-        finished_markers: finished
-            .into_iter()
-            .map(|((index, queue), ids)| (index, queue, ids))
-            .collect(),
-        unreported: unreported.into_values().collect(),
+        finished_markers,
+        unreported,
+        half_marked,
     })
 }
+
+/// The marker work of one pass: the unreported aborts, the half-marked
+/// aborts and the finished markers.
+#[cfg(feature = "db")]
+type MarkerWork = (
+    Vec<UnreportedAbort>,
+    Vec<(String, uuid::Uuid, Vec<usize>)>,
+    Vec<(usize, String, Vec<uuid::Uuid>)>,
+);
 
 /// A finished abort that no guard reported, from its unreported markers.
 #[cfg(feature = "db")]
@@ -1008,16 +993,100 @@ struct UnreportedAbort {
     pools: Vec<usize>,
 }
 
+/// Group the finished abort markers of every pool per abort, and sort the
+/// aborts by what a pass must do with them. See [`read_ramps`].
+#[cfg(feature = "db")]
+fn classify_finished_markers(
+    pool_markers_by_index: Vec<Vec<(String, StoredMarker)>>,
+    live: &std::collections::BTreeSet<AbortMarker>,
+    report_grace: Duration,
+    claim_lease: Duration,
+) -> MarkerWork {
+    let grace_ms = i64::try_from(report_grace.as_millis()).unwrap_or(i64::MAX);
+    let lease_ms = i64::try_from(claim_lease.as_millis()).unwrap_or(i64::MAX);
+    // Group the finished markers per abort, in pool order.
+    let mut groups: std::collections::BTreeMap<(String, uuid::Uuid), Vec<(usize, StoredMarker)>> =
+        std::collections::BTreeMap::new();
+    for (index, pool_markers) in pool_markers_by_index.into_iter().enumerate() {
+        for (queue, marker) in pool_markers {
+            if live.contains(&(queue.clone(), marker.base.clone(), marker.id)) {
+                continue;
+            }
+            groups
+                .entry((queue, marker.id))
+                .or_default()
+                .push((index, marker));
+        }
+    }
+    let mut finished: std::collections::BTreeMap<(usize, String), Vec<uuid::Uuid>> =
+        std::collections::BTreeMap::new();
+    let mut unreported = Vec::new();
+    let mut half_marked = Vec::new();
+    for ((queue, ramp_id), entries) in groups {
+        let reported = entries.iter().filter(|(_, marker)| marker.reported).count();
+        if reported == entries.len() {
+            for (index, _) in entries {
+                finished
+                    .entry((index, queue.clone()))
+                    .or_default()
+                    .push(ramp_id);
+            }
+        } else if reported > 0 {
+            // A guard reported the abort and stopped while it marked the
+            // markers. The rest only need the mark.
+            let pools = entries
+                .iter()
+                .filter(|(_, marker)| !marker.reported)
+                .map(|&(index, _)| index)
+                .collect();
+            half_marked.push((queue, ramp_id, pools));
+        } else {
+            // A fresh claim on any pool means that a guard reports the abort
+            // now, so no pool is eligible.
+            let claimed = entries
+                .iter()
+                .any(|(_, marker)| marker.claim_age_ms.is_some_and(|claim| claim < lease_ms));
+            let due = entries.iter().any(|(_, marker)| marker.age_ms >= grace_ms);
+            if due && !claimed {
+                let target = entries.iter().find_map(|(_, marker)| marker.target.clone());
+                let pools = entries.iter().map(|&(index, _)| index).collect();
+                let base = entries
+                    .into_iter()
+                    .next()
+                    .map(|(_, marker)| marker.base)
+                    .unwrap_or_default();
+                unreported.push(UnreportedAbort {
+                    queue,
+                    base,
+                    target,
+                    ramp_id,
+                    pools,
+                });
+            }
+        }
+    }
+    let finished = finished
+        .into_iter()
+        .map(|((index, queue), ids)| (index, queue, ids))
+        .collect();
+    (unreported, half_marked, finished)
+}
+
 /// One read of every pool.
 #[cfg(feature = "db")]
 struct FleetRead {
     /// The active ramps, merged per generation.
     ramps: std::collections::BTreeMap<GenerationKey, ObservedRamp>,
     /// The finished, reported abort markers: the pool index, the queue and
-    /// the marker ids. No pool holds the ramp of such a marker.
+    /// the marker ids. No pool holds the ramp of such a marker, and every
+    /// marker of its abort is reported.
     finished_markers: Vec<(usize, String, Vec<uuid::Uuid>)>,
     /// The finished aborts that no guard reported within the grace.
     unreported: Vec<UnreportedAbort>,
+    /// The finished aborts that a guard reported but did not mark on every
+    /// pool. Each holds the queue, the `ramp_id` and the pools that still
+    /// need the mark.
+    half_marked: Vec<(String, uuid::Uuid, Vec<usize>)>,
 }
 
 /// Remove finished abort markers from one pool, within `bound`.
@@ -1351,24 +1420,28 @@ enum Disposition {
 
 /// Decide what to do with an abort from the outcomes of its clears.
 ///
-/// `outcomes` is in pool order. On a first attempt, a lost clear on the
-/// first pool means that another guard owns the report. A moved clear is an
-/// operator change, so it does not decide the owner. A guard reports
-/// an abort only when it cleared a pool itself. A failed clear therefore
-/// never reports a change that did not happen.
+/// `outcomes` is in pool order. The first decisive outcome elects the
+/// reporter. A decisive outcome is `Cleared` (this guard won that pool) or
+/// `Lost` (another guard won it). A failure, an operator move or an unknown
+/// change decides nothing. So two guards that race over the same pools
+/// agree on one reporter, on a first attempt and on a retry alike.
+///
+/// With no decisive outcome, a failed or ambiguous clear defers the report
+/// to a retry. A guard therefore never reports a change that did not happen.
 #[cfg(feature = "db")]
-fn disposition(outcomes: &[ClearOutcome], first_attempt: bool) -> Disposition {
-    let lost_first = outcomes.first() == Some(&ClearOutcome::Lost);
-    if first_attempt && lost_first {
-        Disposition::Drop
-    } else if outcomes.contains(&ClearOutcome::Cleared) {
-        Disposition::Report
-    } else if outcomes.contains(&ClearOutcome::Failed)
-        || outcomes.contains(&ClearOutcome::Ambiguous)
-    {
-        Disposition::Defer
-    } else {
-        Disposition::Drop
+fn disposition(outcomes: &[ClearOutcome]) -> Disposition {
+    let decisive = outcomes
+        .iter()
+        .find(|outcome| matches!(outcome, ClearOutcome::Cleared | ClearOutcome::Lost));
+    match decisive {
+        Some(ClearOutcome::Cleared) => Disposition::Report,
+        None if outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, ClearOutcome::Failed | ClearOutcome::Ambiguous)) =>
+        {
+            Disposition::Defer
+        }
+        _ => Disposition::Drop,
     }
 }
 
@@ -1526,6 +1599,7 @@ impl RampGuard {
             ramps,
             finished_markers,
             unreported,
+            half_marked,
         }) = read
         else {
             return aborts;
@@ -1587,8 +1661,7 @@ impl RampGuard {
                 pools,
                 audit_pool,
                 metrics,
-                unreported,
-                finished_markers,
+                (unreported, half_marked, finished_markers),
                 bound,
                 cancel,
             )
@@ -1597,21 +1670,23 @@ impl RampGuard {
         aborts
     }
 
-    /// Report the unreported aborts and remove the finished markers.
+    /// Report the unreported aborts, finish half-marked ones and remove the
+    /// finished markers.
     ///
     /// A cancel starts no new write, so the rest waits for a later pass.
-    #[allow(clippy::too_many_arguments)]
     async fn recover_and_prune(
         &self,
         pools: &[crate::worker::DbPool],
         audit_pool: &crate::worker::DbPool,
         metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
-        unreported: Vec<UnreportedAbort>,
-        finished_markers: Vec<(usize, String, Vec<uuid::Uuid>)>,
+        (unreported, half_marked, finished_markers): MarkerWork,
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<RampAbort> {
         let mut aborts = Vec::new();
+        for (queue, ramp_id, marker_pools) in half_marked {
+            mark_reported(pools, &marker_pools, &queue, Some(ramp_id), bound, cancel).await;
+        }
         for lost in unreported {
             if cancel.is_cancelled() {
                 return aborts;
@@ -1670,7 +1745,7 @@ impl RampGuard {
             outcomes.push(outcome);
         }
         abort.incomplete = !failed.is_empty();
-        let decision = disposition(&outcomes, true);
+        let decision = disposition(&outcomes);
         if !failed.is_empty() {
             let unreported = (decision == Disposition::Defer).then(|| abort.clone());
             self.pending.insert(
@@ -1817,7 +1892,7 @@ impl RampGuard {
             }
             let mut unreported = entry.unreported;
             if let Some(mut abort) = unreported.take() {
-                match disposition(&outcomes, false) {
+                match disposition(&outcomes) {
                     Disposition::Report => {
                         abort.incomplete = !still_failed.is_empty();
                         let failed_pools: Vec<usize> =
@@ -2270,46 +2345,49 @@ mod tests {
     fn disposition_reports_only_after_this_guard_cleared_a_pool() {
         use ClearOutcome::{Cleared, Failed, Lost};
         // A clear on any pool, with the first pool not lost: report.
-        assert_eq!(disposition(&[Cleared, Failed], true), Disposition::Report);
-        assert_eq!(disposition(&[Failed, Cleared], true), Disposition::Report);
+        assert_eq!(disposition(&[Cleared, Failed]), Disposition::Report);
+        assert_eq!(disposition(&[Failed, Cleared]), Disposition::Report);
         // The first pool was lost to another replica: it owns the report.
-        assert_eq!(disposition(&[Lost, Cleared], true), Disposition::Drop);
-        // Nothing cleared, but a clear failed: wait for a retry. This covers
-        // a failed first pool with a lost later pool.
-        assert_eq!(disposition(&[Failed, Lost], true), Disposition::Defer);
-        assert_eq!(disposition(&[Failed, Failed], true), Disposition::Defer);
+        assert_eq!(disposition(&[Lost, Cleared]), Disposition::Drop);
+        // A failed first pool with a lost later pool: another guard won.
+        assert_eq!(disposition(&[Failed, Lost]), Disposition::Drop);
+        // Nothing decisive, but a clear failed: wait for a retry.
+        assert_eq!(disposition(&[Failed, Failed]), Disposition::Defer);
         // Every clear lost: report nothing.
-        assert_eq!(disposition(&[Lost, Lost], true), Disposition::Drop);
-        assert_eq!(disposition(&[], true), Disposition::Drop);
-        // A retry reports once it clears a pool, whatever pool comes first.
-        assert_eq!(disposition(&[Lost, Cleared], false), Disposition::Report);
-        assert_eq!(disposition(&[Lost], false), Disposition::Drop);
-        assert_eq!(disposition(&[Failed], false), Disposition::Defer);
+        assert_eq!(disposition(&[Lost, Lost]), Disposition::Drop);
+        assert_eq!(disposition(&[]), Disposition::Drop);
+        // A retry follows the same rule: a lost first pool means another
+        // guard won.
+        assert_eq!(disposition(&[Lost, Cleared]), Disposition::Drop);
+        assert_eq!(disposition(&[Lost]), Disposition::Drop);
+        assert_eq!(disposition(&[Failed]), Disposition::Defer);
         // A client timeout is unknown, so it defers like a failure.
-        assert_eq!(
-            disposition(&[ClearOutcome::Ambiguous], true),
-            Disposition::Defer
-        );
+        assert_eq!(disposition(&[ClearOutcome::Ambiguous]), Disposition::Defer);
     }
 
     #[cfg(feature = "db")]
     #[test]
     fn an_operator_change_on_the_first_pool_does_not_decide_the_reporter() {
         use ClearOutcome::{Changed, Cleared, Failed, Lost, Moved};
+        // The first decisive outcome elects the reporter. A failure, an
+        // operator move or an unknown change on an earlier pool decides
+        // nothing, so a later lost clear still means another guard won.
+        assert_eq!(disposition(&[Failed, Lost, Cleared]), Disposition::Drop);
+        assert_eq!(disposition(&[Moved, Lost, Cleared]), Disposition::Drop);
+        assert_eq!(disposition(&[Failed, Cleared, Lost]), Disposition::Report);
+        // The same holds on a retry.
+        assert_eq!(disposition(&[Lost, Cleared]), Disposition::Drop);
         // An unknown change, such as on a ramp with no id, behaves the same.
-        assert_eq!(disposition(&[Changed, Cleared], true), Disposition::Report);
-        assert_eq!(disposition(&[Changed], true), Disposition::Drop);
+        assert_eq!(disposition(&[Changed, Cleared]), Disposition::Report);
+        assert_eq!(disposition(&[Changed]), Disposition::Drop);
         assert_eq!(retry_outcome(Changed, true), Cleared);
         assert_eq!(retry_outcome(Changed, false), Changed);
         // An operator moved the first pool, and this guard cleared another.
-        assert_eq!(disposition(&[Moved, Cleared], true), Disposition::Report);
-        assert_eq!(disposition(&[Moved, Failed], true), Disposition::Defer);
-        assert_eq!(disposition(&[Moved, Moved], true), Disposition::Drop);
+        assert_eq!(disposition(&[Moved, Cleared]), Disposition::Report);
+        assert_eq!(disposition(&[Moved, Failed]), Disposition::Defer);
+        assert_eq!(disposition(&[Moved, Moved]), Disposition::Drop);
         // Another guard cleared the first pool: it still owns the report.
-        assert_eq!(
-            disposition(&[Lost, Moved, Cleared], true),
-            Disposition::Drop
-        );
+        assert_eq!(disposition(&[Lost, Moved, Cleared]), Disposition::Drop);
     }
 
     #[cfg(feature = "db")]
@@ -2325,7 +2403,7 @@ mod tests {
         }
         // So an unreported abort is reported, not dropped.
         assert_eq!(
-            disposition(&[retry_outcome(Lost, true)], false),
+            disposition(&[retry_outcome(Lost, true)]),
             Disposition::Report
         );
     }

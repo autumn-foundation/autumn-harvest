@@ -1580,6 +1580,83 @@ async fn a_policy_update_gives_an_id_less_ramp_an_id() {
     assert_eq!(policy_ramp_id(&mut conn).await, Some(ramp_id));
 }
 
+/// Clear the test ramp on both pools with unreported markers for one id, as
+/// a guard does that stopped before its report.
+async fn clear_on_both_pools_unreported(
+    conn_1: &mut AsyncPgConnection,
+    conn_2: &mut AsyncPgConnection,
+) -> uuid::Uuid {
+    let ramp_id = uuid::Uuid::new_v4();
+    for conn in [conn_1, conn_2] {
+        set_ramp_with_id(conn, ramp_id).await;
+        let step = policy_step(conn).await;
+        assert!(
+            abort_ramp(conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+                .await
+                .expect("clear")
+        );
+    }
+    ramp_id
+}
+
+/// A fresh recovery claim on one pool stops recovery of that abort on every
+/// pool. Another guard therefore cannot report it through the second pool.
+#[tokio::test]
+async fn a_fresh_claim_on_one_pool_stops_recovery_on_every_pool() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = clear_on_both_pools_unreported(&mut conn_1, &mut conn_2).await;
+    // Another guard has claimed the recovery on pool 1 and still reports.
+    assert!(
+        claim_unreported_abort(&mut conn_1, QUEUE, ramp_id, Duration::ZERO, CLEAR_BOUND)
+            .await
+            .expect("claim")
+    );
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "the claim holds fleet-wide: {aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0);
+    assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(false));
+}
+
+/// A reported marker on one pool means that the abort was reported. A pass
+/// marks the rest as reported and does not report the abort again.
+#[tokio::test]
+async fn a_partly_marked_abort_is_not_reported_again() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = clear_on_both_pools_unreported(&mut conn_1, &mut conn_2).await;
+    // The reporting guard marked pool 1, then stopped before pool 2.
+    assert!(
+        mark_abort_reported(&mut conn_1, QUEUE, ramp_id, CLEAR_BOUND)
+            .await
+            .expect("mark pool 1")
+    );
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0);
+    assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(true));
+}
+
 /// A split ramp with no abort marker is not cleared.
 #[tokio::test]
 async fn a_split_ramp_without_an_abort_marker_stays() {
