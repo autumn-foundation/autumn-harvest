@@ -196,7 +196,7 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 
 *Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
 
-A formal model of this protocol is tracked in issue #1819.
+*Model.* `formal/tla/ActivityClaim.tla` models this protocol (issue #1819). TLC checks the invariant over every interleaving. With the fence off, it reproduces the #1789 bug. See [`formal-methods.md`](testing/formal-methods.md).
 
 **10. Suspension readiness (issue #1797)**
 
@@ -1711,6 +1711,9 @@ randomized- and model-checking-based testing layers:
   `heartbeat.rs` (issue #1800).
 * [`docs/testing/concurrency-model-checking.md`](testing/concurrency-model-checking.md)
   — the evaluation of loom / Shuttle / Turmoil behind the adoptions above.
+* [`docs/testing/formal-methods.md`](testing/formal-methods.md) — TLA+
+  models of the core protocols and Kani proofs of the pure kernels
+  (issue #1819).
 
 ---
 

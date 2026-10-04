@@ -1364,6 +1364,38 @@ mod controller {
         hash
     }
 
+    /// Kani proofs of the seeded plan derivation (issue #1819).
+    ///
+    /// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
+    #[cfg(kani)]
+    mod kani_proofs {
+        use super::*;
+
+        /// A seeded plan picks only an action that the point's caps allow,
+        /// and never `Hold`. The stream is any `u64`, so the result holds for
+        /// every `splitmix64` output and every seed.
+        #[kani::proof]
+        #[kani::unwind(6)]
+        fn seeded_action_respects_caps_and_never_holds() {
+            let i: usize = kani::any();
+            kani::assume(i < ALL.len());
+            let point = ALL[i];
+            let caps = point.caps();
+            let Some(action) = pick_seeded_action(point, kani::any()) else {
+                return;
+            };
+            let allowed = match action {
+                Action::Kill => caps & CAP_KILL != 0,
+                Action::Error(_) => caps & CAP_ERROR != 0,
+                Action::DropNotify => caps & CAP_DROP_NOTIFY != 0,
+                Action::Delay(_) => caps & CAP_DELAY != 0,
+                Action::Hold => false,
+            };
+            assert!(allowed);
+            kani::cover!(matches!(action, Action::Kill));
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;

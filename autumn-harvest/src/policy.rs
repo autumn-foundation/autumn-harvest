@@ -66,13 +66,28 @@ const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
     lo.wrapping_add(offset)
 }
 
+/// Full jitter in nanoseconds: a value in `[0, hi]`.
+const fn full_jitter_nanos(hi: u64, seed: u64) -> u64 {
+    uniform_inclusive(seed, 0, hi)
+}
+
+/// Equal jitter in nanoseconds: a value in `[hi/2, hi]`.
+///
+/// For `hi <= 1` the value is `hi`.
+const fn equal_jitter_nanos(hi: u64, seed: u64) -> u64 {
+    if hi <= 1 {
+        return hi;
+    }
+    uniform_inclusive(seed, hi / 2, hi)
+}
+
 /// Full jitter: a deterministic delay in `[0, base]`.
 ///
 /// `stream_seed` and `attempt` select the value, so a replay gets the same delay.
 #[must_use]
 pub(crate) fn full_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
     let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-    Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), 0, hi))
+    Duration::from_nanos(full_jitter_nanos(hi, stream_seed ^ u64::from(attempt)))
 }
 
 /// Equal jitter: a deterministic delay in `[base/2, base]`.
@@ -85,8 +100,7 @@ pub(crate) fn equal_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Du
     if hi <= 1 {
         return base;
     }
-    let lo = hi / 2;
-    Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), lo, hi))
+    Duration::from_nanos(equal_jitter_nanos(hi, stream_seed ^ u64::from(attempt)))
 }
 
 /// Compute deterministic retry delay with jitter.
@@ -2598,4 +2612,70 @@ fn compute_retry_delay_negative_nan() {
 
     let d2 = compute_retry_delay(Duration::from_secs(1), -1.0, Duration::from_secs(300), 2);
     assert_eq!(d2, Duration::from_secs(0));
+}
+
+/// Kani proofs of the retry-delay bounds (issue #1819).
+///
+/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
+///
+/// The jitter proofs replace `mix64` with a stub that returns any `u64`. The
+/// bounds must hold for every mixed value, so the stub over-approximates the
+/// mixer and the proofs stay sound. With the real mixer, CBMC does not finish.
+///
+/// The proofs work in nanoseconds. A proof through `Duration` must relate
+/// `as_nanos` to `from_nanos`, and CBMC does not finish that either.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_mix(_x: u64) -> u64 {
+        kani::any()
+    }
+
+    /// The jitter draw stays in `[lo, hi]` for every seed.
+    #[kani::proof]
+    #[kani::stub(mix64, any_mix)]
+    fn uniform_inclusive_stays_in_range() {
+        let lo: u64 = kani::any();
+        let hi: u64 = kani::any();
+        kani::assume(lo <= hi);
+        let v = uniform_inclusive(kani::any(), lo, hi);
+        assert!(lo <= v && v <= hi);
+        kani::cover!(v == hi);
+    }
+
+    /// Full jitter never exceeds its base.
+    #[kani::proof]
+    #[kani::stub(mix64, any_mix)]
+    fn full_jitter_is_at_most_base() {
+        let hi: u64 = kani::any();
+        assert!(full_jitter_nanos(hi, kani::any()) <= hi);
+    }
+
+    /// Equal jitter stays in `[base/2, base]`. A loop with no attempt cap
+    /// therefore cannot become a hot loop.
+    #[kani::proof]
+    #[kani::stub(mix64, any_mix)]
+    fn equal_jitter_stays_in_upper_half() {
+        let hi: u64 = kani::any();
+        let v = equal_jitter_nanos(hi, kani::any());
+        assert!(hi / 2 <= v && v <= hi);
+    }
+
+    /// The backoff never panics and never exceeds `max_interval`.
+    ///
+    /// CBMC reports any NaN result as an error, but the code handles NaN on
+    /// purpose. The proof therefore assumes a coefficient that is not NaN and
+    /// an initial interval above 0, so `0 * inf` cannot occur. The unit test
+    /// `compute_retry_delay_negative_nan` pins the NaN case.
+    #[kani::proof]
+    fn retry_delay_never_exceeds_max_interval() {
+        let coefficient: f64 = kani::any();
+        kani::assume(!coefficient.is_nan());
+        let initial = Duration::from_millis(u64::from(kani::any::<u32>()));
+        kani::assume(!initial.is_zero());
+        let max = Duration::from_millis(u64::from(kani::any::<u32>()));
+        let d = compute_retry_delay(initial, coefficient, max, kani::any());
+        assert!(d <= max);
+    }
 }

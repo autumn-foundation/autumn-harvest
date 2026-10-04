@@ -6,19 +6,21 @@
 //! - Every `formal/tla/*.cfg` has a row in `formal/tla/models.txt`.
 //! - Each row names a spec, a config and an expected result.
 //! - The claim-epoch model has a passing config and a pre-fix counter-example.
-//! - `ci.yml` runs the model runner and `cargo kani`.
+//! - `ci.yml` runs the model runner and `cargo kani` on every PR.
 //! - The crate holds at least three Kani proofs.
 //! - `docs/testing/formal-methods.md` names every spec and every proof.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate dir has a parent")
-        .to_path_buf()
-}
+use serde_yaml::Value;
+
+use super::ci_run_coverage::{
+    SHELL_OPERATORS, parse_workflow, parse_workflow_text, repo_root, ungated,
+};
+
+/// The job whose `if:` the formal jobs copy: a draft skip and a docs-only skip.
+const GATE_TEMPLATE_JOB: &str = "msrv";
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
@@ -217,17 +219,88 @@ fn model_runner_reads_the_manifest_and_pins_tlc() {
     );
 }
 
+/// Why `doc` does not run `command` in `job` on every PR, or `None` when it
+/// does.
+///
+/// The job must have the same `if:` as [`GATE_TEMPLATE_JOB`] and no
+/// `continue-on-error`. One ungated step must be one plain command that
+/// starts with `command`.
+fn formal_job_defect(doc: &Value, job: &str, command: &str) -> Option<String> {
+    let jobs = doc.get("jobs");
+    let Some(node) = jobs.and_then(|j| j.get(job)) else {
+        return Some(format!("ci.yml must define a `{job}` job"));
+    };
+    let template_if = jobs
+        .and_then(|j| j.get(GATE_TEMPLATE_JOB))
+        .and_then(|j| j.get("if"));
+    if node.get("if") != template_if {
+        return Some(format!(
+            "job `{job}` must use the same `if:` as `{GATE_TEMPLATE_JOB}`"
+        ));
+    }
+    if node
+        .get("continue-on-error")
+        .is_some_and(|v| v.as_bool() != Some(false))
+    {
+        return Some(format!("job `{job}` must not set `continue-on-error`"));
+    }
+    let runs = node
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter(|step| ungated(step))
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+        .any(|run| {
+            let run = run.trim();
+            run.starts_with(command) && !SHELL_OPERATORS.iter().any(|op| run.contains(op))
+        });
+    (!runs).then(|| format!("job `{job}` must have an ungated step that runs `{command}`"))
+}
+
 #[test]
 fn ci_runs_the_model_checker_and_kani() {
-    let ci = read(".github/workflows/ci.yml");
-    assert!(
-        ci.contains("run: scripts/check-formal-models.sh"),
-        "ci.yml must run the TLA+ model runner"
-    );
-    assert!(
-        ci.contains("cargo kani -p autumn-harvest"),
-        "ci.yml must run the Kani proofs"
-    );
+    let ci = parse_workflow(".github/workflows/ci.yml");
+    let jobs = [
+        ("formal-models", "scripts/check-formal-models.sh"),
+        ("kani", "cargo kani -p autumn-harvest"),
+    ];
+    for (job, command) in jobs {
+        if let Some(defect) = formal_job_defect(&ci, job, command) {
+            panic!("{defect} (issue #1819)");
+        }
+    }
+}
+
+/// Self-test: a gated job, a soft failure or a run hidden in a shell list
+/// must not count.
+#[test]
+fn formal_job_check_rejects_gated_and_hidden_runs() {
+    let gate = "(github.event_name != 'pull_request' || github.event.pull_request.draft == false)";
+    let doc = |job_if: &str, job_extra: &str, run: &str| {
+        let text = format!(
+            "jobs:\n  msrv:\n    if: \"{gate}\"\n    steps: []\n  kani:\n    if: \"{job_if}\"\n\
+             {job_extra}    steps:\n      - run: '{run}'\n"
+        );
+        parse_workflow_text(&text).expect("synthetic workflow must parse")
+    };
+    let cmd = "cargo kani -p autumn-harvest";
+    assert_eq!(formal_job_defect(&doc(gate, "", cmd), "kani", cmd), None);
+    let rejected = [
+        (
+            "dispatch-only",
+            doc("github.event_name == 'workflow_dispatch'", "", cmd),
+        ),
+        ("soft job", doc(gate, "    continue-on-error: true\n", cmd)),
+        ("echo", doc(gate, "", &format!("echo {cmd}"))),
+        ("shell list", doc(gate, "", &format!("{cmd} || true"))),
+    ];
+    for (case, d) in &rejected {
+        assert!(
+            formal_job_defect(d, "kani", cmd).is_some(),
+            "`{case}` must not count"
+        );
+    }
 }
 
 #[test]

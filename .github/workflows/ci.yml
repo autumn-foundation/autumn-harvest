@@ -1900,6 +1900,46 @@ jobs:
       - name: Run Shuttle models (random and PCT schedulers)
         run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
 
+  # TLA+ models of the core protocols (issue #1819). The runner checks each
+  # row of formal/tla/models.txt. A `violation:` row is a counter-example, and
+  # it must fail on its named invariant. See docs/testing/formal-methods.md.
+  formal-models:
+    name: TLA+ models
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # A full run takes about 15 seconds. The runner image has Java.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Model-check every manifest row with TLC
+        run: scripts/check-formal-models.sh
+
+  # Kani proofs of the pure kernels (issue #1819). `chaos` turns on the chaos
+  # controller. `-Z stubbing` enables the `mix64` stub of the jitter proofs.
+  kani:
+    name: Kani proofs
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+      - name: Run Kani proofs
+        run: cargo kani -p autumn-harvest --no-default-features --features chaos -Z stubbing
+
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every
   # `ignore` entry in deny.toml carries a reachability verdict and a revisit
