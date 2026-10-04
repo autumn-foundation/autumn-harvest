@@ -506,7 +506,8 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
             }
             Timeout::MaybeCommit => {
                 saved = saved && session;
-                local = None;
+                // A local value holds if the commit does not run.
+                local = local.map(|bounds| bounds && session);
             }
             Timeout::RollbackToSavepoint => {
                 session = false;
@@ -578,7 +579,8 @@ enum Timeout {
     /// assumes no bound remains.
     RollbackToSavepoint,
     /// A `COMMIT` that may not run. It may drop every local value. The saved
-    /// value keeps a bound only when it held both before and after.
+    /// value keeps a bound only when it held both before and after. A local
+    /// value keeps a bound only when the session value bounds too.
     MaybeCommit,
 }
 
@@ -7307,6 +7309,24 @@ fn a_conditional_commit_does_not_save_the_bound() {
             .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events")),
         "{findings:?}"
     );
+}
+
+#[test]
+fn a_conditional_commit_keeps_a_bound_only_on_both_paths() {
+    let branch =
+        "DO $$\nBEGIN\n    IF random() < 0.5 THEN\n        COMMIT;\n    END IF;\nEND $$;\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    // Without the commit, the local value holds. With it, the session value holds.
+    for (session, local, bounded) in [("5s", "0", false), ("0", "5s", false), ("5s", "3s", true)] {
+        let sql = format!(
+            "SET lock_timeout = '{session}';\nSET LOCAL lock_timeout = '{local}';\n{branch}{lock}"
+        );
+        let findings = lint_with_history(&[], &sql, false);
+        let flagged = findings
+            .iter()
+            .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events"));
+        assert_eq!(flagged, !bounded, "{sql}\n{findings:?}");
+    }
 }
 
 #[test]

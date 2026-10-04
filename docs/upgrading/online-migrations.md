@@ -171,7 +171,8 @@ undoes a plain `SET` made since the transaction began. After a `COMMIT` or
 `ROLLBACK`, the next statement opens a new implicit transaction. A `BEGIN`
 takes over the open transaction, so it does not protect an earlier `SET` from
 a later `ROLLBACK`. A `COMMIT` or `ROLLBACK` in a branch may not run, so it
-never saves or restores a bound.
+never saves or restores a bound. After a `COMMIT` in a branch, a bound holds
+only when it holds with the commit and without it.
 
 ## 4. Build indexes with `CONCURRENTLY`
 
