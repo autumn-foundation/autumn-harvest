@@ -122,6 +122,20 @@ pub struct ClaimKey {
     pub attempt: i32,
 }
 
+/// Where a claim of this process stands against the timeout enforcer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimState {
+    /// No enforcement touches the claim.
+    Running,
+    /// The enforcer is deciding. A result that arrives now waits for that
+    /// decision.
+    Provisional,
+    /// The result that arrived while the enforcer was deciding.
+    Held(AttemptOutcome, DispatchToken),
+    /// The enforcer timed the claim out. A later result does not count.
+    TimedOut,
+}
+
 /// Outcome of consulting the breaker before dispatching an activity attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchDecision {
@@ -222,7 +236,7 @@ struct BreakerState {
     /// concurrency limit of claims, so the map stays small. Every exit of a
     /// dispatch removes its entry, so no mark can expire while its claim can
     /// still report.
-    in_flight_claims: HashMap<ClaimKey, bool>,
+    in_flight_claims: HashMap<ClaimKey, ClaimState>,
 }
 
 impl Default for BreakerState {
@@ -457,11 +471,22 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        if st.in_flight_claims.remove(&claim) == Some(true) {
-            apply_cancelled(st, token, now);
-            return None;
+        match st.in_flight_claims.get(&claim).copied() {
+            Some(ClaimState::Provisional) => {
+                st.in_flight_claims
+                    .insert(claim, ClaimState::Held(outcome, token));
+                None
+            }
+            Some(ClaimState::TimedOut) => {
+                st.in_flight_claims.remove(&claim);
+                apply_cancelled(st, token, now);
+                None
+            }
+            _ => {
+                st.in_flight_claims.remove(&claim);
+                apply_result(st, policy, outcome, token, now)
+            }
         }
-        apply_result(st, policy, outcome, token, now)
     }
 
     /// Register `claim` as dispatched by this process (issue #1809).
@@ -474,46 +499,89 @@ impl CircuitBreakerRegistry {
         }
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        st.in_flight_claims.insert(claim, false);
+        st.in_flight_claims.insert(claim, ClaimState::Running);
     }
 
     /// Remove `claim` from the in-flight set without a result (issue #1809).
     /// A claim that already reported is not there, so this is then a no-op.
+    /// A held result stays, because the enforcer still settles it.
     pub fn end_claim(&self, activity_name: &str, claim: ClaimKey) {
         if !self.policies.contains_key(activity_name) {
             return;
         }
         let mut states = self.lock();
-        if let Some(st) = states.get_mut(activity_name) {
+        if let Some(st) = states.get_mut(activity_name)
+            && !matches!(st.in_flight_claims.get(&claim), Some(ClaimState::Held(..)))
+        {
             st.in_flight_claims.remove(&claim);
         }
     }
 
-    /// Mark `claim` as timed out by the enforcer (issue #1809).
+    /// Mark `claim` provisionally, before the enforcer decides on it (issue
+    /// #1809).
     ///
-    /// A later [`on_claim_result`](Self::on_claim_result) for the claim then
-    /// leaves the breaker alone. A claim that this process does not hold has
-    /// no local result to fence, so the mark then does nothing.
+    /// A result that arrives now is held. The enforcer then calls
+    /// [`confirm_claim_timed_out`](Self::confirm_claim_timed_out) or
+    /// [`unmark_claim_timed_out`](Self::unmark_claim_timed_out). A claim that
+    /// this process does not hold has no local result to fence, so the mark
+    /// then does nothing.
     pub fn mark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
-        self.set_timed_out(activity_name, claim, true);
-    }
-
-    /// Remove the mark of `claim`, when the enforcer did not time it out after
-    /// all (issue #1809). A result that already used the mark stays fenced.
-    pub fn unmark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
-        self.set_timed_out(activity_name, claim, false);
-    }
-
-    fn set_timed_out(&self, activity_name: &str, claim: ClaimKey, timed_out: bool) {
         if !self.policies.contains_key(activity_name) {
             return;
         }
         let mut states = self.lock();
-        if let Some(mark) = states
+        if let Some(state) = states
             .get_mut(activity_name)
             .and_then(|st| st.in_flight_claims.get_mut(&claim))
+            && *state == ClaimState::Running
         {
-            *mark = timed_out;
+            *state = ClaimState::Provisional;
+        }
+    }
+
+    /// The enforcer timed `claim` out (issue #1809). A held result is dropped
+    /// and releases its probe slot. A later result does not count.
+    pub fn confirm_claim_timed_out(&self, activity_name: &str, claim: ClaimKey, now: Instant) {
+        if !self.policies.contains_key(activity_name) {
+            return;
+        }
+        let mut states = self.lock();
+        let Some(st) = states.get_mut(activity_name) else {
+            return;
+        };
+        match st.in_flight_claims.get(&claim).copied() {
+            Some(ClaimState::Held(_, token)) => {
+                st.in_flight_claims.remove(&claim);
+                apply_cancelled(st, token, now);
+            }
+            Some(ClaimState::Provisional) => {
+                st.in_flight_claims.insert(claim, ClaimState::TimedOut);
+            }
+            _ => {}
+        }
+    }
+
+    /// The enforcer did not time `claim` out after all (issue #1809). A held
+    /// result now counts as usual. Returns its transition, if any.
+    pub fn unmark_claim_timed_out(
+        &self,
+        activity_name: &str,
+        claim: ClaimKey,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        let &policy = self.policies.get(activity_name)?;
+        let mut states = self.lock();
+        let st = states.get_mut(activity_name)?;
+        match st.in_flight_claims.get(&claim).copied() {
+            Some(ClaimState::Held(outcome, token)) => {
+                st.in_flight_claims.remove(&claim);
+                apply_result(st, policy, outcome, token, now)
+            }
+            Some(ClaimState::Provisional) => {
+                st.in_flight_claims.insert(claim, ClaimState::Running);
+                None
+            }
+            _ => None,
         }
     }
 
@@ -882,6 +950,7 @@ mod tests {
         let token = dispatch(&reg, t0);
         reg.begin_claim("send_email", claim(1));
         reg.mark_claim_timed_out("send_email", claim(1));
+        reg.confirm_claim_timed_out("send_email", claim(1), t0);
         let _ = reg.on_external_failure("send_email", t0);
         assert_eq!(rolling(&reg, t0), 1);
 
@@ -905,6 +974,7 @@ mod tests {
         reg.begin_claim("send_email", claim(1));
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
         reg.mark_claim_timed_out("send_email", claim(1));
+        reg.confirm_claim_timed_out("send_email", claim(1), t0);
         let _ = reg.on_external_failure("send_email", t0);
         assert_eq!(rolling(&reg, t0), 1);
     }
@@ -922,6 +992,7 @@ mod tests {
         assert!(probe.is_probe());
         reg.begin_claim("send_email", claim(1));
         reg.mark_claim_timed_out("send_email", claim(1));
+        reg.confirm_claim_timed_out("send_email", claim(1), t1);
         let late = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t1);
         assert_eq!(late, None, "a timed-out probe does not close the breaker");
         assert_eq!(
@@ -942,13 +1013,53 @@ mod tests {
         let token = dispatch(&reg, t0);
         reg.begin_claim("send_email", claim(1));
         reg.mark_claim_timed_out("send_email", claim(1));
-        reg.unmark_claim_timed_out("send_email", claim(1));
+        let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
         assert_eq!(
             rolling(&reg, t0),
             0,
             "the success counts and clears the window"
         );
+    }
+
+    /// A result that arrives while the enforcer decides is held. A no-op
+    /// enforcement then applies it, so a successful probe still closes the
+    /// breaker.
+    #[test]
+    fn held_result_counts_when_the_enforcer_does_nothing() {
+        let reg = registry();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        let probe = dispatch(&reg, t1);
+        reg.begin_claim("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let held = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t1);
+        assert_eq!(held, None, "the result waits for the enforcer");
+        reg.end_claim("send_email", claim(1));
+        let applied = reg.unmark_claim_timed_out("send_email", claim(1), t1);
+        assert_eq!(applied, Some(CircuitTransition::Closed));
+    }
+
+    /// A held result is dropped when the enforcer times the claim out.
+    #[test]
+    fn held_result_is_dropped_when_the_enforcer_acts() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        reg.confirm_claim_timed_out("send_email", claim(1), t0);
+        assert_eq!(
+            rolling(&reg, t0),
+            1,
+            "the late success does not clear the window"
+        );
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
     }
 
     /// A claim that this process does not hold cannot be marked, and an

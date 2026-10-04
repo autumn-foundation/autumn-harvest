@@ -1330,11 +1330,10 @@ async fn enforce_activity_timeout(
     // role disable the guarantee from outside this code.
     let mut tx = conn.build_transaction().read_committed();
     // Mark the claim before the transaction can requeue it (issue #1809).
-    // The handler can return as soon as the requeue commits. Its late result
-    // must then see the mark and leave the breaker alone. Any result that
-    // races this enforcement comes from an attempt past its deadline, so a
-    // mark that the transaction does not use costs nothing. It is removed
-    // below all the same.
+    // The handler can return as soon as the requeue commits. A result that
+    // arrives while the mark is provisional is held. The code after the
+    // transaction confirms the mark, which drops the held result, or rolls
+    // it back, which applies the held result.
     let claim_key = crate::circuit_breaker::ClaimKey {
         task_id: task.id,
         attempt: task.attempt,
@@ -1616,12 +1615,28 @@ async fn enforce_activity_timeout(
     let enforced = match enforced {
         Ok(Some(enforced)) => enforced,
         other => {
+            // No timeout after all. A result held meanwhile counts now.
             if let Some(breakers) = circuit_breakers {
-                breakers.unmark_claim_timed_out(activity_name, claim_key);
+                match breakers.unmark_claim_timed_out(
+                    activity_name,
+                    claim_key,
+                    std::time::Instant::now(),
+                ) {
+                    Some(crate::circuit_breaker::CircuitTransition::Tripped) => {
+                        metrics.record_circuit_tripped(activity_name);
+                    }
+                    Some(crate::circuit_breaker::CircuitTransition::Closed) => {
+                        metrics.record_circuit_closed(activity_name);
+                    }
+                    None => {}
+                }
             }
             return other.map(|_| ());
         }
     };
+    if let Some(breakers) = circuit_breakers {
+        breakers.confirm_claim_timed_out(activity_name, claim_key, std::time::Instant::now());
+    }
     if enforced.retried {
         metrics.record_activity_retried(activity_name, &task.queue_name);
     }
@@ -1637,8 +1652,8 @@ async fn enforce_activity_timeout(
     // them would let a backlog open the circuit and turn overload into
     // failure (#1785).
     //
-    // The claim was marked before the transaction, so a late result of this
-    // attempt leaves the breaker alone. This path counts the attempt.
+    // The claim mark is confirmed above, so a late result of this attempt
+    // leaves the breaker alone. This path counts the attempt.
     if enforced.handler_started
         && let Some(breakers) = circuit_breakers
         && breakers.on_external_failure(activity_name, std::time::Instant::now())
