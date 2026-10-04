@@ -39,6 +39,11 @@ the drain. Now:
   process that outlives `run`, such as an embedded runtime, therefore never
   lets a peer start a second copy. If the process exits, orphan reclaim
   recovers the task.
+- The kept lease hides every claim of the worker from orphan reclaim. So
+  each lease refresh also gives back, through the new fenced
+  `queue::release_abandoned_claim`, each `RUNNING` claim of the worker that
+  no dispatch body holds. A failed release or result write leaves such a
+  claim.
 
 **Safety.** A claim is released only when no handler for it can still run:
 the handler never started, or it returned. The release is fenced on the

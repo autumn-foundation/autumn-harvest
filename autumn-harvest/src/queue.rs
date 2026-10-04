@@ -3039,6 +3039,100 @@ pub async fn release_unstarted_claim(
     Ok(ClaimWrite::Applied)
 }
 
+/// The claims of the `RUNNING` rows that `worker_id` holds (issue #1813).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn running_claims_of_worker(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Vec<TaskClaim>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let rows: Vec<(Uuid, i32)> = dsl::harvest_task_queue
+        .filter(dsl::state.eq("RUNNING"))
+        .filter(dsl::worker_id.eq(worker_id))
+        .select((dsl::id, dsl::attempt))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|(task_id, attempt)| TaskClaim::new(task_id, worker_id, attempt))
+        .collect())
+}
+
+/// Give back a claim that no dispatch body holds (issue #1813). A stale
+/// claim changes nothing.
+///
+/// A drained worker keeps its lease while a handler that ignores the cancel
+/// runs. Orphan reclaim then skips every claim of that worker. A claim whose
+/// release or result write failed would stay `RUNNING`. The lease keeper
+/// gives such a claim back with this write.
+///
+/// The write sets the same columns as orphan reclaim. It keeps `attempt`,
+/// because a handler can have run. It keeps `crash_strikes`, because a
+/// failed write says nothing about the task.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn release_abandoned_claim(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let update = diesel::update(
+        dsl::harvest_task_queue
+            .find(claim.task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<DateTime<Utc>>),
+        dsl::sticky_worker_id.eq(None::<String>),
+        dsl::sticky_until.eq(None::<DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<DateTime<Utc>>),
+        dsl::error.eq(None::<String>),
+        dsl::scheduled_at.eq(db_clock_stamp::<diesel::sql_types::Timestamptz>()),
+    ))
+    .into_boxed();
+    let Some((queue_name, priority, task_type, scheduled_at)) = fence(update, Some(claim))
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(ClaimWrite::LeaseLost);
+    };
+    if let Err(error) = announce_deferred_task(
+        conn,
+        claim.task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        &task_type,
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = %claim.task_id,
+            %error,
+            "failed to announce a released claim; the poll loop still claims it"
+        );
+    }
+    Ok(ClaimWrite::Applied)
+}
+
 /// Mark a task as completed with the given output.
 ///
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be

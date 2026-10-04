@@ -27671,9 +27671,8 @@ pub struct Worker {
     /// Fired by the drain one join window before its deadline (issue
     /// #1813). Each running activity then sees its context cancelled.
     drain_cancel: CancellationToken,
-    /// Every dispatch body (issue #1813). The drain waits for it, so a body
-    /// that releases a claim with no permit still counts as in flight.
-    dispatched: tokio_util::task::TaskTracker,
+    /// Every dispatch body and its claim (issue #1813).
+    dispatched: Dispatched,
     /// Set (and refreshed on every heartbeat) by the heartbeat task while the
     /// worker is draining.  Holds the absolute deadline from the operator's
     /// `drain_deadline_at` so that `drain_in_flight` can honour an extended
@@ -28860,6 +28859,50 @@ impl Drop for DispatchReservation {
     }
 }
 
+/// The `(task_id, attempt)` claim of each dispatch body that still runs
+/// (issue #1813).
+type LiveClaims = Arc<std::sync::Mutex<std::collections::HashSet<(uuid::Uuid, i32)>>>;
+
+/// The dispatch bodies of a worker (issue #1813).
+#[derive(Debug, Default)]
+struct Dispatched {
+    /// Every dispatch body. The drain waits for it, so a body that releases
+    /// a claim with no permit still counts as in flight.
+    tracker: tokio_util::task::TaskTracker,
+    /// The claim of each body that still runs. The lease keeper gives back
+    /// every other claim of this worker.
+    live: LiveClaims,
+}
+
+/// Marks one claim live until its dispatch body ends (issue #1813).
+struct LiveClaim {
+    claims: LiveClaims,
+    key: (uuid::Uuid, i32),
+}
+
+impl LiveClaim {
+    fn new(claims: &LiveClaims, task_id: uuid::Uuid, attempt: i32) -> Self {
+        let key = (task_id, attempt);
+        claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key);
+        Self {
+            claims: Arc::clone(claims),
+            key,
+        }
+    }
+}
+
+impl Drop for LiveClaim {
+    fn drop(&mut self) {
+        self.claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
 /// What a dispatch needs to give back a claim it never started (issue #1813).
 struct UnstartedClaim {
     claim: Option<queue::TaskClaim>,
@@ -29449,7 +29492,7 @@ impl Worker {
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             drain_cancel: CancellationToken::new(),
-            dispatched: tokio_util::task::TaskTracker::new(),
+            dispatched: Dispatched::default(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
@@ -33556,8 +33599,10 @@ impl Worker {
         // not the live slot (issue #1431). Another runtime can replace the
         // slot after this worker starts.
         let bound_channel = self.bound_channel();
+        let live = LiveClaim::new(&self.dispatched.live, task_id, claim_attempt);
         // The tracker keeps the body's handle for the drain (issue #1813).
-        self.dispatched.spawn(async move {
+        self.dispatched.tracker.spawn(async move {
+            let _live = live;
             // Every hint this task raises waits in the scope until the
             // transaction that raised it commits and a flush point publishes
             // it. This is the catch-all for a hint no flush point reached.
@@ -33630,11 +33675,11 @@ impl Worker {
         tokio::pin!(cancel_sleep);
 
         // No body starts after this point, so the tracker can close.
-        self.dispatched.close();
+        self.dispatched.tracker.close();
         let drain = async {
             // Every dispatch body has ended, including one that gives back a
             // claim with no permit (issue #1813).
-            self.dispatched.wait().await;
+            self.dispatched.tracker.wait().await;
             // Try to acquire ALL permits — when we can, all in-flight tasks are done.
             let _wf = self
                 .workflow_semaphore
@@ -33704,15 +33749,17 @@ impl Worker {
     /// heartbeat interval. A stalled shard pool therefore cannot stop the
     /// refresh of another shard. Each refresh has its own limit, from
     /// [`lease_refresh_bound`], so a slow pool cannot let the lease expire.
+    /// The kept lease would also hide a claim that no body holds. So each
+    /// refresh gives such claims back through [`release_abandoned_claims`].
     /// Each keeper stops when the last dispatch body ends. It also stops when the process exits, and orphan reclaim then
     /// recovers the task.
     fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
-        if self.dispatched.is_empty() {
+        if self.dispatched.tracker.is_empty() {
             return;
         }
         tracing::warn!(
             worker_id = %self.config.worker_id,
-            running = self.dispatched.len(),
+            running = self.dispatched.tracker.len(),
             "drain ended with handlers still running; the worker keeps its lease until they return"
         );
         let interval = self.config.worker_heartbeat_interval;
@@ -33721,8 +33768,9 @@ impl Worker {
         // refresh of another shard. Detached on purpose: the handlers they
         // guard are detached too.
         for pool in pools {
-            let dispatched = self.dispatched.clone();
+            let dispatched = self.dispatched.tracker.clone();
             let worker_id = self.config.worker_id.clone();
+            let live_claims = Arc::clone(&self.dispatched.live);
             tokio::spawn(async move {
                 let done = dispatched.wait();
                 tokio::pin!(done);
@@ -33734,7 +33782,13 @@ impl Worker {
                         _ = tick.tick() => {
                             let touched = tokio::time::timeout(bound, async {
                                 let mut conn = crate::pool::acquire(&pool, bound).await?;
-                                crate::workers::touch_worker_liveness(&mut conn, &worker_id).await
+                                crate::workers::touch_worker_liveness(&mut conn, &worker_id)
+                                    .await?;
+                                // The kept lease hides every claim of this
+                                // worker from orphan reclaim. So give back
+                                // each claim that no body holds.
+                                release_abandoned_claims(&mut conn, &worker_id, &live_claims)
+                                    .await
                             })
                             .await;
                             let error = match touched {
@@ -33794,6 +33848,39 @@ fn drain_cancel_at(
 /// seconds, so it cannot serve as this limit.
 fn lease_refresh_bound(heartbeat_interval: Duration) -> Duration {
     heartbeat_interval / 2
+}
+
+/// Give back each claim of `worker_id` that no dispatch body holds (issue
+/// #1813).
+///
+/// A failed release or result write leaves such a claim `RUNNING`. Orphan
+/// reclaim recovers it only when the worker lease lapses. The lease keeper
+/// holds the lease, so it gives these claims back itself. No body can start
+/// after the drain, and a claim leaves `live` only when its body ends.
+async fn release_abandoned_claims(
+    conn: &mut diesel_async::AsyncPgConnection,
+    worker_id: &str,
+    live: &LiveClaims,
+) -> HarvestResult<usize> {
+    let mut released = 0;
+    for claim in queue::running_claims_of_worker(conn, worker_id).await? {
+        let held = live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(claim.task_id, claim.attempt));
+        if held {
+            continue;
+        }
+        if queue::release_abandoned_claim(conn, &claim).await? == queue::ClaimWrite::Applied {
+            tracing::warn!(
+                task_id = %claim.task_id,
+                worker_id = %worker_id,
+                "the lease keeper gave back a claim that no handler holds"
+            );
+            released += 1;
+        }
+    }
+    Ok(released)
 }
 
 // ---------------------------------------------------------------------------

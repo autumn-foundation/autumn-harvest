@@ -275,6 +275,38 @@ async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
         )
 }
 
+/// Enqueue an activity task on `queue` and mark it claimed by `worker_id`.
+///
+/// No dispatch body holds this claim.
+async fn abandon_claim(conn: &mut AsyncPgConnection, queue: &str, worker_id: &str) -> Uuid {
+    let params = EnqueueParams::new(queue, TaskType::Activity, serde_json::json!({}));
+    let task_id = queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue activity task");
+    diesel::update(harvest_task_queue::table.find(task_id))
+        .set((
+            harvest_task_queue::state.eq("RUNNING"),
+            harvest_task_queue::worker_id.eq(Some(worker_id)),
+            harvest_task_queue::attempt.eq(1),
+            harvest_task_queue::started_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .expect("mark the task claimed");
+    task_id
+}
+
+/// The `state` and `worker_id` of task `task_id`.
+async fn task_state(url: &str, task_id: Uuid) -> (String, Option<String>) {
+    let mut conn = connect(url).await;
+    harvest_task_queue::table
+        .find(task_id)
+        .select((harvest_task_queue::state, harvest_task_queue::worker_id))
+        .first(&mut conn)
+        .await
+        .expect("load task")
+}
+
 /// Wait until `worker_id` runs the activity handler.
 async fn wait_for_start(url: &str, exec_id: ExecutionId, worker_id: &str, starts: &AtomicU32) {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -438,7 +470,8 @@ async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
 /// use a 1 s heartbeat, so orphan reclaim judges the drained worker stale
 /// after 2 s. The activity has a 2 s heartbeat timeout. The test waits longer
 /// than both. The drained worker must keep its lease and the task heartbeat
-/// while the handler runs.
+/// while the handler runs. The kept lease must not hide a claim that no
+/// handler holds, so the keeper gives such a claim back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
     let (url, _container) = setup_test_database_url_or_env().await;
@@ -453,6 +486,10 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
     wait_for_start(&url, exec_id, &worker_a, &STUBBORN_STARTS).await;
     let worker_b = format!("{queue}-b");
     let b = Running::start_with_heartbeat(&worker_b, &queue, &pool, heartbeat);
+
+    // A claim that no dispatch body holds, as a failed release leaves one.
+    // No worker polls its queue, so a release leaves it `PENDING`.
+    let abandoned = abandon_claim(&mut conn, &format!("{queue}-abandoned"), &worker_a).await;
 
     let drain = a.stop().await;
     assert!(
@@ -476,6 +513,10 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         1,
         "no peer may run the activity while its handler runs"
     );
+    // The kept lease must not hide a claim that no handler holds.
+    let (state, worker_id) = task_state(&url, abandoned).await;
+    assert_eq!(state, "PENDING", "the keeper gives back an abandoned claim");
+    assert_eq!(worker_id, None);
 
     STUBBORN_GO.notify_one();
     wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))

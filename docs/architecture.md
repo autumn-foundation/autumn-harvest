@@ -184,7 +184,7 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 
 *Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write and claim check uses it, in its own statement:
 
-- Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task`, `defer_claimed_retry_for_budget`, `release_unstarted_claim` and `record_heartbeat`.
+- Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task`, `defer_claimed_retry_for_budget`, `release_unstarted_claim`, `release_abandoned_claim` and `record_heartbeat`.
 - Drain release of a joined activity (issue #1813): `requeue_claimed_task_for_retry`. It keeps `attempt`, because the handler ran.
 - Workflow-task writes: `requeue_claimed_workflow_task_after_deadlock` (issue #1797).
 - `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
