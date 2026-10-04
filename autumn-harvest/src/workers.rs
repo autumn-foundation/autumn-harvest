@@ -495,30 +495,51 @@ pub const WORKER_TASK_STATS_RETENTION: Duration = Duration::from_secs(3600);
 ///
 /// A multi-shard worker compares itself on one heartbeat only. That heartbeat
 /// merges the rows every shard heartbeat stored here. So a peer that lives on
-/// another of the worker's shards still counts.
+/// another of the worker's shards still counts. A slot expires when its shard
+/// heartbeat stops reading, so a lost shard cannot keep stale peers alive.
 #[derive(Debug, Default)]
-pub struct ShardPeerViews(Mutex<std::collections::BTreeMap<usize, Vec<LiveWorkerTaskStats>>>);
+pub struct ShardPeerViews(
+    Mutex<std::collections::BTreeMap<usize, (std::time::Instant, Vec<LiveWorkerTaskStats>)>>,
+);
 
 impl ShardPeerViews {
-    /// Replace the rows that shard heartbeat `slot` read.
-    pub fn store(&self, slot: usize, rows: Vec<LiveWorkerTaskStats>) {
+    fn slots(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::BTreeMap<usize, (std::time::Instant, Vec<LiveWorkerTaskStats>)>,
+    > {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(slot, rows);
     }
 
-    /// The rows of every slot, one per worker. When two shards hold a row for
-    /// the same worker, the row with the most tasks wins.
+    /// Replace the rows that shard heartbeat `slot` read now.
+    pub fn store(&self, slot: usize, rows: Vec<LiveWorkerTaskStats>) {
+        self.store_at(slot, std::time::Instant::now(), rows);
+    }
+
+    /// Replace the rows that shard heartbeat `slot` read at `at`.
+    pub fn store_at(&self, slot: usize, at: std::time::Instant, rows: Vec<LiveWorkerTaskStats>) {
+        self.slots().insert(slot, (at, rows));
+    }
+
+    /// Drop the rows of `slot`, for example after its shard heartbeat fails.
+    pub fn clear(&self, slot: usize) {
+        self.slots().remove(&slot);
+    }
+
+    /// The rows of every slot stored within `max_age`, one per worker. When
+    /// two shards hold a row for the same worker, the row with the most tasks
+    /// wins.
     #[must_use]
-    pub fn merged(&self) -> Vec<LiveWorkerTaskStats> {
+    pub fn merged(&self, max_age: Duration) -> Vec<LiveWorkerTaskStats> {
+        let now = std::time::Instant::now();
         let rows: Vec<LiveWorkerTaskStats> = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slots()
             .values()
-            .flatten()
-            .cloned()
+            .filter(|(at, _)| now.saturating_duration_since(*at) <= max_age)
+            .flat_map(|(_, rows)| rows.iter().cloned())
             .collect();
         let mut by_worker: std::collections::BTreeMap<String, LiveWorkerTaskStats> =
             std::collections::BTreeMap::new();
@@ -560,6 +581,23 @@ impl ProcessOutlierFlags {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         verdicts.insert(worker_id.to_owned(), flagged.to_vec());
+        let any: Vec<OutlierDimension> = OutlierDimension::ALL
+            .into_iter()
+            .filter(|d| verdicts.values().any(|v| v.contains(d)))
+            .collect();
+        drop(verdicts);
+        any
+    }
+
+    /// Forget `worker_id`, for example when its heartbeat stops, and return
+    /// the dimensions on which any remaining local worker is an outlier.
+    #[must_use]
+    pub fn remove(&self, worker_id: &str) -> Vec<OutlierDimension> {
+        let mut verdicts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        verdicts.remove(worker_id);
         let any: Vec<OutlierDimension> = OutlierDimension::ALL
             .into_iter()
             .filter(|d| verdicts.values().any(|v| v.contains(d)))
@@ -612,19 +650,36 @@ impl OutlierProbe {
     /// of every local worker's verdict.
     fn publish(&self, worker_id: &str, flagged: &[OutlierDimension]) {
         let any = self.process_flags.set(worker_id, flagged);
+        self.emit(&any);
+    }
+
+    fn emit(&self, any: &[OutlierDimension]) {
         for dimension in OutlierDimension::ALL {
             self.metrics
                 .record_worker_outlier(dimension, any.contains(&dimension));
         }
     }
 
-    /// Clear this worker's verdict and refresh the gauge.
+    /// Drop this heartbeat's peer rows, clear this worker's verdict and
+    /// refresh the gauge.
     ///
     /// A tick that cannot compare calls this. An unknown state then reads as
     /// "not an outlier", and a stale 1 cannot keep an alert firing.
     pub fn clear_gauge(&self, worker_id: &str) {
+        self.shard_peers.clear(self.slot);
         if self.compare {
             self.publish(worker_id, &[]);
+        }
+    }
+
+    /// Forget this worker when its heartbeat stops, and refresh the gauge.
+    ///
+    /// A stopped worker then cannot keep the process-wide OR at 1.
+    pub fn retire(&self, worker_id: &str) {
+        self.shard_peers.clear(self.slot);
+        if self.compare {
+            let any = self.process_flags.remove(worker_id);
+            self.emit(&any);
         }
     }
 }
@@ -807,7 +862,10 @@ pub async fn run_outlier_tick(
     let flagged = if draining {
         Vec::new()
     } else {
-        let live = probe.shard_peers.merged();
+        // A slot older than the fleet window belongs to a shard that stopped
+        // reading, so its rows are left out.
+        let max_age = Duration::from_secs(u64::try_from(probe.fleet_stale_secs).unwrap_or(0));
+        let live = probe.shard_peers.merged(max_age);
         live.iter()
             .find(|row| row.worker_id == worker_id)
             .map(|me| {
@@ -2129,6 +2187,7 @@ pub fn spawn_worker_heartbeat(
                 }
             }
         }
+        outliers.retire(&registration.worker_id);
     })
 }
 
@@ -2237,10 +2296,11 @@ mod tests {
     #[test]
     fn shard_peer_views_merge_every_slot_once_per_worker() {
         let views = super::ShardPeerViews::default();
+        let window = std::time::Duration::from_secs(60);
         views.store(0, vec![live("me", 50), live("a", 10)]);
         views.store(1, vec![live("me", 40), live("b", 30), live("a", 20)]);
         let merged: Vec<(String, u32)> = views
-            .merged()
+            .merged(window)
             .into_iter()
             .map(|r| (r.worker_id, r.stats.tasks))
             .collect();
@@ -2250,7 +2310,30 @@ mod tests {
         );
         // A later read from one slot replaces that slot only.
         views.store(1, vec![]);
-        assert_eq!(views.merged().len(), 2);
+        assert_eq!(views.merged(window).len(), 2);
+    }
+
+    /// Issue #1815: a slot whose shard heartbeat failed or went quiet no
+    /// longer supplies peers.
+    #[test]
+    fn shard_peer_views_drop_cleared_and_expired_slots() {
+        let views = super::ShardPeerViews::default();
+        let window = std::time::Duration::from_secs(60);
+        views.store(0, vec![live("me", 50)]);
+        views.store(1, vec![live("a", 20)]);
+        views.clear(1);
+        assert_eq!(views.merged(window).len(), 1, "a cleared slot is gone");
+
+        let old = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .expect("the clock is past two minutes");
+        views.store_at(1, old, vec![live("a", 20)]);
+        let ids: Vec<String> = views
+            .merged(window)
+            .into_iter()
+            .map(|r| r.worker_id)
+            .collect();
+        assert_eq!(ids, vec!["me".to_string()], "an expired slot is skipped");
     }
 
     /// Issue #1815: a healthy worker in the same process cannot clear a sick
@@ -2266,6 +2349,8 @@ mod tests {
             vec![FailureRatio, LatencyP99]
         );
         assert_eq!(flags.set("sick", &[]), vec![LatencyP99]);
+        // A stopped worker leaves the map, so its flag cannot linger.
+        assert_eq!(flags.remove("slow"), Vec::new());
     }
 
     /// The fleet lookup that gates the capability-miss redelivery budget
