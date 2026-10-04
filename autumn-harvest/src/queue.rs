@@ -4995,6 +4995,10 @@ pub async fn claim_still_held_for_update(
 /// in place would let an unrelated, already-resolved crash history count
 /// against a task that just proved itself dispatchable.
 ///
+/// Also guards on `attempt = $4` (issue #1806). A stuck-task requeue keeps
+/// `crash_strikes`, so the same worker can claim the row again with an equal
+/// strike count. Only `attempt` tells the new claim from the old one.
+///
 /// Also clears `timer_fires_at` (issue #1402). This release hands the
 /// row to a fresh dispatch attempt at the current instant, not to
 /// whatever timer last armed it. A stale marker must not outlive it.
@@ -5021,6 +5025,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
        AND state = 'RUNNING' \
        AND worker_id = $2 \
        AND crash_strikes = $3 \
+       AND attempt = $4 \
      RETURNING id, queue_name, scheduled_at, priority, task_type"
 }
 
@@ -5059,13 +5064,13 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
 /// Deliberately **not** `FOR UPDATE SKIP LOCKED`: a plain `UPDATE` blocks
 /// behind whatever transiently holds the row instead of skipping it, then
 /// re-evaluates its `WHERE` clause against the row's *post-commit* state. If
-/// ownership genuinely moved in the interim, the guard (`worker_id` +
-/// `crash_strikes`, the same claim token [`claim_still_held_for_update`]
-/// checks) no longer matches and this updates nothing -- the new owner keeps
-/// the row, exactly as if this call were never made. If it did not move, the
-/// row is released, and `wake_requested` is cleared in the very same write so
-/// a wake that landed in the contention window is reconciled rather than
-/// silently lost. This mirrors the established, doubly-reviewed
+/// ownership genuinely moved in the interim, the guard no longer matches. The
+/// guard checks `worker_id`, `crash_strikes` and `attempt`, as
+/// [`claim_still_held_for_update`] does. This call then updates nothing, and
+/// the new owner keeps the row, exactly as if this call never ran. If
+/// ownership did not move, the row is released. The same write clears
+/// `wake_requested`, so a wake that landed in the contention window is
+/// reconciled rather than silently lost. This mirrors the established, doubly-reviewed
 /// [`release_task_for_capability_miss`] fallback -- the pattern this crate
 /// already relies on whenever a `SKIP LOCKED` guard's ambiguous "not ours"
 /// answer needs an authoritative, blocking follow-up -- but touches none of
@@ -5084,8 +5089,9 @@ pub async fn release_suspended_workflow_claim(
     task_id: Uuid,
     worker_id: &str,
     crash_strikes: i32,
+    attempt: i32,
 ) -> HarvestResult<bool> {
-    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes).await
+    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes, attempt).await
 }
 
 /// [`release_suspended_workflow_claim`] under a name that does not imply
@@ -5111,8 +5117,9 @@ pub async fn release_terminal_workflow_claim(
     task_id: Uuid,
     worker_id: &str,
     crash_strikes: i32,
+    attempt: i32,
 ) -> HarvestResult<bool> {
-    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes).await
+    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes, attempt).await
 }
 
 async fn release_workflow_claim_inner(
@@ -5120,11 +5127,13 @@ async fn release_workflow_claim_inner(
     task_id: Uuid,
     worker_id: &str,
     crash_strikes: i32,
+    attempt: i32,
 ) -> HarvestResult<bool> {
     let rows: Vec<PendingHintRow> = diesel::sql_query(release_suspended_workflow_claim_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Integer, _>(crash_strikes)
+        .bind::<diesel::sql_types::Integer, _>(attempt)
         .get_results(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -10080,9 +10089,10 @@ mod tests {
             sql.contains("id = $1")
                 && sql.contains("state = 'RUNNING'")
                 && sql.contains("worker_id = $2")
-                && sql.contains("crash_strikes = $3"),
-            "must be guarded on the exact claim token (worker_id AND crash_strikes), \
-             the same pair claim_still_held_for_update checks",
+                && sql.contains("crash_strikes = $3")
+                && sql.contains("attempt = $4"),
+            "must be guarded on the exact claim (worker_id, crash_strikes AND \
+             attempt), as claim_still_held_for_update is (issue #1806)",
         );
         assert!(
             !sql.contains("SKIP LOCKED"),
