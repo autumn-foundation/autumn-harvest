@@ -60,7 +60,29 @@ impl MetricsRecorder for RecordingMetrics {
 
 // ── Test helpers ───────────────────────────────────────────────────────────
 
-async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
+async fn setup_db() -> (
+    AsyncPgConnection,
+    String,
+    Option<ContainerAsync<Postgres>>,
+) {
+    // `HARVEST_TEST_DATABASE_URL` runs the suite without Docker. Each test
+    // gets its own database, because `tick_once` fires every row it can see.
+    if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        let db_name = format!("harvest_ha_{}", Uuid::new_v4().simple());
+        let mut admin = AsyncPgConnection::establish(&base_url)
+            .await
+            .expect("connect to HARVEST_TEST_DATABASE_URL");
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .await
+            .expect("create per-test database");
+        let url = rewrite_pg_db(&base_url, &db_name);
+        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        conn.batch_execute(&autumn_harvest::test_init_sql())
+            .await
+            .expect("migration");
+        return (conn, url, None);
+    }
     let container = Postgres::default()
         .with_tag("16")
         .start()
@@ -73,7 +95,18 @@ async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
-    (conn, url, container)
+    (conn, url, Some(container))
+}
+
+/// Replace the database name in a Postgres URL.
+fn rewrite_pg_db(base: &str, db: &str) -> String {
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    let rest = &base[after_scheme..];
+    let (authority, tail) = rest
+        .find('/')
+        .map_or((rest, ""), |i| (&rest[..i], &rest[i + 1..]));
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    format!("{}{}/{}{}", &base[..after_scheme], authority, db, query)
 }
 
 fn noop_handler<'a>(
@@ -364,4 +397,252 @@ async fn test_ha_concurrent_tick_produces_exactly_one_execution() {
         count, 1,
         "exactly one execution must exist after two concurrent ticks on the same schedule row"
     );
+}
+
+// ── Buffered-drain claim guard (issue #1820) ───────────────────────────────
+
+/// Insert a `BufferOne` row that holds one buffered slot.
+///
+/// `next_run_at` is one hour away, so only the drain can start a run.
+async fn insert_buffered_schedule(
+    conn: &mut AsyncPgConnection,
+    wf_name: &str,
+    slot: chrono::DateTime<Utc>,
+) -> Uuid {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let id = Uuid::new_v4();
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            dsl::id.eq(id),
+            dsl::workflow_name.eq(wf_name),
+            dsl::schedule_expr.eq("interval:3600"),
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(false),
+            dsl::max_active_runs.eq(10),
+            dsl::is_paused.eq(false),
+            dsl::next_run_at.eq(Utc::now() + chrono::Duration::hours(1)),
+            dsl::jitter_secs.eq(0_i64),
+            dsl::overlap_policy.eq("buffer_one"),
+            dsl::buffered_runs.eq(serde_json::json!([slot.to_rfc3339()])),
+            dsl::buffer_all_max.eq(100),
+            dsl::skip_policy.eq("skip"),
+        ))
+        .execute(conn)
+        .await
+        .expect("insert buffered schedule");
+    id
+}
+
+/// Set the fire claim on a row, as a peer replica does.
+async fn set_claim(
+    conn: &mut AsyncPgConnection,
+    sched_id: Uuid,
+    token: Uuid,
+    until: chrono::DateTime<Utc>,
+) {
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET fire_claim_token = $1, fire_claimed_until = $2 WHERE id = $3",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(token)
+    .bind::<diesel::sql_types::Timestamptz, _>(until)
+    .bind::<diesel::sql_types::Uuid, _>(sched_id)
+    .execute(conn)
+    .await
+    .expect("set claim");
+}
+
+/// Return `(buffered_runs, runs_started, fire_claim_token)` for a row.
+async fn schedule_state(
+    conn: &mut AsyncPgConnection,
+    sched_id: Uuid,
+) -> (serde_json::Value, i32, Option<Uuid>) {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    harvest_schedules::table
+        .find(sched_id)
+        .select((dsl::buffered_runs, dsl::runs_started, dsl::fire_claim_token))
+        .first(conn)
+        .await
+        .expect("select schedule state")
+}
+
+async fn count_executions(conn: &mut AsyncPgConnection, wf_name: &str) -> i64 {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count executions")
+}
+
+/// Count the `fired` decisions that the buffered drain wrote for a row.
+///
+/// The drain writes one per dispatch attempt, also for a duplicate start.
+async fn count_buffered_fired_decisions(conn: &mut AsyncPgConnection, sched_id: Uuid) -> i64 {
+    use autumn_harvest::schema::harvest_schedule_decisions::dsl;
+    dsl::harvest_schedule_decisions
+        .filter(dsl::schedule_id.eq(Some(sched_id)))
+        .filter(dsl::decision.eq("fired"))
+        .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+            "detail ->> 'buffered' = 'true'",
+        ))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count buffered fired decisions")
+}
+
+async fn tick(url: &str, wf_name: &'static str) {
+    tick_once(
+        make_pool(url),
+        make_registry(wf_name),
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick_once must succeed");
+}
+
+/// A peer holds a live claim on a buffered row. The drain must leave the row
+/// alone: no start, no change to `buffered_runs`, no change to the claim.
+#[tokio::test]
+async fn test_live_claim_blocks_buffered_drain() {
+    let (mut conn, url, _c) = setup_db().await;
+    let wf_name = "ha_drain_live_claim_wf";
+    let slot = Utc::now() - chrono::Duration::seconds(30);
+    let sched_id = insert_buffered_schedule(&mut conn, wf_name, slot).await;
+    let peer_token = Uuid::new_v4();
+    set_claim(
+        &mut conn,
+        sched_id,
+        peer_token,
+        Utc::now() + chrono::Duration::seconds(60),
+    )
+    .await;
+
+    tick(&url, wf_name).await;
+
+    assert_eq!(
+        count_executions(&mut conn, wf_name).await,
+        0,
+        "the drain must not start a run while a peer holds the claim"
+    );
+    let (buffered, runs_started, token) = schedule_state(&mut conn, sched_id).await;
+    assert_eq!(
+        buffered,
+        serde_json::json!([slot.to_rfc3339()]),
+        "the buffered slot must stay for the claim holder"
+    );
+    assert_eq!(runs_started, 0, "runs_started must not change");
+    assert_eq!(token, Some(peer_token), "the peer claim must stay in place");
+}
+
+/// Two schedulers drain the same `BufferOne` backlog at the same time.
+/// Each buffered run must start exactly once.
+///
+/// `WorkflowIdReusePolicy::RejectDuplicate` is a `const` for scheduled starts,
+/// so the test cannot switch it off. A duplicate start still writes a `fired`
+/// decision and increments `runs_started`, so the test counts those.
+#[tokio::test]
+async fn test_concurrent_drains_start_each_buffered_run_once() {
+    let (mut conn, url, _c) = setup_db().await;
+    let wf_name = "ha_drain_concurrent_wf";
+    let first_slot = Utc::now() - chrono::Duration::minutes(10);
+    let sched_id = insert_buffered_schedule(&mut conn, wf_name, first_slot).await;
+
+    for round in 0..5_i64 {
+        let slot = first_slot + chrono::Duration::minutes(round);
+        diesel::sql_query(
+            "UPDATE harvest_schedules SET buffered_runs = $1, runs_started = 0 WHERE id = $2",
+        )
+        .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([slot.to_rfc3339()]))
+        .bind::<diesel::sql_types::Uuid, _>(sched_id)
+        .execute(&mut conn)
+        .await
+        .expect("reset buffered slot");
+
+        tokio::join!(tick(&url, wf_name), tick(&url, wf_name));
+
+        assert_eq!(
+            count_executions(&mut conn, wf_name).await,
+            round + 1,
+            "round {round}: one execution per buffered run"
+        );
+        assert_eq!(
+            count_buffered_fired_decisions(&mut conn, sched_id).await,
+            round + 1,
+            "round {round}: one dispatch per buffered run"
+        );
+        let (buffered, runs_started, token) = schedule_state(&mut conn, sched_id).await;
+        assert_eq!(runs_started, 1, "round {round}: runs_started counts one start");
+        assert_eq!(buffered, serde_json::json!([]), "round {round}: buffer drained");
+        assert_eq!(token, None, "round {round}: claim released");
+    }
+}
+
+/// The drain releases its claim when it dispatches a run and when it has no
+/// capacity. A leaked claim blocks the tick for the full TTL.
+#[tokio::test]
+async fn test_buffered_drain_releases_its_claim() {
+    let (mut conn, url, _c) = setup_db().await;
+    let wf_name = "ha_drain_release_wf";
+    let slot = Utc::now() - chrono::Duration::seconds(30);
+    let sched_id = insert_buffered_schedule(&mut conn, wf_name, slot).await;
+
+    tick(&url, wf_name).await;
+
+    assert_eq!(count_executions(&mut conn, wf_name).await, 1);
+    let (buffered, runs_started, token) = schedule_state(&mut conn, sched_id).await;
+    assert_eq!(buffered, serde_json::json!([]), "the slot must be drained");
+    assert_eq!(runs_started, 1);
+    assert_eq!(token, None, "the claim must be released after a dispatch");
+
+    // The first run is still RUNNING, so a limit of one leaves no capacity.
+    let next_slot = slot + chrono::Duration::seconds(10);
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET max_active_runs = 1, buffered_runs = $1 WHERE id = $2",
+    )
+    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([next_slot.to_rfc3339()]))
+    .bind::<diesel::sql_types::Uuid, _>(sched_id)
+    .execute(&mut conn)
+    .await
+    .expect("fill the buffer with no capacity");
+
+    tick(&url, wf_name).await;
+
+    assert_eq!(count_executions(&mut conn, wf_name).await, 1);
+    let (buffered, _, token) = schedule_state(&mut conn, sched_id).await;
+    assert_eq!(
+        buffered,
+        serde_json::json!([next_slot.to_rfc3339()]),
+        "the slot must wait for capacity"
+    );
+    assert_eq!(token, None, "the claim must be released with no capacity");
+}
+
+/// A drain that crashed leaves an expired claim. A peer must drain the row.
+#[tokio::test]
+async fn test_expired_claim_does_not_block_buffered_drain() {
+    let (mut conn, url, _c) = setup_db().await;
+    let wf_name = "ha_drain_expired_claim_wf";
+    let slot = Utc::now() - chrono::Duration::seconds(30);
+    let sched_id = insert_buffered_schedule(&mut conn, wf_name, slot).await;
+    set_claim(
+        &mut conn,
+        sched_id,
+        Uuid::new_v4(),
+        Utc::now() - chrono::Duration::seconds(10),
+    )
+    .await;
+
+    tick(&url, wf_name).await;
+
+    assert_eq!(
+        count_executions(&mut conn, wf_name).await,
+        1,
+        "a peer must drain the row after the claim expires"
+    );
+    let (buffered, _, token) = schedule_state(&mut conn, sched_id).await;
+    assert_eq!(buffered, serde_json::json!([]));
+    assert_eq!(token, None, "the claim must be released after the drain");
 }
