@@ -192,7 +192,7 @@ pub const TRANSITIONS: &[Transition] = &[
         Some(Paused),
         Failed,
         "worker.rs",
-        "quarantine_workflow_task_timeout",
+        "quarantine_workflow_task_timeout_outcome",
     ),
     t(
         Some(Running),

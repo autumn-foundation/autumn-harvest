@@ -3413,8 +3413,11 @@ two intervals would compare two time ranges. So do the workflow cache
 settings (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`), the
 task budgets (`workflow_task_timeout`, `max_local_activity_start_to_close`)
 and the quarantine limits (`workflow_panic_max_attempts`,
-`poison_pill_threshold`). A worker with the cache off replays full histories,
-and a shorter budget times out tasks that its peers finish. Those
+`poison_pill_threshold`). So do the payload caps, the history policy, the
+payload offloader, the registered codec keys and the activity interceptors. A
+worker with the cache off replays full histories, a shorter budget times out
+tasks that its peers finish, and a smaller result cap fails results that its
+peers return. Those
 decide which tasks a worker can claim, and in
 which mix under load. So workers of two sizes are two cohorts. A worker on a
 slow queue is not compared with workers on a fast queue. A worker that favours
@@ -3422,7 +3425,8 @@ a bulk queue is not compared with one that favours an interactive queue.
 During a rolling deployment, each build is its own cohort. A GPU worker that
 takes capability-routed tasks is not compared with a CPU worker. Each
 heartbeat reads only its own cohort. `GET /admin/status` runs the same
-comparison over every shard. It lists the worst 20 outliers under
+comparison over every shard. It keeps each cohort's rows for that cohort's
+own freshness limit, as the cohort's heartbeat does. It lists the worst 20 outliers under
 `workers.outliers`, and `workers.outliers_total` gives the full count.
 
 The rule flags a failure ratio at least 20 points above the peer median. That

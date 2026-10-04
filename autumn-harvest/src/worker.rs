@@ -1213,6 +1213,30 @@ impl HandlerRegistry {
         Arc::clone(&self.retry_budgets)
     }
 
+    /// The settings of this registry that decide whether a task's payloads
+    /// pass, for the worker's cohort key (issue #1815).
+    #[must_use]
+    pub fn payload_policy(&self) -> crate::workers::PayloadPolicy {
+        crate::workers::PayloadPolicy {
+            max_activity_input_bytes: self.max_activity_input_bytes,
+            max_workflow_input_bytes: self.max_workflow_input_bytes,
+            max_activity_result_bytes: self.max_activity_result_bytes,
+            max_signal_payload_bytes: self.max_signal_payload_bytes,
+            max_current_details_bytes: self.max_current_details_bytes,
+            continue_as_new_threshold: self.history_policy.continue_as_new_threshold(),
+            event_hard_cap: self.history_policy.event_hard_cap(),
+            continue_as_new_deadline_fraction: self
+                .history_policy
+                .continue_as_new_deadline_fraction(),
+            offload_threshold: self
+                .payload_offloader
+                .as_ref()
+                .map(|offloader| offloader.threshold()),
+            codec_key_ids: self.payload_codecs.registered_key_ids(),
+            activity_interceptors: self.activity_interceptors.len(),
+        }
+    }
+
     /// History-size guardrails applied to workflow contexts run by this registry.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -31876,6 +31900,7 @@ impl Worker {
                         workflow_panic_max_attempts: self.config.workflow_panic_max_attempts,
                         poison_pill_threshold: self.config.poison_pill_threshold,
                     },
+                    payload: self.registry.payload_policy(),
                 }),
                 compare: true,
                 slot: shard_slot,

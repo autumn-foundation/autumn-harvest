@@ -25,7 +25,7 @@ use autumn_harvest::worker_outlier::{
 };
 use autumn_harvest::workers::{
     LiveWorkerTaskStats, WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers,
-    load_live_worker_task_stats,
+    load_live_worker_task_stats_per_cohort,
 };
 use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Nullable};
@@ -861,7 +861,9 @@ async fn gather_bundle(
     let stale_secs = i64::try_from(stale_threshold.as_secs())
         .unwrap_or(i64::MAX)
         .saturating_add(i64::from(stale_threshold.subsec_nanos() > 0));
-    let task_stats = load_live_worker_task_stats(conn, stale_secs, None)
+    // Each cohort keeps its rows for its own freshness limit, as its
+    // heartbeat does. This runtime's threshold covers a key without one.
+    let task_stats = load_live_worker_task_stats_per_cohort(conn, stale_secs)
         .await
         .unwrap_or_else(|error| {
             tracing::warn!(error = %error, "worker task stats unavailable; outliers skipped");

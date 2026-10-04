@@ -62,7 +62,11 @@ heartbeat check only. A worker that was alive but sick passed that check.
   freshness limit (both follow the heartbeat interval), and execution policy
   (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`,
   `workflow_task_timeout`, `max_local_activity_start_to_close`,
-  `workflow_panic_max_attempts`, `poison_pill_threshold`), with
+  `workflow_panic_max_attempts`, `poison_pill_threshold`), and payload policy
+  (`max_activity_input_bytes`, `max_workflow_input_bytes`,
+  `max_activity_result_bytes`, `max_signal_payload_bytes`,
+  `max_current_details_bytes`, the history policy, the offload threshold,
+  the registered codec key ids and the activity interceptor count), with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A
   worker on a slow queue is not compared with a fast queue. Each heartbeat
@@ -90,7 +94,10 @@ heartbeat check only. A worker that was alive but sick passed that check.
 flagged workers with their stats and the peer medians. It also gains
 `outliers_total`. Any outlier degrades the block with reason code
 `worker_outlier`. A failed stats read skips only the outlier signal; the
-shard still counts as inspected.
+shard still counts as inspected. Status keeps each cohort's rows for that
+cohort's own freshness limit, read from its key, so a fast API runtime does
+not drop a slow cohort between its heartbeats
+(`workers::load_live_worker_task_stats_per_cohort`).
 
 **Preflight.** `/admin/preflight` checks `SELECT`, `INSERT`, `UPDATE` and
 `DELETE` on `harvest_worker_task_stats`.

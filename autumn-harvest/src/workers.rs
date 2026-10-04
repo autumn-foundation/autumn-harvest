@@ -901,6 +901,8 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   with two freshness limits can disagree on the live peer set.
 /// - `execution`: the workflow cache, the task budgets and the panic limit.
 ///   See [`ExecutionPolicy`].
+/// - `payload`: the payload caps, the history policy, the offloader, the codec
+///   keys and the interceptors. See [`PayloadPolicy`].
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -923,6 +925,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         outcome_window,
         peer_stale_secs,
         execution,
+        payload,
     } = policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -963,6 +966,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "outcome_window_ms": outcome_window.as_millis(),
         "peer_stale_secs": peer_stale_secs,
         "execution": execution.key(),
+        "payload": payload.key(),
     })
     .to_string()
 }
@@ -1062,6 +1066,61 @@ pub struct CohortPolicy<'a> {
     pub peer_stale_secs: i64,
     /// The worker settings that decide how a claimed task runs.
     pub execution: ExecutionPolicy,
+    /// The registry settings that decide whether a task's payloads pass.
+    pub payload: PayloadPolicy,
+}
+
+/// The registry settings that decide whether a task's payloads pass, and so
+/// its outcome and its latency (issue #1815).
+///
+/// The worker enforces each cap itself. An oversized activity result fails
+/// the attempt, and an oversized input or signal fails the workflow task that
+/// sends it. The history policy decides when a workflow continues as new or
+/// fails on its hard cap. An offloader moves a large payload out instead of
+/// failing it. A stored payload under a key id the worker lacks cannot be
+/// decoded. An interceptor can change any outcome.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PayloadPolicy {
+    /// `max_activity_input_bytes`.
+    pub max_activity_input_bytes: u64,
+    /// `max_workflow_input_bytes`.
+    pub max_workflow_input_bytes: u64,
+    /// `max_activity_result_bytes`.
+    pub max_activity_result_bytes: u64,
+    /// `max_signal_payload_bytes`.
+    pub max_signal_payload_bytes: u64,
+    /// `max_current_details_bytes`.
+    pub max_current_details_bytes: usize,
+    /// The history policy's continue-as-new event threshold.
+    pub continue_as_new_threshold: u64,
+    /// The history policy's event hard cap.
+    pub event_hard_cap: Option<u64>,
+    /// The history policy's continue-as-new deadline fraction.
+    pub continue_as_new_deadline_fraction: f64,
+    /// The payload offloader's threshold. `None` without an offloader.
+    pub offload_threshold: Option<u64>,
+    /// The registered payload-codec key ids, sorted.
+    pub codec_key_ids: Vec<String>,
+    /// How many activity interceptors the worker runs.
+    pub activity_interceptors: usize,
+}
+
+impl PayloadPolicy {
+    fn key(&self) -> serde_json::Value {
+        serde_json::json!({
+            "max_activity_input_bytes": self.max_activity_input_bytes,
+            "max_workflow_input_bytes": self.max_workflow_input_bytes,
+            "max_activity_result_bytes": self.max_activity_result_bytes,
+            "max_signal_payload_bytes": self.max_signal_payload_bytes,
+            "max_current_details_bytes": self.max_current_details_bytes,
+            "continue_as_new_threshold": self.continue_as_new_threshold,
+            "event_hard_cap": self.event_hard_cap,
+            "continue_as_new_deadline_fraction": self.continue_as_new_deadline_fraction,
+            "offload_threshold": self.offload_threshold,
+            "codec_key_ids": self.codec_key_ids,
+            "activity_interceptors": self.activity_interceptors,
+        })
+    }
 }
 
 /// The worker settings that decide how a claimed task runs, and so its
@@ -1386,7 +1445,7 @@ struct TaskStatsRow {
 ///
 /// With `cohort`, only the rows of that cohort are read. A heartbeat compares
 /// its worker only with its cohort, so it reads only those rows. Without it,
-/// every cohort is read, as `GET /admin/status` needs.
+/// every cohort is read.
 ///
 /// # Errors
 ///
@@ -1396,6 +1455,36 @@ pub async fn load_live_worker_task_stats(
     worker_stale_secs: i64,
     cohort: Option<&str>,
 ) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
+    load_task_stats(conn, worker_stale_secs, cohort, false).await
+}
+
+/// [`load_live_worker_task_stats`] for every cohort, each with its own
+/// freshness limit (issue #1815).
+///
+/// Each cohort key records `peer_stale_secs`, which follows that cohort's
+/// heartbeat interval. A row counts as fresh for as long as its own cohort's
+/// heartbeat counts it, so `GET /admin/status` sees the same peer set as the
+/// workers. A key without the field falls back to `fallback_stale_secs`.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure, or when a stored cohort key
+/// is not JSON.
+pub async fn load_live_worker_task_stats_per_cohort(
+    conn: &mut AsyncPgConnection,
+    fallback_stale_secs: i64,
+) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
+    load_task_stats(conn, fallback_stale_secs, None, true).await
+}
+
+/// The query behind [`load_live_worker_task_stats`] and
+/// [`load_live_worker_task_stats_per_cohort`].
+async fn load_task_stats(
+    conn: &mut AsyncPgConnection,
+    worker_stale_secs: i64,
+    cohort: Option<&str>,
+    per_cohort_freshness: bool,
+) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
     let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
     // A plain equality, not `$3 IS NULL OR ...`, so the cohort index applies.
     let cohort_filter = if cohort.is_some() {
@@ -1403,14 +1492,22 @@ pub async fn load_live_worker_task_stats(
     } else {
         ""
     };
+    let limit = if per_cohort_freshness {
+        format!(
+            "LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, $2), 0), {})",
+            crate::poison_pill::MAX_WORKER_STALE_SECS
+        )
+    } else {
+        "$2::bigint".to_owned()
+    };
     let query = diesel::sql_query(format!(
         "SELECT s.worker_id, s.cohort, s.window_tasks, s.window_failures, s.p99_latency_ms, \
                 s.snapshot_seq \
          FROM harvest_worker_task_stats s \
          JOIN harvest_workers w ON w.worker_id = s.worker_id \
          WHERE w.status = $1 \
-           AND w.last_heartbeat_at > NOW() - ($2::bigint * INTERVAL '1 second') \
-           AND s.updated_at > NOW() - ($2::bigint * INTERVAL '1 second') \
+           AND w.last_heartbeat_at > NOW() - ({limit} * INTERVAL '1 second') \
+           AND s.updated_at > NOW() - ({limit} * INTERVAL '1 second') \
            {cohort_filter}\
          ORDER BY s.worker_id"
     ))
@@ -3063,6 +3160,7 @@ mod tests {
             outcome_window: std::time::Duration::from_secs(300),
             peer_stale_secs: 120,
             execution: super::ExecutionPolicy::default(),
+            payload: super::PayloadPolicy::default(),
         })
     }
 
@@ -3093,6 +3191,7 @@ mod tests {
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         assert_ne!(slots(10, 0), slots(0, 10));
@@ -3128,6 +3227,7 @@ mod tests {
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         assert_ne!(sessions(0), sessions(4));
@@ -3169,6 +3269,7 @@ mod tests {
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
@@ -3204,6 +3305,7 @@ mod tests {
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
@@ -3332,6 +3434,7 @@ mod tests {
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         let tracking = |threshold| {
@@ -3385,6 +3488,7 @@ mod tests {
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         assert_ne!(cohort(true), cohort(false));
@@ -3421,6 +3525,7 @@ mod tests {
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         let default = RetryBudgetConfig::default();
@@ -3470,6 +3575,7 @@ mod tests {
                 outcome_window,
                 peer_stale_secs,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         let five_minutes = std::time::Duration::from_secs(300);
@@ -3516,6 +3622,7 @@ mod tests {
                 outcome_window: Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution,
+                payload: super::PayloadPolicy::default(),
             })
         };
         let base = ExecutionPolicy::default();
@@ -3568,6 +3675,92 @@ mod tests {
         );
     }
 
+    /// Issue #1815: the payload caps, the history policy, the offloader, the
+    /// codec keys and the interceptors decide whether a task's payloads pass.
+    /// Workers that differ in any of them are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_payload_policy() {
+        use super::PayloadPolicy;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |payload: PayloadPolicy| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: false,
+                retry_budgets: &budgets,
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload,
+            })
+        };
+        let base = PayloadPolicy::default();
+        let variants = [
+            PayloadPolicy {
+                max_activity_input_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_workflow_input_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_activity_result_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_signal_payload_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_current_details_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                continue_as_new_threshold: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                event_hard_cap: Some(1),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                continue_as_new_deadline_fraction: 0.5,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                offload_threshold: Some(1),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                codec_key_ids: vec!["k1".to_owned()],
+                ..base.clone()
+            },
+            PayloadPolicy {
+                activity_interceptors: 1,
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(cohort(base.clone()), cohort(variant.clone()), "{variant:?}");
+        }
+        assert_eq!(cohort(base), cohort(PayloadPolicy::default()));
+    }
+
     /// Issue #1815: under load, the claim gate gives each worker a task mix
     /// that follows its slots per kind. Workers with different slot counts
     /// therefore do different work, so they are in different cohorts.
@@ -3595,6 +3788,7 @@ mod tests {
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
             })
         };
         assert_ne!(slots(100, 1), slots(1, 100));

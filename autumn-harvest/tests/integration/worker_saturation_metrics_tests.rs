@@ -179,6 +179,7 @@ fn cohort(queue: &str) -> String {
         outcome_window: std::time::Duration::from_secs(300),
         peer_stale_secs: 120,
         execution: workers::ExecutionPolicy::default(),
+        payload: workers::PayloadPolicy::default(),
     })
 }
 
@@ -642,6 +643,7 @@ async fn a_long_cohort_key_still_stores() {
         outcome_window: std::time::Duration::from_secs(300),
         peer_stale_secs: 120,
         execution: workers::ExecutionPolicy::default(),
+        payload: workers::PayloadPolicy::default(),
     });
     assert!(key.len() > 10_000, "the key is long: {}", key.len());
     workers::upsert_worker_task_stats(&mut conn, &id, &key, &WorkerTaskStats::default())
@@ -1156,4 +1158,54 @@ async fn a_shard_checker_records_its_scan_under_its_shard() {
         "pool waits: {waits:?}"
     );
     assert!(scans.iter().all(|shard| *shard == 3), "scans: {scans:?}");
+}
+
+/// Issue #1815: `GET /admin/status` keeps each cohort's rows for as long as
+/// that cohort's own heartbeat does. A fast API runtime must not drop a slow
+/// cohort's rows between its heartbeats.
+#[tokio::test]
+async fn status_keeps_each_cohort_for_its_own_freshness_window() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("slow-q");
+    let id = unique_id("w-slow");
+    register(&mut conn, &id, &queue).await;
+    let stats = WorkerTaskStats {
+        tasks: 30,
+        failures: 0,
+        p99_latency_ms: Some(10),
+    };
+    // `cohort` records a peer freshness limit of 120 seconds.
+    workers::upsert_worker_task_stats(&mut conn, &id, &cohort(&queue), &stats)
+        .await
+        .expect("upsert");
+    for table in ["harvest_worker_task_stats", "harvest_workers"] {
+        let column = if table == "harvest_workers" {
+            "last_heartbeat_at"
+        } else {
+            "updated_at"
+        };
+        diesel::sql_query(format!(
+            "UPDATE {table} SET {column} = NOW() - INTERVAL '60 seconds' WHERE worker_id = $1"
+        ))
+        .bind::<diesel::sql_types::Text, _>(&id)
+        .execute(&mut conn)
+        .await
+        .expect("age the row");
+    }
+
+    let api_threshold_secs = 10;
+    let fixed = workers::load_live_worker_task_stats(&mut conn, api_threshold_secs, None)
+        .await
+        .expect("load with one threshold");
+    assert_eq!(find(&fixed, &id), None, "one fast threshold drops the row");
+
+    let per_cohort = workers::load_live_worker_task_stats_per_cohort(&mut conn, api_threshold_secs)
+        .await
+        .expect("load per cohort");
+    assert_eq!(
+        find(&per_cohort, &id),
+        Some(stats),
+        "the cohort's own 120 second limit keeps the row"
+    );
 }
