@@ -635,19 +635,13 @@ fn lex(
             while let Some(c) = at(i) {
                 line += usize::from(c == '\n');
                 if escapes && c == '\\' {
-                    if let Some(escaped) = at(i + 1) {
-                        line += usize::from(escaped == '\n');
-                        // A whitespace escape must still split words in a
-                        // `DO` body.
-                        value.push(match escaped {
-                            'n' => '\n',
-                            't' => '\t',
-                            'r' => '\r',
-                            'b' | 'f' => ' ',
-                            other => other,
-                        });
+                    if let Some((decoded, len)) = e_escape(&chars[i + 1..]) {
+                        line += usize::from(at(i + 1) == Some('\n'));
+                        value.push(decoded);
+                        i += 1 + len;
+                    } else {
+                        i += 1;
                     }
-                    i += 2;
                 } else if c == '\'' && at(i + 1) == Some('\'') {
                     value.push('\'');
                     i += 2;
@@ -758,6 +752,41 @@ fn lex(
             i += 1;
         }
     }
+}
+
+/// Decode one `E''` escape. `rest` starts after the backslash.
+///
+/// Returns the character and the length of the escape. A whitespace escape
+/// must still split words in a `DO` body, so `\b` and `\f` become a space.
+fn e_escape(rest: &[char]) -> Option<(char, usize)> {
+    // `max` digits at most, `exact` when the escape needs all of them.
+    let number = |from: usize, max: usize, radix: u32, exact: bool| {
+        let tail = rest.get(from..)?;
+        let len = tail
+            .iter()
+            .take(max)
+            .take_while(|c| c.is_digit(radix))
+            .count();
+        if len == 0 || (exact && len < max) {
+            return None;
+        }
+        let text: String = tail[..len].iter().collect();
+        let decoded = char::from_u32(u32::from_str_radix(&text, radix).ok()?)?;
+        Some((decoded, from + len))
+    };
+    let first = *rest.first()?;
+    let simple = match first {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        'b' | 'f' => ' ',
+        'x' => return number(1, 2, 16, false).or(Some(('x', 1))),
+        'u' => return number(1, 4, 16, true).or(Some(('u', 1))),
+        'U' => return number(1, 8, 16, true).or(Some(('U', 1))),
+        '0'..='7' => return number(0, 3, 8, false),
+        other => other,
+    };
+    Some((simple, 1))
 }
 
 /// The body of a quoted token that opens before `from`, and the index after
@@ -1137,6 +1166,17 @@ impl<'a> Stmts<'a> {
     }
 }
 
+/// The new history key of `index` after the `ALTER INDEX` at `at`, if the
+/// statement renames it or moves it to another schema.
+fn moved_index_key(s: &Stmts, at: usize, index: &str) -> Option<String> {
+    let end = s.end(at);
+    if let Some(j) = (at..end).find(|&j| s.is(j, "rename") && s.is(j + 1, "to")) {
+        return Some(index_key(index, s.word(j + 2)?));
+    }
+    let j = (at..end).find(|&j| s.is(j, "set") && s.is(j + 1, "schema"))?;
+    Some(format!("{}.{}", s.word(j + 2)?, base(index)))
+}
+
 /// The history key of `index`, in the schema that `owner` names.
 ///
 /// Postgres puts an index in the schema of its table. A name without a schema
@@ -1417,6 +1457,21 @@ fn resolve(
                 .or_default()
                 .insert(table.clone());
         }
+        // A rename or schema move takes the history to the new name. When it
+        // surely runs, the old name is forgotten.
+        if let (Some(index), "ALTER INDEX") = (&raw.index, raw.verb)
+            && !unplaced(index, raw.at)
+            && let Some(new_key) = moved_index_key(s, raw.at, index)
+        {
+            let old_key = index_key(index, index);
+            let tables = history.indexes.get(&old_key).cloned();
+            if toks[raw.at].runs && unconditional[raw.at] {
+                history.indexes.remove(&old_key);
+            }
+            if let Some(tables) = tables {
+                history.indexes.entry(new_key).or_default().extend(tables);
+            }
+        }
         // A drop that surely runs removes the name. A later index of that name
         // is then unknown, which fails closed. A table drop takes every index
         // on the table with it.
@@ -1556,6 +1611,14 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
                 Some(Timeout::Rollback)
             }
         }
+        // A named-argument call never sets a bound. When it may name
+        // `lock_timeout`, it counts as a session clear, which fails closed.
+        "set_config" if s.is_punct(k + 1, '(') && named_lock_timeout_call(s, k + 1) => {
+            Some(Timeout::Set {
+                bounds: false,
+                local: false,
+            })
+        }
         "set_config"
             if s.is_punct(k + 1, '(')
                 && s.string(k + 2)
@@ -1575,6 +1638,30 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
         }
         _ => None,
     }
+}
+
+/// Whether the call whose `(` is at `open` uses named arguments and names
+/// `lock_timeout` in a string.
+fn named_lock_timeout_call(s: &Stmts, open: usize) -> bool {
+    let mut parens = 0_usize;
+    let mut named = false;
+    let mut names_it = false;
+    for j in open..s.toks.len() {
+        if s.is_punct(j, '(') {
+            parens += 1;
+        } else if s.is_punct(j, ')') {
+            parens -= 1;
+            if parens == 0 {
+                break;
+            }
+        }
+        named |= (s.is_punct(j, '=') && s.is_punct(j + 1, '>'))
+            || (s.is_punct(j, ':') && s.is_punct(j + 1, '='));
+        names_it |= s
+            .string(j)
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("lock_timeout"));
+    }
+    named && names_it
 }
 
 /// Whether Postgres reads `value` as boolean false.
@@ -3600,6 +3687,68 @@ fn vacuum_full_false_is_a_plain_vacuum() {
             [Rule::LockTimeout],
             "{full}: {findings:?}"
         );
+    }
+}
+
+#[test]
+fn a_named_argument_set_config_only_clears() {
+    // A named call can clear the bound. The lint does not read it as a bound.
+    for value in ["'0'", "'5s'"] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = '5s';\n\
+             SELECT set_config(setting_name => 'lock_timeout', new_value => {value}, \
+             is_local => true);\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{value}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn an_e_string_do_body_decodes_every_escape() {
+    for table in [
+        r"harvest\x5fevents",
+        r"harvest\137events",
+        r"harvest_events",
+        r"harvest\U0000005fevents",
+    ] {
+        let sql = format!("DO E'BEGIN ALTER TABLE {table} ADD COLUMN x INT; END';");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{table}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn alter_index_rename_moves_the_history() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let create = "CREATE INDEX idx_shared ON harvest_schedules (id);";
+    for (moved, new_name) in [
+        ("ALTER INDEX idx_shared RENAME TO idx_old;", "idx_old"),
+        (
+            "ALTER INDEX idx_shared SET SCHEMA staging;",
+            "staging.idx_shared",
+        ),
+    ] {
+        let history = [create, moved];
+        // The old name is unknown now, so a drop of it fails closed.
+        let findings = lint_with_history(&history, &format!("{set}DROP INDEX idx_shared;"), true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::BlockingIndex],
+            "{moved}: {findings:?}"
+        );
+        // The new name keeps the cold table.
+        let sql = format!("DROP INDEX {new_name};");
+        assert_eq!(lint_with_history(&history, &sql, true), [], "{moved}");
     }
 }
 
