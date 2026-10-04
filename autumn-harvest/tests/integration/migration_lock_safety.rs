@@ -1872,8 +1872,11 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
                 local: false,
             })
         }
-        "commit" | "end" if start && s.toks[k].depth == 0 => Some(Timeout::Commit),
-        "rollback" | "abort" if start && s.toks[k].depth == 0 => {
+        // A top-level `DO` may end its transaction too. Inside PL/pgSQL, `END`
+        // closes a block, so it counts only at top level.
+        "end" if start && s.toks[k].depth == 0 => Some(Timeout::Commit),
+        "commit" if start && (s.toks[k].depth == 0 || s.toks[k].runs) => Some(Timeout::Commit),
+        "rollback" | "abort" if start && (s.toks[k].depth == 0 || s.toks[k].runs) => {
             // `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] s` restores the value
             // from the savepoint, which the lint does not track.
             if (k + 1..=k + 2).any(|j| s.is(j, "to")) {
@@ -1900,11 +1903,18 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
             // A bound counts only from a bare `SELECT` or `PERFORM` of the
             // call. A clear counts anywhere.
             let bounds = bounds_wait(s, k + 4);
-            // Only a literal false is session-level. Any other third argument
-            // may be true, and a local value ends with the transaction.
-            let session = s.word(k + 6).is_some_and(pg_false) && s.is_punct(k + 7, ')')
-                || s.string(k + 6).is_some_and(pg_false) && s.is_punct(k + 7, ')');
-            let local = !session;
+            // A bound is session-level only with a plain false scope, and a
+            // clear is local only with a plain true one. Any other scope takes
+            // the stricter reading.
+            let scope = s
+                .word(k + 6)
+                .or_else(|| s.string(k + 6))
+                .filter(|_| s.is_punct(k + 7, ')'));
+            let local = if bounds {
+                !scope.is_some_and(pg_false)
+            } else {
+                scope.is_some_and(pg_true)
+            };
             (!bounds || s.is_bare_call(k)).then_some(Timeout::Set { bounds, local })
         }
         // Any other call that names `lock_timeout`, such as one with a cast,
@@ -4362,6 +4372,29 @@ fn reindex_concurrently_reads_a_quoted_true() {
     for value in ["'true'", "'on'", "TRUE"] {
         let sql = format!("REINDEX (CONCURRENTLY {value}) TABLE harvest_task_queue;");
         assert_eq!(lint_with_history(&[], &sql, false), [], "{value}");
+    }
+}
+
+#[test]
+fn a_clear_is_local_only_with_a_plain_true_scope() {
+    // A session clear outlives the commit. A cast hides the scope, so the
+    // lint reads it as session.
+    let sql = "SET lock_timeout = '5s';\n\
+               SELECT set_config('lock_timeout', '0', false::boolean);\nCOMMIT;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_commit_in_a_do_body_ends_the_transaction() {
+    for end in ["COMMIT", "ROLLBACK"] {
+        let sql = format!(
+            "DO $$\nBEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\n    {end};\n    \
+             ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;"
+        );
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{end}: {findings:?}");
     }
 }
 
