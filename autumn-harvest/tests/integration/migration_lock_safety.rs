@@ -1411,8 +1411,17 @@ impl<'a> Stmts<'a> {
             // it goes on, so a literal never splits it.
             let (start, cases) = &mut open[depth];
             // A quoted word is a name, never a keyword.
+            // `BEGIN ATOMIC` opens an inline SQL body at the depth of its
+            // `CREATE`, so its first statement starts after `ATOMIC`.
+            let word = |j: usize| !toks[j].quoted && toks[j].depth == depth;
+            let atomic = k >= 2
+                && word(k - 1)
+                && word(k - 2)
+                && toks[k - 1].tok == Tok::Word("atomic".to_string())
+                && toks[k - 2].tok == Tok::Word("begin".to_string());
             let boundary = entering
                 || start.is_none()
+                || atomic
                 || (depth > 0
                     && k > 0
                     && toks[k - 1].depth == depth
@@ -2642,13 +2651,16 @@ impl SpanEnd {
 /// on. That doubt holds for the rest of the file only. Carried into history,
 /// one such call would leave every later migration unreadable.
 fn path_change(s: &Stmts, opaque: &[usize], history: &mut History) -> Option<usize> {
-    let changes = |k: usize| s.starts[k] == k && changes_search_path(s, k);
-    let text = (0..s.toks.len()).find(|&k| changes(k));
+    let text = (0..s.toks.len())
+        .find(|&k| s.starts[k] == k && running_path_change(s, k, true))
+        .into_iter()
+        .chain(path_routine_call(s))
+        .min();
     let hidden = opaque.first().map(|&k| s.end(k));
     // Only a session change that runs now carries into history. A local
     // change ends with its transaction. A routine body runs only when called,
     // and that call counts as code the lint cannot read in its own file.
-    let session = (0..s.toks.len()).any(|k| s.starts[k] == k && session_path_change(s, k));
+    let session = (0..s.toks.len()).any(|k| s.starts[k] == k && running_path_change(s, k, false));
     history.search_path_changed |= session;
     let local = text.into_iter().chain(hidden).min();
     local.or_else(|| history.search_path_changed.then_some(0))
@@ -2691,28 +2703,47 @@ fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
         .collect()
 }
 
-/// Whether the statement at `k` holds a session `search_path` change that
-/// runs now.
+/// Whether the statement at `k` holds a `search_path` change that runs now.
 ///
-/// The test reads each setter token, not the statement around it. So a
-/// setter in an uncalled routine body does not count, and nor does a
-/// `SET LOCAL` or a plain `set_config` with a literal `true` scope.
-fn session_path_change(s: &Stmts, k: usize) -> bool {
+/// The test reads each setter token, not the statement around it. So a setter
+/// in an uncalled routine body does not count. Unless `local` is set, nor does
+/// a `SET LOCAL` or a plain `set_config` with a literal `true` scope.
+fn running_path_change(s: &Stmts, k: usize, local: bool) -> bool {
     let scope = usize::from(s.keyword(k + 1, "local") || s.keyword(k + 1, "session"));
     let set = s.keyword(k, "set")
         && (s.is(k + 1 + scope, "search_path") || s.keyword(k + 1 + scope, "schema"));
     let reset = s.keyword(k, "reset") && (s.is(k + 1, "search_path") || s.keyword(k + 1, "all"));
     if set || reset {
-        return s.toks[k].runs && !(set && s.keyword(k + 1, "local"));
+        return s.toks[k].runs && (local || !(set && s.keyword(k + 1, "local")));
     }
     let literal = |j: usize| s.word(j).or_else(|| s.string(j));
-    let local = |j: usize| {
+    let is_local = |j: usize| {
         s.string(j + 2).is_some()
             && s.is_punct(j + 3, ',')
             && s.is_punct(j + 5, ',')
             && literal(j + 6).is_some_and(pg_true)
     };
-    (k..s.end(k)).any(|j| path_call(s, j) && s.toks[j].runs && !local(j))
+    (k..s.end(k)).any(|j| path_call(s, j) && s.toks[j].runs && (local || !is_local(j)))
+}
+
+/// The end of the first running call of a routine in this file whose body may
+/// change `search_path`. The change takes effect when that call returns.
+fn path_routine_call(s: &Stmts) -> Option<usize> {
+    let routines = file_routines(s);
+    let changes_path = |r: &Routine| {
+        routine_body(s, r.at).is_some_and(|(from, to)| {
+            (from..to).any(|j| s.starts[j] == j && changes_search_path(s, j))
+        })
+    };
+    let names: BTreeSet<&str> = routines
+        .iter()
+        .filter(|r| changes_path(r))
+        .map(|r| base(&r.name))
+        .collect();
+    (0..s.toks.len())
+        .filter(|&k| s.toks[k].runs)
+        .find(|&k| call_target(s, k, &names).is_some())
+        .map(|k| s.end(k))
 }
 
 /// Whether the token at `k` is a `set_config` call that may name
@@ -2900,12 +2931,37 @@ fn routine_body(s: &Stmts, k: usize) -> Option<(usize, usize)> {
     routine_keyword(s, k)?;
     let depth = s.toks[k].depth;
     let end = s.end(k);
+    let atomic = |j: usize| s.keyword(j, "begin") && s.keyword(j + 1, "atomic");
     let start = (k + 1..end).find(|&j| {
-        let inline =
-            s.keyword(j, "return") || (s.keyword(j, "begin") && s.keyword(j + 1, "atomic"));
+        let inline = s.keyword(j, "return") || atomic(j);
         s.toks[j].depth > depth || (s.toks[j].depth == depth && !s.toks[j].runs && inline)
     })?;
+    // An atomic body holds statements of its own, so it runs to its `END`.
+    let end = if atomic(start) {
+        atomic_end(s, start) + 1
+    } else {
+        end
+    };
     Some((start, end))
+}
+
+/// The `END` that closes the `BEGIN ATOMIC` at `begin`.
+///
+/// A SQL `CASE` expression also ends with `END`, so the search counts them.
+fn atomic_end(s: &Stmts, begin: usize) -> usize {
+    let depth = s.toks[begin].depth;
+    let mut cases = 0_usize;
+    for j in (begin + 2..s.toks.len()).filter(|&j| s.toks[j].depth == depth) {
+        if s.keyword(j, "case") {
+            cases += 1;
+        } else if s.keyword(j, "end") {
+            if cases == 0 {
+                return j;
+            }
+            cases -= 1;
+        }
+    }
+    s.toks.len().saturating_sub(1)
 }
 
 /// The first token of the innermost routine body that holds the token at `at`.
@@ -2993,6 +3049,8 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
             }
             Some("loop" | "case") if !after_end => *branches += 1,
             // An early exit, or a handler, makes the rest of the body conditional.
+            // `RETURN NEXT` and `RETURN QUERY` add rows but do not exit.
+            Some("return") if s.keyword(k + 1, "next") || s.keyword(k + 1, "query") => {}
             Some("return" | "exit" | "continue") => *skippable = true,
             Some("exception") if handler(k) => *skippable = true,
             _ => {}
@@ -7069,6 +7127,51 @@ fn an_execute_column_is_not_dynamic_sql() {
         let sql = format!("DO $$\nDECLARE v int;\nBEGIN\n    {statement}\nEND $$;");
         assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
     }
+}
+
+#[test]
+fn return_next_and_return_query_do_not_exit() {
+    for ret in ["RETURN NEXT 1;", "RETURN QUERY SELECT 1;"] {
+        let sql = format!(
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE plpgsql AS $$\nBEGIN\n    {ret}\n    \
+             SET LOCAL lock_timeout = '5s';\n    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;"
+        );
+        assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    }
+    // A bare `RETURN` exits, so what follows may never run.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    RETURN;\n    \
+               SET LOCAL lock_timeout = '5s';\n    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn an_uncalled_body_does_not_change_the_path_of_its_file() {
+    let routine = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                   SET search_path = scratch, public;\nEND $$;\n";
+    let index = "CREATE INDEX idx ON scratch_t (x);";
+    let history = format!("{routine}{index}");
+    let drop = "DROP INDEX public.idx;";
+    assert_eq!(lint_with_history(&[&history], drop, true), [], "{history}");
+    // A call of the routine in the same file runs the change.
+    let history = format!("{routine}SELECT f();\n{index}");
+    let findings = lint_with_history(&[&history], drop, true);
+    assert!(!findings.is_empty(), "{history}\n{findings:?}");
+}
+
+#[test]
+fn an_atomic_body_setter_covers_a_later_call() {
+    let history = [
+        "CREATE FUNCTION legacy_f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                    ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;",
+    ];
+    let sql = "CREATE FUNCTION g() RETURNS void LANGUAGE sql\nBEGIN ATOMIC\n    \
+               SELECT set_config('lock_timeout', '5s', true);\n    SELECT legacy_f();\nEND;";
+    assert_eq!(lint_with_history(&history, sql, true), [], "{sql}");
+    let sql = "CREATE FUNCTION g() RETURNS void LANGUAGE sql\nBEGIN ATOMIC\n    \
+               SELECT 1;\n    SELECT legacy_f();\nEND;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 #[test]
