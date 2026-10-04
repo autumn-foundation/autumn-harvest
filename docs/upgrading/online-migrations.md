@@ -288,7 +288,8 @@ that no longer matches a finding also fails the build.
   as code, in any quote form. Any other string is data.
 - The lint reads string literals as `standard_conforming_strings = on` does.
   A statement that may turn the setting off counts as a lock on an unknown
-  table that no bound covers. While it is off, each statement with a
+  table that no bound covers. That includes a `set_config` call whose name is
+  not one literal. While it is off, each statement with a
   backslash counts the same way, later in the file and in later migrations,
   until a reset that surely runs. A reset in a function body or in a branch
   does not count. A `ROLLBACK` restores the value from the start of its

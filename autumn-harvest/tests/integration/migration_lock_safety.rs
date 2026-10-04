@@ -2005,15 +2005,58 @@ fn conforming_change(s: &Stmts, k: usize) -> Option<(bool, bool)> {
             .then(|| (on(value), local))
             .filter(|&(on, local)| !(on && local));
     }
-    let named = s.is(k, "set_config")
-        && s.is_punct(k + 1, '(')
-        && s.string(k + 2)
-            .is_some_and(|n| n.trim().eq_ignore_ascii_case("standard_conforming_strings"));
+    let call = s.is(k, "set_config") && s.is_punct(k + 1, '(');
+    // A name that the lint cannot read may name this setting too, with any
+    // value. So the call counts as a session `off`, which fails closed.
+    let name = call.then(|| set_config_name(s, k));
+    if name == Some(None) {
+        return Some((false, false));
+    }
+    let named = name
+        .flatten()
+        .is_some_and(|n| n.eq_ignore_ascii_case("standard_conforming_strings"));
     let scope = |read: fn(&str) -> bool| s.is_punct(k + 5, ',') && literal(k + 6).is_some_and(read);
     let (session, local) = (scope(pg_false), scope(pg_true));
     named
         .then(|| (s.is_punct(k + 3, ',') && on(k + 4), local))
         .filter(|&(on, _)| !on || session)
+}
+
+/// The setting that the `set_config` call at `k` names, if it is one literal.
+///
+/// The name may carry a cast, parentheses or the `setting_name =>` label. In
+/// an `EXECUTE` statement, the lexer reads a literal as SQL, so its text is a
+/// deeper token. Any other name, such as `'a' || 'b'`, is unknown.
+fn set_config_name(s: &Stmts, k: usize) -> Option<String> {
+    let depth = s.toks[k].depth;
+    let mut parens = 0_usize;
+    let mut name = None;
+    for j in k + 1..s.toks.len() {
+        let tok = &s.toks[j];
+        let text = match &tok.tok {
+            Tok::Str(v) => Some(v.as_str()),
+            Tok::Word(w) if tok.depth > depth => Some(w.as_str()),
+            _ => None,
+        };
+        if tok.depth > depth && text.is_none() {
+            return None;
+        }
+        match &tok.tok {
+            _ if text.is_some() => {
+                if name.is_some() {
+                    return None;
+                }
+                name = text.map(|t| t.trim().to_string());
+            }
+            Tok::Punct('(') => parens += 1,
+            Tok::Punct(')') => parens = parens.checked_sub(1)?,
+            Tok::Punct(',') if parens == 1 => return name,
+            Tok::Punct(':' | '=' | '>') => {}
+            Tok::Word(w) if ["text", "varchar", "name", "setting_name"].contains(&w.as_str()) => {}
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The verb of a lock that an `ALTER` of a routine may expose.
@@ -4878,10 +4921,13 @@ fn a_search_path_change_ends_an_unqualified_exemption() {
             "SET search_path = scratch;\nCREATE TABLE harvest_events (id INT);\n{change}\n\
              ALTER TABLE harvest_events ADD COLUMN x INT;"
         );
+        // A computed name may also turn conforming strings off, which is a
+        // finding of its own. So check the `ALTER` finding.
         let findings = lint_with_history(&[], &sql, true);
-        assert_eq!(
-            rules(&findings),
-            [Rule::LockTimeout],
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events")),
             "{change}: {findings:?}"
         );
     }
@@ -5519,8 +5565,15 @@ fn a_computed_set_config_name_may_clear() {
     let sql = "SET lock_timeout = '5s';\n\
                SELECT set_config('lock_' || 'timeout', '0', false);\n\
                ALTER TABLE harvest_events ADD COLUMN x INT;";
+    // The computed name may also turn conforming strings off, which is a
+    // finding of its own.
     let findings = lint_with_history(&[], sql, false);
-    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events")),
+        "{findings:?}"
+    );
     // A literal name of another setting leaves the bound alone.
     let sql = "SET LOCAL lock_timeout = '5s';\n\
                SELECT set_config('statement_timeout', '0', true);\n\
@@ -6229,6 +6282,28 @@ fn nonstandard_strings_carry_into_later_migrations() {
             .any(|f| f.detail.contains("standard_conforming_strings")),
         "{findings:?}"
     );
+}
+
+#[test]
+fn a_computed_setting_name_may_turn_conforming_strings_off() {
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    for call in [
+        "SELECT set_config('standard_' || 'conforming_strings', 'off', false);",
+        "SELECT set_config(name_var, 'off', false);",
+    ] {
+        let sql =
+            format!("-- lock-safety: allow lock-timeout #1810 test fixture\n{call}\n{hidden}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.contains("standard_conforming_strings")),
+            "{sql}\n{findings:?}"
+        );
+    }
+    // A plain literal that names another setting changes nothing.
+    let sql = "SELECT set_config('application_name', 'off', false);";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
 }
 
 #[test]
