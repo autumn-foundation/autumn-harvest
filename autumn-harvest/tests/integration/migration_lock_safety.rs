@@ -1714,6 +1714,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     let unconditional = unconditional(&s);
     let opaque = opaque_points(&s, history);
     let path_change = path_change(&s, &opaque, history);
+    let path_bodies = path_bodies(&s);
 
     for (k, tok) in toks.iter().enumerate() {
         let start = s.starts[k] == k;
@@ -1771,7 +1772,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             }
             // A function body keeps its own changes, for the locks in it.
             _ => {
-                let change = recorded_change(&s, k, unconditional[k], path_change);
+                let change = recorded_change(&s, k, unconditional[k], (path_change, &path_bodies));
                 let list = if tok.runs {
                     &mut timeouts
                 } else {
@@ -1821,21 +1822,7 @@ fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
         let Some((body, end)) = routine_body(s, k) else {
             continue;
         };
-        let depth = s.toks[k].depth;
-        // A clause sits outside the parentheses of the signature, and starts
-        // with an unquoted `SET`.
-        let mut parens = 0_usize;
-        let mut sets = Vec::new();
-        for t in (k..end).filter(|&t| s.toks[t].depth == depth) {
-            if s.is_punct(t, '(') {
-                parens += 1;
-            } else if s.is_punct(t, ')') {
-                parens = parens.saturating_sub(1);
-            } else if parens == 0 && s.keyword(t, "set") && s.is(t + 1, "lock_timeout") {
-                sets.push(t);
-            }
-        }
-        for set in sets {
+        for set in routine_clauses(s, k, end, "lock_timeout") {
             let value = if s.is_punct(set + 2, '=') || s.keyword(set + 2, "to") {
                 set + 3
             } else {
@@ -1857,6 +1844,38 @@ fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
     settings.append(body_timeouts);
     settings.sort_by_key(|(k, _)| *k);
     *body_timeouts = settings;
+}
+
+/// Each `SET <name>` clause of the routine that `CREATE` starts at `k`.
+///
+/// A clause sits outside the parentheses of the signature, and starts with an
+/// unquoted `SET`.
+fn routine_clauses(s: &Stmts, k: usize, end: usize, name: &str) -> Vec<usize> {
+    let depth = s.toks[k].depth;
+    let mut parens = 0_usize;
+    let mut sets = Vec::new();
+    for t in (k..end).filter(|&t| s.toks[t].depth == depth) {
+        if s.is_punct(t, '(') {
+            parens += 1;
+        } else if s.is_punct(t, ')') {
+            parens = parens.saturating_sub(1);
+        } else if parens == 0 && s.keyword(t, "set") && s.is(t + 1, name) {
+            sets.push(t);
+        }
+    }
+    sets
+}
+
+/// The body of each routine with a `SET search_path` clause.
+///
+/// The body runs with that path, so an unqualified `set_config` in it may be
+/// a user function that shadows the built-in.
+fn path_bodies(s: &Stmts) -> Vec<(usize, usize)> {
+    (0..s.toks.len())
+        .filter_map(|k| routine_body(s, k).map(|body| (k, body)))
+        .filter(|&(k, (_, end))| !routine_clauses(s, k, end, "search_path").is_empty())
+        .map(|(_, body)| body)
+        .collect()
 }
 
 /// Treat each `DO` body in another language as unreadable code.
@@ -3379,11 +3398,13 @@ fn recorded_change(
     s: &Stmts,
     k: usize,
     unconditional: bool,
-    path_change: Option<usize>,
+    (path_change, path_bodies): (Option<usize>, &[(usize, usize)]),
 ) -> Option<Timeout> {
     let change = timeout_change(s, k)?;
     let qualified = k >= 2 && s.is_punct(k - 1, '.') && s.is(k - 2, "pg_catalog");
-    let shadowed = s.is(k, "set_config") && !qualified && path_change.is_some_and(|c| c <= k);
+    let changed = path_change.is_some_and(|c| c <= k)
+        || path_bodies.iter().any(|&(from, to)| from <= k && k < to);
+    let shadowed = s.is(k, "set_config") && !qualified && changed;
     match change {
         Timeout::Set { bounds: true, .. } if !unconditional => None,
         // A transaction end that may not run must not save or restore a bound.
@@ -6996,6 +7017,23 @@ fn a_path_change_in_an_uncalled_body_does_not_carry() {
             "{change}"
         );
     }
+}
+
+#[test]
+fn a_routine_search_path_may_shadow_set_config() {
+    let body = |call: &str| {
+        format!(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql SET search_path = public, pg_catalog \
+             AS $$\nBEGIN\n    PERFORM {call}('lock_timeout', '5s', true);\n    \
+             ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;"
+        )
+    };
+    // `public.set_config` may shadow the built-in in that body.
+    let sql = body("set_config");
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    let sql = body("pg_catalog.set_config");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
 #[test]

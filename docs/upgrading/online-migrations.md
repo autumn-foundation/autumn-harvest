@@ -139,7 +139,8 @@ A call of a clearing routine that an earlier migration created ends the bound
 too. Set the bound again after the call.
 
 After a `search_path` change, only `pg_catalog.set_config` sets a bound,
-because another schema may hold a `set_config` that shadows the built-in. An
+because another schema may hold a `set_config` that shadows the built-in. The
+same holds in the body of a routine with a `SET search_path` clause. An
 unqualified call after such a change also ends the bound. A session change
 outlives its file, so the rule holds for every later migration too. A
 top-level `SET LOCAL` change ends with its transaction, so it does not.
