@@ -13,15 +13,15 @@
 /// A URL DSN keeps its query options, such as `sslmode`. A libpq
 /// keyword/value DSN gets its `dbname` replaced, or appended if absent.
 pub fn with_database(url: &str, database: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
+    let Some(scheme_end) = url_scheme_len(url) else {
         return set_conninfo(url, "dbname", database);
     };
     let (base, query) = url
         .split_once('?')
         .map_or((url, None), |(b, q)| (b, Some(q)));
-    let authority_end = base[scheme_end + 3..]
+    let authority_end = base[scheme_end..]
         .find('/')
-        .map_or(base.len(), |i| scheme_end + 3 + i);
+        .map_or(base.len(), |i| scheme_end + i);
     let prefix = &base[..authority_end];
     query.map_or_else(
         || format!("{prefix}/{database}"),
@@ -32,11 +32,21 @@ pub fn with_database(url: &str, database: &str) -> String {
 /// The DSN `url` with its `application_name` set to `app`. A test tags its
 /// sessions this way, so it can find them in `pg_stat_activity`.
 pub fn with_application_name(url: &str, app: &str) -> String {
-    if !url.contains("://") {
+    if url_scheme_len(url).is_none() {
         return set_conninfo(url, "application_name", app);
     }
     let sep = if url.contains('?') { '&' } else { '?' };
     format!("{url}{sep}application_name={app}")
+}
+
+/// The length of the URL scheme and `://` when `dsn` is a URL DSN, else
+/// `None`. Only the prefix counts, because a keyword DSN can hold `://`
+/// inside a quoted value.
+fn url_scheme_len(dsn: &str) -> Option<usize> {
+    ["postgresql://", "postgres://"]
+        .into_iter()
+        .find(|scheme| dsn.starts_with(scheme))
+        .map(str::len)
 }
 
 /// The keyword/value DSN `dsn` with `key` set to `value`. The result quotes
@@ -233,6 +243,21 @@ mod tests {
                 "t1"
             ),
             r"host='h' dbname='t1' password='a \'b\' = c' sslmode='require'"
+        );
+    }
+
+    /// A keyword DSN can hold `://` inside a quoted value. Only a leading
+    /// `postgres://` or `postgresql://` marks a URL.
+    #[test]
+    fn a_keyword_dsn_with_a_url_in_a_value_stays_a_keyword_dsn() {
+        let dsn = "host=db password='https://secret' dbname=postgres";
+        assert_eq!(
+            with_database(dsn, "t1"),
+            "host='db' password='https://secret' dbname='t1'"
+        );
+        assert_eq!(
+            with_application_name(dsn, "app"),
+            "host='db' password='https://secret' dbname='postgres' application_name='app'"
         );
     }
 
