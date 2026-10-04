@@ -141,7 +141,8 @@ too. Set the bound again after the call.
 After a `search_path` change, only `pg_catalog.set_config` sets a bound,
 because another schema may hold a `set_config` that shadows the built-in. An
 unqualified call after such a change also ends the bound. A session change
-outlives its file, so the rule holds for every later migration too.
+outlives its file, so the rule holds for every later migration too. A
+top-level `SET LOCAL` change ends with its transaction, so it does not.
 
 A change in the expression of an `EXECUTE` takes effect before the SQL runs.
 A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`, `EXIT` or
@@ -159,7 +160,8 @@ for the whole file, even with `run_in_transaction = false`. An explicit `COMMIT`
 undoes a plain `SET` made since the transaction began. After a `COMMIT` or
 `ROLLBACK`, the next statement opens a new implicit transaction. A `BEGIN`
 takes over the open transaction, so it does not protect an earlier `SET` from
-a later `ROLLBACK`.
+a later `ROLLBACK`. A `COMMIT` or `ROLLBACK` in a branch may not run, so it
+never saves or restores a bound.
 
 ## 4. Build indexes with `CONCURRENTLY`
 

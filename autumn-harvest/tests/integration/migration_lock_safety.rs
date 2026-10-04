@@ -497,6 +497,10 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
                 session = saved;
                 local = None;
             }
+            Timeout::MaybeCommit => {
+                saved = saved && session;
+                local = None;
+            }
             Timeout::RollbackToSavepoint => {
                 session = false;
                 local = None;
@@ -561,6 +565,9 @@ enum Timeout {
     /// `ROLLBACK TO SAVEPOINT`. The lint does not track savepoints, so it
     /// assumes no bound remains.
     RollbackToSavepoint,
+    /// A `COMMIT` that may not run. It may drop every local value. The saved
+    /// value keeps a bound only when it held both before and after.
+    MaybeCommit,
 }
 
 // ── Annotations ──────────────────────────────────────────────────────────────
@@ -2597,9 +2604,13 @@ impl SpanEnd {
 /// on. That doubt holds for the rest of the file only. Carried into history,
 /// one such call would leave every later migration unreadable.
 fn path_change(s: &Stmts, opaque: &[usize], history: &mut History) -> Option<usize> {
-    let text = (0..s.toks.len()).find(|&k| s.starts[k] == k && changes_search_path(s, k));
+    let changes = |k: usize| s.starts[k] == k && changes_search_path(s, k);
+    let text = (0..s.toks.len()).find(|&k| changes(k));
     let hidden = opaque.first().map(|&k| s.end(k));
-    history.search_path_changed |= text.is_some();
+    // A top-level local change ends with its transaction, so it stays here.
+    let session =
+        (0..s.toks.len()).any(|k| changes(k) && !(s.toks[k].depth == 0 && local_path_change(s, k)));
+    history.search_path_changed |= session;
     let local = text.into_iter().chain(hidden).min();
     local.or_else(|| history.search_path_changed.then_some(0))
 }
@@ -2642,6 +2653,25 @@ fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
             (start && foreign_do(s, k)) || execute || call
         })
         .collect()
+}
+
+/// Whether the `search_path` change at `k` is surely local to its transaction:
+/// `SET LOCAL`, or only plain `set_config` calls with a literal `true` scope.
+fn local_path_change(s: &Stmts, k: usize) -> bool {
+    if s.keyword(k, "set") || s.keyword(k, "reset") {
+        return s.keyword(k, "set") && s.keyword(k + 1, "local");
+    }
+    let literal = |j: usize| s.word(j).or_else(|| s.string(j));
+    let calls: Vec<usize> = (k..s.end(k))
+        .filter(|&j| s.is(j, "set_config") && s.is_punct(j + 1, '('))
+        .collect();
+    !calls.is_empty()
+        && calls.iter().all(|&j| {
+            s.string(j + 2).is_some()
+                && s.is_punct(j + 3, ',')
+                && s.is_punct(j + 5, ',')
+                && literal(j + 6).is_some_and(pg_true)
+        })
 }
 
 /// Whether the statement at `k` may change `search_path`.
@@ -2786,14 +2816,16 @@ fn routine_bodies(s: &Stmts) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Drop each lock in the body of a routine in another language.
+/// Drop each lock in the body of a routine or `DO` in another language.
 ///
-/// Postgres only stores that source, so text in it that reads as SQL takes no
-/// lock. A call of the routine counts as foreign code instead.
+/// Postgres only stores the source of such a routine, so text in it that
+/// reads as SQL takes no lock. A call of the routine counts as foreign code
+/// instead. A foreign `DO` counts as one lock at the `DO` token.
 fn drop_foreign_body_locks(s: &Stmts, raws: &mut Vec<Raw>) {
+    // A foreign `DO` keeps its own lock, at the `DO` token itself.
     let foreign: Vec<(usize, usize)> = (0..s.toks.len())
         .filter(|&k| language(s, k).is_some_and(|l| l != "plpgsql" && l != "sql"))
-        .filter_map(|k| routine_body(s, k))
+        .filter_map(|k| routine_body(s, k).or_else(|| foreign_do(s, k).then(|| (k + 1, s.end(k)))))
         .collect();
     raws.retain(|raw| {
         !foreign
@@ -3321,6 +3353,9 @@ fn recorded_change(
     let shadowed = s.is(k, "set_config") && !qualified && path_change.is_some_and(|c| c <= k);
     match change {
         Timeout::Set { bounds: true, .. } if !unconditional => None,
+        // A transaction end that may not run must not save or restore a bound.
+        Timeout::Commit if !unconditional => Some(Timeout::MaybeCommit),
+        Timeout::Rollback if !unconditional => Some(Timeout::RollbackToSavepoint),
         Timeout::Set { .. } if shadowed => Some(Timeout::Set {
             bounds: false,
             local: false,
@@ -6817,6 +6852,45 @@ fn an_altered_routine_keeps_its_history() {
             "{alter} {call}\n{findings:?}"
         );
     }
+}
+
+#[test]
+fn a_conditional_commit_does_not_save_the_bound() {
+    // The `COMMIT` may not run, so the `ROLLBACK` may restore the value from
+    // before the `SET`.
+    let sql = "SET lock_timeout = '5s';\nDO $$\nBEGIN\n    IF random() < 0.5 THEN\n        COMMIT;\n    \
+               END IF;\nEND $$;\nROLLBACK;\nALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, false);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_local_path_change_does_not_carry_into_later_migrations() {
+    let create = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX public.idx;";
+    for local in [
+        "SET LOCAL search_path = scratch, public;",
+        "SELECT set_config('search_path', 'scratch, public', true);",
+    ] {
+        assert_eq!(
+            lint_with_history(&[local, create], drop, true),
+            [],
+            "{local}"
+        );
+    }
+}
+
+#[test]
+fn a_foreign_do_body_takes_no_lock_of_its_own() {
+    // The annotated `DO` finding covers the body, which is not SQL.
+    let sql = "-- lock-safety: allow lock-timeout #1810 test fixture\n\
+               DO $$\n# ; ALTER TABLE harvest_events ADD COLUMN x INT\npass\n$$ LANGUAGE plpython3u;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
 }
 
 #[test]
