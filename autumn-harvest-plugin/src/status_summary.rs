@@ -449,19 +449,19 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
     let mut dlq_newest: Option<i64> = None;
     let mut by_queue: BTreeMap<String, i64> = BTreeMap::new();
     let mut stalled_count = 0i64;
-    // One entry per worker. A multi-shard worker writes the same snapshot to
-    // each shard, so the entry with the most tasks wins.
-    let mut task_stats: BTreeMap<String, (String, WorkerTaskStats)> = BTreeMap::new();
+    // One entry per worker. A multi-shard worker writes a snapshot to each
+    // shard, so the newest one wins.
+    let mut task_stats: BTreeMap<String, LiveWorkerTaskStats> = BTreeMap::new();
 
     for observation in observations {
         for bundle in observation.rows {
             all_workers.extend(bundle.workers);
             for row in bundle.task_stats {
-                let entry = task_stats
-                    .entry(row.worker_id)
-                    .or_insert_with(|| (row.cohort.clone(), row.stats));
-                if row.stats.tasks > entry.1.tasks {
-                    *entry = (row.cohort, row.stats);
+                match task_stats.get(&row.worker_id) {
+                    Some(kept) if !row.is_fresher_than(kept) => {}
+                    _ => {
+                        task_stats.insert(row.worker_id.clone(), row);
+                    }
                 }
             }
             dlq_total += bundle.dlq_total;
@@ -515,8 +515,8 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
     }
 
     let fleet: Vec<(String, String, WorkerTaskStats)> = task_stats
-        .into_iter()
-        .map(|(worker_id, (cohort, stats))| (worker_id, cohort, stats))
+        .into_values()
+        .map(|row| (row.worker_id, row.cohort, row.stats))
         .collect();
     let mut worker_outliers = detect_outliers_in_cohorts(&fleet, &OutlierConfig::default());
     let worker_outliers_total = worker_outliers.len();
@@ -1101,10 +1101,21 @@ mod tests {
     }
 
     fn live(worker_id: &str, cohort: &str, stats: WorkerTaskStats) -> LiveWorkerTaskStats {
+        live_aged(worker_id, cohort, stats, 0)
+    }
+
+    /// A live row published `age_secs` ago.
+    fn live_aged(
+        worker_id: &str,
+        cohort: &str,
+        stats: WorkerTaskStats,
+        age_secs: i64,
+    ) -> LiveWorkerTaskStats {
         LiveWorkerTaskStats {
             worker_id: worker_id.to_string(),
             cohort: cohort.to_string(),
             stats,
+            updated_at: Utc::now() - chrono::Duration::seconds(age_secs),
         }
     }
 
@@ -1139,9 +1150,12 @@ mod tests {
             ok("w-1"),
             ok("w-2"),
         ]);
-        // Shard 1 holds an older, smaller snapshot of the same worker. The
-        // merge keeps the snapshot with the most tasks.
-        let shard1 = stats_bundle(vec![live("w-sick", Q, task_stats(40, 0)), ok("w-3")]);
+        // Shard 1 holds an older snapshot of the same worker, with more tasks.
+        // The merge keeps the newest snapshot, not the biggest.
+        let shard1 = stats_bundle(vec![
+            live_aged("w-sick", Q, task_stats(200, 0), 30),
+            ok("w-3"),
+        ]);
         let merged = merge_bundle(vec![observe(0, shard0), observe(1, shard1)]);
         assert_eq!(
             merged.worker_outliers.len(),

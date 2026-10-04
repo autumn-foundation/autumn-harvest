@@ -530,8 +530,7 @@ impl ShardPeerViews {
     }
 
     /// The rows of every slot stored within `max_age`, one per worker. When
-    /// two shards hold a row for the same worker, the row with the most tasks
-    /// wins.
+    /// two shards hold a row for the same worker, the newest row wins.
     #[must_use]
     pub fn merged(&self, max_age: Duration) -> Vec<LiveWorkerTaskStats> {
         let now = std::time::Instant::now();
@@ -545,7 +544,7 @@ impl ShardPeerViews {
             std::collections::BTreeMap::new();
         for row in rows {
             match by_worker.get(&row.worker_id) {
-                Some(kept) if kept.stats.tasks >= row.stats.tasks => {}
+                Some(kept) if !row.is_fresher_than(kept) => {}
                 _ => {
                     by_worker.insert(row.worker_id.clone(), row);
                 }
@@ -717,6 +716,18 @@ pub struct LiveWorkerTaskStats {
     pub cohort: String,
     /// The published snapshot.
     pub stats: WorkerTaskStats,
+    /// When the worker published the snapshot, on the database clock.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl LiveWorkerTaskStats {
+    /// Whether `self` should replace `kept` as a worker's snapshot: the newer
+    /// one wins. A window shrinks as old samples expire, so the newer snapshot
+    /// can hold fewer tasks and still be the correct one.
+    #[must_use]
+    pub fn is_fresher_than(&self, kept: &Self) -> bool {
+        self.updated_at > kept.updated_at
+    }
 }
 
 /// The cohort key for a worker's `queues` JSON: the sorted, deduplicated
@@ -799,6 +810,8 @@ struct TaskStatsRow {
     window_failures: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     p99_latency_ms: Option<i64>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    updated_at: DateTime<Utc>,
 }
 
 /// The task stats of every `Active` worker with a fresh heartbeat and fresh
@@ -817,7 +830,8 @@ pub async fn load_live_worker_task_stats(
 ) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
     let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
     let rows: Vec<TaskStatsRow> = diesel::sql_query(
-        "SELECT s.worker_id, w.queues, s.window_tasks, s.window_failures, s.p99_latency_ms \
+        "SELECT s.worker_id, w.queues, s.window_tasks, s.window_failures, s.p99_latency_ms, \
+                s.updated_at \
          FROM harvest_worker_task_stats s \
          JOIN harvest_workers w ON w.worker_id = s.worker_id \
          WHERE w.status = $1 \
@@ -840,6 +854,7 @@ pub async fn load_live_worker_task_stats(
                 failures: u32::try_from(r.window_failures).unwrap_or(0),
                 p99_latency_ms: r.p99_latency_ms.and_then(|ms| u64::try_from(ms).ok()),
             },
+            updated_at: r.updated_at,
         })
         .collect())
 }
@@ -2299,7 +2314,8 @@ pub fn local_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    fn live(worker_id: &str, tasks: u32) -> super::LiveWorkerTaskStats {
+    /// A live row published `age_secs` ago.
+    fn live_aged(worker_id: &str, tasks: u32, age_secs: i64) -> super::LiveWorkerTaskStats {
         super::LiveWorkerTaskStats {
             worker_id: worker_id.to_owned(),
             cohort: "[\"q\"]".to_owned(),
@@ -2308,17 +2324,26 @@ mod tests {
                 failures: 0,
                 p99_latency_ms: Some(1),
             },
+            updated_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs),
         }
     }
 
+    fn live(worker_id: &str, tasks: u32) -> super::LiveWorkerTaskStats {
+        live_aged(worker_id, tasks, 0)
+    }
+
     /// Issue #1815: the comparing heartbeat sees peers from every shard, once
-    /// each, with the fullest snapshot of a worker that both shards hold.
+    /// each, with the newest snapshot of a worker that both shards hold. The
+    /// newest one wins even with fewer tasks, because a window shrinks.
     #[test]
     fn shard_peer_views_merge_every_slot_once_per_worker() {
         let views = super::ShardPeerViews::default();
         let window = std::time::Duration::from_secs(60);
-        views.store(0, vec![live("me", 50), live("a", 10)]);
-        views.store(1, vec![live("me", 40), live("b", 30), live("a", 20)]);
+        views.store(0, vec![live("me", 50), live_aged("a", 99, 30)]);
+        views.store(
+            1,
+            vec![live_aged("me", 90, 30), live("b", 30), live("a", 20)],
+        );
         let merged: Vec<(String, u32)> = views
             .merged(window)
             .into_iter()

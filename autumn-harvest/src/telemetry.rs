@@ -2347,18 +2347,20 @@ impl TunerDecision {
     }
 }
 
-/// A key for one metrics recorder (issue #1815): the address of its shared
-/// allocation.
+/// A key for the sink one metrics recorder writes to (issue #1815).
 ///
-/// Two clones of one `Arc` give the same key, and two recorders give two keys.
-/// An aggregate that feeds an unlabelled gauge, such as the poller count, is
-/// kept per key. Workers that share a recorder then share the aggregate, and
-/// a second runtime with its own recorder stays apart. A holder of a key must
-/// also hold a clone of the `Arc`, so the address is not reused.
+/// It is [`MetricsRecorder::sink_key`] when the recorder names its sink, else
+/// the address of the recorder's shared allocation. An aggregate that feeds an
+/// unlabelled gauge, such as the poller count, is kept per key. Workers that
+/// feed one sink then share the aggregate, and a runtime with its own sink
+/// stays apart. A holder of an address key must also hold a clone of the
+/// `Arc`, so the address is not reused.
 #[cfg(feature = "db")]
 #[must_use]
 pub(crate) fn recorder_key(metrics: &Arc<dyn MetricsRecorder>) -> usize {
-    Arc::as_ptr(metrics).cast::<()>() as usize
+    metrics
+        .sink_key()
+        .unwrap_or_else(|| Arc::as_ptr(metrics).cast::<()>() as usize)
 }
 
 /// A timed database operation (issue #1815), used as the bounded `op` label on
@@ -3880,6 +3882,17 @@ pub trait MetricsRecorder: Send + Sync {
     /// for guarding observation work, never for changing engine behavior.
     fn is_enabled(&self) -> bool {
         true
+    }
+
+    /// The identity of the sink this recorder writes to (issue #1815).
+    ///
+    /// Two recorders that feed one sink must return the same value, even when
+    /// they are separate allocations. For example, every metrics-rs recorder
+    /// writes to the one global registry. The engine keeps unlabelled
+    /// aggregates, such as the poller count, per sink. The default `None`
+    /// treats each recorder allocation as its own sink.
+    fn sink_key(&self) -> Option<usize> {
+        None
     }
 
     // ── Custom / user-emitted metrics (issue #532) ────────────────────────

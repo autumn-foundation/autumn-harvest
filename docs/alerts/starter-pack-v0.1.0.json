@@ -1564,7 +1564,7 @@
       "id": "harvest_db_pool_wait_high",
       "status": "enforceable",
       "signal_source": "METRIC_DB_POOL_WAIT / harvest.db.pool.wait_duration{shard}, timed around pool.get() on the claim path, the timeout scanner and the activity heartbeat flush (issue #1815).",
-      "default_threshold": "Ticket when the p99 wait for a pooled connection on any shard exceeds 100 ms for 10 minutes.",
+      "default_threshold": "Ticket when the p99 wait for a pooled connection on any replica and shard exceeds 100 ms for 10 minutes. Pools are per replica, so the rules keep the instance label: one starved replica must not hide behind healthy ones.",
       "severity": "ticket",
       "owner_persona": "service on-call",
       "description": "Callers wait too long for a database connection. The worker pool is too small for the load, or slow queries hold connections too long. Claims slow down first, so schedule-to-start latency rises next.",
@@ -1582,12 +1582,12 @@
         "expressions": [
           {
             "kind": "promql",
-            "expr": "histogram_quantile(0.99, sum by (le, shard) (rate(harvest_db_pool_wait_duration_bucket[5m]))) > 0.1",
+            "expr": "histogram_quantile(0.99, sum by (le, instance, shard) (rate(harvest_db_pool_wait_duration_bucket[5m]))) > 0.1",
             "for": "10m"
           },
           {
             "kind": "promql",
-            "expr": "sum by (shard) (rate(harvest_db_pool_wait_duration_sum[5m])) / sum by (shard) (rate(harvest_db_pool_wait_duration_count[5m])) > 0.05",
+            "expr": "sum by (instance, shard) (rate(harvest_db_pool_wait_duration_sum[5m])) / sum by (instance, shard) (rate(harvest_db_pool_wait_duration_count[5m])) > 0.05",
             "for": "10m",
             "note": "Bucket-less fallback: the average wait. Use it on the built-in scrape endpoint, which renders only _sum and _count."
           },

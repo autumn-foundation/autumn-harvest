@@ -315,6 +315,11 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         true
     }
 
+    /// Clones share one `Inner`, so they feed one sink (issue #1815).
+    fn sink_key(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.0) as usize)
+    }
+
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         self.0
             .workflow_started

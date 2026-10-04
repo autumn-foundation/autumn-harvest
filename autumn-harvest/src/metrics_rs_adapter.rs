@@ -109,7 +109,15 @@ use crate::telemetry::{
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetricsRsRecorder;
 
+/// The [`MetricsRecorder::sink_key`] of every [`MetricsRsRecorder`]: they all
+/// write to the one global `metrics` registry. A heap address is never 1.
+const METRICS_RS_GLOBAL_SINK: usize = 1;
+
 impl MetricsRecorder for MetricsRsRecorder {
+    fn sink_key(&self) -> Option<usize> {
+        Some(METRICS_RS_GLOBAL_SINK)
+    }
+
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         counter!(
             METRIC_WORKFLOW_STARTED,
