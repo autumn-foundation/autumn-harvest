@@ -304,7 +304,8 @@ pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions"
 ///
 /// An in-process sampler reads the deadpool status. No query runs. Labelled
 /// `{shard}`. Each replica owns its pool, so a sum across replicas is valid.
-/// Colocated shards that share one pool report the same value.
+/// Colocated shards that share one pool report the same value. Runtimes in one
+/// process that share a sink report the sum of their distinct pools.
 pub const METRIC_DB_POOL_IN_USE: &str = "harvest.db.pool.in_use";
 
 /// Gauge: open database connections that wait idle in a worker's pool (issue

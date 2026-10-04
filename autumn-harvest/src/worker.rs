@@ -25870,6 +25870,10 @@ fn spawn_db_pool_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let metrics = &telemetry.metrics;
+        for (shard, pool) in &pools {
+            pool_gauge_update(metrics, *shard, pool_identity(pool), PoolGaugeChange::Join);
+        }
         loop {
             tokio::select! {
                 biased;
@@ -25878,10 +25882,94 @@ fn spawn_db_pool_sampler(
             }
             for (shard, pool) in &pools {
                 let (in_use, idle) = pool_occupancy(&pool.status());
-                telemetry.metrics.record_db_pool(*shard, in_use, idle);
+                let change = PoolGaugeChange::Sample { in_use, idle };
+                pool_gauge_update(metrics, *shard, pool_identity(pool), change);
             }
         }
+        for (shard, pool) in &pools {
+            pool_gauge_update(metrics, *shard, pool_identity(pool), PoolGaugeChange::Leave);
+        }
     })
+}
+
+/// A stable identity for one pool across all its clones (issue #1815): the
+/// address of its manager, which lives in the pool's shared state. A sampler
+/// holds a clone, so the address is not reused while the sampler runs.
+fn pool_identity(pool: &DbPool) -> usize {
+    std::ptr::from_ref(pool.manager()) as usize
+}
+
+/// One pool's last sample, and how many samplers read it (issue #1815).
+#[derive(Debug, Default, Clone, Copy)]
+struct SampledPool {
+    samplers: usize,
+    in_use: u64,
+    idle: u64,
+}
+
+/// One sampler event on one pool (issue #1815).
+#[derive(Debug, Clone, Copy)]
+enum PoolGaugeChange {
+    Join,
+    Sample { in_use: u64, idle: u64 },
+    Leave,
+}
+
+/// The sampled pools behind each `(sink, shard)` gauge pair (issue #1815).
+type SampledPools =
+    std::collections::HashMap<(usize, u16), std::collections::HashMap<usize, SampledPool>>;
+
+/// The DB-pool gauges, per sink and shard (issue #1815).
+///
+/// The gauges carry only a `shard` label. Two runtimes in one process can feed
+/// one sink with separate pools for the same shard. Each would otherwise
+/// overwrite the other's value. So the gauge reports the sum over the distinct
+/// pools, and a pool that two samplers read counts once.
+static POOL_GAUGES: std::sync::LazyLock<std::sync::Mutex<SampledPools>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
+/// Apply `change` and emit the shard's summed gauges (issue #1815).
+///
+/// The emit runs under the lock, so concurrent samplers emit in update order.
+/// A join emits nothing, because it has no sample yet. When the last pool of
+/// a shard leaves, the gauges read 0.
+#[allow(clippy::significant_drop_tightening)]
+fn pool_gauge_update(
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+    shard: u16,
+    pool: usize,
+    change: PoolGaugeChange,
+) {
+    let key = (crate::telemetry::recorder_key(metrics), shard);
+    let mut gauges = POOL_GAUGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pools = gauges.entry(key).or_default();
+    match change {
+        PoolGaugeChange::Join => {
+            pools.entry(pool).or_default().samplers += 1;
+            return;
+        }
+        PoolGaugeChange::Sample { in_use, idle } => {
+            let sampled = pools.entry(pool).or_default();
+            sampled.in_use = in_use;
+            sampled.idle = idle;
+        }
+        PoolGaugeChange::Leave => {
+            if let Some(sampled) = pools.get_mut(&pool) {
+                sampled.samplers = sampled.samplers.saturating_sub(1);
+                if sampled.samplers == 0 {
+                    pools.remove(&pool);
+                }
+            }
+        }
+    }
+    let in_use = pools.values().map(|p| p.in_use).sum();
+    let idle = pools.values().map(|p| p.idle).sum();
+    if pools.is_empty() {
+        gauges.remove(&key);
+    }
+    metrics.record_db_pool(shard, in_use, idle);
 }
 
 /// Split a deadpool status into `(in_use, idle)` connections (issue #1815).
@@ -39943,6 +40031,44 @@ mod tests {
         use crate::types::ShardId;
         assert_eq!(pool_shard_label(ShardId::new(3)), 3);
         assert_ne!(pool_shard_label(ShardId::UNENCODED), u16::MAX);
+    }
+
+    /// Issue #1815: two pools on one shard and sink sum, a pool that two
+    /// samplers read counts once, and the gauges fall to 0 when the last pool
+    /// leaves.
+    #[test]
+    fn pool_gauges_sum_distinct_pools_per_sink_and_shard() {
+        #[derive(Default)]
+        struct Pools(std::sync::Mutex<Vec<(u16, u64, u64)>>);
+        impl crate::telemetry::MetricsRecorder for Pools {
+            fn record_db_pool(&self, shard: u16, in_use: u64, idle: u64) {
+                self.0.lock().unwrap().push((shard, in_use, idle));
+            }
+        }
+        let recorder = Arc::new(Pools::default());
+        let metrics: Arc<dyn crate::telemetry::MetricsRecorder> = recorder.clone();
+        let (a, b) = (1usize, 2usize);
+        pool_gauge_update(&metrics, 7, a, PoolGaugeChange::Join);
+        pool_gauge_update(&metrics, 7, a, PoolGaugeChange::Join);
+        pool_gauge_update(&metrics, 7, b, PoolGaugeChange::Join);
+        let sample = |in_use, idle| PoolGaugeChange::Sample { in_use, idle };
+        pool_gauge_update(&metrics, 7, a, sample(3, 1));
+        pool_gauge_update(&metrics, 7, a, sample(3, 1));
+        pool_gauge_update(&metrics, 7, b, sample(2, 4));
+        pool_gauge_update(&metrics, 7, a, PoolGaugeChange::Leave);
+        pool_gauge_update(&metrics, 7, b, PoolGaugeChange::Leave);
+        pool_gauge_update(&metrics, 7, a, PoolGaugeChange::Leave);
+        assert_eq!(
+            recorder.0.lock().unwrap().clone(),
+            vec![
+                (7, 3, 1),
+                (7, 3, 1),
+                (7, 5, 5),
+                (7, 5, 5),
+                (7, 3, 1),
+                (7, 0, 0)
+            ]
+        );
     }
 
     /// Issue #1815: the pool gauges split open connections into lent and idle.
