@@ -390,6 +390,10 @@ pub struct EnqueueParams {
     /// since the session's local state only exists on that one worker.
     /// `None` for an ordinary (non-session) activity.
     pub session_id: Option<Uuid>,
+    /// `true` only for the first workflow task of a freshly admitted run
+    /// (issue #1824). The workflow start path sets it. Every other path
+    /// keeps `false`, so its row is a continuation in the claim order.
+    pub new_start: bool,
 }
 
 impl EnqueueParams {
@@ -428,6 +432,7 @@ impl EnqueueParams {
             required_capabilities: None,
             context_headers: None,
             session_id: None,
+            new_start: false,
         }
     }
 
@@ -536,6 +541,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         required_capabilities: params.required_capabilities.clone(),
         context_headers: params.context_headers.clone(),
         session_id: params.session_id,
+        new_start: params.new_start,
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -587,7 +593,7 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 /// number by exhaustive field destructure. Adding or removing a
 /// `NewTaskQueueItem` field breaks that test at compile time until this
 /// constant is updated too, so it cannot silently drift.
-const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 27;
+const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 28;
 
 /// Largest row count one `enqueue_batch` `INSERT` may carry.
 ///
@@ -797,6 +803,7 @@ pub async fn enqueue_batch(
                     required_capabilities: p.required_capabilities.clone(),
                     context_headers: p.context_headers.clone(),
                     session_id: p.session_id,
+                    new_start: p.new_start,
                 }
             })
             .collect();
@@ -970,10 +977,16 @@ pub const NEW_START_HANDICAP_SECS: u32 = 30;
 
 /// The claim-order due time of a `harvest_task_queue` row (issue #1824).
 ///
-/// A continuation is a task of a run that already started: an activity
-/// task, or a woken workflow task. A new start is the first workflow task of
-/// a run. Every claim increments `attempt`, and a wake reuses the same row,
-/// so a workflow row with `attempt = 0` is a new start.
+/// A new start is the first workflow task of a freshly admitted run. The
+/// workflow start path sets `new_start` on that row. Every claim increments
+/// `attempt`, and a wake reuses the same row. So the row stops being a new
+/// start at its first claim.
+///
+/// Every other task is a continuation. That includes an activity task and a
+/// woken workflow task. It also includes the first task of a child, a
+/// continue-as-new, a reset fork, a workflow retry or a DLQ redrive. Each of
+/// these extends admitted work.
+/// This matches the admission gate, which gates only fresh admissions.
 ///
 /// A new start sorts as if it were due [`NEW_START_HANDICAP_SECS`] later. So
 /// at equal priority, a continuation goes first under a backlog. The
@@ -985,7 +998,7 @@ pub const NEW_START_HANDICAP_SECS: u32 = 30;
 /// an index could have saved. See `docs/performance.md`, issue #1177.
 macro_rules! claim_order_due_sql {
     () => {
-        "(scheduled_at + CASE WHEN task_type = 'workflow' AND attempt = 0 \
+        "(scheduled_at + CASE WHEN new_start AND attempt = 0 \
          THEN INTERVAL '30 seconds' ELSE INTERVAL '0 seconds' END)"
     };
 }
@@ -1604,7 +1617,7 @@ pub async fn claim_task_of_kind_on_shard(
             }
             ClaimOutcome::Empty => return Ok(None),
             // The row is now terminal, so the next pass cannot select it again.
-            ClaimOutcome::DeadlineExceeded(_) => {}
+            ClaimOutcome::DeadlineExceeded => {}
         }
     }
     Ok(None)
@@ -1822,7 +1835,7 @@ enum ClaimOutcome {
     Empty,
     /// The run deadline of the row had passed. The row is `FAILED` with
     /// [`DEADLINE_EXCEEDED_ERROR`] once this transaction commits (issue #1824).
-    DeadlineExceeded(Uuid),
+    DeadlineExceeded,
 }
 
 /// Execute one pre-built release-if-paused statement and report whether a
@@ -1956,7 +1969,7 @@ async fn apply_post_claim_rechecks(
             queue = %task.queue_name,
             "run deadline passed before claim; task failed as deadline_exceeded"
         );
-        return Ok(ClaimOutcome::DeadlineExceeded(task.id));
+        return Ok(ClaimOutcome::DeadlineExceeded);
     }
 
     Ok(ClaimOutcome::Claimed(Box::new(task)))
@@ -2056,7 +2069,7 @@ pub async fn claim_task_by_id_on_shard(
         // this row and releases it with backoff. That is the reference the row
         // needs. A second one would only duplicate it. A deadline-exceeded row
         // is terminal, so the caller's probe acks its reference.
-        ClaimOutcome::Released(_) | ClaimOutcome::Empty | ClaimOutcome::DeadlineExceeded(_) => {
+        ClaimOutcome::Released(_) | ClaimOutcome::Empty | ClaimOutcome::DeadlineExceeded => {
             Ok(None)
         }
     }
@@ -7532,7 +7545,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
              ) \
              SELECT \
                  id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
-                 scheduled_at, schedule_to_close_at, {due} AS claim_due_at, \
+                 schedule_to_close_at, {due} AS claim_due_at, \
                  CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS sticky_rank, \
                  CASE \
                      WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
@@ -7961,8 +7974,6 @@ struct BatchedClaimCandidate {
     rate_limit_key: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     activity_name: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    scheduled_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     schedule_to_close_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
@@ -8254,7 +8265,7 @@ pub async fn claim_task_batched(
                         {
                             match apply_post_claim_rechecks(conn, task, worker_id).await? {
                                 // The row is terminal now. Try the next candidate.
-                                ClaimOutcome::DeadlineExceeded(_) => {}
+                                ClaimOutcome::DeadlineExceeded => {}
                                 outcome => return Ok(outcome),
                             }
                         }
@@ -8282,7 +8293,7 @@ pub async fn claim_task_batched(
             record_pending_hints(conn, &[task_id]).await;
             Ok(None)
         }
-        ClaimOutcome::Empty | ClaimOutcome::DeadlineExceeded(_) => Ok(None),
+        ClaimOutcome::Empty | ClaimOutcome::DeadlineExceeded => Ok(None),
     }
 }
 
@@ -8973,7 +8984,7 @@ mod tests {
             CLAIM_ORDER_DUE_SQL.contains(&format!("INTERVAL '{NEW_START_HANDICAP_SECS} seconds'")),
             "the SQL handicap must equal NEW_START_HANDICAP_SECS; got: {CLAIM_ORDER_DUE_SQL}"
         );
-        assert!(CLAIM_ORDER_DUE_SQL.contains("task_type = 'workflow' AND attempt = 0"));
+        assert!(CLAIM_ORDER_DUE_SQL.contains("new_start AND attempt = 0"));
     }
 
     /// Every claim variant sorts on the claim-order due time, after the
@@ -11994,6 +12005,7 @@ mod tests {
             required_capabilities: None,
             context_headers: None,
             session_id: None,
+            new_start: false,
         };
         let NewTaskQueueItem {
             id: _,
@@ -12023,13 +12035,14 @@ mod tests {
             required_capabilities: _,
             context_headers: _,
             session_id: _,
+            new_start: _,
         } = sample;
         // The field destructure above is the compile-time proof that
         // NEW_TASK_QUEUE_ITEM_COLUMNS counts every field. This const block
         // is a second, independent compile-time check: the chunk size
         // computed from that count never crosses Postgres's ceiling.
         const {
-            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 27);
+            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 28);
             assert!(
                 ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
             );

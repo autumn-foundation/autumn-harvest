@@ -9,6 +9,9 @@ a caller can tell overload from an operator halt.
 Load shedding is opt-in per queue. A deployment with no policy runs no
 sampler and no extra SQL.
 
+Shedding acts at admission. Inside the queue, the claim order also favors
+running workflows over new starts. See [`claim-order.md`](claim-order.md).
+
 ## Signal
 
 The signal is the **age of the oldest claimable `PENDING` task** on the

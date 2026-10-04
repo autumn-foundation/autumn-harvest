@@ -234,5 +234,9 @@ rather than admitting a new one:
 Gating these would halt in-flight work mid-flight, the opposite of the gate's
 "halt **new** starts while in-flight work drains" contract.
 
+The claim order uses the same split (issue #1824). Without a gate, a fresh
+admission yields to these continuations at claim. See
+[`claim-order.md`](claim-order.md).
+
 Gating starts from *outside* the plugin process, auto-lifting/scheduling gates,
 and rate-limited recovery replay are also out of scope (issue #618).

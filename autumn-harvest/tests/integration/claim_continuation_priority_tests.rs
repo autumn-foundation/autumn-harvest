@@ -1,5 +1,9 @@
 #![cfg(feature = "db")]
-#![allow(clippy::doc_markdown, clippy::too_many_lines)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::too_many_lines
+)]
 //! Continuations outrank new starts at claim (issue #1824).
 //!
 //! A continuation is any task of a run that already started: a woken
@@ -58,7 +62,7 @@ async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
 ///
 /// `enqueue` and `wake_workflow_task` both date a row 5 seconds in the past
 /// to absorb clock skew. A lead must clear that allowance by a wide margin.
-const FIFO_LEAD_SECS: i64 = 15;
+const FIFO_LEAD_SECS: i32 = 15;
 
 fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8])
@@ -182,13 +186,13 @@ async fn exec_of(conn: &mut AsyncPgConnection, task_id: Uuid) -> Uuid {
 }
 
 /// Move a row's due time `secs` seconds into the past.
-async fn age(conn: &mut AsyncPgConnection, task_id: Uuid, secs: i64) {
+async fn age(conn: &mut AsyncPgConnection, task_id: Uuid, secs: i32) {
     diesel::sql_query(
         "UPDATE harvest_task_queue \
          SET scheduled_at = NOW() - make_interval(secs => $2) WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<diesel::sql_types::Double, _>(secs as f64)
+    .bind::<diesel::sql_types::Integer, _>(secs)
     .execute(conn)
     .await
     .expect("age row");
@@ -280,7 +284,11 @@ async fn pending_check(conn: &mut AsyncPgConnection, ids: &[Uuid]) {
     .get_result(conn)
     .await
     .expect("count due");
-    assert_eq!(due.n, ids.len() as i64, "every continuation is due");
+    assert_eq!(
+        due.n,
+        i64::try_from(ids.len()).expect("small fixture"),
+        "every continuation is due"
+    );
 }
 
 fn assert_continuations_first(order: &[Uuid], backlog: &Backlog) {
@@ -342,7 +350,7 @@ async fn new_starts_are_not_starved_by_a_stream_of_continuations() {
     let (mut conn, _container) = setup_db().await;
     let worker = unique("w");
     let queue = unique("starve");
-    let aged = i64::from(NEW_START_HANDICAP_SECS) + FIFO_LEAD_SECS;
+    let aged = i32::try_from(NEW_START_HANDICAP_SECS).expect("small handicap") + FIFO_LEAD_SECS;
 
     let mut starts = Vec::new();
     for i in 0..3 {
@@ -374,7 +382,7 @@ async fn new_starts_are_not_starved_by_a_stream_of_continuations() {
 async fn the_handicap_expires_after_new_start_handicap_secs() {
     let (mut conn, _container) = setup_db().await;
     let worker = unique("w");
-    let handicap = i64::from(NEW_START_HANDICAP_SECS);
+    let handicap = i32::try_from(NEW_START_HANDICAP_SECS).expect("small handicap");
 
     let queue = unique("young");
     let young = new_start(&mut conn, &queue, 0).await;

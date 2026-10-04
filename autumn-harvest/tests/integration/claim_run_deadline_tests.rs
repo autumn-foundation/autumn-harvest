@@ -1,5 +1,9 @@
 #![cfg(feature = "db")]
-#![allow(clippy::doc_markdown, clippy::too_many_lines)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::too_many_lines
+)]
 //! A task whose run deadline has passed is not executed (issue #1824).
 //!
 //! The claim fails such a task with a `deadline_exceeded` error and hands
@@ -56,8 +60,8 @@ fn unique(prefix: &str) -> String {
 #[derive(Clone, Copy)]
 enum Deadline {
     None,
-    Run(i64),
-    Chain(i64),
+    Run(i32),
+    Chain(i32),
 }
 
 async fn insert_execution(conn: &mut AsyncPgConnection, state: &str, deadline: Deadline) -> Uuid {
@@ -78,8 +82,8 @@ async fn insert_execution(conn: &mut AsyncPgConnection, state: &str, deadline: D
     .bind::<diesel::sql_types::Uuid, _>(id)
     .bind::<diesel::sql_types::Text, _>(id.to_string())
     .bind::<diesel::sql_types::Text, _>(state)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(run.map(|s| s as f64))
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(chain.map(|s| s as f64))
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(run)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(chain)
     .execute(conn)
     .await
     .expect("insert execution");
@@ -170,8 +174,8 @@ async fn chain_deadline_also_stops_the_claim() {
     assert_deadline_exceeded(&row(&mut conn, task).await);
 }
 
-/// One claim call skips the expired row and returns the live row behind
-/// it, so an expired backlog does not idle the slot for a poll interval.
+/// One claim call skips the expired row and returns the live row behind it.
+/// So an expired backlog does not idle the slot for a poll interval.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expired_task_does_not_block_the_live_task_behind_it() {
     let (mut conn, _container) = setup_db().await;
@@ -238,7 +242,7 @@ async fn by_id_claim_does_not_claim_an_expired_task() {
     let claimed = queue::claim_task_by_id_on_shard(
         &mut conn,
         task,
-        &[queue.clone()],
+        std::slice::from_ref(&queue),
         &unique("w"),
         "",
         None,
@@ -270,7 +274,7 @@ async fn batched_claim_skips_an_expired_task() {
 
     let claimed = queue::claim_task_batched(
         &mut conn,
-        &[queue.clone()],
+        std::slice::from_ref(&queue),
         &unique("w"),
         "",
         None,

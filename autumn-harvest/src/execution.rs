@@ -1513,6 +1513,9 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
     enqueue.priority = request.priority.as_i32();
+    // A fresh admission yields to continuations at claim (issue #1824). A
+    // workflow retry continues a failed run, so it does not yield.
+    enqueue.new_start = request.retry_of_exec_id.is_none();
     if request.delay.is_some_and(|d| d > chrono::Duration::zero()) || request.start_at.is_some() {
         enqueue.scheduled_at = target_start_time;
     }
