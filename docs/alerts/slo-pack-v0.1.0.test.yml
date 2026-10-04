@@ -7,7 +7,8 @@
 # 'axn' is a, n+1 times. The interval is 1m, so sample i is at minute i.
 #
 # Rules evaluate every 5m. That keeps the 3-day cases fast in CI.
-# The alerts have no `for` clause, so the step does not change a result.
+# The burn alerts have no `for` clause. The objective check has `for: 10m`.
+# Every eval_time is a multiple of 5m, so the step does not change a result.
 
 rule_files:
   - slo-pack-v0.1.0.rules.yml
@@ -90,6 +91,20 @@ tests:
           - exp_labels: {severity: page, slo: workflow_task, window: 1h}
             exp_annotations: *workflow_task_burn_1h
 
+  - name: workflow_task counts timeouts in the total
+    # Timeouts are 1.43% of all tasks, under 1.44%. If the total left them
+    # out, the ratio would be 1.45% and the alert would fire.
+    interval: 1m
+    input_series:
+      - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="completed"}'
+        values: '0+9857x120'
+      - series: 'harvest_workflow_task_timeout_total{workflow="billing",queue="default"}'
+        values: '0+143x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: harvest_slo_workflow_task_burn_1h
+        exp_alerts: []
+
   - name: workflow_task ignores canary probe timeouts
     # Canary probes have their own SLI. Their timeouts must not count here.
     interval: 1m
@@ -114,18 +129,22 @@ tests:
         exp_alerts: []
 
   - name: workflow_task slow burn pages
-    # A steady 0.8% error ratio: under 1.44%, over 0.6%.
+    # A steady 0.8% error ratio to 380m: under 1.44%, over 0.6%.
+    # The errors then stop. At 420m the 30m window is clean, so it resets.
     interval: 1m
     input_series:
       - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="completed"}'
-        values: '0+992x420'
+        values: '0+992x380 377960+1000x39'
       - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="failed"}'
-        values: '0+8x420'
+        values: '0+8x380 3040x39'
     alert_rule_test:
-      - eval_time: 420m
+      - eval_time: 380m
         alertname: harvest_slo_workflow_task_burn_1h
         exp_alerts: []
       - eval_time: 420m
+        alertname: harvest_slo_workflow_task_burn_6h
+        exp_alerts: []
+      - eval_time: 380m
         alertname: harvest_slo_workflow_task_burn_6h
         exp_alerts:
           - exp_labels: {severity: page, slo: workflow_task, window: 6h}
@@ -135,18 +154,22 @@ tests:
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_workflow_task
 
   - name: workflow_task budget burn opens a ticket
-    # A steady 0.2% error ratio for 3 days: under 0.6%, over 0.1%.
+    # A steady 0.2% error ratio to 4000m: under 0.6%, over 0.1%.
+    # The errors then stop. At 3d the 6h window is under 0.1%, so it resets.
     interval: 1m
     input_series:
       - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="completed"}'
-        values: '0+998x4320'
+        values: '0+998x4000 3993000+1000x319'
       - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="failed"}'
-        values: '0+2x4320'
+        values: '0+2x4000 8000x319'
     alert_rule_test:
-      - eval_time: 3d
+      - eval_time: 4000m
         alertname: harvest_slo_workflow_task_burn_6h
         exp_alerts: []
       - eval_time: 3d
+        alertname: harvest_slo_workflow_task_burn_3d
+        exp_alerts: []
+      - eval_time: 4000m
         alertname: harvest_slo_workflow_task_burn_3d
         exp_alerts:
           - exp_labels: {severity: ticket, slo: workflow_task, window: 3d}
@@ -156,9 +179,14 @@ tests:
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_workflow_task
 
   - name: workflow_task inside budget stays silent
-    # A steady 0.05% error ratio for 3 days.
+    # A steady 0.05% error ratio for 3 days. Suspended and continued
+    # cycles are good events, so they must not count as errors.
     interval: 1m
     input_series:
+      - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="suspended"}'
+        values: '0+2000x4320'
+      - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="continued_as_new"}'
+        values: '0+100x4320'
       - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="completed"}'
         values: '0+1999x4320'
       - series: 'harvest_workflow_duration_count{workflow="billing",queue="default",status="failed"}'
@@ -178,19 +206,24 @@ tests:
   # Objective: 99% of tasks start within 5 s. Budget 1%.
   # Thresholds: 14.4% / 6% / 1% of tasks slower than 5 s.
 
-  - name: schedule_to_start fast burn pages
-    # Half of the tasks in the last hour take more than 5 s.
-    # The le="0.5" and le="+Inf" buckets must not match the 5 s matcher.
+  - name: schedule_to_start fast burn pages, then resets
+    # Half of the tasks take more than 5 s from 60m to 110m. Then all are fast.
+    # At 120m the 5m window is clean, so the alert resets.
+    # The other buckets must not match the 5 s matcher.
     interval: 1m
     input_series:
       - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="0.5"}'
         values: '0+40x120'
       - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="5"}'
-        values: '0+100x60 6050+50x59'
+        values: '0+100x60 6050+50x49 8600+100x9'
+      - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="50"}'
+        values: '0+100x120'
+      - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="5000"}'
+        values: '0+100x120'
       - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="+Inf"}'
         values: '0+100x120'
     alert_rule_test:
-      - eval_time: 120m
+      - eval_time: 110m
         alertname: harvest_slo_schedule_to_start_burn_1h
         exp_alerts:
           - exp_labels: {severity: page, slo: schedule_to_start, window: 1h}
@@ -198,6 +231,9 @@ tests:
               summary: "Schedule-to-start SLO: fast burn (14.4x budget)."
               description: "The share of tasks that wait over 5 s to start is over 14.4x budget in the 1h and 5m windows. At this rate, the 30-day budget runs out in about 2 days."
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_schedule_to_start
+      - eval_time: 120m
+        alertname: harvest_slo_schedule_to_start_burn_1h
+        exp_alerts: []
 
   - name: schedule_to_start fast burn pages with Prometheus 3 bucket labels
     # Prometheus 3 stores le="5" as le="5.0". The SLI must still match.
@@ -230,19 +266,20 @@ tests:
         alertname: harvest_slo_schedule_to_start_burn_1h
         exp_alerts: []
 
-  - name: schedule_to_start slow burn pages
-    # A steady 8% of tasks over 5 s: under 14.4%, over 6%.
+  - name: schedule_to_start slow burn pages, then resets
+    # A steady 8% of tasks over 5 s to 380m: under 14.4%, over 6%.
+    # Then all are fast. At 420m the 30m window is clean, so it resets.
     interval: 1m
     input_series:
       - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="+Inf"}'
         values: '0+100x420'
       - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="5"}'
-        values: '0+92x420'
+        values: '0+92x380 35060+100x39'
     alert_rule_test:
-      - eval_time: 420m
+      - eval_time: 380m
         alertname: harvest_slo_schedule_to_start_burn_1h
         exp_alerts: []
-      - eval_time: 420m
+      - eval_time: 380m
         alertname: harvest_slo_schedule_to_start_burn_6h
         exp_alerts:
           - exp_labels: {severity: page, slo: schedule_to_start, window: 6h}
@@ -250,20 +287,24 @@ tests:
               summary: "Schedule-to-start SLO: slow burn (6x budget)."
               description: "The share of tasks that wait over 5 s to start is over 6x budget in the 6h and 30m windows. At this rate, the 30-day budget runs out in 5 days."
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_schedule_to_start
+      - eval_time: 420m
+        alertname: harvest_slo_schedule_to_start_burn_6h
+        exp_alerts: []
 
-  - name: schedule_to_start budget burn opens a ticket
-    # A steady 2% of tasks over 5 s for 3 days: under 6%, over 1%.
+  - name: schedule_to_start budget burn opens a ticket, then resets
+    # A steady 2% of tasks over 5 s to 4000m: under 6%, over 1%.
+    # Then all are fast. At 3d the 6h window is under 1%, so it resets.
     interval: 1m
     input_series:
       - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="+Inf"}'
         values: '0+100x4320'
       - series: 'harvest_queue_schedule_to_start_bucket{queue="default",le="5"}'
-        values: '0+98x4320'
+        values: '0+98x4000 392100+100x319'
     alert_rule_test:
-      - eval_time: 3d
+      - eval_time: 4000m
         alertname: harvest_slo_schedule_to_start_burn_6h
         exp_alerts: []
-      - eval_time: 3d
+      - eval_time: 4000m
         alertname: harvest_slo_schedule_to_start_burn_3d
         exp_alerts:
           - exp_labels: {severity: ticket, slo: schedule_to_start, window: 3d}
@@ -271,6 +312,9 @@ tests:
               summary: "Schedule-to-start SLO: budget burn (1x budget)."
               description: "The share of tasks that wait over 5 s to start is over 1x budget in the 3d and 6h windows. At this rate, the 30-day budget runs out before the period ends."
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_schedule_to_start
+      - eval_time: 3d
+        alertname: harvest_slo_schedule_to_start_burn_3d
+        exp_alerts: []
 
   - name: schedule_to_start inside budget stays silent
     # A steady 0.5% of tasks over 5 s for 3 days.
@@ -294,16 +338,17 @@ tests:
   # ----------------------------------------------------------------------- canary
   # Objective 99%. Budget 1%. Thresholds: 14.4% / 6% / 1%.
 
-  - name: canary fast burn pages
-    # One probe a minute. Every probe fails for the last 30m.
+  - name: canary fast burn pages, then resets
+    # One probe a minute. Every probe fails from 91m to 110m.
+    # Then probes pass. At 120m the 5m window is clean, so it resets.
     interval: 1m
     input_series:
       - series: 'harvest_canary_success_total{queue="default",shard="0"}'
-        values: '0+1x90 90x29'
+        values: '0+1x90 90x19 91+1x9'
       - series: 'harvest_canary_failure_total{queue="default",shard="0"}'
-        values: '0x90 1+1x29'
+        values: '0x90 1+1x19 20x9'
     alert_rule_test:
-      - eval_time: 120m
+      - eval_time: 110m
         alertname: harvest_slo_canary_burn_1h
         exp_alerts:
           - exp_labels: {severity: page, slo: canary, window: 1h}
@@ -311,6 +356,9 @@ tests:
               summary: "Canary SLO: fast burn (14.4x budget)."
               description: "The canary probe failure ratio is over 14.4x budget in the 1h and 5m windows. At this rate, the 30-day budget runs out in about 2 days."
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_canary
+      - eval_time: 120m
+        alertname: harvest_slo_canary_burn_1h
+        exp_alerts: []
 
   - name: canary fast burn pages when no probe ever succeeds
     # No success series exists. Failures alone must page.
@@ -325,19 +373,34 @@ tests:
           - exp_labels: {severity: page, slo: canary, window: 1h}
             exp_annotations: *canary_burn_1h
 
-  - name: canary slow burn pages
-    # 50 probes a minute; 8% fail.
+  - name: canary counts failures in the total
+    # 13% of probes fail, under 14.4%. If the total left out failures, the
+    # ratio would be 13/87 = 14.9% and the alert would fire.
     interval: 1m
     input_series:
       - series: 'harvest_canary_success_total{queue="default",shard="0"}'
-        values: '0+46x420'
+        values: '0+87x120'
       - series: 'harvest_canary_failure_total{queue="default",shard="0"}'
-        values: '0+4x420'
+        values: '0+13x120'
     alert_rule_test:
-      - eval_time: 420m
+      - eval_time: 120m
         alertname: harvest_slo_canary_burn_1h
         exp_alerts: []
-      - eval_time: 420m
+
+  - name: canary slow burn pages, then resets
+    # 50 probes a minute; 8% fail to 380m. Then all pass.
+    # At 420m the 30m window is clean, so it resets.
+    interval: 1m
+    input_series:
+      - series: 'harvest_canary_success_total{queue="default",shard="0"}'
+        values: '0+46x380 17530+50x39'
+      - series: 'harvest_canary_failure_total{queue="default",shard="0"}'
+        values: '0+4x380 1520x39'
+    alert_rule_test:
+      - eval_time: 380m
+        alertname: harvest_slo_canary_burn_1h
+        exp_alerts: []
+      - eval_time: 380m
         alertname: harvest_slo_canary_burn_6h
         exp_alerts:
           - exp_labels: {severity: page, slo: canary, window: 6h}
@@ -345,20 +408,24 @@ tests:
               summary: "Canary SLO: slow burn (6x budget)."
               description: "The canary probe failure ratio is over 6x budget in the 6h and 30m windows. At this rate, the 30-day budget runs out in 5 days."
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_canary
+      - eval_time: 420m
+        alertname: harvest_slo_canary_burn_6h
+        exp_alerts: []
 
-  - name: canary budget burn opens a ticket
-    # 2% of probes fail for 3 days: under 6%, over 1%.
+  - name: canary budget burn opens a ticket, then resets
+    # 2% of probes fail to 4000m: under 6%, over 1%. Then all pass.
+    # At 3d the 6h window is under 1%, so it resets.
     interval: 1m
     input_series:
       - series: 'harvest_canary_success_total{queue="default",shard="0"}'
-        values: '0+49x4320'
+        values: '0+49x4000 196050+50x319'
       - series: 'harvest_canary_failure_total{queue="default",shard="0"}'
-        values: '0+1x4320'
+        values: '0+1x4000 4000x319'
     alert_rule_test:
-      - eval_time: 3d
+      - eval_time: 4000m
         alertname: harvest_slo_canary_burn_6h
         exp_alerts: []
-      - eval_time: 3d
+      - eval_time: 4000m
         alertname: harvest_slo_canary_burn_3d
         exp_alerts:
           - exp_labels: {severity: ticket, slo: canary, window: 3d}
@@ -366,6 +433,9 @@ tests:
               summary: "Canary SLO: budget burn (1x budget)."
               description: "The canary probe failure ratio is over 1x budget in the 3d and 6h windows. At this rate, the 30-day budget runs out before the period ends."
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_canary
+      - eval_time: 3d
+        alertname: harvest_slo_canary_burn_3d
+        exp_alerts: []
 
   - name: canary inside budget stays silent
     # 0.5% of probes fail for 3 days.
@@ -396,18 +466,30 @@ tests:
         alertname: harvest_slo_objective_invalid
         exp_alerts: []
 
-  - name: objective check opens a ticket for an out-of-range objective
+  - name: objective check opens a ticket for each out-of-range objective
     # A tune that writes 99 for 99% makes the budget negative.
+    # Each SLO group checks its own objective. The check waits 10m.
     interval: 1m
     input_series:
-      - series: 'harvest:slo_objective:ratio{slo="canary",source="bad_tune"}'
+      - series: 'harvest:slo_objective:ratio{slo="workflow_task",source="bad_tune"}'
+        values: '99.9x30'
+      - series: 'harvest:slo_objective:ratio{slo="schedule_to_start",source="bad_tune"}'
         values: '99x30'
+      - series: 'harvest:slo_objective:ratio{slo="canary",source="bad_tune"}'
+        values: '0x30'
     alert_rule_test:
+      - eval_time: 5m
+        alertname: harvest_slo_objective_invalid
+        exp_alerts: []
       - eval_time: 30m
         alertname: harvest_slo_objective_invalid
         exp_alerts:
-          - exp_labels: {severity: ticket, slo: canary, source: bad_tune}
-            exp_annotations:
+          - exp_labels: {severity: ticket, slo: workflow_task, source: bad_tune}
+            exp_annotations: &objective_invalid
               summary: "An SLO objective is missing or out of range."
               description: "Each SLO needs one harvest:slo_objective:ratio record with a value above 0 and below 1. Until you fix it, the burn alerts for that SLO are wrong."
               runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_objective_invalid
+          - exp_labels: {severity: ticket, slo: schedule_to_start, source: bad_tune}
+            exp_annotations: *objective_invalid
+          - exp_labels: {severity: ticket, slo: canary, source: bad_tune}
+            exp_annotations: *objective_invalid

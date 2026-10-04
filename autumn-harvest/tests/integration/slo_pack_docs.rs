@@ -111,11 +111,18 @@ fn every_sli_records_its_objective_and_each_window() {
         );
         for window in WINDOWS {
             let name = format!("{}{window}", sli.ratio_prefix);
-            assert!(
-                rules
-                    .iter()
-                    .any(|rule| rule["record"].as_str() == Some(name.as_str())),
-                "missing recording rule {name}"
+            let expr = recording_expr(&name);
+            // A steady fixture ratio is the same over any range, so promtool
+            // cannot see a wrong range. Each range must match the name.
+            let ranges: BTreeSet<&str> = expr
+                .split('[')
+                .skip(1)
+                .filter_map(|rest| rest.split(']').next())
+                .collect();
+            assert_eq!(
+                ranges,
+                BTreeSet::from([*window]),
+                "{name} must read only [{window}] ranges: {expr}"
             );
         }
     }
@@ -189,6 +196,21 @@ fn every_alert_has_a_firing_and_a_silent_promtool_case() {
         assert!(
             mine.iter().any(|case| exp_alerts(case).is_empty()),
             "{name} has no promtool case that expects it to stay silent"
+        );
+    }
+    // Each SLO group has its own copy of the objective check, so each copy
+    // needs a case that fires.
+    let fired: BTreeSet<&str> = cases
+        .iter()
+        .filter(|case| case["alertname"].as_str() == Some(OBJECTIVE_ALERT))
+        .flat_map(|case| case["exp_alerts"].as_sequence().into_iter().flatten())
+        .filter_map(|alert| alert["exp_labels"]["slo"].as_str())
+        .collect();
+    for sli in SLIS {
+        assert!(
+            fired.contains(sli.key),
+            "no promtool case fires {OBJECTIVE_ALERT} for slo={}",
+            sli.key
         );
     }
 }

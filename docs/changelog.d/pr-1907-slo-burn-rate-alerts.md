@@ -34,7 +34,9 @@ the objective check. Those sections link to the existing triage sections.
 alerts a case that fires and a case that stays silent. It also covers the
 time-out-only outage, timeouts mixed with completed cycles, excluded canary
 timeouts, the `le="5.0"` form, a worker without buckets, zero traffic, a
-short-window reset, and a short spike that the long window holds back. The CI `lint` job runs `promtool check rules` and `promtool test
+short spike that the long window holds back, and a short-window reset for
+every tier. Cases near a threshold prove that each total includes its bad
+events. A mutation run of the rules (17 mutants) kills every mutant. The CI `lint` job runs `promtool check rules` and `promtool test
 rules` with a pinned, checksummed `promtool` 3.5.0. The guard suite
 `autumn-harvest/tests/integration/slo_pack_docs.rs` pins the burn-rate
 pairs, the objectives in the docs, the runbook links, the metric names, and
