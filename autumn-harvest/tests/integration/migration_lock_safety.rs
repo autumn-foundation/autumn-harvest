@@ -1752,7 +1752,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 
     function_settings(&s, &mut body_timeouts);
     foreign_do_bodies(&s, &mut raws, &mut timeouts, &mut body_timeouts);
-    unreadable_settings(&s, sql, &unconditional, history, &mut raws);
+    unreadable_settings(&s, sql, &unconditional, path_change, history, &mut raws);
     call_clears(
         &s,
         history,
@@ -1892,10 +1892,11 @@ fn unreadable_settings(
     s: &Stmts,
     sql: &str,
     unconditional: &[bool],
+    path_change: Option<usize>,
     history: &mut History,
     raws: &mut Vec<Raw>,
 ) {
-    nonstandard_strings(s, sql, unconditional, history, raws);
+    nonstandard_strings(s, sql, unconditional, path_change, history, raws);
     routine_resets(s, raws);
 }
 
@@ -1915,6 +1916,7 @@ fn nonstandard_strings(
     s: &Stmts,
     sql: &str,
     unconditional: &[bool],
+    path_change: Option<usize>,
     history: &mut History,
     raws: &mut Vec<Raw>,
 ) {
@@ -1963,7 +1965,7 @@ fn nonstandard_strings(
         // A routine body may run in a later transaction, so only a top-level
         // local value ends at the commit.
         let top = s.toks[k].depth == 0;
-        match conforming_change(s, k).map(|(on, local)| (on, local && top)) {
+        match conforming_change(s, k, path_change).map(|(on, local)| (on, local && top)) {
             Some((false, true)) => {
                 raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
                 local = true;
@@ -1989,7 +1991,7 @@ fn nonstandard_strings(
 /// Only a session value counts as `true`. A transaction-local `on` ends at
 /// the commit and restores the session value, so it changes nothing. A scope
 /// the lint cannot read counts as the session.
-fn conforming_change(s: &Stmts, k: usize) -> Option<(bool, bool)> {
+fn conforming_change(s: &Stmts, k: usize, path_change: Option<usize>) -> Option<(bool, bool)> {
     let literal = |j: usize| s.word(j).or_else(|| s.string(j));
     let on = |j: usize| literal(j).is_some_and(pg_true);
     let start = s.starts[k] == k;
@@ -2015,8 +2017,18 @@ fn conforming_change(s: &Stmts, k: usize) -> Option<(bool, bool)> {
             .filter(|&(on, local)| !(on && local));
     }
     let call = s.is(k, "set_config") && s.is_punct(k + 1, '(');
-    // A name that the lint cannot read may name this setting too, with any
-    // value. So the call counts as a session `off`, which fails closed.
+    // Another schema's `set_config`, or an unqualified one after a path
+    // change, may be a user function. So it never turns the setting on. A
+    // name that the lint cannot read counts as a session `off`.
+    let schema = (k >= 2 && s.is_punct(k - 1, '.')).then(|| s.word(k - 2));
+    let built_in = match schema {
+        Some(name) => name == Some("pg_catalog"),
+        // A call resolves before its own statement changes the path.
+        None => path_change.is_none_or(|c| c >= s.starts[k]),
+    };
+    if call && !built_in {
+        return None;
+    }
     let name = call.then(|| set_config_name(s, k));
     if name == Some(None) {
         return Some((false, false));
@@ -6313,6 +6325,37 @@ fn nonstandard_strings_carry_into_later_migrations() {
             .any(|f| f.detail.contains("standard_conforming_strings")),
         "{findings:?}"
     );
+}
+
+#[test]
+fn only_the_built_in_set_config_turns_conforming_strings_on() {
+    let off = "-- lock-safety: allow lock-timeout #1810 test fixture\n\
+               SET standard_conforming_strings = off;";
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let tainted = |findings: &[Finding]| {
+        findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings"))
+    };
+    // Another schema's `set_config`, or an unqualified one after a path
+    // change, may be a user function.
+    for on in [
+        "SELECT other.set_config('standard_conforming_strings', 'on', false);",
+        "SET search_path = other, pg_catalog;\nSELECT set_config('standard_conforming_strings', 'on', false);",
+    ] {
+        let sql = format!("{on}\n{hidden}");
+        let findings = lint_with_history(&[off], &sql, true);
+        assert!(tainted(&findings), "{sql}\n{findings:?}");
+    }
+    // The built-in turns it on.
+    for on in [
+        "SELECT pg_catalog.set_config('standard_conforming_strings', 'on', false);",
+        "SELECT set_config('standard_conforming_strings', 'on', false);",
+    ] {
+        let sql = format!("{on}\n{hidden}");
+        let findings = lint_with_history(&[off], &sql, true);
+        assert!(!tainted(&findings), "{sql}\n{findings:?}");
+    }
 }
 
 #[test]

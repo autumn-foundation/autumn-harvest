@@ -292,7 +292,7 @@ that no longer matches a finding also fails the build.
   not one literal. While it is off, each statement with a
   backslash counts the same way, later in the file and in later migrations,
   until a reset that surely runs. A reset in a function body or in a branch
-  does not count. A `ROLLBACK` restores the value from the start of its
+  does not count. Nor does a `set_config` that may not be the built-in. A `ROLLBACK` restores the value from the start of its
   transaction. A top-level `SET LOCAL` ends at the commit. A local value in a
   routine body carries, because the body may run in any later transaction.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
