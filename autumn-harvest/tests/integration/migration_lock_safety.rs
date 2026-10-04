@@ -208,6 +208,9 @@ struct History {
     /// Each partition of a hot table, without its schema. A partition takes
     /// the live writes of its parent, so it is hot too.
     partitions: BTreeSet<String>,
+    /// Each table that a migration created with `PARTITION BY`, without its
+    /// schema. Postgres runs no `CONCURRENTLY` index DDL on such a table.
+    partitioned: BTreeSet<String>,
 }
 
 impl History {
@@ -231,6 +234,11 @@ impl History {
             .find(|t| self.is_hot(t))
             .or_else(|| tables.iter().next())
             .cloned()
+    }
+
+    /// Whether `table` is a partitioned table, which rejects `CONCURRENTLY`.
+    fn is_partitioned(&self, table: &str) -> bool {
+        PARTITIONED_TABLES.contains(&base(table)) || self.partitioned.contains(base(table))
     }
 
     /// Forget every index on `table`.
@@ -295,7 +303,7 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
                 && hit
                     .table
                     .as_deref()
-                    .is_none_or(|t| PARTITIONED_TABLES.contains(&base(t)));
+                    .is_none_or(|t| history.is_partitioned(t));
             if partitioned {
                 findings.push(Finding {
                     rule: Rule::BlockingIndex,
@@ -1057,6 +1065,13 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 let sure = tok.runs && unconditional[k];
                 let created = if sure { &mut created } else { &mut not_run };
                 create(&s, k, &mut raws, created);
+                // A partitioned table is learnt even from a branch, which
+                // fails closed.
+                if s.has_pair(k, "partition", "by")
+                    && let Some(table) = s.statement_table(k)
+                {
+                    history.partitioned.insert(base(&table).to_string());
+                }
             }
             Some("drop") if start => drop(&s, k, history, &mut raws),
             Some("alter") if start => alter(&s, k, history, &mut raws),
@@ -1533,8 +1548,10 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
         .entry(base(&new).to_string())
         .or_default()
         .extend(keys);
-    if history.partitions.contains(base(&old)) {
-        history.partitions.insert(base(&new).to_string());
+    for names in [&mut history.partitions, &mut history.partitioned] {
+        if names.contains(base(&old)) {
+            names.insert(base(&new).to_string());
+        }
     }
     // An index on the old name now sits on the new one. A foreign key that
     // pointed at the old name now points at the new one.
@@ -3288,6 +3305,25 @@ fn a_sure_table_drop_forgets_its_indexes() {
     let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;";
     let findings = lint_with_history(&history, sql, true);
     assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn concurrently_cannot_reach_a_partitioned_child() {
+    // A child with `PARTITION BY` is a partitioned table too.
+    let history = ["CREATE TABLE events_2026 PARTITION OF harvest_events \
+                    FOR VALUES FROM (1) TO (2) PARTITION BY RANGE (id);"];
+    let sql = "CREATE INDEX CONCURRENTLY idx_x ON events_2026 (id);";
+    let findings = lint_with_history(&history, sql, false);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+    // A rename keeps the table partitioned.
+    let renamed = [history[0], "ALTER TABLE events_2026 RENAME TO events_y;"];
+    let sql = "CREATE INDEX CONCURRENTLY idx_x ON events_y (id);";
+    let findings = lint_with_history(&renamed, sql, false);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+    // A leaf partition takes `CONCURRENTLY`.
+    let leaf = ["CREATE TABLE events_p PARTITION OF harvest_events FOR VALUES FROM (1) TO (2);"];
+    let sql = "CREATE INDEX CONCURRENTLY idx_x ON events_p (id);";
+    assert_eq!(lint_with_history(&leaf, sql, false), []);
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

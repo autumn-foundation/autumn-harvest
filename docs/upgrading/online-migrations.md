@@ -150,7 +150,8 @@ does not block reads or writes, so this statement needs no `lock_timeout`.
 into a partitioned parent. Postgres does not build or drop an index
 `CONCURRENTLY` on a partitioned parent, so the lint flags both forms there as
 `blocking-index`. Build the index on each partition first, then on the parent.
-`docs/partitioned-events.md` and
+A partition created with `PARTITION BY` is a partitioned table too, and the
+lint flags it the same way. `docs/partitioned-events.md` and
 `20260905181020_harvest_usage_activity_lookback_index/up.sql` give the recipe.
 Then annotate the statement. The lint also flags a concurrent `DROP INDEX` of
 an index it cannot place, because that index may sit on the parent.
