@@ -15279,7 +15279,7 @@ async fn handle_session_acquire(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
+) -> HarvestResult<Option<queue::ClaimWrite>> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
     let Some(activity_uuid) = task.activity_id else {
@@ -15288,7 +15288,8 @@ async fn handle_session_acquire(
             task.id,
             "session-acquire task missing activity_id",
         )
-        .await;
+        .await
+        .map(|()| None);
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
@@ -15332,7 +15333,8 @@ async fn handle_session_acquire(
             activity_id,
             codecs,
         )
-        .await;
+        .await
+        .map(|()| None);
     }
 
     if !crate::sessions::try_acquire_session_slot(
@@ -15363,7 +15365,7 @@ async fn handle_session_acquire(
         {
             log_lease_lost(task, "session acquire deferral");
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let expires_at = chrono::Utc::now()
@@ -15415,7 +15417,8 @@ async fn handle_session_acquire(
                 &payload,
                 codecs,
             )
-            .await;
+            .await
+            .map(|()| None);
         }
         Err(error) => {
             // Failed to durably record the session -- release the slot just
@@ -15447,7 +15450,9 @@ async fn handle_session_acquire(
         crate::telemetry::SessionAcquisitionOutcome::Acquired,
     );
     let output = serde_json::json!(actual_host);
-    finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None, codecs).await
+    finalize_activity_completion_write(&mut conn, task, exec_id, activity_id, output, None, codecs)
+        .await
+        .map(Some)
 }
 
 /// Handle the internal session-release activity (issue #606), dispatched by
@@ -15465,7 +15470,7 @@ async fn handle_session_release(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
+) -> HarvestResult<Option<queue::ClaimWrite>> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
     let Some(activity_uuid) = task.activity_id else {
@@ -15474,7 +15479,8 @@ async fn handle_session_release(
             task.id,
             "session-release task missing activity_id",
         )
-        .await;
+        .await
+        .map(|()| None);
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
@@ -15500,7 +15506,9 @@ async fn handle_session_release(
     crate::sessions::release_session_slot(session_slots_in_use, session_id);
 
     let output = serde_json::Value::Null;
-    finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None, codecs).await
+    finalize_activity_completion_write(&mut conn, task, exec_id, activity_id, output, None, codecs)
+        .await
+        .map(Some)
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -15533,29 +15541,42 @@ async fn process_activity_task(
     // `session_internal_activity_info`) so the enqueue-time lookup in
     // `persist_scheduled_activities` succeeds, but their `handler` fn is a
     // stub that must never actually run.
-    if activity_name == crate::context::SESSION_ACQUIRE_ACTIVITY_NAME {
-        return handle_session_acquire(
-            pool,
-            task,
-            worker_id,
-            exec_id,
-            max_concurrent_sessions,
-            session_slots_in_use,
-            registry.telemetry().metrics.as_ref(),
-            registry.payload_codecs(),
+    // Issue #1815: a reserved session activity counts in the outlier window
+    // when it finalizes or fails, as any activity does.
+    let session_result = if activity_name == crate::context::SESSION_ACQUIRE_ACTIVITY_NAME {
+        Some(
+            handle_session_acquire(
+                pool,
+                task,
+                worker_id,
+                exec_id,
+                max_concurrent_sessions,
+                session_slots_in_use,
+                registry.telemetry().metrics.as_ref(),
+                registry.payload_codecs(),
+            )
+            .await,
         )
-        .await;
-    }
-    if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
-        return handle_session_release(
-            pool,
-            task,
-            worker_id,
-            exec_id,
-            session_slots_in_use,
-            registry.payload_codecs(),
+    } else if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
+        Some(
+            handle_session_release(
+                pool,
+                task,
+                worker_id,
+                exec_id,
+                session_slots_in_use,
+                registry.payload_codecs(),
+            )
+            .await,
         )
-        .await;
+    } else {
+        None
+    };
+    if let Some(result) = session_result {
+        if let Some(failed) = session_task_outcome(&result) {
+            task_outcomes.record(failed, Duration::ZERO);
+        }
+        return result.map(|_| ());
     }
 
     let Some(activity) = registry.activities.get(activity_name) else {
@@ -16404,6 +16425,21 @@ fn count_setup_failure<T>(
         window.record(true, Duration::ZERO);
     }
     result
+}
+
+/// How a reserved session activity enters the outlier window (issue #1815).
+///
+/// `result` is `Ok(None)` when the task left without a finalize of its own.
+/// Examples are a capacity deferral, a schedule-to-start timeout, a session
+/// broken elsewhere and a malformed task. Those say nothing about the worker,
+/// so they are skipped, and so is a lost claim. An applied finalize is a success, and an
+/// error is a failure.
+const fn session_task_outcome(result: &HarvestResult<Option<queue::ClaimWrite>>) -> Option<bool> {
+    match result {
+        Ok(Some(queue::ClaimWrite::Applied)) => Some(false),
+        Ok(Some(queue::ClaimWrite::LeaseLost) | None) => None,
+        Err(_) => Some(true),
+    }
 }
 
 /// How an activity attempt enters the outlier window (issue #1815).
@@ -30550,6 +30586,7 @@ impl Worker {
                         self.config.max_concurrent_activities,
                         self.config.slot_tuner.as_ref(),
                     ),
+                    self.config.max_concurrent_sessions,
                 ),
                 compare: true,
                 slot: shard_slot,
@@ -40253,6 +40290,24 @@ mod tests {
         ] {
             assert_eq!(activity_attempt_outcome(status, true, finalized), None);
         }
+    }
+
+    /// Issue #1815: a session acquire or release counts when it finalizes or
+    /// fails. A deferral or a lost claim is skipped.
+    #[test]
+    fn session_task_outcome_counts_finalizes_and_failures_only() {
+        use queue::ClaimWrite::{Applied, LeaseLost};
+        assert_eq!(session_task_outcome(&Ok(Some(Applied))), Some(false));
+        assert_eq!(
+            session_task_outcome(&Err(HarvestError::Config("db".into()))),
+            Some(true)
+        );
+        assert_eq!(session_task_outcome(&Ok(Some(LeaseLost))), None);
+        assert_eq!(
+            session_task_outcome(&Ok(None)),
+            None,
+            "a deferral is skipped"
+        );
     }
 
     /// Issue #1815: two pools on one shard and sink sum. A pool that two

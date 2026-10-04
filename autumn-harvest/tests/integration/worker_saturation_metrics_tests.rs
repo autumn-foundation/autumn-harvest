@@ -167,6 +167,7 @@ fn cohort(queue: &str) -> String {
         "",
         &HashMap::<String, String>::new(),
         workers::SlotPolicy::of(1, 1, None),
+        0,
     )
 }
 
@@ -618,6 +619,7 @@ async fn a_long_cohort_key_still_stores() {
         "",
         &HashMap::<String, String>::new(),
         workers::SlotPolicy::of(1, 1, None),
+        0,
     );
     assert!(key.len() > 10_000, "the key is long: {}", key.len());
     workers::upsert_worker_task_stats(&mut conn, &id, &key, &WorkerTaskStats::default())

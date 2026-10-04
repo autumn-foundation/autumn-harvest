@@ -1544,7 +1544,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Gauge, 1 or 0, one series per worker and dimension. Each worker reports itself, so the instance label identifies the worker. A worker is compared only with live peers that poll the same queues with the same queue weights, on the same build with the same labels and the same slots per task kind. It needs at least 20 tasks in its window, and 2 such peers, before the gauge can read 1. The window holds at most 1024 tasks, from the last 5 minutes or two heartbeat intervals, whichever is longer. A tick that cannot compare sets 0.",
+        "notes": "Gauge, 1 or 0, one series per worker and dimension. Each worker reports itself, so the instance label identifies the worker. A worker is compared only with live peers that poll the same queues with the same queue weights, on the same build with the same labels, slots per task kind and session capacity. It needs at least 20 tasks in its window, and 2 such peers, before the gauge can read 1. The window holds at most 1024 tasks, from the last 5 minutes or two heartbeat intervals, whichever is longer. A tick that cannot compare sets 0.",
         "expressions": [
           {
             "kind": "promql",

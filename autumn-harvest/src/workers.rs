@@ -881,6 +881,8 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   only to a matching build.
 /// - `labels`: the claim predicate matches `required_capabilities` against
 ///   these labels, sorted by key.
+/// - `sessions`: the worker's session capacity. Session member activities are
+///   pinned to the session's host, so only a worker with capacity gets them.
 /// - `slots`: the worker's [`SlotPolicy`]. A worker with no slot for one kind
 ///   claims only the other. Under load, the claim gate gives each worker a
 ///   task mix that follows its slots, so two sizes are two cohorts.
@@ -893,6 +895,7 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
     build_id: &str,
     labels: &std::collections::HashMap<String, String, L>,
     slots: SlotPolicy,
+    session_slots: i32,
 ) -> String {
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -914,6 +917,7 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
         "build_id": build_id,
         "labels": labels,
         "slots": slots.key(),
+        "sessions": session_slots.max(0),
     })
     .to_string()
 }
@@ -2828,6 +2832,7 @@ mod tests {
             build,
             &labels,
             super::SlotPolicy::of(1, 1, None),
+            0,
         )
     }
 
@@ -2846,12 +2851,40 @@ mod tests {
                 "v1",
                 &labels,
                 super::SlotPolicy::of(workflows, activities, None),
+                0,
             )
         };
         assert_ne!(slots(10, 0), slots(0, 10));
         assert_ne!(slots(10, 10), slots(10, 0));
         assert_ne!(slots(10, 10), slots(0, 10));
         assert_eq!(slots(10, 10), slots(10, 10));
+    }
+
+    /// Issue #1815: session member activities are pinned to the session's
+    /// host. A worker with session capacity gets that work and one without
+    /// does not, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_session_capacity() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let sessions = |n| {
+            super::worker_cohort(
+                &queues,
+                &none,
+                "v1",
+                &labels,
+                super::SlotPolicy::of(10, 10, None),
+                n,
+            )
+        };
+        assert_ne!(sessions(0), sessions(4));
+        assert_ne!(sessions(4), sessions(8));
+        assert_eq!(
+            sessions(0),
+            sessions(-1),
+            "a negative capacity is no capacity"
+        );
     }
 
     /// Issue #1815: a slot tuner clamps the configured maximums into its band
@@ -2892,6 +2925,7 @@ mod tests {
                 "v1",
                 &labels,
                 super::SlotPolicy::of(workflows, activities, None),
+                0,
             )
         };
         assert_ne!(slots(100, 1), slots(1, 100));
