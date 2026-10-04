@@ -50,10 +50,10 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - Two workers in one process share the gauge, so it reports the OR of their
   verdicts.
 - The peers are the live `Active` workers that poll the same queues with the
-  same `queue_weights`, on the same build with the same labels, with fresh
-  stats. Those decide which tasks a worker can claim. A worker on a slow queue is not
-  compared with a fast queue. Each heartbeat reads only its own cohort, so
-  the read stays small in a large fleet.
+  same `queue_weights`, on the same build with the same labels and task
+  kinds, with fresh stats. Those decide which tasks a worker can claim. A
+  worker on a slow queue is not compared with a fast queue. Each heartbeat
+  reads only its own cohort, so the read stays small in a large fleet.
 - A worker is an outlier on failure ratio when its ratio is at least 20
   points above the peer median. The ratio must also be at least twice the
   median.

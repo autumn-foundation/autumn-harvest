@@ -166,6 +166,8 @@ fn cohort(queue: &str) -> String {
         &HashMap::new(),
         "",
         &HashMap::<String, String>::new(),
+        true,
+        true,
     )
 }
 
@@ -524,6 +526,45 @@ async fn the_heartbeat_reads_only_its_own_cohort() {
         find(&all, &ids[2]).is_some(),
         "the full read keeps other cohorts"
     );
+}
+
+/// Two heartbeats of one worker can write one row, as colocated shards that
+/// share a database do. A snapshot captured earlier but written later does
+/// not replace the newer one.
+#[tokio::test]
+async fn a_late_write_of_an_older_snapshot_is_dropped() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("late-q");
+    let id = unique_id("w-late");
+    register(&mut conn, &id, &queue).await;
+    let (older, older_seq) = workers::capture_task_stats(&window(40, None));
+    let (newer, newer_seq) = workers::capture_task_stats(&window(60, Some(2)));
+    assert!(
+        newer_seq > older_seq,
+        "a later capture has a higher sequence"
+    );
+
+    let first =
+        workers::write_task_stats_snapshot(&mut conn, &id, &cohort(&queue), &newer, newer_seq)
+            .await
+            .expect("write the newer snapshot");
+    assert_eq!(first, workers::SnapshotWrite::Stored);
+    let late =
+        workers::write_task_stats_snapshot(&mut conn, &id, &cohort(&queue), &older, older_seq)
+            .await
+            .expect("write the older snapshot");
+    assert_eq!(late, workers::SnapshotWrite::Superseded);
+
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60, None)
+        .await
+        .expect("load");
+    let row = rows
+        .iter()
+        .find(|r| r.worker_id == id)
+        .expect("the row is live");
+    assert_eq!(row.stats, newer, "the newer snapshot stays");
+    assert_eq!(row.snapshot_seq, newer_seq);
 }
 
 /// A frozen stats row leaves the live set. The prune deletes a row once it

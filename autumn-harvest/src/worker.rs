@@ -15810,37 +15810,44 @@ async fn process_activity_task(
             &task.queue_name,
             ActivityStatus::Failed,
         );
+        let finalized = async {
+            let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+            let retry_policy_result = configured_retry_policy(task);
+            let retry_policy = fail_execution_on_error(
+                &mut conn,
+                task,
+                worker_id,
+                retry_policy_result,
+                registry.payload_codecs(),
+            )
+            .await?;
+            handle_activity_result(
+                &mut conn,
+                task,
+                exec_id,
+                activity_id,
+                worker_id,
+                retry_policy.as_ref(),
+                Err(payload),
+                0,
+                activity_name,
+                registry.payload_offloader(),
+                telemetry.metrics.as_ref(),
+                registry.retry_after_ceiling,
+                registry.payload_codecs(),
+            )
+            .await
+        }
+        .await;
         // Issue #1815: a breaker is per worker, so a rejected attempt counts as
         // a failure. Otherwise the ratio would improve while the worker rejects
-        // work.
-        task_outcomes.record(true, Duration::ZERO);
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        let retry_policy_result = configured_retry_policy(task);
-        let retry_policy = fail_execution_on_error(
-            &mut conn,
-            task,
-            worker_id,
-            retry_policy_result,
-            registry.payload_codecs(),
-        )
-        .await?;
-        return handle_activity_result(
-            &mut conn,
-            task,
-            exec_id,
-            activity_id,
-            worker_id,
-            retry_policy.as_ref(),
-            Err(payload),
-            0,
-            activity_name,
-            registry.payload_offloader(),
-            telemetry.metrics.as_ref(),
-            registry.retry_after_ceiling,
-            registry.payload_codecs(),
-        )
-        .await
-        .map(|_| ());
+        // work. A rejection whose claim a later owner took is skipped, as for
+        // any attempt.
+        let write = finalized.as_ref().ok().copied();
+        if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write) {
+            task_outcomes.record(failed, Duration::ZERO);
+        }
+        return finalized.map(|_| ());
     }
 
     let cancel = CancellationToken::new();
@@ -30538,6 +30545,8 @@ impl Worker {
                     &self.config.queue_weights,
                     &self.config.build_id,
                     &self.config.labels,
+                    self.config.max_concurrent_workflows > 0,
+                    self.config.max_concurrent_activities > 0,
                 ),
                 compare: true,
                 slot: shard_slot,

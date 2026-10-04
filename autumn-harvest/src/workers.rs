@@ -814,8 +814,8 @@ pub struct LiveWorkerTaskStats {
     /// The worker's cohort key, from [`worker_cohort`].
     ///
     /// Workers in one cohort poll the same queues with the same weights. They
-    /// also share a build and labels, so they do the same work. A worker is compared only with peers in its own
-    /// cohort.
+    /// also share a build, labels and task kinds, so they do the same work. A
+    /// worker is compared only with peers in its own cohort.
     pub cohort: String,
     /// The published snapshot.
     pub stats: WorkerTaskStats,
@@ -880,6 +880,8 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   only to a matching build.
 /// - `labels`: the claim predicate matches `required_capabilities` against
 ///   these labels, sorted by key.
+/// - `kinds`: the task kinds the worker has slots for. A worker with no slot
+///   for one kind claims only the other.
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -888,6 +890,8 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
     weights: &std::collections::HashMap<String, u32, S>,
     build_id: &str,
     labels: &std::collections::HashMap<String, String, L>,
+    takes_workflows: bool,
+    takes_activities: bool,
 ) -> String {
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -904,27 +908,69 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    serde_json::json!({ "queues": routing, "build_id": build_id, "labels": labels }).to_string()
+    let kinds: Vec<&str> = [
+        (takes_workflows, "workflow"),
+        (takes_activities, "activity"),
+    ]
+    .into_iter()
+    .filter_map(|(takes, kind)| takes.then_some(kind))
+    .collect();
+    serde_json::json!({
+        "queues": routing,
+        "build_id": build_id,
+        "labels": labels,
+        "kinds": kinds,
+    })
+    .to_string()
 }
 
-/// Write one worker's task stats snapshot (issue #1815).
+/// What one task-stats write did (issue #1815).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotWrite {
+    /// The snapshot is stored.
+    Stored,
+    /// A newer snapshot of this process is already stored, so this one is
+    /// dropped. Two heartbeats of one worker can write one row, when
+    /// colocated shards share a database.
+    Superseded,
+    /// A row that this process did not write holds a higher sequence, for
+    /// example from the worker's previous process. The counter now runs above
+    /// it, so a fresh snapshot written next is stored.
+    Foreign,
+}
+
+/// Capture `window` and give it the next snapshot sequence, as one step
+/// (issue #1815).
+///
+/// Two heartbeats of one worker then cannot pair an older window with a newer
+/// sequence.
+pub fn capture_task_stats(window: &TaskOutcomeWindow) -> (WorkerTaskStats, i64) {
+    static CAPTURE: Mutex<()> = Mutex::new(());
+    let _capture = CAPTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (window.snapshot(), next_snapshot_seq())
+}
+
+/// Write one worker's task stats snapshot with sequence `seq` (issue #1815).
 ///
 /// The write is an upsert. It fails on the foreign key when the worker row is
 /// missing. The next heartbeat heals the worker row and then retries.
 ///
-/// The stored sequence is above the old row's sequence, also when a previous
-/// process of the same worker wrote that row. The process counter then moves
-/// above the stored value.
+/// The upsert replaces only a row with a lower sequence, so a snapshot that
+/// arrives late never replaces a newer one. A rejected write reads the stored
+/// sequence and moves the counter above it.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError`] on database failure.
-pub async fn upsert_worker_task_stats(
+pub async fn write_task_stats_snapshot(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     cohort: &str,
     stats: &WorkerTaskStats,
-) -> HarvestResult<()> {
+    seq: i64,
+) -> HarvestResult<SnapshotWrite> {
     let to_i32 = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
     let stored = diesel::sql_query(
         "INSERT INTO harvest_worker_task_stats \
@@ -936,9 +982,9 @@ pub async fn upsert_worker_task_stats(
              window_tasks = EXCLUDED.window_tasks, \
              window_failures = EXCLUDED.window_failures, \
              p99_latency_ms = EXCLUDED.p99_latency_ms, \
-             snapshot_seq = GREATEST(harvest_worker_task_stats.snapshot_seq + 1, \
-                                     EXCLUDED.snapshot_seq), \
+             snapshot_seq = EXCLUDED.snapshot_seq, \
              updated_at = EXCLUDED.updated_at \
+         WHERE harvest_worker_task_stats.snapshot_seq < EXCLUDED.snapshot_seq \
          RETURNING snapshot_seq",
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
@@ -949,12 +995,56 @@ pub async fn upsert_worker_task_stats(
             .p99_latency_ms
             .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
     )
-    .bind::<diesel::sql_types::BigInt, _>(next_snapshot_seq())
+    .bind::<diesel::sql_types::BigInt, _>(seq)
     .bind::<diesel::sql_types::Text, _>(cohort)
     .get_result::<StoredSnapshotSeq>(conn)
     .await
+    .optional()
     .map_err(crate::error::database_error)?;
-    observe_snapshot_seq(stored.snapshot_seq);
+    if stored.is_some() {
+        return Ok(SnapshotWrite::Stored);
+    }
+    let existing: StoredSnapshotSeq = diesel::sql_query(
+        "SELECT snapshot_seq FROM harvest_worker_task_stats WHERE worker_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    // This process has issued every sequence below its counter. A stored
+    // sequence at or above the counter came from another process.
+    let issued = std::sync::atomic::AtomicI64::load(&SNAPSHOT_SEQ, Ordering::Relaxed);
+    let foreign = existing.snapshot_seq >= issued;
+    observe_snapshot_seq(existing.snapshot_seq);
+    Ok(if foreign {
+        SnapshotWrite::Foreign
+    } else {
+        SnapshotWrite::Superseded
+    })
+}
+
+/// Write one worker's current task stats (issue #1815).
+///
+/// The snapshot takes the next sequence. A row from a previous process of the
+/// same worker can hold a higher one. The write then retries once, above it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn upsert_worker_task_stats(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    cohort: &str,
+    stats: &WorkerTaskStats,
+) -> HarvestResult<()> {
+    for _ in 0..2 {
+        let seq = next_snapshot_seq();
+        if write_task_stats_snapshot(conn, worker_id, cohort, stats, seq).await?
+            != SnapshotWrite::Foreign
+        {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -1094,8 +1184,18 @@ pub async fn run_outlier_tick(
     probe: &OutlierProbe,
     draining: bool,
 ) -> HarvestResult<Vec<OutlierDimension>> {
-    let own = probe.window.snapshot();
-    upsert_worker_task_stats(conn, worker_id, &probe.cohort, &own).await?;
+    // A row of the worker's previous process can hold a higher sequence. The
+    // first write then moves the counter above it, and a fresh capture follows.
+    let mut own = WorkerTaskStats::default();
+    for _ in 0..2 {
+        let (stats, seq) = capture_task_stats(&probe.window);
+        own = stats;
+        if write_task_stats_snapshot(conn, worker_id, &probe.cohort, &own, seq).await?
+            != SnapshotWrite::Foreign
+        {
+            break;
+        }
+    }
     // Every shard heartbeat prunes its own database, whether it compares or not.
     prune_worker_task_stats(conn, probe.fleet_stale_secs).await?;
     if !probe.metrics.is_enabled() {
@@ -2665,7 +2765,24 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        super::worker_cohort(&queues, &weights, build, &labels)
+        super::worker_cohort(&queues, &weights, build, &labels, true, true)
+    }
+
+    /// Issue #1815: a worker with no slot for one task kind claims only the
+    /// other kind. An activity-only worker and a workflow-only worker do
+    /// disjoint work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_task_kinds() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let kinds = |workflows, activities| {
+            super::worker_cohort(&queues, &none, "v1", &labels, workflows, activities)
+        };
+        assert_ne!(kinds(true, false), kinds(false, true));
+        assert_ne!(kinds(true, true), kinds(true, false));
+        assert_ne!(kinds(true, true), kinds(false, true));
+        assert_eq!(kinds(true, true), kinds(true, true));
     }
 
     /// Issue #1815: workers that poll the same queues with different weights
