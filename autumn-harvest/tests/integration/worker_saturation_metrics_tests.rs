@@ -161,7 +161,12 @@ fn window(tasks: u32, fail_every: Option<u32>) -> Arc<TaskOutcomeWindow> {
 
 /// The cohort key of a worker that polls `queue` alone, with no weights.
 fn cohort(queue: &str) -> String {
-    workers::worker_cohort(&[queue.to_owned()], &HashMap::new())
+    workers::worker_cohort(
+        &[queue.to_owned()],
+        &HashMap::new(),
+        "",
+        &HashMap::<String, String>::new(),
+    )
 }
 
 fn probe(queue: &str, window: Arc<TaskOutcomeWindow>, metrics: Arc<Recording>) -> OutlierProbe {
@@ -294,14 +299,14 @@ async fn outlier_tick_flags_the_worker_failing_half_its_tasks() {
             p99_latency_ms: Some(20)
         })
     );
-    let cohort = rows
+    let stored = rows
         .iter()
         .find(|row| row.worker_id == sick)
         .map(|row| row.cohort.clone());
     assert_eq!(
-        cohort,
-        Some(format!("[\"{queue}\"]")),
-        "the cohort is the queue list"
+        stored,
+        Some(cohort(&queue)),
+        "the cohort is the worker's own key"
     );
 }
 

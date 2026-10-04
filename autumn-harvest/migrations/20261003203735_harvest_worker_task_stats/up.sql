@@ -13,8 +13,8 @@
 -- only. `snapshot_seq` comes from the worker. It orders one worker's rows
 -- across shards whose clocks differ.
 --
--- `cohort` is the worker's queues and queue weights, as the worker computes
--- them. A worker is compared only with its cohort. The heartbeat reads only
+-- `cohort` is the worker's queues, queue weights, build id and labels, as the
+-- worker computes them. A worker is compared only with its cohort. The heartbeat reads only
 -- its own cohort, so the second index keeps that read small.
 CREATE TABLE IF NOT EXISTS harvest_worker_task_stats (
     worker_id       TEXT        PRIMARY KEY

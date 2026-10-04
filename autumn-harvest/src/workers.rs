@@ -813,8 +813,8 @@ pub struct LiveWorkerTaskStats {
     pub worker_id: String,
     /// The worker's cohort key, from [`worker_cohort`].
     ///
-    /// Workers in one cohort poll the same queues with the same weights, so
-    /// they do the same work. A worker is compared only with peers in its own
+    /// Workers in one cohort poll the same queues with the same weights. They
+    /// also share a build and labels, so they do the same work. A worker is compared only with peers in its own
     /// cohort.
     pub cohort: String,
     /// The published snapshot.
@@ -866,31 +866,45 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
         std::sync::atomic::AtomicI64::new(i64::try_from(micros).unwrap_or(0))
     });
 
-/// The cohort key of a worker that polls `queues` with `weights` (issue
-/// #1815).
+/// The cohort key of a worker (issue #1815): a JSON object of everything that
+/// decides which tasks the worker can claim, and in which mix.
 ///
-/// Without weights, the key is the sorted queue list, as a JSON array. Such a
-/// worker claims from all its queues in one query.
+/// - `queues`: without weights, the sorted queue list. Such a worker claims
+///   from all its queues in one query. With weights, the sorted list of
+///   `[queue, weight]` pairs. Such a worker tries its queues in a weighted
+///   order, so its task mix follows the weights. A queue missing from the map
+///   has weight 1, as
+///   [`effective_queue_weights`](crate::queue_fairness::effective_queue_weights)
+///   gives. An entry for a queue the worker does not poll is ignored.
+/// - `build_id`: the claim predicate routes a task with `required_build_id`
+///   only to a matching build.
+/// - `labels`: the claim predicate matches `required_capabilities` against
+///   these labels, sorted by key.
 ///
-/// With weights, the key is the sorted list of `[queue, weight]` pairs. Such a
-/// worker tries its queues in a weighted order, so its task mix follows the
-/// weights. A queue missing from the map has weight 1, as
-/// [`effective_queue_weights`](crate::queue_fairness::effective_queue_weights)
-/// gives. An entry for a queue the worker does not poll is ignored.
-pub fn worker_cohort<S: std::hash::BuildHasher>(
+/// So workers on two builds are not compared during a rolling deployment. A
+/// build that fails everywhere is a fleet alert, not a gray failure.
+pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
     queues: &[String],
     weights: &std::collections::HashMap<String, u32, S>,
+    build_id: &str,
+    labels: &std::collections::HashMap<String, String, L>,
 ) -> String {
-    if weights.is_empty() {
+    let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
         names.sort_unstable();
         names.dedup();
-        return serde_json::to_string(&names).unwrap_or_default();
-    }
-    let mut pairs = crate::queue_fairness::effective_queue_weights(queues, weights);
-    pairs.sort_unstable();
-    pairs.dedup();
-    serde_json::to_string(&pairs).unwrap_or_default()
+        serde_json::json!(names)
+    } else {
+        let mut pairs = crate::queue_fairness::effective_queue_weights(queues, weights);
+        pairs.sort_unstable();
+        pairs.dedup();
+        serde_json::json!(pairs)
+    };
+    let labels: std::collections::BTreeMap<&str, &str> = labels
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    serde_json::json!({ "queues": routing, "build_id": build_id, "labels": labels }).to_string()
 }
 
 /// Write one worker's task stats snapshot (issue #1815).
@@ -2638,25 +2652,35 @@ mod tests {
         assert!(flags.set("peer", &[]).is_empty(), "no shard can compare");
     }
 
+    fn cohort_of(
+        queues: &[&str],
+        weights: &[(&str, u32)],
+        build: &str,
+        labels: &[(&str, &str)],
+    ) -> String {
+        let queues: Vec<String> = queues.iter().map(|n| (*n).to_owned()).collect();
+        let weights: std::collections::HashMap<String, u32> =
+            weights.iter().map(|(q, w)| ((*q).to_owned(), *w)).collect();
+        let labels: std::collections::HashMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        super::worker_cohort(&queues, &weights, build, &labels)
+    }
+
     /// Issue #1815: workers that poll the same queues with different weights
     /// do different work, so they are in different cohorts.
     #[test]
     fn the_cohort_key_includes_the_queue_weights() {
-        let queues = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
-        let weights = |pairs: &[(&str, u32)]| {
-            pairs
-                .iter()
-                .map(|(q, w)| ((*q).to_owned(), *w))
-                .collect::<std::collections::HashMap<_, _>>()
-        };
-        let unweighted = super::worker_cohort(&queues(&["b", "a", "a"]), &weights(&[]));
+        let unweighted = cohort_of(&["b", "a", "a"], &[], "", &[]);
         assert_eq!(
-            unweighted, "[\"a\",\"b\"]",
+            unweighted,
+            cohort_of(&["a", "b"], &[], "", &[]),
             "order and duplicates do not matter"
         );
 
-        let bulk_first = super::worker_cohort(&queues(&["a", "b"]), &weights(&[("b", 5)]));
-        let equal = super::worker_cohort(&queues(&["a", "b"]), &weights(&[("a", 1)]));
+        let bulk_first = cohort_of(&["a", "b"], &[("b", 5)], "", &[]);
+        let equal = cohort_of(&["a", "b"], &[("a", 1)], "", &[]);
         assert_ne!(bulk_first, unweighted, "weights change the cohort");
         assert_ne!(bulk_first, equal, "different weights, different cohorts");
         // An unweighted worker claims from all its queues at once. A weighted
@@ -2667,7 +2691,29 @@ mod tests {
         // the worker does not poll is ignored.
         assert_eq!(
             equal,
-            super::worker_cohort(&queues(&["b", "a"]), &weights(&[("b", 1), ("z", 9)]))
+            cohort_of(&["b", "a"], &[("b", 1), ("z", 9)], "", &[])
+        );
+    }
+
+    /// Issue #1815: the claim predicate routes tasks by build id and by
+    /// capability labels. Workers that differ in either can get different
+    /// work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_build_and_the_labels() {
+        let base = cohort_of(&["a"], &[], "v1", &[("gpu", "a100"), ("zone", "eu")]);
+        assert_ne!(
+            base,
+            cohort_of(&["a"], &[], "v2", &[("gpu", "a100"), ("zone", "eu")])
+        );
+        assert_ne!(
+            base,
+            cohort_of(&["a"], &[], "v1", &[("gpu", "h100"), ("zone", "eu")])
+        );
+        assert_ne!(base, cohort_of(&["a"], &[], "v1", &[("zone", "eu")]));
+        assert_eq!(
+            base,
+            cohort_of(&["a"], &[], "v1", &[("zone", "eu"), ("gpu", "a100")]),
+            "label order does not matter"
         );
     }
 

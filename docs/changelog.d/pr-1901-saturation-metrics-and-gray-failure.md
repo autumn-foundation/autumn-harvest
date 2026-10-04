@@ -7,7 +7,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
 
 - `harvest.db.pool.in_use{shard}` and `harvest.db.pool.idle{shard}`: gauges
   from the deadpool status of each shard pool. A new in-memory sampler reads
-  them on the `poll_interval` cadence. No query runs.
+  them on the `poll_interval` cadence. No query runs. When runtimes in one
+  process share a metrics sink with separate pools for one shard, `in_use` is
+  their sum and `idle` reads 0 while any of them is exhausted.
 - `harvest.db.pool.wait_duration{shard}`: histogram of the wait for a pooled
   connection. The claim path, the timeout scanner and the activity heartbeat
   flush record it. A failed or timed-out wait counts too.
@@ -47,7 +49,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - Two workers in one process share the gauge, so it reports the OR of their
   verdicts.
 - The peers are the live `Active` workers that poll the same queues with the
-  same `queue_weights`, with fresh stats. A worker on a slow queue is not
+  same `queue_weights`, on the same build with the same labels, with fresh
+  stats. Those decide which tasks a worker can claim. A worker on a slow queue is not
   compared with a fast queue. Each heartbeat reads only its own cohort, so
   the read stays small in a large fleet.
 - A worker is an outlier on failure ratio when its ratio is at least 20

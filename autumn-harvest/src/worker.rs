@@ -26002,8 +26002,10 @@ type SampledPools =
 ///
 /// The gauges carry only a `shard` label. Two runtimes in one process can feed
 /// one sink with separate pools for the same shard. Each would otherwise
-/// overwrite the other's value. So the gauge reports the sum over the distinct
-/// pools, and a pool that two samplers read counts once.
+/// overwrite the other's value. So `in_use` reports the sum over the distinct
+/// pools, and a pool that two samplers read counts once. `idle` reports the
+/// sum too, except that it reads 0 while any of the pools is exhausted. The
+/// `harvest_db_pool_idle == 0` alert then still fires for that pool.
 static POOL_GAUGES: std::sync::LazyLock<std::sync::Mutex<SampledPools>> =
     std::sync::LazyLock::new(std::sync::Mutex::default);
 
@@ -26044,7 +26046,14 @@ fn pool_gauge_update(
         }
     }
     let in_use = pools.values().map(|p| p.in_use).sum();
-    let idle = pools.values().map(|p| p.idle).sum();
+    // An exhausted pool lends out connections and holds none idle. A sum with
+    // a healthy pool would hide it, so the shard then reads 0 idle.
+    let exhausted = pools.values().any(|p| p.in_use > 0 && p.idle == 0);
+    let idle = if exhausted {
+        0
+    } else {
+        pools.values().map(|p| p.idle).sum()
+    };
     if pools.is_empty() {
         gauges.remove(&key);
     }
@@ -30469,6 +30478,8 @@ impl Worker {
                 cohort: crate::workers::worker_cohort(
                     &self.config.queues,
                     &self.config.queue_weights,
+                    &self.config.build_id,
+                    &self.config.labels,
                 ),
                 compare: true,
                 slot: shard_slot,
@@ -40193,6 +40204,47 @@ mod tests {
                 (7, 5, 5),
                 (7, 3, 1),
                 (7, 0, 0)
+            ]
+        );
+    }
+
+    /// Issue #1815: an exhausted pool keeps `idle` at 0 while a healthy pool
+    /// on the same shard and sink has idle connections. A sum would hide it
+    /// from the `harvest_db_pool_idle == 0` alert.
+    #[test]
+    fn an_exhausted_pool_reads_zero_idle_beside_a_healthy_one() {
+        #[derive(Default)]
+        struct Pools(std::sync::Mutex<Vec<(u16, u64, u64)>>);
+        impl crate::telemetry::MetricsRecorder for Pools {
+            fn record_db_pool(&self, shard: u16, in_use: u64, idle: u64) {
+                self.0.lock().unwrap().push((shard, in_use, idle));
+            }
+        }
+        let recorder = Arc::new(Pools::default());
+        let metrics: Arc<dyn crate::telemetry::MetricsRecorder> = recorder.clone();
+        let (exhausted, healthy, empty) = (1usize, 2usize, 3usize);
+        for pool in [exhausted, healthy, empty] {
+            pool_gauge_update(&metrics, 8, pool, PoolGaugeChange::Join);
+        }
+        let sample = |in_use, idle| PoolGaugeChange::Sample { in_use, idle };
+        // A pool that has opened no connection yet is not exhausted.
+        pool_gauge_update(&metrics, 8, empty, sample(0, 0));
+        pool_gauge_update(&metrics, 8, healthy, sample(2, 10));
+        pool_gauge_update(&metrics, 8, exhausted, sample(5, 0));
+        pool_gauge_update(&metrics, 8, exhausted, sample(4, 1));
+        for pool in [exhausted, healthy, empty] {
+            pool_gauge_update(&metrics, 8, pool, PoolGaugeChange::Leave);
+        }
+        assert_eq!(
+            recorder.0.lock().unwrap().clone(),
+            vec![
+                (8, 0, 0),
+                (8, 2, 10),
+                (8, 7, 0),
+                (8, 6, 11),
+                (8, 2, 10),
+                (8, 0, 0),
+                (8, 0, 0)
             ]
         );
     }
