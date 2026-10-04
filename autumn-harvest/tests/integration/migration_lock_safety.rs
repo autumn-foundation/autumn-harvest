@@ -1170,7 +1170,9 @@ fn function_body_follows(toks: &[Token], depth: usize) -> bool {
 fn statement_head(toks: &[Token], depth: usize) -> Option<&Token> {
     let opens = |t: &Token| match &t.tok {
         Tok::Punct(';') => true,
-        Tok::Word(w) => depth > 0 && ["begin", "then", "else", "loop"].contains(&w.as_str()),
+        Tok::Word(w) => {
+            depth > 0 && !t.quoted && ["begin", "then", "else", "loop"].contains(&w.as_str())
+        }
         _ => false,
     };
     toks.iter()
@@ -1352,11 +1354,13 @@ impl<'a> Stmts<'a> {
             // A body starts a statement. After the body, the statement around
             // it goes on, so a literal never splits it.
             let (start, cases) = &mut open[depth];
+            // A quoted word is a name, never a keyword.
             let boundary = entering
                 || start.is_none()
                 || (depth > 0
                     && k > 0
                     && toks[k - 1].depth == depth
+                    && !toks[k - 1].quoted
                     && match &toks[k - 1].tok {
                         Tok::Word(w) if ["begin", "loop"].contains(&w.as_str()) => true,
                         Tok::Word(w) if ["then", "else"].contains(&w.as_str()) => *cases == 0,
@@ -1368,6 +1372,7 @@ impl<'a> Stmts<'a> {
             }
             // A `CASE` that does not start a statement is an expression.
             match &toks[k].tok {
+                _ if toks[k].quoted => {}
                 Tok::Word(w) if w == "case" && !boundary => *cases += 1,
                 Tok::Word(w) if w == "end" && *cases > 0 => *cases -= 1,
                 _ => {}
@@ -5246,6 +5251,15 @@ fn a_routine_that_calls_a_clearing_routine_clears() {
     );
     let findings = lint_with_history(&[], &sql, true);
     assert!(unbounded(&findings), "{findings:?}");
+}
+
+#[test]
+fn a_quoted_case_is_no_case_expression() {
+    // `"case"` names a variable, so the `THEN` still starts the `ALTER`.
+    let sql = "DO $$\nBEGIN\n    IF \"case\" THEN\n        \
+               ALTER TABLE harvest_events ADD COLUMN x INT;\n    END IF;\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 #[test]
