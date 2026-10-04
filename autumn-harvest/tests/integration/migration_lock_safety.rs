@@ -740,12 +740,14 @@ fn lex(
             }
         } else if c == '\'' || (matches!(c, 'e' | 'E') && next == Some('\'')) {
             // An `E'...'` string also takes backslash escapes.
-            let mut escapes = c != '\'';
+            let escapes = c != '\'';
             let start_line = line;
             i += if escapes { 2 } else { 1 };
             let mut value = String::new();
             // Postgres joins literals that only whitespace with a newline
-            // parts, as in `'a'` and then `'b'` on the next line.
+            // parts, as in `'a'` and then `'b'` on the next line. Only a bare
+            // quote continues a literal, and the joined literal keeps the
+            // escape mode of its first part.
             'literal: loop {
                 while let Some(c) = at(i) {
                     line += usize::from(c == '\n');
@@ -768,19 +770,12 @@ fn lex(
                         i += 1;
                     }
                 }
-                let Some((newlines, next)) = continuation_gap(chars, i) else {
-                    break 'literal;
-                };
-                if at(next) == Some('\'') {
-                    escapes = false;
-                    line += newlines;
-                    i = next + 1;
-                } else if matches!(at(next), Some('e' | 'E')) && at(next + 1) == Some('\'') {
-                    escapes = true;
-                    line += newlines;
-                    i = next + 2;
-                } else {
-                    break 'literal;
+                match continuation_gap(chars, i) {
+                    Some((newlines, next)) if at(next) == Some('\'') => {
+                        line += newlines;
+                        i = next + 1;
+                    }
+                    _ => break 'literal,
                 }
             }
             // A `DO` body may be a plain string, so it is code too. So is the
@@ -1594,6 +1589,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     }
 
     function_settings(&s, &mut body_timeouts);
+    call_clears(&s, &mut timeouts, &mut body_timeouts);
     let new_tables = new_table_spans(&s, &created);
     let hits = resolve(raws, &s, &unconditional, &new_tables, history);
 
@@ -1614,15 +1610,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 /// Postgres applies the clause on each call, before the body runs. So the
 /// clause counts as a session value at the first token of the body.
 fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
-    for k in (0..s.toks.len()).filter(|&k| s.starts[k] == k && s.is(k, "create")) {
-        let j = if s.is(k + 1, "or") && s.is(k + 2, "replace") {
-            k + 3
-        } else {
-            k + 1
-        };
-        if !(s.is(j, "function") || s.is(j, "procedure")) {
-            continue;
-        }
+    for k in (0..s.toks.len()).filter(|&k| routine_keyword(s, k).is_some()) {
         let depth = s.toks[k].depth;
         let end = s.end(k);
         let Some(body) = (k..end).find(|&b| !s.toks[b].runs && s.toks[b].depth > depth) else {
@@ -1648,6 +1636,107 @@ fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
     }
     // `timeout_in_force` reads the changes in token order.
     body_timeouts.sort_by_key(|(k, _)| *k);
+}
+
+/// The index of `FUNCTION` or `PROCEDURE` when a routine `CREATE` starts at `k`.
+fn routine_keyword(s: &Stmts, k: usize) -> Option<usize> {
+    if s.starts[k] != k || !s.is(k, "create") {
+        return None;
+    }
+    let j = if s.is(k + 1, "or") && s.is(k + 2, "replace") {
+        k + 3
+    } else {
+        k + 1
+    };
+    (s.is(j, "function") || s.is(j, "procedure")).then_some(j)
+}
+
+/// The last part of the name that starts at `k`, without its schema.
+fn last_name_part<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
+    let (_, next) = s.qualified_name(k)?;
+    s.word(next - 1)
+}
+
+/// Add a session clear at each call that may clear the bound.
+///
+/// A clear in a routine body can outlive the call. For example, a
+/// `set_config(..., true)` holds until the transaction ends. A call clears
+/// when the body in this file changes `lock_timeout` other than to set a
+/// bound, or calls such a routine. A `CALL` of a routine from another file
+/// clears too, because the lint cannot read its body.
+fn call_clears(
+    s: &Stmts,
+    timeouts: &mut Vec<(usize, Timeout)>,
+    body_timeouts: &mut Vec<(usize, Timeout)>,
+) {
+    // Each routine in this file: its name and its statement range.
+    let routines: Vec<(&str, usize, usize)> = (0..s.toks.len())
+        .filter_map(|k| Some((last_name_part(s, routine_keyword(s, k)? + 1)?, k, s.end(k))))
+        .collect();
+    let known: BTreeSet<&str> = routines.iter().map(|(name, ..)| *name).collect();
+    let calls: Vec<(usize, &str)> = (0..s.toks.len())
+        .filter_map(|k| call_target(s, k, &known).map(|name| (k, name)))
+        .collect();
+    // A routine that calls a clearing routine clears too.
+    let mut clearing: BTreeSet<&str> = BTreeSet::new();
+    loop {
+        let before = clearing.len();
+        for &(name, from, to) in &routines {
+            let changes = body_timeouts.iter().any(|(k, change)| {
+                (from..to).contains(k) && !matches!(change, Timeout::Set { bounds: true, .. })
+            });
+            let calls_a_clearer = calls.iter().any(|(k, callee)| {
+                (from..to).contains(k) && (!known.contains(callee) || clearing.contains(callee))
+            });
+            if changes || calls_a_clearer {
+                clearing.insert(name);
+            }
+        }
+        if clearing.len() == before {
+            break;
+        }
+    }
+    let clear = Timeout::Set {
+        bounds: false,
+        local: false,
+    };
+    for (k, callee) in calls {
+        if known.contains(callee) && !clearing.contains(callee) {
+            continue;
+        }
+        if s.toks[k].runs {
+            timeouts.push((k, clear));
+        } else {
+            body_timeouts.push((k, clear));
+        }
+    }
+    // `timeout_in_force` reads the changes in token order.
+    timeouts.sort_by_key(|(k, _)| *k);
+    body_timeouts.sort_by_key(|(k, _)| *k);
+}
+
+/// The name of the routine that the token at `k` calls, if any.
+///
+/// A `CALL` names any routine. Elsewhere, only a routine in `known` counts,
+/// and only when its name is not part of DDL such as `DROP FUNCTION f()`.
+fn call_target<'a>(s: &Stmts<'a>, k: usize, known: &BTreeSet<&str>) -> Option<&'a str> {
+    if s.starts[k] == k && s.is(k, "call") {
+        return last_name_part(s, k + 1);
+    }
+    let callee = s.word(k)?;
+    if !known.contains(callee) || !s.is_punct(k + 1, '(') {
+        return None;
+    }
+    let first = if k >= 2 && s.is_punct(k - 1, '.') {
+        k - 2
+    } else {
+        k
+    };
+    let ddl = first > 0
+        && ["function", "procedure", "routine"]
+            .iter()
+            .any(|w| s.is(first - 1, w));
+    (!ddl).then_some(callee)
 }
 
 /// The token range in which each new table is exempt.
@@ -4667,6 +4756,43 @@ fn a_function_set_clause_bounds_its_body() {
     );
     let findings = lint_with_history(&[], &sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_continued_e_string_keeps_its_escapes() {
+    // `\\163` decodes to `s` only while the escapes hold.
+    let sql = "DO $$\nBEGIN\n    EXECUTE E'ALTER TABLE harvest_event'\n        \
+               '\\163 ADD COLUMN x INT';\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert!(
+        findings[0].detail.contains("harvest_events"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_call_may_clear_the_bound() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let clears = "BEGIN\n    PERFORM set_config('lock_timeout', '0', true);\nEND";
+    let keeps = "BEGIN\n    RAISE NOTICE 'hi';\nEND";
+    let procedure =
+        |body: &str| format!("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\n{body} $$;\n");
+    let function =
+        format!("CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\n{clears} $$;\n");
+    // A body that clears, or a body from another migration, may clear the bound.
+    for sql in [
+        format!("{set}{}CALL p();\n{lock}", procedure(clears)),
+        format!("{set}CALL p();\n{lock}"),
+        format!("{set}{function}SELECT f();\n{lock}"),
+    ] {
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    }
+    // A known body with no timeout change keeps the bound.
+    let sql = format!("{set}{}CALL p();\n{lock}", procedure(keeps));
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
