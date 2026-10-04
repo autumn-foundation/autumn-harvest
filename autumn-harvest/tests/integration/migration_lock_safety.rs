@@ -2245,10 +2245,23 @@ struct Routine {
     name: String,
     /// The number of arguments or parameters. `None` when the lint cannot count them.
     arity: Option<usize>,
+    /// The fewest arguments a call may pass. A parameter with a default may
+    /// be left out. For a call, this is its own argument count.
+    min_arity: Option<usize>,
     /// The first token: the `CALL`, the called name, or the `CREATE`.
     at: usize,
     /// Whether the body is in a language other than PL/pgSQL or SQL.
     foreign: bool,
+}
+
+impl Routine {
+    /// Whether `call` passes a number of arguments this routine accepts.
+    const fn accepts(&self, call: &Self) -> bool {
+        match (self.min_arity, self.arity, call.arity) {
+            (Some(fewest), Some(most), Some(n)) => fewest <= n && n <= most,
+            _ => false,
+        }
+    }
 }
 
 /// Add a session clear at each call that may clear the bound.
@@ -2295,7 +2308,7 @@ fn call_clears(
     let keeps = |call: &Routine, clearing: &BTreeSet<usize>| {
         let mut matches = (0..routines.len()).filter(|&i| {
             let r = &routines[i];
-            r.at < call.at && r.name == call.name && r.arity.is_some() && r.arity == call.arity
+            r.at < call.at && r.name == call.name && r.accepts(call)
         });
         let first = matches.next();
         // After a `search_path` change, an unqualified name may reach a
@@ -2351,9 +2364,9 @@ fn call_clears(
         // locking routine from an earlier migration, may take any lock.
         let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c <= call.at);
         let resolved = !unplaced
-            && routines.iter().any(|r| {
-                r.at < call.at && r.name == call.name && r.arity.is_some() && r.arity == call.arity
-            });
+            && routines
+                .iter()
+                .any(|r| r.at < call.at && r.name == call.name && r.accepts(call));
         let unread = s.keyword(call.at, "call") || inherited_locking.contains(callee);
         if !foreign && !resolved && unread {
             // A routine that may clear the bound before it locks makes the
@@ -2395,6 +2408,7 @@ fn file_routines(s: &Stmts) -> Vec<Routine> {
             Some(Routine {
                 name,
                 arity,
+                min_arity: required_params(s, open),
                 at: k,
                 foreign,
             })
@@ -2416,14 +2430,29 @@ fn record_routines(
             .clearing_routines
             .insert(base(&routines[i].name).to_string());
     }
-    let body = |r: &Routine| r.at + 1..s.end(r.at);
+    // A token belongs to the innermost routine body that holds it. So a lock
+    // in a nested routine is not a lock of the routine around it.
+    let bodies = routine_bodies(s);
+    let owner = |at: usize| {
+        bodies
+            .iter()
+            .filter(|&&(from, to)| from <= at && at < to)
+            .map(|&(from, _)| from)
+            .max()
+    };
+    let body = |r: &Routine| {
+        routine_body(s, r.at)
+            .map(|(from, to)| (from..to).filter(move |&j| owner(j) == Some(from)))
+            .into_iter()
+            .flatten()
+    };
     let mut locking = history.locking_routines.clone();
     for r in routines {
         let name = base(&r.name).to_string();
         if r.foreign {
             history.foreign_routines.insert(name.clone());
         }
-        if raws.iter().any(|raw| body(r).contains(&raw.at)) {
+        if body(r).any(|j| raws.iter().any(|raw| raw.at == j)) {
             locking.insert(name);
         }
     }
@@ -2451,11 +2480,15 @@ fn record_routines(
     }
     for r in routines.iter().filter(|r| !r.foreign) {
         let name = base(&r.name);
+        // A call may pass any number of arguments from the required ones up
+        // to all of them.
         if locking.contains(name)
             && !history.clearing_routines.contains(name)
-            && let Some(id) = r.arity.map(|n| identity(&r.name, n))
+            && let (Some(fewest), Some(most)) = (r.min_arity, r.arity)
         {
-            history.bounded_routines.insert(id);
+            for n in fewest..=most {
+                history.bounded_routines.insert(identity(&r.name, n));
+            }
         }
     }
     history.locking_routines = locking;
@@ -2486,6 +2519,7 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
         return Some(Routine {
             name,
             arity,
+            min_arity: arity,
             at: k,
             foreign: false,
         });
@@ -2509,9 +2543,51 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
     (!not_a_call).then_some(Routine {
         name,
         arity,
+        min_arity: arity,
         at: k,
         foreign: false,
     })
+}
+
+/// The number of parameters a call must pass to the routine whose signature
+/// opens at `open`.
+///
+/// A parameter with a default may be left out, and so may an `OUT` parameter
+/// of a function. Postgres requires the defaults to come last.
+fn required_params(s: &Stmts, open: usize) -> Option<usize> {
+    let close = closing_paren(s, open)?;
+    let depth = s.toks[open].depth;
+    let mut required = 0;
+    let mut parens = 0_usize;
+    let mut optional = false;
+    let mut first = true;
+    let mut empty = true;
+    for j in (open..=close).filter(|&j| s.toks[j].depth == depth) {
+        if s.is_punct(j, '(') {
+            parens += 1;
+            if parens == 1 {
+                continue;
+            }
+        } else if s.is_punct(j, ')') {
+            parens -= 1;
+            if parens == 0 {
+                required += usize::from(!optional && !empty);
+                continue;
+            }
+        }
+        if parens == 1 && s.is_punct(j, ',') {
+            required += usize::from(!optional);
+            (optional, first) = (false, true);
+            continue;
+        }
+        empty = false;
+        if parens == 1 {
+            optional |=
+                (first && s.keyword(j, "out")) || s.keyword(j, "default") || s.is_punct(j, '=');
+            first = false;
+        }
+    }
+    Some(required)
 }
 
 /// The number of comma-separated items in the parentheses that open at `open`.
@@ -2684,13 +2760,9 @@ fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
         .chain(inherited.into_iter().flatten().map(String::as_str))
         .collect();
     let resolved = |call: &Routine| {
-        routines.iter().any(|r| {
-            !r.foreign
-                && r.at < call.at
-                && r.name == call.name
-                && r.arity.is_some()
-                && r.arity == call.arity
-        })
+        routines
+            .iter()
+            .any(|r| !r.foreign && r.at < call.at && r.name == call.name && r.accepts(call))
     };
     (0..s.toks.len())
         .filter(|&k| s.toks[k].runs)
@@ -7171,6 +7243,42 @@ fn an_atomic_body_setter_covers_a_later_call() {
     let sql = "CREATE FUNCTION g() RETURNS void LANGUAGE sql\nBEGIN ATOMIC\n    \
                SELECT 1;\n    SELECT legacy_f();\nEND;";
     let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_call_may_omit_defaulted_parameters() {
+    let history = [
+        "CREATE FUNCTION f(a int, b int DEFAULT 1) RETURNS void LANGUAGE plpgsql AS $$\n\
+                    BEGIN\n    ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;",
+    ];
+    for call in ["SELECT f(1);", "SELECT f(1, 2);"] {
+        let sql = format!("SET LOCAL lock_timeout = '5s';\n{call}");
+        assert_eq!(lint_with_history(&history, &sql, true), [], "{sql}");
+    }
+    // Too few arguments may reach another routine.
+    let sql = "SET LOCAL lock_timeout = '5s';\nSELECT f();";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // In the same file, the call reaches the known body.
+    let sql = "CREATE PROCEDURE p(a int, b int = 1) LANGUAGE plpgsql AS $$\nBEGIN\n    \
+               RAISE NOTICE 'hi';\nEND $$;\nSET LOCAL lock_timeout = '5s';\nCALL p(1);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+}
+
+#[test]
+fn an_inner_routine_lock_is_not_the_outer_routine_lock() {
+    // Calling `outer_f` only creates `inner_f`, so it takes no lock.
+    let history = [
+        "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
+                    CREATE OR REPLACE FUNCTION inner_f() RETURNS void LANGUAGE plpgsql AS $i$\n    \
+                    BEGIN\n        SET LOCAL lock_timeout = '5s';\n        \
+                    ALTER TABLE harvest_events ADD COLUMN y INT;\n    END $i$;\nEND $o$;",
+    ];
+    assert_eq!(lint_with_history(&history, "SELECT outer_f();", true), []);
+    // A call of `inner_f` still counts as a lock.
+    let findings = lint_with_history(&history, "SELECT inner_f();", true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
