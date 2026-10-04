@@ -1204,6 +1204,83 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
     );
 }
 
+/// A WASM guest must not start after its claim is lost (issue #1809). The
+/// start marker is the last claim-fenced write before the guest runs. A
+/// trigger makes that write match no row, as a timeout committed in
+/// between would. The worker then stops, so no `ActivityCompleted` appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_guest_does_not_start_after_a_lost_claim() {
+    use diesel_async::SimpleAsyncConnection as _;
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-lost-claim";
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    conn.batch_execute(
+        "CREATE OR REPLACE FUNCTION t1809_lose_wasm_claim() RETURNS trigger AS $$ \
+         BEGIN \
+           IF NEW.queue_name = 'q-wasm-lost-claim' \
+              AND NEW.handler_started_attempt IS DISTINCT FROM OLD.handler_started_attempt THEN \
+             RETURN NULL; \
+           END IF; \
+           RETURN NEW; \
+         END $$ LANGUAGE plpgsql; \
+         DROP TRIGGER IF EXISTS t1809_lose_wasm_claim ON harvest_task_queue; \
+         CREATE TRIGGER t1809_lose_wasm_claim BEFORE UPDATE ON harvest_task_queue \
+           FOR EACH ROW EXECUTE FUNCTION t1809_lose_wasm_claim();",
+    )
+    .await
+    .expect("install the trigger");
+
+    let input = serde_json::json!({"hello": "lost"});
+    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input, queue).await;
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: assemble(ECHO_WAT),
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            retry: None,
+            schedule_to_close: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+    );
+    let worker = build_worker("w-wasm-lost-claim", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // Wait until the attempt started, then give the guest time to finish.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let history = load_history(&url, exec_id).await;
+            if history
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the activity starts");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    worker.shutdown();
+    handle.await.expect("worker joins cleanly");
+    conn.batch_execute("DROP TRIGGER IF EXISTS t1809_lose_wasm_claim ON harvest_task_queue")
+        .await
+        .expect("drop the trigger");
+
+    let history = load_history(&url, exec_id).await;
+    assert_eq!(
+        find_activity_completed(&history),
+        None,
+        "a guest whose claim was lost must not run: {history:?}"
+    );
+}
+
 // ── Finding 24: default single-shard worker (empty shard_assignments) seeds ─
 //    builder-registered WASM modules on the default pool ──────────────────────
 

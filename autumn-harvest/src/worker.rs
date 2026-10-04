@@ -16237,20 +16237,38 @@ async fn process_activity_task(
                     // a timeout in flight and then changes nothing. A failed
                     // write only keeps a timeout of this attempt out of the
                     // breaker.
+                    //
+                    // A lost claim means a timeout or another path already
+                    // settled this attempt, and a retry may own the task. The
+                    // guest then must not start. The attempt ends as a lost
+                    // claim, and every write it tries is fenced.
                     if matches!(dispatch, crate::wasm_store::WasmDispatch::Invoke(_)) {
                         match queue::mark_claim_handler_started(&mut conn, &activity_claim).await {
-                            Ok(queue::ClaimWrite::Applied) => {}
+                            Ok(queue::ClaimWrite::Applied) => dispatch,
                             Ok(queue::ClaimWrite::LeaseLost) => {
+                                use crate::failure::IntoActivityErrorString as _;
                                 log_lease_lost(task, "wasm handler start marker");
+                                cancel.cancel();
+                                crate::wasm_store::WasmDispatch::Fail(
+                                    crate::failure::ActivityFailure::retryable(
+                                        "ClaimLost",
+                                        "the claim was lost before the wasm guest started",
+                                    )
+                                    .into_error_payload(),
+                                )
                             }
-                            Err(error) => tracing::warn!(
-                                task_id = %task.id,
-                                error = %error,
-                                "could not record the wasm handler start"
-                            ),
+                            Err(error) => {
+                                tracing::warn!(
+                                    task_id = %task.id,
+                                    error = %error,
+                                    "could not record the wasm handler start"
+                                );
+                                dispatch
+                            }
                         }
+                    } else {
+                        dispatch
                     }
-                    dispatch
                     // `conn` is dropped at the end of this arm, before the guest runs.
                 }
                 Err(e) => {
