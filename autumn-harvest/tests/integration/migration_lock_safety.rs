@@ -254,6 +254,14 @@ struct History {
     /// bound, from `identity`. Only a call of that exact identity keeps an
     /// outside bound. Another schema or arity may reach a routine that clears.
     bounded_routines: BTreeSet<String>,
+    /// The full identity of each routine that bounds every lock it takes, from
+    /// `identity`. Postgres applies that bound on each call. So a call of that
+    /// exact identity needs no outside bound.
+    self_bounded_routines: BTreeSet<String>,
+    /// Each routine name, without its schema, that a definition or an `ALTER`
+    /// may leave with an unbounded lock. No identity of such a name counts as
+    /// self-bounded, because a later call may reach that version.
+    unbounded_routines: BTreeSet<String>,
 }
 
 impl History {
@@ -395,8 +403,7 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
     let unbounded = analysis
         .hits
         .iter()
-        .filter(|hit| hit.hot && hit.kind != (Kind::Index { concurrent: true }))
-        .filter(|hit| !bound_in_force(&analysis, hit))
+        .filter(|hit| needs_bound(&analysis, hit))
         .filter(|hit| reported.insert(hit.at));
     for lock in unbounded {
         findings.push(Finding {
@@ -508,6 +515,11 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
         }
     }
     local.unwrap_or(session)
+}
+
+/// Whether `hit` locks a hot table with no bound in force.
+fn needs_bound(analysis: &Analysis, hit: &Hit) -> bool {
+    hit.hot && hit.kind != (Kind::Index { concurrent: true }) && !bound_in_force(analysis, hit)
 }
 
 /// Whether a bound is in force for `hit`.
@@ -1813,14 +1825,16 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     let statement_count = (0..toks.len())
         .filter(|&k| s.starts[k] == k && toks[k].depth == 0 && !s.is_punct(k, ';'))
         .count();
-    Analysis {
+    let analysis = Analysis {
         comments,
         hits,
         timeouts,
         body_timeouts,
         statement_count,
         bodies: routine_bodies(&s),
-    }
+    };
+    record_self_bounded(&s, &analysis, history);
+    analysis
 }
 
 /// Add each `CREATE FUNCTION ... SET lock_timeout` clause to `body_timeouts`.
@@ -2205,7 +2219,11 @@ fn alter_routine_history(s: &Stmts, k: usize, clears: bool, history: &mut Histor
     let renamed = (k..s.end(k))
         .find(|&j| s.keyword(j, "rename") && s.keyword(j + 1, "to"))
         .and_then(|j| s.word(j + 2));
+    // The `ALTER` may drop the routine's own bound, or give its name to
+    // another routine.
+    history.unbounded_routines.insert(old.clone());
     if let Some(new) = renamed {
+        history.unbounded_routines.insert(new.to_string());
         for set in [
             &mut history.clearing_routines,
             &mut history.foreign_routines,
@@ -2368,7 +2386,8 @@ fn call_clears(
                 .iter()
                 .any(|r| r.at < call.at && r.name == call.name && r.accepts(call));
         let unread = s.keyword(call.at, "call") || inherited_locking.contains(callee);
-        if !foreign && !resolved && unread {
+        let self_bounded = !unplaced && reaches_self_bounded(call, raws, history);
+        if !foreign && !resolved && unread && !self_bounded {
             // A routine that may clear the bound before it locks makes the
             // outside bound worthless. An unknown routine may do that too.
             let known = call
@@ -2494,6 +2513,90 @@ fn record_routines(
 /// its number of parameters.
 fn identity(name: &str, arity: usize) -> String {
     format!("{name}/{arity}")
+}
+
+/// Whether `call` names, by its exact identity, an earlier routine that bounds
+/// its own locks. Unreadable code earlier in the file may replace the routine.
+fn reaches_self_bounded(call: &Routine, raws: &[Raw], history: &History) -> bool {
+    let opaque_before = raws
+        .iter()
+        .any(|raw| raw.at < call.at && [UNREADABLE_EXECUTE, FOREIGN_CODE].contains(&raw.verb));
+    !opaque_before
+        && !history.unbounded_routines.contains(base(&call.name))
+        && call.arity.is_some_and(|n| {
+            history
+                .self_bounded_routines
+                .contains(&identity(&call.name, n))
+        })
+}
+
+/// Record which routines of this file bound every lock they take.
+///
+/// A routine counts only when each hot lock in its own body has a bound. Each
+/// routine of this file that it calls must count too. An annotation does not
+/// make a lock bounded. Code that the lint cannot read may replace any
+/// routine, so it clears the record.
+fn record_self_bounded(s: &Stmts, analysis: &Analysis, history: &mut History) {
+    let routines = file_routines(s);
+    let inside = |r: &Routine, j: usize| owns(s, &analysis.bodies, r.at, j);
+    let names: BTreeSet<&str> = routines.iter().map(|r| base(&r.name)).collect();
+    let mut bounded: Vec<bool> = routines
+        .iter()
+        .map(|r| {
+            !r.foreign
+                && r.arity.is_some()
+                && !analysis
+                    .hits
+                    .iter()
+                    .any(|hit| inside(r, hit.at) && needs_bound(analysis, hit))
+        })
+        .collect();
+    // A call of a routine that may lock without a bound passes that lock up.
+    loop {
+        let unbounded: BTreeSet<&str> = routines
+            .iter()
+            .zip(&bounded)
+            .filter(|(_, b)| !**b)
+            .map(|(r, _)| base(&r.name))
+            .collect();
+        let mut changed = false;
+        for (i, r) in routines.iter().enumerate() {
+            let calls_unbounded = (0..s.toks.len())
+                .filter(|&j| inside(r, j))
+                .filter_map(|j| call_target(s, j, &names))
+                .any(|c| unbounded.contains(base(&c.name)));
+            if bounded[i] && calls_unbounded {
+                bounded[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (r, _) in routines.iter().zip(&bounded).filter(|(_, b)| !**b) {
+        history.unbounded_routines.insert(base(&r.name).to_string());
+    }
+    let unbounded = &history.unbounded_routines;
+    history
+        .self_bounded_routines
+        .retain(|id| !unbounded.contains(base(id.split('/').next().unwrap_or(id))));
+    for (r, _) in routines.iter().zip(&bounded).filter(|(_, b)| **b) {
+        if unbounded.contains(base(&r.name)) {
+            continue;
+        }
+        if let (Some(fewest), Some(most)) = (r.min_arity, r.arity) {
+            for n in fewest..=most {
+                history.self_bounded_routines.insert(identity(&r.name, n));
+            }
+        }
+    }
+    let opaque = analysis.hits.iter().any(|hit| {
+        hit.body_start.is_none() && [UNREADABLE_EXECUTE, FOREIGN_CODE].contains(&hit.verb)
+    });
+    if opaque {
+        history.self_bounded_routines.clear();
+    }
 }
 
 /// The verb of a lock that a call of an unread routine may take.
@@ -7069,6 +7172,85 @@ fn an_inherited_call_needs_the_full_identity_to_keep_the_bound() {
 }
 
 #[test]
+fn a_call_of_a_self_bounded_routine_needs_no_outside_bound() {
+    let lock = "ALTER TABLE harvest_events ADD COLUMN y INT;";
+    let proc = |clause: &str, body: &str| {
+        format!(
+            "CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql {clause}AS $$\nBEGIN\n{body}\nEND $$;"
+        )
+    };
+    let setter = "    SET LOCAL lock_timeout = '5s';\n";
+    let clause = proc("SET lock_timeout = '5s' ", lock);
+    let body = proc("", &format!("{setter}    {lock}"));
+    // Postgres applies the routine's own bound on each call.
+    for earlier in [&clause, &body] {
+        assert_eq!(
+            lint_with_history(&[earlier], "CALL p();", true),
+            [],
+            "{earlier}"
+        );
+    }
+    let function = format!(
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql SET lock_timeout = '5s' AS $$\nBEGIN\n    {lock}\nEND $$;"
+    );
+    assert_eq!(lint_with_history(&[&function], "SELECT f();", true), []);
+    // A routine that only calls a self-bounded routine is self-bounded too.
+    let caller = "CREATE PROCEDURE q() LANGUAGE plpgsql AS $$\nBEGIN\n    CALL p();\nEND $$;";
+    let earlier = format!("{clause}\n{caller}");
+    assert_eq!(
+        lint_with_history(&[&earlier], "CALL q();", true),
+        [],
+        "{earlier}"
+    );
+
+    let late = proc("", &format!("    {lock}\n{setter}"));
+    let branch = proc(
+        "",
+        &format!("    IF now() > '2000-01-01' THEN\n    {setter}    END IF;\n    {lock}"),
+    );
+    let allowed = proc(
+        "",
+        &format!("    -- lock-safety: allow lock-timeout #1810 test fixture\n    {lock}"),
+    );
+    let nested = format!(
+        "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    {}\nEND $o$;",
+        proc("", &format!("    {lock}")).replace("$$", "$i$")
+    );
+    let opaque = "DO $$\nBEGIN\n    EXECUTE format('%s', 'x');\nEND $$;".to_string();
+    let reset = "ALTER PROCEDURE p() RESET lock_timeout;".to_string();
+    let unbounded_chain = format!("{allowed}\n{caller}");
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec![&late], "CALL p();"),
+        (vec![&branch], "CALL p();"),
+        (vec![&allowed], "CALL p();"),
+        (vec![&clause], "CALL other.p();"),
+        (vec![&clause], "CALL p(1);"),
+        (vec![&clause, &late], "CALL p();"),
+        (vec![&clause, &nested], "CALL p();"),
+        (vec![&nested, &clause], "CALL p();"),
+        (vec![&clause, &opaque], "CALL p();"),
+        (vec![&clause, &reset], "CALL p();"),
+        (vec![&clause], "SET search_path = other;\nCALL p();"),
+        (vec![&unbounded_chain], "CALL q();"),
+    ];
+    // Each of these may reach a lock that no bound covers.
+    for (history, sql) in cases {
+        let findings = lint_with_history(&history, sql, true);
+        assert!(
+            rules(&findings).contains(&Rule::LockTimeout),
+            "{history:?}\n{sql}\n{findings:?}"
+        );
+    }
+    // Unreadable code earlier in the same file may replace the routine too.
+    let qualified = clause.replace("PROCEDURE p()", "PROCEDURE app.p()");
+    assert_eq!(lint_with_history(&[&qualified], "CALL app.p();", true), []);
+    let sql = format!("{opaque}\nCALL app.p();");
+    let findings = lint_with_history(&[&qualified], &sql, true);
+    let calls = findings.iter().filter(|f| f.line == 5).count();
+    assert_eq!(calls, 1, "{sql}\n{findings:?}");
+}
+
+#[test]
 fn an_inner_routine_bound_does_not_cover_the_outer_body() {
     // Creating the inner routine changes nothing for the outer call.
     for (clause, setter) in [
@@ -7307,17 +7489,22 @@ fn a_call_may_omit_defaulted_parameters() {
 
 #[test]
 fn an_inner_routine_lock_is_not_the_outer_routine_lock() {
-    // Calling `outer_f` only creates `inner_f`, so it takes no lock.
-    let history = [
-        "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
-                    CREATE OR REPLACE FUNCTION inner_f() RETURNS void LANGUAGE plpgsql AS $i$\n    \
-                    BEGIN\n        SET LOCAL lock_timeout = '5s';\n        \
-                    ALTER TABLE harvest_events ADD COLUMN y INT;\n    END $i$;\nEND $o$;",
-    ];
-    assert_eq!(lint_with_history(&history, "SELECT outer_f();", true), []);
-    // A call of `inner_f` still counts as a lock.
-    let findings = lint_with_history(&history, "SELECT inner_f();", true);
-    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    for (setter, expected) in [
+        ("", vec![Rule::LockTimeout]),
+        ("        SET LOCAL lock_timeout = '5s';\n", vec![]),
+    ] {
+        let history = [format!(
+            "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
+             CREATE OR REPLACE FUNCTION inner_f() RETURNS void LANGUAGE plpgsql AS $i$\n    \
+             BEGIN\n{setter}        ALTER TABLE harvest_events ADD COLUMN y INT;\n    END $i$;\nEND $o$;"
+        )];
+        let history = [history[0].as_str()];
+        // Calling `outer_f` only creates `inner_f`, so it takes no lock.
+        assert_eq!(lint_with_history(&history, "SELECT outer_f();", true), []);
+        // A call of `inner_f` counts as a lock, unless `inner_f` bounds it.
+        let findings = lint_with_history(&history, "SELECT inner_f();", true);
+        assert_eq!(rules(&findings), expected, "{setter}\n{findings:?}");
+    }
 }
 
 #[test]

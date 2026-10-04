@@ -138,6 +138,15 @@ outside bound covers a call by either name.
 A call of a clearing routine that an earlier migration created ends the bound
 too. Set the bound again after the call.
 
+A routine can bound its own locks with a `SET lock_timeout` clause, or with a
+setter that surely runs before each lock in its body. Postgres applies that
+bound on each call. So a later call of that routine needs no outside bound.
+The call must use the same schema and an accepted number of arguments. The
+routine must also call only routines of its file that bound their own locks.
+An annotation does not make a lock bounded. Any other definition of the same
+name, or any `ALTER` of it, removes the exemption for good. Code that the lint
+cannot read removes it too, because that code may replace the routine.
+
 After a `search_path` change, only `pg_catalog.set_config` sets a bound,
 because another schema may hold a `set_config` that shadows the built-in. The
 same holds in the body of a routine with a `SET search_path` clause. An
