@@ -488,6 +488,25 @@ fn metric_tokens(expr: &str) -> Vec<String> {
         .collect()
 }
 
+/// A Windows checkout can have CRLF line endings. The section search
+/// matches on `\n`, so every doc goes through `lf_only` first.
+#[test]
+fn runbook_sections_resolve_from_a_crlf_checkout() {
+    let crlf = read_doc(RUNBOOK_PATH).replace('\n', "\r\n");
+    let doc = lf_only(&crlf);
+    for sli in SLIS {
+        let heading = format!("harvest_slo_{}", sli.key);
+        assert!(
+            markdown_section(&doc, &heading).is_some(),
+            "## {heading} must resolve in a CRLF checkout"
+        );
+    }
+}
+
+fn lf_only(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 fn markdown_section<'a>(document: &'a str, heading: &str) -> Option<&'a str> {
     let marker = format!("\n## {heading}\n");
     let start = document.find(&marker)? + 1;
@@ -508,8 +527,9 @@ fn read_yaml(relative: &str) -> Value {
 }
 
 fn read_doc(relative: &str) -> String {
-    fs::read_to_string(workspace_path(relative))
-        .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+    let text = fs::read_to_string(workspace_path(relative))
+        .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"));
+    lf_only(&text)
 }
 
 fn workspace_path(relative: &str) -> PathBuf {
