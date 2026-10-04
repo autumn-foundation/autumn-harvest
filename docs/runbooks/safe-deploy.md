@@ -589,7 +589,7 @@ behaviour change). Those deploys can use the plain drain runbook above.
 
 | Term | Meaning |
 |------|---------|
-| `build_id` | Immutable string (Git SHA, semver tag, CI job ID) advertised by a worker at startup via `WorkerConfig::with_build_id("sha-abc123")`. Empty string = legacy worker that can claim any task. |
+| `build_id` | Immutable string (Git SHA, semver tag, CI job ID) advertised by a worker at startup via `WorkerConfig::with_build_id("sha-abc123")`. Empty string = no build identity. Such a worker cannot claim a pinned task (issue #1805). |
 | Build policy | Per-queue row in `harvest_build_policies`. New workflow starts on the queue receive `assigned_build_id = policy.build_id`. Updated by operators when a new build ships. |
 | Compat declaration | Row in `harvest_build_compat`. Means "workers running build B may process executions assigned to build A". Added after replay tests confirm safety. |
 | `required_build_id` | Denormalized onto `harvest_task_queue`. Workers skip tasks whose `required_build_id` they are not eligible for. |
@@ -654,14 +654,26 @@ set_build_policy(&mut conn, "default", "sha-new123", Some("v2.3.0")).await?;
 New executions now get `assigned_build_id = "sha-new123"` and old-build
 workers are ineligible to claim them.
 
-> **First-adoption prerequisite:** this exclusion only applies to workers
-> that advertise a non-empty `build_id`. Workers using the default
-> `WorkerConfig` have `build_id = ""` (the legacy sentinel) and the claim
-> filter allows them to pick up **any** task regardless of
-> `required_build_id`. Before advancing the build policy, ensure the entire
-> old fleet is already running with `with_build_id("sha-old456")` — or drain
-> all legacy workers first. A mixed fleet with even one legacy worker
-> invalidates the routing guarantee.
+> **First-adoption prerequisite:** old-build workers must advertise a
+> non-empty `build_id` to keep their pinned runs. Workers using the default
+> `WorkerConfig` have `build_id = ""`. The claim filter never lets such a
+> worker take a task with a `required_build_id` (issue #1805). Before you
+> advance the build policy, run the entire old fleet with
+> `with_build_id("sha-old456")`. An empty-build worker on a queue with a
+> policy logs a warning and sets `harvest.worker.empty_build_policy`.
+>
+> **Stuck pinned runs.** After you upgrade, pinned rows that only
+> empty-build workers poll stay `PENDING`. List them with:
+>
+> ```sql
+> SELECT queue_name, required_build_id, count(*)
+> FROM harvest_task_queue
+> WHERE state = 'PENDING' AND required_build_id IS NOT NULL
+> GROUP BY 1, 2;
+> ```
+>
+> Start workers with the listed build, or declare compatibility for the
+> build your workers run.
 
 **Step 4 — Drain and retire old-build workers.**
 
@@ -954,7 +966,7 @@ Response fields:
 | Forgetting to declare compat in Scenario A | New workers skip old-build tasks; old-build executions stall |
 | Breaking deploy without a `ctx.patched()` / `ctx.version()` gate | New workers corrupt in-flight histories on replay; use a patched gate (or a version gate for >2 versions) |
 | Rollback without updating the build policy | New starts continue landing on the bad build; set policy back first |
-| Empty `build_id` on new workers | Legacy sentinel — the worker claims any task, bypassing all routing |
+| Empty `build_id` on new workers | The worker cannot claim pinned runs (issue #1805); set `with_build_id` on every worker |
 
 ---
 

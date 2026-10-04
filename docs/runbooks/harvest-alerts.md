@@ -931,7 +931,8 @@ shows a shard the router considers writable but no worker resolves.
 
 New build policy moved starts to a build with no active workers, old workers
 were drained before in-flight executions finished, compat was not declared, or
-legacy workers with empty build IDs are masking the real routing state.
+workers with empty build IDs cannot claim pinned runs (see
+`harvest.worker.empty_build_policy`).
 
 ### False positives
 
