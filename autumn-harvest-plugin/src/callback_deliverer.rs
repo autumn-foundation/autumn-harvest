@@ -43,6 +43,10 @@ impl ReqwestCallbackDeliverer {
     /// `reqwest::Client` builder failure, which cannot occur for this
     /// static, valid configuration (a timeout and a redirect policy).
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "the static client configuration is valid"
+    )]
     pub fn with_timeout(timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)

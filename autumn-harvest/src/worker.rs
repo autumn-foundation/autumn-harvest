@@ -3283,6 +3283,10 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
 /// gets handled, is a documented no-op the caller already handles, or is
 /// provably unreachable and panics if it ever arrives.
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::expect_used,
+    reason = "callers check for `RunLocalActivity` first"
+)]
 fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCommandBatch {
     // Positional TimerStarted/TimerCancelled plan for a co-batched
     // CancelTimer or ArmTimer{for_await:false} (issue #1247). Pure, so it
@@ -13541,31 +13545,21 @@ fn merge_wake_events(
     let mut signals = pending_signals.into_iter().peekable();
 
     loop {
-        match (timers.peek(), signals.peek()) {
-            (Some((_, fires_at)), Some((_, _, received_at))) => {
-                if received_at < fires_at {
-                    let (signal_name, payload, _) = signals.next().expect("peeked");
-                    events.push(WorkflowEvent::SignalReceived {
-                        signal_name,
-                        payload,
-                    });
-                } else {
-                    let (timer_id, _) = timers.next().expect("peeked");
-                    events.push(WorkflowEvent::TimerFired { timer_id });
-                }
-            }
-            (Some(_), None) => {
-                let (timer_id, _) = timers.next().expect("peeked");
-                events.push(WorkflowEvent::TimerFired { timer_id });
-            }
-            (None, Some(_)) => {
-                let (signal_name, payload, _) = signals.next().expect("peeked");
+        let signal_first = match (timers.peek(), signals.peek()) {
+            (Some((_, fires_at)), Some((_, _, received_at))) => received_at < fires_at,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (None, None) => break,
+        };
+        if signal_first {
+            if let Some((signal_name, payload, _)) = signals.next() {
                 events.push(WorkflowEvent::SignalReceived {
                     signal_name,
                     payload,
                 });
             }
-            (None, None) => break,
+        } else if let Some((timer_id, _)) = timers.next() {
+            events.push(WorkflowEvent::TimerFired { timer_id });
         }
     }
 
@@ -20679,6 +20673,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
         // `encode_payload`. The patch places it in the encoded row before the
         // INSERT. No UPDATE of `harvest_events` follows, so this path adds no
         // in-place writer to the append-only log.
+        #[expect(clippy::expect_used, reason = "both values come from one parse")]
         let carried_raw = carried_lcr_ref.as_ref().map(|_| {
             raw_carryover.clone().expect(
                 "carried_lcr_ref is Some only when raw_carryover parsed as an offload envelope",
@@ -21990,6 +21985,7 @@ fn resolve_retry_attempts<T, E>(attempts: Vec<Result<T, E>>) -> Result<T, E> {
 /// the first success, else surface the last failure) as a lazy loop --
 /// see that function's doc comment for why this is hand-rolled rather than
 /// calling it directly.
+#[expect(clippy::expect_used, reason = "the retry loop runs at least once")]
 async fn count_history_events_with_retries(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -23046,6 +23042,12 @@ async fn process_workflow_task(
                         event_count,
                     } => {
                         history_events.extend(events);
+                        let hard_cap =
+                            registry.history_policy().event_hard_cap().ok_or_else(|| {
+                                HarvestError::Config(
+                                    "HistoryCapReached requires a configured hard cap".to_owned(),
+                                )
+                            })?;
                         // Issue #1247: no emit_update_result_metrics call
                         // here — run_local_activity_inline already emitted
                         // any update-result metrics for this batch, right
@@ -23062,10 +23064,7 @@ async fn process_workflow_task(
                             worker_id,
                             started_at,
                             event_count,
-                            registry
-                                .history_policy()
-                                .event_hard_cap()
-                                .expect("HistoryCapReached requires a configured hard cap"),
+                            hard_cap,
                         )
                         .await?;
                         for start in deferred {
@@ -29427,6 +29426,10 @@ impl Worker {
                             // shard is guaranteed by the missing-shard guard at
                             // run() entry, so this never falls back to the default
                             // pool under the wrong shard label (issue #522 review).
+                            #[expect(
+                                clippy::expect_used,
+                                reason = "`run` checks every shard pool first"
+                            )]
                             let shard_pool = sharded
                                 .exact_pool_for(*shard)
                                 .expect("assigned shard pool presence verified at run() entry")
@@ -29698,6 +29701,10 @@ impl Worker {
         // So the bound always applies. A timed-out connect falls back to
         // polling on that shard. A connect error already takes the same
         // fallback.
+        #[expect(
+            clippy::expect_used,
+            reason = "`multi_shard = true` always gives a bound"
+        )]
         let connect_bound = shard_acquire_bound(true, self.config.poll_interval)
             .expect("multi_shard=true always yields Some bound");
 
@@ -34100,6 +34107,10 @@ async fn log_claim_reset_outcome(
 /// chaos `Kill` path. The inner `HarvestResult<()>` is `process_workflow_task`'s
 /// own result on every non-panic path.
 #[cfg(feature = "chaos")]
+#[expect(
+    clippy::expect_used,
+    reason = "chaos test driver, not a production path"
+)]
 pub async fn chaos_drive_one_workflow_task(
     db_url: &str,
     registry: Arc<HandlerRegistry>,
@@ -34161,6 +34172,10 @@ pub async fn chaos_drive_one_workflow_task(
 /// the hold's chaos point, so the caller's race assertion would
 /// otherwise pass vacuously.
 #[cfg(feature = "chaos")]
+#[expect(
+    clippy::expect_used,
+    reason = "chaos test driver, not a production path"
+)]
 pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
     db_url: &str,
     registry: Arc<HandlerRegistry>,

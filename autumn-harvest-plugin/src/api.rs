@@ -11544,18 +11544,22 @@ async fn get_workflow_result(
         let handle = client.handle(current_id);
         match handle.result_snapshot_with_wait(remaining).await {
             Ok(None) => return workflow_result_pending_response(),
-            // Successor row gone mid-chain — return the last CAN sentinel.
-            Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-                return respond_with_workflow_result(
-                    &api_state,
-                    &headers,
-                    exec_id,
-                    last_can_snapshot.unwrap(),
-                    decoder.as_ref(),
-                )
-                .await;
+            Err(error) => {
+                return match (error, last_can_snapshot) {
+                    // Successor row gone mid-chain — return the last CAN sentinel.
+                    (HarvestError::NotFound(_), Some(snapshot)) => {
+                        respond_with_workflow_result(
+                            &api_state,
+                            &headers,
+                            exec_id,
+                            snapshot,
+                            decoder.as_ref(),
+                        )
+                        .await
+                    }
+                    (error, _) => map_error(error).into_response(),
+                };
             }
-            Err(error) => return map_error(error).into_response(),
             Ok(Some(snapshot)) => {
                 use autumn_harvest::WorkflowResultState;
                 if snapshot.state != WorkflowResultState::ContinuedAsNew {
@@ -11623,10 +11627,7 @@ pub(crate) async fn resolve_terminal_workflow_execution(
         let execution = match load_execution_following_retries(api_state, current_id).await {
             Ok(e) => e,
             // Only swallow NotFound mid-chain (missing successor row).
-            Err(HarvestError::NotFound(_)) if last_continued_as_new.is_some() => {
-                return Ok(last_continued_as_new.unwrap());
-            }
-            Err(e) => return Err(map_error(e)),
+            Err(e) => return last_known_on_not_found(e, last_continued_as_new),
         };
         if execution.state != "CONTINUED_AS_NEW" {
             return Ok(execution);
@@ -11644,12 +11645,19 @@ pub(crate) async fn resolve_terminal_workflow_execution(
         }
     }
     // Exceeded chain depth — return whatever state the current execution has.
-    match load_execution_following_retries(api_state, current_id).await {
-        Ok(e) => Ok(e),
-        Err(HarvestError::NotFound(_)) if last_continued_as_new.is_some() => {
-            Ok(last_continued_as_new.unwrap())
-        }
-        Err(e) => Err(map_error(e)),
+    load_execution_following_retries(api_state, current_id)
+        .await
+        .or_else(|e| last_known_on_not_found(e, last_continued_as_new))
+}
+
+/// Returns `last` for a `NotFound` error when `last` is `Some`. Maps every other error.
+fn last_known_on_not_found(
+    error: HarvestError,
+    last: Option<WorkflowExecution>,
+) -> Result<WorkflowExecution, AutumnError> {
+    match (error, last) {
+        (HarvestError::NotFound(_), Some(last)) => Ok(last),
+        (error, _) => Err(map_error(error)),
     }
 }
 
@@ -22063,6 +22071,11 @@ pub(crate) async fn signal_with_start_workflow(
 
 // ── update-with-start (issue #479) ───────────────────────────────────────────
 
+/// Version 5 UUID namespace for update ids derived from an idempotency key.
+///
+/// It is the RFC 4122 DNS namespace. Do not change it: stored ids depend on it.
+const UPDATE_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::NAMESPACE_DNS;
+
 /// `POST /workflows/{workflow_name}/update-with-start`
 ///
 /// Atomically starts a workflow if no live run for `(workflow_name, workflow_id)`
@@ -22208,9 +22221,7 @@ async fn update_with_start_workflow(
         .idempotency_key
         .as_ref()
         .map_or_else(UpdateId::new, |key| {
-            let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-                .expect("static namespace UUID is valid");
-            UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
+            UpdateId::from_uuid(uuid::Uuid::new_v5(&UPDATE_ID_NAMESPACE, key.as_bytes()))
         });
 
     // INVARIANT (this PR + #377): keyed committed-replay short-circuit. A retry of
@@ -33977,6 +33988,10 @@ async fn replay_diagnosis(
     }
 
     // The registered handler to replay against.
+    #[expect(
+        clippy::expect_used,
+        reason = "the check above returns early for an unregistered workflow"
+    )]
     let handler = runtime
         .registry
         .workflows
@@ -35404,6 +35419,7 @@ fn build_rate_limit_bucket_view(
     // depleted shard rather than an optimistically full one.
     let is_active =
         |b: &RateLimitBucket| b.override_expires_at.is_some_and(|expires| expires > now);
+    #[expect(clippy::expect_used, reason = "callers pass a non-empty `rows`")]
     let representative = rows
         .iter()
         .filter(|b| is_active(b))
@@ -37983,6 +37999,7 @@ fn merge_paused_queue_rows(
 
             // Deterministic top-level summary: the hold that started first.
             // Tie-broken by shard id so the choice never depends on fan-out order.
+            #[expect(clippy::expect_used, reason = "each group has at least one row")]
             let earliest = shard_rows
                 .iter()
                 .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
@@ -40238,6 +40255,7 @@ fn merge_activity_catalog_rows(
             let mut shard_rows = paused_by_activity.remove(name).unwrap_or_default();
             shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
 
+            #[expect(clippy::expect_used, reason = "a `json!` object literal is an object")]
             let map = entry
                 .as_object_mut()
                 .expect("json! object literal is an object");
@@ -40359,6 +40377,7 @@ async fn prometheus_metrics(
         .into_response())
 }
 
+#[expect(clippy::unwrap_used, reason = "`fmt::Write` for `String` never fails")]
 fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSignal]) -> String {
     let mut out = String::new();
 
@@ -49035,8 +49054,8 @@ async fn evaluate_eligibility_for_shard(
         i64::from(tasks.iter().any(|t| {
             t.state == "PENDING"
                 && t.scheduled_at <= chrono::Utc::now()
-                && (t.schedule_to_close_at.is_none()
-                    || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                && t.schedule_to_close_at
+                    .is_none_or(|at| at > chrono::Utc::now())
         }))
     } else {
         let count: i64 = harvest_task_queue::table
@@ -49062,8 +49081,8 @@ async fn evaluate_eligibility_for_shard(
             .filter(|&t| {
                 t.state == "PENDING"
                     && t.scheduled_at <= chrono::Utc::now()
-                    && (t.schedule_to_close_at.is_none()
-                        || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                    && t.schedule_to_close_at
+                        .is_none_or(|at| at > chrono::Utc::now())
             })
             .map(|t| {
                 let age = chrono::Utc::now().signed_duration_since(t.scheduled_at);
@@ -49294,8 +49313,8 @@ async fn evaluate_eligibility_for_shard(
         .filter(|t| {
             t.state == "PENDING"
                 && t.scheduled_at <= chrono::Utc::now()
-                && (t.schedule_to_close_at.is_none()
-                    || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                && t.schedule_to_close_at
+                    .is_none_or(|at| at > chrono::Utc::now())
         })
         .collect();
 
@@ -53132,6 +53151,27 @@ mod tests {
         assert_eq!(
             state.worker_stale_threshold(),
             std::time::Duration::from_secs(20)
+        );
+    }
+
+    // Issue #1821: only `NotFound` with a known row returns that row.
+    #[test]
+    fn last_known_on_not_found_swallows_only_not_found_1821() {
+        let last = stub_workflow_execution();
+        let id = last.id;
+        let kept =
+            last_known_on_not_found(HarvestError::NotFound("gone".into()), Some(last.clone()));
+        assert_eq!(kept.ok().map(|e| e.id), Some(id));
+        assert!(last_known_on_not_found(HarvestError::NotFound("gone".into()), None).is_err());
+        assert!(last_known_on_not_found(HarvestError::Config("x".into()), Some(last)).is_err());
+    }
+
+    // Issue #1821: stored update ids depend on these exact namespace bytes.
+    #[test]
+    fn update_id_namespace_keeps_its_bytes_1821() {
+        assert_eq!(
+            UPDATE_ID_NAMESPACE.to_string(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
         );
     }
 

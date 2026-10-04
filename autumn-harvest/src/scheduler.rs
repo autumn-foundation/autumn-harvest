@@ -1999,6 +1999,10 @@ async fn find_reusable_dag_workflow_schedule(
     match classify_workflow_name_holder(dag_name, workflow_name, holder_shape) {
         WorkflowNameHolder::Vacant => Ok(dag_row),
         WorkflowNameHolder::WorkflowOnly => {
+            #[expect(
+                clippy::expect_used,
+                reason = "the classifier gives this variant only for a present holder"
+            )]
             let workflow_only_row = foreign_holder.expect("classified from a present holder");
             match dag_row {
                 Some(dag_row) => {
@@ -2015,6 +2019,10 @@ async fn find_reusable_dag_workflow_schedule(
             }
         }
         WorkflowNameHolder::Squatter => {
+            #[expect(
+                clippy::expect_used,
+                reason = "the classifier gives this variant only for a present holder"
+            )]
             let squatter = foreign_holder.expect("classified from a present holder");
             if !release_squatted_workflow_name(conn, squatter, workflow_name).await? {
                 // The holder stopped matching the squat we classified between
@@ -2036,6 +2044,10 @@ async fn find_reusable_dag_workflow_schedule(
             Ok(dag_row)
         }
         WorkflowNameHolder::Conflict => {
+            #[expect(
+                clippy::expect_used,
+                reason = "the classifier gives this variant only for a present holder"
+            )]
             let holder = foreign_holder.expect("classified from a present holder");
             Err(HarvestError::Config(format!(
                 "schedule registration conflict: workflow_name '{workflow_name}' requested by \
