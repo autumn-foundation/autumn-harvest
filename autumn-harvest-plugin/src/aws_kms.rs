@@ -5,7 +5,13 @@
 //! each wrapped data key with AWS KMS, once, at startup. The binding lives in
 //! this crate, so the core crate keeps zero cloud dependencies (issue #944).
 //!
+//! The module re-exports [`aws_sdk_kms`], so an application needs no direct
+//! dependency on it. To load AWS credentials, the application adds
+//! `aws-config` with the `behavior-version-latest` feature.
+//!
 //! ```text
+//! use autumn_harvest_plugin::aws_kms::{AwsKms, aws_sdk_kms};
+//!
 //! let kms = AwsKms::new(aws_sdk_kms::Client::new(&aws_config::load_from_env().await));
 //! let keys = KmsKeyProvider::new(kms, kms_key_arn)
 //!     .with_wrapped_key_base64("2026-10", &wrapped)?;
@@ -17,6 +23,10 @@
 use std::collections::BTreeMap;
 
 use autumn_harvest::aead_codec::{KmsDecrypt, Zeroizing};
+
+/// The AWS SDK for KMS, re-exported so that an application can build a
+/// client with no direct dependency.
+pub use aws_sdk_kms;
 
 /// An AWS KMS client that unwraps codec data keys.
 #[derive(Debug, Clone)]

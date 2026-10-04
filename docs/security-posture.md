@@ -719,9 +719,18 @@ The CLI writes the wrapped key as base64. Load it with
 `with_wrapped_key_base64`. Never store the `Plaintext` field. KMS refuses to
 unwrap the key under another key id or another KMS key.
 
+The application needs the plugin feature, and `aws-config` to load AWS
+credentials. The plugin re-exports `aws_sdk_kms`.
+
+```toml
+[dependencies]
+autumn-harvest-plugin = { version = "0.6", features = ["aws-kms"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+```
+
 ```rust,ignore
 use autumn_harvest::aead_codec::{AeadCodec, KmsKeyProvider};
-use autumn_harvest_plugin::aws_kms::AwsKms;
+use autumn_harvest_plugin::aws_kms::{AwsKms, aws_sdk_kms};
 
 let kms = AwsKms::new(aws_sdk_kms::Client::new(&aws_config::load_from_env().await));
 let wrapped = std::fs::read_to_string("2026-10.wrapped.b64")?;
