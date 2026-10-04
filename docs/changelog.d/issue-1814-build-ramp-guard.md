@@ -32,8 +32,11 @@ Design decisions:
   adds it to the durable marker list `ramp_aborted` in the same UPDATE. A
   newer abort keeps the older markers. A marker records whether the abort
   was reported. A pass reports an abort whose marker stayed unreported past
-  `report_grace`, with reason `unreported`. A pass removes a reported marker
-  once no pool holds its ramp. After
+  `report_grace`, with reason `unreported`. The recovery claim is a lease,
+  and a marker turns reported only after its audit row commits. A pass
+  removes a reported marker once no pool holds its ramp. A trigger clears
+  `ramp_id` when an `UPDATE` changes a ramp without a new id, so a replica
+  from before the migration cannot reuse an old id. After
   a restart, the guard matches markers to ramps by id and base build, not by
   clocks, to finish a partial clear. A clear has a server-side timeout, so it cannot commit late. After a
   cancel, a pass starts no new clear.
@@ -63,7 +66,8 @@ custom recorder needs no change.
 
 New surface: the `ramp_guard` module (`RampGuardConfig`, `RampGuard`,
 `evaluate`, `wilson_lower_bound`, `guard_once`, `run_ramp_guard`,
-`abort_ramp`, `mark_abort_reported`, `ramp_aborted_by_guard`). Also new: the audit operation `build_routing.ramp.auto_abort`,
+`abort_ramp`, `mark_abort_reported`, `claim_unreported_abort`,
+`ramp_aborted_by_guard`). Also new: the audit operation `build_routing.ramp.auto_abort`,
 the counter `harvest.build.ramp_aborted{queue, reason}` with a dashboard
 panel, and `telemetry::{build_id_label, BuildIdLabelCap}`.
 

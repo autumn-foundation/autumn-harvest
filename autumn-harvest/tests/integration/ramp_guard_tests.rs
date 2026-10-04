@@ -19,8 +19,8 @@ use autumn_harvest::build_routing::{
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::ramp_guard::{
-    RampAbortReason, RampGuardConfig, abort_ramp, guard_once, mark_abort_reported,
-    ramp_aborted_by_guard, run_ramp_guard,
+    RampAbortReason, RampGuardConfig, abort_ramp, claim_unreported_abort, guard_once,
+    mark_abort_reported, ramp_aborted_by_guard, run_ramp_guard,
 };
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::{
@@ -1312,6 +1312,162 @@ async fn an_unreported_abort_is_reported_once_from_its_marker() {
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 1, "reported once");
     assert_eq!(abort_marker_count(&mut conn).await, 0);
+}
+
+/// The `reported` flag of the abort marker of `ramp_id` on one pool.
+async fn marker_reported(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) -> Option<bool> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        reported: bool,
+    }
+    diesel::sql_query(
+        "SELECT (entry->>'reported')::boolean AS reported \
+         FROM harvest_build_policies, jsonb_array_elements(ramp_aborted) AS m(entry) \
+         WHERE queue_name = $1 AND entry->>'id' = $2",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(ramp_id.to_string())
+    .get_result::<Row>(conn)
+    .await
+    .optional()
+    .expect("read marker")
+    .map(|row| row.reported)
+}
+
+/// The `ramp_id` of the test queue on one pool.
+async fn policy_ramp_id(conn: &mut AsyncPgConnection) -> Option<uuid::Uuid> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        ramp_id: Option<uuid::Uuid>,
+    }
+    diesel::sql_query("SELECT ramp_id FROM harvest_build_policies WHERE queue_name = $1")
+        .bind::<Text, _>(QUEUE)
+        .get_result::<Row>(conn)
+        .await
+        .expect("read ramp_id")
+        .ramp_id
+}
+
+/// A writer from before the `ramp_id` column changes a ramp but keeps the
+/// old `ramp_id`. The database clears that id, so an old abort marker cannot
+/// match the new ramp.
+#[tokio::test]
+async fn a_ramp_change_without_a_new_ramp_id_drops_the_id() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+    );
+    // An old API replica sets a new ramp on pool 2 with its old UPDATE.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT + 10)
+    .execute(&mut conn_2)
+    .await
+    .expect("old writer ramp");
+    assert_eq!(policy_ramp_id(&mut conn_2).await, None, "the old id goes");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "the old marker does not clear the new ramp"
+    );
+}
+
+/// The guard marks an abort as reported only after its audit row commits.
+/// A failed audit write keeps the marker unreported, so a later pass can
+/// report the abort.
+#[tokio::test]
+async fn a_failed_audit_write_keeps_the_marker_unreported() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    seed_healthy_base(&mut conn, 5).await;
+    for _ in 0..5 {
+        seed(&mut conn, true, "FAILED", false).await;
+    }
+    // No server listens on port 1, so every audit write fails.
+    let audit_pool = build_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+
+    let aborts = guard_once(
+        std::slice::from_ref(&pool),
+        &audit_pool,
+        &guard_config(),
+        None,
+    )
+    .await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert!(!ramp_is_active(&mut conn).await, "the clear still happens");
+    assert_eq!(
+        marker_reported(&mut conn, ramp_id).await,
+        Some(false),
+        "no audit row, so the marker stays unreported"
+    );
+}
+
+/// A recovery claim is a lease. A guard can claim an unreported abort and
+/// then stop. After the lease, another pass claims it again and reports it
+/// once.
+#[tokio::test]
+async fn a_recovery_claim_that_did_not_report_is_retried_after_its_lease() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+    );
+    let grace = Duration::from_secs(1);
+    tokio::time::sleep(grace + Duration::from_millis(200)).await;
+    // A guard claims the recovery, then stops before its report.
+    assert!(
+        claim_unreported_abort(&mut conn, QUEUE, ramp_id, grace, CLEAR_BOUND)
+            .await
+            .expect("claim")
+    );
+    assert_eq!(marker_reported(&mut conn, ramp_id).await, Some(false));
+
+    // The lease is fresh, so a pass does not report.
+    let config = guard_config().with_report_grace(grace);
+    let pools = [pool.clone()];
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+
+    // After the lease, a pass claims it again and reports it once.
+    tokio::time::sleep(grace + Duration::from_millis(200)).await;
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
+    assert_eq!(marker_reported(&mut conn, ramp_id).await, Some(true));
 }
 
 /// A split ramp with no abort marker is not cleared.

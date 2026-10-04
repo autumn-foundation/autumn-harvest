@@ -149,7 +149,8 @@ After the clear, the guard does these steps once per abort:
   both builds and the sample counts.
 - It increments `harvest.build.ramp_aborted{queue, reason}`.
 - It logs a warning.
-- It marks the abort markers of the ramp as reported.
+- After the audit row commits, it marks the abort markers of the ramp as
+  reported. A failed audit write keeps them unreported.
 
 Many replicas can run the guard. A replica reports an abort only after it
 cleared a pool itself, so a failed clear never reports a change that did not
@@ -193,8 +194,8 @@ The guard fails safe: when it cannot read, it does not abort.
   pool holds its ramp. A marker therefore stays until its abort finishes. After a
   restart, a pool can still hold a ramp whose `ramp_id` and base build match a marker on
   another pool. The guard then clears that ramp with no new verdict and no
-  new audit row. A base-build change keeps the `ramp_id`, but the base no
-  longer matches, so the marker does not clear the new step. The
+  new audit row. The marker also holds the base build, so it matches only a
+  ramp with the same base. The
   match uses ids, not database clocks, so clock skew between pools does not
   matter. An operator ramp set after the abort has a new `ramp_id`, so the
   guard does not clear it. A ramp set before the migration has no id, and the
@@ -203,15 +204,24 @@ The guard fails safe: when it cannot read, it does not abort.
   The guard reads the marker anyway. It clears only the pools whose `ramp_id`
   matches a marker. The newer ramp stays, and the next pass judges it on its
   own counts.
-- A guard can stop after its clear commits and before it reports. Its
-  marker then stays unreported. A pass finds a marker that is unreported,
-  older than `report_grace`, and whose ramp no pool holds. It claims the
-  abort: it marks the marker as reported, and only the guard whose mark
-  changed the row goes on. That guard reports the abort with reason
-  `unreported`, no rates and `ramp_percent=0`, because the verdict is gone.
-  A guard that reported but could not mark its markers can cause a second
-  report after the grace. An extra audit row is better than an abort with
-  none.
+- A trigger on `harvest_build_policies` clears `ramp_id` when an `UPDATE`
+  changes the target, the percentage or `updated_at` but keeps the old
+  `ramp_id`. A ramp therefore keeps an id only when an id-aware writer set
+  it. This covers an API replica from before the migration during a rolling
+  upgrade, and a base-build change through `set_build_policy`. Such a ramp
+  has no id, so no old marker can clear it. The guard judges it as usual.
+- A guard can stop after its clear commits and before it reports, or its
+  audit write can fail. Its marker then stays unreported. A pass finds a
+  marker that is unreported, older than `report_grace`, and whose ramp no
+  pool holds. It claims the abort with a lease of `report_grace`, and only
+  the guard that took the claim reports. The claim leaves the marker
+  unreported. That guard reports the abort with reason `unreported`, no
+  rates and `ramp_percent=0`, because the verdict is gone. After the audit
+  row commits, it marks the markers as reported. A guard that stops before
+  that leaves the claim to expire, and another guard reports the abort.
+- A guard that reported but could not mark its markers causes a second
+  report after the grace. A failed audit write also makes the counter count
+  the abort twice. An extra report is better than an abort with none.
 - After a cancel, a pass lets the clear in flight finish and starts no new
   clear. Shutdown therefore waits for one bounded clear at most, plus the
   audit write of a clear that the pass made.

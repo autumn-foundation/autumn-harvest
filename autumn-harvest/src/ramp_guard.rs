@@ -499,6 +499,76 @@ pub async fn mark_abort_reported(
     .await
 }
 
+/// SQL that claims the recovery of one unreported abort.
+///
+/// The binds are the queue, the `ramp_id` as text and the lease in
+/// milliseconds. The UPDATE sets `claim` to the pool clock on the markers of
+/// that id. It changes the row only when a marker of that id is unreported
+/// and has no claim younger than the lease. So of two guards, only one
+/// claims. A claim does not mark the abort as reported. A guard that claims
+/// and then stops leaves the marker unreported, and after the lease another
+/// guard can claim it again. The UPDATE does not change `updated_at`.
+#[must_use]
+pub const fn claim_unreported_abort_query() -> &'static str {
+    "UPDATE harvest_build_policies \
+     SET ramp_aborted = \
+             (SELECT jsonb_agg(CASE WHEN entry->>'id' = $2 \
+                                    THEN jsonb_set(entry, '{claim}', \
+                                             to_jsonb((EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)) \
+                                    ELSE entry END \
+                               ORDER BY position) \
+              FROM jsonb_array_elements(ramp_aborted) WITH ORDINALITY AS m(entry, position)) \
+     WHERE queue_name = $1 \
+       AND EXISTS (SELECT 1 FROM jsonb_array_elements(ramp_aborted) AS c(entry) \
+                   WHERE entry->>'id' = $2 \
+                     AND entry->'reported' = 'false'::jsonb \
+                     AND (entry->'claim' IS NULL \
+                          OR (entry->>'claim')::bigint \
+                             <= (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint - $3))"
+}
+
+/// Claim the recovery of the unreported abort of `ramp_id` on `queue`.
+///
+/// Returns `true` when this call took the claim. The claim is a lease of
+/// `lease`. The caller reports the abort and then calls
+/// [`mark_abort_reported`].
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
+pub async fn claim_unreported_abort(
+    conn: &mut diesel_async::AsyncPgConnection,
+    queue: &str,
+    ramp_id: uuid::Uuid,
+    lease: Duration,
+    bound: Duration,
+) -> crate::error::HarvestResult<bool> {
+    use diesel::sql_types::{BigInt, Text};
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+
+    let timeout_ms = bound.as_millis().max(1);
+    let lease_ms = i64::try_from(lease.as_millis()).unwrap_or(i64::MAX);
+    let id = ramp_id.to_string();
+    conn.transaction(async |conn| -> crate::error::HarvestResult<bool> {
+        for setting in ["lock_timeout", "statement_timeout"] {
+            diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
+        let changed = diesel::sql_query(claim_unreported_abort_query())
+            .bind::<Text, _>(queue)
+            .bind::<Text, _>(&id)
+            .bind::<BigInt, _>(lease_ms)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        Ok(changed > 0)
+    })
+    .await
+}
+
 /// Clear the ramp of `queue` when it still ramps `base` to `target` at `step`.
 ///
 /// The clear is a compare-and-swap. `step` is the policy row's `updated_at`
@@ -629,6 +699,9 @@ struct StoredMarker {
     reported: bool,
     /// The age of the marker in milliseconds, by the clock of its own pool.
     age_ms: i64,
+    /// The age of the recovery claim in milliseconds, when a guard claimed
+    /// the marker.
+    claim_age_ms: Option<i64>,
 }
 
 /// What one pool holds: its active ramps and its guard abort markers, each
@@ -741,12 +814,17 @@ fn abort_markers(
                 .get("at")
                 .and_then(serde_json::Value::as_i64)
                 .map_or(0, |at| now_ms.saturating_sub(at));
+            let claim_age_ms = entry
+                .get("claim")
+                .and_then(serde_json::Value::as_i64)
+                .map(|claim| now_ms.saturating_sub(claim));
             Some(StoredMarker {
                 base,
                 id,
                 target,
                 reported,
                 age_ms,
+                claim_age_ms,
             })
         })
 }
@@ -889,7 +967,9 @@ async fn read_ramps(
             }
             if marker.reported {
                 finished.entry((index, queue)).or_default().push(marker.id);
-            } else if marker.age_ms >= grace_ms {
+            } else if marker.age_ms >= grace_ms
+                && marker.claim_age_ms.is_none_or(|claim| claim >= grace_ms)
+            {
                 let entry = unreported
                     .entry((queue.clone(), marker.id))
                     .or_insert_with(|| UnreportedAbort {
@@ -1139,16 +1219,49 @@ async fn mark_reported_on_pool(
     }
 }
 
+/// Claim the recovery of the unreported abort of `ramp_id` on one pool,
+/// within `bound`. Returns `true` when this call took the claim.
+///
+/// A failure logs a warning and returns `false`, so the guard does not
+/// report. A later pass tries again.
+#[cfg(feature = "db")]
+async fn claim_on_pool(
+    pool: &crate::worker::DbPool,
+    index: usize,
+    queue: &str,
+    ramp_id: uuid::Uuid,
+    lease: Duration,
+    bound: Duration,
+) -> bool {
+    let claim = async {
+        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        claim_unreported_abort(&mut conn, queue, ramp_id, lease, bound)
+            .await
+            .map_err(|e| e.to_string())
+    };
+    match tokio::time::timeout(bound.saturating_mul(2), claim).await {
+        Ok(Ok(claimed)) => claimed,
+        Ok(Err(error)) => {
+            tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard recovery claim failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(queue = %queue, pool = index, "ramp guard recovery claim timed out");
+            false
+        }
+    }
+}
+
 /// The part of an abort's audit summary that names its two builds.
 #[cfg(feature = "db")]
 fn abort_summary_tag(target: &str, base: &str) -> String {
     format!("target_build={target} base_build={base} ")
 }
 
-/// Write the audit row of one abort, within `bound`.
+/// Write the audit row of one abort, within `bound`. Returns `true` when
+/// the row committed.
 ///
-/// The write is best effort. A failed write logs a warning and does not undo
-/// the abort. The summary names a pool that did not clear by its index only,
+/// A failed write logs a warning and does not undo the abort. The summary names a pool that did not clear by its index only,
 /// so no database error text reaches the audit log.
 #[cfg(feature = "db")]
 async fn record_abort(
@@ -1156,7 +1269,7 @@ async fn record_abort(
     abort: &RampAbort,
     failed_pools: &[usize],
     bound: Duration,
-) {
+) -> bool {
     let mut summary = format!(
         "reason={} {}ramp_percent={} \
          target_rate={:.4} target_lower_bound={:.4} base_rate={:.4} \
@@ -1204,11 +1317,15 @@ async fn record_abort(
             .map_err(|e| e.to_string())
     };
     match tokio::time::timeout(bound, write).await {
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => true,
         Ok(Err(error)) => {
             tracing::warn!(queue = %abort.queue, error = %error, "ramp guard audit write failed");
+            false
         }
-        Err(_) => tracing::warn!(queue = %abort.queue, "ramp guard audit write timed out"),
+        Err(_) => {
+            tracing::warn!(queue = %abort.queue, "ramp guard audit write timed out");
+            false
+        }
     }
 }
 
@@ -1249,7 +1366,12 @@ fn disposition(outcomes: &[ClearOutcome], first_attempt: bool) -> Disposition {
     }
 }
 
-/// Log, count and audit one abort.
+/// Log, count and audit one abort. Returns `true` when the audit row
+/// committed.
+///
+/// Only a committed audit row lets the guard mark the abort as reported. A
+/// failed write keeps the marker unreported, so a later pass reports the
+/// abort again. The counter then counts it twice.
 #[cfg(feature = "db")]
 async fn report_abort(
     abort: &RampAbort,
@@ -1257,7 +1379,7 @@ async fn report_abort(
     metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
     failed_pools: &[usize],
     bound: Duration,
-) {
+) -> bool {
     tracing::warn!(
         queue = %abort.queue,
         base_build = %abort.base_build_id,
@@ -1272,7 +1394,7 @@ async fn report_abort(
     if let Some(m) = metrics {
         m.record_build_ramp_aborted(&abort.queue, abort.reason.as_str());
     }
-    record_abort(audit_pool, abort, failed_pools, bound).await;
+    record_abort(audit_pool, abort, failed_pools, bound).await
 }
 
 /// One pool clear to retry: the pool index, the step, and `true` when an
@@ -1439,17 +1561,54 @@ impl RampGuard {
                 aborts.push(abort);
             }
         }
+        aborts.extend(
+            self.recover_and_prune(
+                pools,
+                audit_pool,
+                metrics,
+                unreported,
+                finished_markers,
+                bound,
+                cancel,
+            )
+            .await,
+        );
+        aborts
+    }
+
+    /// Report the unreported aborts and remove the finished markers.
+    ///
+    /// A cancel starts no new write, so the rest waits for a later pass.
+    #[allow(clippy::too_many_arguments)]
+    async fn recover_and_prune(
+        &self,
+        pools: &[crate::worker::DbPool],
+        audit_pool: &crate::worker::DbPool,
+        metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
+        unreported: Vec<UnreportedAbort>,
+        finished_markers: Vec<(usize, String, Vec<uuid::Uuid>)>,
+        bound: Duration,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Vec<RampAbort> {
+        let mut aborts = Vec::new();
         for lost in unreported {
             if cancel.is_cancelled() {
-                break;
+                return aborts;
             }
-            if let Some(abort) =
-                report_unreported(pools, audit_pool, metrics, lost, bound, cancel).await
+            if let Some(abort) = report_unreported(
+                pools,
+                audit_pool,
+                metrics,
+                lost,
+                self.config.report_grace(),
+                bound,
+                cancel,
+            )
+            .await
             {
                 aborts.push(abort);
             }
         }
-        // A cancel starts no new write, so the prune waits for a later pass.
         for (index, queue, ramp_ids) in finished_markers {
             if cancel.is_cancelled() {
                 break;
@@ -1505,9 +1664,10 @@ impl RampGuard {
         match decision {
             Disposition::Report => {
                 let failed_pools: Vec<usize> = failed.iter().map(|&(index, _, _)| index).collect();
-                report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await;
-                let all: Vec<usize> = (0..pools.len()).collect();
-                mark_reported(pools, &all, &key.0, ramp_id, bound, cancel).await;
+                if report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await {
+                    let all: Vec<usize> = (0..pools.len()).collect();
+                    mark_reported(pools, &all, &key.0, ramp_id, bound, cancel).await;
+                }
                 Some(abort)
             }
             Disposition::Drop => {
@@ -1641,9 +1801,10 @@ impl RampGuard {
                         abort.incomplete = !still_failed.is_empty();
                         let failed_pools: Vec<usize> =
                             still_failed.iter().map(|&(index, _, _)| index).collect();
-                        report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await;
-                        let all: Vec<usize> = (0..pools.len()).collect();
-                        mark_reported(pools, &all, &key.0, entry.ramp_id, bound, cancel).await;
+                        if report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await {
+                            let all: Vec<usize> = (0..pools.len()).collect();
+                            mark_reported(pools, &all, &key.0, entry.ramp_id, bound, cancel).await;
+                        }
                         reported.push(abort);
                     }
                     Disposition::Defer => unreported = Some(abort),
@@ -1694,22 +1855,27 @@ async fn mark_reported(
 
 /// Report a finished abort that no guard reported.
 ///
-/// The guard claims the abort first. It marks the marker on the first pool
-/// as reported. Only the guard whose mark changed the row reports. The
-/// report has reason [`RampAbortReason::Unreported`] and no rates, because
-/// the verdict is gone. Returns the abort when this guard reported it.
+/// The guard claims the abort first, on the first pool that holds an
+/// unreported marker. The claim is a lease of `lease`. Only the guard that
+/// took the claim reports. The report has reason
+/// [`RampAbortReason::Unreported`] and no rates, because the verdict is
+/// gone. After a committed audit row, the guard marks every marker as
+/// reported. A guard that stops before that leaves the markers unreported,
+/// and after the lease another guard reports the abort. Returns the abort
+/// when this guard reported it.
 #[cfg(feature = "db")]
 async fn report_unreported(
     pools: &[crate::worker::DbPool],
     audit_pool: &crate::worker::DbPool,
     metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
     lost: UnreportedAbort,
+    lease: Duration,
     bound: Duration,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<RampAbort> {
-    let (&first, rest) = lost.pools.split_first()?;
+    let &first = lost.pools.first()?;
     let pool = pools.get(first)?;
-    if !mark_reported_on_pool(pool, first, &lost.queue, lost.ramp_id, bound).await {
+    if !claim_on_pool(pool, first, &lost.queue, lost.ramp_id, lease, bound).await {
         return None;
     }
     let abort = RampAbort {
@@ -1725,8 +1891,17 @@ async fn report_unreported(
         target: BuildOutcomeStats::default(),
         incomplete: false,
     };
-    report_abort(&abort, audit_pool, metrics, &[], bound).await;
-    mark_reported(pools, rest, &abort.queue, Some(lost.ramp_id), bound, cancel).await;
+    if report_abort(&abort, audit_pool, metrics, &[], bound).await {
+        mark_reported(
+            pools,
+            &lost.pools,
+            &abort.queue,
+            Some(lost.ramp_id),
+            bound,
+            cancel,
+        )
+        .await;
+    }
     Some(abort)
 }
 
@@ -2019,8 +2194,15 @@ mod tests {
         assert!(!mark_sql.contains("updated_at"), "a mark keeps the step");
         assert!(
             mark_sql.contains("'reported', false"),
-            "only an unreported marker matches, so the mark is a claim"
+            "only an unreported marker matches"
         );
+        let claim_sql = claim_unreported_abort_query();
+        assert!(!claim_sql.contains("updated_at"), "a claim keeps the step");
+        assert!(
+            !claim_sql.contains("'{reported}'"),
+            "a claim leaves the marker unreported"
+        );
+        assert!(claim_sql.contains("- $3"), "a claim is a lease");
     }
 
     #[cfg(feature = "db")]
@@ -2042,6 +2224,7 @@ mod tests {
                 target: None,
                 reported: true,
                 age_ms: 0,
+                claim_age_ms: None,
             }]
         );
         assert_eq!(abort_markers(&serde_json::json!({}), 0).count(), 0);
@@ -2053,6 +2236,12 @@ mod tests {
         assert!(!marker.reported);
         assert_eq!(marker.target.as_deref(), Some("b"));
         assert_eq!(marker.age_ms, 600);
+        assert_eq!(marker.claim_age_ms, None);
+        let list = serde_json::json!([
+            {"id": id.to_string(), "base": "a", "reported": false, "at": 0, "claim": 900},
+        ]);
+        let marker = abort_markers(&list, 1000).next().expect("one marker");
+        assert_eq!(marker.claim_age_ms, Some(100));
     }
 
     #[cfg(feature = "db")]
