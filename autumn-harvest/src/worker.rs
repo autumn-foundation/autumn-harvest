@@ -1550,12 +1550,6 @@ impl ClaimedTaskKind {
     }
 }
 
-fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
-    id.to_string()
-        .parse()
-        .expect("database UUIDs must round-trip into ExecutionId")
-}
-
 const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
     match command {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
@@ -11314,7 +11308,7 @@ async fn persist_all_started_child_workflows(
         }
     }
 
-    let parent_exec_id = execution_id_from_uuid(parent_execution.id);
+    let parent_exec_id = ExecutionId::from_uuid(parent_execution.id);
     let queue_name = parent_execution.queue_name.clone();
     let children = children.to_vec();
     // Pre-compute position-tagged pre-suspension events (markers + detached-spawns) and
@@ -12686,7 +12680,7 @@ async fn persist_child_timeout_race(
         });
     }
 
-    let parent_exec_id = execution_id_from_uuid(parent_execution.id);
+    let parent_exec_id = ExecutionId::from_uuid(parent_execution.id);
     let child_id = child.child_id;
     let telemetry = registry.telemetry().clone();
     let execute_span = execute_span.clone();
@@ -13027,7 +13021,7 @@ async fn persist_mixed_suspension_batch(
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<()> {
-    let exec_id = execution_id_from_uuid(parent_execution.id);
+    let exec_id = ExecutionId::from_uuid(parent_execution.id);
 
     // Two `StartTimer`s for one id would arm two durable rows and record two
     // `TimerStarted` events for one logical timer. Reject before anything is
@@ -13871,7 +13865,7 @@ pub async fn preload_failure_history(
     let Some(exec_uuid) = task.workflow_exec_id else {
         return PreloadedFailureHistory::NoExecution;
     };
-    let exec_id = execution_id_from_uuid(exec_uuid);
+    let exec_id = ExecutionId::from_uuid(exec_uuid);
     // Undecoded on purpose. This reads `next_event_id` -- id arithmetic over
     // the row set -- and never looks at a payload field, so it is not a replay
     // path and needs no codec. Decoding here would be worse than useless: with
@@ -14862,7 +14856,7 @@ async fn create_detached_child_executions(
             )?;
             crate::cross_shard_child::record_cross_shard_child(
                 conn,
-                execution_id_from_uuid(parent_execution.id),
+                ExecutionId::from_uuid(parent_execution.id),
                 *child_id,
                 workflow_name,
                 Some(*parent_close_policy),
@@ -15481,7 +15475,7 @@ pub async fn write_activity_result_for_task(
             task.id
         )));
     };
-    let exec_id = execution_id_from_uuid(exec_uuid);
+    let exec_id = ExecutionId::from_uuid(exec_uuid);
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
     handle_activity_result(
         conn,
@@ -16490,7 +16484,7 @@ async fn process_activity_task(
         let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         return fail_task_only(&mut conn, task.id, "activity task missing activity_name").await;
     };
-    let exec_id = execution_id_from_uuid(exec_uuid);
+    let exec_id = ExecutionId::from_uuid(exec_uuid);
 
     // Worker sessions (issue #606): intercept the two reserved internal
     // activity names before any of the normal handler-dispatch machinery
@@ -19172,7 +19166,7 @@ async fn prepare_workflow_task_with_cache(
         fail_task_only(conn, task.id, &error.to_string()).await?;
         return Err(error);
     };
-    let exec_id = execution_id_from_uuid(exec_uuid);
+    let exec_id = ExecutionId::from_uuid(exec_uuid);
 
     // Only probe the cache when sticky routing is enabled (lease_ttl > 0).
     // With sticky_timeout == 0 the cache is permanently disabled: no lookups,
@@ -19319,7 +19313,7 @@ async fn reject_child_continue_as_new(
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) else {
+    let Some(parent_exec_id) = execution.parent_id.map(ExecutionId::from_uuid) else {
         return Ok(());
     };
 
@@ -20822,7 +20816,7 @@ async fn persist_workflow_outcome(
     // outcome arm ignores this.
     continue_as_new_verdict: Option<ContinueAsNewVerdict>,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
-    let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
+    let parent_exec_id = execution.parent_id.map(ExecutionId::from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
     // do NOT wake their parent on completion or failure.
     let is_detached_child = execution.parent_close_policy.is_some();
@@ -22200,7 +22194,7 @@ async fn fail_workflow_for_history_cap(
         exec_id,
         next_event_id,
         worker_id,
-        execution.parent_id.map(execution_id_from_uuid),
+        execution.parent_id.map(ExecutionId::from_uuid),
         reason,
         Some(telemetry.metrics.as_ref()),
         registry.payload_codecs(),
@@ -33708,7 +33702,7 @@ pub async fn quarantine_workflow_task_timeout(
                         .await
                         .map_err(crate::error::database_error)?;
 
-                        let exec_id = execution_id_from_uuid(exec_uuid);
+                        let exec_id = ExecutionId::from_uuid(exec_uuid);
                         let history =
                             crate::store::load_history_with_codecs(conn, exec_id, codecs).await?;
                         crate::store::append_events_with_codecs(
@@ -33762,7 +33756,7 @@ pub async fn quarantine_workflow_task_timeout(
                         if parent_close_policy_opt.is_none()
                             && let Some(parent_uuid) = parent_id_opt
                         {
-                            let parent_exec_id = execution_id_from_uuid(parent_uuid);
+                            let parent_exec_id = ExecutionId::from_uuid(parent_uuid);
                             let _ = wake_parent_for_child_failure(
                                 conn,
                                 parent_exec_id,
@@ -33834,7 +33828,7 @@ pub async fn quarantine_workflow_task_timeout(
                     crate::telemetry::WorkflowStatus::Failed,
                 );
                 if let Some(exec_uuid) = exec_id_opt {
-                    let exec_id = execution_id_from_uuid(exec_uuid);
+                    let exec_id = ExecutionId::from_uuid(exec_uuid);
                     check_and_report_unfinished_handlers_for_worker(
                         &mut conn,
                         exec_id,

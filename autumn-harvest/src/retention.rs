@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 #[cfg(feature = "db")]
 use std::{collections::HashMap, time::Instant};
@@ -1189,14 +1189,12 @@ impl RetentionMonitor {
         AtomicU64::fetch_add(&self.iterations_completed, 1, Ordering::Relaxed);
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex has been poisoned.
+    /// Returns a copy of the current retention status.
     #[must_use]
     pub fn snapshot(&self) -> RetentionStatus {
         self.inner
             .lock()
-            .expect("retention monitor lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -1208,7 +1206,7 @@ impl RetentionMonitor {
     /// cannot ride along in the same `update`.
     #[cfg(feature = "db")]
     fn update_partitions(&self, shard: ShardId, outcome: crate::partition::MaintenanceOutcome) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -1228,7 +1226,7 @@ impl RetentionMonitor {
     /// returns to `None` instead of going stale.
     #[cfg(feature = "db")]
     fn clear_partitions(&self, shard: ShardId) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -1248,7 +1246,7 @@ impl RetentionMonitor {
     /// `update`.
     #[cfg(feature = "db")]
     fn update_rate_limit_buckets(&self, shard: ShardId, outcome: RateLimitBucketGcOutcome) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -1264,7 +1262,7 @@ impl RetentionMonitor {
     /// cannot ride along in that phase's `update`.
     #[cfg(feature = "db")]
     fn update_terminal_tasks(&self, shard: ShardId, outcome: TerminalTaskGcOutcome) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -1276,7 +1274,7 @@ impl RetentionMonitor {
 
     #[cfg(feature = "db")]
     fn update(&self, shard: ShardId, result: RetentionTickResult) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -2232,12 +2230,20 @@ impl Drop for RetentionLeaseGuard {
         if self.active {
             let pool = self.pool.clone();
             let lease_id = self.lease_id.clone();
-            let ids = {
-                let guard = self.active_ids.lock().expect("lease guard lock poisoned");
-                guard.clone()
+            // A panic here during unwinding aborts the process (issue #1821).
+            // A poisoned list is still a valid list, so recover it.
+            let ids = self
+                .active_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            // `tokio::spawn` panics without a runtime. Skip the release instead.
+            // The rows then keep the lease, as they do after a process crash.
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
             };
             if !ids.is_empty() {
-                tokio::spawn(async move {
+                runtime.spawn(async move {
                     if let Ok(mut conn) = pool.get().await {
                         let _ = diesel::update(
                             harvest_workflow_executions::table
@@ -2533,7 +2539,7 @@ async fn run_shard_tick(
             guard
                 .active_ids
                 .lock()
-                .expect("lease guard lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .extend(ids);
         }
 
@@ -2979,7 +2985,10 @@ async fn run_shard_tick(
             }
 
             {
-                let mut active_guard = guard.active_ids.lock().expect("lease guard lock poisoned");
+                let mut active_guard = guard
+                    .active_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
                     active_guard.swap_remove(pos);
                 }
@@ -3853,7 +3862,7 @@ async fn routine_skip_candidate(
     }
 
     {
-        let mut active_guard = active_ids.lock().expect("lease guard lock poisoned");
+        let mut active_guard = active_ids.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(pos) = active_guard.iter().position(|&x| x == candidate_id) {
             active_guard.swap_remove(pos);
         }

@@ -522,12 +522,6 @@ pub async fn find_timed_out_tasks(
     Ok(results)
 }
 
-fn execution_id_from_uuid(id: uuid::Uuid) -> crate::types::ExecutionId {
-    id.to_string()
-        .parse()
-        .expect("database UUIDs must round-trip into ExecutionId")
-}
-
 fn timeout_error(task_name: &str, reason: &TimeoutReason) -> String {
     HarvestError::Timeout {
         timeout_type: reason.timeout_type(),
@@ -1179,7 +1173,7 @@ async fn commit_workflow_execution_timeout(
             if let Some(parent_uuid) = parent_uuid {
                 wake_parent_for_child_timeout(
                     conn,
-                    execution_id_from_uuid(parent_uuid),
+                    ExecutionId::from_uuid(parent_uuid),
                     exec_id,
                     &error_msg,
                 )
@@ -1664,7 +1658,7 @@ pub async fn force_fail_activity(
     use crate::failure::IntoActivityErrorString;
     use crate::schema::harvest_task_queue::dsl;
 
-    let exec_id = execution_id_from_uuid(workflow_exec_id);
+    let exec_id = ExecutionId::from_uuid(workflow_exec_id);
     let reason = reason.map(str::to_owned);
 
     // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
@@ -1982,7 +1976,7 @@ async fn enforce_workflow_timeout(
             {
                 wake_parent_for_child_timeout(
                     conn,
-                    execution_id_from_uuid(parent_uuid),
+                    ExecutionId::from_uuid(parent_uuid),
                     exec_id,
                     &error,
                 )
@@ -2109,7 +2103,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
     let mut count = 0usize;
 
     for task in &expired {
-        let exec_id = execution_id_from_uuid(task.workflow_exec_id);
+        let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
         let exec_uuid = task.workflow_exec_id;
         let activity_id = ActivityExecId::from_uuid(task.activity_id);
         let task_id = task.id;
@@ -2299,7 +2293,7 @@ pub async fn enforce_workflow_execution_timeouts(
     let count = expired.len();
 
     for execution in &expired {
-        let exec_id = execution_id_from_uuid(execution.id);
+        let exec_id = ExecutionId::from_uuid(execution.id);
         // Chain deadline takes precedence when both fired (issue #617). A
         // chain-only expiry has no per-run `deadline_at`, so classification must
         // not `.expect()` `deadline_at`.
@@ -4817,7 +4811,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
                 enforce_activity_timeout(
                     conn,
                     &task,
-                    execution_id_from_uuid(exec_uuid),
+                    ExecutionId::from_uuid(exec_uuid),
                     &reason,
                     circuit_breakers,
                     metrics,
@@ -4829,7 +4823,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
                 enforce_workflow_timeout(
                     conn,
                     &task,
-                    execution_id_from_uuid(exec_uuid),
+                    ExecutionId::from_uuid(exec_uuid),
                     &reason,
                     metrics,
                     payload_codecs,
@@ -5355,7 +5349,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
     let count = oversized.len();
 
     for row in &oversized {
-        let exec_id = execution_id_from_uuid(row.id);
+        let exec_id = ExecutionId::from_uuid(row.id);
         let event_count = row.event_count;
 
         let error_msg =
@@ -5438,7 +5432,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                 if let Some(parent_uuid) = parent_uuid {
                     wake_parent_for_child_timeout(
                         conn,
-                        execution_id_from_uuid(parent_uuid),
+                        ExecutionId::from_uuid(parent_uuid),
                         exec_id,
                         &error_msg,
                     )

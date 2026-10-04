@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use autumn_web::error::AutumnError;
@@ -529,43 +529,31 @@ impl HarvestApiState {
     ///
     /// Call this during startup with `2 × WorkerConfig::worker_heartbeat_interval`
     /// so the API correctly reflects the configured heartbeat cadence.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_worker_stale_threshold(&self, threshold: std::time::Duration) {
         *self
             .worker_stale_threshold
             .lock()
-            .expect("harvest api state lock poisoned") = threshold;
+            .unwrap_or_else(PoisonError::into_inner) = threshold;
     }
 
     /// Override the per-query execution timeout (default 5 s, issue #234).
     ///
     /// Call this at startup with `WorkerConfig::query_timeout` so the management
     /// API honours the same timeout as the worker's in-process query dispatch.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_query_timeout(&self, timeout: std::time::Duration) {
         *self
             .query_timeout
             .lock()
-            .expect("harvest api state lock poisoned") = timeout;
+            .unwrap_or_else(PoisonError::into_inner) = timeout;
     }
 
     /// Current per-query execution timeout.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn query_timeout(&self) -> std::time::Duration {
         *self
             .query_timeout
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the server-side ceiling for workflow execution timeouts (issue #243).
@@ -573,26 +561,20 @@ impl HarvestApiState {
     /// Call this during startup from the plugin to propagate
     /// `BuiltHarvest::max_workflow_execution_timeout` into the API state so the
     /// `POST /workflows` handler can apply the cap to every start request.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_execution_timeout(&self, ceiling: Option<std::time::Duration>) {
         *self
             .max_workflow_execution_timeout
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Current server-side ceiling for workflow execution timeouts.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<std::time::Duration> {
         *self
             .max_workflow_execution_timeout
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the server-side ceiling for the chain-scoped lifetime cap (issue #617).
@@ -601,26 +583,20 @@ impl HarvestApiState {
     /// ceiling both caps a workflow-declared chain cap AND acts as a fleet-wide
     /// default so `POST /workflows` starts inherit it even when a workflow
     /// under-specifies.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_chain_timeout(&self, ceiling: Option<std::time::Duration>) {
         *self
             .max_workflow_chain_timeout
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Current server-side ceiling for workflow chain timeouts.
     #[must_use]
     pub fn max_workflow_chain_timeout(&self) -> Option<std::time::Duration> {
         *self
             .max_workflow_chain_timeout
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the server-side ceiling for workflow-level retry attempts (issue #523).
@@ -628,35 +604,25 @@ impl HarvestApiState {
     /// Call this during startup from the plugin to propagate
     /// `BuiltHarvest::max_workflow_attempts` into the API state so every start
     /// request can have the cap applied.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_attempts(&self, ceiling: Option<u32>) {
         *self
             .max_workflow_attempts
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Current server-side ceiling for workflow attempts.
     #[must_use]
     pub fn max_workflow_attempts(&self) -> Option<u32> {
         *self
             .max_workflow_attempts
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the SSRF policy used to validate completion-callback targets at
     /// registration time (issue #605). Call this during startup from the
     /// plugin to mirror `BuiltHarvest::completion_callback_config()`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_completion_callback_ssrf_policy(
         &self,
         policy: autumn_harvest::completion_callback::SsrfPolicy,
@@ -664,19 +630,17 @@ impl HarvestApiState {
         *self
             .completion_callback_ssrf_policy
             .lock()
-            .expect("harvest api state lock poisoned") = policy;
+            .unwrap_or_else(PoisonError::into_inner) = policy;
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Current SSRF policy for completion-callback targets.
     #[must_use]
     pub fn completion_callback_ssrf_policy(
         &self,
     ) -> autumn_harvest::completion_callback::SsrfPolicy {
         self.completion_callback_ssrf_policy
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -686,27 +650,19 @@ impl HarvestApiState {
     /// stored envelopes. Mirroring the registry alone changes nothing —
     /// decoding also requires the [`Self::set_decode_payloads_on_read`]
     /// opt-in and harvest-admin access on the request.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_payload_codecs(&self, codecs: autumn_harvest::payload_codec::PayloadCodecs) {
         *self
             .payload_codecs
             .lock()
-            .expect("harvest api state lock poisoned") = codecs;
+            .unwrap_or_else(PoisonError::into_inner) = codecs;
     }
 
     /// Snapshot of the mirrored codec registry (issue #608).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub(crate) fn payload_codecs(&self) -> autumn_harvest::payload_codec::PayloadCodecs {
         self.payload_codecs
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -715,109 +671,77 @@ impl HarvestApiState {
     /// Default **off**: with the flag off, no handler consults the codec
     /// registry and responses are byte-for-byte identical to a deployment
     /// that never heard of this feature.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_decode_payloads_on_read(&self, enabled: bool) {
         *self
             .decode_payloads_on_read
             .lock()
-            .expect("harvest api state lock poisoned") = enabled;
+            .unwrap_or_else(PoisonError::into_inner) = enabled;
     }
 
     /// Override the thresholds for the rolled-up `GET /admin/status` verdict
     /// (issue #679). Mirrored from the plugin builder at startup.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_status_thresholds(&self, thresholds: crate::status_summary::StatusThresholds) {
         *self
             .status_thresholds
             .lock()
-            .expect("harvest api state lock poisoned") = thresholds;
+            .unwrap_or_else(PoisonError::into_inner) = thresholds;
     }
 
     /// Current thresholds for the rolled-up `GET /admin/status` verdict.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn status_thresholds(&self) -> crate::status_summary::StatusThresholds {
         self.status_thresholds
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
     /// Mirror the built-in synthetic liveness canary configuration (issue #796)
     /// from the plugin builder at startup. `None` disables the canary.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_canary_config(&self, config: Option<crate::canary::CanaryConfig>) {
         *self
             .canary_config
             .lock()
-            .expect("harvest api state lock poisoned") = config;
+            .unwrap_or_else(PoisonError::into_inner) = config;
     }
 
     /// The mirrored synthetic liveness canary configuration, if enabled
     /// (issue #796).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn canary_config(&self) -> Option<crate::canary::CanaryConfig> {
         self.canary_config
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
     /// Mirror [`crate::plugin::HarvestPlugin`]'s dev-runtime-only flag (issue
     /// #1291), so `start_harvest_runtime` can also refuse a non-embedded
     /// ambient mode. See the field doc on `require_embedded_harvest_mode`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub(crate) fn set_require_embedded_harvest_mode(&self, value: bool) {
         *self
             .require_embedded_harvest_mode
             .lock()
-            .expect("harvest api state lock poisoned") = value;
+            .unwrap_or_else(PoisonError::into_inner) = value;
     }
 
     /// Whether `start_harvest_runtime` must refuse a non-embedded ambient
     /// Harvest mode (issue #1291). See the field doc on
     /// `require_embedded_harvest_mode`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub(crate) fn require_embedded_harvest_mode(&self) -> bool {
         *self
             .require_embedded_harvest_mode
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether read-path payload decoding is enabled (issue #608).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn decode_payloads_on_read(&self) -> bool {
         *self
             .decode_payloads_on_read
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the hard ceiling on per-execution event count (issue #493).
@@ -825,35 +749,27 @@ impl HarvestApiState {
     /// Call this during startup from the plugin to propagate
     /// `BuiltHarvest::max_workflow_history_events` into the API state so the
     /// preflight check can surface it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_history_events(&self, ceiling: Option<u64>) {
         *self
             .max_workflow_history_events
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
     /// Current hard ceiling on per-execution event count (issue #493).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn max_workflow_history_events(&self) -> Option<u64> {
         *self
             .max_workflow_history_events
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the SSE keepalive comment interval (default 15 s, issue #324).
     ///
     /// # Panics
     ///
-    /// Panics if `interval` is zero or if the internal mutex is poisoned.
+    /// Panics if `interval` is zero.
     pub fn set_sse_keepalive_interval(&self, interval: std::time::Duration) {
         assert!(
             !interval.is_zero(),
@@ -862,221 +778,157 @@ impl HarvestApiState {
         *self
             .sse_keepalive_interval
             .lock()
-            .expect("harvest api state lock poisoned") = interval;
+            .unwrap_or_else(PoisonError::into_inner) = interval;
     }
 
     /// Current SSE keepalive comment interval.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn sse_keepalive_interval(&self) -> std::time::Duration {
         *self
             .sse_keepalive_interval
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the SSE per-stream event buffer depth (default 1024, issue #324).
     ///
     /// When the producer falls behind by more than this many events the stream
     /// closes with a slow-consumer response.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_sse_buffer_depth(&self, depth: usize) {
         *self
             .sse_buffer_depth
             .lock()
-            .expect("harvest api state lock poisoned") = depth;
+            .unwrap_or_else(PoisonError::into_inner) = depth;
     }
 
     /// Current SSE per-stream event buffer depth.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn sse_buffer_depth(&self) -> usize {
         *self
             .sse_buffer_depth
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the maximum start delay allowed (issue #322).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_start_delay(&self, delay: std::time::Duration) {
         *self
             .max_workflow_start_delay
             .lock()
-            .expect("harvest api state lock poisoned") = delay;
+            .unwrap_or_else(PoisonError::into_inner) = delay;
     }
 
     /// Maximum allowed workflow start delay.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn max_workflow_start_delay(&self) -> std::time::Duration {
         *self
             .max_workflow_start_delay
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Returns the default max-wait cap applied to debounced workflow starts (issue #499).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn default_debounce_max_wait(&self) -> std::time::Duration {
         *self
             .default_debounce_max_wait
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the default debounce max-wait cap (issue #499).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_default_debounce_max_wait(&self, max_wait: std::time::Duration) {
         *self
             .default_debounce_max_wait
             .lock()
-            .expect("harvest api state lock poisoned") = max_wait;
+            .unwrap_or_else(PoisonError::into_inner) = max_wait;
     }
 
     /// Returns the retention window for request-scoped start idempotency keys
     /// (issue #808). Defaults to 24h.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn start_idempotency_window(&self) -> std::time::Duration {
         *self
             .start_idempotency_window
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the start-idempotency retention window (issue #808).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_start_idempotency_window(&self, window: std::time::Duration) {
         *self
             .start_idempotency_window
             .lock()
-            .expect("harvest api state lock poisoned") = window;
+            .unwrap_or_else(PoisonError::into_inner) = window;
     }
 
     /// Returns the ceiling on the `[from, to]` window accepted by
     /// `GET /admin/usage` (issue #596). Defaults to 90 days.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn usage_window_ceiling(&self) -> std::time::Duration {
         *self
             .usage_window_ceiling
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the `GET /admin/usage` window ceiling (issue #596).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_usage_window_ceiling(&self, ceiling: std::time::Duration) {
         *self
             .usage_window_ceiling
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
     /// Returns the cap on distinct groups `GET /admin/usage` will return
     /// before failing loudly with `413` (issue #596). Defaults to 10,000.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn usage_max_groups(&self) -> usize {
         *self
             .usage_max_groups
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the `GET /admin/usage` group-count cap (issue #596).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_usage_max_groups(&self, cap: usize) {
         *self
             .usage_max_groups
             .lock()
-            .expect("harvest api state lock poisoned") = cap;
+            .unwrap_or_else(PoisonError::into_inner) = cap;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
     ///
     /// Call this during startup with values from [`BatchStartConfig`] so the
     /// management API honours operator-configured limits.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_batch_start_config(&self, config: &BatchStartConfig) {
         *self
             .batch_start_max_items
             .lock()
-            .expect("harvest api state lock poisoned") = config.max_items_per_batch;
+            .unwrap_or_else(PoisonError::into_inner) = config.max_items_per_batch;
         *self
             .batch_start_max_bytes
             .lock()
-            .expect("harvest api state lock poisoned") = config.max_total_bytes;
+            .unwrap_or_else(PoisonError::into_inner) = config.max_total_bytes;
     }
 
     /// Maximum items per `POST /workflows/batch_start` request.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn batch_start_max_items(&self) -> usize {
         *self
             .batch_start_max_items
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Maximum total bytes for a `POST /workflows/batch_start` request body.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn batch_start_max_bytes(&self) -> u64 {
         *self
             .batch_start_max_bytes
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Return a clone of the shared admission gate cache (issue #377).
@@ -1117,10 +969,6 @@ impl HarvestApiState {
     ///
     /// When no extractor is installed the default behaviour reads the
     /// `X-Harvest-Actor` header and falls back to `"anonymous"`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_actor_extractor<F>(&self, f: F)
     where
         F: Fn(&axum::http::HeaderMap) -> String + Send + Sync + 'static,
@@ -1128,22 +976,18 @@ impl HarvestApiState {
         *self
             .actor_extractor
             .lock()
-            .expect("harvest api state lock poisoned") = Some(Arc::new(f));
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
     }
 
     /// Set the audit log retention period in days.
     ///
     /// Audit records older than this threshold will be deleted on each
     /// retention sweep. Default: 90 days.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_audit_retention_days(&self, days: i64) {
         *self
             .audit_retention_days
             .lock()
-            .expect("harvest api state lock poisoned") = Some(days);
+            .unwrap_or_else(PoisonError::into_inner) = Some(days);
     }
 
     /// Record the host application's deployment profile for preflight checks.
@@ -1153,15 +997,11 @@ impl HarvestApiState {
     ///
     /// A standalone embedder declares the profile with
     /// [`StandaloneAdminAuth::with_deployment_profile`]. See `docs/embedding.md`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_deployment_profile(&self, profile: impl Into<String>) {
         *self
             .deployment_profile
             .lock()
-            .expect("harvest api state lock poisoned") = profile.into();
+            .unwrap_or_else(PoisonError::into_inner) = profile.into();
     }
 
     /// Mark whether the Harvest management API is mounted behind auth.
@@ -1169,15 +1009,11 @@ impl HarvestApiState {
     /// This reports the boundary provided via [`crate::plugin::HarvestPlugin::api_with_auth`]
     /// or [`StandaloneAdminAuth::with_admin_auth_boundary`]. It does not implement RBAC.
     /// See `docs/embedding.md` for the standalone path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_admin_auth_boundary(&self, present: bool) {
         *self
             .admin_auth_boundary
             .lock()
-            .expect("harvest api state lock poisoned") = present;
+            .unwrap_or_else(PoisonError::into_inner) = present;
     }
 
     /// Open the mutating routes to a caller with no credential (issue #1802).
@@ -1187,15 +1023,11 @@ impl HarvestApiState {
     /// for routes with no admin gate. Admin-gated routes keep their gate.
     /// `HarvestPlugin` and `HarvestEmbedding` log a startup warning while the
     /// opt-out opens the routes. A raw router mount logs nothing.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_allow_unauthenticated_mutations(&self, allow: bool) {
         *self
             .allow_unauthenticated_mutations
             .lock()
-            .expect("harvest api state lock poisoned") = allow;
+            .unwrap_or_else(PoisonError::into_inner) = allow;
     }
 
     /// Set the Autumn session key used by built-in management guards.
@@ -1204,15 +1036,11 @@ impl HarvestApiState {
     /// integrations that mount `harvest_api_router` directly can call this to keep
     /// Harvest's built-in high-impact route guard aligned with their app auth config.
     /// [`StandaloneAdminAuth::with_admin_auth_session_key`] declares it for them.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_admin_auth_session_key(&self, session_key: impl Into<String>) {
         *self
             .admin_auth_session_key
             .lock()
-            .expect("harvest api state lock poisoned") = session_key.into();
+            .unwrap_or_else(PoisonError::into_inner) = session_key.into();
     }
 
     /// Configure `/health` to fail when writable shard rollout readiness is not `ready`.
@@ -1221,15 +1049,11 @@ impl HarvestApiState {
     /// liveness-style health check. Production deployments can enable this to
     /// make readiness probes and rollout pipelines gate on worker and scheduler
     /// coverage before accepting starts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_health_requires_shard_readiness(&self, required: bool) {
         *self
             .health_requires_shard_readiness
             .lock()
-            .expect("harvest api state lock poisoned") = required;
+            .unwrap_or_else(PoisonError::into_inner) = required;
     }
 
     /// Mark this replica as draining (issue #1812).
@@ -1245,10 +1069,6 @@ impl HarvestApiState {
     /// Report whether this replica is draining (issue #1812).
     ///
     /// A linked autumn-web probe state that is shutting down also counts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn is_draining(&self) -> bool {
         // The full path is necessary. Diesel `RunQueryDsl::load` shadows the method.
@@ -1256,7 +1076,7 @@ impl HarvestApiState {
             || self
                 .host_probes
                 .lock()
-                .expect("harvest api state lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .as_ref()
                 .is_some_and(autumn_web::probe::ProbeState::is_shutting_down)
     }
@@ -1275,7 +1095,7 @@ impl HarvestApiState {
         *self
             .host_probes
             .lock()
-            .expect("harvest api state lock poisoned") = Some(probes);
+            .unwrap_or_else(PoisonError::into_inner) = Some(probes);
     }
 
     /// Returns `Some(days)` only when explicitly set via [`HarvestApiState::set_audit_retention_days`];
@@ -1284,13 +1104,13 @@ impl HarvestApiState {
         *self
             .audit_retention_days
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn deployment_profile(&self) -> String {
         self.deployment_profile
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -1298,20 +1118,20 @@ impl HarvestApiState {
         *self
             .admin_auth_boundary
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn allow_unauthenticated_mutations(&self) -> bool {
         *self
             .allow_unauthenticated_mutations
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn admin_auth_session_key(&self) -> String {
         self.admin_auth_session_key
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -1319,44 +1139,32 @@ impl HarvestApiState {
         *self
             .health_requires_shard_readiness
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the default deadline applied when `POST /workers/{id}/drain` does not
     /// supply a `deadline_at`. Defaults to 30 s (the `WorkerConfig::shutdown_timeout`
     /// default). Set this at startup from the actual `WorkerConfig`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_worker_shutdown_timeout(&self, timeout: std::time::Duration) {
         *self
             .worker_shutdown_timeout
             .lock()
-            .expect("harvest api state lock poisoned") = timeout;
+            .unwrap_or_else(PoisonError::into_inner) = timeout;
     }
 
     pub(crate) fn worker_shutdown_timeout(&self) -> std::time::Duration {
         *self
             .worker_shutdown_timeout
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Configure the default-shard database URL used by workflow result waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_workflow_result_notification_database_url(&self, url: impl Into<String>) {
         self.set_workflow_result_notification_database_urls([(ShardId::new(0), url)]);
     }
 
     /// Configure per-shard database URLs used by workflow result waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_workflow_result_notification_database_urls<I, S>(&self, urls: I)
     where
         I: IntoIterator<Item = (ShardId, S)>,
@@ -1365,29 +1173,25 @@ impl HarvestApiState {
         *self
             .workflow_result_notification_urls
             .lock()
-            .expect("harvest api state lock poisoned") = urls
+            .unwrap_or_else(PoisonError::into_inner) = urls
             .into_iter()
             .map(|(shard, url)| (shard, url.into()))
             .collect();
     }
 
     /// Override the maximum long-poll wait for workflow result requests.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_workflow_result_max_wait(&self, max_wait: std::time::Duration) {
         *self
             .workflow_result_max_wait
             .lock()
-            .expect("harvest api state lock poisoned") = max_wait;
+            .unwrap_or_else(PoisonError::into_inner) = max_wait;
     }
 
     pub(crate) fn workflow_result_max_wait(&self) -> std::time::Duration {
         *self
             .workflow_result_max_wait
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn workflow_result_notification_database_urls(
@@ -1396,7 +1200,7 @@ impl HarvestApiState {
         let urls = self
             .workflow_result_notification_urls
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if urls.is_empty() {
             return Err(HarvestError::Config(
@@ -1434,7 +1238,7 @@ impl HarvestApiState {
         let extractor = self
             .actor_extractor
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(f) = extractor {
             return f(headers);
@@ -1452,53 +1256,35 @@ impl HarvestApiState {
         *self
             .worker_stale_threshold
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Install the currently running Harvest runtime snapshot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal API-state mutex is poisoned.
     pub fn install(&self, runtime: HarvestApiRuntime) {
-        *self
-            .runtime
-            .lock()
-            .expect("harvest api state lock poisoned") = Some(runtime);
+        *self.runtime.lock().unwrap_or_else(PoisonError::into_inner) = Some(runtime);
     }
 
     /// Install the Harvest storage pool used by management routes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal API-state mutex is poisoned.
     pub fn install_storage_pool(&self, pool: HarvestDbPool) {
         *self
             .storage_pool
             .lock()
-            .expect("harvest api state lock poisoned") = Some(pool);
+            .unwrap_or_else(PoisonError::into_inner) = Some(pool);
     }
 
     /// Clear the currently running Harvest runtime snapshot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal API-state mutex is poisoned.
     pub fn clear(&self) {
-        *self
-            .runtime
-            .lock()
-            .expect("harvest api state lock poisoned") = None;
+        *self.runtime.lock().unwrap_or_else(PoisonError::into_inner) = None;
         *self
             .storage_pool
             .lock()
-            .expect("harvest api state lock poisoned") = None;
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     pub(crate) fn runtime(&self) -> HarvestResult<HarvestApiRuntime> {
         self.runtime
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or_else(|| HarvestError::Config("harvest runtime is not started".to_string()))
     }
@@ -1506,7 +1292,7 @@ impl HarvestApiState {
     pub(crate) fn storage_pool(&self) -> HarvestResult<HarvestDbPool> {
         self.storage_pool
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or_else(|| {
                 HarvestError::Config("harvest storage pool is not configured".to_string())

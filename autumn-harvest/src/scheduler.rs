@@ -1,7 +1,7 @@
 //! DAG scheduler and runtime execution.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -354,27 +354,23 @@ impl SchedulerMonitor {
     }
 
     /// Snapshot the current scheduler heartbeat state.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal scheduler monitor mutex is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> SchedulerSnapshot {
         self.inner
             .lock()
-            .expect("scheduler monitor lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
     fn mark_tick(&self, dag_count: usize) {
-        let mut guard = self.inner.lock().expect("scheduler monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard.running = true;
         guard.dag_count = dag_count;
         guard.last_tick_at = Some(Utc::now());
     }
 
     fn mark_stopped(&self, dag_count: usize) {
-        let mut guard = self.inner.lock().expect("scheduler monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard.running = false;
         guard.dag_count = dag_count;
     }
