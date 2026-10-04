@@ -15283,6 +15283,25 @@ impl Drop for CircuitProbeGuard<'_> {
     }
 }
 
+/// Whether `error`, read from a task row, is the error the timeout enforcer
+/// writes when it times out an attempt of `activity_name` (issue #1809).
+fn is_attempt_timeout_error(error: &str, activity_name: &str) -> bool {
+    [
+        crate::error::TimeoutType::StartToClose,
+        crate::error::TimeoutType::Heartbeat,
+        crate::error::TimeoutType::ScheduleToClose,
+    ]
+    .into_iter()
+    .any(|timeout_type| {
+        error
+            == HarvestError::Timeout {
+                timeout_type,
+                task_name: activity_name.to_string(),
+            }
+            .to_string()
+    })
+}
+
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
 /// cannot spin the claim loop hot (issue #1809).
 const CIRCUIT_DEFER_MIN: Duration = Duration::from_millis(100);
@@ -16418,15 +16437,16 @@ async fn process_activity_task(
     probe_guard.disarm();
     let circuit_outcome = if was_cancelled {
         if let Some(token) = circuit_token {
-            // The claim watcher cancels on any lost claim (issue #1809). A
-            // cancelled task says nothing about the downstream. Any other loss
-            // of a probe's claim is a timeout, perhaps enforced by another
-            // process: a failed probe, so it reports its trip. Only a probe
-            // pays for the read.
+            // The claim watcher cancels on any lost claim (issue #1809). Only a
+            // timeout, perhaps enforced by another process, fails a probe, so
+            // only that loss reports a trip. The enforcer writes its timeout
+            // error to the row. A cancellation, an operator force-fail, an
+            // orphan reclaim, a deleted row or a failed read reports none.
+            // Only a probe pays for the read.
             let probe_timed_out = token.is_probe()
-                && !matches!(
+                && matches!(
                     queue::task_status_for_claim(&mut conn, &activity_claim).await,
-                    Ok(Some((state, _, _))) if state == "CANCELLED"
+                    Ok(Some((_, Some(error), _))) if is_attempt_timeout_error(&error, activity_name)
                 );
             let now = std::time::Instant::now();
             if probe_timed_out {
@@ -42322,6 +42342,33 @@ mod tests {
             timeout_retry_delay(&task, "timeout: StartToClose for call_api"),
             None
         );
+    }
+
+    /// Issue #1809: only the enforcer's timeout error marks a probe's lost
+    /// claim as a timeout.
+    #[test]
+    fn only_the_enforcer_timeout_error_counts_as_a_timeout() {
+        assert!(is_attempt_timeout_error(
+            "timeout: StartToClose for send",
+            "send"
+        ));
+        assert!(is_attempt_timeout_error(
+            "timeout: Heartbeat for send",
+            "send"
+        ));
+        assert!(is_attempt_timeout_error(
+            "timeout: ScheduleToClose for send",
+            "send"
+        ));
+        assert!(!is_attempt_timeout_error(
+            "timeout: StartToClose for other",
+            "send"
+        ));
+        assert!(!is_attempt_timeout_error(
+            "force-failed by operator",
+            "send"
+        ));
+        assert!(!is_attempt_timeout_error("", "send"));
     }
 
     #[test]
