@@ -3412,8 +3412,9 @@ freshness limit, which both follow `worker_heartbeat_interval`. Workers with
 two intervals would compare two time ranges. So do the workflow cache
 settings (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`), the
 task budgets (`workflow_task_timeout`, `max_local_activity_start_to_close`)
-and `workflow_panic_max_attempts`. A worker with the cache off replays full
-histories, and a shorter budget times out tasks that its peers finish. Those
+and the quarantine limits (`workflow_panic_max_attempts`,
+`poison_pill_threshold`). A worker with the cache off replays full histories,
+and a shorter budget times out tasks that its peers finish. Those
 decide which tasks a worker can claim, and in
 which mix under load. So workers of two sizes are two cohorts. A worker on a
 slow queue is not compared with workers on a fast queue. A worker that favours

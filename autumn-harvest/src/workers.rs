@@ -1070,7 +1070,8 @@ pub struct CohortPolicy<'a> {
 /// Each one changes what the outcome window records for the same task. The
 /// workflow cache decides whether a task replays its full history. The two
 /// budgets decide whether a task times out, and a timeout is a failure. The
-/// panic limit decides how many failing attempts run before quarantine.
+/// panic limit and the poison-pill threshold decide how many failing attempts
+/// run before quarantine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionPolicy {
     /// `sticky_timeout`. Zero turns the workflow cache off.
@@ -1085,6 +1086,9 @@ pub struct ExecutionPolicy {
     pub max_local_activity_start_to_close: std::time::Duration,
     /// `workflow_panic_max_attempts`.
     pub workflow_panic_max_attempts: u32,
+    /// `poison_pill_threshold`. The worker's timeout path quarantines a
+    /// workflow task that times out this many times in a row.
+    pub poison_pill_threshold: i32,
 }
 
 impl Default for ExecutionPolicy {
@@ -1097,6 +1101,7 @@ impl Default for ExecutionPolicy {
             workflow_task_timeout: std::time::Duration::from_secs(10),
             max_local_activity_start_to_close: std::time::Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
+            poison_pill_threshold: 3,
         }
     }
 }
@@ -1110,6 +1115,9 @@ impl ExecutionPolicy {
             "workflow_task_timeout_ms": self.workflow_task_timeout.as_millis(),
             "max_local_activity_ms": self.max_local_activity_start_to_close.as_millis(),
             "workflow_panic_max_attempts": self.workflow_panic_max_attempts,
+            // Every threshold at or below 0 turns quarantine off, so they are
+            // one setting.
+            "poison_pill_threshold": self.poison_pill_threshold.max(0),
         })
     }
 }
@@ -3536,11 +3544,28 @@ mod tests {
                 workflow_panic_max_attempts: 1,
                 ..base
             },
+            ExecutionPolicy {
+                poison_pill_threshold: 10,
+                ..base
+            },
+            ExecutionPolicy {
+                poison_pill_threshold: 0,
+                ..base
+            },
         ];
         for variant in variants {
             assert_ne!(cohort(base), cohort(variant), "{variant:?}");
         }
         assert_eq!(cohort(base), cohort(ExecutionPolicy::default()));
+        let off = |threshold| ExecutionPolicy {
+            poison_pill_threshold: threshold,
+            ..base
+        };
+        assert_eq!(
+            cohort(off(0)),
+            cohort(off(-1)),
+            "every threshold at or below 0 turns quarantine off"
+        );
     }
 
     /// Issue #1815: under load, the claim gate gives each worker a task mix

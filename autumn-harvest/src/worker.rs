@@ -27509,21 +27509,47 @@ impl Drop for DbOpTimer {
     }
 }
 
-/// Record one workflow-task outcome in the worker's task window (issue #1815).
+/// What a claim-fenced recovery write did (issue #1815).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRecovery {
+    /// The write applied under this worker's claim.
+    Applied,
+    /// The claim fence matched no row. A peer or a reclaim owns the task now.
+    ClaimLost,
+    /// The write did not reach the database. This worker may still hold the
+    /// claim.
+    Failed,
+}
+
+/// Whether one workflow-task outcome is a failure, for the task window
+/// (issue #1815).
 ///
 /// A completion is a success. An error or a body timeout is a failure. A
 /// release is neither, because the task did not run to a decision here.
-fn record_workflow_task_outcome(
+const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> Option<bool> {
+    match outcome {
+        Ok(TaskDispatchOutcome::Completed) => Some(false),
+        Ok(TaskDispatchOutcome::BodyTimedOut) | Err(_) => Some(true),
+        Ok(TaskDispatchOutcome::Released { .. }) => None,
+    }
+}
+
+/// Record a failed workflow task once its recovery write has run (issue
+/// #1815).
+///
+/// A lost claim means a peer owns the task. The stale attempt then stays out
+/// of the window, as in the activity finalization path. A recovery that did
+/// not reach the database still counts, because this worker may still hold
+/// the claim. `elapsed` is taken when the attempt ended, so the recovery I/O
+/// adds no latency.
+fn record_failed_workflow_task(
     window: &crate::worker_outlier::TaskOutcomeWindow,
-    outcome: &HarvestResult<TaskDispatchOutcome>,
-    dispatched_at: std::time::Instant,
+    recovery: ClaimRecovery,
+    elapsed: Duration,
 ) {
-    let failed = match outcome {
-        Ok(TaskDispatchOutcome::Completed) => false,
-        Ok(TaskDispatchOutcome::BodyTimedOut) | Err(_) => true,
-        Ok(TaskDispatchOutcome::Released { .. }) => return,
-    };
-    window.record(failed, dispatched_at.elapsed());
+    if recovery != ClaimRecovery::ClaimLost {
+        window.record(true, elapsed);
+    }
 }
 
 /// Spawn the cross-region DR sampler (issue #954).
@@ -31848,6 +31874,7 @@ impl Worker {
                             .config
                             .max_local_activity_start_to_close,
                         workflow_panic_max_attempts: self.config.workflow_panic_max_attempts,
+                        poison_pill_threshold: self.config.poison_pill_threshold,
                     },
                 }),
                 compare: true,
@@ -33759,7 +33786,12 @@ impl Worker {
                     pool_shard,
                 )
                 .await;
-                record_workflow_task_outcome(&task_outcomes, &outcome, dispatched_at);
+                // Issue #1815: a success counts now. A failure counts after
+                // its claim-fenced recovery, below.
+                let elapsed = dispatched_at.elapsed();
+                if workflow_task_failed(&outcome) == Some(false) {
+                    task_outcomes.record(false, elapsed);
+                }
                 match outcome {
                     Ok(TaskDispatchOutcome::Completed) => {
                         // Success: clear the consecutive-timeout counter for
@@ -33842,7 +33874,7 @@ impl Worker {
                         // dropped first, as the timeout arm does, so recovery
                         // I/O holds no concurrency permit.
                         #[cfg(feature = "db")]
-                        if task_type == "workflow" {
+                        let recovery = if task_type == "workflow" {
                             drop(permit);
                             reset_timed_out_workflow_task(
                                 &pool,
@@ -33851,8 +33883,13 @@ impl Worker {
                                 claim_crash_strikes,
                                 claim_attempt,
                             )
-                            .await;
-                        }
+                            .await
+                        } else {
+                            ClaimRecovery::Applied
+                        };
+                        #[cfg(not(feature = "db"))]
+                        let recovery = ClaimRecovery::Applied;
+                        record_failed_workflow_task(&task_outcomes, recovery, elapsed);
                     }
                     Ok(TaskDispatchOutcome::BodyTimedOut) => {
                         // Release the concurrency slot immediately so other
@@ -33908,7 +33945,7 @@ impl Worker {
                         );
 
                         #[cfg(feature = "db")]
-                        match decision {
+                        let recovery = match decision {
                             crate::poison_pill::ReclaimAction::Quarantine => {
                                 // Clear the in-process counter before the
                                 // async DB call so a concurrent reclaim
@@ -33921,7 +33958,7 @@ impl Worker {
                                         exec_id,
                                     );
                                 }
-                                let quarantined = quarantine_workflow_task_timeout(
+                                let recovery = quarantine_workflow_task_timeout_outcome(
                                     &pool,
                                     task_id,
                                     exec_id_for_timeout,
@@ -33947,10 +33984,11 @@ impl Worker {
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner),
                                         exec_id,
-                                        quarantined,
+                                        recovery == ClaimRecovery::Applied,
                                         new_strikes,
                                     );
                                 }
+                                recovery
                             }
                             crate::poison_pill::ReclaimAction::Requeue => {
                                 // Reset the task to PENDING so any worker can
@@ -33963,11 +34001,15 @@ impl Worker {
                                     claim_crash_strikes,
                                     claim_attempt,
                                 )
-                                .await;
+                                .await
                             }
-                        }
+                        };
                         #[cfg(not(feature = "db"))]
-                        let _ = decision;
+                        let recovery = {
+                            let _ = decision;
+                            ClaimRecovery::Applied
+                        };
+                        record_failed_workflow_task(&task_outcomes, recovery, elapsed);
                     }
                 }
             } else {
@@ -34001,8 +34043,16 @@ impl Worker {
                 )
                 .await;
                 // An activity records its own attempt in `process_activity_task`.
-                if task_type == "workflow" {
-                    record_workflow_task_outcome(&task_outcomes, &outcome, dispatched_at);
+                // Issue #1815: a workflow success counts now. A workflow
+                // failure counts after its claim-fenced recovery, below.
+                let elapsed = dispatched_at.elapsed();
+                let workflow_failed = if task_type == "workflow" {
+                    workflow_task_failed(&outcome)
+                } else {
+                    None
+                };
+                if workflow_failed == Some(false) {
+                    task_outcomes.record(false, elapsed);
                 }
                 if let Err(error) = outcome {
                     tracing::error!(
@@ -34028,7 +34078,7 @@ impl Worker {
                     // all deadlines unset strands too after a pool acquire
                     // timeout (issue #1788). See `releases_claim_after_error`.
                     #[cfg(feature = "db")]
-                    if releases_claim_after_error(&task_type, &error) {
+                    let recovery = if releases_claim_after_error(&task_type, &error) {
                         drop(permit);
                         reset_timed_out_workflow_task(
                             &pool,
@@ -34037,7 +34087,14 @@ impl Worker {
                             claim_crash_strikes,
                             claim_attempt,
                         )
-                        .await;
+                        .await
+                    } else {
+                        ClaimRecovery::Applied
+                    };
+                    #[cfg(not(feature = "db"))]
+                    let recovery = ClaimRecovery::Applied;
+                    if workflow_failed == Some(true) {
+                        record_failed_workflow_task(&task_outcomes, recovery, elapsed);
                     }
                 }
             }
@@ -34212,8 +34269,41 @@ async fn workflow_task_timeout_metric_names(
 /// The write is fenced on the claim `(worker_id, attempt)`. The acquire can
 /// retry for longer than the stuck-running backstop. A peer can then hold a
 /// new claim, and its run must not fail. A lost claim also returns `false`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub async fn quarantine_workflow_task_timeout(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    exec_id_opt: Option<uuid::Uuid>,
+    worker_id: &str,
+    attempt: i32,
+    new_strikes: i32,
+    timeout_secs: u64,
+    workflow_name: &str,
+    queue_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> bool {
+    quarantine_workflow_task_timeout_outcome(
+        pool,
+        task_id,
+        exec_id_opt,
+        worker_id,
+        attempt,
+        new_strikes,
+        timeout_secs,
+        workflow_name,
+        queue_name,
+        metrics,
+        codecs,
+    )
+    .await
+        == ClaimRecovery::Applied
+}
+
+/// [`quarantine_workflow_task_timeout`], which also tells a lost claim from
+/// a failed write (issue #1815).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn quarantine_workflow_task_timeout_outcome(
     pool: &DbPool,
     task_id: uuid::Uuid,
     exec_id_opt: Option<uuid::Uuid>,
@@ -34227,7 +34317,7 @@ pub async fn quarantine_workflow_task_timeout(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> bool {
+) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
     use diesel::BoolExpressionMethods;
@@ -34243,7 +34333,7 @@ pub async fn quarantine_workflow_task_timeout(
                 error = %e,
                 "workflow task timeout quarantine: pool exhausted"
             );
-            return false;
+            return ClaimRecovery::Failed;
         }
     };
 
@@ -34276,7 +34366,7 @@ pub async fn quarantine_workflow_task_timeout(
         Ok(row) => row.unwrap_or((serde_json::Value::Null, 1)),
         Err(error) => {
             lookup_failed(&error);
-            return false;
+            return ClaimRecovery::Failed;
         }
     };
 
@@ -34319,7 +34409,7 @@ pub async fn quarantine_workflow_task_timeout(
                 Ok(row) => row,
                 Err(error) => {
                     lookup_failed(&error);
-                    return false;
+                    return ClaimRecovery::Failed;
                 }
             };
             match res {
@@ -34530,7 +34620,7 @@ pub async fn quarantine_workflow_task_timeout(
                 attempt,
                 "workflow task timeout quarantine: claim lost; a peer owns the task"
             );
-            return false;
+            return ClaimRecovery::ClaimLost;
         }
         Ok(Some((deferred_starts, queue_used, closed_children, pending_cancel_metrics))) => {
             // issue #1197, item 1: emitted only now that this transaction has
@@ -34588,10 +34678,10 @@ pub async fn quarantine_workflow_task_timeout(
                 error = %e,
                 "workflow task timeout quarantine: transaction failed"
             );
-            return false;
+            return ClaimRecovery::Failed;
         }
     }
-    true
+    ClaimRecovery::Applied
 }
 
 /// Whether the dispatch error path releases the claim after `error`.
@@ -34636,13 +34726,16 @@ const RESET_POOL_RETRY_BACKOFF_MS: &[u64] =
 /// Uses an optimistic `WHERE state = 'RUNNING' AND worker_id = …` guard so a
 /// concurrent reclaim or a different worker that somehow picked it up does not
 /// get its state overwritten.
+///
+/// Returns [`ClaimRecovery::ClaimLost`] when the guard matches no row, so the
+/// caller can leave the attempt out of its outlier window (issue #1815).
 pub async fn reset_timed_out_workflow_task(
     pool: &DbPool,
     task_id: uuid::Uuid,
     worker_id: &str,
     claim_crash_strikes: i32,
     claim_attempt: i32,
-) {
+) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl;
 
     // Retry both the pool acquire and the release write. Without the retry, a
@@ -34742,7 +34835,11 @@ pub async fn reset_timed_out_workflow_task(
             }
             Ok(updated) => {
                 log_claim_reset_outcome(&mut conn, task_id, worker_id, updated).await;
-                return;
+                return if updated > 0 {
+                    ClaimRecovery::Applied
+                } else {
+                    ClaimRecovery::ClaimLost
+                };
             }
         }
     }
@@ -34753,6 +34850,7 @@ pub async fn reset_timed_out_workflow_task(
         "workflow task timeout reset: retries exhausted; \
          task may be stuck RUNNING until worker stops"
     );
+    ClaimRecovery::Failed
 }
 
 /// Log the result of the claim reset in [`reset_timed_out_workflow_task`].
@@ -42045,6 +42143,36 @@ mod tests {
         assert!(
             reason.contains("never missed this task"),
             "the operator's next step is the live peer, not the deploy: {reason}"
+        );
+    }
+
+    /// Issue #1815: a failed workflow task counts once its recovery has run.
+    /// A lost claim means a peer owns the task, so the stale attempt stays
+    /// out. A recovery that never reached the database still counts.
+    #[test]
+    fn a_failed_workflow_task_counts_unless_its_claim_was_lost() {
+        let window = crate::worker_outlier::TaskOutcomeWindow::new(16, Duration::from_secs(300));
+        let latency = Duration::from_millis(40);
+        record_failed_workflow_task(&window, ClaimRecovery::ClaimLost, latency);
+        assert_eq!(window.snapshot().tasks, 0, "a lost claim adds nothing");
+        record_failed_workflow_task(&window, ClaimRecovery::Applied, latency);
+        record_failed_workflow_task(&window, ClaimRecovery::Failed, latency);
+        let stats = window.snapshot();
+        assert_eq!((stats.tasks, stats.failures), (2, 2));
+
+        assert_eq!(
+            workflow_task_failed(&Ok(TaskDispatchOutcome::Completed)),
+            Some(false)
+        );
+        assert_eq!(
+            workflow_task_failed(&Ok(TaskDispatchOutcome::BodyTimedOut)),
+            Some(true)
+        );
+        assert_eq!(
+            workflow_task_failed(&Ok(TaskDispatchOutcome::Released {
+                clears_timeout_strike: false
+            })),
+            None
         );
     }
 

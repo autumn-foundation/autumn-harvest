@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use autumn_harvest::dlq::{DeadLetterReason, dead_letter_count};
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::worker::{
-    DbPool, quarantine_workflow_task_timeout, reset_timed_out_workflow_task,
+    ClaimRecovery, DbPool, quarantine_workflow_task_timeout, reset_timed_out_workflow_task,
 };
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
@@ -321,6 +321,33 @@ async fn reset_does_not_clobber_a_reclaim_at_a_newer_claim_epoch() {
 
     // The reset that belongs to the current claim still applies.
     reset_timed_out_workflow_task(&pool, task_id, "worker-1", 1, 2).await;
+    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+}
+
+/// Issue #1815: the reset reports whether it applied under this claim. The
+/// worker leaves a failed attempt out of its outlier window when a peer owns
+/// the task.
+#[tokio::test]
+async fn reset_reports_a_lost_claim() {
+    let (mut conn, pool, _container) = setup().await;
+
+    let exec_id = insert_running_workflow(&mut conn).await;
+    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
+
+    assert_eq!(
+        reset_timed_out_workflow_task(&pool, task_id, "worker-99", 0, 1).await,
+        ClaimRecovery::ClaimLost,
+        "another worker's claim"
+    );
+    assert_eq!(
+        reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 2).await,
+        ClaimRecovery::ClaimLost,
+        "a newer claim epoch"
+    );
+    assert_eq!(
+        reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await,
+        ClaimRecovery::Applied
+    );
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 }
 
