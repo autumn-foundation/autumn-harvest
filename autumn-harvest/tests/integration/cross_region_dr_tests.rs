@@ -1012,6 +1012,107 @@ async fn a_fenced_worker_cannot_claim_tasks() {
     FenceRegistry::clear();
 }
 
+/// The batched claim applies the same fence as the single-row claim (issue
+/// #1823). Issue #1340 intends to make it the default claim path.
+#[tokio::test]
+async fn a_fenced_worker_cannot_claim_through_claim_task_batched() {
+    use autumn_harvest::queue::{BatchedClaimConfig, claim_task_batched};
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("claimbatched");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-batched",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+
+    FenceRegistry::clear();
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::new(0))],
+        ShardId::new(0),
+    )
+    .expect("no conflicting pin in this test");
+
+    let queues = ["q-dr-batched".to_string()];
+    let claimed = claim_task_batched(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        BatchedClaimConfig::default(),
+    )
+    .await
+    .expect("claim");
+    assert!(claimed.is_some(), "the current epoch claims normally");
+
+    diesel::sql_query("UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let after = claim_task_batched(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        BatchedClaimConfig::default(),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    let after_on_shard = autumn_harvest::queue::claim_task_batched_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        BatchedClaimConfig::default(),
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    FenceRegistry::clear();
+    assert!(
+        after.is_none(),
+        "a worker pinned to a superseded generation must claim nothing"
+    );
+    assert!(
+        after_on_shard.is_none(),
+        "the explicit-shard entry point is fenced too"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+    }
+    let rows: Vec<Row> = diesel::sql_query("SELECT state, attempt FROM harvest_task_queue")
+        .load(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].state, "PENDING");
+    assert_eq!(rows[0].attempt, 1, "a fenced claim must not burn a retry");
+}
+
 /// The fence bump is a **commit-order barrier**, not a racy read.
 ///
 /// This is the property the whole mechanism rests on: a persist that passes the

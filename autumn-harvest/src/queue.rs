@@ -1208,30 +1208,40 @@ fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(i32, i64)> {
 /// `bump_generation` for the full argument.
 #[must_use]
 pub fn claim_task_query_fenced() -> &'static str {
-    static FENCED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        const FENCE_CTE: &str = "WITH fence AS MATERIALIZED ( \
-             SELECT 1 AS ok FROM harvest_shard_generation \
-             WHERE shard_id = $7 AND generation = $8 \
-         ), ";
-        let base = claim_task_query();
-        let base = base
-            .strip_prefix("WITH ")
-            .expect("claim query starts with WITH");
-        let spliced = format!("{FENCE_CTE}{base}");
-
-        // One anchor, one substitution: `CROSS JOIN worker_info ` appears
-        // exactly once, in `candidate`'s FROM list. Asserting the count before
-        // replacing turns a future edit that duplicates or renames the anchor
-        // into a loud panic at first use instead of a silently unfenced claim.
-        let anchor = "CROSS JOIN worker_info ";
-        assert_eq!(
-            spliced.matches(anchor).count(),
-            1,
-            "claim query fence anchor must appear exactly once"
-        );
-        spliced.replace(anchor, "CROSS JOIN worker_info CROSS JOIN fence ")
-    });
+    static FENCED: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| splice_dr_fence(claim_task_query(), "$7", "$8"));
     &FENCED
+}
+
+/// Splice the DR `fence` CTE into a claim query (issues #954, #1823).
+///
+/// `shard_bind` and `generation_bind` name the two new bind positions. The
+/// single-row claim and the batched claim both use this splice. So one probe
+/// text guards every claim path.
+fn splice_dr_fence(base: &str, shard_bind: &str, generation_bind: &str) -> String {
+    let fence_cte = format!(
+        "WITH fence AS MATERIALIZED ( \
+             SELECT 1 AS ok FROM harvest_shard_generation \
+             WHERE shard_id = {shard_bind} AND generation = {generation_bind} \
+         ), "
+    );
+    let base = base
+        .strip_prefix("WITH ")
+        .expect("claim query starts with WITH");
+    let spliced = format!("{fence_cte}{base}");
+
+    // One anchor, one substitution: `CROSS JOIN worker_info ` appears
+    // exactly once, in the candidate scan's FROM list. Asserting the count
+    // before replacing turns a future edit that duplicates or renames the
+    // anchor into a loud panic at first use instead of a silently unfenced
+    // claim.
+    let anchor = "CROSS JOIN worker_info ";
+    assert_eq!(
+        spliced.matches(anchor).count(),
+        1,
+        "claim query fence anchor must appear exactly once"
+    );
+    spliced.replace(anchor, "CROSS JOIN worker_info CROSS JOIN fence ")
 }
 
 /// Atomically claim the highest-priority pending task from the given queues.
@@ -7332,11 +7342,11 @@ pub async fn pending_queue_demand_by_queue_name(
 /// full context on `queue.rs`'s exactly-once-claim and lock-ordering
 /// invariants, per issue #1340's own scope.
 ///
-/// This variant also does not implement the cross-region DR fence (issue
-/// #954). Nor does it implement the by-id claim (issue #1312) that
-/// [`claim_task_query_fenced`] and [`claim_task_by_id_query`] add to the
-/// single-row path. A deployment using either would need those ported here
-/// first.
+/// This variant applies the cross-region DR fence, like the single-row path
+/// (issue #1823). See [`claim_task_batched_candidates_query_fenced`]. It does
+/// not implement the by-id claim (issue #1312) that
+/// [`claim_task_by_id_query`] adds to the single-row path. A deployment that
+/// uses the by-id claim would need it ported here first.
 ///
 /// **Known limitation, safe-side: the advisory lock can be held longer
 /// than the single-row path's.** `pg_try_advisory_xact_lock` is
@@ -7515,6 +7525,25 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
         )
     });
     &QUERY
+}
+
+/// [`claim_task_batched_candidates_query`] with the cross-region DR fence
+/// spliced in (issue #1823).
+///
+/// The splice is the one [`claim_task_query_fenced`] uses. It binds `$13`
+/// shard id and `$14` pinned generation after the base query's `$1..$12`. A
+/// stale generation selects zero candidates, so the walk claims nothing.
+///
+/// The probe guards the per-candidate attempts too. The batch fetch and every
+/// attempt run in one transaction. The probe holds `ACCESS SHARE` on
+/// `harvest_shard_generation` until that transaction ends. The bump needs
+/// `ACCESS EXCLUSIVE`, so it cannot commit while a walk is in progress.
+#[must_use]
+pub fn claim_task_batched_candidates_query_fenced() -> &'static str {
+    static FENCED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        splice_dr_fence(claim_task_batched_candidates_query(), "$13", "$14")
+    });
+    &FENCED
 }
 
 /// The `required_build_id`/`required_capabilities` eligibility predicate
@@ -7891,6 +7920,9 @@ impl Default for BatchedClaimConfig {
 
 /// Fetch one ordered batch of claim candidates, optionally resuming past
 /// `cursor`. See [`claim_task_batched_candidates_query`] for the predicate.
+///
+/// `fence` is the `(shard, generation)` pair from [`fence_binding`]. `Some`
+/// issues the fenced query; `None` issues the unchanged one.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_claim_batch(
     conn: &mut AsyncPgConnection,
@@ -7902,8 +7934,14 @@ async fn fetch_claim_batch(
     ineligible_activities: &[String],
     cursor: Option<BatchCursor>,
     batch_size: i64,
+    fence: Option<(i32, i64)>,
 ) -> HarvestResult<Vec<BatchedClaimCandidate>> {
-    diesel::sql_query(claim_task_batched_candidates_query())
+    let query = if fence.is_some() {
+        claim_task_batched_candidates_query_fenced()
+    } else {
+        claim_task_batched_candidates_query()
+    };
+    let query = diesel::sql_query(query)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
         .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -7921,10 +7959,18 @@ async fn fetch_claim_batch(
             cursor.map(|c| c.scheduled_at),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(cursor.map(|c| c.id))
-        .bind::<diesel::sql_types::BigInt, _>(batch_size)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)
+        .bind::<diesel::sql_types::BigInt, _>(batch_size);
+    let rows: Result<Vec<BatchedClaimCandidate>, diesel::result::Error> = match fence {
+        None => query.load(conn).await,
+        Some((fence_shard, generation)) => {
+            query
+                .bind::<diesel::sql_types::Integer, _>(fence_shard)
+                .bind::<diesel::sql_types::BigInt, _>(generation)
+                .load(conn)
+                .await
+        }
+    };
+    rows.map_err(crate::error::database_error)
 }
 
 /// The database's own clock (review finding, fourteenth bug in the
@@ -8071,7 +8117,45 @@ pub async fn claim_task_batched(
     ineligible_activities: &[String],
     config: BatchedClaimConfig,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_batched_on_shard(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        config,
+        None,
+    )
+    .await
+}
+
+/// [`claim_task_batched`], told which shard this connection serves, so the
+/// cross-region DR fence applies (issue #1823).
+///
+/// `shard` works as in [`claim_task_on_shard`]. `None` resolves through the
+/// fence registry's default shard. With no pin for the resolved shard, the
+/// batch scan is the unchanged statement. With a pin, a worker on a
+/// superseded generation claims nothing and changes no row.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_batched_on_shard(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    config: BatchedClaimConfig,
+    shard: Option<crate::types::ShardId>,
+) -> HarvestResult<Option<TaskQueueItem>> {
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
+    let fence = fence_binding(shard);
     let batch_size = config.batch_size.max(1);
     let max_batches = config.max_batches.max(1);
 
@@ -8091,6 +8175,7 @@ pub async fn claim_task_batched(
                         ineligible_activities,
                         cursor,
                         batch_size,
+                        fence,
                     )
                     .await?;
                     let fetched = batch.len();
@@ -8504,6 +8589,100 @@ mod tests {
         ] {
             assert!(base.contains(gate), "precondition: base has {gate}");
             assert!(fenced.contains(gate), "fenced form dropped {gate}");
+        }
+    }
+
+    /// The fenced batch scan is the base scan plus the splice, and nothing
+    /// else (issue #1823).
+    #[test]
+    fn fenced_batched_candidates_query_is_the_base_query_plus_one_fence_cte() {
+        let base = claim_task_batched_candidates_query();
+        let fenced = claim_task_batched_candidates_query_fenced();
+        assert!(!base.contains("harvest_shard_generation"));
+        assert_eq!(fenced.matches("FROM harvest_shard_generation").count(), 1);
+        assert!(fenced.contains("WHERE shard_id = $13 AND generation = $14"));
+        assert!(!base.contains("$13"), "the base scan binds $1..$12 only");
+        assert!(!fenced.contains("FOR SHARE"), "the probe takes no row lock");
+        let unspliced = fenced
+            .replacen(
+                "WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation \
+                 WHERE shard_id = $13 AND generation = $14 ), ",
+                "WITH ",
+                1,
+            )
+            .replacen("CROSS JOIN fence ", "", 1);
+        assert_eq!(unspliced, base, "the splice must change nothing else");
+    }
+
+    /// The single-row fenced query keeps its exact pre-#1823 text.
+    #[test]
+    fn the_shared_splice_keeps_the_single_row_fenced_query_text() {
+        let unspliced = claim_task_query_fenced()
+            .replacen(
+                "WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation \
+                 WHERE shard_id = $7 AND generation = $8 ), ",
+                "WITH ",
+                1,
+            )
+            .replacen("CROSS JOIN fence ", "", 1);
+        assert_eq!(unspliced, claim_task_query());
+    }
+
+    /// Every public claim entry point applies the DR fence (issue #1823).
+    ///
+    /// The test reads this file. A `pub async fn claim_task*` passes when its
+    /// body calls `fence_binding`, or calls another variant that passes. A new
+    /// claim variant without the fence fails here, not during a failover.
+    #[test]
+    fn every_claim_variant_applies_the_dr_fence() {
+        let source = include_str!("queue.rs");
+        let marker = "pub async fn claim_task";
+        let mut variants: Vec<(String, String)> = Vec::new();
+        let mut rest = source;
+        while let Some(start) = rest.find(marker) {
+            let tail = &rest[start + "pub async fn ".len()..];
+            let name_end = tail.find('(').expect("fn name ends at its parameter list");
+            let body_start = tail.find("{\n").expect("fn body opens a block");
+            let body_end = tail.find("\n}\n").expect("fn body ends at column zero");
+            variants.push((
+                tail[..name_end].to_string(),
+                tail[body_start..body_end].to_string(),
+            ));
+            rest = &tail[body_end..];
+        }
+        let mut fenced: Vec<&str> = Vec::new();
+        loop {
+            let before = fenced.len();
+            for (name, body) in &variants {
+                let calls_fenced = fenced.iter().any(|f| body.contains(&format!("{f}(")));
+                if !fenced.contains(&name.as_str())
+                    && (body.contains("fence_binding(") || calls_fenced)
+                {
+                    fenced.push(name);
+                }
+            }
+            if fenced.len() == before {
+                break;
+            }
+        }
+        for (name, _) in &variants {
+            assert!(
+                fenced.contains(&name.as_str()),
+                "`{name}` must apply the DR fence through `fence_binding`"
+            );
+        }
+        let variants: Vec<&str> = variants.iter().map(|(name, _)| name.as_str()).collect();
+        for expected in [
+            "claim_task",
+            "claim_task_on_shard",
+            "claim_task_of_kind_on_shard",
+            "claim_task_by_id_on_shard",
+            "claim_task_batched",
+        ] {
+            assert!(
+                variants.contains(&expected),
+                "the scan must find `{expected}`: {variants:?}"
+            );
         }
     }
 
