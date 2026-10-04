@@ -23803,13 +23803,18 @@ async fn handle_ambiguous_suspended_claim(
     error: &HarvestError,
 ) -> Option<HarvestResult<TaskDispatchOutcome>> {
     let task_id = error.suspended_claim_ambiguous()?;
-    let released =
-        match queue::release_suspended_workflow_claim(conn, task_id, worker_id, task.crash_strikes)
-            .await
-        {
-            Ok(released) => released,
-            Err(err) => return Some(Err(err)),
-        };
+    let released = match queue::release_suspended_workflow_claim(
+        conn,
+        task_id,
+        worker_id,
+        task.crash_strikes,
+        task.attempt,
+    )
+    .await
+    {
+        Ok(released) => released,
+        Err(err) => return Some(Err(err)),
+    };
     tracing::info!(
         task_id = %task_id,
         queue = %task.queue_name,
@@ -23844,13 +23849,18 @@ async fn handle_ambiguous_terminal_write_claim(
     error: &HarvestError,
 ) -> Option<HarvestResult<TaskDispatchOutcome>> {
     let task_id = error.terminal_write_claim_ambiguous()?;
-    let released =
-        match queue::release_terminal_workflow_claim(conn, task_id, worker_id, task.crash_strikes)
-            .await
-        {
-            Ok(released) => released,
-            Err(err) => return Some(Err(err)),
-        };
+    let released = match queue::release_terminal_workflow_claim(
+        conn,
+        task_id,
+        worker_id,
+        task.crash_strikes,
+        task.attempt,
+    )
+    .await
+    {
+        Ok(released) => released,
+        Err(err) => return Some(Err(err)),
+    };
     tracing::info!(
         task_id = %task_id,
         queue = %task.queue_name,

@@ -740,6 +740,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 ambiguous_task_id,
                 "dispatcher-a",
                 task.crash_strikes,
+                task.attempt,
             )
             .await?;
             Ok::<_, autumn_harvest::HarvestError>((probe_elapsed, released))
@@ -1188,4 +1189,41 @@ async fn the_guard_locks_the_row_and_skips_a_locked_row_1806() {
         })
         .await
         .expect("transaction");
+}
+
+/// The ambiguous-claim release is a plain `UPDATE`. It must not free a later
+/// claim of the same worker that has the same `crash_strikes` (issue #1806).
+#[tokio::test]
+async fn a_release_from_a_stale_attempt_does_not_free_the_current_claim_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-release").await;
+    let mut conn = connect(&url).await;
+
+    let released = queue::release_terminal_workflow_claim(
+        &mut conn,
+        fx.stale.id,
+        &fx.worker_id,
+        fx.stale.crash_strikes,
+        fx.stale.attempt,
+    )
+    .await
+    .expect("release runs");
+
+    assert!(!released, "a stale release must not free the later claim");
+    let row = load_tasks(&url, fx.exec_id).await.remove(0);
+    assert_eq!(
+        (row.state.as_str(), row.attempt),
+        ("RUNNING", fx.current.attempt)
+    );
+
+    let released = queue::release_terminal_workflow_claim(
+        &mut conn,
+        fx.current.id,
+        &fx.worker_id,
+        fx.current.crash_strikes,
+        fx.current.attempt,
+    )
+    .await
+    .expect("release runs");
+    assert!(released, "the current claim must still release");
 }
