@@ -421,23 +421,36 @@ fn index_cost(verb: &str) -> &'static str {
 /// A literal continues only across a gap with a newline. Postgres counts a
 /// `--` comment in the gap as whitespace, but not a `/* */` comment.
 fn continuation_gap(chars: &[char], mut i: usize) -> Option<(usize, usize)> {
+    // `newlines` counts `\n` for line numbers. Postgres also reads a lone
+    // `\r` as a newline.
     let mut newlines = 0;
+    let mut newline = false;
     loop {
         match chars.get(i) {
             Some('\n') => {
                 newlines += 1;
+                newline = true;
+                i += 1;
+            }
+            Some('\r') => {
+                newline = true;
                 i += 1;
             }
             Some(c) if c.is_whitespace() => i += 1,
-            Some('-') if chars.get(i + 1) == Some(&'-') => {
-                while chars.get(i).is_some_and(|c| *c != '\n') {
-                    i += 1;
-                }
-            }
+            Some('-') if chars.get(i + 1) == Some(&'-') => i = line_comment_end(chars, i),
             _ => break,
         }
     }
-    (newlines > 0).then_some((newlines, i))
+    newline.then_some((newlines, i))
+}
+
+/// The index of the newline that ends the `--` comment at `i`, or the end.
+///
+/// Postgres ends a line comment at `\n` or `\r`.
+fn line_comment_end(chars: &[char], i: usize) -> usize {
+    (i..chars.len())
+        .find(|&j| matches!(chars[j], '\n' | '\r'))
+        .unwrap_or(chars.len())
 }
 
 /// Whether a bound is in force at token `at`.
@@ -737,9 +750,7 @@ fn lex(
             i += 1;
         } else if c == '-' && next == Some('-') {
             let start = i + 2;
-            while at(i).is_some_and(|c| c != '\n') {
-                i += 1;
-            }
+            i = line_comment_end(chars, i);
             comments.push(Comment {
                 text: chars[start..i].iter().collect(),
                 line,
@@ -1038,11 +1049,7 @@ fn skip_blank(chars: &[char], mut i: usize) -> usize {
     loop {
         match (chars.get(i), chars.get(i + 1)) {
             (Some(c), _) if c.is_whitespace() => i += 1,
-            (Some('-'), Some('-')) => {
-                while chars.get(i).is_some_and(|c| *c != '\n') {
-                    i += 1;
-                }
-            }
+            (Some('-'), Some('-')) => i = line_comment_end(chars, i),
             (Some('/'), Some('*')) => {
                 let mut depth = 0_usize;
                 while i < chars.len() {
@@ -2854,9 +2861,9 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                 });
                 !adopts
                     && (from..to).any(|j| {
-                        s.is(j, "unique")
-                            || s.is(j, "exclude")
-                            || (s.is(j, "primary") && s.is(j + 1, "key"))
+                        s.keyword(j, "unique")
+                            || s.keyword(j, "exclude")
+                            || (s.keyword(j, "primary") && s.keyword(j + 1, "key"))
                     })
             });
             if builds_index {
@@ -5546,6 +5553,33 @@ fn a_path_change_in_an_earlier_migration_taints_set_config() {
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
     let sql = format!("SELECT pg_catalog.set_config('lock_timeout', '5s', true);\n{lock}");
     assert_eq!(lint_with_history(&[earlier], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_carriage_return_ends_a_line_comment() {
+    let sql = "-- comment\rALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql:?}");
+    // A literal continues across a lone carriage return too.
+    let sql = "DO $$\rBEGIN\r    EXECUTE 'ALTER TABLE harvest_'\r        'events ADD COLUMN x INT';\rEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql:?}");
+    assert!(
+        findings[0].detail.contains("harvest_events"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_quoted_constraint_word_builds_no_index() {
+    for action in [
+        "ADD CHECK (\"unique\" IS NOT NULL)",
+        "ADD CHECK (\"exclude\" > 0)",
+        "ADD CHECK (\"primary\" IS NOT NULL AND \"key\" > 0)",
+    ] {
+        let sql = format!("SET LOCAL lock_timeout = '5s';\nALTER TABLE harvest_events {action};");
+        assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
