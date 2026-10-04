@@ -37,8 +37,10 @@ the drain. Now:
 - While such a handler runs, the worker keeps its lease alive through the
   new `workers::touch_worker_liveness`, even after `run` returns. A host
   process that outlives `run`, such as an embedded runtime, therefore never
-  lets a peer start a second copy. If the process exits, orphan reclaim
-  recovers the task.
+  lets a peer start a second copy. If the worker row is gone, the keeper
+  restores it through the new `workers::restore_stopped_worker_row`. The
+  restored row is `Stopped` and lists no queue or shard, so it claims no
+  coverage. If the process exits, orphan reclaim recovers the task.
 - The kept lease hides every claim of the worker from orphan reclaim. So
   each lease refresh also gives back, through the new fenced
   `queue::release_abandoned_claim`, each `RUNNING` claim of the worker that

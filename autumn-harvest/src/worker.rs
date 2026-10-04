@@ -33790,6 +33790,7 @@ impl Worker {
             let dispatched = self.dispatched.tracker.clone();
             let worker_id = self.config.worker_id.clone();
             let live_claims = Arc::clone(&self.dispatched.live);
+            let host = crate::workers::local_hostname();
             tokio::spawn(async move {
                 let done = dispatched.wait();
                 tokio::pin!(done);
@@ -33801,8 +33802,18 @@ impl Worker {
                         () = tokio::time::sleep_until(next) => {
                             let touched = tokio::time::timeout(bound, async {
                                 let mut conn = crate::pool::acquire(&pool, bound).await?;
-                                crate::workers::touch_worker_liveness(&mut conn, &worker_id)
+                                let touched =
+                                    crate::workers::touch_worker_liveness(&mut conn, &worker_id)
+                                        .await?;
+                                // A shutdown heartbeat does not re-register a
+                                // missing row. Without one, orphan reclaim
+                                // sees no worker.
+                                if touched == 0 {
+                                    crate::workers::restore_stopped_worker_row(
+                                        &mut conn, &worker_id, &host,
+                                    )
                                     .await?;
+                                }
                                 // The kept lease hides every claim of this
                                 // worker from orphan reclaim. So give back
                                 // each claim that no body holds.

@@ -455,6 +455,49 @@ pub async fn touch_worker_liveness(
         .map_err(crate::error::database_error)
 }
 
+/// Restore the row of a worker that has stopped but still runs a drained
+/// handler (issue #1813).
+///
+/// Orphan reclaim treats a worker with no row as dead. A shutdown heartbeat
+/// does not re-register a missing row, so the lease keeper calls this
+/// instead. The row has status `Stopped` and lists no queue and no shard, so
+/// it never claims coverage. A row that exists already only gets a fresh
+/// `last_heartbeat_at`.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn restore_stopped_worker_row(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    host: &str,
+) -> HarvestResult<()> {
+    let row = NewHarvestWorker {
+        worker_id,
+        queues: serde_json::json!([]),
+        shard_assignments: serde_json::json!([]),
+        max_concurrency: 0,
+        host,
+        version: Some(env!("CARGO_PKG_VERSION")),
+        build_id: "",
+        deployment_name: None,
+        labels: serde_json::json!({}),
+        max_concurrent_sessions: 0,
+    };
+    diesel::insert_into(harvest_workers::table)
+        .values((
+            &row,
+            harvest_workers::status.eq(WorkerStatus::Stopped.as_str()),
+        ))
+        .on_conflict(harvest_workers::worker_id)
+        .do_update()
+        .set(harvest_workers::last_heartbeat_at.eq(diesel::dsl::now))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 /// Upsert `last_heartbeat_at` and `in_flight_count` for a worker.
 ///
 /// Returns the number of rows updated (1 if the worker row exists, 0 if it is

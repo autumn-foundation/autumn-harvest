@@ -19,7 +19,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::prelude::*;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
+use autumn_harvest::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
@@ -526,6 +526,12 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         drain < SHUTDOWN_TIMEOUT + Duration::from_secs(3),
         "the drain must end at its deadline: took {drain:?}"
     );
+    // A shutdown heartbeat does not re-register a missing row. The keeper
+    // must restore it, or orphan reclaim sees no worker.
+    diesel::delete(harvest_workers::table.find(&worker_a))
+        .execute(&mut conn)
+        .await
+        .expect("delete the drained worker row");
 
     // Outlast the stale window (2 s), the heartbeat timeout (2 s) and a
     // reclaimer tick (1 s) on the live peer. It must not take the claim.
@@ -539,6 +545,13 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         1,
         "no peer may run the activity while its handler runs"
     );
+    let status: String = harvest_workers::table
+        .find(&worker_a)
+        .select(harvest_workers::status)
+        .first(&mut conn)
+        .await
+        .expect("the keeper restores the worker row");
+    assert_eq!(status, "Stopped", "the restored row claims no coverage");
     // The kept lease must not hide a claim that no handler holds.
     let (state, worker_id) = task_state(&url, abandoned).await;
     assert_eq!(state, "PENDING", "the keeper gives back an abandoned claim");
