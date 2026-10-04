@@ -7032,6 +7032,117 @@
         }
       ],
       "description": "1 per queue where a worker has an empty build_id and the queue has a build policy (issue #1805). That worker cannot claim pinned runs. Set a build_id on it."
+    },
+    {
+      "id": 177984,
+      "type": "row",
+      "title": "Database pool & Postgres timeouts (issue #1788)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 207
+      },
+      "panels": []
+    },
+    {
+      "id": 428323,
+      "type": "timeseries",
+      "title": "Pool acquire timeouts",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 208
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (site) (rate(harvest_db_pool_acquire_timeout_total[$__rate_interval]))",
+          "legendFormat": "{{site}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of pool acquires that hit their bound, per site (claim or heartbeat_flush). The bound is the pool's deadpool wait timeout, or 30 s when the pool has none. A steady rate means the pool is too small or a connection is stuck. See docs/operations/postgres-timeouts.md."
+    },
+    {
+      "id": 422004,
+      "type": "timeseries",
+      "title": "Heartbeat flush failures",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 208
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(harvest_heartbeat_flush_failed_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of activity heartbeat flushes that failed, per reason. The flusher keeps the payload and tries again on the next tick. A run of failures longer than heartbeat_timeout fails a healthy activity. See docs/operations/postgres-timeouts.md."
     }
   ]
 }

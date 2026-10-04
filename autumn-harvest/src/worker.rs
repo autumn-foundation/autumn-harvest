@@ -5619,6 +5619,239 @@ struct StartedActivity {
     workflow_name: String,
 }
 
+/// Whether this claim's `ActivityStarted` committed (issue #1788).
+///
+/// # Errors
+///
+/// A database error from the reads.
+#[doc(hidden)]
+pub async fn lost_start_committed(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    reconcile_lost_start(pool, task, exec_id, activity_name, worker_id)
+        .await
+        .map(|started| started.is_some())
+}
+
+/// Find the start that a lost connection hid (issue #1788).
+///
+/// The server can commit `ActivityStarted` after the client loses the
+/// connection. A release would then let the next claim append a second start.
+/// So read the history again on a new connection.
+///
+/// A read that fails on a transient error runs again, up to
+/// `FINALIZE_ACQUIRE_ATTEMPTS` times. The tries start one pool bound apart, so
+/// they ride out a short outage. After the last try the claim is released. An
+/// outage that long would otherwise leave an activity with no deadline
+/// `RUNNING` for good.
+async fn reconcile_lost_start(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<Option<StartedActivity>> {
+    let spacing = crate::pool::retry_spacing(pool);
+    let mut attempt = 1;
+    loop {
+        let started = tokio::time::Instant::now();
+        match read_lost_start(pool, task, exec_id, activity_name, worker_id).await {
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_transient_db_error(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "could not read a lost activity start; trying again"
+                );
+                tokio::time::sleep_until(started + spacing).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// One read for [`reconcile_lost_start`].
+///
+/// This claim wrote the start only if an `ActivityStarted` from this worker
+/// has a time at or after the claim's `started_at`. An earlier attempt of the
+/// same worker wrote its start before this claim. The database clock sets both
+/// times: the event row's `DEFAULT NOW()` and the claim's `started_at = NOW()`.
+///
+/// A later claim by the same worker also matches that test. So the task row
+/// must still be `RUNNING` under this claim's `attempt` and `worker_id`. The
+/// row is read after the history. A newer start in that history needs a newer
+/// claim first, and a newer claim has a larger `attempt`.
+///
+/// The read first waits for any transaction that holds the task row lock. A
+/// start whose connection dropped can still be committing, and a plain read
+/// would miss it.
+async fn read_lost_start(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<Option<StartedActivity>> {
+    let Some(claimed_at) = task.started_at else {
+        return Ok(None);
+    };
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+    // The lost start can still be committing. Its transaction holds the task
+    // row lock until it ends. A key-share lock waits for that, so the history
+    // read below sees the outcome. The lock goes at the end of the statement.
+    {
+        use crate::schema::harvest_task_queue::dsl;
+        dsl::harvest_task_queue
+            .find(task.id)
+            .select(dsl::id)
+            .for_key_share()
+            .first::<uuid::Uuid>(&mut conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+    }
+    let history = store::load_history_with_timestamps(&mut conn, exec_id).await?;
+    let events: Vec<WorkflowEvent> = history.iter().map(|(_, event)| event.clone()).collect();
+    let Some(activity_id) = pending_activity_id_for_task(&events, task, activity_name)? else {
+        return Ok(None);
+    };
+    let ours = history.iter().any(|(at, event)| {
+        *at >= claimed_at
+            && matches!(
+                event,
+                WorkflowEvent::ActivityStarted { activity_id: id, worker_id: by }
+                    if *id == activity_id && by.as_str() == worker_id
+            )
+    });
+    if !ours {
+        return Ok(None);
+    }
+    let claim = queue::TaskClaim::new(task.id, worker_id, task.attempt);
+    if !queue::claim_is_current(&mut conn, &claim).await? {
+        return Ok(None);
+    }
+    let execution = load_workflow_execution(&mut conn, exec_id).await?;
+    Ok(Some(StartedActivity {
+        activity_id,
+        workflow_id: execution.workflow_id,
+        workflow_name: execution.workflow_name,
+    }))
+}
+
+/// Append `ActivityStarted`, and find a start that a lost connection hid
+/// (issue #1788).
+///
+/// A lost connection hides whether the start committed. If it did, the
+/// handler must run. A release would add a second start. Returns the
+/// connection when it is still usable.
+///
+/// `handler_runs` is passed to `append_activity_started_if_pending`. The start
+/// marker commits in the same transaction as the start, so a reconciled start
+/// also has its marker (issue #1809).
+#[allow(clippy::too_many_arguments)]
+async fn append_start_or_reconcile(
+    pool: &DbPool,
+    mut conn: crate::pool::PooledConn,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    handler_runs: bool,
+) -> (
+    HarvestResult<Option<StartedActivity>>,
+    Option<crate::pool::PooledConn>,
+) {
+    let started = append_activity_started_if_pending(
+        &mut conn,
+        task,
+        exec_id,
+        activity_name,
+        worker_id,
+        codecs,
+        handler_runs,
+    )
+    .await;
+    match started {
+        Err(error) if crate::pool::is_connection_lost(&error) => {
+            // Return the dead connection first. It holds a pool slot, and the
+            // reconcile read needs one.
+            drop(conn);
+            let found = reconcile_lost_start(pool, task, exec_id, activity_name, worker_id).await;
+            let outcome = match found {
+                Ok(Some(started)) => Ok(Some(started)),
+                Ok(None) => Err(error),
+                Err(reconcile_error) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %reconcile_error,
+                        "could not check whether a lost activity start committed"
+                    );
+                    Err(error)
+                }
+            };
+            (outcome, None)
+        }
+        other => (other, Some(conn)),
+    }
+}
+
+/// Whether [`append_start_or_reconcile`] reports this claim's start on `conn`.
+/// Tests use it (issue #1788).
+///
+/// # Errors
+///
+/// The start or reconcile error.
+#[doc(hidden)]
+pub async fn append_start_for_test(
+    pool: &DbPool,
+    conn: crate::pool::PooledConn,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    let (started, _) = append_start_or_reconcile(
+        pool,
+        conn,
+        task,
+        exec_id,
+        activity_name,
+        worker_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+        true,
+    )
+    .await;
+    started.map(|started| started.is_some())
+}
+
+/// Whether [`reconcile_lost_start`] finds this claim's start. Tests use it
+/// (issue #1788).
+///
+/// # Errors
+///
+/// The reconcile error.
+#[doc(hidden)]
+pub async fn reconcile_lost_start_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    reconcile_lost_start(pool, task, exec_id, activity_name, worker_id)
+        .await
+        .map(|started| started.is_some())
+}
+
 async fn append_activity_started_if_pending(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -6181,7 +6414,7 @@ pub(crate) const MIN_SHARD_ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 /// The per-shard pool-acquisition bound (issue #961 review, Codex P1; extended
 /// to shutdown by issue #1209).
 ///
-/// Harvest configures no deadpool `Timeouts`, so every `pool.get().await` is an
+/// A pool with no deadpool `Timeouts` makes every `pool.get().await` an
 /// **unbounded** wait. The multi-shard path visits its shards *sequentially* in
 /// three places. In each, a single exhausted or unreachable pool parks the
 /// one future and strands every peer shard:
@@ -6217,10 +6450,10 @@ pub(crate) const MIN_SHARD_ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 /// follow-up; it needs `poll_once` to distinguish "acquisition timed out" from
 /// "no work", which it deliberately does not today.
 ///
-/// `false` - the single-shard path - returns `None`, which keeps the original
-/// unbounded `pool.get().await` byte-for-byte (AC7): with one shard there are
-/// no peers to starve, and blocking until a connection frees is the desired
-/// behaviour.
+/// `false` - the single-shard path - returns `None`. With one shard there are
+/// no peers to starve, so this floor does not apply. `None` uses the pool's
+/// own bound instead (issue #1788). An unbounded wait let one stuck connection
+/// stop all claims.
 #[must_use]
 pub(crate) const fn shard_acquire_bound(
     multi_shard: bool,
@@ -6242,38 +6475,391 @@ pub(crate) const fn shard_acquire_bound(
     }
 }
 
-/// A pooled connection, optionally acquired under a bound.
+/// A pooled connection, acquired under a bound.
 ///
 /// The single source of truth for [`shard_acquire_bound`]'s two behaviours, so
 /// the multi-shard startup path and the poll loop cannot drift on whether the
-/// wait is capped. `None` is a plain `pool.get().await` — byte-for-byte the
-/// pre-#961 single-shard code path.
+/// wait is capped. `None` uses the pool's own bound,
+/// [`crate::pool::acquire_bound`] (issue #1788).
 ///
-/// Both outcomes collapse to `Err(String)` so each caller's existing
-/// pool-failure branch handles a timeout identically to a pool error: the
-/// shard is skipped, its graceful recovery (pending-flag retry, or the next
-/// poll iteration) takes over, and no peer shard is affected.
+/// Each caller's existing pool-failure branch handles a timeout the same way
+/// as a pool error. The shard is skipped, and its graceful recovery takes
+/// over: the pending-flag retry, or the next poll iteration. No peer shard is
+/// affected. A timeout is [`HarvestError::PoolAcquireTimeout`], so a caller
+/// can count it.
 async fn acquire_shard_conn(
     pool: &DbPool,
     acquire_bound: Option<Duration>,
-) -> Result<
-    deadpool::managed::Object<
-        diesel_async::pooled_connection::AsyncDieselConnectionManager<
-            diesel_async::AsyncPgConnection,
-        >,
-    >,
-    String,
-> {
-    match acquire_bound {
-        Some(bound) => match tokio::time::timeout(bound, pool.get()).await {
-            Ok(result) => result.map_err(|e| e.to_string()),
-            Err(_elapsed) => Err(format!(
-                "pool acquisition exceeded {bound:?}; skipping this shard for one iteration"
-            )),
-        },
-        None => pool.get().await.map_err(|e| e.to_string()),
+) -> HarvestResult<crate::pool::PooledConn> {
+    let bound = acquire_bound.unwrap_or_else(|| crate::pool::acquire_bound(pool));
+    crate::pool::acquire(pool, bound).await
+}
+
+/// Register the static rate-limit buckets of `registry`'s activities.
+///
+/// See `Worker::register_rate_limit_buckets`, which this backs.
+async fn register_static_rate_limit_buckets(
+    pool: &DbPool,
+    acquire_bound: Option<Duration>,
+    registry: &HandlerRegistry,
+    worker_id: &str,
+) -> bool {
+    match acquire_shard_conn(pool, acquire_bound).await {
+        Ok(mut conn) => {
+            let mut complete = true;
+            for activity in registry.activities.values() {
+                // A dynamic rate_limit(key = ...) with no rps is an invalid
+                // declaration that `HarvestBuilder::try_build` rejects. A
+                // worker built via a direct `HandlerRegistry` bypasses that
+                // validation; surface it loudly at startup (the enqueue path
+                // also fails the schedule transaction -- see
+                // `persist_scheduled_activities`) rather than silently running
+                // the activity unrated (issue #699 review, Codex P2).
+                if activity.rate_limit_key_expr.is_some() && activity.rate_limit_rps.is_none() {
+                    tracing::error!(
+                        worker_id = %worker_id,
+                        activity = %activity.name,
+                        "activity declares a dynamic rate_limit(key = ...) without \
+                         rate_limit_rps; it will fail at schedule time -- add an rps \
+                         or remove the key"
+                    );
+                    continue;
+                }
+                let Some(refill_rate) = activity.rate_limit_rps else {
+                    continue;
+                };
+                // Dynamic per-key limits (issue #699) register their buckets
+                // lazily at enqueue time (one per resolved tenant key), so
+                // there is no single static bucket to pre-register here.
+                if activity.rate_limit_key_expr.is_some() {
+                    continue;
+                }
+                // A static `rate_limit_key` beginning with a reserved
+                // caller-keyed prefix (`dyn-rate:`, #699; `start-throttle:`,
+                // #607) reaching a worker via a direct `HandlerRegistry`
+                // (bypassing the macro reject and
+                // `HarvestBuilder::try_build`) would collide with the
+                // generated buckets; since both this registration and the
+                // lazy enqueue registration use `ON CONFLICT DO NOTHING`,
+                // the bucket's rate/burst would become insertion-order
+                // dependent. Worse since issue #1127: the idle-bucket GC
+                // collects those namespaces on the guarantee that everything
+                // in them re-registers with the work that needs it, which a
+                // static key does not. Skip it loudly here, mirroring the
+                // dynamic-no-rps guard above (issue #699 review, Codex P2).
+                // The enqueue path also fails the schedule transaction (see
+                // `persist_scheduled_activities`).
+                // The EFFECTIVE key, since `rate_limit_key` falls back to
+                // the activity name below and that is what gets registered
+                // (issue #1127, Codex review round 1 P2).
+                let static_key = activity.rate_limit_key.unwrap_or(activity.name);
+                if let Some(prefix) = crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
+                    .into_iter()
+                    .find(|prefix| static_key.starts_with(prefix))
+                {
+                    tracing::error!(
+                        worker_id = %worker_id,
+                        activity = %activity.name,
+                        key = %static_key,
+                        prefix = %prefix,
+                        "activity resolves to a static rate-limit bucket key beginning with \
+                         a reserved caller-keyed prefix; not registering this colliding \
+                         bucket -- rename the activity or its key, or use \
+                         rate_limit(key = ...) for dynamic per-key buckets"
+                    );
+                    continue;
+                }
+                let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
+                let key = activity.rate_limit_key.unwrap_or(activity.name);
+
+                // Insert rate limit bucket if it doesn't already exist.
+                // This preserves operator overrides.
+                if let Err(error) =
+                    queue::ensure_rate_limit_bucket(&mut conn, key, refill_rate, burst).await
+                {
+                    tracing::warn!(
+                        worker_id = %worker_id,
+                        key = %key,
+                        error = %error,
+                        "failed to auto-register rate limit bucket; continuing, and \
+                         the registration will run again"
+                    );
+                    complete = false;
+                }
+            }
+            complete
+        }
+        Err(error) => {
+            tracing::warn!(
+                worker_id = %worker_id,
+                error = %error,
+                "failed to acquire connection for rate limit bucket registration; \
+                 the registration will run again"
+            );
+            false
+        }
     }
 }
+
+/// Run `attempt` every `interval` until it returns `true` or `cancel` fires.
+///
+/// The first run comes one `interval` after the call. A cancel also stops a
+/// run that is in progress.
+async fn retry_until_done<F, Fut>(interval: Duration, cancel: CancellationToken, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(interval) => {}
+        }
+        let done = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            done = attempt() => done,
+        };
+        if done {
+            return;
+        }
+    }
+}
+
+/// Hand an execution's timeout strikes to a quarantine (issue #1788).
+///
+/// The count becomes 0, so a concurrent reclaim does not quarantine twice.
+/// The 0 also marks the entry as untouched. Every dispatch that clears the
+/// strikes removes the entry, and a newer timeout increments it.
+fn begin_quarantine_strikes(
+    strikes: &mut std::collections::HashMap<uuid::Uuid, i32>,
+    exec_id: uuid::Uuid,
+) {
+    strikes.insert(exec_id, 0);
+}
+
+/// Settle an execution's strikes after its quarantine (issue #1788).
+///
+/// A committed quarantine ends the streak. A quarantine that did not commit
+/// gets its strikes back, so the next timeout quarantines at once. It does so
+/// only while the entry is still the untouched mark. A newer dispatch that
+/// cleared the strikes, or a newer timeout, keeps its own state. That can
+/// count too few strikes, which only delays a quarantine.
+fn settle_quarantine_strikes(
+    strikes: &mut std::collections::HashMap<uuid::Uuid, i32>,
+    exec_id: uuid::Uuid,
+    quarantined: bool,
+    new_strikes: i32,
+) {
+    if quarantined {
+        strikes.remove(&exec_id);
+    } else if let Some(count) = strikes.get_mut(&exec_id)
+        && *count == 0
+    {
+        *count = new_strikes;
+    }
+}
+
+/// Tries for an executed activity's result write: pool acquires, and repeats
+/// after a session timeout.
+///
+/// Each acquire waits up to the pool bound. Ten tries ride out a short pool
+/// incident. A pool that stays full longer leaves the task to its heartbeat
+/// or `start_to_close` timeout, as before.
+const FINALIZE_ACQUIRE_ATTEMPTS: u32 = 10;
+
+/// Emit `harvest.activity.panic` once if `result` is a contained handler panic
+/// (issue #782).
+///
+/// A contained panic carries the typed `HandlerPanic` error type in its
+/// envelope. Call it once per attempt, before any result write, because that
+/// write can repeat (issue #1788).
+fn record_activity_panic_once(
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    activity_name: &str,
+    queue_name: &str,
+    result: &Result<serde_json::Value, String>,
+) {
+    if let Err(error) = result
+        && crate::failure::parse_error_payload_full(error).error_type
+            == crate::failure::ERROR_TYPE_HANDLER_PANIC
+    {
+        metrics.record_activity_panic(activity_name, queue_name);
+    }
+}
+
+/// Refund the rate-limit token this dispatch debited, if any (issue #1788).
+///
+/// Use it when setup fails after the debit and before the handler runs. A
+/// refund that fails is logged; the bucket refills on its own.
+async fn refund_debited_token(conn: &mut AsyncPgConnection, debited_key: Option<&str>) {
+    if let Some(key) = debited_key
+        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
+    {
+        tracing::warn!(
+            rate_limit_key = %key,
+            error = %error,
+            "failed to refund rate-limit token after a failed activity start"
+        );
+    }
+}
+
+/// Refund the token that a failed activity start debited.
+///
+/// The handler did not run, so the token goes back. A lost connection cannot
+/// run the refund (issue #1788). The refund then uses a new connection.
+#[doc(hidden)]
+pub async fn refund_after_start_error(
+    pool: &DbPool,
+    conn: Option<crate::pool::PooledConn>,
+    debited_key: Option<&str>,
+    error: &HarvestError,
+) {
+    if debited_key.is_none() {
+        return;
+    }
+    // `filter` drops a dead connection here, so its pool slot is free before
+    // the new acquire.
+    let usable = conn.filter(|_| !crate::pool::is_connection_lost(error));
+    let mut conn = match usable {
+        Some(conn) => conn,
+        None => match crate::pool::acquire_within_pool_bound(pool).await {
+            Ok(conn) => conn,
+            Err(acquire_error) => {
+                tracing::warn!(
+                    rate_limit_key = debited_key.unwrap_or_default(),
+                    error = %acquire_error,
+                    "no connection to refund the rate-limit token after a failed activity start"
+                );
+                return;
+            }
+        },
+    };
+    refund_debited_token(&mut conn, debited_key).await;
+}
+
+/// Release the dispatch `token`, then return `error` unchanged.
+///
+/// Use it on each setup error after `on_dispatch` admitted the attempt and
+/// before the handler runs. A half-open probe that is not released keeps
+/// `probe_in_flight` set, so every later dispatch short-circuits. A token in
+/// the closed state makes this a no-op.
+fn release_probe_on_error(
+    circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry,
+    activity_name: &str,
+    token: Option<crate::circuit_breaker::DispatchToken>,
+    error: HarvestError,
+) -> HarvestError {
+    if let Some(token) = token {
+        circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+    }
+    error
+}
+
+/// [`retry_policy_or_fail_task`] for the finalization of an attempt that ran
+/// (issue #1788).
+///
+/// The attempt's outcome reaches the circuit breaker only after this read.
+/// An error here skips that step, so it releases the dispatch `token` first.
+/// A half-open probe that is not released short-circuits every later
+/// dispatch, even after the database recovers.
+async fn finalization_retry_policy(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry,
+    activity_name: &str,
+    token: Option<crate::circuit_breaker::DispatchToken>,
+) -> HarvestResult<Option<RetryPolicy>> {
+    retry_policy_or_fail_task(pool, task, worker_id, codecs)
+        .await
+        .map_err(|error| release_probe_on_error(circuit_breakers, activity_name, token, error))
+}
+
+/// Parse the task's retry policy. A policy that does not parse fails the task.
+///
+/// The handler can already have run, so the failure write must not be lost
+/// (issue #1788). A session timeout rolls the write back, so the write runs
+/// again, up to `FINALIZE_ACQUIRE_ATTEMPTS` times. A lost connection gets a new
+/// one first. The write re-checks the claim under a row lock, so a repeat is
+/// safe.
+///
+/// # Errors
+///
+/// Returns the parse error after the task fails, or the write error when the
+/// write does not commit.
+#[doc(hidden)]
+pub async fn retry_policy_or_fail_task(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<RetryPolicy>> {
+    if let Ok(policy) = configured_retry_policy(task) {
+        return Ok(policy);
+    }
+    let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
+    let mut attempt = 1;
+    loop {
+        // Parse again on each try. The parse error is not `Clone`.
+        let outcome = fail_execution_on_error(
+            &mut conn,
+            task,
+            worker_id,
+            configured_retry_policy(task),
+            codecs,
+        )
+        .await;
+        match outcome {
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_session_timeout(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "session timeout while failing a task with an invalid retry policy; trying again"
+                );
+                attempt += 1;
+            }
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_connection_lost(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "lost the connection while failing a task with an invalid retry policy; \
+                     trying again on a new connection"
+                );
+                // Return the dead connection first. It holds a pool slot, and on a
+                // full pool the new acquire would wait for that slot.
+                drop(conn);
+                conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Whether to run an activity result write again after try `attempt`
+/// (issue #1788).
+///
+/// An offloaded output uploads its blob before the insert. A rollback drops
+/// the reference row but not the blob. So a write that uploaded a blob does
+/// not run again, and a session timeout releases the claim. A write that
+/// uploaded nothing runs again, up to `FINALIZE_ACQUIRE_ATTEMPTS` tries.
+const fn repeats_result_write(attempt: u32, uploaded: bool) -> bool {
+    attempt < FINALIZE_ACQUIRE_ATTEMPTS && !uploaded
+}
+
+/// The `site` label for a claim acquire timeout.
+const SITE_CLAIM: &str = "claim";
 
 /// Whether the single-pool `run_with_listener` entrypoint must refuse to start
 /// (issue #961 review, Codex P1).
@@ -14575,7 +15161,7 @@ pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
-        let Ok(mut conn) = pool.get().await else {
+        let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
             continue;
         };
 
@@ -14903,15 +15489,9 @@ async fn handle_activity_result(
             .await
         }
         Err(error) => {
-            // Issue #782: emit the panic counter once per panicking attempt
-            // (before the retry/terminal split). A contained activity panic is
-            // classified by the typed HandlerPanic error type in the envelope;
-            // it otherwise flows through the ordinary retryable-failure path.
-            if crate::failure::parse_error_payload_full(&error).error_type
-                == crate::failure::ERROR_TYPE_HANDLER_PANIC
-            {
-                metrics.record_activity_panic(activity_name_for_cap, &task.queue_name);
-            }
+            // The panic counter (issue #782) is not emitted here. The caller
+            // emits it once through `record_activity_panic_once`, because the
+            // result write can run more than once (issue #1788).
             let delay_result = next_retry_delay(task, &error, retry_policy, retry_after_ceiling);
             let delay =
                 fail_execution_on_error(conn, task, worker_id, delay_result, codecs).await?;
@@ -14978,6 +15558,52 @@ async fn handle_activity_result(
                 .await
         }
     }
+}
+
+/// Write one activity attempt's result through the normal finalization.
+///
+/// Tests use it to check the claim fence (issue #1788). It applies no result
+/// size cap, no offloader and no metrics. The execution and activity ids come
+/// from `task`.
+///
+/// # Errors
+///
+/// [`HarvestError::Config`] when `task` has no execution or activity id.
+/// Otherwise see `handle_activity_result`.
+#[doc(hidden)]
+pub async fn write_activity_result_for_task(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    retry_policy: Option<&RetryPolicy>,
+    result: Result<serde_json::Value, String>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    let (Some(exec_uuid), Some(activity_uuid)) = (task.workflow_exec_id, task.activity_id) else {
+        return Err(HarvestError::Config(format!(
+            "task {} has no execution or activity id",
+            task.id
+        )));
+    };
+    let exec_id = execution_id_from_uuid(exec_uuid);
+    let activity_id = ActivityExecId::from_uuid(activity_uuid);
+    handle_activity_result(
+        conn,
+        task,
+        exec_id,
+        activity_id,
+        worker_id,
+        retry_policy,
+        result,
+        0,
+        task.activity_name.as_deref().unwrap_or_default(),
+        None,
+        &crate::telemetry::NoOpMetrics,
+        crate::builder::DEFAULT_RETRY_AFTER_CEILING,
+        codecs,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Outcome of the retry budget gate in `process_activity_task` (issue #1793).
@@ -15336,29 +15962,21 @@ impl Drop for AttemptMetrics<'_> {
 /// even when the activity has no breaker policy. Otherwise the record stays
 /// on the row until the row goes.
 ///
-/// A failed write leaves the record, so a retry is safe. The retries use a
-/// fresh connection, in case the first one broke. If every try fails, the
+/// A failed write leaves the record, so a retry is safe. Each try takes a new
+/// connection, with a bounded acquire (issue #1788). If every try fails, the
 /// answer is unknown. The loss then counts as no timeout here, and a warning
 /// says so. The enforcing process counted the timeout in its own breaker.
-async fn claim_lost_to_timeout(
-    pool: &DbPool,
-    conn: &mut AsyncPgConnection,
-    task: &TaskQueueItem,
-) -> bool {
+async fn claim_lost_to_timeout(pool: &DbPool, task: &TaskQueueItem) -> bool {
     let Some(started_at) = task.started_at else {
         return false;
     };
-    let mut error = match queue::take_timed_out_claim(conn, task.id, started_at).await {
+    let mut error = match take_timed_out_claim_once(pool, task, started_at).await {
         Ok(hit) => return hit,
         Err(error) => error,
     };
     for backoff in [Duration::from_millis(50), Duration::from_millis(250)] {
         tokio::time::sleep(backoff).await;
-        let retried = match pool.get().await {
-            Ok(mut fresh) => queue::take_timed_out_claim(&mut fresh, task.id, started_at).await,
-            Err(pool_error) => Err(crate::error::database_error(pool_error)),
-        };
-        match retried {
+        match take_timed_out_claim_once(pool, task, started_at).await {
             Ok(hit) => return hit,
             Err(retry_error) => error = retry_error,
         }
@@ -15370,6 +15988,16 @@ async fn claim_lost_to_timeout(
          against the circuit breaker in this process"
     );
     false
+}
+
+/// One try for [`claim_lost_to_timeout`], on a new connection.
+async fn take_timed_out_claim_once(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> HarvestResult<bool> {
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+    queue::take_timed_out_claim(&mut conn, task.id, started_at).await
 }
 
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
@@ -15490,12 +16118,14 @@ async fn handle_session_acquire(
     exec_id: ExecutionId,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    // Stops a background slot re-check at worker shutdown (issue #1788).
+    shutdown: &CancellationToken,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
 
     let Some(activity_uuid) = task.activity_id else {
         return fail_task_only(
@@ -15550,11 +16180,18 @@ async fn handle_session_acquire(
         .await;
     }
 
-    if !crate::sessions::try_acquire_session_slot(
-        session_slots_in_use,
-        max_concurrent_sessions,
-        session_id,
-    ) {
+    // A re-check of an earlier failed acquire can still release this slot
+    // (issue #1788). Defer until it ends, as at full capacity. The hold
+    // keeps any later re-check from releasing the slot while this acquire
+    // runs.
+    let mut acquire_hold = SessionAcquireHold::begin(session_slots_in_use, session_id);
+    if acquire_hold.is_none()
+        || !crate::sessions::try_acquire_session_slot(
+            session_slots_in_use,
+            max_concurrent_sessions,
+            session_id,
+        )
+    {
         // Lost the race: this worker is at its advertised session
         // capacity (or sessions are disabled: max_concurrent_sessions <= 0,
         // so every acquire loses). Reschedule with a randomized backoff so
@@ -15639,6 +16276,28 @@ async fn handle_session_acquire(
             // wedging. The periodic reconciler (`reconcile_local_sessions`) is
             // a backstop for this same release should it ever be missed (e.g.
             // a crash between the DB error and this line).
+            // A transient failure (issue #1788) returns as is, and the dispatch
+            // error path releases the claim for a retry. The acquire write is
+            // idempotent, so a retry is safe. The insert may have committed,
+            // so settle the slot from the recorded row.
+            if crate::pool::is_transient_db_error(&error) {
+                drop(conn);
+                // The hold becomes the re-check in one step, so no other
+                // acquire can start between them.
+                let recheck = acquire_hold.take().map_or_else(
+                    || RecheckedSessionSlot::mark(session_slots_in_use, session_id),
+                    SessionAcquireHold::into_recheck,
+                );
+                let row = AttemptedSessionRow {
+                    session_id,
+                    exec_id,
+                    host_worker_id: worker_id.to_owned(),
+                    queue_name: task.queue_name.clone(),
+                };
+                settle_session_slot_with_mark(pool, session_slots_in_use, &row, recheck, shutdown)
+                    .await;
+                return Err(error);
+            }
             crate::sessions::release_session_slot(session_slots_in_use, session_id);
             let msg = error.to_string();
             fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
@@ -15681,7 +16340,7 @@ async fn handle_session_release(
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
 
     let Some(activity_uuid) = task.activity_id else {
         return fail_task_only(
@@ -15704,6 +16363,11 @@ async fn handle_session_release(
     };
 
     if let Err(error) = crate::sessions::record_session_completed(&mut conn, session_id).await {
+        // A transient failure (issue #1788) wrote nothing. Return it, and the
+        // dispatch error path releases the claim for a retry.
+        if crate::pool::is_transient_db_error(&error) {
+            return Err(error);
+        }
         let msg = error.to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
         return Err(error);
@@ -15718,6 +16382,370 @@ async fn handle_session_release(
     finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None, codecs).await
 }
 
+/// Settle the local slot of a session acquire that failed on a transient
+/// error (issue #1788).
+///
+/// The insert of the session row can commit before the error. A retry then
+/// finds the row and keeps this worker as host, so this worker must still
+/// count the slot. Read the row again on a new connection:
+///
+/// - This worker hosts the `ACTIVE` session: keep the slot.
+/// - No row, or another host: release the slot.
+/// - No read succeeds: keep the slot for now. A slot too few lets the worker
+///   exceed `max_concurrent_sessions`. A background task reads again until
+///   the database answers, then settles the slot. The reconciler only
+///   handles rows that exist, so it cannot release a slot with no row.
+///   `shutdown` stops the reads, the first round included, so they do not
+///   outlive the worker.
+#[doc(hidden)]
+pub async fn settle_session_slot_after_transient_error(
+    pool: &DbPool,
+    registry: &crate::sessions::SessionSlotRegistry,
+    row: &AttemptedSessionRow,
+    shutdown: &CancellationToken,
+) {
+    // Mark before the first read. Those reads can take ten pool bounds, and an
+    // orphan reclaim can retry the task on this worker in that time.
+    let recheck = RecheckedSessionSlot::mark(registry, row.session_id);
+    settle_session_slot_with_mark(pool, registry, row, recheck, shutdown).await;
+}
+
+/// The session row that a failed acquire tried to insert (issue #1788).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AttemptedSessionRow {
+    /// The session.
+    pub session_id: crate::types::SessionId,
+    /// The execution that acquires the session.
+    pub exec_id: ExecutionId,
+    /// The worker that tried to host the session.
+    pub host_worker_id: String,
+    /// The queue of the acquire task.
+    pub queue_name: String,
+}
+
+/// [`settle_session_slot_after_transient_error`] with a mark that the caller
+/// already holds.
+async fn settle_session_slot_with_mark(
+    pool: &DbPool,
+    registry: &crate::sessions::SessionSlotRegistry,
+    row: &AttemptedSessionRow,
+    recheck: RecheckedSessionSlot,
+    shutdown: &CancellationToken,
+) {
+    // One round can take ten pool bounds. Shutdown stops it too, so the
+    // dispatch cannot outlive the worker's drain deadline. The mark drops
+    // with this call.
+    let settled = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return,
+        settled = settle_session_slot_once(pool, registry, row) => settled,
+    };
+    if settled {
+        return;
+    }
+    tracing::warn!(
+        session_id = %row.session_id,
+        "could not read a session after a failed acquire; keeping its slot until a read succeeds"
+    );
+    let pool = pool.clone();
+    let registry = std::sync::Arc::clone(registry);
+    let row = row.clone();
+    let shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let spacing = crate::pool::retry_spacing(&pool);
+        retry_until_done(spacing, shutdown, || {
+            settle_session_slot_once(&pool, &registry, &row)
+        })
+        .await;
+        drop(recheck);
+    });
+}
+
+/// What runs on one session slot of this worker (issue #1788).
+///
+/// A re-check reads the session row and can then release the slot. An acquire
+/// that runs at the same time can insert the row just after that read. The
+/// re-check would then release the slot of a session that this worker hosts.
+/// So the two exclude each other here:
+///
+/// - An acquire does not begin while a re-check runs. It defers instead.
+/// - A re-check does not release a slot while an acquire runs. That acquire
+///   settles the slot itself.
+///
+/// Both are counts, because attempts of one session can overlap.
+#[derive(Default)]
+struct SlotActivity {
+    acquires: usize,
+    rechecks: usize,
+}
+
+/// A slot of one worker: the registry address and the session. Two workers
+/// in one process keep separate entries.
+type SlotKey = (usize, crate::types::SessionId);
+
+static SESSION_SLOT_ACTIVITY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<SlotKey, SlotActivity>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn slot_key(
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+) -> SlotKey {
+    (std::sync::Arc::as_ptr(registry).addr(), session_id)
+}
+
+fn slot_activity()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<SlotKey, SlotActivity>> {
+    SESSION_SLOT_ACTIVITY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Apply `change` to the activity of `key`, and drop an entry that is idle.
+fn update_slot_activity(key: SlotKey, change: impl FnOnce(&mut SlotActivity)) {
+    let mut activity = slot_activity();
+    let entry = activity.entry(key).or_default();
+    change(entry);
+    if entry.acquires == 0 && entry.rechecks == 0 {
+        activity.remove(&key);
+    }
+}
+
+/// Whether a re-check of this slot is still in progress.
+#[cfg(test)]
+fn session_slot_rechecked(
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+) -> bool {
+    slot_activity()
+        .get(&slot_key(registry, session_id))
+        .is_some_and(|activity| activity.rechecks > 0)
+}
+
+/// Release the slot, unless an acquire of it runs. That acquire settles the
+/// slot itself.
+fn release_session_slot_unless_acquiring(
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+) {
+    let activity = slot_activity();
+    let acquiring = activity
+        .get(&slot_key(registry, session_id))
+        .is_some_and(|slot| slot.acquires > 0);
+    if !acquiring {
+        crate::sessions::release_session_slot(registry, session_id);
+    }
+    // Hold the lock until after the release. No acquire can then begin between
+    // the check and the release.
+    drop(activity);
+}
+
+/// An acquire in progress on a slot. The count goes when this value drops.
+struct SessionAcquireHold(SlotKey);
+
+impl SessionAcquireHold {
+    /// Start an acquire. Returns `None` while a re-check of the slot runs.
+    fn begin(
+        registry: &crate::sessions::SessionSlotRegistry,
+        session_id: crate::types::SessionId,
+    ) -> Option<Self> {
+        let key = slot_key(registry, session_id);
+        let mut activity = slot_activity();
+        let entry = activity.entry(key).or_default();
+        let admitted = entry.rechecks == 0;
+        if admitted {
+            entry.acquires += 1;
+        }
+        drop(activity);
+        admitted.then(|| Self(key))
+    }
+
+    /// Turn this acquire into a re-check in one step. No other acquire can
+    /// begin between the two.
+    fn into_recheck(self) -> RecheckedSessionSlot {
+        let key = self.0;
+        update_slot_activity(key, |activity| {
+            activity.acquires -= 1;
+            activity.rechecks += 1;
+        });
+        std::mem::forget(self);
+        RecheckedSessionSlot(key)
+    }
+}
+
+impl Drop for SessionAcquireHold {
+    fn drop(&mut self) {
+        update_slot_activity(self.0, |activity| activity.acquires -= 1);
+    }
+}
+
+/// Marks a slot as in re-check. The mark goes when this value drops, also
+/// when the runtime cancels the re-check task.
+struct RecheckedSessionSlot(SlotKey);
+
+impl RecheckedSessionSlot {
+    fn mark(
+        registry: &crate::sessions::SessionSlotRegistry,
+        session_id: crate::types::SessionId,
+    ) -> Self {
+        let key = slot_key(registry, session_id);
+        update_slot_activity(key, |activity| activity.rechecks += 1);
+        Self(key)
+    }
+}
+
+impl Drop for RecheckedSessionSlot {
+    fn drop(&mut self) {
+        update_slot_activity(self.0, |activity| activity.rechecks -= 1);
+    }
+}
+
+/// One round of [`settle_session_slot_after_transient_error`]: up to
+/// `FINALIZE_ACQUIRE_ATTEMPTS` reads, one pool bound apart. Returns whether a
+/// read succeeded and the slot is settled.
+/// Read the host and state of `row`'s session once no insert of it runs
+/// (issue #1788).
+///
+/// A failed acquire can lose its connection while the server still runs its
+/// insert. A plain read then sees no row, and the insert commits after it. The
+/// slot would go back for a session that this worker hosts. So this function
+/// first inserts the same row in a transaction that it always rolls back.
+/// Postgres makes that insert wait for any insert of the same key in
+/// progress. The read that follows sees the outcome of that insert.
+async fn read_session_after_inserts(
+    conn: &mut AsyncPgConnection,
+    row: &AttemptedSessionRow,
+) -> HarvestResult<Option<(String, String)>> {
+    use crate::schema::harvest_sessions::dsl;
+    use diesel::result::{DatabaseErrorKind, Error as DieselError};
+    use diesel_async::AsyncConnection as _;
+
+    let probe = crate::models::NewHarvestSession {
+        id: row.session_id.as_uuid(),
+        workflow_exec_id: row.exec_id.as_uuid(),
+        host_worker_id: &row.host_worker_id,
+        queue_name: &row.queue_name,
+        expires_at: chrono::Utc::now(),
+    };
+    let waited = conn
+        .transaction::<(), DieselError, _>(async |conn| {
+            diesel::insert_into(dsl::harvest_sessions)
+                .values(&probe)
+                .on_conflict(dsl::id)
+                .do_nothing()
+                .execute(conn)
+                .await?;
+            Err(DieselError::RollbackTransaction)
+        })
+        .await;
+    match waited {
+        // A missing execution means that no session row can exist either.
+        Ok(())
+        | Err(
+            DieselError::RollbackTransaction
+            | DieselError::DatabaseError(DatabaseErrorKind::ForeignKeyViolation, _),
+        ) => {}
+        Err(error) => return Err(crate::error::database_error(error)),
+    }
+    dsl::harvest_sessions
+        .find(row.session_id.as_uuid())
+        .select((dsl::host_worker_id, dsl::state))
+        .first::<(String, String)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
+async fn settle_session_slot_once(
+    pool: &DbPool,
+    registry: &crate::sessions::SessionSlotRegistry,
+    row: &AttemptedSessionRow,
+) -> bool {
+    let session_id = row.session_id;
+    let spacing = crate::pool::retry_spacing(pool);
+    for attempt in 1..=FINALIZE_ACQUIRE_ATTEMPTS {
+        let started = tokio::time::Instant::now();
+        let read = match crate::pool::acquire_within_pool_bound(pool).await {
+            Ok(mut conn) => read_session_after_inserts(&mut conn, row).await,
+            Err(error) => Err(error),
+        };
+        match read {
+            Ok(found) => {
+                let ours = found
+                    .is_some_and(|(host, state)| host == row.host_worker_id && state == "ACTIVE");
+                if !ours {
+                    release_session_slot_unless_acquiring(registry, session_id);
+                }
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    attempt,
+                    error = %error,
+                    "could not read a session after a failed acquire; trying again"
+                );
+                tokio::time::sleep_until(started + spacing).await;
+            }
+        }
+    }
+    false
+}
+
+/// Run the internal session-release activity for `task`. Tests use it
+/// (issue #1788).
+///
+/// # Errors
+///
+/// See `handle_session_release`.
+#[doc(hidden)]
+pub async fn handle_session_release_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    handle_session_release(
+        pool,
+        task,
+        worker_id,
+        exec_id,
+        &crate::sessions::new_session_slot_registry(),
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+}
+
+/// Run the internal session-acquire activity for `task` against `registry`.
+/// Tests use it (issue #1788).
+///
+/// # Errors
+///
+/// See `handle_session_acquire`.
+#[doc(hidden)]
+pub async fn handle_session_acquire_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    exec_id: ExecutionId,
+    max_concurrent_sessions: i32,
+    registry: &crate::sessions::SessionSlotRegistry,
+) -> HarvestResult<()> {
+    handle_session_acquire(
+        pool,
+        task,
+        worker_id,
+        exec_id,
+        max_concurrent_sessions,
+        registry,
+        &CancellationToken::new(),
+        &crate::telemetry::NoOpMetrics,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn process_activity_task(
     pool: &DbPool,
@@ -15728,13 +16756,14 @@ async fn process_activity_task(
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    shutdown: &CancellationToken,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         return fail_task_only(&mut conn, task.id, "activity task missing workflow_exec_id").await;
     };
     let Some(activity_name) = task.activity_name.as_deref() else {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         return fail_task_only(&mut conn, task.id, "activity task missing activity_name").await;
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
@@ -15754,6 +16783,7 @@ async fn process_activity_task(
             exec_id,
             max_concurrent_sessions,
             session_slots_in_use,
+            shutdown,
             registry.telemetry().metrics.as_ref(),
             registry.payload_codecs(),
         )
@@ -15816,7 +16846,7 @@ async fn process_activity_task(
         && policy.open_mode == crate::policy::CircuitOpenMode::Defer
     {
         let delay = circuit_defer_delay(retry_after, policy.cooldown, task);
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         match queue::defer_claimed_task_for_open_circuit(&mut conn, &claim_of_task(task)?, delay)
             .await?
         {
@@ -15840,7 +16870,7 @@ async fn process_activity_task(
                 if let Some(token) = circuit_token {
                     circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
                 }
-                let deferred = match pool.get().await {
+                let deferred = match crate::pool::acquire_within_pool_bound(pool).await {
                     Ok(mut conn) => {
                         defer_retry_for_budget(
                             &mut conn,
@@ -15853,7 +16883,7 @@ async fn process_activity_task(
                         )
                         .await
                     }
-                    Err(error) => Err(crate::error::database_error(error)),
+                    Err(error) => Err(error),
                 };
                 if matches!(deferred, Ok(true)) {
                     // Count only a deferral that persisted, so the counter
@@ -15885,57 +16915,74 @@ async fn process_activity_task(
     // A short-circuit reserves nothing; only a real call consumes a token. The
     // `circuit_token.is_some()` guard means "decision is Allow"; the breaker guard
     // restricts this to activities whose claim-time rate limiting was skipped.
-    if circuit_token.is_some()
-        && activity.circuit_breaker.is_some()
-        && let Some(key) = task.rate_limit_key.as_deref()
-    {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        if !queue::try_consume_rate_limit_token(&mut conn, key).await? {
-            // No token available (bucket empty, or fail-closed when the bucket
-            // row is missing): defer this real call instead of running it.
-            //
-            // Releasing any half-open probe slot this dispatch just admitted is
-            // essential — `on_dispatch` set `probe_in_flight = true`, and if we
-            // returned without resolving it the breaker would stay HalfOpen
-            // forever and short-circuit every later attempt. A rate-limit defer
-            // is not a downstream health signal, so `on_cancelled` re-arms the
-            // cooldown (rather than tripping or closing) and a fresh probe is
-            // admitted once the cooldown re-elapses.
-            if let Some(token) = circuit_token {
-                circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
-            }
-            let refill_delay = activity
-                .rate_limit_rps
-                .filter(|rps| *rps > 0.0)
-                .map_or(RATE_LIMIT_DEFER_FALLBACK, |rps| {
-                    Duration::from_secs_f64(1.0 / rps)
-                })
-                .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
-            // Label the throttle metric by the bounded activity name, never the
-            // rate-limit bucket key (which for a dynamic per-key limit,
-            // issue #699, embeds unbounded tenant input — ADR-0001 §7).
-            registry
-                .telemetry()
-                .metrics
-                .record_rate_limit_throttled(activity_name);
-            // host-clock-ok: the deferral API takes an absolute time. See issue #1807 follow-ups.
-            let scheduled_at = chrono::Utc::now()
-                + chrono::Duration::from_std(refill_delay)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(5));
-            // A lost lease is a no-op (issue #1789).
-            if queue::defer_claimed_rate_limited_task(
-                &mut conn,
-                &claim_of_task(task)?,
-                scheduled_at,
-            )
-            .await?
-                == queue::ClaimWrite::LeaseLost
+    //
+    // The connection that took the token also appends ActivityStarted below
+    // (issue #1788). A second acquire there could time out after the debit and
+    // leave the token spent on a call that never ran.
+    let (mut reserved_conn, debited_key): (Option<crate::pool::PooledConn>, Option<&str>) =
+        if circuit_token.is_some()
+            && activity.circuit_breaker.is_some()
+            && let Some(key) = task.rate_limit_key.as_deref()
+        {
+            let mut conn = crate::pool::acquire_within_pool_bound(pool)
+                .await
+                .map_err(|e| {
+                    release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+                })?;
+            if !queue::try_consume_rate_limit_token(&mut conn, key)
+                .await
+                .map_err(|e| {
+                    release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+                })?
             {
-                log_lease_lost(task, "rate-limit deferral");
+                // No token available (bucket empty, or fail-closed when the bucket
+                // row is missing): defer this real call instead of running it.
+                //
+                // Releasing any half-open probe slot this dispatch just admitted is
+                // essential — `on_dispatch` set `probe_in_flight = true`, and if we
+                // returned without resolving it the breaker would stay HalfOpen
+                // forever and short-circuit every later attempt. A rate-limit defer
+                // is not a downstream health signal, so `on_cancelled` re-arms the
+                // cooldown (rather than tripping or closing) and a fresh probe is
+                // admitted once the cooldown re-elapses.
+                if let Some(token) = circuit_token {
+                    circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+                }
+                let refill_delay = activity
+                    .rate_limit_rps
+                    .filter(|rps| *rps > 0.0)
+                    .map_or(RATE_LIMIT_DEFER_FALLBACK, |rps| {
+                        Duration::from_secs_f64(1.0 / rps)
+                    })
+                    .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
+                // Label the throttle metric by the bounded activity name, never the
+                // rate-limit bucket key (which for a dynamic per-key limit,
+                // issue #699, embeds unbounded tenant input — ADR-0001 §7).
+                registry
+                    .telemetry()
+                    .metrics
+                    .record_rate_limit_throttled(activity_name);
+                // host-clock-ok: the deferral API takes an absolute time. See issue #1807 follow-ups.
+                let scheduled_at = chrono::Utc::now()
+                    + chrono::Duration::from_std(refill_delay)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(5));
+                // A lost lease is a no-op (issue #1789).
+                if queue::defer_claimed_rate_limited_task(
+                    &mut conn,
+                    &claim_of_task(task)?,
+                    scheduled_at,
+                )
+                .await?
+                    == queue::ClaimWrite::LeaseLost
+                {
+                    log_lease_lost(task, "rate-limit deferral");
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-    }
+            (Some(conn), Some(key))
+        } else {
+            (None, None)
+        };
 
     // Setup phase: append ActivityStarted, then drop the connection so the pool
     // slot is free before the handler runs (prevents a deadlock when
@@ -15953,9 +17000,17 @@ async fn process_activity_task(
     #[cfg(not(feature = "wasm-activities"))]
     let wasm_bound = false;
     let started = {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        let started_result = append_activity_started_if_pending(
-            &mut conn,
+        let conn = match reserved_conn.take() {
+            Some(conn) => conn,
+            None => crate::pool::acquire_within_pool_bound(pool)
+                .await
+                .map_err(|e| {
+                    release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+                })?,
+        };
+        let (started_result, mut conn) = append_start_or_reconcile(
+            pool,
+            conn,
             task,
             exec_id,
             activity_name,
@@ -15965,15 +17020,37 @@ async fn process_activity_task(
             circuit_token.is_some() && !wasm_bound,
         )
         .await;
-        let Some(started) = fail_execution_on_error(
-            &mut conn,
-            task,
-            worker_id,
-            started_result,
-            registry.payload_codecs(),
-        )
-        .await?
-        else {
+        // A transient failure (issue #1788) has not run the handler and wrote
+        // nothing. It must not fail the workflow through
+        // `fail_execution_on_error`. Return it instead: the dispatch error path
+        // releases the claim, so the task runs again.
+        let started_result = match (started_result, conn.as_mut()) {
+            (Err(error), Some(conn)) if !crate::pool::is_transient_db_error(&error) => {
+                fail_execution_on_error(
+                    conn,
+                    task,
+                    worker_id,
+                    Err(error),
+                    registry.payload_codecs(),
+                )
+                .await
+            }
+            (other, _) => other,
+        };
+        let started_opt = match started_result {
+            Ok(started_opt) => started_opt,
+            Err(error) => {
+                // Undo the dispatch reservation: the token and the probe.
+                refund_after_start_error(pool, conn, debited_key, &error).await;
+                return Err(release_probe_on_error(
+                    &circuit_breakers,
+                    activity_name,
+                    circuit_token,
+                    error,
+                ));
+            }
+        };
+        let Some(started) = started_opt else {
             // The activity will not run: it already has a terminal event, or the
             // task row stopped being RUNNING (cancelled / timed out concurrently).
             // Undo the side effects of the dispatch decision for this no-op so the
@@ -15989,7 +17066,8 @@ async fn process_activity_task(
             if circuit_token.is_some()
                 && activity.circuit_breaker.is_some()
                 && let Some(key) = task.rate_limit_key.as_deref()
-                && let Err(error) = queue::refund_rate_limit_token(&mut conn, key).await
+                && let Some(conn) = conn.as_mut()
+                && let Err(error) = queue::refund_rate_limit_token(conn, key).await
             {
                 tracing::warn!(
                     rate_limit_key = %key,
@@ -16054,30 +17132,24 @@ async fn process_activity_task(
             &task.queue_name,
             ActivityStatus::Failed,
         );
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        let retry_policy_result = configured_retry_policy(task);
-        let retry_policy = fail_execution_on_error(
-            &mut conn,
-            task,
-            worker_id,
-            retry_policy_result,
-            registry.payload_codecs(),
-        )
-        .await?;
-        return handle_activity_result(
-            &mut conn,
+        // `ActivityStarted` is already committed, and a start is not
+        // idempotent. So this write uses the same retries as a handler result
+        // (issue #1788). A released claim would append a second start.
+        let retry_policy =
+            retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
+        let attempt = ActivityAttempt {
             task,
             exec_id,
             activity_id,
             worker_id,
-            retry_policy.as_ref(),
-            Err(payload),
-            0,
             activity_name,
-            registry.payload_offloader(),
-            telemetry.metrics.as_ref(),
-            registry.retry_after_ceiling,
-            registry.payload_codecs(),
+        };
+        return write_activity_result(
+            pool,
+            registry,
+            &attempt,
+            retry_policy.as_ref(),
+            &Err(payload),
         )
         .await
         .map(|_| ());
@@ -16085,10 +17157,14 @@ async fn process_activity_task(
 
     let cancel = CancellationToken::new();
     let activity_claim = claim_of_task(task)?;
-    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher(
+    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with(
         activity_claim.clone(),
         pool.clone(),
         cancel.clone(),
+        crate::heartbeat::HeartbeatFlushOptions {
+            acquire_timeout: crate::pool::acquire_bound(pool),
+            metrics: Arc::clone(&registry.telemetry().metrics),
+        },
     );
     let trace_carrier = task
         .trace_context
@@ -16121,7 +17197,7 @@ async fn process_activity_task(
     );
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
-        Some(heartbeat_tx),
+        Some(heartbeat_tx.into()),
         task.heartbeat_details.clone(),
         cancel.clone(),
         activity_claim.clone(),
@@ -16243,102 +17319,107 @@ async fn process_activity_task(
         registry.wasm_binding(activity_name),
         registry.wasm_store(),
     ) {
-        (Some(binding), Some(store)) => Some(match pool.get().await {
-            Ok(mut conn) => {
-                let dispatch = crate::wasm_store::resolve_wasm_dispatch(
-                    &mut conn,
-                    store,
-                    binding,
-                    activity_name,
-                    wasm_effective_deadline(task.start_to_close, activity.default_start_to_close),
-                    // Thread the task cancellation token so a cancelled guest
-                    // is cooperatively interrupted (issue #965 review) within
-                    // ~1 epoch tick, instead of holding a blocking-pool thread
-                    // until its wall-clock ceiling.
-                    Some(cancel.clone()),
-                    // Thread the start-to-close anchor so `invoke` charges the
-                    // whole pre-guest interval — resolution (this checkout +
-                    // active-hash lookup + cold-cache byte fetch) plus compile
-                    // — against the guest deadline, not just compile (issue
-                    // #965 review round 7). `attempt_clock_start` was captured
-                    // above, just before this dispatch resolution began, so it
-                    // APPROXIMATES the start-to-close anchor (issue #965
-                    // review round 10 — it does not equal it). The
-                    // authoritative anchor is `task.started_at`, set at claim,
-                    // and `ActivityStarted` is appended earlier still, so the
-                    // setup between them is not charged to the guest. Under
-                    // pool contention the guest's budget therefore starts
-                    // slightly later than the timeout scanner's. That is
-                    // safe-direction — the scanner fires first, the guest's own
-                    // epoch ceiling still bounds it, and a late result lands on
-                    // an already-terminal task — and it matches native
-                    // activities, which are equally unaware of `started_at`.
-                    attempt_clock_start,
-                )
-                .await;
-                // The guest runs next, so its handler starts now (issue
-                // #1809). The write is fenced by the claim, so it waits for
-                // a timeout in flight and then changes nothing. A failed
-                // write only keeps a timeout of this attempt out of the
-                // breaker.
-                //
-                // A lost claim means a timeout or another path already
-                // settled this attempt, and a retry may own the task. The
-                // guest then must not start. The attempt ends as a lost
-                // claim, and every write it tries is fenced.
-                //
-                // A failed write leaves the start unrecorded, so a later
-                // timeout of the guest would feed no breaker. The guest
-                // does not start then either. The attempt fails as a
-                // retry, and the cancel keeps it out of the breaker.
-                if matches!(dispatch, crate::wasm_store::WasmDispatch::Invoke(_)) {
-                    match queue::mark_claim_handler_started(&mut conn, &activity_claim).await {
-                        Ok(queue::ClaimWrite::Applied) => dispatch,
-                        Ok(queue::ClaimWrite::LeaseLost) => {
-                            use crate::failure::IntoActivityErrorString as _;
-                            log_lease_lost(task, "wasm handler start marker");
-                            cancel.cancel();
-                            crate::wasm_store::WasmDispatch::Fail(
-                                crate::failure::ActivityFailure::retryable(
-                                    "ClaimLost",
-                                    "the claim was lost before the wasm guest started",
+        (Some(binding), Some(store)) => {
+            Some(match crate::pool::acquire_within_pool_bound(pool).await {
+                Ok(mut conn) => {
+                    let dispatch = crate::wasm_store::resolve_wasm_dispatch(
+                        &mut conn,
+                        store,
+                        binding,
+                        activity_name,
+                        wasm_effective_deadline(
+                            task.start_to_close,
+                            activity.default_start_to_close,
+                        ),
+                        // Thread the task cancellation token so a cancelled guest
+                        // is cooperatively interrupted (issue #965 review) within
+                        // ~1 epoch tick, instead of holding a blocking-pool thread
+                        // until its wall-clock ceiling.
+                        Some(cancel.clone()),
+                        // Thread the start-to-close anchor so `invoke` charges the
+                        // whole pre-guest interval — resolution (this checkout +
+                        // active-hash lookup + cold-cache byte fetch) plus compile
+                        // — against the guest deadline, not just compile (issue
+                        // #965 review round 7). `attempt_clock_start` was captured
+                        // above, just before this dispatch resolution began, so it
+                        // APPROXIMATES the start-to-close anchor (issue #965
+                        // review round 10 — it does not equal it). The
+                        // authoritative anchor is `task.started_at`, set at claim,
+                        // and `ActivityStarted` is appended earlier still, so the
+                        // setup between them is not charged to the guest. Under
+                        // pool contention the guest's budget therefore starts
+                        // slightly later than the timeout scanner's. That is
+                        // safe-direction — the scanner fires first, the guest's own
+                        // epoch ceiling still bounds it, and a late result lands on
+                        // an already-terminal task — and it matches native
+                        // activities, which are equally unaware of `started_at`.
+                        attempt_clock_start,
+                    )
+                    .await;
+                    // The guest runs next, so its handler starts now (issue
+                    // #1809). The write is fenced by the claim, so it waits for
+                    // a timeout in flight and then changes nothing. A failed
+                    // write only keeps a timeout of this attempt out of the
+                    // breaker.
+                    //
+                    // A lost claim means a timeout or another path already
+                    // settled this attempt, and a retry may own the task. The
+                    // guest then must not start. The attempt ends as a lost
+                    // claim, and every write it tries is fenced.
+                    //
+                    // A failed write leaves the start unrecorded, so a later
+                    // timeout of the guest would feed no breaker. The guest
+                    // does not start then either. The attempt fails as a
+                    // retry, and the cancel keeps it out of the breaker.
+                    if matches!(dispatch, crate::wasm_store::WasmDispatch::Invoke(_)) {
+                        match queue::mark_claim_handler_started(&mut conn, &activity_claim).await {
+                            Ok(queue::ClaimWrite::Applied) => dispatch,
+                            Ok(queue::ClaimWrite::LeaseLost) => {
+                                use crate::failure::IntoActivityErrorString as _;
+                                log_lease_lost(task, "wasm handler start marker");
+                                cancel.cancel();
+                                crate::wasm_store::WasmDispatch::Fail(
+                                    crate::failure::ActivityFailure::retryable(
+                                        "ClaimLost",
+                                        "the claim was lost before the wasm guest started",
+                                    )
+                                    .into_error_payload(),
                                 )
-                                .into_error_payload(),
-                            )
-                        }
-                        Err(error) => {
-                            use crate::failure::IntoActivityErrorString as _;
-                            tracing::warn!(
-                                task_id = %task.id,
-                                error = %error,
-                                "could not record the wasm handler start; the guest does not start"
-                            );
-                            cancel.cancel();
-                            crate::wasm_store::WasmDispatch::Fail(
-                                crate::failure::ActivityFailure::retryable(
-                                    "ActivityStartNotRecorded",
-                                    format!("could not record the wasm handler start: {error}"),
+                            }
+                            Err(error) => {
+                                use crate::failure::IntoActivityErrorString as _;
+                                tracing::warn!(
+                                    task_id = %task.id,
+                                    error = %error,
+                                    "could not record the wasm handler start; the guest does not start"
+                                );
+                                cancel.cancel();
+                                crate::wasm_store::WasmDispatch::Fail(
+                                    crate::failure::ActivityFailure::retryable(
+                                        "ActivityStartNotRecorded",
+                                        format!("could not record the wasm handler start: {error}"),
+                                    )
+                                    .into_error_payload(),
                                 )
-                                .into_error_payload(),
-                            )
+                            }
                         }
+                    } else {
+                        dispatch
                     }
-                } else {
-                    dispatch
+                    // `conn` is dropped at the end of this arm, before the guest runs.
                 }
-                // `conn` is dropped at the end of this arm, before the guest runs.
-            }
-            Err(e) => {
-                use crate::failure::IntoActivityErrorString as _;
-                crate::wasm_store::WasmDispatch::Fail(
-                    crate::failure::ActivityFailure::wasm_module_lookup_failed(format!(
-                        "failed to acquire a database connection to resolve the wasm module \
+                Err(e) => {
+                    use crate::failure::IntoActivityErrorString as _;
+                    crate::wasm_store::WasmDispatch::Fail(
+                        crate::failure::ActivityFailure::wasm_module_lookup_failed(format!(
+                            "failed to acquire a database connection to resolve the wasm module \
                              for activity '{activity_name}': {e}"
-                    ))
-                    .into_error_payload(),
-                )
-            }
-        }),
+                        ))
+                        .into_error_payload(),
+                    )
+                }
+            })
+        }
         _ => None,
     };
 
@@ -16523,17 +17604,26 @@ async fn process_activity_task(
     cancel.cancel();
     drop(activity_future);
 
-    // Finalization phase: re-acquire a connection now that the handler is done.
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-    let retry_policy_result = configured_retry_policy(task);
-    let retry_policy = fail_execution_on_error(
-        &mut conn,
-        task,
-        worker_id,
-        retry_policy_result,
-        registry.payload_codecs(),
-    )
-    .await?;
+    // Finalization phase. The handler already ran, so a short pool incident
+    // must not drop its result: each acquire is bounded and retried (issue
+    // #1788). Acquire only when a write is needed. An activity that committed
+    // through `run_transactional` needs none, so it must not wait on the pool.
+    // Its outcome is sealed, so it needs no retry policy, and an invalid
+    // policy must not fail it.
+    let retry_policy = if committed_transactionally {
+        None
+    } else {
+        finalization_retry_policy(
+            pool,
+            task,
+            worker_id,
+            registry.payload_codecs(),
+            &circuit_breakers,
+            activity_name,
+            circuit_token,
+        )
+        .await?
+    };
 
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
@@ -16558,8 +17648,7 @@ async fn process_activity_task(
             // timeout counts against the downstream. `on_claim_lost` counts
             // one that another process enforced, and releases the slot of any
             // other loss.
-            attempt_metrics.counted_by_enforcer =
-                claim_lost_to_timeout(pool, &mut conn, task).await;
+            attempt_metrics.counted_by_enforcer = claim_lost_to_timeout(pool, task).await;
             let lost_to_timeout =
                 attempt_metrics.counted_by_enforcer && circuit_breakers.has_policy(activity_name);
             if circuit_breakers.on_claim_lost(
@@ -16666,22 +17755,25 @@ async fn process_activity_task(
         return Ok(());
     }
 
-    // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
-    // pass 0 so handle_activity_result skips the redundant cap check.
-    let finalized = handle_activity_result(
-        &mut conn,
+    record_activity_panic_once(
+        telemetry.metrics.as_ref(),
+        activity_name,
+        &task.queue_name,
+        &activity_result,
+    );
+    let attempt = ActivityAttempt {
         task,
         exec_id,
         activity_id,
         worker_id,
-        retry_policy.as_ref(),
-        activity_result,
-        0,
         activity_name,
-        registry.payload_offloader(),
-        telemetry.metrics.as_ref(),
-        registry.retry_after_ceiling,
-        registry.payload_codecs(),
+    };
+    let finalized = write_activity_result(
+        pool,
+        registry,
+        &attempt,
+        retry_policy.as_ref(),
+        &activity_result,
     )
     .await;
     // A failed write still releases an admitted probe, without a trip. A
@@ -16689,13 +17781,116 @@ async fn process_activity_task(
     let applied = finalized.as_ref().ok().copied();
     // A cancelled attempt took its record above, and reports no outcome.
     if applied == Some(false) && circuit_outcome.is_some() {
-        attempt_metrics.counted_by_enforcer = claim_lost_to_timeout(pool, &mut conn, task).await;
+        attempt_metrics.counted_by_enforcer = claim_lost_to_timeout(pool, task).await;
     }
     let lost_to_timeout = applied == Some(false)
         && attempt_metrics.counted_by_enforcer
         && circuit_breakers.has_policy(activity_name);
     report_outcome(applied, lost_to_timeout);
     finalized.map(|_| ())
+}
+
+/// The activity attempt whose result [`write_activity_result`] writes.
+#[derive(Clone, Copy)]
+struct ActivityAttempt<'a> {
+    task: &'a TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    worker_id: &'a str,
+    activity_name: &'a str,
+}
+
+/// Write the result of an activity attempt that has started (issue #1788).
+///
+/// Each acquire is bounded and retried, so a short pool incident does not
+/// drop the result. A session `statement_timeout` or `lock_timeout` rolls the
+/// write back, so the write runs again. A lost connection, for example after a
+/// `transaction_timeout`, gets a new connection first. Each finalization
+/// re-checks `RUNNING` under a row lock, so a repeat is safe. A write that
+/// uploads a blob turns the repeats off; see `repeats_result_write`. The
+/// write counts its own uploads, so the decision uses the bytes it sent.
+///
+/// `activity_result` is already cap-normalized: an oversized `Ok` is a
+/// non-retryable `Err`. So the cap passed to `handle_activity_result` is 0,
+/// which skips a second check.
+///
+/// Returns `true` when this claim wrote the result, as `handle_activity_result`
+/// does (issue #1809). A repeat that finds an earlier try already committed
+/// returns `false`. The breaker then sees a lost claim and only releases a
+/// probe slot. So a repeat can drop one breaker count, but it never adds one.
+async fn write_activity_result(
+    pool: &DbPool,
+    registry: &HandlerRegistry,
+    attempt_of: &ActivityAttempt<'_>,
+    retry_policy: Option<&RetryPolicy>,
+    activity_result: &Result<serde_json::Value, String>,
+) -> HarvestResult<bool> {
+    let ActivityAttempt {
+        task,
+        exec_id,
+        activity_id,
+        worker_id,
+        activity_name,
+    } = *attempt_of;
+    let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
+    // A handler failure and an inline output upload nothing. The count
+    // follows the codec key that each try encodes with.
+    let counted = registry
+        .payload_offloader()
+        .map(crate::payload_store::PayloadOffloader::counting_uploads);
+    let offloader = counted.as_ref().map(|(offloader, _)| offloader);
+    let uploaded = || counted.as_ref().is_some_and(|(_, uploads)| uploads.any());
+    let mut attempt = 1;
+    loop {
+        let outcome = handle_activity_result(
+            &mut conn,
+            task,
+            exec_id,
+            activity_id,
+            worker_id,
+            retry_policy,
+            activity_result.clone(),
+            0,
+            activity_name,
+            offloader,
+            registry.telemetry().metrics.as_ref(),
+            registry.retry_after_ceiling,
+            registry.payload_codecs(),
+        )
+        .await;
+        match outcome {
+            Err(error)
+                if repeats_result_write(attempt, uploaded())
+                    && crate::pool::is_session_timeout(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "session timeout while writing the activity result; trying again"
+                );
+                attempt += 1;
+            }
+            Err(error)
+                if repeats_result_write(attempt, uploaded())
+                    && crate::pool::is_connection_lost(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "lost the connection while writing the activity result; \
+                     trying again on a new connection"
+                );
+                // Return the dead connection first. It holds a pool slot, and on a
+                // full pool the new acquire would wait for that slot.
+                drop(conn);
+                conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -24088,6 +25283,9 @@ async fn process_task(
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    // The worker's shutdown token. It stops background slot re-checks
+    // (issue #1788).
+    shutdown: &CancellationToken,
     // Issue #782: contained-handler-panic strike map + retry budget, consulted
     // only on the workflow path.
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
@@ -24123,7 +25321,7 @@ async fn process_task(
             // Boxed so `process_task`'s own future does not grow by the whole
             // decision cycle's state (clippy::large_futures).
             let cycle = Box::pin(async {
-                let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
                 // Boxed for the same reason the enclosing `cycle` is
                 // (clippy::large_futures): `process_workflow_task`'s state is
                 // large enough on its own that inlining it here grows every
@@ -24171,6 +25369,7 @@ async fn process_task(
                 dispatched_at,
                 max_concurrent_sessions,
                 session_slots_in_use,
+                shutdown,
             )
             .await;
             // Acquire only if we actually need to act on a capability miss or
@@ -24186,7 +25385,7 @@ async fn process_task(
             if result.as_ref().err().is_some_and(|e| {
                 e.handler_not_registered().is_some() || e.terminal_write_claim_ambiguous().is_some()
             }) {
-                let conn = pool.get().await.map_err(crate::error::database_error)?;
+                let conn = crate::pool::acquire_within_pool_bound(pool).await?;
                 (conn, result)
             } else {
                 return result.map(|()| TaskDispatchOutcome::Completed);
@@ -28722,8 +29921,8 @@ impl Worker {
         // can park it forever. No shard then reaches registration or
         // polling. A bounded acquisition still fails closed on that shard.
         // It matches the existing intent. It bounds the wait instead of
-        // hanging. Single-shard keeps the original unbounded
-        // `pool.get().await`. That path has no peer shard to strand.
+        // hanging. Single-shard passes `None`, which uses the pool's own
+        // bound (issue #1788). That path has no peer shard to strand.
         #[cfg(feature = "wasm-activities")]
         {
             let registrations = self.registry.wasm_module_registrations();
@@ -29061,16 +30260,9 @@ impl Worker {
             return;
         }
 
-        let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
-        let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
-            Vec::with_capacity(shard_targets.len());
-        for (_, shard_pool) in &shard_targets {
-            registration_pending_per_shard.push(Arc::new(AtomicBool::new(
-                self.register_in_fleet(shard_pool, startup_bound).await,
-            )));
-            self.register_rate_limit_buckets(shard_pool, startup_bound)
-                .await;
-        }
+        // The retry guards live as long as this run (issue #1788).
+        let (registration_pending_per_shard, _bucket_retries) =
+            self.register_shards(&shard_targets).await;
 
         // Monitoring tasks use the default pool for non-shard-specific monitors;
         // the stranded-work sampler (added in spawn_monitoring_tasks) uses the
@@ -29549,7 +30741,9 @@ impl Worker {
             Arc::new(AtomicBool::new(self.register_in_fleet(pool, None).await));
 
         // Auto-register rate limit buckets for the activities configured on this worker.
-        self.register_rate_limit_buckets(pool, None).await;
+        // A registration that does not complete runs again in the background.
+        let _bucket_retry = (!self.register_rate_limit_buckets(pool, None).await)
+            .then(|| self.spawn_rate_limit_bucket_retry(pool, None));
 
         let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool));
         let heartbeat_cancel = CancellationToken::new();
@@ -29597,8 +30791,8 @@ impl Worker {
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
         // Transition to Draining before waiting for in-flight tasks. `None`:
-        // the single-shard path has no peer to strand, so this stays the
-        // original unbounded wait (AC3, issue #1209).
+        // the single-shard path has no peer to strand, so it uses the pool's
+        // own bound (issue #1788).
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
             .await;
 
@@ -29688,7 +30882,7 @@ impl Worker {
         let mut pinned: Vec<(crate::types::ShardId, crate::replication::ShardGeneration)> =
             Vec::with_capacity(targets.len());
         for (shard_id, pool) in &targets {
-            let mut conn = match pool.get().await {
+            let mut conn = match crate::pool::acquire_within_pool_bound(pool).await {
                 Ok(conn) => conn,
                 Err(error) => {
                     tracing::error!(
@@ -31646,97 +32840,93 @@ impl Worker {
         }
     }
 
-    /// Auto-upsert rate-limiting buckets for activities registered on this worker.
-    async fn register_rate_limit_buckets(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
-        match acquire_shard_conn(pool, acquire_bound).await {
-            Ok(mut conn) => {
-                for activity in self.registry.activities.values() {
-                    // A dynamic rate_limit(key = ...) with no rps is an invalid
-                    // declaration that `HarvestBuilder::try_build` rejects. A
-                    // worker built via a direct `HandlerRegistry` bypasses that
-                    // validation; surface it loudly at startup (the enqueue path
-                    // also fails the schedule transaction -- see
-                    // `persist_scheduled_activities`) rather than silently running
-                    // the activity unrated (issue #699 review, Codex P2).
-                    if activity.rate_limit_key_expr.is_some() && activity.rate_limit_rps.is_none() {
-                        tracing::error!(
-                            worker_id = %self.config.worker_id,
-                            activity = %activity.name,
-                            "activity declares a dynamic rate_limit(key = ...) without \
-                             rate_limit_rps; it will fail at schedule time -- add an rps \
-                             or remove the key"
-                        );
-                        continue;
-                    }
-                    let Some(refill_rate) = activity.rate_limit_rps else {
-                        continue;
-                    };
-                    // Dynamic per-key limits (issue #699) register their buckets
-                    // lazily at enqueue time (one per resolved tenant key), so
-                    // there is no single static bucket to pre-register here.
-                    if activity.rate_limit_key_expr.is_some() {
-                        continue;
-                    }
-                    // A static `rate_limit_key` beginning with a reserved
-                    // caller-keyed prefix (`dyn-rate:`, #699; `start-throttle:`,
-                    // #607) reaching a worker via a direct `HandlerRegistry`
-                    // (bypassing the macro reject and
-                    // `HarvestBuilder::try_build`) would collide with the
-                    // generated buckets; since both this registration and the
-                    // lazy enqueue registration use `ON CONFLICT DO NOTHING`,
-                    // the bucket's rate/burst would become insertion-order
-                    // dependent. Worse since issue #1127: the idle-bucket GC
-                    // collects those namespaces on the guarantee that everything
-                    // in them re-registers with the work that needs it, which a
-                    // static key does not. Skip it loudly here, mirroring the
-                    // dynamic-no-rps guard above (issue #699 review, Codex P2).
-                    // The enqueue path also fails the schedule transaction (see
-                    // `persist_scheduled_activities`).
-                    // The EFFECTIVE key, since `rate_limit_key` falls back to
-                    // the activity name below and that is what gets registered
-                    // (issue #1127, Codex review round 1 P2).
-                    let static_key = activity.rate_limit_key.unwrap_or(activity.name);
-                    if let Some(prefix) = crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
-                        .into_iter()
-                        .find(|prefix| static_key.starts_with(prefix))
-                    {
-                        tracing::error!(
-                            worker_id = %self.config.worker_id,
-                            activity = %activity.name,
-                            key = %static_key,
-                            prefix = %prefix,
-                            "activity resolves to a static rate-limit bucket key beginning with \
-                             a reserved caller-keyed prefix; not registering this colliding \
-                             bucket -- rename the activity or its key, or use \
-                             rate_limit(key = ...) for dynamic per-key buckets"
-                        );
-                        continue;
-                    }
-                    let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
-                    let key = activity.rate_limit_key.unwrap_or(activity.name);
-
-                    // Insert rate limit bucket if it doesn't already exist.
-                    // This preserves operator overrides.
-                    if let Err(error) =
-                        queue::ensure_rate_limit_bucket(&mut conn, key, refill_rate, burst).await
-                    {
-                        tracing::warn!(
-                            worker_id = %self.config.worker_id,
-                            key = %key,
-                            error = %error,
-                            "failed to auto-register rate limit bucket; continuing"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "failed to acquire connection for rate limit bucket registration"
-                );
+    /// Register this worker and its rate-limit buckets on each shard in turn.
+    ///
+    /// Each acquire uses the multi-shard startup bound, so a stuck shard does
+    /// not block its peers. Returns each shard's fleet-registration pending
+    /// flag, and a retry guard for each shard whose bucket registration did
+    /// not complete (issue #1788). A dropped guard stops its retry.
+    async fn register_shards(
+        &self,
+        shard_targets: &[(crate::types::ShardId, DbPool)],
+    ) -> (Vec<Arc<AtomicBool>>, Vec<AbortOnDrop>) {
+        let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
+        let mut registration_pending_per_shard = Vec::with_capacity(shard_targets.len());
+        let mut bucket_retries = Vec::new();
+        for (_, shard_pool) in shard_targets {
+            registration_pending_per_shard.push(Arc::new(AtomicBool::new(
+                self.register_in_fleet(shard_pool, startup_bound).await,
+            )));
+            if !self
+                .register_rate_limit_buckets(shard_pool, startup_bound)
+                .await
+            {
+                bucket_retries.push(self.spawn_rate_limit_bucket_retry(shard_pool, startup_bound));
             }
         }
+        (registration_pending_per_shard, bucket_retries)
+    }
+
+    /// Auto-upsert rate-limiting buckets for activities registered on this worker.
+    ///
+    /// Returns `false` when a bucket may be missing: the acquire failed, or a
+    /// bucket write failed. The claim gate fails closed on a missing bucket,
+    /// so the caller retries (issue #1788). An invalid declaration counts as
+    /// done, because a retry cannot fix it.
+    async fn register_rate_limit_buckets(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+    ) -> bool {
+        register_static_rate_limit_buckets(
+            pool,
+            acquire_bound,
+            &self.registry,
+            &self.config.worker_id,
+        )
+        .await
+    }
+
+    /// Retry [`Self::register_rate_limit_buckets`] in the background until it
+    /// completes (issue #1788).
+    ///
+    /// The retry runs every `worker_heartbeat_interval` and stops at shutdown.
+    /// Without it, a pool outage at startup leaves a static bucket missing, and
+    /// its activity never runs until the worker restarts.
+    fn spawn_rate_limit_bucket_retry(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+    ) -> AbortOnDrop {
+        let pool = pool.clone();
+        let registry = Arc::clone(&self.registry);
+        let worker_id = self.config.worker_id.clone();
+        let interval = self.config.worker_heartbeat_interval;
+        let cancel = self.shutdown.clone();
+        AbortOnDrop::new(tokio::spawn(async move {
+            retry_until_done(interval, cancel, || {
+                let pool = pool.clone();
+                let registry = Arc::clone(&registry);
+                let worker_id = worker_id.clone();
+                async move {
+                    let done = register_static_rate_limit_buckets(
+                        &pool,
+                        acquire_bound,
+                        &registry,
+                        &worker_id,
+                    )
+                    .await;
+                    if done {
+                        tracing::info!(
+                            worker_id = %worker_id,
+                            "registered the rate limit buckets on a retry"
+                        );
+                    }
+                    done
+                }
+            })
+            .await;
+        }))
     }
 
     /// Release the sticky pins of this worker on one pool (issue #1798).
@@ -31793,7 +32983,7 @@ impl Worker {
     /// Transition this worker's status in the fleet table.
     ///
     /// `acquire_bound` follows `shard_acquire_bound`. `None` on the
-    /// single-shard path keeps the wait unbounded, byte-for-byte. `Some(_)`
+    /// single-shard path uses the pool's own bound (issue #1788). `Some(_)`
     /// applies during multi-shard shutdown. That sequence visits shards
     /// sequentially, so one exhausted shard pool must not park the others'
     /// Draining/Stopped writes (issue #1209).
@@ -31888,11 +33078,12 @@ impl Worker {
     /// `false` when no permit is free, no task is claimable, or the claim
     /// fails. The caller then waits (issue #1787).
     ///
-    /// `acquire_bound` optionally caps the pool acquisition. It is `None` on
-    /// the single-shard path (byte-for-byte the original unbounded
-    /// `pool.get().await`) and `Some(poll_interval)` when one loop drains
-    /// several shards in sequence, so an exhausted pool on one shard cannot
-    /// park the loop and strand its peers -- see `shard_acquire_bound`.
+    /// `acquire_bound` caps the pool acquisition. `None` on the single-shard
+    /// path uses the pool's own bound (issue #1788). `Some(poll_interval)`
+    /// applies when one loop drains several shards in sequence, so an
+    /// exhausted pool on one shard cannot park the loop and strand its peers.
+    /// See `shard_acquire_bound`. A timeout increments
+    /// `harvest.db.pool_acquire_timeout{site="claim"}`.
     // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
     // across the claim on purpose (issue #1787). An earlier drop would let a
     // slot tuner shrink take the permit of a row this poll then claims.
@@ -31923,6 +33114,12 @@ impl Worker {
         let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
             Err(e) => {
+                if e.is_pool_acquire_timeout() {
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_db_pool_acquire_timeout(SITE_CLAIM);
+                }
                 tracing::error!(error = %e, "failed to get connection from pool");
                 return false;
             }
@@ -32104,6 +33301,7 @@ impl Worker {
             ClaimedTaskKind::Activity => self.activity_permit_wait_micros.clone(),
         };
         let session_slots_in_use = Arc::clone(&self.session_slots_in_use);
+        let shutdown = self.shutdown.clone();
         let max_concurrent_sessions = self.config.max_concurrent_sessions;
         let capacity_freed = Arc::clone(&self.capacity_freed);
         // The row waited in `PENDING` from eligibility to claim. Database
@@ -32280,6 +33478,7 @@ impl Worker {
                     dispatched_at,
                     max_concurrent_sessions,
                     &session_slots_in_use,
+                    &shutdown,
                     Arc::clone(&panic_strikes),
                     workflow_panic_max_attempts,
                     Arc::clone(&deadlock_strikes),
@@ -32442,16 +33641,19 @@ impl Worker {
                                 // async DB call so a concurrent reclaim
                                 // doesn't double-quarantine.
                                 if let Some(exec_id) = exec_id_for_timeout {
-                                    timeout_strikes
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .remove(&exec_id);
+                                    begin_quarantine_strikes(
+                                        &mut timeout_strikes
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                                        exec_id,
+                                    );
                                 }
-                                quarantine_workflow_task_timeout(
+                                let quarantined = quarantine_workflow_task_timeout(
                                     &pool,
                                     task_id,
                                     exec_id_for_timeout,
                                     &worker_id,
+                                    claim_attempt,
                                     new_strikes,
                                     timeout_secs,
                                     &workflow_name_str,
@@ -32463,6 +33665,19 @@ impl Worker {
                                     telemetry.payload_codecs(),
                                 )
                                 .await;
+                                // No commit: put the strikes back so the next
+                                // timeout quarantines at once, unless a newer
+                                // dispatch touched them (issue #1788).
+                                if let Some(exec_id) = exec_id_for_timeout {
+                                    settle_quarantine_strikes(
+                                        &mut timeout_strikes
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                                        exec_id,
+                                        quarantined,
+                                        new_strikes,
+                                    );
+                                }
                             }
                             crate::poison_pill::ReclaimAction::Requeue => {
                                 // Reset the task to PENDING so any worker can
@@ -32497,6 +33712,7 @@ impl Worker {
                     dispatched_at,
                     max_concurrent_sessions,
                     &session_slots_in_use,
+                    &shutdown,
                     panic_strikes,
                     workflow_panic_max_attempts,
                     deadlock_strikes,
@@ -32525,13 +33741,15 @@ impl Worker {
                     // task on that path met the same abandoned claim, so the
                     // recovery cannot live only in the timed arm.
                     //
-                    // An activity task needs nothing here. Its `heartbeat_timeout`
-                    // and `start_to_close` columns give the server-side scan in
-                    // `timeout::find_timed_out_tasks` a deadline to find it by. A
-                    // workflow task has no such column, which is why only its
-                    // claim strands.
+                    // An activity task usually needs nothing here. Its
+                    // `heartbeat_timeout` and `start_to_close` columns give the
+                    // server-side scan in `timeout::find_timed_out_tasks` a
+                    // deadline to find it by. A workflow task has no such
+                    // column, which is why its claim strands. An activity with
+                    // all deadlines unset strands too after a pool acquire
+                    // timeout (issue #1788). See `releases_claim_after_error`.
                     #[cfg(feature = "db")]
-                    if task_type == "workflow" {
+                    if releases_claim_after_error(&task_type, &error) {
                         drop(permit);
                         reset_timed_out_workflow_task(
                             &pool,
@@ -32689,7 +33907,7 @@ async fn workflow_task_timeout_metric_names(
     let Some(exec_uuid) = exec_id else {
         return ("unknown".to_string(), "default".to_string());
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
         return ("unknown".to_string(), "default".to_string());
     };
     dsl::harvest_workflow_executions
@@ -32707,12 +33925,21 @@ async fn workflow_task_timeout_metric_names(
 ///
 /// Called when the consecutive in-memory timeout counter reaches
 /// `poison_pill_threshold` (issue #494). Errors are logged and swallowed.
+///
+/// Returns `false` when the quarantine did not commit: no pool connection, or
+/// the transaction rolled back. The caller then keeps the strike count, so the
+/// next timeout tries the quarantine again.
+///
+/// The write is fenced on the claim `(worker_id, attempt)`. The acquire can
+/// retry for longer than the stuck-running backstop. A peer can then hold a
+/// new claim, and its run must not fail. A lost claim also returns `false`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn quarantine_workflow_task_timeout(
     pool: &DbPool,
     task_id: uuid::Uuid,
     exec_id_opt: Option<uuid::Uuid>,
     worker_id: &str,
+    attempt: i32,
     new_strikes: i32,
     timeout_secs: u64,
     workflow_name: &str,
@@ -32721,12 +33948,15 @@ pub async fn quarantine_workflow_task_timeout(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) {
+) -> bool {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
     use diesel::BoolExpressionMethods;
 
-    let mut conn = match pool.get().await {
+    // Retry the acquire (issue #1788). The caller already cleared the strike
+    // count. A lost quarantine would let the poison workflow run up the whole
+    // threshold again, so the caller restores the count when this is false.
+    let mut conn = match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(
@@ -32734,7 +33964,7 @@ pub async fn quarantine_workflow_task_timeout(
                 error = %e,
                 "workflow task timeout quarantine: pool exhausted"
             );
-            return;
+            return false;
         }
     };
 
@@ -32744,16 +33974,32 @@ pub async fn quarantine_workflow_task_timeout(
     };
     let error_msg = reason.to_string();
 
+    // A failed lookup is not a missing row (issue #1788). A session timeout
+    // can cancel it. Treated as missing, the execution lookup would skip the
+    // workflow's terminal transition. So report failure, and the caller keeps
+    // the strike count.
+    let lookup_failed = |error: &diesel::result::Error| {
+        tracing::error!(
+            task_id = %task_id,
+            error = %error,
+            "workflow task timeout quarantine: lookup failed"
+        );
+    };
+
     // Fetch the task row's input + attempt for the DLQ entry.
-    let (input, attempts) = task_dsl::harvest_task_queue
+    let task_row = task_dsl::harvest_task_queue
         .find(task_id)
         .select((task_dsl::input, task_dsl::attempt))
         .first::<(serde_json::Value, i32)>(&mut conn)
         .await
-        .optional()
-        .ok()
-        .flatten()
-        .unwrap_or((serde_json::Value::Null, 1));
+        .optional();
+    let (input, attempts) = match task_row {
+        Ok(row) => row.unwrap_or((serde_json::Value::Null, 1)),
+        Err(error) => {
+            lookup_failed(&error);
+            return false;
+        }
+    };
 
     // Fetch owner/severity/parent_id from the execution row for the DLQ
     // entry and parent notification.  Also record whether the execution row
@@ -32789,9 +34035,14 @@ pub async fn quarantine_workflow_task_timeout(
                     Option<String>,
                 )>(&mut conn)
                 .await
-                .optional()
-                .ok()
-                .flatten();
+                .optional();
+            let res = match res {
+                Ok(row) => row,
+                Err(error) => {
+                    lookup_failed(&error);
+                    return false;
+                }
+            };
             match res {
                 Some((o, s, p, pcp, wid, sched_id, orig)) => {
                     exec_exists = true;
@@ -32821,15 +34072,21 @@ pub async fn quarantine_workflow_task_timeout(
         severity,
     };
 
-    let result = Box::pin(conn.transaction::<(
+    let claim = queue::TaskClaim::new(task_id, worker_id, attempt);
+    let result = Box::pin(conn.transaction::<Option<(
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Option<String>,
         Vec<(ExecutionId, String)>,
         Vec<crate::execution::StartCancelledRun>,
-    ), HarvestError, _>(async |conn| {
+    )>, HarvestError, _>(async |conn| {
         let error_msg = error_msg.clone();
         let entry = entry.clone();
         let worker_id = worker_id.to_string();
+        // `fail_task` below has no fence. The row lock keeps the claim current
+        // until this transaction ends.
+        if let queue::ClaimLock::Lost { .. } = queue::lock_claim_for_update(conn, &claim).await? {
+            return Ok(None);
+        }
         dlq::dead_letter(conn, &entry).await?;
         queue::fail_task(conn, task_id, &error_msg).await?;
 
@@ -32977,17 +34234,26 @@ pub async fn quarantine_workflow_task_timeout(
                 (Vec::new(), None, Vec::new(), Vec::new())
             };
 
-        Ok((
+        Ok(Some((
             deferred,
             queue_used,
             closed_children,
             pending_cancel_metrics,
-        ))
+        )))
     }))
     .await;
 
     match result {
-        Ok((deferred_starts, queue_used, closed_children, pending_cancel_metrics)) => {
+        Ok(None) => {
+            tracing::warn!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                attempt,
+                "workflow task timeout quarantine: claim lost; a peer owns the task"
+            );
+            return false;
+        }
+        Ok(Some((deferred_starts, queue_used, closed_children, pending_cancel_metrics))) => {
             // issue #1197, item 1: emitted only now that this transaction has
             // actually committed.
             crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
@@ -33043,8 +34309,24 @@ pub async fn quarantine_workflow_task_timeout(
                 error = %e,
                 "workflow task timeout quarantine: transaction failed"
             );
+            return false;
         }
     }
+    true
+}
+
+/// Whether the dispatch error path releases the claim after `error`.
+///
+/// A workflow task has no deadline column, so its claim is always released.
+/// An activity can have every deadline unset. After a pool acquire failure or
+/// a session timeout (issue #1788) no scanner would then find it, and the
+/// orphan reclaimer skips a live worker. Release it too. The handler may
+/// already have run, so the activity can run again. That is the
+/// at-least-once contract a crash gives as well. Another database error is
+/// not released: it may repeat, and a release would skip the retry policy.
+fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
+    task_type == "workflow"
+        || (task_type == "activity" && crate::pool::is_transient_db_error(error))
 }
 
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
@@ -33069,6 +34351,9 @@ const RESET_POOL_RETRY_BACKOFF_MS: &[u64] =
 /// re-claim it on the next poll cycle without waiting for the orphan-reclaim
 /// staleness window (issue #494).
 ///
+/// The reset applies to any task row. It also releases an activity claim
+/// after a pool acquire timeout (issue #1788).
+///
 /// Uses an optimistic `WHERE state = 'RUNNING' AND worker_id = …` guard so a
 /// concurrent reclaim or a different worker that somehow picked it up does not
 /// get its state overwritten.
@@ -33081,132 +34366,138 @@ pub async fn reset_timed_out_workflow_task(
 ) {
     use crate::schema::harvest_task_queue::dsl;
 
-    // Retry acquiring a pool connection: a transient pool saturation during
-    // timeout handling would otherwise leave the task stuck in RUNNING on a
-    // live worker (the orphan reclaimer skips tasks owned by live workers).
-    let mut conn = {
-        let mut last_err = None;
-        let backoff_ms: &[u64] = RESET_POOL_RETRY_BACKOFF_MS;
-        let mut result = None;
-        for &delay_ms in backoff_ms {
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            match pool.get().await {
-                Ok(c) => {
-                    result = Some(c);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        worker_id = %worker_id,
-                        error = %e,
-                        "workflow task timeout reset: pool unavailable, retrying"
-                    );
-                    last_err = Some(e);
-                }
-            }
+    // Retry both the pool acquire and the release write. Without the retry, a
+    // short pool saturation leaves the task stuck in RUNNING on a live worker.
+    // The orphan reclaimer skips tasks owned by live workers. Any write error
+    // retries (issue #1788): a session `lock_timeout`, often the same lock that
+    // stopped the activity's own result write, or a dropped connection. The
+    // write is one claim-fenced statement, so a repeat is safe.
+    let mut last_err = None;
+    for &delay_ms in RESET_POOL_RETRY_BACKOFF_MS {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        if let Some(c) = result {
-            c
-        } else {
-            tracing::error!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                error = ?last_err,
-                "workflow task timeout reset: pool exhausted after retries; \
-                 task may be stuck RUNNING until worker stops"
-            );
-            return;
-        }
-    };
-    match diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::worker_id.eq(worker_id))
-            // Claim-epoch guard (issue #1459). It is the same race
-            // `queue::release_task_for_capability_miss` already guards.
-            // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
-            // with `crash_strikes + 1`, and the same worker can win it again.
-            // A `(state, worker_id)` guard alone then matches that new claim.
-            // This reset would re-`PENDING` a row whose replacement handler
-            // already runs, and invite a second concurrent dispatch.
+        let mut conn = match crate::pool::acquire_within_pool_bound(pool).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    worker_id = %worker_id,
+                    error = %e,
+                    "workflow task timeout reset: pool unavailable, retrying"
+                );
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let written = diesel::update(
+            dsl::harvest_task_queue
+                .find(task_id)
+                .filter(dsl::state.eq("RUNNING"))
+                .filter(dsl::worker_id.eq(worker_id))
+                // Claim-epoch guard (issue #1459). It is the same race
+                // `queue::release_task_for_capability_miss` already guards.
+                // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
+                // with `crash_strikes + 1`, and the same worker can win it again.
+                // A `(state, worker_id)` guard alone then matches that new claim.
+                // This reset would re-`PENDING` a row whose replacement handler
+                // already runs, and invite a second concurrent dispatch.
+                //
+                // Two discriminators, not one. `crash_strikes` alone is not
+                // enough. `poison_pill::requeue_stuck_task` (issue #1459's
+                // stuck-running backstop) also hands a row back to `PENDING` for
+                // re-claim. It deliberately leaves `crash_strikes` untouched --
+                // being stuck is not a crash. Its re-claim would then still match
+                // on `crash_strikes` alone. This reset must also check `attempt`,
+                // which `claim_task` bumps on every claim without exception.
+                .filter(dsl::crash_strikes.eq(claim_crash_strikes))
+                .filter(dsl::attempt.eq(claim_attempt)),
+        )
+        .set((
+            dsl::state.eq("PENDING"),
+            dsl::worker_id.eq(None::<String>),
+            dsl::started_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            dsl::last_heartbeat_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            // Clear sticky affinity so any worker can reclaim the task immediately
+            // rather than waiting for the expired lease of the hung worker.
+            dsl::sticky_worker_id.eq(None::<String>),
+            dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
+            // `capability_misses` is deliberately NOT reset here (issue #804).
             //
-            // Two discriminators, not one. `crash_strikes` alone is not
-            // enough. `poison_pill::requeue_stuck_task` (issue #1459's
-            // stuck-running backstop) also hands a row back to `PENDING` for
-            // re-claim. It deliberately leaves `crash_strikes` untouched --
-            // being stuck is not a crash. Its re-claim would then still match
-            // on `crash_strikes` alone. This reset must also check `attempt`,
-            // which `claim_task` bumps on every claim without exception.
-            .filter(dsl::crash_strikes.eq(claim_crash_strikes))
-            .filter(dsl::attempt.eq(claim_attempt)),
-    )
-    .set((
-        dsl::state.eq("PENDING"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-        // Clear sticky affinity so any worker can reclaim the task immediately
-        // rather than waiting for the expired lease of the hung worker.
-        dsl::sticky_worker_id.eq(None::<String>),
-        dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
-        // `capability_misses` is deliberately NOT reset here (issue #804).
-        //
-        // It is tempting to: a workflow-task timeout usually means the handler
-        // was found and ran long, which would be proof of capability. But that
-        // premise does not hold on this path. The timeout is armed around the
-        // whole of `process_task`, and `pool.get()` plus the full history load
-        // both sit inside it — strictly *before* the registry lookup that
-        // defines a capability miss. Under pool starvation or a slow shard the
-        // budget expires with the lookup never having run, so reaching here
-        // proves nothing about the claiming worker.
-        //
-        // Resetting on that false premise is the worse error of the two: a
-        // genuinely unregistered type under load would have its consecutive-miss
-        // streak zeroed indefinitely and never escalate, so the run never
-        // reaches the `no_capable_worker:` terminal AC3 promises and the
-        // operator sees only the ticket-severity sustained-release rule instead
-        // of the page. It also erases an in-flight miss when the release UPDATE
-        // itself is what timed out.
-        //
-        // Accepted cost: a capable-but-slow worker's timeout leaves a stale
-        // streak, so a later genuine miss can escalate before spending the full
-        // budget. That direction is fail-safe — it produces a loud, actionable
-        // terminal failure rather than a silently un-escalating task — and the
-        // two `park_workflow_task` queries already cover the dominant
-        // proof-of-capability path (the handler ran and suspended).
-    ))
-    .execute(&mut conn)
-    .await
-    {
-        Ok(n) if n > 0 => {
-            // Dispatch hint (issue #1312). The row is `PENDING` again with no
-            // owner, so the channel gets a reference to it.
-            crate::queue::record_pending_hints(&mut conn, &[task_id]).await;
-            tracing::debug!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                "reset timed-out workflow task to PENDING"
-            );
+            // It is tempting to: a workflow-task timeout usually means the handler
+            // was found and ran long, which would be proof of capability. But that
+            // premise does not hold on this path. The timeout is armed around the
+            // whole of `process_task`, and `pool.get()` plus the full history load
+            // both sit inside it — strictly *before* the registry lookup that
+            // defines a capability miss. Under pool starvation or a slow shard the
+            // budget expires with the lookup never having run, so reaching here
+            // proves nothing about the claiming worker.
+            //
+            // Resetting on that false premise is the worse error of the two: a
+            // genuinely unregistered type under load would have its consecutive-miss
+            // streak zeroed indefinitely and never escalate, so the run never
+            // reaches the `no_capable_worker:` terminal AC3 promises and the
+            // operator sees only the ticket-severity sustained-release rule instead
+            // of the page. It also erases an in-flight miss when the release UPDATE
+            // itself is what timed out.
+            //
+            // Accepted cost: a capable-but-slow worker's timeout leaves a stale
+            // streak, so a later genuine miss can escalate before spending the full
+            // budget. That direction is fail-safe — it produces a loud, actionable
+            // terminal failure rather than a silently un-escalating task — and the
+            // two `park_workflow_task` queries already cover the dominant
+            // proof-of-capability path (the handler ran and suspended).
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(crate::error::database_error);
+        match written {
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    worker_id = %worker_id,
+                    error = %e,
+                    "workflow task timeout reset: write failed, retrying"
+                );
+                last_err = Some(e);
+            }
+            Ok(updated) => {
+                log_claim_reset_outcome(&mut conn, task_id, worker_id, updated).await;
+                return;
+            }
         }
-        Ok(_) => {
-            tracing::debug!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                "timed-out workflow task already reclaimed or transitioned"
-            );
-        }
-        Err(e) => {
-            tracing::error!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                error = %e,
-                "failed to reset timed-out workflow task to PENDING"
-            );
-        }
+    }
+    tracing::error!(
+        task_id = %task_id,
+        worker_id = %worker_id,
+        error = ?last_err,
+        "workflow task timeout reset: retries exhausted; \
+         task may be stuck RUNNING until worker stops"
+    );
+}
+
+/// Log the result of the claim reset in [`reset_timed_out_workflow_task`].
+async fn log_claim_reset_outcome(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    updated: usize,
+) {
+    if updated > 0 {
+        // Dispatch hint (issue #1312). The row is `PENDING` again with no
+        // owner, so the channel gets a reference to it.
+        crate::queue::record_pending_hints(conn, &[task_id]).await;
+        tracing::debug!(
+            task_id = %task_id,
+            worker_id = %worker_id,
+            "reset timed-out workflow task to PENDING"
+        );
+    } else {
+        tracing::debug!(
+            task_id = %task_id,
+            worker_id = %worker_id,
+            "timed-out workflow task already reclaimed or transitioned"
+        );
     }
 }
 
@@ -36174,10 +37465,11 @@ mod tests {
         );
     }
 
-    /// The multi-shard loop bounds its pool acquisition; the single-shard path
-    /// stays unbounded, byte-for-byte (issue #961 review, Codex P1 / AC7).
+    /// The multi-shard loop floors its bound at `MIN_SHARD_ACQUIRE_BOUND`.
+    /// The single-shard path passes `None`, which uses the pool's own bound
+    /// (issue #1788).
     #[test]
-    fn shard_acquire_bound_is_multi_shard_only() {
+    fn shard_acquire_bound_floors_only_the_multi_shard_path() {
         // Below the floor -> floored. A poll interval is tuned for idle polling
         // cadence, not for how long a healthy acquisition takes on a busy pool;
         // using it directly starved a shard that merely had a deep backlog.
@@ -36199,19 +37491,472 @@ mod tests {
             "a slow loop should not be bounded tighter than its own cadence",
         );
 
-        // AC7: the single-shard path keeps the original unbounded acquisition
-        // at every cadence.
+        // The single-shard path defers to the pool bound at every cadence.
         for interval in [
             Duration::from_millis(50),
             Duration::from_millis(500),
             Duration::from_secs(60),
         ] {
-            assert_eq!(
-                shard_acquire_bound(false, interval),
-                None,
-                "the single-shard path must keep the original unbounded pool.get().await",
-            );
+            assert_eq!(shard_acquire_bound(false, interval), None);
         }
+    }
+
+    /// An activity whose claim hit a pool acquire timeout goes back to the
+    /// queue. Its deadlines may all be unset, so no scanner would ever find it
+    /// (issue #1788). A workflow task is always released, as before.
+    #[test]
+    fn a_pool_acquire_timeout_releases_an_activity_claim() {
+        let timeout = crate::error::HarvestError::PoolAcquireTimeout {
+            waited: Duration::from_secs(30),
+        };
+        let other = crate::error::HarvestError::Database("boom".into());
+        let session_timeout =
+            crate::error::HarvestError::Database("canceling statement due to lock timeout".into());
+        assert!(releases_claim_after_error("activity", &timeout));
+        assert!(
+            releases_claim_after_error("activity", &session_timeout),
+            "a result write that used up its session-timeout retries must not strand"
+        );
+        let refused = crate::error::HarvestError::PoolAcquireFailed {
+            reason: "connection refused".into(),
+        };
+        assert!(releases_claim_after_error("activity", &refused));
+        assert!(!releases_claim_after_error("activity", &other));
+        assert!(releases_claim_after_error("workflow", &timeout));
+        assert!(releases_claim_after_error("workflow", &other));
+    }
+
+    /// A setup error after `on_dispatch` admitted the half-open probe must
+    /// release the probe. Otherwise every later dispatch short-circuits and
+    /// the breaker never recovers (issue #1788).
+    #[test]
+    fn a_setup_error_releases_the_half_open_probe() {
+        use crate::circuit_breaker::{AttemptOutcome, CircuitBreakerRegistry, DispatchDecision};
+        use crate::policy::CircuitBreakerPolicy;
+        let mut policies = HashMap::new();
+        policies.insert(
+            "send_email".to_owned(),
+            CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60)),
+        );
+        let reg = CircuitBreakerRegistry::new(policies);
+        let allow = |now| match reg.on_dispatch("send_email", now) {
+            DispatchDecision::Allow { token } => token,
+            DispatchDecision::ShortCircuit { .. } => panic!("expected Allow"),
+        };
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            let token = allow(t0);
+            reg.on_result("send_email", AttemptOutcome::RetryableFailure, token, t0);
+        }
+        let probe_time = t0 + Duration::from_secs(61);
+        let probe = allow(probe_time);
+        assert!(probe.is_probe());
+
+        let error = release_probe_on_error(
+            &reg,
+            "send_email",
+            Some(probe),
+            HarvestError::PoolAcquireTimeout {
+                waited: Duration::from_secs(30),
+            },
+        );
+        assert!(error.is_pool_acquire_timeout(), "the error passes through");
+
+        let next = allow(probe_time + Duration::from_secs(61));
+        assert!(next.is_probe(), "a released probe lets a fresh probe in");
+    }
+
+    /// A finalization that cannot read the retry policy releases the half-open
+    /// probe (issue #1788). The handler already ran, but its outcome reaches
+    /// the breaker only after this read. Without the release, every later
+    /// dispatch short-circuits, even after the database recovers.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_finalization_read_releases_the_half_open_probe() {
+        use crate::circuit_breaker::{AttemptOutcome, CircuitBreakerRegistry, DispatchDecision};
+        use crate::policy::CircuitBreakerPolicy;
+        let mut policies = HashMap::new();
+        policies.insert(
+            "send_email".to_owned(),
+            CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60)),
+        );
+        let reg = CircuitBreakerRegistry::new(policies);
+        let allow = |now| match reg.on_dispatch("send_email", now) {
+            DispatchDecision::Allow { token } => token,
+            DispatchDecision::ShortCircuit { .. } => panic!("expected Allow"),
+        };
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            let token = allow(t0);
+            reg.on_result("send_email", AttemptOutcome::RetryableFailure, token, t0);
+        }
+        let probe_time = t0 + Duration::from_secs(61);
+        let probe = allow(probe_time);
+        assert!(probe.is_probe());
+
+        // A policy that does not parse needs a write, and the pool has no
+        // connection to give.
+        let task = TaskQueueItem {
+            retry_policy: Some(serde_json::json!("not a retry policy")),
+            ..retry_after_test_task(1, 5)
+        };
+        let pool = unreachable_pool("postgres://127.0.0.1:1/finalize");
+        finalization_retry_policy(
+            &pool,
+            &task,
+            "w-1",
+            &crate::payload_codec::PayloadCodecs::default(),
+            &reg,
+            "send_email",
+            Some(probe),
+        )
+        .await
+        .expect_err("no connection, so the read fails");
+
+        let next = allow(probe_time + Duration::from_secs(61));
+        assert!(next.is_probe(), "a released probe lets a fresh probe in");
+    }
+
+    /// A re-check does not release a slot while an acquire of it runs (issue
+    /// #1788). That acquire settles the slot itself.
+    #[test]
+    fn a_recheck_keeps_a_slot_that_an_acquire_holds() {
+        let registry = crate::sessions::new_session_slot_registry();
+        let session_id = crate::types::SessionId::new();
+        assert!(crate::sessions::try_acquire_session_slot(
+            &registry, 4, session_id
+        ));
+        let hold = SessionAcquireHold::begin(&registry, session_id).expect("no re-check runs");
+        release_session_slot_unless_acquiring(&registry, session_id);
+        assert_eq!(crate::sessions::session_slot_count(&registry), 1);
+        drop(hold);
+        release_session_slot_unless_acquiring(&registry, session_id);
+        assert_eq!(crate::sessions::session_slot_count(&registry), 0);
+    }
+
+    /// An acquire does not begin while a re-check of its slot runs, and a
+    /// failed acquire turns into a re-check in one step (issue #1788).
+    #[test]
+    fn an_acquire_waits_for_a_recheck_and_becomes_one() {
+        let registry = crate::sessions::new_session_slot_registry();
+        let session_id = crate::types::SessionId::new();
+        let recheck = RecheckedSessionSlot::mark(&registry, session_id);
+        assert!(SessionAcquireHold::begin(&registry, session_id).is_none());
+        drop(recheck);
+        let hold = SessionAcquireHold::begin(&registry, session_id).expect("the re-check ended");
+        let recheck = hold.into_recheck();
+        assert!(session_slot_rechecked(&registry, session_id));
+        assert!(SessionAcquireHold::begin(&registry, session_id).is_none());
+        drop(recheck);
+        assert!(!session_slot_rechecked(&registry, session_id));
+    }
+
+    /// Two overlapping re-checks of one slot keep the mark until both end
+    /// (issue #1788). The first to end must not clear the other's mark.
+    #[test]
+    fn an_overlapping_recheck_keeps_the_slot_marked() {
+        let registry = crate::sessions::new_session_slot_registry();
+        let session_id = crate::types::SessionId::new();
+        let first = RecheckedSessionSlot::mark(&registry, session_id);
+        let second = RecheckedSessionSlot::mark(&registry, session_id);
+        drop(first);
+        assert!(session_slot_rechecked(&registry, session_id));
+        drop(second);
+        assert!(!session_slot_rechecked(&registry, session_id));
+    }
+
+    /// A quarantine that cannot reach the pool reports it, so the caller can
+    /// keep the strike count (issue #1788).
+    #[tokio::test]
+    async fn a_quarantine_without_a_connection_reports_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let bound = Duration::from_millis(50);
+        let pool = crate::pool::engine_pool(
+            format!("postgres://silent@{addr}/silent"),
+            1,
+            crate::pool::DbRole::Hot,
+            &crate::pool::EngineDbTimeouts {
+                pool: crate::pool::PoolTimeouts {
+                    wait: bound,
+                    create: bound,
+                    recycle: bound,
+                },
+                ..crate::pool::EngineDbTimeouts::default()
+            },
+        )
+        .expect("pool builds without connecting");
+
+        let reached = tokio::time::timeout(
+            Duration::from_secs(10),
+            quarantine_workflow_task_timeout(
+                &pool,
+                uuid::Uuid::new_v4(),
+                None,
+                "w-1",
+                1,
+                3,
+                10,
+                "wf",
+                "default",
+                &crate::telemetry::NoOpMetrics,
+                &crate::payload_codec::PayloadCodecs::default(),
+            ),
+        )
+        .await
+        .expect("the quarantine must give up within its retries");
+        assert!(
+            !reached,
+            "a quarantine with no connection must report failure"
+        );
+    }
+
+    #[derive(Default)]
+    struct PanicSink(std::sync::Mutex<u32>);
+
+    impl crate::telemetry::MetricsRecorder for PanicSink {
+        fn record_activity_panic(&self, _activity: &str, _queue: &str) {
+            *self.0.lock().expect("lock") += 1;
+        }
+    }
+
+    /// The panic counter fires once per panicking result, outside the result
+    /// write retries (issue #1788).
+    #[test]
+    fn the_panic_metric_counts_only_a_handler_panic() {
+        use crate::failure::IntoActivityErrorString as _;
+        let sink = PanicSink::default();
+        let panic = crate::failure::ActivityFailure::retryable(
+            crate::failure::ERROR_TYPE_HANDLER_PANIC,
+            "boom",
+        )
+        .into_error_payload();
+        record_activity_panic_once(&sink, "act", "default", &Err(panic));
+        record_activity_panic_once(&sink, "act", "default", &Err("plain error".to_owned()));
+        record_activity_panic_once(&sink, "act", "default", &Ok(serde_json::json!({})));
+        assert_eq!(*sink.0.lock().expect("lock"), 1);
+    }
+
+    /// A retry runs again after each failure and stops after a success.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_stops_after_its_first_success() {
+        let runs = std::cell::Cell::new(0_u32);
+        retry_until_done(Duration::from_secs(5), CancellationToken::new(), || {
+            runs.set(runs.get() + 1);
+            let run = runs.get();
+            async move { run == 3 }
+        })
+        .await;
+        assert_eq!(runs.get(), 3);
+    }
+
+    /// Shutdown stops a retry that never succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_a_retry() {
+        let cancel = CancellationToken::new();
+        let retry = tokio::spawn(retry_until_done(
+            Duration::from_secs(5),
+            cancel.clone(),
+            || async { false },
+        ));
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("the retry stops at shutdown")
+            .expect("the retry task joins");
+    }
+
+    /// Shutdown also stops an attempt that is still running.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_a_retry_mid_attempt() {
+        let cancel = CancellationToken::new();
+        let retry = tokio::spawn(retry_until_done(
+            Duration::from_secs(5),
+            cancel.clone(),
+            std::future::pending::<bool>,
+        ));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("the retry stops during its attempt")
+            .expect("the retry task joins");
+    }
+
+    /// A quarantine that does not commit gets its strikes back while no
+    /// newer dispatch touched them (issue #1788).
+    #[test]
+    fn a_failed_quarantine_restores_untouched_strikes() {
+        let exec_id = uuid::Uuid::new_v4();
+        let mut strikes = std::collections::HashMap::new();
+        begin_quarantine_strikes(&mut strikes, exec_id);
+        settle_quarantine_strikes(&mut strikes, exec_id, false, 3);
+        assert_eq!(strikes.get(&exec_id), Some(&3));
+    }
+
+    /// A newer dispatch that succeeds clears the strikes. A late restore must
+    /// not bring them back.
+    #[test]
+    fn a_failed_quarantine_leaves_strikes_that_a_newer_dispatch_cleared() {
+        let exec_id = uuid::Uuid::new_v4();
+        let mut strikes = std::collections::HashMap::new();
+        begin_quarantine_strikes(&mut strikes, exec_id);
+        strikes.remove(&exec_id);
+        settle_quarantine_strikes(&mut strikes, exec_id, false, 3);
+        assert_eq!(strikes.get(&exec_id), None);
+        strikes.insert(exec_id, 1);
+        settle_quarantine_strikes(&mut strikes, exec_id, false, 3);
+        assert_eq!(
+            strikes.get(&exec_id),
+            Some(&1),
+            "a later streak is not inflated"
+        );
+    }
+
+    /// A newer timeout during the quarantine keeps its own count.
+    #[test]
+    fn a_failed_quarantine_leaves_strikes_that_a_newer_timeout_wrote() {
+        let exec_id = uuid::Uuid::new_v4();
+        let mut strikes = std::collections::HashMap::new();
+        begin_quarantine_strikes(&mut strikes, exec_id);
+        *strikes.entry(exec_id).or_insert(0) += 1;
+        settle_quarantine_strikes(&mut strikes, exec_id, false, 3);
+        assert_eq!(strikes.get(&exec_id), Some(&1));
+    }
+
+    /// A quarantine that commits ends the streak.
+    #[test]
+    fn a_committed_quarantine_clears_the_strikes() {
+        let exec_id = uuid::Uuid::new_v4();
+        let mut strikes = std::collections::HashMap::new();
+        begin_quarantine_strikes(&mut strikes, exec_id);
+        settle_quarantine_strikes(&mut strikes, exec_id, true, 3);
+        assert_eq!(strikes.get(&exec_id), None);
+    }
+
+    /// A result write repeats only while it has uploaded no blob (issue
+    /// #1788). A repeat after an upload would leave a blob that no row
+    /// references.
+    #[test]
+    fn an_upload_turns_off_result_write_repeats() {
+        assert!(repeats_result_write(1, false));
+        assert!(repeats_result_write(FINALIZE_ACQUIRE_ATTEMPTS - 1, false));
+        assert!(!repeats_result_write(FINALIZE_ACQUIRE_ATTEMPTS, false));
+        assert!(!repeats_result_write(1, true));
+    }
+
+    #[derive(Default)]
+    struct AcquireTimeoutSink(std::sync::Mutex<Vec<String>>);
+
+    impl crate::telemetry::MetricsRecorder for AcquireTimeoutSink {
+        fn record_db_pool_acquire_timeout(&self, site: &str) {
+            self.0.lock().expect("lock").push(site.to_owned());
+        }
+    }
+
+    /// A single-shard claim on a pool that never yields a connection returns
+    /// within the pool bound and counts the timeout (issue #1788).
+    #[tokio::test]
+    async fn a_single_shard_claim_is_bounded_and_counted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let bound = Duration::from_millis(200);
+        let pool = crate::pool::engine_pool(
+            format!("postgres://silent@{addr}/silent"),
+            1,
+            crate::pool::DbRole::Hot,
+            &crate::pool::EngineDbTimeouts {
+                pool: crate::pool::PoolTimeouts {
+                    wait: bound,
+                    create: bound,
+                    recycle: bound,
+                },
+                ..crate::pool::EngineDbTimeouts::default()
+            },
+        )
+        .expect("pool builds without connecting");
+
+        let sink = Arc::new(AcquireTimeoutSink::default());
+        let telemetry = Arc::new(
+            crate::telemetry::TelemetryConfig::builder()
+                .metrics(Arc::clone(&sink) as Arc<dyn crate::telemetry::MetricsRecorder>)
+                .build(),
+        );
+        let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+            vec![],
+            vec![],
+            crate::context::empty_shared_state(),
+            telemetry,
+        ));
+        let worker = Worker::new(default_runtime_config(), registry).expect("worker builds");
+
+        assert_eq!(crate::pool::acquire_bound(&pool), bound);
+        let claim_bound = shard_acquire_bound(false, worker.config.poll_interval);
+        let started = std::time::Instant::now();
+        let claimed = tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.poll_once(&pool, claim_bound, None),
+        )
+        .await
+        .expect("a claim must not hang past the pool bound");
+        assert!(!claimed);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(*sink.0.lock().expect("lock"), vec!["claim".to_owned()]);
+    }
+
+    /// A pool with no deadpool timeouts still bounds the claim. The bound is
+    /// `DEFAULT_ACQUIRE_TIMEOUT`. A paused clock skips the 30 s wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_on_a_pool_without_timeouts_uses_the_default_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(format!("postgres://silent@{addr}/silent"));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        assert_eq!(pool.timeouts().wait, None);
+
+        let sink = Arc::new(AcquireTimeoutSink::default());
+        let telemetry = Arc::new(
+            crate::telemetry::TelemetryConfig::builder()
+                .metrics(Arc::clone(&sink) as Arc<dyn crate::telemetry::MetricsRecorder>)
+                .build(),
+        );
+        let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+            vec![],
+            vec![],
+            crate::context::empty_shared_state(),
+            telemetry,
+        ));
+        let worker = Worker::new(default_runtime_config(), registry).expect("worker builds");
+
+        let started = tokio::time::Instant::now();
+        let claimed = tokio::time::timeout(
+            Duration::from_secs(120),
+            worker.poll_once(
+                &pool,
+                shard_acquire_bound(false, worker.config.poll_interval),
+                None,
+            ),
+        )
+        .await
+        .expect("a claim must not wait without limit");
+        assert!(!claimed);
+        assert!(started.elapsed() >= crate::pool::DEFAULT_ACQUIRE_TIMEOUT);
+        assert_eq!(*sink.0.lock().expect("lock"), vec!["claim".to_owned()]);
     }
 
     /// The single-pool entrypoint refuses a multi-shard config, and only when

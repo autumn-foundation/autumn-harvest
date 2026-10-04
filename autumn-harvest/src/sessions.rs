@@ -382,7 +382,7 @@ pub fn spawn_session_slot_reconciler(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            // Selected against `cancel` (issue #1426). Harvest configures no
+            // Selected against `cancel` (issue #1426). A pool may have no
             // deadpool `Timeouts`, so `pool.get()` alone can park this task
             // indefinitely on an exhausted shard pool. The top-of-loop select
             // only guards the sleep between ticks. A tick already parked
