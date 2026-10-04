@@ -1456,6 +1456,15 @@ pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 /// `docs/operations/postgres-timeouts.md`.
 pub const METRIC_DB_POOL_ACQUIRE_TIMEOUT: &str = "harvest.db.pool_acquire_timeout";
 
+/// Counter: Postgres aborted a transaction and the engine ran it again
+/// (issue #1822).
+///
+/// Labelled `{site, reason}`. `site` is `persist`, `claim` or `scanner`.
+/// `reason` is `deadlock` (`40P01`) or `serialization_failure` (`40001`).
+/// A steady `deadlock` rate points to a lock-order defect. See the lock-order
+/// table in `docs/architecture.md`.
+pub const METRIC_DB_TRANSACTION_RETRY: &str = "harvest.db.transaction_retry";
+
 /// Counter: an activity heartbeat flush failed (issue #1788).
 ///
 /// Labelled `{reason}`: `acquire_timeout`, `acquire_error` or `write_error`.
@@ -2748,6 +2757,15 @@ pub trait MetricsRecorder: Send + Sync {
     /// `site` is `claim` or `heartbeat_flush`. Additive with a no-op default.
     fn record_db_pool_acquire_timeout(&self, site: &str) {
         let _ = site;
+    }
+
+    /// Postgres aborted a transaction and the engine runs it again
+    /// (issue #1822).
+    ///
+    /// `site` is `persist`, `claim` or `scanner`. `reason` is `deadlock` or
+    /// `serialization_failure`. Additive with a no-op default.
+    fn record_db_transaction_retry(&self, site: &str, reason: &str) {
+        let _ = (site, reason);
     }
 
     /// An activity heartbeat flush failed (issue #1788).

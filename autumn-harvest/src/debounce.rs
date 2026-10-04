@@ -588,7 +588,7 @@ type FiredDebounce = (
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
-    _metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Vec<FiredDebounce>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
@@ -616,10 +616,20 @@ async fn fire_due_on_conn(
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
     // Deferred trigger-starts are collected and spawned *after* the transaction
     // commits so a rollback can't leave orphaned completion-trigger workflows.
-    let fired: Vec<FiredDebounce> = Box::pin(
-        conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(async |conn| {
-            let now = Utc::now();
-            let due_sql = "
+    //
+    // Issue #1822: a deadlock or serialization abort runs the batch again.
+    // The rollback releases every claimed row, so the next run claims afresh.
+    let fired: Vec<FiredDebounce> = Box::pin(crate::tx_retry::run_with_conflict_retry(
+        conn,
+        crate::tx_retry::SITE_SCANNER,
+        metrics.unwrap_or(&crate::telemetry::NoOpMetrics),
+        crate::tx_retry::TxRetryPolicy::DEFAULT,
+        async |conn| {
+            Box::pin(
+                conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(
+                    async |conn| {
+                        let now = Utc::now();
+                        let due_sql = "
                 SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
                        last_input, start_options, shard_id, max_fire_at
                 FROM harvest_debounce
@@ -629,26 +639,33 @@ async fn fire_due_on_conn(
                 FOR UPDATE SKIP LOCKED
             ";
 
-            let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
-                .bind::<diesel::sql_types::Timestamptz, _>(now)
-                .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
-                .load(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+                        let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
+                            .bind::<diesel::sql_types::Timestamptz, _>(now)
+                            .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
+                            .load(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
 
-            let due_rows =
-                crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(conn, due_rows)
-                    .await?;
+                        let due_rows =
+                            crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(
+                                conn, due_rows,
+                            )
+                            .await?;
 
-            let mut results = Vec::with_capacity(due_rows.len());
-            for row in due_rows {
-                if let Some(item) = fire_claimed_debounce_row(conn, row, codecs).await? {
-                    results.push(item);
-                }
-            }
-            Ok(results)
-        }),
-    )
+                        let mut results = Vec::with_capacity(due_rows.len());
+                        for row in due_rows {
+                            if let Some(item) = fire_claimed_debounce_row(conn, row, codecs).await?
+                            {
+                                results.push(item);
+                            }
+                        }
+                        Ok(results)
+                    },
+                ),
+            )
+            .await
+        },
+    ))
     .await?;
 
     Ok(fired)

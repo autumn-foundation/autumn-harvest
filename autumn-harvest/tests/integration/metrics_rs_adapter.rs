@@ -278,3 +278,22 @@ fn record_retry_budget_exhausted_bridges_counter_with_activity_label() {
     let labels = labels_of(key);
     assert_eq!(labels, vec![("activity", "charge_card")], "issue #1793");
 }
+
+#[test]
+fn record_db_transaction_retry_bridges_counter_with_site_and_reason_labels() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_db_transaction_retry("persist", "deadlock");
+    });
+    let key = find_key(
+        &keys,
+        "harvest.db.transaction_retry",
+        InstrumentKind::Counter,
+    );
+    let mut labels = labels_of(key);
+    labels.sort_unstable();
+    assert_eq!(
+        labels,
+        vec![("reason", "deadlock"), ("site", "persist")],
+        "issue #1822"
+    );
+}

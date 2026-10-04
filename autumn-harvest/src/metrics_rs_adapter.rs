@@ -52,8 +52,8 @@ use crate::telemetry::{
     METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
     METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED,
     METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
-    METRIC_CONNECTOR_RECEIVED, METRIC_DB_POOL_ACQUIRE_TIMEOUT, METRIC_DEBOUNCE_FIRED,
-    METRIC_DISPATCH_DROPPED_HINTS, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
+    METRIC_CONNECTOR_RECEIVED, METRIC_DB_POOL_ACQUIRE_TIMEOUT, METRIC_DB_TRANSACTION_RETRY,
+    METRIC_DEBOUNCE_FIRED, METRIC_DISPATCH_DROPPED_HINTS, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
     METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT, METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
     METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED, METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE,
     METRIC_EXTERNAL_CANCEL_SENT, METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE,
@@ -562,6 +562,16 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_db_pool_acquire_timeout(&self, site: &str) {
         // Bounded label: `site` is `claim` or `heartbeat_flush` (issue #1788).
         counter!(METRIC_DB_POOL_ACQUIRE_TIMEOUT, METRIC_LABEL_SITE => site.to_owned()).increment(1);
+    }
+
+    fn record_db_transaction_retry(&self, site: &str, reason: &str) {
+        // Bounded labels: three sites and two reasons (issue #1822).
+        counter!(
+            METRIC_DB_TRANSACTION_RETRY,
+            METRIC_LABEL_SITE => site.to_owned(),
+            METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(1);
     }
 
     fn record_heartbeat_flush_failed(&self, reason: &str) {

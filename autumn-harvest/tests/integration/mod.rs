@@ -137,6 +137,7 @@ mod idempotency_tests;
 mod integration_e2e;
 mod legal_hold_tests;
 mod lineage_store_tests;
+mod lock_order_docs;
 mod macros_activity;
 mod macros_collect;
 #[cfg(feature = "testing")]
@@ -282,6 +283,8 @@ mod transactional_activity_tests;
 mod transactional_start_tests;
 #[cfg(feature = "db")]
 mod triage_tests;
+#[cfg(feature = "db")]
+mod tx_conflict_retry_tests;
 #[cfg(feature = "db")]
 mod typed_stub_deferred_admission_tests;
 #[cfg(feature = "db")]

@@ -3815,7 +3815,17 @@ async fn persist_external_signal_inline(
     // deliver it, and append the terminal first, leaving the inline path to
     // append the same terminal at a now-stale `next_event_id` — a history write
     // conflict that fails the caller even though delivery succeeded (issue #492).
-    let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = Box::pin(conn
+    // Issue #1822: two workflows that signal each other in one cycle lock
+    // their own row, then the row of the peer. Postgres aborts one side with
+    // `40P01`. The retry runs the whole transaction again, so the victim does
+    // not fail its workflow. Follow-up work runs after the commit, below.
+    // A completion-trigger counter inside an inline cancel can count twice.
+    let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = Box::pin(crate::tx_retry::run_with_conflict_retry(
+        conn,
+        crate::tx_retry::SITE_PERSIST,
+        metrics,
+        crate::tx_retry::TxRetryPolicy::DEFAULT,
+        async |conn| Box::pin(conn
         .transaction::<InlinePersistResult, HarvestError, _>(async |conn| {
             // For await-bearing batches, take the awaiter row `FOR UPDATE`
             // lock and read the TRUE `next_event_id` under it. Whichever of
@@ -3856,7 +3866,7 @@ async fn persist_external_signal_inline(
             let multi_shard_deployment =
                 crate::external_target_location::deployment_is_multi_shard();
 
-            for item in items {
+            for item in items.iter().cloned() {
                 match item {
                     SignalBatchItem::Marker(event) => {
                         store::append_events_with_codecs(conn, exec_id, std::slice::from_ref(&event), next, codecs)
@@ -4257,8 +4267,9 @@ async fn persist_external_signal_inline(
             }
 
             Ok((new_events, next, deferred_starts, cancel_metrics, deferred_checks))
-        }))
-        .await?;
+        })).await,
+    ))
+    .await?;
 
     // The inline batch is durably committed: now spawn trigger/cascade follow-up
     // starts and record terminal metrics for any targets cancelled above.
@@ -24602,6 +24613,18 @@ async fn process_workflow_task(
             // un-failed); a suspended/simple-terminal persist failure
             // (including this one) propagates so the caller can act on it.
             //
+            // Issue #1822: a deadlock or serialization abort rolled the whole
+            // cycle back. Return the error on every path. The dispatcher then
+            // resets the task to `PENDING`, and replay derives the same decision
+            // again. The persist closure records metrics before it commits, so
+            // an in-place re-run would count them twice.
+            if let Some(conflict) = crate::tx_retry::classify_conflict(&error) {
+                registry
+                    .telemetry()
+                    .metrics
+                    .record_db_transaction_retry(crate::tx_retry::SITE_PERSIST, conflict.as_str());
+                return Err(error);
+            }
             // Issue #946, Codex round-3/round-4 review: `persist_terminal_
             // outcome_commands` calls `create_detached_child_executions`
             // directly, so a `QuotaExceeded` from a detached child's target
@@ -31691,18 +31714,22 @@ impl Worker {
         };
 
         let circuit_breakers = self.registry.circuit_breakers();
-        let claimed = queue::claim_task_by_id_on_shard(
-            &mut conn,
-            lease.task_id,
-            &self.config.queues,
-            &self.config.worker_id,
-            &self.config.build_id,
-            self.config.priority_aging_secs,
-            circuit_breakers.tracked_activity_names(),
-            &self.ineligible_activities,
-            shard,
-        )
-        .await;
+        let claimed = self
+            .claim_with_conflict_retry(&mut conn, async |conn| {
+                queue::claim_task_by_id_on_shard(
+                    conn,
+                    lease.task_id,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    self.config.priority_aging_secs,
+                    circuit_breakers.tracked_activity_names(),
+                    &self.ineligible_activities,
+                    shard,
+                )
+                .await
+            })
+            .await;
 
         match claimed {
             Ok(Some(task)) => {
@@ -32641,6 +32668,34 @@ impl Worker {
         }
     }
 
+    /// Run one claim transaction and run it again after a conflict abort.
+    ///
+    /// Each claim function opens and commits its own transaction. A
+    /// rolled-back claim leaves its row `PENDING`, so a re-run is safe.
+    /// See [`crate::tx_retry`] (issue #1822).
+    async fn claim_with_conflict_retry<F>(
+        &self,
+        conn: &mut AsyncPgConnection,
+        claim: F,
+    ) -> HarvestResult<Option<TaskQueueItem>>
+    where
+        for<'r> F: AsyncFnMut(&'r mut AsyncPgConnection) -> HarvestResult<Option<TaskQueueItem>>
+            + crate::tx_retry::TxAttempt<
+                &'r mut AsyncPgConnection,
+                HarvestResult<Option<TaskQueueItem>>,
+                Fut: Send,
+            > + Send,
+    {
+        crate::tx_retry::run_with_conflict_retry(
+            conn,
+            crate::tx_retry::SITE_CLAIM,
+            &*self.registry.telemetry().metrics,
+            crate::tx_retry::TxRetryPolicy::DEFAULT,
+            claim,
+        )
+        .await
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Claims one task of a kind with a free permit and dispatches it. Returns
@@ -32732,18 +32787,22 @@ impl Worker {
                 // permutation. A claim that succeeds on the first
                 // (typically highest-weight) queue never pays for the rest.
                 let single_queue = [(*queue_name).to_owned()];
-                match queue::claim_task_of_kind_on_shard(
-                    &mut conn,
-                    &single_queue,
-                    &self.config.worker_id,
-                    &self.config.build_id,
-                    self.config.priority_aging_secs,
-                    circuit_breaker_activities,
-                    &self.ineligible_activities,
-                    shard,
-                    kind,
-                )
-                .await
+                match self
+                    .claim_with_conflict_retry(&mut conn, async |conn| {
+                        queue::claim_task_of_kind_on_shard(
+                            conn,
+                            &single_queue,
+                            &self.config.worker_id,
+                            &self.config.build_id,
+                            self.config.priority_aging_secs,
+                            circuit_breaker_activities,
+                            &self.ineligible_activities,
+                            shard,
+                            kind,
+                        )
+                        .await
+                    })
+                    .await
                 {
                     Ok(Some(task)) => {
                         tracing::debug!(
@@ -32776,18 +32835,22 @@ impl Worker {
         }
 
         // --- Default (unweighted) path: original single ANY($2) query ---
-        match queue::claim_task_of_kind_on_shard(
-            &mut conn,
-            &self.config.queues,
-            &self.config.worker_id,
-            &self.config.build_id,
-            self.config.priority_aging_secs,
-            circuit_breaker_activities,
-            &self.ineligible_activities,
-            shard,
-            kind,
-        )
-        .await
+        match self
+            .claim_with_conflict_retry(&mut conn, async |conn| {
+                queue::claim_task_of_kind_on_shard(
+                    conn,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    self.config.priority_aging_secs,
+                    circuit_breaker_activities,
+                    &self.ineligible_activities,
+                    shard,
+                    kind,
+                )
+                .await
+            })
+            .await
         {
             Ok(Some(task)) => {
                 tracing::debug!(

@@ -431,6 +431,9 @@ pub mod shard_fence;
 pub mod shard_rebalance;
 /// Shared, immutable JSON payload for the workflow start path (issue #1733).
 pub mod shared_json;
+/// Retry a transaction after a deadlock or serialization abort (issue #1822).
+#[cfg(feature = "db")]
+pub mod tx_retry;
 
 /// `cfg(shuttle)` async-primitive shim (tokio under normal builds).
 ///
