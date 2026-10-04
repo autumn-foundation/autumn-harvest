@@ -721,6 +721,11 @@ fn lex(
             i = end;
             let escape = uescape(chars, &mut i, &mut line).unwrap_or('\\');
             let value = decode_unicode(&raw, escape);
+            if quote == '\'' && in_do_statement(toks, depth) {
+                let body: Vec<char> = value.chars().collect();
+                lex(&body, start_line, depth + 1, runs, toks, comments);
+                continue;
+            }
             toks.push(Token {
                 tok: if quote == '"' {
                     Tok::Word(value)
@@ -927,35 +932,44 @@ struct Stmts<'a> {
 impl<'a> Stmts<'a> {
     fn new(toks: &'a [Token]) -> Self {
         let mut starts = Vec::with_capacity(toks.len());
-        let mut start = 0;
-        // How many SQL `CASE` expressions are open. Their `THEN` and `ELSE`
-        // belong to the expression, not to PL/pgSQL control flow.
-        let mut open_cases = 0_usize;
+        // Per dollar-quote depth: the start of the open statement, if any, and
+        // how many SQL `CASE` expressions are open in it. A `THEN` or `ELSE`
+        // of such an expression is not PL/pgSQL control flow.
+        let mut open: Vec<(Option<usize>, usize)> = Vec::new();
         for k in 0..toks.len() {
-            // `BEGIN`, `THEN`, `ELSE` and `LOOP` open a statement only inside a
-            // PL/pgSQL body. At top level they belong to SQL, such as `CASE`.
-            let hard =
-                k == 0 || toks[k].depth != toks[k - 1].depth || toks[k - 1].tok == Tok::Punct(';');
-            if hard {
-                open_cases = 0;
+            let depth = toks[k].depth;
+            let entering = k == 0 || depth > toks[k - 1].depth;
+            if entering {
+                open.truncate(depth);
             }
-            let boundary = hard
-                || (toks[k].depth > 0
+            open.resize(depth + 1, (None, 0));
+            // A body starts a statement. After the body, the statement around
+            // it goes on, so a literal never splits it.
+            let (start, cases) = &mut open[depth];
+            let boundary = entering
+                || start.is_none()
+                || (depth > 0
+                    && k > 0
+                    && toks[k - 1].depth == depth
                     && match &toks[k - 1].tok {
                         Tok::Word(w) if ["begin", "loop"].contains(&w.as_str()) => true,
-                        Tok::Word(w) if ["then", "else"].contains(&w.as_str()) => open_cases == 0,
+                        Tok::Word(w) if ["then", "else"].contains(&w.as_str()) => *cases == 0,
                         _ => false,
                     });
             if boundary {
-                start = k;
+                *start = Some(k);
+                *cases = 0;
             }
             // A `CASE` that does not start a statement is an expression.
             match &toks[k].tok {
-                Tok::Word(w) if w == "case" && !boundary => open_cases += 1,
-                Tok::Word(w) if w == "end" && open_cases > 0 => open_cases -= 1,
+                Tok::Word(w) if w == "case" && !boundary => *cases += 1,
+                Tok::Word(w) if w == "end" && *cases > 0 => *cases -= 1,
                 _ => {}
             }
-            starts.push(start);
+            starts.push(start.unwrap_or(k));
+            if toks[k].tok == Tok::Punct(';') {
+                *start = None;
+            }
         }
         Self { toks, starts }
     }
@@ -1006,9 +1020,16 @@ impl<'a> Stmts<'a> {
     }
 
     /// The index one past the last token of the statement that holds `k`.
+    ///
+    /// The range takes in any body nested in the statement.
     fn end(&self, k: usize) -> usize {
+        let depth = self.toks[self.starts[k]].depth;
         (k..self.toks.len())
-            .find(|&j| self.starts[j] != self.starts[k] || self.is_punct(j, ';'))
+            .find(|&j| {
+                let d = self.toks[j].depth;
+                d < depth
+                    || (d == depth && (self.starts[j] != self.starts[k] || self.is_punct(j, ';')))
+            })
             .unwrap_or(self.toks.len())
     }
 
@@ -1832,7 +1853,11 @@ fn vacuum_full(s: &Stmts, k: usize) -> Vec<Raw> {
     let mut full = false;
     if s.is_punct(j, '(') {
         while j < s.toks.len() && !s.is_punct(j, ')') {
-            full |= s.is(j, "full");
+            // `FULL` may carry a boolean, as in `FULL false`.
+            if s.is(j, "full") {
+                let value = s.word(j + 1).or_else(|| s.string(j + 1));
+                full = !value.is_some_and(pg_false);
+            }
             j += 1;
         }
         j += 1;
@@ -3325,6 +3350,7 @@ fn a_single_quoted_do_body_is_scanned_as_code() {
         "DO 'BEGIN ALTER TABLE harvest_events ADD COLUMN note TEXT; END';",
         "DO LANGUAGE plpgsql 'BEGIN ALTER TABLE harvest_events ADD COLUMN note TEXT; END';",
         "DO E'BEGIN\\nALTER TABLE harvest_events ADD COLUMN note TEXT;\\nEND';",
+        "DO U&'BEGIN ALTER TABLE harvest_events ADD COLUMN note TEXT; END';",
         // A doubled quote inside the body is one quote.
         "DO 'BEGIN RAISE NOTICE ''x''; ALTER TABLE harvest_events ADD COLUMN note TEXT; END';",
     ] {
@@ -3547,6 +3573,34 @@ fn a_case_expression_in_a_do_body_does_not_split_the_statement() {
                END $$;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_dollar_literal_does_not_split_its_statement() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               ALTER TABLE harvest_events ADD CHECK (note <> $$x$$), ADD UNIQUE (event_id);";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+    // The statement after the literal is the same statement.
+    let sql = "CREATE INDEX CONCURRENTLY idx_x ON harvest_task_queue (id) WHERE note <> $$x$$;";
+    assert_eq!(lint_with_history(&[], sql, false), []);
+}
+
+#[test]
+fn vacuum_full_false_is_a_plain_vacuum() {
+    assert_eq!(
+        lint_with_history(&[], "VACUUM (FULL false) harvest_events;", false),
+        []
+    );
+    for full in ["FULL", "FULL true", "FULL on", "VERBOSE, FULL 1"] {
+        let sql = format!("VACUUM ({full}) harvest_events;");
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{full}: {findings:?}"
+        );
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
