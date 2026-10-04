@@ -450,7 +450,7 @@ async fn backdate_events(pool: &DbPool, exec_id: ExecutionId, interval: &str) {
         "UPDATE harvest_events SET timestamp = NOW() - INTERVAL '{interval}' \
          WHERE workflow_exec_id = $1"
     );
-    autumn_harvest::append_only::with_guard_off(&mut *conn, async |c| {
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
         diesel::sql_query(sql)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .execute(c)
