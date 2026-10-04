@@ -253,13 +253,15 @@ impl History {
         PARTITIONED_TABLES.contains(&base(table)) || self.partitioned.contains(base(table))
     }
 
-    /// Forget every index on `table`.
+    /// Forget every cold index on `table`.
     ///
     /// The match ignores the schema, so it may forget too much. A forgotten
-    /// index is unknown, and an unknown index counts as hot.
+    /// index is unknown, and an unknown index counts as hot. A hot mapping
+    /// stays, because it can only make a later drop stricter.
     fn forget_table(&mut self, table: &str) {
+        let hot = self.is_hot(table);
         for tables in self.indexes.values_mut() {
-            tables.retain(|t| base(t) != base(table));
+            tables.retain(|t| hot || base(t) != base(table));
         }
         self.indexes.retain(|_, tables| !tables.is_empty());
     }
@@ -1606,9 +1608,10 @@ fn resolve(
             if let (Some(table), "DROP TABLE") = (&table, raw.verb) {
                 history.forget_table(table);
             }
-            // A table moves its indexes with it to the new schema.
+            // A table moves its indexes with it to the new schema. A dropped
+            // column or constraint can take indexes with it.
             if let (Some(table), "ALTER TABLE") = (&table, raw.verb)
-                && s.has_pair(raw.at, "set", "schema")
+                && (s.has_pair(raw.at, "set", "schema") || drops_dependents(s, raw.at))
             {
                 history.forget_table(table);
             }
@@ -1958,12 +1961,13 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
     }
 }
 
-/// Whether the `ALTER TABLE` at `k` may drop or rebuild a foreign key.
+/// Whether the `ALTER TABLE` at `k` may drop or rebuild a dependent object,
+/// such as a foreign key or an index.
 ///
-/// `DROP CONSTRAINT` drops one. `DROP [COLUMN]` drops the keys on the column.
-/// A column type change rebuilds them. Each form also changes the key's
-/// triggers on the referenced table.
-fn touches_a_foreign_key(s: &Stmts, k: usize) -> bool {
+/// `DROP CONSTRAINT` drops one. `DROP [COLUMN]` drops the keys and indexes on
+/// the column. A column type change rebuilds them. A key change also changes
+/// the key's triggers on the referenced table.
+fn drops_dependents(s: &Stmts, k: usize) -> bool {
     const KEEPS_KEYS: [&str; 4] = ["default", "not", "identity", "expression"];
     (k..s.end(k)).any(|j| {
         let drops = s.is(j, "drop") && !KEEPS_KEYS.iter().any(|w| s.is(j + 1, w));
@@ -1976,18 +1980,50 @@ fn touches_a_foreign_key(s: &Stmts, k: usize) -> bool {
 /// A lock on an unknown table for the PL/pgSQL `EXECUTE` at `k`, when the
 /// lint cannot read the SQL it runs.
 ///
-/// The lint reads only constant SQL. A variable, SQL built with `||`, or a
-/// `format()` `%s` placeholder may hold any statement.
+/// The lint reads only constant SQL: one literal, or `format()` of one
+/// literal. Only `INTO` or `USING` may follow. A variable, a composed
+/// expression, or a `format()` `%s` placeholder may hold any statement.
 fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     let toks = s.toks;
     let depth = toks[k].depth;
     let end = s.end(k);
-    let constant = (k + 1..end).any(|j| toks[j].depth > depth);
-    let built =
-        (k..end).any(|j| toks[j].depth == depth && s.is_punct(j, '|') && s.is_punct(j + 1, '|'));
+    let formatted = s.is(k + 1, "format") && s.is_punct(k + 2, '(');
+    let literal = if formatted { k + 3 } else { k + 1 };
+    let constant = toks.get(literal).is_some_and(|t| t.depth > depth);
+    // The first token after the SQL, at the depth of the statement.
+    let after_literal = (literal..end).find(|&j| toks[j].depth == depth);
+    let rest = if formatted {
+        closing_paren(s, k + 2).map(|close| close + 1)
+    } else {
+        after_literal.or(Some(end))
+    };
+    let tail_ok = rest.is_some_and(|j| j >= end || s.is(j, "into") || s.is(j, "using"));
     let text_placeholder = (k + 1..end).any(|j| toks[j].depth > depth && s.is(j, "%s"));
-    (!constant || built || text_placeholder)
+    (!constant || !tail_ok || text_placeholder)
         .then(|| Raw::lock(k, "EXECUTE of SQL the lint cannot read", None))
+}
+
+/// The `)` that closes the `(` at `open`, at the same depth.
+fn closing_paren(s: &Stmts, open: usize) -> Option<usize> {
+    let depth = s.toks[open].depth;
+    let mut parens = 0_usize;
+    for j in open..s.toks.len() {
+        if s.toks[j].depth < depth {
+            return None;
+        }
+        if s.toks[j].depth > depth {
+            continue;
+        }
+        if s.is_punct(j, '(') {
+            parens += 1;
+        } else if s.is_punct(j, ')') {
+            parens -= 1;
+            if parens == 0 {
+                return Some(j);
+            }
+        }
+    }
+    None
 }
 
 /// Remember `child` as hot when its `parent` is hot.
@@ -2036,7 +2072,7 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                     kind: Kind::Index { concurrent: false },
                 });
             }
-            if touches_a_foreign_key(s, k) {
+            if drops_dependents(s, k) {
                 raws.extend(
                     referenced(history, &table)
                         .map(|t| Raw::lock(k, "ALTER TABLE DROP CONSTRAINT", Some(t))),
@@ -3938,6 +3974,7 @@ fn execute_of_sql_the_lint_cannot_read_fails_closed() {
     for body in [
         "EXECUTE 'ALTER TABLE ' || quote_ident('t') || ' ADD COLUMN x INT';",
         "EXECUTE q;",
+        "EXECUTE concat('ALTER TABLE ', 'harvest_events ADD COLUMN x INT');",
     ] {
         let sql = format!("DO $$\nDECLARE q TEXT := 'SELECT 1';\nBEGIN\n    {body}\nEND $$;");
         let findings = lint_with_history(&[], &sql, true);
@@ -4015,6 +4052,24 @@ fn an_unparsed_set_config_of_lock_timeout_clears() {
             rules(&findings),
             [Rule::LockTimeout],
             "{call}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn an_alter_that_drops_dependents_forgets_the_indexes() {
+    // A dropped column or constraint takes its indexes with it.
+    for alter in [
+        "ALTER TABLE harvest_schedules DROP COLUMN c;",
+        "ALTER TABLE harvest_schedules DROP CONSTRAINT harvest_schedules_c_key;",
+    ] {
+        let history = ["CREATE INDEX idx_shared ON harvest_schedules (c);", alter];
+        let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;";
+        let findings = lint_with_history(&history, sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::BlockingIndex],
+            "{alter}: {findings:?}"
         );
     }
 }
