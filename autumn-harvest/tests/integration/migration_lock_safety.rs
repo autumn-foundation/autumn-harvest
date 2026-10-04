@@ -223,6 +223,9 @@ struct History {
     /// Each table that a migration created with `PARTITION BY`, without its
     /// schema. Postgres runs no `CONCURRENTLY` index DDL on such a table.
     partitioned: BTreeSet<String>,
+    /// Each routine that may clear the bound, without its schema. A call of
+    /// such a routine in a later migration clears the bound too.
+    clearing_routines: BTreeSet<String>,
 }
 
 impl History {
@@ -1551,6 +1554,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     // Its locks still count, which fails closed.
     let mut not_run: BTreeMap<String, usize> = BTreeMap::new();
     let unconditional = unconditional(&s);
+    let path_change = (0..toks.len()).find(|&k| s.starts[k] == k && changes_search_path(&s, k));
 
     for (k, tok) in toks.iter().enumerate() {
         let start = s.starts[k] == k;
@@ -1610,13 +1614,9 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 let child = s.qualified_name(k + 2).map(|(t, _)| t);
                 learn_partition(history, parent.as_deref(), child.as_deref());
             }
-            // A conditional setter cannot set a bound, but a conditional
-            // clear may end one.
             // A function body keeps its own changes, for the locks in it.
             _ => {
-                let change = timeout_change(&s, k).filter(|change| {
-                    unconditional[k] || !matches!(change, Timeout::Set { bounds: true, .. })
-                });
+                let change = recorded_change(&s, k, unconditional[k], path_change);
                 let list = if tok.runs {
                     &mut timeouts
                 } else {
@@ -1628,7 +1628,8 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     }
 
     function_settings(&s, &mut body_timeouts);
-    call_clears(&s, &mut timeouts, &mut body_timeouts);
+    foreign_do_bodies(&s, &mut raws, &mut timeouts, &mut body_timeouts);
+    call_clears(&s, history, &mut timeouts, &mut body_timeouts);
     let new_tables = new_table_spans(&s, &created);
     let hits = resolve(raws, &s, &unconditional, &new_tables, history);
 
@@ -1677,6 +1678,42 @@ fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
     body_timeouts.sort_by_key(|(k, _)| *k);
 }
 
+/// Treat each `DO` body in another language as unreadable code.
+///
+/// The lint reads only PL/pgSQL. A body in another language, such as
+/// `plpython3u`, may lock any table. It may also clear the bound for what
+/// comes after it, so a session clear follows the statement.
+fn foreign_do_bodies(
+    s: &Stmts,
+    raws: &mut Vec<Raw>,
+    timeouts: &mut Vec<(usize, Timeout)>,
+    body_timeouts: &mut Vec<(usize, Timeout)>,
+) {
+    for k in (0..s.toks.len()).filter(|&k| s.starts[k] == k && s.keyword(k, "do")) {
+        let depth = s.toks[k].depth;
+        let end = s.end(k);
+        let language = (k..end)
+            .find(|&j| s.toks[j].depth == depth && s.keyword(j, "language"))
+            .and_then(|j| s.word(j + 1).or_else(|| s.string(j + 1)));
+        if language.is_none_or(|l| l.eq_ignore_ascii_case("plpgsql")) {
+            continue;
+        }
+        raws.push(Raw::lock(k, "DO in another language", None));
+        let list = if s.toks[k].runs {
+            &mut *timeouts
+        } else {
+            &mut *body_timeouts
+        };
+        list.push((
+            end,
+            Timeout::Set {
+                bounds: false,
+                local: false,
+            },
+        ));
+    }
+}
+
 /// The index of `FUNCTION` or `PROCEDURE` when a routine `CREATE` starts at `k`.
 fn routine_keyword(s: &Stmts, k: usize) -> Option<usize> {
     if s.starts[k] != k || !s.is(k, "create") {
@@ -1710,9 +1747,11 @@ struct Routine {
 /// A call reaches a body in this file only when an earlier `CREATE` has the
 /// same name as written and the same number of parameters. Any other `CALL`
 /// clears, because it may reach a routine from another file. A call also
-/// clears when any such `CREATE` clears.
+/// clears when any such `CREATE` clears, or when an earlier migration created
+/// a clearing routine of that name.
 fn call_clears(
     s: &Stmts,
+    history: &mut History,
     timeouts: &mut Vec<(usize, Timeout)>,
     body_timeouts: &mut Vec<(usize, Timeout)>,
 ) {
@@ -1723,7 +1762,12 @@ fn call_clears(
             Some(Routine { name, arity, at: k })
         })
         .collect();
-    let bases: BTreeSet<&str> = routines.iter().map(|r| base(&r.name)).collect();
+    let inherited = history.clearing_routines.clone();
+    let bases: BTreeSet<&str> = routines
+        .iter()
+        .map(|r| base(&r.name))
+        .chain(inherited.iter().map(String::as_str))
+        .collect();
     let calls: Vec<Routine> = (0..s.toks.len())
         .filter_map(|k| call_target(s, k, &bases))
         .collect();
@@ -1736,7 +1780,8 @@ fn call_clears(
             r.at < call.at && r.name == call.name && r.arity.is_some() && r.arity == call.arity
         });
         let first = matches.next();
-        first.is_some()
+        !inherited.contains(base(&call.name))
+            && first.is_some()
             && first
                 .into_iter()
                 .chain(matches)
@@ -1780,6 +1825,11 @@ fn call_clears(
         } else {
             body_timeouts.push((call.at, clear));
         }
+    }
+    for &i in &clearing {
+        history
+            .clearing_routines
+            .insert(base(&routines[i].name).to_string());
     }
     // `timeout_in_force` reads the changes in token order.
     timeouts.sort_by_key(|(k, _)| *k);
@@ -2496,6 +2546,30 @@ fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     let tail_ok = rest.is_some_and(|j| j >= end || s.is(j, "into") || s.is(j, "using"));
     let text_placeholder = (k + 1..end).any(|j| toks[j].depth > depth && s.is(j, "%s"));
     (!constant || !tail_ok || text_placeholder).then(|| Raw::lock(k, UNREADABLE_EXECUTE, None))
+}
+
+/// The `lock_timeout` change at `k`, as `analyse` records it.
+///
+/// A conditional setter cannot set a bound, but a conditional clear may end
+/// one. After a `search_path` change, an unqualified `set_config` may call a
+/// function that shadows the built-in. So it counts as a session clear.
+fn recorded_change(
+    s: &Stmts,
+    k: usize,
+    unconditional: bool,
+    path_change: Option<usize>,
+) -> Option<Timeout> {
+    let change = timeout_change(s, k)?;
+    let qualified = k >= 2 && s.is_punct(k - 1, '.') && s.is(k - 2, "pg_catalog");
+    let shadowed = s.is(k, "set_config") && !qualified && path_change.is_some_and(|c| c < k);
+    match change {
+        Timeout::Set { bounds: true, .. } if !unconditional => None,
+        Timeout::Set { .. } if shadowed => Some(Timeout::Set {
+            bounds: false,
+            local: false,
+        }),
+        other => Some(other),
+    }
 }
 
 /// Where a change at `k` takes effect.
@@ -5068,6 +5142,58 @@ fn a_call_keeps_the_bound_only_when_no_overload_clears() {
     let sql = format!("{set}{clears}{keeps}CALL p('x'::text);\n{lock}");
     let findings = lint_with_history(&[], &sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+}
+
+#[test]
+fn an_unqualified_set_config_after_a_path_change_sets_no_bound() {
+    let path = "SET search_path = app, pg_catalog;\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    // `app.set_config` may shadow the built-in.
+    let sql = format!("{path}SELECT set_config('lock_timeout', '5s', true);\n{lock}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    let sql = format!("{path}SELECT pg_catalog.set_config('lock_timeout', '5s', true);\n{lock}");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_do_body_in_another_language_is_unreadable() {
+    let body = "$$ plpy.execute(\"ALTER TABLE harvest_events ADD COLUMN x int\") $$";
+    for sql in [
+        format!("DO LANGUAGE plpython3u {body};"),
+        format!("DO {body} LANGUAGE 'plpython3u';"),
+    ] {
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        assert!(findings[0].detail.contains("unknown"), "{findings:?}");
+    }
+    // The foreign body may also clear the bound.
+    let sql = format!(
+        "SET LOCAL lock_timeout = '5s';\nDO LANGUAGE plpython3u {body};\n\
+         ALTER TABLE harvest_events ADD COLUMN y INT;"
+    );
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    // An explicit PL/pgSQL body is still read.
+    let sql = "DO LANGUAGE plpgsql $$\nBEGIN\n    NULL;\nEND $$;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_clearing_function_from_an_earlier_migration_clears() {
+    let earlier = "CREATE FUNCTION clear_timeout() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                   PERFORM set_config('lock_timeout', '0', true);\nEND $$;";
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    for call in ["SELECT clear_timeout();", "PERFORM clear_timeout();"] {
+        let sql = if call.starts_with("PERFORM") {
+            format!("{set}DO $$\nBEGIN\n    {call}\nEND $$;\n{lock}")
+        } else {
+            format!("{set}{call}\n{lock}")
+        };
+        let findings = lint_with_history(&[earlier], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

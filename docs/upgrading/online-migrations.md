@@ -117,7 +117,10 @@ when the routine may clear it. A call reaches a body in the same file only
 when an earlier `CREATE` has the same name, schema included, and the same
 number of parameters. Any other `CALL` also ends the bound, because the lint
 cannot read the body it reaches. The lint does not compare parameter types, so
-a call also ends the bound when any such `CREATE` may clear it. Set the bound again after the call. A change
+a call also ends the bound when any such `CREATE` may clear it. A call of a
+clearing routine that an earlier migration created ends the bound too.
+After a `search_path` change, only `pg_catalog.set_config` sets a bound,
+because another schema may hold a `set_config` that shadows the built-in. Set the bound again after the call. A change
 in the expression of an `EXECUTE` takes effect before the SQL runs. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
 `EXIT` or `CONTINUE`, does not count either, because it may not run. Nothing in a block with an
 `EXCEPTION` handler counts, because the handler rolls the block back. A clear inside a
@@ -262,6 +265,8 @@ that no longer matches a finding also fails the build.
   with `%s` anywhere in its text, even in a comment or a quoted name.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
   as code, in any quote form. Any other string is data.
+- The lint reads only PL/pgSQL. A `DO` body in another language counts as a
+  lock on an unknown table, and it ends the bound for what comes after it.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.
