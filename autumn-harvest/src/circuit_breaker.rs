@@ -111,9 +111,8 @@ impl DispatchToken {
 ///
 /// A worker registers each claim it dispatches with
 /// [`CircuitBreakerRegistry::begin_claim`]. The timeout enforcer marks a
-/// registered claim when it times out (issue #1809). The result of a marked
-/// claim does not move the breaker, because the enforcer already counted that
-/// attempt.
+/// claim when it times out (issue #1809). The result of a marked claim does
+/// not move the breaker, because the enforcer already counted that attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClaimKey {
     /// The task queue row.
@@ -125,12 +124,18 @@ pub struct ClaimKey {
     pub started_at: Option<DateTime<Utc>>,
 }
 
-/// A claim that this process dispatched and that has not reported yet.
+/// A claim that this process dispatched and that has not reported yet, or
+/// a claim that an enforcer here marked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InFlightClaim {
     /// The token of its dispatch. A confirmed timeout releases a probe slot
     /// with it, before the handler returns.
-    token: DispatchToken,
+    ///
+    /// `None` until this process registers the claim. An enforcer can mark a
+    /// claim before its worker registers it, or mark a claim of another
+    /// process. The entry then holds the mark, so a later registration
+    /// still sees it.
+    token: Option<DispatchToken>,
     state: ClaimState,
 }
 
@@ -556,21 +561,25 @@ impl CircuitBreakerRegistry {
 
     /// Register `claim` as dispatched by this process (issue #1809).
     ///
-    /// Only a registered claim can be marked. Call [`end_claim`](Self::end_claim)
-    /// or a claim-aware report on every exit of the dispatch.
+    /// Call [`end_claim`](Self::end_claim) or a claim-aware report on every
+    /// exit of the dispatch.
+    ///
+    /// An enforcer may have marked the claim already. The claim then keeps
+    /// that mark, so its loss or result waits for the enforcer. Otherwise
+    /// the owner could count the timeout, and the enforcer count it again.
     pub fn begin_claim(&self, activity_name: &str, claim: ClaimKey, token: DispatchToken) {
         if !self.policies.contains_key(activity_name) {
             return;
         }
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        st.in_flight_claims.insert(
-            claim,
-            InFlightClaim {
-                token,
+        st.in_flight_claims
+            .entry(claim)
+            .and_modify(|entry| entry.token = Some(token))
+            .or_insert(InFlightClaim {
+                token: Some(token),
                 state: ClaimState::Running,
-            },
-        );
+            });
     }
 
     /// Remove `claim` from the in-flight set without a result (issue #1809).
@@ -597,32 +606,35 @@ impl CircuitBreakerRegistry {
     /// A result that arrives now is held. Each enforcer that marks then calls
     /// [`confirm_claim_timed_out`](Self::confirm_claim_timed_out) or
     /// [`unmark_claim_timed_out`](Self::unmark_claim_timed_out) once. One
-    /// confirm wins over any number of rollbacks, in any order. A claim that
-    /// this process does not hold has no local result to fence, so the mark
-    /// then does nothing.
+    /// confirm wins over any number of rollbacks, in any order.
+    ///
+    /// A claim that this process has not registered gets an entry with no
+    /// token. Its worker may register it before the enforcer decides, and
+    /// then keeps the mark. The confirm or the last rollback removes an entry
+    /// that no worker registered.
     pub fn mark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
         if !self.policies.contains_key(activity_name) {
             return;
         }
         let mut states = self.lock();
-        if let Some(entry) = states
-            .get_mut(activity_name)
-            .and_then(|st| st.in_flight_claims.get_mut(&claim))
-        {
-            entry.state = match entry.state {
-                ClaimState::Running => ClaimState::Provisional(1),
-                ClaimState::Provisional(deciding) => {
-                    ClaimState::Provisional(deciding.saturating_add(1))
-                }
-                ClaimState::Held(outcome, token, deciding) => {
-                    ClaimState::Held(outcome, token, deciding.saturating_add(1))
-                }
-                ClaimState::TimedOut => ClaimState::TimedOut,
-                ClaimState::LostPending(deciding) => {
-                    ClaimState::LostPending(deciding.saturating_add(1))
-                }
-            };
-        }
+        let st = states.entry(activity_name.to_string()).or_default();
+        let entry = st.in_flight_claims.entry(claim).or_insert(InFlightClaim {
+            token: None,
+            state: ClaimState::Running,
+        });
+        entry.state = match entry.state {
+            ClaimState::Running => ClaimState::Provisional(1),
+            ClaimState::Provisional(deciding) => {
+                ClaimState::Provisional(deciding.saturating_add(1))
+            }
+            ClaimState::Held(outcome, token, deciding) => {
+                ClaimState::Held(outcome, token, deciding.saturating_add(1))
+            }
+            ClaimState::TimedOut => ClaimState::TimedOut,
+            ClaimState::LostPending(deciding) => {
+                ClaimState::LostPending(deciding.saturating_add(1))
+            }
+        };
     }
 
     /// The enforcer timed `claim` out (issue #1809). The claim's probe slot,
@@ -633,8 +645,13 @@ impl CircuitBreakerRegistry {
     ///
     /// With `count_failure`, the timeout also counts as a failure, under the
     /// same lock. A claim of this process counts through its dispatch token,
-    /// so a token from before a trip or a reset counts nothing. A claim of
-    /// another process has no token here and counts as an external failure.
+    /// so a token from before a trip or a reset counts nothing. A claim that
+    /// no worker here registered has no token, and counts as an external
+    /// failure.
+    ///
+    /// A claim whose handler started was registered before the enforcer read
+    /// that fact. So an entry with no token here belongs to another process,
+    /// and this removes it.
     pub fn confirm_claim_timed_out(
         &self,
         activity_name: &str,
@@ -646,18 +663,22 @@ impl CircuitBreakerRegistry {
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
         let token = match st.in_flight_claims.get(&claim).copied() {
-            Some(entry) => match entry.state {
-                ClaimState::Held(..) | ClaimState::LostPending(_) => {
+            Some(entry) => match (entry.state, entry.token) {
+                (ClaimState::TimedOut, _) => return None,
+                (_, None) => {
                     st.in_flight_claims.remove(&claim);
-                    Some(entry.token)
+                    None
                 }
-                ClaimState::Running | ClaimState::Provisional(_) => {
+                (ClaimState::Held(..) | ClaimState::LostPending(_), token) => {
+                    st.in_flight_claims.remove(&claim);
+                    token
+                }
+                (ClaimState::Running | ClaimState::Provisional(_), token) => {
                     if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
                         entry.state = ClaimState::TimedOut;
                     }
-                    Some(entry.token)
+                    token
                 }
-                ClaimState::TimedOut => return None,
             },
             None => None,
         };
@@ -695,6 +716,11 @@ impl CircuitBreakerRegistry {
                 entry.state = ClaimState::Provisional(deciding - 1);
                 None
             }
+            ClaimState::Provisional(_) if entry.token.is_none() => {
+                // No worker here registered the claim.
+                st.in_flight_claims.remove(&claim);
+                None
+            }
             ClaimState::Provisional(_) => {
                 entry.state = ClaimState::Running;
                 None
@@ -707,7 +733,7 @@ impl CircuitBreakerRegistry {
                 // No enforcer here timed it out, so another process did.
                 let token = entry.token;
                 st.in_flight_claims.remove(&claim);
-                count_remote_timeout(st, policy, token, now)
+                token.and_then(|token| count_remote_timeout(st, policy, token, now))
             }
             ClaimState::Running | ClaimState::TimedOut => None,
         }
@@ -1362,21 +1388,68 @@ mod tests {
         assert_eq!(rolling(&reg, t0), 1);
     }
 
+    /// A mark on a claim that no worker here registered leaves nothing behind
+    /// once its enforcer decides (issue #1809).
     #[test]
-    fn only_in_flight_claims_are_marked() {
+    fn an_unregistered_mark_leaves_nothing_behind() {
         let reg = registry();
         let t0 = Instant::now();
+        reg.mark_claim_timed_out("send_email", claim(8));
+        assert_eq!(reg.unmark_claim_timed_out("send_email", claim(8), t0), None);
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // A claim of another process: the confirm counts it once.
         reg.mark_claim_timed_out("send_email", claim(9));
-        fail(&reg, t0);
-        let token = dispatch(&reg, t0);
-        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(9), t0);
-        assert_eq!(rolling(&reg, t0), 0, "a foreign mark does not fence");
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(9), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 1);
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
 
         reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         reg.end_claim("send_email", claim(1));
         let states = reg.lock();
         assert!(states["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// An enforcer can mark a claim before its worker registers it. The
+    /// worker keeps the mark, so its loss waits for the enforcer, and the
+    /// timeout counts once (issue #1809).
+    #[test]
+    fn a_claim_registered_after_its_mark_counts_its_timeout_once() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), token);
+        assert_eq!(
+            reg.on_claim_lost("send_email", token, claim(1), true, t0),
+            None,
+            "the loss waits for the enforcer that marked the claim"
+        );
+        assert_eq!(rolling(&reg, t0), 1);
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 2, "one timeout, one failure");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // A late result of such a claim waits for the enforcer too.
+        reg.mark_claim_timed_out("send_email", claim(2));
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(2), token);
+        assert_eq!(
+            reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(2), t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 2, "the success is held");
+        assert_eq!(reg.unmark_claim_timed_out("send_email", claim(2), t0), None);
+        assert_eq!(rolling(&reg, t0), 0, "no timeout, so the success counts");
     }
 
     #[test]
