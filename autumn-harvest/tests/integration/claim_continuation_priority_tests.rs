@@ -53,6 +53,12 @@ async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// How far a fixture row is aged to lead plain FIFO order.
+///
+/// `enqueue` and `wake_workflow_task` both date a row 5 seconds in the past
+/// to absorb clock skew. A lead must clear that allowance by a wide margin.
+const FIFO_LEAD_SECS: i64 = 15;
+
 fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8])
 }
@@ -100,12 +106,10 @@ async fn parked_run(conn: &mut AsyncPgConnection, queue: &str, worker: &str) -> 
     let task_id = queue::enqueue(conn, &params).await.expect("enqueue run");
     let claimed = claim_one(conn, queue, worker).await;
     assert_eq!(claimed, Some(task_id), "setup claims the run's first task");
-    assert!(
-        queue::park_workflow_task(conn, task_id, None)
-            .await
-            .expect("park"),
-        "setup parks the run"
-    );
+    let had_wake = queue::park_workflow_task(conn, task_id, None)
+        .await
+        .expect("park");
+    assert!(!had_wake, "setup has no pending wake");
     (task_id, exec_id)
 }
 
@@ -155,7 +159,8 @@ async fn claim_one_batched(
 /// The single-slot backlog both claim paths share.
 ///
 /// Holds three parked runs, four new starts and two activity continuations.
-/// The new starts are the oldest rows, so plain FIFO would claim them first.
+/// The new starts lead FIFO by [`FIFO_LEAD_SECS`], so plain FIFO would claim
+/// them first.
 struct Backlog {
     queue: String,
     continuations: Vec<Uuid>,
@@ -171,7 +176,7 @@ async fn backlog(conn: &mut AsyncPgConnection, worker: &str) -> Backlog {
     let mut starts = Vec::new();
     for _ in 0..4 {
         let id = new_start(conn, &queue, 0).await;
-        age(conn, id, 2).await;
+        age(conn, id, FIFO_LEAD_SECS).await;
         starts.push(id);
     }
     let mut continuations = Vec::new();
@@ -184,11 +189,30 @@ async fn backlog(conn: &mut AsyncPgConnection, worker: &str) -> Backlog {
             .expect("wake");
         continuations.push(task_id);
     }
+    pending_check(conn, &continuations).await;
     Backlog {
         queue,
         continuations,
         starts,
     }
+}
+
+/// Every continuation is due again, and each woken row was claimed once.
+async fn pending_check(conn: &mut AsyncPgConnection, ids: &[Uuid]) {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let due: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_task_queue \
+         WHERE id = ANY($1) AND state = 'PENDING' AND scheduled_at <= NOW()",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+    .get_result(conn)
+    .await
+    .expect("count due");
+    assert_eq!(due.n, ids.len() as i64, "every continuation is due");
 }
 
 fn assert_continuations_first(order: &[Uuid], backlog: &Backlog) {
@@ -246,7 +270,7 @@ async fn new_starts_are_not_starved_by_a_stream_of_continuations() {
     let (mut conn, _container) = setup_db().await;
     let worker = unique("w");
     let queue = unique("starve");
-    let aged = i64::from(NEW_START_HANDICAP_SECS) + 5;
+    let aged = i64::from(NEW_START_HANDICAP_SECS) + FIFO_LEAD_SECS;
 
     let mut starts = Vec::new();
     for i in 0..3 {
@@ -282,14 +306,14 @@ async fn the_handicap_expires_after_new_start_handicap_secs() {
 
     let queue = unique("young");
     let young = new_start(&mut conn, &queue, 0).await;
-    age(&mut conn, young, handicap - 5).await;
+    age(&mut conn, young, handicap - FIFO_LEAD_SECS).await;
     let fresh = activity_continuation(&mut conn, &queue).await;
     assert_eq!(claim_one(&mut conn, &queue, &worker).await, Some(fresh));
     assert_eq!(claim_one(&mut conn, &queue, &worker).await, Some(young));
 
     let queue = unique("old");
     let old = new_start(&mut conn, &queue, 0).await;
-    age(&mut conn, old, handicap + 5).await;
+    age(&mut conn, old, handicap + FIFO_LEAD_SECS).await;
     let fresh = activity_continuation(&mut conn, &queue).await;
     assert_eq!(claim_one(&mut conn, &queue, &worker).await, Some(old));
     assert_eq!(claim_one(&mut conn, &queue, &worker).await, Some(fresh));
@@ -306,7 +330,7 @@ async fn explicit_priority_outranks_the_continuation_band() {
     let queue = unique("prio");
 
     let continuation = activity_continuation(&mut conn, &queue).await;
-    age(&mut conn, continuation, 2).await;
+    age(&mut conn, continuation, FIFO_LEAD_SECS).await;
     let urgent_start = new_start(&mut conn, &queue, 1).await;
 
     assert_eq!(
