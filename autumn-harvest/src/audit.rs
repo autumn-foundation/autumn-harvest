@@ -338,9 +338,10 @@ pub const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
 pub enum RouteClass {
     /// Always safe to expose without authentication.
     ///
-    /// `GET /health` and `GET /openapi.json`. Kubernetes liveness/readiness
+    /// `GET /health`, `GET /health/live`, `GET /health/ready` and
+    /// `GET /openapi.json`. Kubernetes liveness/readiness
     /// probes and load-balancer health checks commonly require the health
-    /// endpoint to be reachable without credentials. The `OpenAPI` document
+    /// endpoints to be reachable without credentials. The `OpenAPI` document
     /// describes the route surface only and carries no execution state.
     /// Exposing both is an explicit product decision, not an oversight.
     PublicSafe,
@@ -402,6 +403,9 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Kubernetes liveness/readiness probes and load-balancer health checks
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
+    // The probe split of /health (issue #1812). No worker ids, queues or shard detail.
+    ("GET /health/live", RouteClass::PublicSafe),
+    ("GET /health/ready", RouteClass::PublicSafe),
     // The published OpenAPI document. Route surface only, no execution state,
     // and a client generator must reach it before it holds a credential.
     ("GET /openapi.json", RouteClass::PublicSafe),
@@ -992,6 +996,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /dags/{dag_name}/runs/{run_exec_id}",
     "GET /dead-letters",
     "GET /health",
+    "GET /health/live",
+    "GET /health/ready",
     "GET /openapi.json",
     "GET /admin/preflight",
     "GET /admin/shards/health",
@@ -1177,6 +1183,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /dlq/redrive", Some(OP_DLQ_REDRIVE)),
     // Health / observability (read-only)
     ("GET /health", None),
+    ("GET /health/live", None),
+    ("GET /health/ready", None),
     ("GET /openapi.json", None),
     ("GET /admin/preflight", None),
     ("GET /admin/shards/health", None),

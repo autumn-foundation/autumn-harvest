@@ -1653,6 +1653,10 @@ async fn start_harvest_runtime(
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
+    // Issue #1812: a new start ends an old drain. autumn-web marks its probe
+    // state at SIGTERM, before the shutdown hook runs, so readiness reads it.
+    api_state.end_draining();
+    api_state.link_host_probes(state.probes().clone());
     api_state.set_deployment_profile(state.profile().to_string());
     api_state.set_admin_auth_session_key(state.auth_session_key());
     warn_if_dev_admin_api_is_open(state.profile(), api_state.admin_auth_boundary());
@@ -2275,6 +2279,10 @@ fn harvest_database_url(
 }
 
 async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: HarvestApiState) {
+    // Issue #1812: autumn-web has already closed the listener at this point.
+    // The linked probe state reported the drain earlier. This call covers a
+    // state with no linked probes.
+    api_state.begin_draining();
     let runtime = { slot.lock().expect("harvest lock poisoned").runtime.take() };
 
     let Some(runtime) = runtime else {
@@ -2599,6 +2607,15 @@ mod migration_remedy_tests {
 mod tests {
     use super::*;
     use std::any::TypeId;
+
+    /// Issue #1812: the shutdown hook sets the drain, also with no runtime.
+    #[tokio::test]
+    async fn stop_harvest_runtime_sets_the_drain() {
+        let api_state = HarvestApiState::new();
+        let slot = Arc::new(Mutex::new(HarvestRuntimeSlot::default()));
+        stop_harvest_runtime(slot, api_state.clone()).await;
+        assert!(api_state.is_draining());
+    }
 
     /// **Issue #1284.** The startup warning's predicate must be exact: it fires
     /// for, and only for, the one configuration under which

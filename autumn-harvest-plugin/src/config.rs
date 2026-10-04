@@ -45,7 +45,8 @@ pub struct HarvestBatchConfig {
 /// Readiness and health endpoint behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HarvestReadinessConfig {
-    /// When true, `/health` returns 503 unless writable/candidate shards are ready.
+    /// When true, `/health` and `/health/ready` return 503 unless
+    /// writable/candidate shards are ready.
     pub require_shard_readiness: bool,
 }
 

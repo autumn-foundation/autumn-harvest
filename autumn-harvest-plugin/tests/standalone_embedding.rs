@@ -584,6 +584,100 @@ async fn stop_tears_down_globals_and_the_api_state() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
+/// Signals that `embed_block` is running.
+static BLOCK_ENTERED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+/// Lets `embed_block` finish.
+static BLOCK_RELEASE: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// A workflow that stays in flight until the test releases it.
+fn blocking_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        BLOCK_ENTERED.notify_one();
+        BLOCK_RELEASE.notified().await;
+        Ok(input)
+    })
+}
+
+async fn wait_for_unready(router: &axum::Router) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (status, body) = send(router, "GET", "/health/ready", None, None).await;
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("readiness should drop while stop runs")
+}
+
+/// Issue #1812: `stop` drops readiness before in-flight work stops.
+/// Liveness stays 200 during the drain.
+#[tokio::test]
+async fn stop_drops_readiness_before_in_flight_work_stops() {
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = database().await;
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            workflow_info("embed_echo"),
+            WorkflowInfo {
+                handler: blocking_workflow,
+                ..workflow_info("embed_block")
+            },
+        ])
+        .worker(WorkerConfig {
+            shutdown_timeout: Duration::from_secs(20),
+            ..WorkerConfig::default()
+        })
+        .build();
+    let runtime =
+        HarvestEmbedding::new(built, config(&url), HarvestRunnerResources::new(pool(&url)))
+            .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
+            .start()
+            .await
+            .expect("embedding should start");
+    let router = runtime.router();
+
+    let (status, body) = send(&router, "GET", "/health/ready", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["database_reachable"], true);
+
+    let (status, started) = send(
+        &router,
+        "POST",
+        "/workflows/embed_block/start",
+        None,
+        Some(json!({ "workflow_id": "block-1", "input": {} })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{started}");
+    tokio::time::timeout(Duration::from_secs(20), BLOCK_ENTERED.notified())
+        .await
+        .expect("the blocking workflow should start");
+
+    let stop = tokio::spawn(runtime.stop());
+    let body = wait_for_unready(&router).await;
+    // The runtime is still installed, so only the drain explains the 503.
+    assert_eq!(body["runtime_ready"], true, "{body}");
+    assert_eq!(body["reasons"], json!(["draining"]), "{body}");
+    assert!(!stop.is_finished(), "the in-flight workflow holds stop");
+    let (status, live) = send(&router, "GET", "/health/live", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(live["draining"], true);
+
+    BLOCK_RELEASE.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), stop)
+        .await
+        .expect("stop should finish")
+        .expect("stop should not panic");
+}
+
 // ---------------------------------------------------------------------------
 // Multi-shard
 // ---------------------------------------------------------------------------
