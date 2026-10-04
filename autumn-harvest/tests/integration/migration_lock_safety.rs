@@ -121,6 +121,18 @@ const GRANDFATHERED: &[(&str, Rule, &str)] = &[
          this lint.",
     ),
     (
+        "20261001190405_harvest_audit_unexported_idx_lazy",
+        Rule::BlockingIndex,
+        "Drops the audit claim-scan index through EXECUTE, only on a database \
+         with no export cursor. Shipped before this lint.",
+    ),
+    (
+        "20261001190405_harvest_audit_unexported_idx_lazy",
+        Rule::LockTimeout,
+        "The 5 s bound and the drop sit in one IF branch, so the bound is in \
+         force. The lint does not count a setter inside a branch.",
+    ),
+    (
         "20261001192155_harvest_quota_reconcile_name_id_index",
         Rule::BlockingIndex,
         "Guarded plain build. The upgrade guide tells operators to prebuild \
@@ -653,9 +665,13 @@ fn lex(
                     i += 1;
                 }
             }
-            // A `DO` body may be a plain string, so it is code too.
+            // A `DO` body may be a plain string, so it is code too. So is the
+            // SQL that PL/pgSQL `EXECUTE` runs.
             if in_do_statement(toks, depth) {
                 let body: Vec<char> = value.chars().collect();
+                lex(&body, start_line, depth + 1, runs, toks, comments);
+            } else if in_execute_statement(toks, depth) {
+                let body: Vec<char> = fill_placeholders(&value).chars().collect();
                 lex(&body, start_line, depth + 1, runs, toks, comments);
             } else {
                 toks.push(Token {
@@ -700,7 +716,14 @@ fn lex(
             // Only a `DO` body runs now. Any other body, such as a
             // function body or a string, runs later or never.
             let body_runs = runs && in_do_statement(toks, depth);
-            lex(body, line, depth + 1, body_runs, toks, comments);
+            if in_execute_statement(toks, depth) {
+                let filled: Vec<char> = fill_placeholders(&body.iter().collect::<String>())
+                    .chars()
+                    .collect();
+                lex(&filled, line, depth + 1, runs, toks, comments);
+            } else {
+                lex(body, line, depth + 1, body_runs, toks, comments);
+            }
             line += body.iter().filter(|c| **c == '\n').count();
             i = (body_end + len).min(chars.len());
         } else if matches!(c, 'u' | 'U')
@@ -717,6 +740,11 @@ fn lex(
             let value = decode_unicode(&raw, escape);
             if quote == '\'' && in_do_statement(toks, depth) {
                 let body: Vec<char> = value.chars().collect();
+                lex(&body, start_line, depth + 1, runs, toks, comments);
+                continue;
+            }
+            if quote == '\'' && in_execute_statement(toks, depth) {
+                let body: Vec<char> = fill_placeholders(&value).chars().collect();
                 lex(&body, start_line, depth + 1, runs, toks, comments);
                 continue;
             }
@@ -876,12 +904,69 @@ fn decode_unicode(raw: &str, escape: char) -> String {
 
 /// Whether the open statement at `depth` starts with `DO`.
 fn in_do_statement(toks: &[Token], depth: usize) -> bool {
+    statement_head(toks, depth).is_some_and(|t| t.tok == Tok::Word("do".to_string()))
+}
+
+/// Whether the open statement at `depth` is a PL/pgSQL `EXECUTE`.
+///
+/// A top-level `EXECUTE` runs a prepared statement. Its arguments are data.
+fn in_execute_statement(toks: &[Token], depth: usize) -> bool {
+    depth > 0
+        && statement_head(toks, depth).is_some_and(|t| t.tok == Tok::Word("execute".to_string()))
+}
+
+/// The first token of the open statement at `depth`.
+///
+/// Inside a PL/pgSQL body, `BEGIN`, `THEN`, `ELSE` and `LOOP` also end the
+/// statement before, as in `Stmts::new`.
+fn statement_head(toks: &[Token], depth: usize) -> Option<&Token> {
+    let opens = |t: &Token| match &t.tok {
+        Tok::Punct(';') => true,
+        Tok::Word(w) => depth > 0 && ["begin", "then", "else", "loop"].contains(&w.as_str()),
+        _ => false,
+    };
     toks.iter()
         .rev()
         .filter(|t| t.depth == depth)
-        .take_while(|t| t.tok != Tok::Punct(';'))
+        .take_while(|t| !opens(t))
         .last()
-        .is_some_and(|t| t.tok == Tok::Word("do".to_string()))
+}
+
+/// Replace each `format()` placeholder in `sql` with the unknown name `"%"`.
+///
+/// `%%` is a literal `%`. A placeholder may carry a position, flags and a
+/// width, as in `%1$-10I`.
+fn fill_placeholders(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        if c != '%' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if chars.get(i + 1) == Some(&'%') {
+            out.push('%');
+            i += 2;
+            continue;
+        }
+        let mut j = i + 1;
+        while chars
+            .get(j)
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, '$' | '-' | '*'))
+        {
+            j += 1;
+        }
+        if matches!(chars.get(j), Some('I' | 's' | 'L')) {
+            out.push_str("\"%\"");
+            i = j + 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// The length of a dollar-quote delimiter such as `$$` or `$body$`.
@@ -1063,10 +1148,13 @@ impl<'a> Stmts<'a> {
     }
 
     /// Read a name that may carry a schema. Return the name as written and the next index.
+    ///
+    /// A name never runs past the end of the body that holds it.
     fn qualified_name(&self, k: usize) -> Option<(String, usize)> {
         let mut name = self.word(k)?.to_string();
+        let depth = self.toks[k].depth;
         let mut k = k + 1;
-        while self.is_punct(k, '.') {
+        while self.is_punct(k, '.') && self.toks.get(k + 1).is_some_and(|t| t.depth == depth) {
             let Some(part) = self.word(k + 1) else {
                 break;
             };
@@ -1090,7 +1178,11 @@ impl<'a> Stmts<'a> {
             names.push(name);
             // `name *` asks for the descendant tables too, which is the default.
             let next = next + usize::from(self.is_punct(next, '*'));
-            if !self.is_punct(next, ',') {
+            let same_body = self
+                .toks
+                .get(next)
+                .is_some_and(|t| t.depth == self.toks[k].depth);
+            if !same_body || !self.is_punct(next, ',') {
                 break;
             }
             k = next + 1;
@@ -1281,6 +1373,18 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 raws.push(Raw::lock(k, "CLUSTER", table));
             }
             Some("vacuum") if start => raws.extend(vacuum_full(&s, k)),
+            // The lint reads only constant SQL. An `EXECUTE` of a variable or
+            // of built SQL may lock anything.
+            Some("execute") if start && tok.depth > 0 => {
+                let end = s.end(k);
+                let constant = (k + 1..end).any(|j| toks[j].depth > tok.depth);
+                let built = (k..end).any(|j| {
+                    toks[j].depth == tok.depth && s.is_punct(j, '|') && s.is_punct(j + 1, '|')
+                });
+                if !constant || built {
+                    raws.push(Raw::lock(k, "EXECUTE of SQL the lint cannot read", None));
+                }
+            }
             Some("reindex") if start => raws.extend(reindex(&s, k)),
             Some("references") => {
                 let owner = s.statement_table(s.starts[k]);
@@ -1432,10 +1536,13 @@ fn resolve(
         |name: &str, at: usize| !name.contains('.') && path_change.is_some_and(|c| c < at);
     let mut hits = Vec::with_capacity(raws.len());
     for raw in raws {
-        let table = raw.table.or_else(|| {
+        // A `format()` placeholder makes a name unknown, which fails closed.
+        let placeholder = raw.table.as_deref().is_some_and(|t| t.contains('%'))
+            || raw.index.as_deref().is_some_and(|i| i.contains('%'));
+        let table = raw.table.filter(|_| !placeholder).or_else(|| {
             raw.index
                 .as_deref()
-                .filter(|i| !unplaced(i, raw.at))
+                .filter(|i| !placeholder && !unplaced(i, raw.at))
                 .and_then(|i| history.index_table(i))
         });
         // The history only grows, so a later build of the same name cannot
@@ -3750,6 +3857,51 @@ fn alter_index_rename_moves_the_history() {
         let sql = format!("DROP INDEX {new_name};");
         assert_eq!(lint_with_history(&history, &sql, true), [], "{moved}");
     }
+}
+
+#[test]
+fn execute_runs_its_constant_sql() {
+    // PL/pgSQL `EXECUTE` runs the string, so the lint scans it as code.
+    for body in [
+        "EXECUTE 'ALTER TABLE harvest_events ADD COLUMN x INT';",
+        "EXECUTE $q$ALTER TABLE harvest_events ADD COLUMN x INT$q$;",
+        "EXECUTE format('ALTER TABLE %I ADD COLUMN x INT', 'harvest_events');",
+    ] {
+        let sql = format!("DO $$\nBEGIN\n    {body}\nEND $$;");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{body}: {findings:?}"
+        );
+    }
+    // A placeholder is an unknown name, and an unknown index counts as hot.
+    let sql = "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    \
+               EXECUTE format('DROP INDEX %I.idx_x', 'staging');\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+    // SQL with no lock passes.
+    let sql = "DO $$\nBEGIN\n    EXECUTE 'SELECT 1';\nEND $$;";
+    assert_eq!(lint_with_history(&[], sql, true), []);
+}
+
+#[test]
+fn execute_of_sql_the_lint_cannot_read_fails_closed() {
+    for body in [
+        "EXECUTE 'ALTER TABLE ' || quote_ident('t') || ' ADD COLUMN x INT';",
+        "EXECUTE q;",
+    ] {
+        let sql = format!("DO $$\nDECLARE q TEXT := 'SELECT 1';\nBEGIN\n    {body}\nEND $$;");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{body}: {findings:?}"
+        );
+    }
+    // A top-level `EXECUTE` runs a prepared statement. Its arguments are data.
+    let sql = "EXECUTE plan('ALTER TABLE harvest_events ADD COLUMN x INT');";
+    assert_eq!(lint_with_history(&[], sql, true), []);
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

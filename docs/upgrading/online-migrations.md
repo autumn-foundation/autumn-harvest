@@ -242,8 +242,10 @@ that no longer matches a finding also fails the build.
 
 ## 8. Known limits
 
-- The lint does not see SQL that `EXECUTE` builds from a string. For
-  example, `20261001190405` drops an index on `harvest_audit_log` that way.
+- In a PL/pgSQL body, the lint scans the constant SQL that `EXECUTE` runs.
+  That includes a `format()` template, where each placeholder is an unknown
+  name. The lint cannot read SQL built with `||` or held in a variable, so
+  such an `EXECUTE` counts as a lock on an unknown table.
 - The lint scans a dollar-quoted string as code. A statement inside one can
   fail the lint. That error is on the safe side. A single-quoted `DO` body is
   code too.
