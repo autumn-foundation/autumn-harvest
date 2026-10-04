@@ -1652,9 +1652,9 @@ async fn enforce_activity_timeout(
     Ok(())
 }
 
-/// Record the timed-out claim on its row, so the worker that held it can tell
-/// this timeout from any other loss of its claim (issue #1809). A `PENDING`
-/// task holds no claim and records nothing.
+/// Record the timed-out claim on its row (issue #1809). The worker that held
+/// it can then tell this timeout from any other loss of its claim. A
+/// `PENDING` task holds no claim and records nothing.
 async fn record_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
