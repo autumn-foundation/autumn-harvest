@@ -116,7 +116,7 @@ async fn connect(url: &str) -> AsyncPgConnection {
         .expect("connect to test DB")
 }
 
-fn quick_policy(max_attempts: u32) -> TxRetryPolicy {
+const fn quick_policy(max_attempts: u32) -> TxRetryPolicy {
     TxRetryPolicy {
         max_attempts,
         base_delay: Duration::from_millis(2),
@@ -620,6 +620,11 @@ async fn lock_xact(conn: &mut AsyncPgConnection, key: i64) -> HarvestResult<()> 
 /// A `REPEATABLE READ` write after a concurrent commit aborts with `40001`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_serialization_failure_is_retried_on_a_fresh_snapshot() {
+    #[derive(diesel::QueryableByName)]
+    struct Value {
+        #[diesel(sql_type = Integer)]
+        v: i32,
+    }
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut setup = connect(&url).await;
     let table = format!("harvest_test_tx1822_{}", std::process::id());
@@ -683,11 +688,6 @@ async fn a_serialization_failure_is_retried_on_a_fresh_snapshot() {
     .expect("the retry commits");
     writer.await.expect("join writer");
 
-    #[derive(diesel::QueryableByName)]
-    struct Value {
-        #[diesel(sql_type = Integer)]
-        v: i32,
-    }
     let value = diesel::sql_query(format!("SELECT v FROM {table} WHERE id = 1"))
         .get_result::<Value>(&mut setup)
         .await
