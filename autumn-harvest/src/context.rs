@@ -15489,6 +15489,7 @@ impl ActivityContext {
     /// [`Self::start_auto_heartbeat_default`] does. The checkpoint therefore
     /// does not change. It never completes. Without a heartbeat timeout or a
     /// flusher, it only pends. The `start_to_close` ceiling still applies.
+    #[cfg(feature = "db")]
     pub(crate) async fn keep_alive_after_drain(&self) -> std::convert::Infallible {
         let (Some(timeout), Some(tx)) = (self.heartbeat_timeout, self.heartbeat_tx.as_ref()) else {
             return std::future::pending().await;
