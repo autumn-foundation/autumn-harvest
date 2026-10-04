@@ -383,6 +383,12 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // that has already run on a fresh database cannot meet those states any
     // other way.
     "autumn-harvest/tests/integration/audit_export_tests.rs",
+    // Does not BUILD a schema from the include. The suite bootstraps through
+    // `test_init_sql()` like every other. It REPLAYS the task-queue hygiene
+    // migration (issue #1811), `20261003201739_harvest_task_queue_hygiene`.
+    // The test runs `down.sql`, then `up.sql` twice, on a migrated database.
+    // That proves the round trip and that a second `up.sql` changes nothing.
+    "autumn-harvest/tests/integration/terminal_task_gc_tests.rs",
 ];
 
 /// True when a single source line reintroduces a hand-rolled migration bundle: a

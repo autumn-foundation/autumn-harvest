@@ -763,10 +763,15 @@ async fn stale_execution_failure_under_a_reused_strike_count_changes_nothing() {
     requeue_orphan(&mut conn, &first).await;
     live_worker(&mut conn, &w).await;
     let second = claim(&mut conn, &fx, &w).await;
-    let released =
-        queue::release_terminal_workflow_claim(&mut conn, second.id, &w, second.crash_strikes)
-            .await
-            .expect("release runs");
+    let released = queue::release_terminal_workflow_claim(
+        &mut conn,
+        second.id,
+        &w,
+        second.crash_strikes,
+        second.attempt,
+    )
+    .await
+    .expect("release runs");
     assert!(released, "the release must put the row back to PENDING");
     let third = claim(&mut conn, &fx, &w).await;
     assert_eq!(

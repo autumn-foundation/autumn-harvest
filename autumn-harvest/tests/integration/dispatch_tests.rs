@@ -1018,6 +1018,7 @@ async fn the_by_id_claim_honours_the_dr_fence() {
     )
     .await
     .expect("fenced by-id claim");
+    let claimed_attempt = claimed.as_ref().map_or(0, |task| task.attempt);
     assert_eq!(
         claimed.map(|task| task.id),
         Some(task_id),
@@ -1025,9 +1026,15 @@ async fn the_by_id_claim_honours_the_dr_fence() {
     );
 
     // Give the row back, promote the shard, and try again with the now-stale pin.
-    autumn_harvest::queue::release_terminal_workflow_claim(&mut conn, task_id, "dr-worker", 0)
-        .await
-        .expect("release");
+    autumn_harvest::queue::release_terminal_workflow_claim(
+        &mut conn,
+        task_id,
+        "dr-worker",
+        0,
+        claimed_attempt,
+    )
+    .await
+    .expect("release");
     bump_generation(&mut conn, shard, "promote", "operator")
         .await
         .expect("bump");

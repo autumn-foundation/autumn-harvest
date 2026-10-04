@@ -1729,7 +1729,7 @@ pub fn spawn_worker_heartbeat(
                 AtomicUsize::load(&act_max, Ordering::Relaxed),
             );
             let in_use_sessions = crate::sessions::session_slot_count(&session_slots_in_use);
-            // Selected against `cancel` (issue #1209). Harvest configures no
+            // Selected against `cancel` (issue #1209). A pool may have no
             // deadpool `Timeouts`, so `pool.get()` alone can park this task
             // indefinitely on an exhausted shard pool. The top-of-loop select
             // only guards the sleep between ticks. A tick already parked here
