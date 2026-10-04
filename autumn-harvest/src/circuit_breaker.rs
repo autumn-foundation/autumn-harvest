@@ -109,9 +109,11 @@ impl DispatchToken {
 
 /// One claim of a task: the queue row and the attempt that the claim wrote.
 ///
-/// The timeout enforcer marks a claim when it times out (issue #1809). The
-/// result of a marked claim does not move the breaker, because the enforcer
-/// already counted that attempt.
+/// A worker registers each claim it dispatches with
+/// [`CircuitBreakerRegistry::begin_claim`]. The timeout enforcer marks a
+/// registered claim when it times out (issue #1809). The result of a marked
+/// claim does not move the breaker, because the enforcer already counted that
+/// attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClaimKey {
     /// The task queue row.
@@ -119,13 +121,6 @@ pub struct ClaimKey {
     /// The row's `attempt` value that the claim wrote.
     pub attempt: i32,
 }
-
-/// How long a timed-out claim stays marked. A handler that returns later than
-/// this counts as a normal result again.
-const TIMED_OUT_CLAIM_TTL: Duration = Duration::from_secs(3600);
-
-/// The most timed-out claims kept per activity. The oldest mark goes first.
-const MAX_TIMED_OUT_CLAIMS: usize = 4096;
 
 /// Outcome of consulting the breaker before dispatching an activity attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,9 +217,12 @@ struct BreakerState {
     /// (trip / close / force-open / force-close). A result whose dispatch token
     /// carries an older generation is a stale straggler and is fenced out.
     generation: u64,
-    /// Claims that the timeout enforcer timed out, with the mark time (issue
-    /// #1809). Their late results do not move the breaker.
-    timed_out_claims: HashMap<ClaimKey, Instant>,
+    /// Claims that this process dispatched and that have not reported yet,
+    /// each with its timed-out mark (issue #1809). A worker holds at most its
+    /// concurrency limit of claims, so the map stays small. Every exit of a
+    /// dispatch removes its entry, so no mark can expire while its claim can
+    /// still report.
+    in_flight_claims: HashMap<ClaimKey, bool>,
 }
 
 impl Default for BreakerState {
@@ -237,7 +235,7 @@ impl Default for BreakerState {
             probe_in_flight: false,
             forced_open: false,
             generation: 0,
-            timed_out_claims: HashMap::new(),
+            in_flight_claims: HashMap::new(),
         }
     }
 }
@@ -446,7 +444,8 @@ impl CircuitBreakerRegistry {
     /// the breaker (issue #1809). The enforcer counted that attempt, and a late
     /// success must not clear the failure window. A timed-out probe releases
     /// its slot as [`on_cancelled`](Self::on_cancelled) does. The check and the
-    /// update run under one lock, so they cannot race the enforcer.
+    /// update run under one lock, so they cannot race the enforcer. The claim
+    /// leaves the in-flight set.
     pub fn on_claim_result(
         &self,
         activity_name: &str,
@@ -458,47 +457,63 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        if st.timed_out_claims.remove(&claim).is_some() {
+        if st.in_flight_claims.remove(&claim) == Some(true) {
             apply_cancelled(st, token, now);
             return None;
         }
         apply_result(st, policy, outcome, token, now)
     }
 
-    /// Mark `claim` as timed out by the enforcer (issue #1809).
+    /// Register `claim` as dispatched by this process (issue #1809).
     ///
-    /// A later [`on_claim_result`](Self::on_claim_result) for the claim then
-    /// leaves the breaker alone. A mark expires after an hour, and each
-    /// activity keeps at most a bounded number of marks.
-    pub fn mark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey, now: Instant) {
+    /// Only a registered claim can be marked. Call [`end_claim`](Self::end_claim)
+    /// or a claim-aware report on every exit of the dispatch.
+    pub fn begin_claim(&self, activity_name: &str, claim: ClaimKey) {
         if !self.policies.contains_key(activity_name) {
             return;
         }
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        st.timed_out_claims
-            .retain(|_, at| now.saturating_duration_since(*at) < TIMED_OUT_CLAIM_TTL);
-        if st.timed_out_claims.len() >= MAX_TIMED_OUT_CLAIMS
-            && let Some(oldest) = st
-                .timed_out_claims
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(key, _)| *key)
-        {
-            st.timed_out_claims.remove(&oldest);
-        }
-        st.timed_out_claims.insert(claim, now);
+        st.in_flight_claims.insert(claim, false);
     }
 
-    /// Remove the mark of `claim`, when the enforcer did not time it out after
-    /// all (issue #1809). A result that already used the mark stays fenced.
-    pub fn unmark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
+    /// Remove `claim` from the in-flight set without a result (issue #1809).
+    /// A claim that already reported is not there, so this is then a no-op.
+    pub fn end_claim(&self, activity_name: &str, claim: ClaimKey) {
         if !self.policies.contains_key(activity_name) {
             return;
         }
         let mut states = self.lock();
         if let Some(st) = states.get_mut(activity_name) {
-            st.timed_out_claims.remove(&claim);
+            st.in_flight_claims.remove(&claim);
+        }
+    }
+
+    /// Mark `claim` as timed out by the enforcer (issue #1809).
+    ///
+    /// A later [`on_claim_result`](Self::on_claim_result) for the claim then
+    /// leaves the breaker alone. A claim that this process does not hold has
+    /// no local result to fence, so the mark then does nothing.
+    pub fn mark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
+        self.set_timed_out(activity_name, claim, true);
+    }
+
+    /// Remove the mark of `claim`, when the enforcer did not time it out after
+    /// all (issue #1809). A result that already used the mark stays fenced.
+    pub fn unmark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
+        self.set_timed_out(activity_name, claim, false);
+    }
+
+    fn set_timed_out(&self, activity_name: &str, claim: ClaimKey, timed_out: bool) {
+        if !self.policies.contains_key(activity_name) {
+            return;
+        }
+        let mut states = self.lock();
+        if let Some(mark) = states
+            .get_mut(activity_name)
+            .and_then(|st| st.in_flight_claims.get_mut(&claim))
+        {
+            *mark = timed_out;
         }
     }
 
@@ -865,7 +880,8 @@ mod tests {
         let reg = registry();
         let t0 = Instant::now();
         let token = dispatch(&reg, t0);
-        reg.mark_claim_timed_out("send_email", claim(1), t0);
+        reg.begin_claim("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
         let _ = reg.on_external_failure("send_email", t0);
         assert_eq!(rolling(&reg, t0), 1);
 
@@ -886,8 +902,9 @@ mod tests {
         let reg = registry();
         let t0 = Instant::now();
         let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1));
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
-        reg.mark_claim_timed_out("send_email", claim(1), t0);
+        reg.mark_claim_timed_out("send_email", claim(1));
         let _ = reg.on_external_failure("send_email", t0);
         assert_eq!(rolling(&reg, t0), 1);
     }
@@ -903,7 +920,8 @@ mod tests {
         let t1 = t0 + Duration::from_secs(61);
         let probe = dispatch(&reg, t1);
         assert!(probe.is_probe());
-        reg.mark_claim_timed_out("send_email", claim(1), t1);
+        reg.begin_claim("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
         let late = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t1);
         assert_eq!(late, None, "a timed-out probe does not close the breaker");
         assert_eq!(
@@ -922,7 +940,8 @@ mod tests {
         let t0 = Instant::now();
         fail(&reg, t0);
         let token = dispatch(&reg, t0);
-        reg.mark_claim_timed_out("send_email", claim(1), t0);
+        reg.begin_claim("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
         reg.unmark_claim_timed_out("send_email", claim(1));
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
         assert_eq!(
@@ -932,24 +951,23 @@ mod tests {
         );
     }
 
-    /// A mark expires, so the mark set cannot grow without bound.
+    /// A claim that this process does not hold cannot be marked, and an
+    /// ended claim leaves nothing behind.
     #[test]
-    fn timed_out_claim_marks_expire() {
+    fn only_in_flight_claims_are_marked() {
         let reg = registry();
         let t0 = Instant::now();
-        reg.mark_claim_timed_out("send_email", claim(1), t0);
-        let later = t0 + TIMED_OUT_CLAIM_TTL + Duration::from_secs(1);
-        reg.mark_claim_timed_out("send_email", claim(2), later);
-        let token = dispatch(&reg, later);
-        fail(&reg, later);
-        let _ = reg.on_claim_result(
-            "send_email",
-            AttemptOutcome::Success,
-            token,
-            claim(1),
-            later,
-        );
-        assert_eq!(rolling(&reg, later), 0, "the expired mark no longer fences");
+        reg.mark_claim_timed_out("send_email", claim(9));
+        fail(&reg, t0);
+        let token = dispatch(&reg, t0);
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(9), t0);
+        assert_eq!(rolling(&reg, t0), 0, "a foreign mark does not fence");
+
+        reg.begin_claim("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
+        reg.end_claim("send_email", claim(1));
+        let states = reg.lock();
+        assert!(states["send_email"].in_flight_claims.is_empty());
     }
 
     #[test]

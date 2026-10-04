@@ -15179,18 +15179,26 @@ struct CircuitProbeGuard<'a> {
     breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
     activity_name: &'a str,
     token: Option<crate::circuit_breaker::DispatchToken>,
+    claim: crate::circuit_breaker::ClaimKey,
 }
 
 impl<'a> CircuitProbeGuard<'a> {
-    const fn new(
+    /// Also registers the claim as in flight, so the timeout enforcer can
+    /// mark it (issue #1809). The drop ends the claim on every exit.
+    fn new(
         breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
         activity_name: &'a str,
         token: Option<crate::circuit_breaker::DispatchToken>,
+        claim: crate::circuit_breaker::ClaimKey,
     ) -> Self {
+        if token.is_some() {
+            breakers.begin_claim(activity_name, claim);
+        }
         Self {
             breakers,
             activity_name,
             token,
+            claim,
         }
     }
 
@@ -15206,6 +15214,8 @@ impl Drop for CircuitProbeGuard<'_> {
             self.breakers
                 .on_cancelled(self.activity_name, token, std::time::Instant::now());
         }
+        // A claim that reported is already gone, so this is then a no-op.
+        self.breakers.end_claim(self.activity_name, self.claim);
     }
 }
 
@@ -15635,7 +15645,12 @@ async fn process_activity_task(
     };
     // Releases a half-open probe on every early return, `?` included (issue
     // #1809). In defer mode a leaked probe would defer this activity forever.
-    let mut probe_guard = CircuitProbeGuard::new(&circuit_breakers, activity_name, circuit_token);
+    let claim_key = crate::circuit_breaker::ClaimKey {
+        task_id: task.id,
+        attempt: task.attempt,
+    };
+    let mut probe_guard =
+        CircuitProbeGuard::new(&circuit_breakers, activity_name, circuit_token, claim_key);
 
     // Defer mode (issue #1809): an open breaker puts the task back to
     // PENDING until the next probe. The deferral runs before
@@ -16361,10 +16376,6 @@ async fn process_activity_task(
     // late result of that claim must not count again, and a late success must
     // not clear the failure window. `on_claim_result` checks the mark under
     // the breaker lock, so the check cannot race the enforcer.
-    let claim_key = crate::circuit_breaker::ClaimKey {
-        task_id: activity_claim.task_id,
-        attempt: activity_claim.attempt,
-    };
     if let Some(transition) = circuit_token
         .zip(circuit_outcome)
         .and_then(|(token, outcome)| {

@@ -1340,7 +1340,7 @@ async fn enforce_activity_timeout(
         attempt: task.attempt,
     };
     if let Some(breakers) = circuit_breakers {
-        breakers.mark_claim_timed_out(activity_name, claim_key, std::time::Instant::now());
+        breakers.mark_claim_timed_out(activity_name, claim_key);
     }
     // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
     // scope ties its publish to this transaction's commit.
