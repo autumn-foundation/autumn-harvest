@@ -112,7 +112,8 @@ SET lock_timeout` does not change the current session. Inside a `DO` block,
 bare `SELECT` or `PERFORM` of the call. A query with a filter may never call
 the function, so it does not count. The same call in a
 function body does not count for the migration, because the body runs only
-when something calls the function. A lock in a function body needs its own
+when something calls the function. That includes a `BEGIN ATOMIC` body and the
+`RETURN` body of a SQL function. A lock in a function body needs its own
 bound earlier in the body, because the migration's bound may not hold when
 the function runs. A `SET lock_timeout` clause in `CREATE FUNCTION` or
 `CREATE PROCEDURE` also counts, because Postgres applies it on each call.
@@ -127,7 +128,8 @@ also ends the bound when any such `CREATE` may clear it. Any other `CALL` also
 ends the bound, because the lint cannot read the body it reaches. Such a
 `CALL`, and any call of a locking routine from an earlier migration, also
 counts as a lock on an unknown table. A bound covers that lock only when the
-routine is known to lock and known not to clear. Otherwise the body may clear
+routine is known to lock and known not to clear. The call must also name it
+with the same schema and number of parameters. Otherwise the body may clear
 the bound before it locks, so no bound covers the call. A routine that calls a
 locking routine counts as a locking routine too.
 A call of a clearing routine that an earlier migration created ends the bound

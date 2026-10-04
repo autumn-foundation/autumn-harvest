@@ -250,6 +250,10 @@ struct History {
     /// Each routine whose body may take a lock, without its schema. A call of
     /// such a routine in a later migration counts as a lock.
     locking_routines: BTreeSet<String>,
+    /// The full identity of each routine that may lock and does not clear the
+    /// bound, from `identity`. Only a call of that exact identity keeps an
+    /// outside bound. Another schema or arity may reach a routine that clears.
+    bounded_routines: BTreeSet<String>,
 }
 
 impl History {
@@ -713,9 +717,20 @@ fn mark_atomic_bodies(toks: &mut [Token]) {
     let mut k = 0;
     while k + 1 < toks.len() {
         let depth = toks[k].depth;
-        let opens = word(&toks[k], "begin")
-            && word(&toks[k + 1], "atomic")
-            && statement_head(&toks[..k], depth).is_some_and(|t| word(t, "create"));
+        let in_create = statement_head(&toks[..k], depth).is_some_and(|t| word(t, "create"));
+        // A SQL function may have a `RETURN expression` body instead. It runs
+        // on each call, up to the end of the statement.
+        if in_create && word(&toks[k], "return") {
+            let end = (k..toks.len())
+                .find(|&j| toks[j].depth == depth && toks[j].tok == Tok::Punct(';'))
+                .unwrap_or(toks.len());
+            for tok in &mut toks[k..end] {
+                tok.runs = false;
+            }
+            k = end.max(k + 1);
+            continue;
+        }
+        let opens = in_create && word(&toks[k], "begin") && word(&toks[k + 1], "atomic");
         if !opens {
             k += 1;
             continue;
@@ -2095,6 +2110,7 @@ fn call_clears(
     let inherited = history.clearing_routines.clone();
     let inherited_foreign = history.foreign_routines.clone();
     let inherited_locking = history.locking_routines.clone();
+    let inherited_bounded = history.bounded_routines.clone();
     let bases: BTreeSet<&str> = routines
         .iter()
         .map(|r| base(&r.name))
@@ -2173,7 +2189,11 @@ fn call_clears(
         if !foreign && !resolved && unread {
             // A routine that may clear the bound before it locks makes the
             // outside bound worthless. An unknown routine may do that too.
-            let may_clear = inherited.contains(callee) || !inherited_locking.contains(callee);
+            let known = call
+                .arity
+                .map(|n| identity(&call.name, n))
+                .is_some_and(|id| inherited_bounded.contains(&id));
+            let may_clear = inherited.contains(callee) || unplaced || !known;
             let verb = if may_clear {
                 UNREAD_CLEARING_CALL
             } else {
@@ -2260,7 +2280,22 @@ fn record_routines(
             break;
         }
     }
+    for r in routines.iter().filter(|r| !r.foreign) {
+        let name = base(&r.name);
+        if locking.contains(name)
+            && !history.clearing_routines.contains(name)
+            && let Some(id) = r.arity.map(|n| identity(&r.name, n))
+        {
+            history.bounded_routines.insert(id);
+        }
+    }
     history.locking_routines = locking;
+}
+
+/// The full identity of a routine: its name as written, schema included, and
+/// its number of parameters.
+fn identity(name: &str, arity: usize) -> String {
+    format!("{name}/{arity}")
 }
 
 /// The verb of a lock that a call of an unread routine may take.
@@ -6304,6 +6339,38 @@ fn a_call_of_an_earlier_routine_ends_a_new_table() {
             "{history}\n{findings:?}"
         );
     }
+}
+
+#[test]
+fn a_return_body_runs_only_when_called() {
+    let sql = "CREATE FUNCTION clear_timeout() RETURNS text LANGUAGE SQL \
+               RETURN set_config('lock_timeout', '0', true);\n\
+               SET LOCAL lock_timeout = '5s';\nSELECT clear_timeout();\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn an_inherited_call_needs_the_full_identity_to_keep_the_bound() {
+    let history = [
+        "CREATE PROCEDURE other.p() LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                    ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;",
+    ];
+    // Another schema or another arity may reach a routine that clears.
+    for call in ["CALL public.p();", "CALL p();", "CALL other.p(1);"] {
+        let sql = format!("SET LOCAL lock_timeout = '5s';\n{call}");
+        let findings = lint_with_history(&history, &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}\n{findings:?}");
+    }
+    // The same name and arity reach the known body, which does not clear.
+    let sql = "SET LOCAL lock_timeout = '5s';\nCALL other.p();";
+    assert_eq!(lint_with_history(&history, sql, true), [], "{sql}");
 }
 
 #[test]
