@@ -554,11 +554,13 @@ async fn fresh_heartbeat_does_not_defeat_start_to_close() {
 
     // Row 1 — FRESH heartbeat + start_to_close (started 10s ago, s2c 1s):
     // a fresh heartbeat (what auto-heartbeat produces) must NOT shield a wedged
-    // activity from the independent start_to_close ceiling.
+    // activity from the independent start_to_close ceiling. The fresh rows use
+    // a 5s heartbeat timeout. It is shorter than the 10s since the start, so
+    // only the heartbeat protects them. It also stays fresh on a loaded runner.
     let fresh_with_s2c = seed_running_activity(
         &mut conn,
         exec_id,
-        Some(Duration::from_secs(1)), // heartbeat_timeout 1s
+        Some(Duration::from_secs(5)), // heartbeat_timeout 5s
         Some(Duration::from_secs(1)), // start_to_close 1s
         10,                           // started 10s ago
         true,                         // fresh last_heartbeat_at = NOW()
@@ -570,7 +572,7 @@ async fn fresh_heartbeat_does_not_defeat_start_to_close() {
     let fresh_no_s2c = seed_running_activity(
         &mut conn,
         exec_id,
-        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(5)),
         None,
         10,
         true,

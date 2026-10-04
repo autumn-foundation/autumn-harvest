@@ -1369,11 +1369,11 @@ mod db {
     ///
     /// That is not just an optimisation, it is a deadlock fix.
     /// `spawn_timeout_checker_for_shard` holds its shard pool's connection for
-    /// the whole `enforce_timeouts_once` call. Harvest configures no deadpool
-    /// `Timeouts`, so every `pool.get().await` is an **unbounded** wait (see
-    /// `worker::shard_acquire_bound`) — a sweep that reached back into the same
+    /// the whole `enforce_timeouts_once` call. A pool may have no deadpool
+    /// `Timeouts`. Then every `pool.get().await` is an **unbounded** wait (see
+    /// `worker::shard_acquire_bound`). A sweep that reached back into the same
     /// pool for a second connection would park forever on a single-connection
-    /// pool, wedging not just rotation but every later resident of that tick:
+    /// pool. That wedges rotation and every later resident of that tick:
     /// timeout enforcement, broken-session reclaim, mutex-lease reclaim, and the
     /// scanner-liveness heartbeat.
     ///
