@@ -97,9 +97,6 @@ pub(crate) fn full_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Dur
 #[must_use]
 pub(crate) fn equal_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
     let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-    if hi <= 1 {
-        return base;
-    }
     Duration::from_nanos(equal_jitter_nanos(hi, stream_seed ^ u64::from(attempt)))
 }
 
@@ -2601,6 +2598,13 @@ fn compute_retry_delay_attempt_zero() {
 }
 
 #[test]
+fn compute_retry_delay_zero_initial_with_overflowing_power() {
+    // 2.0^4999 is infinite, and 0 * inf is NaN. The clamp turns NaN into 0.
+    let d = compute_retry_delay(Duration::ZERO, 2.0, Duration::from_secs(300), 5000);
+    assert_eq!(d, Duration::ZERO);
+}
+
+#[test]
 fn compute_retry_delay_negative_nan() {
     let d = compute_retry_delay(
         Duration::from_secs(1),
@@ -2619,8 +2623,9 @@ fn compute_retry_delay_negative_nan() {
 /// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
 ///
 /// The jitter proofs replace `mix64` with a stub that returns any `u64`. The
-/// bounds must hold for every mixed value, so the stub over-approximates the
-/// mixer and the proofs stay sound. With the real mixer, CBMC does not finish.
+/// bounds hold for every stub value, so they hold for the real mixer. The
+/// seed is any `u64` too, and `mix64` is a bijection, so the stub loses no
+/// case. With the real mixer, CBMC does not finish.
 ///
 /// The proofs work in nanoseconds. A proof through `Duration` must relate
 /// `as_nanos` to `from_nanos`, and CBMC does not finish that either.
@@ -2662,12 +2667,16 @@ mod kani_proofs {
         assert!(hi / 2 <= v && v <= hi);
     }
 
-    /// The backoff never panics and never exceeds `max_interval`.
+    /// The backoff never panics for any coefficient that is not NaN.
+    ///
+    /// The final `min` makes `d <= max` true by construction. The value of the
+    /// proof is that no float conversion panics on the way.
     ///
     /// CBMC reports any NaN result as an error, but the code handles NaN on
-    /// purpose. The proof therefore assumes a coefficient that is not NaN and
-    /// an initial interval above 0, so `0 * inf` cannot occur. The unit test
-    /// `compute_retry_delay_negative_nan` pins the NaN case.
+    /// purpose. The proof therefore excludes a NaN coefficient and an initial
+    /// interval of 0, because `0 * inf` is NaN. The unit tests
+    /// `compute_retry_delay_negative_nan` and
+    /// `compute_retry_delay_zero_initial_with_overflowing_power` pin those cases.
     #[kani::proof]
     fn retry_delay_never_exceeds_max_interval() {
         let coefficient: f64 = kani::any();

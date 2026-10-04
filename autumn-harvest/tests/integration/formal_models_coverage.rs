@@ -74,28 +74,49 @@ fn manifest() -> Vec<ModelRow> {
     parse_manifest(&read("formal/tla/models.txt"))
 }
 
+/// The TLC config keywords that start a new block.
+const CFG_KEYWORDS: &[&str] = &[
+    "SPECIFICATION",
+    "INIT",
+    "NEXT",
+    "CONSTANT",
+    "CONSTANTS",
+    "INVARIANT",
+    "INVARIANTS",
+    "PROPERTY",
+    "PROPERTIES",
+    "CONSTRAINT",
+    "CONSTRAINTS",
+    "ACTION_CONSTRAINT",
+    "ACTION_CONSTRAINTS",
+    "SYMMETRY",
+    "VIEW",
+    "CHECK_DEADLOCK",
+    "POSTCONDITION",
+    "ALIAS",
+];
+
 /// The names that a TLC config lists under `INVARIANT` or `INVARIANTS`.
 fn config_invariants(cfg: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut in_block = false;
-    for line in cfg.lines().map(str::trim) {
-        let mut words = line.split_whitespace();
-        match words.next() {
-            Some("INVARIANT" | "INVARIANTS") => {
-                in_block = true;
-                out.extend(words.map(str::to_string));
+    for line in cfg.lines() {
+        let code = line.split("\\*").next().unwrap_or_default();
+        for word in code.split_whitespace() {
+            if CFG_KEYWORDS.contains(&word) {
+                in_block = matches!(word, "INVARIANT" | "INVARIANTS");
+            } else if in_block {
+                out.insert(word.to_string());
             }
-            Some(w) if w.chars().all(|c| c.is_ascii_uppercase() || c == '_') => {
-                in_block = false;
-            }
-            Some(w) if in_block && !w.starts_with('\\') => {
-                out.insert(w.to_string());
-                out.extend(words.map(str::to_string));
-            }
-            _ => {}
         }
     }
     out
+}
+
+/// True when `spec` defines `name` at the start of a line.
+fn defines(spec: &str, name: &str) -> bool {
+    let head = format!("{name} ==");
+    spec.lines().any(|l| l.starts_with(&head))
 }
 
 /// The names of the `#[kani::proof]` functions under `autumn-harvest/src`.
@@ -118,11 +139,13 @@ fn kani_proofs() -> Vec<String> {
         let source = std::fs::read_to_string(&file).expect("read source");
         let mut pending = false;
         for line in source.lines().map(str::trim) {
-            if line == "#[kani::proof]" {
+            if line.starts_with("#[kani::proof") {
                 pending = true;
-            } else if pending && let Some(rest) = line.strip_prefix("fn ") {
-                let name = rest.split('(').next().unwrap_or_default();
-                names.push(name.to_string());
+            } else if pending && line.starts_with("#[") {
+                // Another attribute, such as `#[kani::unwind]`.
+            } else if pending {
+                let name = line.split("fn ").nth(1).and_then(|r| r.split('(').next());
+                names.push(name.unwrap_or(line).to_string());
                 pending = false;
             }
         }
@@ -140,31 +163,46 @@ fn manifest_parser_reads_rows_and_expectations() {
 
 #[test]
 fn config_parser_reads_invariant_blocks() {
-    let cfg = "CONSTANTS\n  N = 2\nINVARIANTS\n  TypeOK\n  Safe\nINVARIANT Other\n";
+    let cfg = "\\* INVARIANT Nope\nCONSTANTS\n  N = 2\nINVARIANTS\n  TypeOK \\* note\n  NI\n\
+               INVARIANT Other\nCHECK_DEADLOCK FALSE\n";
     let names = config_invariants(cfg);
-    let want: BTreeSet<String> = ["TypeOK", "Safe", "Other"].map(String::from).into();
+    let want: BTreeSet<String> = ["TypeOK", "NI", "Other"].map(String::from).into();
     assert_eq!(names, want);
+    assert!(defines("TypeOK == TRUE\n", "TypeOK"));
+    assert!(!defines("XTypeOK == TRUE\n", "TypeOK"));
+}
+
+/// The `formal/tla` file names with extension `ext`, without the extension.
+fn tla_files(ext: &str) -> BTreeSet<String> {
+    let dir = repo_root().join("formal/tla");
+    std::fs::read_dir(&dir)
+        .expect("read formal/tla")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == ext))
+        .filter_map(|p| Some(p.file_stem()?.to_string_lossy().into_owned()))
+        .collect()
 }
 
 #[test]
-fn every_tla_config_has_a_manifest_row() {
+fn every_tla_spec_and_config_has_a_manifest_row() {
     let rows = manifest();
-    let listed: BTreeSet<&str> = rows.iter().map(|r| r.config.as_str()).collect();
-    let dir = repo_root().join("formal/tla");
-    let mut on_disk = BTreeSet::new();
-    for entry in std::fs::read_dir(&dir).expect("read formal/tla").flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".cfg") {
-            on_disk.insert(name);
-        }
-    }
-    let missing: Vec<&String> = on_disk
-        .iter()
-        .filter(|c| !listed.contains(c.as_str()))
+    let configs: BTreeSet<String> = rows.iter().map(|r| r.config.clone()).collect();
+    let specs: BTreeSet<&str> = rows.iter().map(|r| r.spec.as_str()).collect();
+    let missing: Vec<String> = tla_files("cfg")
+        .into_iter()
+        .map(|c| format!("{c}.cfg"))
+        .filter(|c| !configs.contains(c))
+        .chain(
+            tla_files("tla")
+                .into_iter()
+                .filter(|s| !specs.contains(s.as_str()))
+                .map(|s| format!("{s}.tla")),
+        )
         .collect();
     assert!(
         missing.is_empty(),
-        "configs with no models.txt row: {missing:?}"
+        "files with no models.txt row: {missing:?}"
     );
 }
 
@@ -177,7 +215,7 @@ fn every_manifest_row_names_real_files_and_invariants() {
         assert!(!invariants.is_empty(), "{} checks no invariant", row.config);
         for inv in &invariants {
             assert!(
-                spec.contains(&format!("{inv} ==")),
+                defines(&spec, inv),
                 "{} lists `{inv}`, which {}.tla does not define",
                 row.config,
                 row.spec
@@ -207,6 +245,23 @@ fn claim_epoch_model_has_a_pre_fix_counter_example() {
             .any(|r| matches!(r.expect, Expect::Violation(_))),
         "ActivityClaim needs a config that reproduces the pre-#1789 bug"
     );
+}
+
+/// The Kani script must run every proof and check the verified count.
+#[test]
+fn kani_script_runs_every_proof_and_checks_the_count() {
+    let script = read("scripts/check-kani-proofs.sh");
+    let run = script
+        .lines()
+        .find(|l| l.starts_with("cargo kani -p autumn-harvest"))
+        .expect("the script runs `cargo kani -p autumn-harvest`");
+    for flag in ["--features chaos", "-Z stubbing"] {
+        assert!(run.contains(flag), "the Kani run needs `{flag}`");
+    }
+    for flag in ["--harness", "--exact", "--only-codegen"] {
+        assert!(!run.contains(flag), "`{flag}` narrows the Kani run");
+    }
+    assert!(script.contains("successfully verified harnesses, 0 failures"));
 }
 
 #[test]
@@ -263,7 +318,7 @@ fn ci_runs_the_model_checker_and_kani() {
     let ci = parse_workflow(".github/workflows/ci.yml");
     let jobs = [
         ("formal-models", "scripts/check-formal-models.sh"),
-        ("kani", "cargo kani -p autumn-harvest"),
+        ("kani", "scripts/check-kani-proofs.sh"),
     ];
     for (job, command) in jobs {
         if let Some(defect) = formal_job_defect(&ci, job, command) {

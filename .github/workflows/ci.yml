@@ -1911,15 +1911,15 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A full run takes about 15 seconds. The runner image has Java.
+    # A full run takes about 40 seconds. The runner image has Java.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Model-check every manifest row with TLC
         run: scripts/check-formal-models.sh
 
-  # Kani proofs of the pure kernels (issue #1819). `chaos` turns on the chaos
-  # controller. `-Z stubbing` enables the `mix64` stub of the jitter proofs.
+  # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
+  # verifies fewer proofs than the source holds, or when a cover check fails.
   kani:
     name: Kani proofs
     needs: changes
@@ -1938,7 +1938,7 @@ jobs:
           cargo install --locked kani-verifier --version 0.68.0
           cargo kani setup
       - name: Run Kani proofs
-        run: cargo kani -p autumn-harvest --no-default-features --features chaos -Z stubbing
+        run: scripts/check-kani-proofs.sh
 
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every

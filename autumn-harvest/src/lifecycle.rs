@@ -441,46 +441,6 @@ pub fn is_sanctioned(from: WorkflowState, to: WorkflowState) -> bool {
     all_transitions().any(|tr| tr.from == Some(from) && tr.to == to)
 }
 
-/// Kani proofs over the transition table (issue #1819).
-///
-/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
-/// The unit tests below hold the table to the code. These proofs hold the
-/// table to its shape rules, for every pair of states.
-#[cfg(kani)]
-mod kani_proofs {
-    use super::*;
-
-    fn any_state() -> WorkflowState {
-        let i: usize = kani::any();
-        kani::assume(i < WorkflowState::ALL.len());
-        WorkflowState::ALL[i]
-    }
-
-    /// No writer leaves `MIGRATED`. Only a row insert creates `MIGRATING`.
-    /// No writer keeps a state as a transition.
-    #[kani::proof]
-    #[kani::unwind(80)]
-    fn migration_states_are_one_way() {
-        let from = any_state();
-        let to = any_state();
-        assert!(!is_sanctioned(Migrated, to));
-        assert!(!is_sanctioned(from, Migrating));
-        assert!(!is_sanctioned(from, from));
-    }
-
-    /// A closed run opens again only through DLQ redrive, `FAILED` to `RUNNING`.
-    #[kani::proof]
-    #[kani::unwind(80)]
-    fn closed_runs_reopen_only_by_dlq_redrive() {
-        let from = any_state();
-        let to = any_state();
-        if is_sanctioned(from, to) && from.is_terminal() && !to.is_terminal() {
-            assert!(from == Failed && to == Running);
-        }
-        kani::cover!(from == Failed && to == Running && is_sanctioned(from, to));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +592,18 @@ mod tests {
         assert_eq!(reopeners.len(), 1, "{reopeners:?}");
         assert_eq!(reopeners[0].from, Some(Failed));
         assert_eq!(reopeners[0].writer, "reactivate_failed_execution");
+    }
+
+    /// Every pair of states, so the check is exhaustive (issue #1819).
+    #[test]
+    fn migration_states_are_one_way() {
+        for from in WorkflowState::ALL {
+            for to in WorkflowState::ALL {
+                assert!(!is_sanctioned(Migrated, to), "MIGRATED -> {to:?}");
+                assert!(!is_sanctioned(from, Migrating), "{from:?} -> MIGRATING");
+                assert!(!is_sanctioned(from, from), "{from:?} -> itself");
+            }
+        }
     }
 }
 

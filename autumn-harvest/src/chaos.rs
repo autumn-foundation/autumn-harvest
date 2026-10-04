@@ -672,26 +672,22 @@ mod controller {
 
     /// Pick a seeded action for `p` from its declared caps (never `Hold`).
     fn pick_seeded_action(p: ChaosPoint, stream: u64) -> Option<Action> {
+        // A fixed array, not a `Vec`, keeps the Kani proof small. The order
+        // decides which action a stream picks, so it must not change.
         let caps = p.caps();
-        let mut eligible: Vec<Action> = Vec::new();
-        if caps & CAP_ERROR != 0 {
-            eligible.push(Action::Error(ChaosError::Generic));
-        }
-        if caps & CAP_DROP_NOTIFY != 0 {
-            eligible.push(Action::DropNotify);
-        }
-        if caps & CAP_DELAY != 0 {
-            eligible.push(Action::Delay(5));
-        }
-        if caps & CAP_KILL != 0 {
-            eligible.push(Action::Kill);
-        }
-        if eligible.is_empty() {
+        let candidates = [
+            (CAP_ERROR, Action::Error(ChaosError::Generic)),
+            (CAP_DROP_NOTIFY, Action::DropNotify),
+            (CAP_DELAY, Action::Delay(5)),
+            (CAP_KILL, Action::Kill),
+        ];
+        let eligible = candidates.iter().filter(|(cap, _)| caps & cap != 0);
+        let len = u64::try_from(eligible.clone().count()).unwrap_or(1);
+        if len == 0 {
             return None;
         }
-        let len = u64::try_from(eligible.len()).unwrap_or(1);
         let idx = usize::try_from((stream >> 16) % len).unwrap_or(0);
-        eligible.get(idx).cloned()
+        eligible.map(|(_, action)| action).nth(idx).cloned()
     }
 
     /// The armed, in-flight chaos state. One exists at a time (serialized by
@@ -1374,6 +1370,9 @@ mod controller {
         /// A seeded plan picks only an action that the point's caps allow,
         /// and never `Hold`. The stream is any `u64`, so the result holds for
         /// every `splitmix64` output and every seed.
+        ///
+        /// The unit tests check streams that a loop can list. This proof
+        /// checks all 2^64 of them.
         #[kani::proof]
         #[kani::unwind(6)]
         fn seeded_action_respects_caps_and_never_holds() {
@@ -1495,6 +1494,33 @@ mod controller {
                         "seeded action {:?} violates caps of {name} (seed {seed})",
                         d.action
                     );
+                }
+            }
+        }
+
+        /// Pins the candidate order for every index, so seeded plans stay
+        /// reproducible. `stream >> 16` selects the index.
+        #[test]
+        fn pick_seeded_action_keeps_the_caps_order_for_every_index() {
+            for &p in ALL {
+                let caps = p.caps();
+                let mut want = Vec::new();
+                if caps & CAP_ERROR != 0 {
+                    want.push(format!("{:?}", Action::Error(ChaosError::Generic)));
+                }
+                if caps & CAP_DROP_NOTIFY != 0 {
+                    want.push(format!("{:?}", Action::DropNotify));
+                }
+                if caps & CAP_DELAY != 0 {
+                    want.push(format!("{:?}", Action::Delay(5)));
+                }
+                if caps & CAP_KILL != 0 {
+                    want.push(format!("{:?}", Action::Kill));
+                }
+                for k in 0..8_usize {
+                    let got = pick_seeded_action(p, (k as u64) << 16).map(|a| format!("{a:?}"));
+                    let expect = (!want.is_empty()).then(|| want[k % want.len()].clone());
+                    assert_eq!(got, expect, "{} at index {k}", p.name());
                 }
             }
         }

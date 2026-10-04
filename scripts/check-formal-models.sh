@@ -27,7 +27,7 @@ fi
 
 failures=0
 rows=0
-while read -r spec config expect; do
+while read -r spec config expect || [ -n "${spec:-}" ]; do
   case "${spec}" in '' | '#'*) continue ;; esac
   rows=$((rows + 1))
   log="${work}/${config}.log"

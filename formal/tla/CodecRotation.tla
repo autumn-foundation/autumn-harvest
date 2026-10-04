@@ -10,6 +10,12 @@
 (* the row still holds the bytes that the sweep read.                      *)
 (* Cas = FALSE models a blind write. TLC then finds the race in which the  *)
 (* sweep writes ciphertext over a tombstone and resurrects erased data.    *)
+(*                                                                         *)
+(* Erase is one step here. The real erasure reads the row, then writes it  *)
+(* back without a lock. That is safe because it rewrites only the payload  *)
+(* fields that the sweep also writes, and the sweep CAS loses to it.       *)
+(*                                                                         *)
+(* The model does not check pass completion or the unresolved count.       *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -25,10 +31,9 @@ ASSUME Cas \in BOOLEAN /\ OldKey /= NewKey
 VARIABLES
     data,        \* data[r]: the payload field of row r.
     erased,      \* The rows that an erasure has tombstoned.
-    snap,        \* snap[s]: the row and bytes that sweeper s read, or None.
-    unresolved   \* unresolved[s]: the lost writes of sweeper s.
+    snap         \* snap[s]: the row and bytes that sweeper s read, or None.
 
-vars == <<data, erased, snap, unresolved>>
+vars == <<data, erased, snap>>
 
 \* A payload field is ciphertext under a key, or the erasure tombstone.
 \* The plaintext of row r is r itself. Re-encryption never changes it.
@@ -41,13 +46,11 @@ TypeOK ==
     /\ data \in [Rows -> Values]
     /\ erased \subseteq Rows
     /\ snap \in [Sweepers -> [row : Rows, val : Values] \cup {None}]
-    /\ unresolved \in [Sweepers -> Nat]
 
 Init ==
     /\ data = [r \in Rows |-> Cipher(OldKey, r)]
     /\ erased = {}
     /\ snap = [s \in Sweepers |-> None]
-    /\ unresolved = [s \in Sweepers |-> 0]
 
 -----------------------------------------------------------------------------
 (* Actions *)
@@ -57,18 +60,15 @@ Read(s, r) ==
     /\ snap[s] = None
     /\ data[r] = Cipher(OldKey, r)
     /\ snap' = [snap EXCEPT ![s] = [row |-> r, val |-> data[r]]]
-    /\ UNCHANGED <<data, erased, unresolved>>
+    /\ UNCHANGED <<data, erased>>
 
-\* The sweep writes the re-encoded bytes. A lost CAS counts as unresolved.
+\* The sweep writes the re-encoded bytes. A lost CAS writes nothing.
 Write(s) ==
     /\ snap[s] /= None
     /\ LET r == snap[s].row
-           new == Cipher(NewKey, snap[s].val.pt)
        IN IF ~Cas \/ data[r] = snap[s].val
-          THEN /\ data' = [data EXCEPT ![r] = new]
-               /\ UNCHANGED unresolved
-          ELSE /\ unresolved' = [unresolved EXCEPT ![s] = @ + 1]
-               /\ UNCHANGED data
+          THEN data' = [data EXCEPT ![r] = Cipher(NewKey, snap[s].val.pt)]
+          ELSE UNCHANGED data
     /\ snap' = [snap EXCEPT ![s] = None]
     /\ UNCHANGED erased
 
@@ -77,7 +77,7 @@ Erase(r) ==
     /\ r \notin erased
     /\ data' = [data EXCEPT ![r] = Tombstone]
     /\ erased' = erased \cup {r}
-    /\ UNCHANGED <<snap, unresolved>>
+    /\ UNCHANGED snap
 
 Next ==
     \/ \E s \in Sweepers, r \in Rows : Read(s, r)
@@ -92,8 +92,16 @@ Spec == Init /\ [][Next]_vars
 \* An erased row stays erased.
 ErasureIsFinal == \A r \in erased : data[r] = Tombstone
 
-\* Re-encryption never changes the plaintext.
-PlaintextPreserved ==
-    \A r \in Rows : data[r].kind = "cipher" => data[r].pt = r
+\* Every row that is not erased ends under one of the two keys, with its
+\* own plaintext. The sweep never writes one row's bytes into another.
+CiphertextKeepsItsRow ==
+    \A r \in Rows \ erased : data[r] \in {Cipher(OldKey, r), Cipher(NewKey, r)}
+
+-----------------------------------------------------------------------------
+(* Reachability witness. CodecRotationReach.cfg expects TLC to violate it. *)
+(* The violation proves that the CAS model reaches the race: a sweep holds *)
+(* the bytes of a row that an erasure has since tombstoned.                *)
+
+NoSweepRacesErasure == ~ \E s \in Sweepers : snap[s] /= None /\ snap[s].row \in erased
 
 =============================================================================
