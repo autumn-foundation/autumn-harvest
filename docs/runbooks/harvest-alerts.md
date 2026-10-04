@@ -3387,7 +3387,9 @@ worker abandons it (`harvest.workflow.task_timeout`). A `burn_1h` or
    `1h` is 14.4x, `6h` is 6x, and `3d` is 1x.
 2. Find the source of the errors. Compare
    `sum by (workflow) (rate(harvest_workflow_duration_count{status="failed"}[1h]))`
-   with `sum by (workflow) (rate(harvest_workflow_task_timeout_total[1h]))`.
+   with
+   `sum by (workflow) (rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[1h]))`.
+   The matcher removes canary probes, as the SLI does.
 3. If failed cycles lead, follow
    [`harvest_workflow_failure_rate`](#harvest_workflow_failure_rate).
 4. If timeouts lead, run
