@@ -282,6 +282,8 @@ mod throttle_bucket_prelock_batch_perf;
 #[cfg(feature = "db")]
 mod throttle_tests;
 #[cfg(feature = "db")]
+mod throwaway_db;
+#[cfg(feature = "db")]
 mod transactional_activity_tests;
 #[cfg(feature = "db")]
 mod transactional_start_tests;

@@ -1300,28 +1300,17 @@ async fn run_case(
 /// A database that this test alone uses. Each case truncates the engine
 /// tables, so the test never runs on a shared database. With
 /// `HARVEST_TEST_DATABASE_URL` set, it creates a throwaway database on that
-/// server. Otherwise it starts a Postgres 16 container.
-async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
+/// server and drops it at the end. Otherwise it starts a Postgres 16
+/// container.
+async fn database() -> (
+    String,
+    Option<ContainerAsync<Postgres>>,
+    Option<crate::throwaway_db::ThrowawayDb>,
+) {
     use testcontainers::ImageExt;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        let name = format!("harvest_lifecycle_model_{}", Uuid::new_v4().simple());
-        let mut admin = AsyncPgConnection::establish(&admin_url)
-            .await
-            .expect("HARVEST_TEST_DATABASE_URL must be reachable");
-        admin
-            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
-            .await
-            .expect("create a throwaway database");
-        let prefix = admin_url
-            .rsplit_once('/')
-            .map_or(admin_url.as_str(), |(p, _)| p);
-        let url = format!("{prefix}/{name}");
-        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
-            .await
-            .expect("migration");
-        return (url, None);
+    if let Some(db) = crate::throwaway_db::ThrowawayDb::create("harvest_lifecycle_model").await {
+        return (db.url(), None, Some(db));
     }
     let container = Postgres::default()
         .with_tag("16")
@@ -1335,7 +1324,7 @@ async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
-    (url, Some(container))
+    (url, Some(container), None)
 }
 
 /// The stateful lifecycle property. The database and the model must agree
@@ -1349,7 +1338,7 @@ fn lifecycle_matches_the_reference_model() {
     // The container drops in an async context. Keep the runtime entered so
     // a failing case can unwind past it.
     let _enter = rt.enter();
-    let (url, _container) = rt.block_on(database());
+    let (url, _container, _db) = rt.block_on(database());
     let conn = RefCell::new(
         rt.block_on(AsyncPgConnection::establish(&url))
             .expect("connect"),

@@ -102,7 +102,8 @@ dead-letter count. A claim must take the pending task with the earliest
 
 The test needs Docker, or `HARVEST_TEST_DATABASE_URL`. Each case truncates
 the engine tables, so with that variable set the test creates a throwaway
-database on the server.
+database on the server and drops it at the end. The DSN can be a URL or a
+libpq keyword/value string.
 
 ```bash
 cargo test -p autumn-harvest --test integration lifecycle_model_props::

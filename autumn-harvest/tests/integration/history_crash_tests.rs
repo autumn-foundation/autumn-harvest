@@ -63,28 +63,17 @@ async fn history_noop(
 /// A database that this test alone uses. A scheduler tick fires every due
 /// schedule in its database, so a shared database is not safe. With
 /// `HARVEST_TEST_DATABASE_URL` set, the test creates a throwaway database on
-/// that server. Otherwise it starts a Postgres 16 container.
-async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
+/// that server and drops it at the end. Otherwise it starts a Postgres 16
+/// container.
+async fn database() -> (
+    String,
+    Option<ContainerAsync<Postgres>>,
+    Option<crate::throwaway_db::ThrowawayDb>,
+) {
     use testcontainers::ImageExt;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        let name = format!("harvest_history_{}", Uuid::new_v4().simple());
-        let mut admin = AsyncPgConnection::establish(&admin_url)
-            .await
-            .expect("HARVEST_TEST_DATABASE_URL must be reachable");
-        admin
-            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
-            .await
-            .expect("create a throwaway database");
-        let prefix = admin_url
-            .rsplit_once('/')
-            .map_or(admin_url.as_str(), |(p, _)| p);
-        let url = format!("{prefix}/{name}");
-        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
-            .await
-            .expect("migration");
-        return (url, None);
+    if let Some(db) = crate::throwaway_db::ThrowawayDb::create("harvest_history").await {
+        return (db.url(), None, Some(db));
     }
     let container = Postgres::default()
         .with_tag("16")
@@ -98,7 +87,7 @@ async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
-    (url, Some(container))
+    (url, Some(container), None)
 }
 
 /// The seed for this run: `HISTORY_SEED`, or a fresh random seed.
@@ -284,7 +273,7 @@ async fn start_idempotency_history_is_linearizable_under_crashes() {
     const APP: &str = "hist-start";
 
     let seed = seed();
-    let (url, _container) = database().await;
+    let (url, _container, _db) = database().await;
     let run = Uuid::new_v4().simple().to_string();
     let history = Arc::new(Recorder::<StartInput, StartOutput>::new());
     let stop = Arc::new(AtomicBool::new(false));
@@ -468,7 +457,7 @@ async fn schedule_fire_history_is_exactly_once_under_crashes() {
     const APP: &str = "hist-sched";
 
     let seed = seed();
-    let (url, _container) = database().await;
+    let (url, _container, _db) = database().await;
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let mut schedules = Vec::new();
     let run = Uuid::new_v4().simple().to_string();
