@@ -65,10 +65,11 @@ window.
   transaction, the enforcer marks such a claim. A result that arrives then
   is held until the transaction decides. If the transaction times the claim
   out, the held result is dropped. If not, it counts as usual.
-- Breaker state is per process. Another process can enforce the timeout, and
-  then this process holds no mark. The worker therefore also drops the
-  outcome of an attempt that ran past its `start_to_close` budget. It
-  measures from after the claim, so this check never fires early.
+- The worker reports to the breaker after its claim-fenced result write, and
+  counts the outcome only when that write settled the attempt. A timeout
+  enforced first, in this process or another one, leaves the write nothing
+  to settle. The outcome is then dropped, and only a probe slot is released.
+  The write is the one signal that every process shares.
 
 ### 3. An open breaker defers work by default
 
@@ -114,11 +115,10 @@ including an error.
 - A timeout retry keeps `crash_strikes`. A timeout does not prove that the
   attempt ended without a crash, so poison-pill quarantine (#367) still
   counts.
-- The breaker counts a timeout in the process that enforces it, not in the
-  process that ran the attempt. A heartbeat timeout that another process
-  enforces is not seen locally. A late result of that attempt can still
-  count in the local breaker. A shared breaker would close this gap. It is
-  out of scope.
+- Breaker state is per process. The breaker counts a timeout in the process
+  that enforces it, not in the process that ran the attempt. That process
+  drops the attempt's late outcome, so the attempt never counts twice. A
+  shared breaker would count both in one place. It is out of scope.
 - The SQLite backend keeps terminal timeouts and has no breaker feed. It
   is out of scope.
 

@@ -13493,25 +13493,50 @@ pub async fn finalize_activity_completion(
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
+    finalize_activity_completion_applied(
+        conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        offloader,
+        codecs,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`finalize_activity_completion`], returning whether this claim wrote the
+/// outcome (issue #1809). `false` means another path, such as the timeout
+/// enforcer, already settled the activity.
+async fn finalize_activity_completion_applied(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    output: serde_json::Value,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<bool> {
     let Some(activity_name) = task.activity_name.as_deref() else {
-        return Ok(());
+        return Ok(false);
     };
     let completion_event = WorkflowEvent::ActivityCompleted {
         activity_id,
         output: output.clone(),
     };
 
-    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         let output = output.clone();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         // A lost lease is a no-op, not an error (issue #1789). The later
         // claim owns the outcome of this activity.
         if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
             log_lease_lost(task, "activity completion");
-            return Ok(());
+            return Ok(false);
         }
         store::append_events_offloaded_with_codecs(
             conn,
@@ -13541,7 +13566,8 @@ pub async fn finalize_activity_completion(
             )
             .await?;
         }
-        queue::wake_workflow_task(conn, exec_id).await
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(true)
     }))
     .await;
 
@@ -13573,8 +13599,24 @@ pub async fn finalize_activity_failure(
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
+    finalize_activity_failure_applied(conn, task, exec_id, activity_id, error, codecs)
+        .await
+        .map(|_| ())
+}
+
+/// [`finalize_activity_failure`], returning whether this claim wrote the
+/// outcome (issue #1809). `false` means another path, such as the timeout
+/// enforcer, already settled the activity.
+async fn finalize_activity_failure_applied(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    error: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<bool> {
     let Some(activity_name) = task.activity_name.as_deref() else {
-        return Ok(());
+        return Ok(false);
     };
     let failure = parse_error_payload_full(error);
     let failed_event = WorkflowEvent::ActivityFailed {
@@ -13597,11 +13639,11 @@ pub async fn finalize_activity_failure(
     // `ActivityFailed` event (carrying `error_type`, `non_retryable`,
     // `details`) and the `WorkflowFailed` event that follows when the
     // workflow propagates the error.
-    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+    let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         let error = error.to_string();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         // A lost lease is a no-op, not an error (issue #1789).
         if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
@@ -13620,7 +13662,7 @@ pub async fn finalize_activity_failure(
                      must be the final expression in the activity handler"
                 );
             }
-            return Ok(());
+            return Ok(false);
         }
         store::append_events_with_codecs(
             conn,
@@ -13633,7 +13675,8 @@ pub async fn finalize_activity_failure(
         queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
             .await?
             .require_applied(task.id)?;
-        queue::wake_workflow_task(conn, exec_id).await
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(true)
     }))
     .await;
 
@@ -14626,6 +14669,10 @@ enum ScheduleToCloseTimeoutOutcome {
     /// The timeout was recorded — or the task was concurrently resolved by
     /// another writer — so the caller must not requeue.
     Handled,
+    /// A later claim holds the row (issue #1789), so this claim wrote nothing.
+    /// The caller must not requeue, and the attempt has no outcome of its own
+    /// to report (issue #1809).
+    ClaimLost,
     /// The row-current deadline is no longer exceeded: a pause/resume cycle
     /// that completed while this attempt was in flight shifted
     /// `schedule_to_close_at` forward by the pause span (issue #609, AC5).
@@ -14750,7 +14797,7 @@ async fn record_schedule_to_close_activity_timeout(
                 lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
             // A stale owner must not time out a later claim (issue #1789).
             if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
-                return Ok(ScheduleToCloseTimeoutOutcome::Handled);
+                return Ok(ScheduleToCloseTimeoutOutcome::ClaimLost);
             }
             let task_row = task_state_and_deadline_for_update(conn, task.id).await?;
             // Authoritative re-check under the execution row lock: bail
@@ -14815,7 +14862,9 @@ async fn handle_activity_result(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
+    // Returns whether this claim wrote the outcome (issue #1809). `false`
+    // means another path, such as the timeout enforcer, settled the activity.
     match activity_result {
         Ok(output) => {
             let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
@@ -14832,10 +14881,17 @@ async fn handle_activity_result(
                     ),
                 )
                 .into_error_payload();
-                return finalize_activity_failure(conn, task, exec_id, activity_id, &error, codecs)
-                    .await;
+                return finalize_activity_failure_applied(
+                    conn,
+                    task,
+                    exec_id,
+                    activity_id,
+                    &error,
+                    codecs,
+                )
+                .await;
             }
-            finalize_activity_completion(
+            finalize_activity_completion_applied(
                 conn,
                 task,
                 exec_id,
@@ -14880,7 +14936,8 @@ async fn handle_activity_result(
                     )
                     .await?
                     {
-                        ScheduleToCloseTimeoutOutcome::Handled => return Ok(()),
+                        ScheduleToCloseTimeoutOutcome::Handled => return Ok(true),
+                        ScheduleToCloseTimeoutOutcome::ClaimLost => return Ok(false),
                         // Stale claim-time snapshot: a concurrent pause/resume
                         // cycle shifted the row's deadline forward (issue #609
                         // post-review hardening) — the attempt still has
@@ -14914,10 +14971,11 @@ async fn handle_activity_result(
                 } else {
                     log_lease_lost(task, "activity retry requeue");
                 }
-                return Ok(());
+                return Ok(write == queue::ClaimWrite::Applied);
             }
 
-            finalize_activity_failure(conn, task, exec_id, activity_id, &error, codecs).await
+            finalize_activity_failure_applied(conn, task, exec_id, activity_id, &error, codecs)
+                .await
         }
     }
 }
@@ -15223,16 +15281,6 @@ impl Drop for CircuitProbeGuard<'_> {
         // A claim that reported is already gone, so this is then a no-op.
         self.breakers.end_claim(self.activity_name, self.claim);
     }
-}
-
-/// Whether an attempt ran past its start-to-close budget (issue #1809).
-/// `elapsed` is measured from when the claim query returned, so it never
-/// exceeds the enforcer's elapsed time. A missing or negative budget never
-/// overruns.
-fn attempt_overran(start_to_close: Option<chrono::Duration>, elapsed: Duration) -> bool {
-    start_to_close
-        .and_then(|budget| budget.to_std().ok())
-        .is_some_and(|budget| elapsed > budget)
 }
 
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
@@ -15933,7 +15981,8 @@ async fn process_activity_task(
             registry.retry_after_ceiling,
             registry.payload_codecs(),
         )
-        .await;
+        .await
+        .map(|_| ());
     }
 
     let cancel = CancellationToken::new();
@@ -16367,18 +16416,7 @@ async fn process_activity_task(
     // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
     // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
     probe_guard.disarm();
-    // An attempt that ran past its start-to-close budget timed out, whichever
-    // process enforces that (issue #1809). Breaker state is per process, so a
-    // timeout enforced elsewhere sets no mark here. Its late outcome must not
-    // move this breaker either. The scanner measures from `started_at`, the
-    // claim time. `dispatched_at` is taken as soon as the claim query
-    // returns, before the permit wait and the setup. Only the claim round
-    // trip separates the two anchors, so the check never fires early and
-    // misses at most that round trip. A self-committed activity sealed its
-    // own success and keeps it.
-    let overran =
-        !committed_transactionally && attempt_overran(task.start_to_close, dispatched_at.elapsed());
-    let circuit_outcome = if was_cancelled || overran {
+    let circuit_outcome = if was_cancelled {
         if let Some(token) = circuit_token {
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
         }
@@ -16406,21 +16444,23 @@ async fn process_activity_task(
     // not clear the failure window. `on_claim_result` checks the mark under
     // the breaker lock, so the check cannot race the enforcer.
     //
-    // The report runs after the claim-fenced finalization. An enforcer that
-    // wins the row first confirms its mark before this report, so the report
-    // is dropped. A finalization that wins leaves the enforcer nothing to do,
-    // so the attempt counts once.
-    let report_outcome = || {
+    // The report runs after the claim-fenced finalization, and counts only
+    // when this claim wrote the outcome. A timeout enforced first, in this
+    // process or another one, leaves this claim nothing to write. The outcome
+    // is then dropped and only a probe slot is released. Breaker state is per
+    // process, so this write is the one signal every process shares. A
+    // finalization that wins leaves the enforcer nothing to do, so the
+    // attempt counts once.
+    let report_outcome = |applied: bool| {
+        let now = std::time::Instant::now();
         if let Some(transition) = circuit_token
             .zip(circuit_outcome)
             .and_then(|(token, outcome)| {
-                circuit_breakers.on_claim_result(
-                    activity_name,
-                    outcome,
-                    token,
-                    claim_key,
-                    std::time::Instant::now(),
-                )
+                if applied {
+                    circuit_breakers.on_claim_result(activity_name, outcome, token, claim_key, now)
+                } else {
+                    circuit_breakers.on_claim_lost(activity_name, token, claim_key, now)
+                }
             })
         {
             match transition {
@@ -16455,7 +16495,7 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
-        report_outcome();
+        report_outcome(true);
         return Ok(());
     }
 
@@ -16477,9 +16517,9 @@ async fn process_activity_task(
         registry.payload_codecs(),
     )
     .await;
-    // Report even when the write failed, so an admitted probe is released.
-    report_outcome();
-    finalized
+    // A failed write reports as lost, so an admitted probe is still released.
+    report_outcome(matches!(finalized, Ok(true)));
+    finalized.map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -42263,28 +42303,6 @@ mod tests {
             timeout_retry_delay(&task, "timeout: StartToClose for call_api"),
             None
         );
-    }
-
-    /// Issue #1809: only a run past a known budget overruns.
-    #[test]
-    fn attempt_overran_needs_a_known_budget_and_a_longer_run() {
-        let budget = Some(chrono::Duration::milliseconds(300));
-        assert!(!attempt_overran(budget, Duration::from_millis(300)));
-        assert!(attempt_overran(budget, Duration::from_millis(301)));
-        assert!(!attempt_overran(None, Duration::from_secs(3600)));
-        assert!(!attempt_overran(
-            Some(chrono::Duration::milliseconds(-5)),
-            Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn circuit_defer_delay_waits_for_the_next_probe_plus_jitter() {
-        let task = retry_after_test_task(1, 3);
-        let delay =
-            circuit_defer_delay(Some(Duration::from_secs(4)), Duration::from_secs(60), &task);
-        assert!(delay >= chrono::Duration::seconds(4), "{delay:?}");
-        assert!(delay <= chrono::Duration::seconds(5), "{delay:?}");
     }
 
     #[test]

@@ -500,6 +500,27 @@ impl CircuitBreakerRegistry {
         }
     }
 
+    /// Record that `claim` wrote no outcome, because another path settled the
+    /// attempt first (issue #1809). The result does not count. The claim's
+    /// probe slot, if it still holds one, is released, and this returns
+    /// [`CircuitTransition::Tripped`] when that re-opens the breaker. A
+    /// timeout enforced first, in any process, is such a path.
+    pub fn on_claim_lost(
+        &self,
+        activity_name: &str,
+        token: DispatchToken,
+        claim: ClaimKey,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        if !self.policies.contains_key(activity_name) {
+            return None;
+        }
+        let mut states = self.lock();
+        let st = states.get_mut(activity_name)?;
+        st.in_flight_claims.remove(&claim);
+        apply_cancelled(st, token, now).then_some(CircuitTransition::Tripped)
+    }
+
     /// Register `claim` as dispatched by this process (issue #1809).
     ///
     /// Only a registered claim can be marked. Call [`end_claim`](Self::end_claim)
@@ -1162,6 +1183,37 @@ mod tests {
         assert_eq!(rolling(&reg, t0), 1, "one enforcer still decides");
         let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
         assert_eq!(rolling(&reg, t0), 0, "the held success counts now");
+    }
+
+    /// Another process timed out this process's attempt, so its write found
+    /// the claim gone (issue #1809). The result does not count, and a lost
+    /// probe re-trips the breaker.
+    #[test]
+    fn a_lost_claim_counts_nothing_and_re_trips_a_probe() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), token);
+        assert_eq!(reg.on_claim_lost("send_email", token, claim(1), t0), None);
+        assert_eq!(
+            rolling(&reg, t0),
+            1,
+            "a lost success does not clear the window"
+        );
+
+        for _ in 0..2 {
+            fail(&reg, t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        let probe = dispatch(&reg, t1);
+        reg.begin_claim("send_email", claim(2), probe);
+        assert_eq!(
+            reg.on_claim_lost("send_email", probe, claim(2), t1),
+            Some(CircuitTransition::Tripped),
+            "a lost probe is a failed probe"
+        );
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
     }
 
     /// A claim that this process does not hold cannot be marked, and an
