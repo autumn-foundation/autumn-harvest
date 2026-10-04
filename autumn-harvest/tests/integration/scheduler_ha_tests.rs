@@ -60,11 +60,7 @@ impl MetricsRecorder for RecordingMetrics {
 
 // ── Test helpers ───────────────────────────────────────────────────────────
 
-async fn setup_db() -> (
-    AsyncPgConnection,
-    String,
-    Option<ContainerAsync<Postgres>>,
-) {
+async fn setup_db() -> (AsyncPgConnection, String, Option<ContainerAsync<Postgres>>) {
     // `HARVEST_TEST_DATABASE_URL` runs the suite without Docker. Each test
     // gets its own database, because `tick_once` fires every row it can see.
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
@@ -574,8 +570,15 @@ async fn test_concurrent_drains_start_each_buffered_run_once() {
             "round {round}: one dispatch per buffered run"
         );
         let (buffered, runs_started, token) = schedule_state(&mut conn, sched_id).await;
-        assert_eq!(runs_started, 1, "round {round}: runs_started counts one start");
-        assert_eq!(buffered, serde_json::json!([]), "round {round}: buffer drained");
+        assert_eq!(
+            runs_started, 1,
+            "round {round}: runs_started counts one start"
+        );
+        assert_eq!(
+            buffered,
+            serde_json::json!([]),
+            "round {round}: buffer drained"
+        );
         assert_eq!(token, None, "round {round}: claim released");
     }
 }

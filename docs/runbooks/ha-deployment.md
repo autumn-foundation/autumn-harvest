@@ -62,6 +62,18 @@ After a successful fire, `fire_claim_token` and `fire_claimed_until` are reset t
 
 No. If the crashed replica successfully called `start_or_load_workflow_execution` before crashing (before it could advance `next_run_at`), the retry by the healthy peer will receive `AlreadyExists` (because scheduled workflow IDs are deterministic: `sched:{workflow_name}:{logical_date}`). The `AlreadyExists` response is treated as a safe duplicate, not an error.
 
+### Buffered-Run Drain (issue #1820)
+
+The `BufferOne` and `BufferAll` overlap policies store pending slots in `buffered_runs`. Each tick drains them before it fires due slots. The drain uses the same claim:
+
+1. Claim the row with the `UPDATE` above. A live claim held by a peer makes the drain skip the row.
+2. Read the row again, so the drain uses the current `buffered_runs` and `runs_started`.
+3. Start the buffered runs, then write `buffered_runs` and `runs_started`. The write clears the claim and matches only this replica's token.
+
+Every other exit releases the claim, also fenced on the token. Thus one replica starts each buffered slot, and `runs_started` counts it once. This does not depend on `WorkflowIdReusePolicy`.
+
+The drain and the tick fire path use one claim, so they do not overlap on a row. A schedule `PATCH` returns `409` while a drain holds the claim, as it does during a fire. Retry the `PATCH`.
+
 ---
 
 ## Observability: Verifying the Contract in Production
@@ -157,5 +169,4 @@ Workers with explicit shard assignments only poll their assigned shards. The sch
 ## Out of Scope for This Runbook
 
 - **Worker poll loop HA**: workers already coordinate via `FOR UPDATE SKIP LOCKED` in `queue.rs`. This runbook covers the scheduler tick path only.
-- **`drain_buffered_schedule_runs`**: the buffered-run drain path (for `BufferOne`/`BufferAll` overlap policies) has a lower-severity double-dispatch risk. In practice, `WorkflowIdReusePolicy::RejectDuplicate` on scheduled IDs prevents double execution. A dedicated claim guard for drain is tracked separately.
 - **Cross-region active-active**: single-region multi-replica is the target topology. Cross-region deployments with separate Postgres instances should pin the scheduler to a single region.

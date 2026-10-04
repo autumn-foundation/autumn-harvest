@@ -3424,21 +3424,38 @@ pub async fn claim_and_fire_workflow_schedule(
             error = %error, workflow_name = %wf_name,
             "harvest: workflow schedule tick failed; continuing to next schedule"
         );
-        // Clear our own claim on error so a peer can retry promptly. Guard
-        // on the token so a slow late-running tick doesn't clear a
-        // successor's live claim if the 30 s TTL has already expired.
-        let _ = diesel::sql_query(
-            "UPDATE harvest_schedules \
-             SET fire_claim_token = NULL, fire_claimed_until = NULL \
-             WHERE id = $1 AND fire_claim_token = $2",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(schedule.id)
-        .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
-        .execute(conn)
-        .await;
+        // Clear our own claim on error so a peer can retry promptly.
+        release_fire_claim(conn, schedule.id, my_claim_token).await;
     }
 
     Ok(())
+}
+
+/// Clear a fire claim, but only while `claim_token` still holds it.
+///
+/// The token fence stops a late caller from clearing a peer's claim after the
+/// 30 s TTL. This is best effort: a claim that is not cleared expires.
+async fn release_fire_claim(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    claim_token: uuid::Uuid,
+) {
+    if let Err(error) = diesel::sql_query(
+        "UPDATE harvest_schedules \
+         SET fire_claim_token = NULL, fire_claimed_until = NULL \
+         WHERE id = $1 AND fire_claim_token = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(schedule_id)
+    .bind::<diesel::sql_types::Uuid, _>(claim_token)
+    .execute(conn)
+    .await
+    {
+        tracing::debug!(
+            error = %error,
+            schedule_id = %schedule_id,
+            "harvest: could not release the fire claim; it expires after its TTL"
+        );
+    }
 }
 
 /// Load up to `limit` of the oldest scheduled RUNNING/PAUSED execution ids
@@ -4437,7 +4454,7 @@ async fn tick_one_workflow_schedule(
         }
         // Clone-class note: the concurrency-key resolution and the
         // owner/runbook/severity merge below repeat verbatim in
-        // `drain_buffered_schedule_runs`. Apply any change to either
+        // `drain_claimed_buffered_schedule`. Apply any change to either
         // block to both functions.
         //
         // Two instances only. Commit 6b3fb18c (issue #372, PR #550)
@@ -6292,34 +6309,6 @@ async fn claim_and_drain_buffered_schedule(
     result.map(|_| ())
 }
 
-/// Clear a fire claim, but only while `claim_token` still holds it.
-///
-/// The token fence stops a late caller from clearing a peer's claim after the
-/// 30 s TTL. This is best effort: a claim that is not cleared expires.
-#[cfg(feature = "db")]
-async fn release_fire_claim(
-    conn: &mut AsyncPgConnection,
-    schedule_id: uuid::Uuid,
-    claim_token: uuid::Uuid,
-) {
-    if let Err(error) = diesel::sql_query(
-        "UPDATE harvest_schedules \
-         SET fire_claim_token = NULL, fire_claimed_until = NULL \
-         WHERE id = $1 AND fire_claim_token = $2",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(schedule_id)
-    .bind::<diesel::sql_types::Uuid, _>(claim_token)
-    .execute(conn)
-    .await
-    {
-        tracing::debug!(
-            error = %error,
-            schedule_id = %schedule_id,
-            "harvest: could not release the fire claim; it expires after its TTL"
-        );
-    }
-}
-
 /// Drain the buffered slots of one row while `claim_token` holds its claim.
 ///
 /// Reads the row again first, so no decision uses the pre-claim snapshot.
@@ -6351,8 +6340,7 @@ async fn drain_claimed_buffered_schedule(
         return Ok(DrainClaim::Released);
     };
     // The row can change between the pending SELECT and the claim.
-    if schedule.is_paused || schedule.auto_paused_at.is_some() || schedule.exhausted_at.is_some()
-    {
+    if schedule.is_paused || schedule.auto_paused_at.is_some() || schedule.exhausted_at.is_some() {
         return Ok(DrainClaim::Held);
     }
     let Some(ref wf_name) = schedule.workflow_name else {
@@ -6446,8 +6434,7 @@ async fn drain_claimed_buffered_schedule(
         // bar is not met yet. See the note in
         // `tick_one_workflow_schedule`.
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, scheduled_for);
-        let exec_id =
-            scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
+        let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
         let input = schedule
             .workflow_input
             .clone()
@@ -6457,8 +6444,7 @@ async fn drain_claimed_buffered_schedule(
             wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
                 (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
                 |policy| {
-                    let key =
-                        crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                    let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
                     (key, Some(policy.limit), policy.on_conflict)
                 },
             );
@@ -6539,8 +6525,7 @@ async fn drain_claimed_buffered_schedule(
                 )
                 .await?;
                 if !skip_cap_check && effective_cap > 0 {
-                    let observed =
-                        serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                    let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                     if observed > effective_cap {
                         tracing::warn!(
                             workflow_name = %wf_name,
@@ -6603,9 +6588,7 @@ async fn drain_claimed_buffered_schedule(
                     origin: Some(crate::execution::ORIGIN_SCHEDULED.to_string()),
                     // Buffered scheduled fire throttle admission (issue #740):
                     // provenance is `schedule`, referencing the schedule id.
-                    start_source: Some(
-                        crate::types::StartSource::Schedule.as_str().to_string(),
-                    ),
+                    start_source: Some(crate::types::StartSource::Schedule.as_str().to_string()),
                     start_source_ref: Some(schedule.id.to_string()),
                     started_by: None,
                 };
