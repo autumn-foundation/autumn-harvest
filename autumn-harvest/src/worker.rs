@@ -15719,13 +15719,15 @@ const DRAIN_BEFORE_START_ERROR: &str = "the handler never started";
 /// matches a later claim. The release skips the retry delay and the attempt
 /// cap, as orphan reclaim does. A deploy must not fail an activity. A lost
 /// claim is a no-op. An applied release counts one enqueued retry in the
-/// metrics, as the normal retry path does.
+/// metrics, as the normal retry path does. When the handler was never
+/// polled, the release also refunds the attempt's rate-limit debit.
 async fn release_drained_activity(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     payload: &str,
     activity_name: &str,
     metrics: &dyn crate::telemetry::MetricsRecorder,
+    handler_started: bool,
 ) -> HarvestResult<()> {
     let claim = claim_of_task(task)?;
     let message = crate::failure::parse_error_payload_full(payload).message;
@@ -15743,6 +15745,19 @@ async fn release_drained_activity(
         );
     } else {
         log_lease_lost(task, "drain release");
+    }
+    // No handler call used the rate-limit token, so give it back. As for an
+    // unstarted claim, the refund does not depend on the release.
+    if !handler_started
+        && let Some(key) = task.rate_limit_key.as_deref()
+        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
+    {
+        tracing::warn!(
+            task_id = %task.id,
+            rate_limit_key = %key,
+            %error,
+            "failed to refund the rate-limit token of an attempt that never started"
+        );
     }
     Ok(())
 }
@@ -17496,6 +17511,7 @@ async fn process_activity_task(
             payload,
             activity_name,
             registry.telemetry().metrics.as_ref(),
+            started,
         )
         .await;
     }
@@ -25416,8 +25432,8 @@ async fn read_live_fleet_or_degrade(
 ///
 /// The refund is safe to make unconditional because each claim-time debit
 /// gets at most one refund. `claim_task` debits every rate-limited claim it
-/// grants (bar the breaker-tracked ones, unreachable here — see above). Three
-/// sites return a claim-time debit: this one and the two named below. Each
+/// grants (bar the breaker-tracked ones, unreachable here — see above). Four
+/// sites return a claim-time debit: this one and the three named below. Each
 /// runs at most once per dispatch, and no two share a dispatch. No other
 /// path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
 /// second credit for one debit cannot arise.
@@ -25429,6 +25445,12 @@ async fn read_live_fleet_or_degrade(
 /// A drain release of a task that never started (issue #1813) also refunds.
 /// It ends the dispatch before the handler lookup, so it never shares a
 /// dispatch with a capability miss either.
+///
+/// A drain release of an attempt whose handler was never polled (issue
+/// #1813) also refunds. That debit is a claim-time one, or the dispatch-time
+/// one of a breaker-tracked activity. The release ends the dispatch before
+/// the result path, so it never shares a dispatch with a retry-budget
+/// deferral or with the sites above.
 ///
 /// Pinned by `stale_dispatcher_refund_leaves_one_debit_for_the_live_claim` in
 /// `capability_miss_tests`, which drives the exact interleaving above and
@@ -33880,7 +33902,17 @@ impl Worker {
     /// id share one lease row, so each hides the other while both run. That
     /// is true of the normal heartbeat too.
     fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
+        let interval = self.config.worker_heartbeat_interval;
         if self.dispatched.tracker.is_empty() {
+            // Every body ended in the drain. One of them can still have left
+            // its claim `RUNNING` after a failed write, so sweep anyway.
+            for pool in pools {
+                let worker_id = self.config.worker_id.clone();
+                let live_claims = Arc::clone(&self.dispatched.live);
+                tokio::spawn(async move {
+                    final_abandoned_claim_sweep(&pool, &worker_id, &live_claims, interval).await;
+                });
+            }
             return;
         }
         tracing::warn!(
@@ -33888,7 +33920,6 @@ impl Worker {
             running = self.dispatched.tracker.len(),
             "drain ended with handlers still running; the worker keeps its lease until they return"
         );
-        let interval = self.config.worker_heartbeat_interval;
         let bound = lease_refresh_bound(interval);
         // One task for each pool, so a stalled shard pool cannot stop the
         // refresh of another shard. Detached on purpose: the handlers they
