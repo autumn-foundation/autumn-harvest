@@ -266,6 +266,17 @@ impl History {
         self.indexes.retain(|_, tables| !tables.is_empty());
     }
 
+    /// Forget every index that no hot table may own.
+    fn forget_cold_indexes(&mut self) {
+        let keep: BTreeSet<String> = self
+            .indexes
+            .iter()
+            .filter(|(_, tables)| tables.iter().any(|t| self.is_hot(t)))
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.indexes.retain(|key, _| keep.contains(key));
+    }
+
     /// Build the history that `migrations` leave behind, in order.
     fn of<'a>(migrations: impl IntoIterator<Item = &'a str>) -> Self {
         let mut history = Self::default();
@@ -589,7 +600,47 @@ fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
     let mut toks = Vec::new();
     let mut comments = Vec::new();
     lex(&chars, 1, 0, true, &mut toks, &mut comments);
+    mark_atomic_bodies(&mut toks);
     (toks, comments)
+}
+
+/// Mark each unquoted `BEGIN ATOMIC` function body as code that does not run.
+///
+/// `CREATE FUNCTION` stores the body and runs nothing in it, as with a
+/// quoted body. The body ends at the `END` that no SQL `CASE` claims.
+fn mark_atomic_bodies(toks: &mut [Token]) {
+    let word = |t: &Token, w: &str| t.tok == Tok::Word(w.to_string());
+    let mut k = 0;
+    while k + 1 < toks.len() {
+        let depth = toks[k].depth;
+        let opens = word(&toks[k], "begin")
+            && word(&toks[k + 1], "atomic")
+            && statement_head(&toks[..k], depth).is_some_and(|t| word(t, "create"));
+        if !opens {
+            k += 1;
+            continue;
+        }
+        let mut cases = 0_usize;
+        let mut end = toks.len() - 1;
+        for (j, tok) in toks.iter().enumerate().skip(k + 2) {
+            if tok.depth != depth {
+                continue;
+            }
+            if word(tok, "case") {
+                cases += 1;
+            } else if word(tok, "end") {
+                if cases == 0 {
+                    end = j;
+                    break;
+                }
+                cases -= 1;
+            }
+        }
+        for tok in &mut toks[k..=end] {
+            tok.runs = false;
+        }
+        k = end + 1;
+    }
 }
 
 /// Lex `chars`, which start on line `line` inside `depth` dollar bodies.
@@ -642,29 +693,50 @@ fn lex(
             }
         } else if c == '\'' || (matches!(c, 'e' | 'E') && next == Some('\'')) {
             // An `E'...'` string also takes backslash escapes.
-            let escapes = c != '\'';
+            let mut escapes = c != '\'';
             let start_line = line;
             i += if escapes { 2 } else { 1 };
             let mut value = String::new();
-            while let Some(c) = at(i) {
-                line += usize::from(c == '\n');
-                if escapes && c == '\\' {
-                    if let Some((decoded, len)) = e_escape(&chars[i + 1..]) {
-                        line += usize::from(at(i + 1) == Some('\n'));
-                        value.push(decoded);
-                        i += 1 + len;
+            // Postgres joins literals that only whitespace with a newline
+            // parts, as in `'a'` and then `'b'` on the next line.
+            'literal: loop {
+                while let Some(c) = at(i) {
+                    line += usize::from(c == '\n');
+                    if escapes && c == '\\' {
+                        if let Some((decoded, len)) = e_escape(&chars[i + 1..]) {
+                            line += usize::from(at(i + 1) == Some('\n'));
+                            value.push(decoded);
+                            i += 1 + len;
+                        } else {
+                            i += 1;
+                        }
+                    } else if c == '\'' && at(i + 1) == Some('\'') {
+                        value.push('\'');
+                        i += 2;
+                    } else if c == '\'' {
+                        i += 1;
+                        break;
                     } else {
+                        value.push(c);
                         i += 1;
                     }
-                } else if c == '\'' && at(i + 1) == Some('\'') {
-                    value.push('\'');
-                    i += 2;
-                } else if c == '\'' {
-                    i += 1;
-                    break;
+                }
+                let gap = chars[i..].iter().take_while(|c| c.is_whitespace()).count();
+                let newlines = chars[i..i + gap].iter().filter(|c| **c == '\n').count();
+                let next = i + gap;
+                if newlines > 0 && at(next) == Some('\'') {
+                    escapes = false;
+                    line += newlines;
+                    i = next + 1;
+                } else if newlines > 0
+                    && matches!(at(next), Some('e' | 'E'))
+                    && at(next + 1) == Some('\'')
+                {
+                    escapes = true;
+                    line += newlines;
+                    i = next + 2;
                 } else {
-                    value.push(c);
-                    i += 1;
+                    break 'literal;
                 }
             }
             // A `DO` body may be a plain string, so it is code too. So is the
@@ -1608,6 +1680,9 @@ fn resolve(
             if let (Some(table), "DROP TABLE") = (&table, raw.verb) {
                 history.forget_table(table);
             }
+            if matches!(raw.verb, "DROP SCHEMA ... CASCADE" | "DROP OWNED") {
+                history.forget_cold_indexes();
+            }
             // A table moves its indexes with it to the new schema. A dropped
             // column or constraint can take indexes with it.
             if let (Some(table), "ALTER TABLE") = (&table, raw.verb)
@@ -1914,6 +1989,11 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                 raws.push(Raw::lock(k, "DROP TABLE ... CASCADE", None));
             }
         }
+        // Each drops every table it reaches, hot ones included.
+        Some("schema") if (k..s.end(k)).any(|j| s.is(j, "cascade")) => {
+            raws.push(Raw::lock(k, "DROP SCHEMA ... CASCADE", None));
+        }
+        Some("owned") => raws.push(Raw::lock(k, "DROP OWNED", None)),
         Some("trigger") => raws.push(Raw::lock(k, "DROP TRIGGER", s.name_after(k + 2, "on"))),
         Some("policy") => raws.push(Raw::lock(k, "DROP POLICY", s.name_after(k + 2, "on"))),
         Some("rule") => raws.push(Raw::lock(k, "DROP RULE", s.name_after(k + 2, "on"))),
@@ -4072,6 +4152,43 @@ fn an_alter_that_drops_dependents_forgets_the_indexes() {
             "{alter}: {findings:?}"
         );
     }
+}
+
+#[test]
+fn drop_schema_cascade_locks_an_unknown_table() {
+    // CASCADE drops every table in the schema, hot ones included.
+    let findings = lint_with_history(&[], "DROP SCHEMA public CASCADE;", true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // It also drops every index there, so a cold mapping goes stale.
+    let history = [
+        "CREATE INDEX idx_shared ON harvest_schedules (id);",
+        "DROP SCHEMA public CASCADE;",
+    ];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_begin_atomic_body_does_not_run() {
+    // `CREATE FUNCTION` only stores the body. Its setter sets nothing.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE sql\nBEGIN ATOMIC\n    SELECT 1;\n    \
+               SELECT set_config('lock_timeout', '5s', false);\nEND;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn adjacent_string_literals_join() {
+    // Postgres joins two literals that only whitespace with a newline parts.
+    let sql = "DO $$\nBEGIN\n    EXECUTE 'ALTER TABLE harvest_'\n        'events ADD COLUMN x INT';\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert!(
+        findings[0].detail.contains("harvest_events"),
+        "{findings:?}"
+    );
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
