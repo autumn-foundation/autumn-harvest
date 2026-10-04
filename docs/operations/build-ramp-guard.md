@@ -152,7 +152,13 @@ After the clear, the guard does these steps once per abort:
 - The audit summary holds the reason, both rates, the target lower bound,
   both builds and the sample counts.
 - After the audit row commits, it increments
-  `harvest.build.ramp_aborted{queue, reason}` and logs a warning.
+  `harvest.build.ramp_aborted{queue, reason}` and logs a warning. The audit
+  row is the durable record. The counter is process-local: a process that
+  stops between the commit and the increment loses that one count, and its
+  restart resets the counter anyway.
+- `RampGuard::pass` and `guard_once` return only the aborts that this pass
+  reported. An abort whose report failed is not returned, and a later pass
+  reports it.
 - It then marks the abort markers of the ramp as reported. Every clear
   writes an unreported marker, and only a committed report, or a ledger row
   from another guard, marks it. A failed audit write keeps the markers

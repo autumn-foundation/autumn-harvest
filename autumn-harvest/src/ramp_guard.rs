@@ -1823,7 +1823,7 @@ impl RampGuard {
                     let all: Vec<usize> = (0..pools.len()).collect();
                     mark_reported(pools, &all, &key.0, ramp_id, bound, cancel).await;
                 }
-                (outcome != ReportOutcome::AlreadyReported).then_some(abort)
+                (outcome == ReportOutcome::Recorded).then_some(abort)
             }
             // Another guard owns the report. The markers of this guard's
             // clears stay unreported until a report commits, so a guard that
@@ -1947,7 +1947,7 @@ impl RampGuard {
                             let all: Vec<usize> = (0..pools.len()).collect();
                             mark_reported(pools, &all, &key.0, entry.ramp_id, bound, cancel).await;
                         }
-                        if outcome != ReportOutcome::AlreadyReported {
+                        if outcome == ReportOutcome::Recorded {
                             reported.push(abort);
                         }
                     }

@@ -1429,7 +1429,10 @@ async fn a_failed_audit_write_keeps_the_marker_unreported() {
         None,
     )
     .await;
-    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert!(
+        aborts.is_empty(),
+        "a failed report is not returned: {aborts:?}"
+    );
     assert!(!ramp_is_active(&mut conn).await, "the clear still happens");
     assert_eq!(
         marker_reported(&mut conn, ramp_id).await,
