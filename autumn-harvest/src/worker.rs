@@ -33762,14 +33762,16 @@ impl Worker {
     /// can outlive `run`, as an embedded runtime does. Without this keeper, a
     /// peer would then start a second copy while the first one still runs.
     ///
-    /// One keeper task for each pool refreshes `last_heartbeat_at` at the
-    /// heartbeat interval. A stalled shard pool therefore cannot stop the
-    /// refresh of another shard. Each refresh has its own limit, from
-    /// [`lease_refresh_bound`], so a slow pool cannot let the lease expire.
+    /// One keeper task for each pool refreshes `last_heartbeat_at`. A stalled
+    /// shard pool therefore cannot stop the refresh of another shard. Each
+    /// refresh has its own limit, from [`lease_refresh_bound`]. A failed
+    /// refresh retries at once, see [`next_lease_refresh`]. A slow pool
+    /// therefore cannot let the lease expire.
+    ///
     /// The kept lease would also hide a claim that no body holds. So each
     /// refresh gives such claims back through [`release_abandoned_claims`].
-    /// Each keeper stops when the last dispatch body ends. It also stops when the process exits, and orphan reclaim then
-    /// recovers the task.
+    /// Each keeper stops when the last dispatch body ends. It also stops when
+    /// the process exits, and orphan reclaim then recovers the task.
     fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
         if self.dispatched.tracker.is_empty() {
             return;
@@ -33791,12 +33793,12 @@ impl Worker {
             tokio::spawn(async move {
                 let done = dispatched.wait();
                 tokio::pin!(done);
-                let mut tick = tokio::time::interval(interval);
+                let mut next = tokio::time::Instant::now();
                 loop {
                     tokio::select! {
                         biased;
                         () = &mut done => return,
-                        _ = tick.tick() => {
+                        () = tokio::time::sleep_until(next) => {
                             let touched = tokio::time::timeout(bound, async {
                                 let mut conn = crate::pool::acquire(&pool, bound).await?;
                                 crate::workers::touch_worker_liveness(&mut conn, &worker_id)
@@ -33809,15 +33811,19 @@ impl Worker {
                             })
                             .await;
                             let error = match touched {
-                                Ok(Ok(_)) => continue,
-                                Ok(Err(error)) => error.to_string(),
-                                Err(_elapsed) => format!("timed out after {bound:?}"),
+                                Ok(Ok(_)) => None,
+                                Ok(Err(error)) => Some(error.to_string()),
+                                Err(_elapsed) => Some(format!("timed out after {bound:?}")),
                             };
-                            tracing::warn!(
-                                worker_id = %worker_id,
-                                %error,
-                                "failed to keep the worker lease for a drained handler"
-                            );
+                            next = tokio::time::Instant::now()
+                                + next_lease_refresh(interval, error.is_none());
+                            if let Some(error) = error {
+                                tracing::warn!(
+                                    worker_id = %worker_id,
+                                    %error,
+                                    "failed to keep the worker lease for a drained handler"
+                                );
+                            }
                         }
                     }
                 }
@@ -33865,6 +33871,20 @@ fn drain_cancel_at(
 /// seconds, so it cannot serve as this limit.
 fn lease_refresh_bound(heartbeat_interval: Duration) -> Duration {
     heartbeat_interval / 2
+}
+
+/// The wait before the next lease refresh after a drain (issue #1813).
+///
+/// A success waits half a heartbeat interval. A failure retries after
+/// [`crate::pool::ZERO_WAIT_RETRY_SPACING`]. Several tries then fit inside
+/// the stale window after the last success, even when each try runs to its
+/// [`lease_refresh_bound`].
+fn next_lease_refresh(heartbeat_interval: Duration, refreshed: bool) -> Duration {
+    if refreshed {
+        heartbeat_interval / 2
+    } else {
+        crate::pool::ZERO_WAIT_RETRY_SPACING.min(heartbeat_interval / 2)
+    }
 }
 
 /// Give back each claim of `worker_id` that no dispatch body holds (issue
@@ -38341,6 +38361,21 @@ mod tests {
             let bound = lease_refresh_bound(interval);
             assert!(bound < interval);
             assert!(interval + bound < interval * 2);
+        }
+    }
+
+    /// A failed lease refresh retries well before the lease goes stale
+    /// (issue #1813).
+    #[test]
+    fn next_lease_refresh_retries_a_failure_at_once() {
+        for interval in [Duration::from_secs(1), Duration::from_secs(5)] {
+            let success = next_lease_refresh(interval, true);
+            let retry = next_lease_refresh(interval, false);
+            assert!(retry <= crate::pool::ZERO_WAIT_RETRY_SPACING);
+            // After a success, a failed try, the retry spacing and a second
+            // try all end inside the stale window.
+            let bound = lease_refresh_bound(interval);
+            assert!(success + bound + retry + bound < interval * 2);
         }
     }
 
