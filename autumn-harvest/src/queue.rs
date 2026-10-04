@@ -963,13 +963,44 @@ pub async fn enqueue_batch(
 /// values with RUNNING work than this queue set's current PENDING backlog
 /// touches, and the aggregate must not pay for keys this claim attempt cannot
 /// possibly select.
+/// How long a new start yields to continuations at equal priority (issue #1824).
+///
+/// [`claim_order_due_sql!`] spells the same value as an SQL interval.
+pub const NEW_START_HANDICAP_SECS: u32 = 30;
+
+/// The claim-order due time of a `harvest_task_queue` row (issue #1824).
+///
+/// A continuation is a task of a run that already started: an activity
+/// task, or a woken workflow task. A new start is the first workflow task of
+/// a run. Every claim increments `attempt`, and a wake reuses the same row,
+/// so a workflow row with `attempt = 0` is a new start.
+///
+/// A new start sorts as if it were due [`NEW_START_HANDICAP_SECS`] later. So
+/// at equal priority, a continuation goes first under a backlog. The
+/// handicap is fixed, so a new start that waits longer competes FIFO again.
+/// That bounds starvation without a separate ageing term.
+///
+/// The term sorts after `priority`, so an explicit priority still wins.
+/// The claim already sorts on a `CASE` key, so this adds no sort that
+/// an index could have saved. See `docs/performance.md`, issue #1177.
+macro_rules! claim_order_due_sql {
+    () => {
+        "(scheduled_at + CASE WHEN task_type = 'workflow' AND attempt = 0 \
+         THEN INTERVAL '30 seconds' ELSE INTERVAL '0 seconds' END)"
+    };
+}
+
+/// [`claim_order_due_sql!`] as a value, for shape tests.
+pub const CLAIM_ORDER_DUE_SQL: &str = claim_order_due_sql!();
+
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's. `claim_task` carried the same allow before this query was
 // extracted for shape-testing.
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub const fn claim_task_query() -> &'static str {
-    "WITH worker_info AS ( \
+    concat!(
+        "WITH worker_info AS ( \
              SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
          ), \
          paused_queues AS MATERIALIZED ( \
@@ -1100,8 +1131,9 @@ pub const fn claim_task_query() -> &'static str {
                      WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
                      THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
                      ELSE priority \
-                 END DESC, \
-                 scheduled_at ASC \
+                 END DESC, ",
+        claim_order_due_sql!(),
+        " ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
         ), \
         rate_limit_debit AS ( \
@@ -1144,6 +1176,7 @@ pub const fn claim_task_query() -> &'static str {
             RETURNING harvest_task_queue.* \
         ) \
         SELECT * FROM claimed"
+    )
 }
 
 /// Resolve the cross-region DR fence binding for a claim (issue #954).
@@ -1472,83 +1505,97 @@ pub async fn claim_task_of_kind_on_shard(
     // against the row this transaction already locked. Competing claimers
     // `SKIP LOCKED` past that row regardless — it is `RUNNING` either way — so
     // the added contention is the duration of a single PK probe.
-    let mut tx = conn.build_transaction().read_committed();
-    let outcome: ClaimOutcome = tx
-        .run(
-            async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
-                // Cross-region DR fence (issue #954). Two fully separate
-                // arms rather than one boxed builder: `BoxedSqlQuery::bind`
-                // heap-allocates per bind and dispatches dynamically, and the
-                // unfenced arm — which is every deployment that has not opted
-                // into DR — must not pay for a feature it does not use on the
-                // engine's hottest statement.
-                let result: Vec<TaskQueueItem> = match fence_binding(shard) {
-                    None => {
-                        let query = kind.map_or_else(claim_task_query, |kind| {
-                            claim_task_query_for_kind(kind, false)
-                        });
-                        diesel::sql_query(query)
-                            .bind::<diesel::sql_types::Text, _>(worker_id)
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                                aging_secs_i64,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                circuit_breaker_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                ineligible_activities,
-                            )
-                            .load(conn)
-                            .await
+
+    // A row past its run deadline is failed, not handed out (issue #1824).
+    // Claim again so that one expired row does not idle the slot until the
+    // next poll. The bound keeps a large expired backlog from holding this
+    // call. The timeout scanner fails the rest of that backlog.
+    for _ in 0..=MAX_DEADLINE_SKIPS_PER_CLAIM {
+        let mut tx = conn.build_transaction().read_committed();
+        let outcome: ClaimOutcome = tx
+            .run(
+                async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
+                    // Cross-region DR fence (issue #954). Two fully separate
+                    // arms rather than one boxed builder: `BoxedSqlQuery::bind`
+                    // heap-allocates per bind and dispatches dynamically, and the
+                    // unfenced arm — which is every deployment that has not opted
+                    // into DR — must not pay for a feature it does not use on the
+                    // engine's hottest statement.
+                    let result: Vec<TaskQueueItem> = match fence_binding(shard) {
+                        None => {
+                            let query = kind.map_or_else(claim_task_query, |kind| {
+                                claim_task_query_for_kind(kind, false)
+                            });
+                            diesel::sql_query(query)
+                                .bind::<diesel::sql_types::Text, _>(worker_id)
+                                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                    queues,
+                                )
+                                .bind::<diesel::sql_types::Text, _>(worker_build_id)
+                                .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
+                                    aging_secs_i64,
+                                )
+                                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                    circuit_breaker_activities,
+                                )
+                                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                    ineligible_activities,
+                                )
+                                .load(conn)
+                                .await
+                        }
+                        Some((fence_shard, generation)) => {
+                            let query = kind.map_or_else(claim_task_query_fenced, |kind| {
+                                claim_task_query_for_kind(kind, true)
+                            });
+                            diesel::sql_query(query)
+                                .bind::<diesel::sql_types::Text, _>(worker_id)
+                                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                    queues,
+                                )
+                                .bind::<diesel::sql_types::Text, _>(worker_build_id)
+                                .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
+                                    aging_secs_i64,
+                                )
+                                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                    circuit_breaker_activities,
+                                )
+                                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                                    ineligible_activities,
+                                )
+                                .bind::<diesel::sql_types::Integer, _>(fence_shard)
+                                .bind::<diesel::sql_types::BigInt, _>(generation)
+                                .load(conn)
+                                .await
+                        }
                     }
-                    Some((fence_shard, generation)) => {
-                        let query = kind.map_or_else(claim_task_query_fenced, |kind| {
-                            claim_task_query_for_kind(kind, true)
-                        });
-                        diesel::sql_query(query)
-                            .bind::<diesel::sql_types::Text, _>(worker_id)
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                                aging_secs_i64,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                circuit_breaker_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                ineligible_activities,
-                            )
-                            .bind::<diesel::sql_types::Integer, _>(fence_shard)
-                            .bind::<diesel::sql_types::BigInt, _>(generation)
-                            .load(conn)
-                            .await
-                    }
-                }
-                .map_err(crate::error::database_error)?;
+                    .map_err(crate::error::database_error)?;
 
-                let Some(task) = result.into_iter().next() else {
-                    return Ok(ClaimOutcome::Empty);
-                };
+                    let Some(task) = result.into_iter().next() else {
+                        return Ok(ClaimOutcome::Empty);
+                    };
 
-                apply_post_claim_rechecks(conn, task, worker_id).await
-            },
-        )
-        .await?;
+                    apply_post_claim_rechecks(conn, task, worker_id).await
+                },
+            )
+            .await?;
 
-    match outcome {
-        ClaimOutcome::Claimed(task) => Ok(Some(*task)),
-        // A released row is `PENDING` again now that this transaction has
-        // committed, and no dispatch reference names it, so hint it (issue
-        // #1312). The by-id path below deliberately does not: its caller still
-        // holds the reference and releases it with backoff.
-        ClaimOutcome::Released(task_id) => {
-            record_pending_hints(conn, &[task_id]).await;
-            Ok(None)
+        match outcome {
+            ClaimOutcome::Claimed(task) => return Ok(Some(*task)),
+            // A released row is `PENDING` again now that this transaction has
+            // committed, and no dispatch reference names it, so hint it (issue
+            // #1312). The by-id path below deliberately does not: its caller still
+            // holds the reference and releases it with backoff.
+            ClaimOutcome::Released(task_id) => {
+                record_pending_hints(conn, &[task_id]).await;
+                return Ok(None);
+            }
+            ClaimOutcome::Empty => return Ok(None),
+            // The row is now terminal, so the next pass cannot select it again.
+            ClaimOutcome::DeadlineExceeded(_) => {}
         }
-        ClaimOutcome::Empty => Ok(None),
     }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,11 +1732,65 @@ pub fn claim_task_query_for_kind(kind: TaskType, fenced: bool) -> &'static str {
     }
 }
 
-/// How long a new start yields to continuations at equal priority (issue #1824).
-pub const NEW_START_HANDICAP_SECS: u32 = 30;
+/// The error a claim writes on a task whose run deadline passed (issue #1824).
+///
+/// The task is `FAILED` and does not run. The timeout scanner later times out
+/// the run itself. It only rewrites open rows, so this error stays.
+pub const DEADLINE_EXCEEDED_ERROR: &str =
+    "deadline_exceeded: the run deadline passed before the task was claimed";
 
-/// Error prefix of a task that the claim failed after its run deadline (issue #1824).
-pub const DEADLINE_EXCEEDED_ERROR: &str = "deadline_exceeded";
+/// The number of deadline-exceeded rows one claim call skips (issue #1824).
+///
+/// Each skip costs one claim transaction. Past the bound, the call returns
+/// `None` and the next poll continues.
+const MAX_DEADLINE_SKIPS_PER_CLAIM: usize = 8;
+
+/// SQL for [`fail_claim_if_run_deadline_passed`] (issue #1824).
+///
+/// Binds `$1` task id, `$2` worker id, `$3` error.
+///
+/// The predicate is the timeout scanner's own: a `RUNNING` run with a past
+/// `deadline_at` or `chain_deadline_at`. A `PAUSED` run is not matched,
+/// because a resume moves its deadline forward.
+///
+/// The run row is read, never locked. The scanner locks the run row and then
+/// the task rows. This claim already holds the task row, so a lock on the run
+/// row here would invert that order and could deadlock.
+///
+/// `clock_timestamp()` is the real time at the check. `NOW()` is the start of
+/// the claim transaction, which can be earlier.
+#[must_use]
+pub const fn fail_claim_if_run_deadline_passed_query() -> &'static str {
+    "UPDATE harvest_task_queue t \
+     SET state = 'FAILED', error = $3, completed_at = NOW() \
+     WHERE t.id = $1 AND t.worker_id = $2 AND t.state = 'RUNNING' \
+       AND EXISTS ( \
+           SELECT 1 FROM harvest_workflow_executions e \
+           WHERE e.id = t.workflow_exec_id \
+             AND e.state = 'RUNNING' \
+             AND (e.deadline_at < clock_timestamp() \
+                  OR e.chain_deadline_at < clock_timestamp()) \
+       )"
+}
+
+/// Fail a just-claimed task when its run deadline has passed (issue #1824).
+///
+/// Returns `true` when the row is now `FAILED`. Runs inside the claim
+/// transaction, so the claim and the failure commit together.
+async fn fail_claim_if_run_deadline_passed(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    let failed = diesel::sql_query(fail_claim_if_run_deadline_passed_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Text, _>(DEADLINE_EXCEEDED_ERROR)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(failed > 0)
+}
 
 /// What one claim transaction concluded.
 ///
@@ -1707,6 +1808,9 @@ enum ClaimOutcome {
     Released(Uuid),
     /// No row matched the claim predicate.
     Empty,
+    /// The run deadline of the row had passed. The row is `FAILED` with
+    /// [`DEADLINE_EXCEEDED_ERROR`] once this transaction commits (issue #1824).
+    DeadlineExceeded(Uuid),
 }
 
 /// Execute one pre-built release-if-paused statement and report whether a
@@ -1827,6 +1931,22 @@ async fn apply_post_claim_rechecks(
         return Ok(ClaimOutcome::Released(task.id));
     }
 
+    // Run-deadline check (issue #1824). It runs last, so a held task is
+    // released, not failed. The timeout scanner ticks once per poll interval.
+    // Without this check, a task of an expired run can still run in that gap.
+    // The cost is one primary-key probe per claim, on the claimed row only.
+    if task.workflow_exec_id.is_some()
+        && fail_claim_if_run_deadline_passed(conn, task.id, worker_id).await?
+    {
+        tracing::info!(
+            task_id = %task.id,
+            task_type = %task.task_type,
+            queue = %task.queue_name,
+            "run deadline passed before claim; task failed as deadline_exceeded"
+        );
+        return Ok(ClaimOutcome::DeadlineExceeded(task.id));
+    }
+
     Ok(ClaimOutcome::Claimed(Box::new(task)))
 }
 
@@ -1922,8 +2042,11 @@ pub async fn claim_task_by_id_on_shard(
         ClaimOutcome::Claimed(task) => Ok(Some(*task)),
         // No hint on this path. The caller holds the dispatch reference for
         // this row and releases it with backoff. That is the reference the row
-        // needs. A second one would only duplicate it.
-        ClaimOutcome::Released(_) | ClaimOutcome::Empty => Ok(None),
+        // needs. A second one would only duplicate it. A deadline-exceeded row
+        // is terminal, so the caller's probe acks its reference.
+        ClaimOutcome::Released(_) | ClaimOutcome::Empty | ClaimOutcome::DeadlineExceeded(_) => {
+            Ok(None)
+        }
     }
 }
 
@@ -7381,6 +7504,7 @@ pub async fn pending_queue_demand_by_queue_name(
 pub fn claim_task_batched_candidates_query() -> &'static str {
     static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let rate_limit_available = effective_available_tokens_expr("b");
+        let due = claim_order_due_sql!();
         format!(
             "WITH worker_info AS ( \
                  SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
@@ -7396,7 +7520,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
              ) \
              SELECT \
                  id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
-                 scheduled_at, schedule_to_close_at, \
+                 scheduled_at, schedule_to_close_at, {due} AS claim_due_at, \
                  CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS sticky_rank, \
                  CASE \
                      WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
@@ -7503,7 +7627,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
                            THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
                            ELSE priority \
                        END) = $9 \
-                       AND scheduled_at > $10 \
+                       AND {due} > $10 \
                    ) \
                    OR ( \
                        (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) = $8 \
@@ -7512,10 +7636,10 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
                            THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
                            ELSE priority \
                        END) = $9 \
-                       AND scheduled_at = $10 AND id > $11 \
+                       AND {due} = $10 AND id > $11 \
                    ) \
                ) \
-             ORDER BY sticky_rank DESC, effective_priority DESC, scheduled_at ASC, id ASC \
+             ORDER BY sticky_rank DESC, effective_priority DESC, claim_due_at ASC, id ASC \
              LIMIT $12::BIGINT \
              FOR UPDATE SKIP LOCKED"
         )
@@ -7829,6 +7953,8 @@ struct BatchedClaimCandidate {
     scheduled_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     schedule_to_close_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    claim_due_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     sticky_rank: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -7838,18 +7964,21 @@ struct BatchedClaimCandidate {
 /// Keyset cursor resuming [`claim_task_batched_candidates_query`] just past
 /// the last row of an exhausted batch.
 ///
-/// Four columns, not three: `scheduled_at` and `effective_priority` commonly
+/// Four columns, not three: `claim_due_at` and `effective_priority` commonly
 /// tie across many rows in the same fixture (shared enqueue timestamp,
 /// shared priority). A cursor without `id` as a final tiebreak silently
 /// drops every row tied with the batch's own last row. That drop is not
 /// just once, but from every later batch too
 /// (`docs/assays/0005-claim-batched-seek-and-refine.md`, post-review item
 /// 1).
+///
+/// The third column is the claim-order due time, not `scheduled_at` (issue
+/// #1824). The cursor must compare the same key the scan sorts on.
 #[derive(Debug, Clone, Copy)]
 struct BatchCursor {
     sticky_rank: i32,
     effective_priority: i32,
-    scheduled_at: DateTime<Utc>,
+    claim_due_at: DateTime<Utc>,
     id: Uuid,
 }
 
@@ -7858,7 +7987,7 @@ impl From<&BatchedClaimCandidate> for BatchCursor {
         Self {
             sticky_rank: row.sticky_rank,
             effective_priority: row.effective_priority,
-            scheduled_at: row.scheduled_at,
+            claim_due_at: row.claim_due_at,
             id: row.id,
         }
     }
@@ -7924,7 +8053,7 @@ async fn fetch_claim_batch(
             cursor.map(|c| c.effective_priority),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            cursor.map(|c| c.scheduled_at),
+            cursor.map(|c| c.claim_due_at),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(cursor.map(|c| c.id))
         .bind::<diesel::sql_types::BigInt, _>(batch_size)
@@ -8111,7 +8240,11 @@ pub async fn claim_task_batched(
                         )
                         .await?
                         {
-                            return apply_post_claim_rechecks(conn, task, worker_id).await;
+                            match apply_post_claim_rechecks(conn, task, worker_id).await? {
+                                // The row is terminal now. Try the next candidate.
+                                ClaimOutcome::DeadlineExceeded(_) => {}
+                                outcome => return Ok(outcome),
+                            }
                         }
                     }
 
@@ -8137,7 +8270,7 @@ pub async fn claim_task_batched(
             record_pending_hints(conn, &[task_id]).await;
             Ok(None)
         }
-        ClaimOutcome::Empty => Ok(None),
+        ClaimOutcome::Empty | ClaimOutcome::DeadlineExceeded(_) => Ok(None),
     }
 }
 
@@ -8800,17 +8933,86 @@ mod tests {
             "the cursor must be optional -- the first batch of an attempt \
              has no predecessor row to resume past; got:\n{sql}"
         );
+        let due_tie = format!("{CLAIM_ORDER_DUE_SQL} = $10 AND id > $11");
         assert!(
-            sql.contains("scheduled_at = $10 AND id > $11"),
+            sql.contains(&due_tie),
             "the cursor's final tiebreak must compare id, not just \
-             scheduled_at, or tied rows are silently skipped; got:\n{sql}"
+             the due time, or tied rows are silently skipped; got:\n{sql}"
         );
+        let due_after = format!("{CLAIM_ORDER_DUE_SQL} > $10");
         assert_eq!(
-            sql.matches("scheduled_at > $10").count() + sql.matches("scheduled_at = $10").count(),
+            sql.matches(&due_after).count() + sql.matches(&due_tie).count(),
             2,
             "the cursor OR-chain must have exactly one 'strictly after' \
-             branch and one 'tied, break on id' branch for scheduled_at; \
+             branch and one 'tied, break on id' branch for the due time; \
              got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("$10").count(),
+            2,
+            "only the two due-time branches bind $10; got:\n{sql}"
+        );
+    }
+
+    /// The SQL interval and the public constant name one handicap (issue #1824).
+    #[test]
+    fn claim_order_due_sql_spells_the_new_start_handicap() {
+        assert!(
+            CLAIM_ORDER_DUE_SQL.contains(&format!("INTERVAL '{NEW_START_HANDICAP_SECS} seconds'")),
+            "the SQL handicap must equal NEW_START_HANDICAP_SECS; got: {CLAIM_ORDER_DUE_SQL}"
+        );
+        assert!(CLAIM_ORDER_DUE_SQL.contains("task_type = 'workflow' AND attempt = 0"));
+    }
+
+    /// Every claim variant sorts on the claim-order due time, after the
+    /// priority key (issue #1824).
+    #[test]
+    fn every_claim_query_sorts_on_the_claim_order_due_time() {
+        let order_key = format!("END DESC, {CLAIM_ORDER_DUE_SQL} ASC");
+        let variants = [
+            claim_task_query(),
+            claim_task_query_fenced(),
+            claim_task_by_id_query(),
+            claim_task_by_id_query_fenced(),
+            claim_task_query_for_kind(TaskType::Workflow, false),
+            claim_task_query_for_kind(TaskType::Activity, false),
+            claim_task_query_for_kind(TaskType::Workflow, true),
+            claim_task_query_for_kind(TaskType::Activity, true),
+        ];
+        for sql in variants {
+            assert_eq!(
+                sql.matches(&order_key).count(),
+                1,
+                "the due time must sort right after the priority key; got:\n{sql}"
+            );
+            assert!(!sql.contains("scheduled_at ASC"), "got:\n{sql}");
+        }
+        let batched = claim_task_batched_candidates_query();
+        assert!(batched.contains(&format!("{CLAIM_ORDER_DUE_SQL} AS claim_due_at")));
+        assert!(batched.contains("effective_priority DESC, claim_due_at ASC, id ASC"));
+    }
+
+    /// The claim-time deadline check (issue #1824) fails only the row this
+    /// worker holds, only for a `RUNNING` run, and never locks the run row.
+    #[test]
+    fn deadline_check_matches_the_scanner_and_takes_no_run_lock() {
+        let sql = fail_claim_if_run_deadline_passed_query();
+        for clause in [
+            "t.id = $1 AND t.worker_id = $2 AND t.state = 'RUNNING'",
+            "SET state = 'FAILED', error = $3",
+            "e.state = 'RUNNING'",
+            "e.deadline_at < clock_timestamp()",
+            "e.chain_deadline_at < clock_timestamp()",
+        ] {
+            assert!(sql.contains(clause), "missing {clause:?}; got:\n{sql}");
+        }
+        assert!(
+            !sql.contains("FOR UPDATE"),
+            "a run lock would invert the scanner's order"
+        );
+        assert!(
+            !sql.contains("FOR SHARE"),
+            "a run lock would invert the scanner's order"
         );
     }
 

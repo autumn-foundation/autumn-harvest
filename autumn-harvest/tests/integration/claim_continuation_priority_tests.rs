@@ -93,7 +93,9 @@ async fn activity_continuation(conn: &mut AsyncPgConnection, queue: &str) -> Uui
     params.workflow_exec_id = Some(exec_id);
     params.activity_name = Some("noop".to_string());
     params.activity_id = Some(Uuid::new_v4());
-    queue::enqueue(conn, &params).await.expect("enqueue activity")
+    queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue activity")
 }
 
 /// Start a run, claim and park its workflow task, and return the row id and
@@ -217,7 +219,11 @@ async fn pending_check(conn: &mut AsyncPgConnection, ids: &[Uuid]) {
 
 fn assert_continuations_first(order: &[Uuid], backlog: &Backlog) {
     let m = backlog.continuations.len();
-    assert_eq!(order.len(), m + backlog.starts.len(), "every row is claimed");
+    assert_eq!(
+        order.len(),
+        m + backlog.starts.len(),
+        "every row is claimed"
+    );
     for id in &order[..m] {
         assert!(
             backlog.continuations.contains(id),

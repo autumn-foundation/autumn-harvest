@@ -86,12 +86,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, state: &str, deadline: D
     id
 }
 
-async fn enqueue(
-    conn: &mut AsyncPgConnection,
-    queue: &str,
-    kind: TaskType,
-    exec_id: Uuid,
-) -> Uuid {
+async fn enqueue(conn: &mut AsyncPgConnection, queue: &str, kind: TaskType, exec_id: Uuid) -> Uuid {
     let mut params = EnqueueParams::new(queue, kind, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id);
     if kind == TaskType::Activity {
@@ -227,10 +222,7 @@ async fn a_paused_run_past_its_deadline_keeps_its_activity() {
     let exec = insert_execution(&mut conn, "PAUSED", Deadline::Run(-1)).await;
     let task = enqueue(&mut conn, &queue, TaskType::Activity, exec).await;
 
-    assert_eq!(
-        claim_one(&mut conn, &queue, &unique("w")).await,
-        Some(task)
-    );
+    assert_eq!(claim_one(&mut conn, &queue, &unique("w")).await, Some(task));
     assert_eq!(row(&mut conn, task).await.state, "RUNNING");
 }
 
@@ -317,11 +309,12 @@ async fn the_timeout_scanner_times_out_the_run_and_keeps_the_task_outcome() {
         #[diesel(sql_type = diesel::sql_types::Text)]
         state: String,
     }
-    let run: State = diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(exec)
-        .get_result(&mut conn)
-        .await
-        .expect("run state");
+    let run: State =
+        diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec)
+            .get_result(&mut conn)
+            .await
+            .expect("run state");
     assert_eq!(run.state, "TIMED_OUT");
     assert_deadline_exceeded(&row(&mut conn, task).await);
 }
