@@ -2280,6 +2280,109 @@ async fn a_transient_session_acquire_keeps_the_slot_only_for_its_own_session() {
     }
 }
 
+/// A heartbeat write that blocks for an interval and then hits `lock_timeout`
+/// is followed on the same connection by a newer heartbeat (issue #1788).
+/// The timeout keeps the session, so the connection still works. A scanner
+/// that waits for the only slot then never reads the old stamp.
+#[tokio::test]
+async fn a_scanner_behind_a_timed_out_heartbeat_sees_the_newer_one() {
+    #[derive(diesel::QueryableByName)]
+    struct Beat {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let suffix = Uuid::new_v4().simple().to_string()[..12].to_owned();
+    let worker_id = format!("w-hb-{suffix}");
+    register_live_worker(&mut conn, &worker_id).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            format!("q-hb-{suffix}"),
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = $2, attempt = 1, \
+         last_heartbeat_at = clock_timestamp() - INTERVAL '1 hour' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the claim with an old heartbeat");
+
+    let mut role_timeouts = SessionTimeouts::for_role(DbRole::Hot);
+    role_timeouts.lock = Duration::from_millis(1_500);
+    let pool = engine_pool(
+        url.clone(),
+        1,
+        DbRole::Hot,
+        &timeouts(10_000, role_timeouts),
+    )
+    .expect("engine pool");
+
+    // Lock the row, so the heartbeat write waits until `lock_timeout`.
+    let mut locker = connect(&url).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT id FROM harvest_task_queue WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut locker)
+        .await
+        .expect("lock the row");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let tx = autumn_harvest::heartbeat::spawn_heartbeat_flusher_with(
+        autumn_harvest::queue::TaskClaim::new(task_id, worker_id.clone(), 1),
+        pool.clone(),
+        cancel.clone(),
+        autumn_harvest::heartbeat::HeartbeatFlushOptions {
+            acquire_timeout: Duration::from_secs(10),
+            metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+        },
+    );
+    assert!(tx.send(serde_json::json!({"progress": 1})));
+    // The write starts at about 1 s and times out at about 2.5 s.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let newer_sent_at = Utc::now();
+    assert!(tx.send(serde_json::json!({"progress": 2})));
+
+    // The scanner waits for the only slot behind the flush.
+    let scanner = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut scanner = pool.get().await.expect("the scanner gets the slot");
+            diesel::sql_query("SELECT last_heartbeat_at FROM harvest_task_queue WHERE id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .get_result::<Beat>(&mut *scanner)
+                .await
+                .expect("read the heartbeat")
+                .last_heartbeat_at
+                .expect("a heartbeat exists")
+        })
+    };
+    // Release the lock after the first write timed out.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    diesel::sql_query("COMMIT")
+        .execute(&mut locker)
+        .await
+        .expect("release the lock");
+    let beat = scanner.await.expect("the scanner joins");
+    cancel.cancel();
+    assert!(
+        beat >= newer_sent_at - chrono::Duration::milliseconds(50),
+        "the scanner saw the old stamp {beat}; the newer heartbeat was sent at {newer_sent_at}"
+    );
+}
+
 /// An acquire that lost its connection can still run its insert on the
 /// server (issue #1788). The re-check must wait for that insert. A plain
 /// read sees no row, releases the slot, and the insert then commits a

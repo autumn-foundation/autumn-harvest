@@ -406,6 +406,7 @@ pub async fn flush_heartbeat(
         &Latest::default(),
         acquire_timeout,
         Duration::MAX,
+        &crate::telemetry::NoOpMetrics,
     )
     .await
     .map_err(|failure| *failure.error)
@@ -436,6 +437,10 @@ struct Pending {
 /// heartbeat. A scanner that waits for the slot thus never reads the older
 /// send time. A quick write keeps the rate of one write per interval.
 ///
+/// A blocked write that fails on a session timeout is followed too. The
+/// timeout keeps the session, so the connection still works. `metrics`
+/// counts that failure, because the caller sees only the last write.
+///
 /// `beat` holds the last heartbeat written or tried.
 #[cfg(feature = "db")]
 async fn flush(
@@ -445,6 +450,7 @@ async fn flush(
     latest: &Latest,
     acquire_timeout: Duration,
     interval: Duration,
+    metrics: &dyn MetricsRecorder,
 ) -> Result<ClaimWrite, FlushFailure> {
     let mut started = tokio::time::Instant::now();
     let mut conn = crate::pool::acquire(pool, acquire_timeout)
@@ -461,22 +467,25 @@ async fn flush(
         if let Some(newer) = latest.take() {
             *beat = newer;
         }
-        let write = crate::queue::record_heartbeat_sent_ago(
+        let written = crate::queue::record_heartbeat_sent_ago(
             &mut conn,
             claim,
             beat.payload.clone(),
             beat.sent_order.elapsed(),
         )
-        .await
-        .map_err(|error| FlushFailure {
-            reason: "write_error",
-            error: Box::new(error),
-        })?;
-        if write != ClaimWrite::Applied
-            || !write_blocked(started.elapsed(), interval)
-            || !latest.is_full()
-        {
-            return Ok(write);
+        .await;
+        let connection_works = match &written {
+            Ok(write) => *write == ClaimWrite::Applied,
+            Err(error) => crate::pool::is_session_timeout(error),
+        };
+        if !connection_works || !write_blocked(started.elapsed(), interval) || !latest.is_full() {
+            return written.map_err(|error| FlushFailure {
+                reason: "write_error",
+                error: Box::new(error),
+            });
+        }
+        if written.is_err() {
+            metrics.record_heartbeat_flush_failed("write_error");
         }
         started = tokio::time::Instant::now();
     }
@@ -535,6 +544,7 @@ async fn stamped_heartbeat_loop(
                 &latest,
                 options.acquire_timeout,
                 flush_interval,
+                options.metrics.as_ref(),
             )
             .await;
             // A write that blocked leaves the row with an old send time,
