@@ -124,6 +124,7 @@ mod external_completion_tests;
 mod external_outbox_scan_tests;
 mod fanout_tests;
 mod force_fail_tests;
+mod formal_models_coverage;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
