@@ -2623,9 +2623,11 @@ fn path_change(s: &Stmts, opaque: &[usize], history: &mut History) -> Option<usi
     let changes = |k: usize| s.starts[k] == k && changes_search_path(s, k);
     let text = (0..s.toks.len()).find(|&k| changes(k));
     let hidden = opaque.first().map(|&k| s.end(k));
-    // A top-level local change ends with its transaction, so it stays here.
+    // Only a session change that runs now carries into history. A local
+    // change ends with its transaction. A routine body runs only when called,
+    // and that call counts as code the lint cannot read in its own file.
     let session =
-        (0..s.toks.len()).any(|k| changes(k) && !(s.toks[k].depth == 0 && local_path_change(s, k)));
+        (0..s.toks.len()).any(|k| changes(k) && s.toks[k].runs && !local_path_change(s, k));
     history.search_path_changed |= session;
     let local = text.into_iter().chain(hidden).min();
     local.or_else(|| history.search_path_changed.then_some(0))
@@ -3179,7 +3181,7 @@ fn create(s: &Stmts, k: usize, raws: &mut Vec<Raw>, created: &mut BTreeMap<Strin
     if s.keyword(j, "constraint") {
         j += 1;
     }
-    let target = match s.word(j) {
+    let target = match s.word(j).filter(|_| !s.toks[j].quoted) {
         Some("trigger") => Some(("CREATE TRIGGER", "on")),
         Some("policy") => Some(("CREATE POLICY", "on")),
         Some("rule") => Some(("CREATE RULE", "to")),
@@ -3234,7 +3236,7 @@ fn create_index(s: &Stmts, k: usize, mut j: usize) -> Option<Raw> {
 /// Dropping a table also drops the foreign-key triggers on each table it
 /// references. That takes ACCESS EXCLUSIVE on the referenced tables.
 fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
-    match s.word(k + 1) {
+    match s.word(k + 1).filter(|_| !s.toks[k + 1].quoted) {
         Some("index") => {
             let concurrent = s.keyword(k + 2, "concurrently");
             let j = s.skip_if_exists(k + 2 + usize::from(concurrent));
@@ -3506,7 +3508,7 @@ fn learn_partition(history: &mut History, parent: Option<&str>, child: Option<&s
 
 /// The `ALTER` forms that lock a table.
 fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
-    match s.word(k + 1) {
+    match s.word(k + 1).filter(|_| !s.toks[k + 1].quoted) {
         Some("table") => {
             // `ALTER TABLE ALL IN TABLESPACE` moves every table there.
             if s.keyword(k + 2, "all") && s.keyword(k + 3, "in") {
@@ -3610,7 +3612,9 @@ fn vacuum_full(s: &Stmts, k: usize) -> Vec<Raw> {
         }
         j += 1;
     } else {
-        while let Some(option @ ("full" | "freeze" | "verbose" | "analyze")) = s.word(j) {
+        while let Some(option @ ("full" | "freeze" | "verbose" | "analyze")) =
+            s.word(j).filter(|_| !s.toks[j].quoted)
+        {
             full |= option == "full";
             j += 1;
         }
@@ -6968,6 +6972,30 @@ fn an_execute_inside_a_control_form_is_dynamic_sql() {
     let sql = "DO $$\nDECLARE r record;\nBEGIN\n    FOR r IN EXECUTE 'SELECT 1' LOOP\n        NULL;\n    \
                END LOOP;\nEND $$;";
     assert_eq!(lint_with_history(&history, sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_quoted_full_is_a_vacuum_table() {
+    // `"full"` names a cold table, so this is a plain vacuum.
+    let sql = "VACUUM \"full\";";
+    assert_eq!(lint_with_history(&[], sql, false), [], "{sql}");
+}
+
+#[test]
+fn a_path_change_in_an_uncalled_body_does_not_carry() {
+    let create = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX public.idx;";
+    for change in [
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+         SET search_path = scratch, public;\nEND $$;",
+        "DO $$\nBEGIN\n    PERFORM set_config('search_path', 'scratch, public', true);\nEND $$;",
+    ] {
+        assert_eq!(
+            lint_with_history(&[change, create], drop, true),
+            [],
+            "{change}"
+        );
+    }
 }
 
 #[test]
