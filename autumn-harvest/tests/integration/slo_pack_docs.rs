@@ -269,22 +269,30 @@ fn schedule_to_start_ratio_matches_both_bucket_label_forms() {
 }
 
 /// The AC needs both promtool commands to gate CI, docs-only PRs too.
+/// A step-level `if:` can skip a step, so each step must have none.
 #[test]
 fn ci_runs_promtool_and_these_guards_in_the_lint_job() {
-    let ci = read_doc(CI_PATH);
-    let lint = ci
-        .split("\n  test:\n")
-        .next()
-        .expect("ci.yml must have a lint job before the test job");
+    let ci = read_yaml(CI_PATH);
+    let steps = ci["jobs"]["lint"]["steps"]
+        .as_sequence()
+        .expect("ci.yml must have a lint job with steps");
     for required in [
         "check rules docs/alerts/slo-pack-v0.1.0.rules.yml",
         "test rules docs/alerts/slo-pack-v0.1.0.test.yml",
         "sha256sum -c",
-        "slo_pack_docs::",
+        "--test integration slo_pack_docs::",
     ] {
+        let step = steps
+            .iter()
+            .find(|step| {
+                step["run"]
+                    .as_str()
+                    .is_some_and(|run| run.contains(required))
+            })
+            .unwrap_or_else(|| panic!("no lint step runs {required:?}"));
         assert!(
-            lint.contains(required),
-            "the lint job must contain {required:?}"
+            step.get("if").is_none(),
+            "the lint step that runs {required:?} must not be conditional"
         );
     }
 }

@@ -12,6 +12,10 @@ metric-backed rule below — each alert maps to a named panel (the mapping
 table lives in `docs/dashboards/README.md`), and each mapped panel's
 description links back to its section in this runbook.
 
+The `harvest_slo_*` sections at the end serve the optional SLO burn-rate
+pack ([`docs/alerts/slo.md`](../alerts/slo.md)). Those alerts have no
+starter-pack rule and no dashboard panel.
+
 ## First 60 seconds — one-call incident triage
 
 When an alert fires or a page lands, hit **one** endpoint first:
