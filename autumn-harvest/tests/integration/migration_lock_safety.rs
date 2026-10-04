@@ -2511,6 +2511,7 @@ fn resolve(
     // unqualified name. Such a name is never placed or learnt.
     let unplaced =
         |name: &str, at: usize| !name.contains('.') && path_change.is_some_and(|c| c <= at);
+    let bodies = routine_bodies(s);
     let mut hits = Vec::with_capacity(raws.len());
     for raw in raws {
         // A `format()` placeholder makes a name unknown, which fails closed.
@@ -2596,18 +2597,52 @@ fn resolve(
             table,
             kind: raw.kind,
             in_body: toks[raw.at].depth > 0,
-            body_start: (!toks[raw.at].runs).then(|| {
-                (0..raw.at)
-                    .rev()
-                    .take_while(|&j| !toks[j].runs)
-                    .last()
-                    .unwrap_or(raw.at)
-            }),
+            body_start: (!toks[raw.at].runs).then(|| body_start(&bodies, toks, raw.at)),
             hot,
         });
     }
 
     hits
+}
+
+/// The first token and the end of each routine body.
+///
+/// A body is the code after `AS`, a `BEGIN ATOMIC` block or a `RETURN`
+/// expression. A routine that another body creates has a body of its own.
+fn routine_bodies(s: &Stmts) -> Vec<(usize, usize)> {
+    (0..s.toks.len())
+        .filter(|&k| routine_keyword(s, k).is_some())
+        .filter_map(|k| {
+            let depth = s.toks[k].depth;
+            let end = s.end(k);
+            let start = (k + 1..end).find(|&j| {
+                let inline =
+                    s.keyword(j, "return") || (s.keyword(j, "begin") && s.keyword(j + 1, "atomic"));
+                s.toks[j].depth > depth || (s.toks[j].depth == depth && !s.toks[j].runs && inline)
+            })?;
+            Some((start, end))
+        })
+        .collect()
+}
+
+/// The first token of the innermost routine body that holds the token at `at`.
+///
+/// A bound from an outer body does not hold when an inner routine runs. The
+/// SQL of an `EXECUTE` in a body belongs to that body. Code that runs later
+/// outside any routine falls back to its run of deferred tokens.
+fn body_start(bodies: &[(usize, usize)], toks: &[Token], at: usize) -> usize {
+    bodies
+        .iter()
+        .filter(|&&(start, end)| start <= at && at < end)
+        .map(|&(start, _)| start)
+        .max()
+        .unwrap_or_else(|| {
+            (0..at)
+                .rev()
+                .take_while(|&j| !toks[j].runs)
+                .last()
+                .unwrap_or(at)
+        })
 }
 
 /// Whether each token runs on every path through its `DO` body.
@@ -5325,6 +5360,35 @@ fn a_quoted_label_does_not_end_a_branch() {
                END $$;\nALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn an_outer_routine_bound_does_not_cover_an_inner_routine() {
+    let inner = "    CREATE FUNCTION inner_f() RETURNS void LANGUAGE plpgsql AS $i$\n    BEGIN\n        \
+                 ALTER TABLE harvest_events ADD COLUMN x INT;\n    END $i$;\n";
+    // The inner routine runs later, after the outer call has restored its value.
+    for (clause, setter) in [
+        ("SET lock_timeout = '5s' ", ""),
+        ("", "    SET LOCAL lock_timeout = '5s';\n"),
+    ] {
+        let sql = format!(
+            "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql {clause}AS $o$\nBEGIN\n\
+             {setter}{inner}END $o$;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}\n{findings:?}");
+    }
+    // A bound in the inner body covers its lock.
+    let sql = "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
+               CREATE FUNCTION inner_f() RETURNS void LANGUAGE plpgsql AS $i$\n    BEGIN\n        \
+               SET LOCAL lock_timeout = '5s';\n        ALTER TABLE harvest_events ADD COLUMN x INT;\n    \
+               END $i$;\nEND $o$;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+    // The SQL of an `EXECUTE` in a body belongs to that body.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+               SET LOCAL lock_timeout = '5s';\n    \
+               EXECUTE 'ALTER TABLE harvest_events ADD COLUMN x INT';\nEND $$;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
 }
 
 #[test]
