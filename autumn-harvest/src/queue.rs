@@ -1297,13 +1297,12 @@ pub async fn claim_task(
 /// resolves through [`crate::replication::FenceRegistry`]'s default shard,
 /// which is what a legacy single-pool worker and every non-worker caller pass.
 ///
-/// When this process pinned no generation for the resolved shard — every
-/// deployment that has not opted into DR fencing — this issues the byte-for-
-/// byte unchanged pre-#954 statement. When it did, the fenced form applies, and
-/// a worker pinned to a superseded epoch selects zero candidates: it cannot
-/// claim, and the rows it did not claim are untouched (no `attempt` burned, no
-/// state change), so a worker in the region that actually holds authority
-/// picks them up.
+/// A process with no pin for the resolved shard issues the byte-for-byte
+/// unchanged pre-#954 statement. That is every process that found no DR
+/// marker at startup. With a pin, the fenced form applies. A worker pinned to
+/// a superseded epoch selects zero candidates, so it cannot claim. The rows it
+/// did not claim are untouched: no `attempt` burned, no state change. A worker
+/// in the region that actually holds authority picks them up.
 ///
 /// # Errors
 ///
@@ -1487,11 +1486,11 @@ pub async fn claim_task_of_kind_on_shard(
         .run(
             async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
                 // Cross-region DR fence (issue #954). Two fully separate
-                // arms rather than one boxed builder: `BoxedSqlQuery::bind`
-                // heap-allocates per bind and dispatches dynamically, and the
-                // unfenced arm — which is every deployment that has not opted
-                // into DR — must not pay for a feature it does not use on the
-                // engine's hottest statement.
+                // arms, not one boxed builder. `BoxedSqlQuery::bind`
+                // heap-allocates per bind and dispatches dynamically. The
+                // unfenced arm serves every process with no DR marker. It
+                // must not pay for an unused feature on the engine's hottest
+                // statement.
                 let result: Vec<TaskQueueItem> = match fence_binding(shard) {
                     None => {
                         let query = kind.map_or_else(claim_task_query, |kind| {
@@ -8630,33 +8629,49 @@ mod tests {
 
     /// Every public claim entry point applies the DR fence (issue #1823).
     ///
-    /// The test reads this file. A `pub async fn claim_task*` passes when its
-    /// body calls `fence_binding`, or calls another variant that passes. A new
-    /// claim variant without the fence fails here, not during a failover.
+    /// The test reads this file, up to the test module. A top-level
+    /// `pub async fn claim_task*` passes when its body calls `fence_binding`,
+    /// or calls another variant that passes. Comment lines do not count. A
+    /// new claim variant without the fence fails here, not during a failover.
     #[test]
     fn every_claim_variant_applies_the_dr_fence() {
-        let source = include_str!("queue.rs");
-        let marker = "pub async fn claim_task";
+        let full = include_str!("queue.rs");
+        let source = &full[..full
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("queue.rs has a test module")];
+        let marker = "\npub async fn claim_task";
         let mut variants: Vec<(String, String)> = Vec::new();
         let mut rest = source;
         while let Some(start) = rest.find(marker) {
-            let tail = &rest[start + "pub async fn ".len()..];
+            let tail = &rest[start + "\npub async fn ".len()..];
             let name_end = tail.find('(').expect("fn name ends at its parameter list");
             let body_start = tail.find("{\n").expect("fn body opens a block");
             let body_end = tail.find("\n}\n").expect("fn body ends at column zero");
-            variants.push((
-                tail[..name_end].to_string(),
-                tail[body_start..body_end].to_string(),
-            ));
+            let code: String = tail[body_start..body_end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            variants.push((tail[..name_end].to_string(), code));
             rest = &tail[body_end..];
         }
+        // A call to `name(` that is not the tail of a longer identifier.
+        let calls = |body: &str, name: &str| {
+            let needle = format!("{name}(");
+            body.match_indices(&needle).any(|(at, _)| {
+                body[..at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+            })
+        };
         let mut fenced: Vec<&str> = Vec::new();
         loop {
             let before = fenced.len();
             for (name, body) in &variants {
-                let calls_fenced = fenced.iter().any(|f| body.contains(&format!("{f}(")));
+                let calls_fenced = fenced.iter().any(|f| calls(body, f));
                 if !fenced.contains(&name.as_str())
-                    && (body.contains("fence_binding(") || calls_fenced)
+                    && (calls(body, "fence_binding") || calls_fenced)
                 {
                     fenced.push(name);
                 }
@@ -8678,6 +8693,7 @@ mod tests {
             "claim_task_of_kind_on_shard",
             "claim_task_by_id_on_shard",
             "claim_task_batched",
+            "claim_task_batched_on_shard",
         ] {
             assert!(
                 variants.contains(&expected),

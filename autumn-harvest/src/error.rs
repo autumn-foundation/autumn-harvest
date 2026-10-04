@@ -746,7 +746,7 @@ pub enum HarvestError {
     /// absent entirely. That also fences: a pinned worker with nothing to
     /// check against fails closed rather than assuming it still has authority.
     #[error(
-        "shard {shard_id} is fenced: this worker is pinned to generation {pinned} but the \
+        "shard {shard_id} is fenced: this process expects generation {pinned} but the \
          database is at {current:?} — another region holds write authority"
     )]
     ShardFenced {

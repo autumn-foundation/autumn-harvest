@@ -444,6 +444,13 @@ async fn handle_webhook(
     };
     let metrics = runtime.registry().telemetry().metrics.clone();
 
+    // These routes skip `admit_mutation`, so they run the DR fence check
+    // here (issue #1823). The refusal is a `503`. A `5xx` releases the replay
+    // key, so the provider retries later against a node with authority.
+    if let Err(refusal) = crate::api::enforce_dr_fence(&api_state).await {
+        return refusal.into_response();
+    }
+
     let payload: serde_json::Value = match serde_json::from_slice(hook.raw_body()) {
         Ok(v) => v,
         Err(e) => {

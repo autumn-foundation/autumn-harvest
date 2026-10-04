@@ -330,9 +330,9 @@ pub enum PartitionCommand {
         /// The DR generation that holds write authority (issue #1823).
         ///
         /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. A shard at
-        /// any other generation is refused, so a stale DSN to a demoted
-        /// primary writes nothing.
+        /// from `harvest dr status` against the promoted primary. The command
+        /// refuses a shard at any other generation, so a stale DSN to a
+        /// demoted primary writes nothing.
         #[arg(long = "expect-generation", value_name = "N")]
         expect_generation: Option<i64>,
 
@@ -373,9 +373,9 @@ pub enum PartitionCommand {
         /// The DR generation that holds write authority (issue #1823).
         ///
         /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. A shard at
-        /// any other generation is refused, so a stale DSN to a demoted
-        /// primary writes nothing.
+        /// from `harvest dr status` against the promoted primary. The command
+        /// refuses a shard at any other generation, so a stale DSN to a
+        /// demoted primary writes nothing.
         #[arg(long = "expect-generation", value_name = "N")]
         expect_generation: Option<i64>,
 
@@ -401,9 +401,9 @@ pub enum PartitionCommand {
         /// The DR generation that holds write authority (issue #1823).
         ///
         /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. A shard at
-        /// any other generation is refused, so a stale DSN to a demoted
-        /// primary writes nothing.
+        /// from `harvest dr status` against the promoted primary. The command
+        /// refuses a shard at any other generation, so a stale DSN to a
+        /// demoted primary writes nothing.
         #[arg(long = "expect-generation", value_name = "N")]
         expect_generation: Option<i64>,
 
@@ -1971,6 +1971,14 @@ enum ShardCommand {
         /// See `--after-created-at`; both must be supplied together.
         #[arg(long, requires = "after_created_at")]
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required when any `--shard` database carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. The command
+        /// refuses a shard at any other generation, so a stale DSN writes
+        /// nothing.
+        #[arg(long = "expect-generation", value_name = "N")]
+        expect_generation: Option<i64>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -1991,6 +1999,14 @@ enum ShardCommand {
         /// Maximum records to advance in this run.
         #[arg(long, default_value_t = 100)]
         limit: i64,
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required when any `--shard` database carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. The command
+        /// refuses a shard at any other generation, so a stale DSN writes
+        /// nothing.
+        #[arg(long = "expect-generation", value_name = "N")]
+        expect_generation: Option<i64>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -2025,6 +2041,14 @@ enum ShardCommand {
         /// See `--after-migrated-at`; both must be supplied together.
         #[arg(long, requires = "after_migrated_at")]
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required when any `--shard` database carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. The command
+        /// refuses a shard at any other generation, so a stale DSN writes
+        /// nothing.
+        #[arg(long = "expect-generation", value_name = "N")]
+        expect_generation: Option<i64>,
         /// Print the raw JSON count instead of a human summary.
         #[arg(long)]
         json: bool,
@@ -5975,12 +5999,14 @@ async fn dr_connect_read_only(
 
 // ── `harvest partition` (issue #958) ───────────────────────────────────────
 
-/// Refuse a partition write on a shard without write authority (issue #1823).
+/// Refuse a direct-database write on a shard without write authority
+/// (issue #1823).
 ///
-/// `harvest partition` connects to the shard database directly, so the
-/// management API fence never sees it. The operator states the generation
-/// that holds authority. A demoted primary is still at an older one.
-async fn partition_write_authority(
+/// `harvest partition` and `harvest shard rebalance` connect to shard
+/// databases directly, so the management API fence never sees them. The
+/// operator states the generation that holds authority. A demoted primary is
+/// still at an older one.
+async fn direct_write_authority(
     conn: &mut autumn_harvest::diesel_async::AsyncPgConnection,
     shard_id: i32,
     expect_generation: Option<i64>,
@@ -5999,6 +6025,25 @@ async fn partition_write_authority(
         ),
         other => other.to_string(),
     })
+}
+
+/// [`direct_write_authority`] for every shard of a rebalance pool, before any
+/// write. A rebalance moves history between two shards, so both must hold
+/// authority.
+async fn shard_pool_write_authority(
+    pool: &autumn_harvest::shard::ShardedDbPool,
+    expect_generation: Option<i64>,
+) -> Result<(), CliError> {
+    for (shard, shard_pool) in pool.iter_shards() {
+        let mut conn = shard_pool
+            .get()
+            .await
+            .map_err(|e| CliError::InvalidInput(format!("cannot connect to shard {shard}: {e}")))?;
+        direct_write_authority(&mut conn, shard.as_i32(), expect_generation)
+            .await
+            .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
+    }
+    Ok(())
 }
 
 /// What `harvest partition disable` did on one shard.
@@ -6302,7 +6347,7 @@ async fn run_partition_enable(
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
         if let Err(error) =
-            partition_write_authority(&mut conn, target.shard_id, expect_generation).await
+            direct_write_authority(&mut conn, target.shard_id, expect_generation).await
         {
             row.error = Some(error);
             out.push(row);
@@ -6349,7 +6394,7 @@ async fn run_partition_maintain(
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
         if let Err(error) =
-            partition_write_authority(&mut conn, target.shard_id, expect_generation).await
+            direct_write_authority(&mut conn, target.shard_id, expect_generation).await
         {
             row.error = Some(error);
             out.push(row);
@@ -6406,7 +6451,7 @@ async fn run_partition_disable(
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
         if let Err(error) =
-            partition_write_authority(&mut conn, target.shard_id, expect_generation).await
+            direct_write_authority(&mut conn, target.shard_id, expect_generation).await
         {
             row.error = Some(error);
             out.push(row);
@@ -10216,6 +10261,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             dry_run,
             after_created_at,
             after_execution_id,
+            expect_generation,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
@@ -10227,6 +10273,9 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 ));
             }
             let pool = build_pool(&targets)?;
+            if !*dry_run {
+                shard_pool_write_authority(&pool, *expect_generation).await?;
+            }
             let after = after_created_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
@@ -10258,11 +10307,13 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             shards,
             from,
             limit,
+            expect_generation,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
+            shard_pool_write_authority(&pool, *expect_generation).await?;
             let outcomes = autumn_harvest::shard_rebalance::resume_incomplete_migrations(
                 &pool,
                 ShardId::new(*from),
@@ -10294,11 +10345,13 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             limit,
             after_migrated_at,
             after_execution_id,
+            expect_generation,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
+            shard_pool_write_authority(&pool, *expect_generation).await?;
             let after = after_migrated_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));

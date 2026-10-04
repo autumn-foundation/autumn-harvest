@@ -406,8 +406,8 @@ long the whole thing takes.
 
 1. Stand up two "regions" (a compose file with two Postgres containers, or two
    databases in one instance as above) and replicate shard 0 from A to B.
-2. Start a worker fleet against A with `dr_fencing` enabled. Start some
-   long-running workflows.
+2. Start a worker fleet against A. The default `Auto` mode fences it,
+   because A carries the DR slot. Start some long-running workflows.
 3. **Start a stopwatch.** Kill region A (`docker stop`, or a firewall rule —
    prefer the firewall, because it simulates a *partition*, which is the harder
    case).

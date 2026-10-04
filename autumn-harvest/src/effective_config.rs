@@ -183,7 +183,9 @@ pub struct WorkerConfigView {
     ///
     /// The single most consequential DR setting to be able to read back from a
     /// running fleet. `auto` fences on a database that carries a DR marker.
-    /// `disabled` refuses to start on one.
+    /// `disabled` refuses to start on one. This is the configured mode. The
+    /// startup log line `pinned shard write-authority generation` shows that
+    /// the process actually fenced.
     pub dr_fencing: crate::replication::DrFencing,
     /// DR sampler cadence, milliseconds — the RPO's resolution floor and the
     /// bound on fence-detection latency (issue #954).

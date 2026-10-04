@@ -27676,7 +27676,7 @@ struct WorkerMonitoringHandles {
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Cross-region DR sampler (issue #954): replication watermark beat,
     /// measured-RPO gauges, and this worker's periodic self-fence check.
-    /// `Some` only when `dr_fencing` is enabled and a sharded pool exists.
+    /// `Some` only when this worker is fenced (issue #1823).
     replication_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
     /// itself no-ops when metrics are disabled); `None` without `db`.

@@ -2882,8 +2882,9 @@ mutually exclusive and neither can fire on a stale reading.
 - A single tick during a role change or a failover, where the connection is
   re-established as a different role. The `for: 10m` window covers that.
 - A deployment that has not configured DR at all but set
-  `with_dr_fencing(true)`: the sampler runs and finds nothing to read. Silence this shard explicitly rather
-  than letting it become background noise.
+  `with_dr_fencing(true)`: the sampler runs and finds nothing to read.
+  Silence this shard explicitly rather than letting it become background
+  noise.
 
 ### Safe actions
 

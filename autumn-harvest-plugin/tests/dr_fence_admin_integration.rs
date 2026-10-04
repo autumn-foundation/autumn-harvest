@@ -233,3 +233,73 @@ async fn an_unpinned_process_admits_admin_writes() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(paused_queue_count(&pool, "unfenced").await, 1);
 }
+
+fn api_only_config() -> autumn_harvest_plugin::config::HarvestRuntimeConfig {
+    autumn_harvest_plugin::config::HarvestRuntimeConfig {
+        worker_enabled: false,
+        scheduler_enabled: false,
+        ..autumn_harvest_plugin::config::HarvestRuntimeConfig::default()
+    }
+}
+
+/// An API-only node owns no worker, so `HarvestRunner::start` itself must pin.
+/// Without the pin, the admin-write fence would check nothing on this node.
+#[tokio::test]
+async fn an_api_only_runner_pins_a_dr_database_at_startup() {
+    use autumn_harvest_plugin::runner::{HarvestRunner, HarvestRunnerResources};
+
+    let _serial = REGISTRY_SERIAL.lock().await;
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .expect("provision");
+    }
+    FenceRegistry::clear();
+    let runner = HarvestRunner::start(
+        autumn_harvest::builder::HarvestBuilder::new().build(),
+        &api_only_config(),
+        HarvestRunnerResources::new(pool),
+    )
+    .await;
+    let pinned = FenceRegistry::expected(ShardId::new(0));
+    FenceRegistry::clear();
+    let runner = runner.expect("a DR database starts fenced");
+    runner.stop().await;
+    assert_eq!(
+        pinned,
+        Some(ShardGeneration::INITIAL),
+        "the runner pins before the API serves"
+    );
+}
+
+/// A runner configured `Disabled` refuses to start on a DR database.
+#[tokio::test]
+async fn a_runner_configured_disabled_refuses_a_dr_database() {
+    use autumn_harvest_plugin::runner::{HarvestRunner, HarvestRunnerResources};
+
+    let _serial = REGISTRY_SERIAL.lock().await;
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .expect("provision");
+    }
+    FenceRegistry::clear();
+    let built = autumn_harvest::builder::HarvestBuilder::new()
+        .worker(autumn_harvest::builder::WorkerConfig::default().with_dr_fencing(false))
+        .build();
+    let result =
+        HarvestRunner::start(built, &api_only_config(), HarvestRunnerResources::new(pool)).await;
+    let enabled = FenceRegistry::is_enabled();
+    FenceRegistry::clear();
+    let Err(error) = result else {
+        panic!("a disagreeing runner must refuse to start");
+    };
+    assert!(error.to_string().contains("refusing to start"), "{error}");
+    assert!(!enabled, "a refused runner pins nothing");
+}

@@ -516,7 +516,8 @@ impl DrFencing {
                 "DR fencing is Disabled, but a shard database carries a DR marker (a \
                  harvest_shard_generation row, a DR replication slot or a DR subscription). An \
                  unfenced process could write to a demoted primary after a failover. Remove \
-                 with_dr_fencing(false) to use the default Auto mode."
+                 with_dr_fencing(false) or with_dr_fencing_mode(Disabled) to use the default \
+                 Auto mode."
                     .to_string(),
             ),
         }
@@ -534,13 +535,27 @@ pub struct DrMarkers {
     pub dr_slots: i64,
     /// Subscriptions in this database with the DR prefix.
     pub dr_subscriptions: i64,
+    /// Whether the server is a physical standby (`pg_is_in_recovery()`).
+    pub in_recovery: bool,
 }
 
 impl DrMarkers {
     /// Whether any DR signal is present.
+    ///
+    /// Recovery alone is not a signal. A plain read replica is not DR.
     #[must_use]
-    pub fn is_dr(&self) -> bool {
+    pub const fn is_dr(&self) -> bool {
         !self.generation_shards.is_empty() || self.dr_slots > 0 || self.dr_subscriptions > 0
+    }
+
+    /// Whether this database is a DR standby that has not been promoted.
+    ///
+    /// A DR subscription means a logical standby. Recovery means a physical
+    /// standby. No Harvest process may start on either. The runbook starts
+    /// workers only after promotion.
+    #[must_use]
+    pub const fn is_standby(&self) -> bool {
+        self.in_recovery || self.dr_subscriptions > 0
     }
 }
 
@@ -1220,8 +1235,8 @@ mod db {
     /// Assert that this process still holds write authority for `shard`.
     ///
     /// Call at the top of a persist. Costs **nothing** — not even a round trip
-    /// — when this process pinned no generation, which is every deployment that
-    /// has not opted into DR fencing.
+    /// — when this process pinned no generation. That is every process that
+    /// found no DR marker at startup (issue #1823).
     ///
     /// When it does run it takes the fencing row `FOR SHARE`. Inside a
     /// transaction that makes the check a commit-order barrier:
@@ -1289,6 +1304,8 @@ mod db {
         dr_slots: i64,
         #[diesel(sql_type = BigInt)]
         dr_subscriptions: i64,
+        #[diesel(sql_type = Bool)]
+        in_recovery: bool,
     }
 
     /// Probe this database for DR markers (issue #1823).
@@ -1296,9 +1313,8 @@ mod db {
     /// The slot test uses the same scope as the RPO metric. A logical slot
     /// counts for its own database. A physical slot has no database, so it
     /// counts for every database on the cluster. Physical replication copies
-    /// the whole cluster, so that is the correct answer. `starts_with` is
-    /// used rather than `LIKE`, for the reason the RPO queries give: `_` is a
-    /// wildcard in `LIKE`.
+    /// the whole cluster, so that is the correct answer. The query uses
+    /// `starts_with`, not `LIKE`, because `_` is a wildcard in `LIKE`.
     ///
     /// Every catalog read here needs no special grant. `pg_subscription`
     /// hides only its connection string from ordinary roles.
@@ -1333,7 +1349,8 @@ mod db {
                  (SELECT COUNT(*) FROM pg_subscription s \
                   JOIN pg_database d ON d.oid = s.subdbid \
                   WHERE d.datname = current_database() \
-                    AND starts_with(s.subname::text, $1)) AS dr_subscriptions"
+                    AND starts_with(s.subname::text, $1)) AS dr_subscriptions, \
+                 pg_is_in_recovery() AS in_recovery"
         ))
         .bind::<Text, _>(slot_prefix)
         .get_result(conn)
@@ -1347,7 +1364,47 @@ mod db {
                 .collect(),
             dr_slots: row.dr_slots,
             dr_subscriptions: row.dr_subscriptions,
+            in_recovery: row.in_recovery,
         })
+    }
+
+    /// How many times startup probes one shard before it refuses to start.
+    const PROBE_ATTEMPTS: u32 = 5;
+
+    /// Probe one pool, and retry a failure with backoff (issue #1823).
+    ///
+    /// Before the default became `Auto`, an unfenced worker issued no probe.
+    /// A shard that is briefly unreachable at boot must not stop it at once.
+    /// After the last attempt the error stands, and the process refuses to
+    /// start. An unknown shard could carry a DR marker, so running unfenced
+    /// would fail open.
+    async fn probe_pool(
+        pool: &crate::worker::DbPool,
+        slot_prefix: &str,
+    ) -> HarvestResult<DrMarkers> {
+        let mut delay = std::time::Duration::from_millis(500);
+        let mut attempt = 1;
+        loop {
+            let probed = async {
+                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+                probe_dr_markers(&mut conn, slot_prefix).await
+            }
+            .await;
+            match probed {
+                Ok(markers) => return Ok(markers),
+                Err(error) if attempt < PROBE_ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        "DR marker probe failed; retrying before startup refuses"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Check that a direct-database admin write may run on `shard`
@@ -1418,24 +1475,29 @@ mod db {
             || vec![fallback_pool],
             |(targets, _)| targets.iter().map(|(_, pool)| pool).collect(),
         );
-        let mut dr_configured = false;
-        let mut fallback_markers = DrMarkers::default();
+        let mut probed = Vec::with_capacity(probe_pools.len());
         for pool in probe_pools {
-            let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-            let markers = probe_dr_markers(&mut conn, slot_prefix).await?;
-            dr_configured |= markers.is_dr();
-            fallback_markers = markers;
+            probed.push(probe_pool(pool, slot_prefix).await?);
         }
+        let dr_configured = probed.iter().any(DrMarkers::is_dr);
         if !mode
             .resolve(dr_configured)
             .map_err(crate::error::HarvestError::Config)?
         {
             return Ok(None);
         }
+        if probed.iter().any(DrMarkers::is_standby) {
+            return Err(crate::error::HarvestError::Config(
+                "this database is a DR standby: it has a DR subscription or is in recovery. \
+                 No Harvest process may write to a standby. Promote it first (runbook step 2), \
+                 or point this process at the primary."
+                    .to_string(),
+            ));
+        }
 
         let (targets, default_shard) = match targets {
             Some(targets) => targets,
-            None => match fallback_markers.generation_shards.as_slice() {
+            None => match probed[0].generation_shards.as_slice() {
                 [shard] => (vec![(*shard, fallback_pool.clone())], *shard),
                 rows => {
                     return Err(crate::error::HarvestError::Config(format!(
@@ -1448,6 +1510,26 @@ mod db {
                 }
             },
         };
+
+        // A shard database holds its own row only. A row for another shard
+        // means this process names the database wrongly. Pinning would add a
+        // second row, and `harvest dr fence` on the real shard would then
+        // fence nothing this process checks.
+        for ((shard, _), markers) in targets.iter().zip(&probed) {
+            if !markers.generation_shards.is_empty() && !markers.generation_shards.contains(shard) {
+                return Err(crate::error::HarvestError::Config(format!(
+                    "this process serves shard {} on a database whose harvest_shard_generation \
+                     names shard(s) {:?}. Configure the shard number the operator fences with \
+                     `harvest dr fence`. Refusing to start.",
+                    shard.as_i32(),
+                    markers
+                        .generation_shards
+                        .iter()
+                        .map(|s| s.as_i32())
+                        .collect::<Vec<_>>()
+                )));
+            }
+        }
 
         let mut pins = Vec::with_capacity(targets.len());
         for (shard, pool) in &targets {
@@ -2787,7 +2869,10 @@ mod tests {
     fn registry_round_trips_and_defaults_to_disabled() {
         let _serial = registry_guard();
         FenceRegistry::clear();
-        assert!(!FenceRegistry::is_enabled(), "fencing is opt-in");
+        assert!(
+            !FenceRegistry::is_enabled(),
+            "an empty registry fences nothing"
+        );
         assert_eq!(FenceRegistry::expected(ShardId::new(3)), None);
 
         FenceRegistry::register(ShardId::new(3), ShardGeneration(7)).expect("first registration");

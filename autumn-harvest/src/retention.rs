@@ -1497,6 +1497,21 @@ async fn run_partition_maintenance_pass(
                 }
             },
         };
+        // A fenced process must not create or drop partitions on a shard
+        // another region owns (issue #1823). `harvest partition maintain`
+        // makes the same check. With no pin, this check issues no statement.
+        if let Err(error) = crate::replication::assert_fence(&mut conn, shard).await {
+            tracing::warn!(
+                shard = %shard,
+                error = %error,
+                "harvest event-partition maintenance skipped: this process is fenced"
+            );
+            monitor_task.update_partitions(
+                shard,
+                crate::partition::MaintenanceOutcome::failed(error.to_string()),
+            );
+            continue;
+        }
         // Review finding: a standalone probe used to run here, before
         // calling `maintain` below. That told an unpartitioned shard
         // apart from one that ran and did nothing (issue #1270 item 6).

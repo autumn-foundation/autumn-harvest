@@ -163,12 +163,14 @@ GRANT pg_monitor TO harvest;
 Without it the RPO degrades to *unavailable* — logged, never fatal — and you
 lose the number, not the engine.
 
-### Turning the fence on
+### When the fence turns on
 
 The fence is **on by default wherever DR is configured** (issue #1823). The
 default mode is `Auto`. You do not need to set anything.
 
 ```rust
+use autumn_harvest::replication::DrFencing;
+
 // The default. Shown only for clarity.
 let config = WorkerConfig::default().with_dr_fencing_mode(DrFencing::Auto);
 ```
@@ -187,28 +189,46 @@ cluster, because physical replication copies the whole cluster.
 
 | Mode | No marker found | Marker found |
 | --- | --- | --- |
-| `Auto` (default) | Runs unfenced. | Pins every shard and runs fenced. |
-| `Enabled` (`with_dr_fencing(true)`) | Provisions the row, pins, runs fenced. | Pins and runs fenced. |
+| `Auto` (default) | Runs unfenced. | Provisions an absent row, pins every shard, runs fenced. |
+| `Enabled` (`with_dr_fencing(true)`) | Provisions the row, pins, runs fenced. | Provisions an absent row, pins, runs fenced. |
 | `Disabled` (`with_dr_fencing(false)`) | Runs unfenced. | **Refuses to start.** |
 
 A process whose configuration disagrees with the database does not start.
-`Disabled` against a DR database is that disagreement. So is `Auto` or
-`Enabled` when the process cannot name the shard it serves. The log line
-says which, and what to change.
+The log line says which rule it broke, and what to change:
+
+- `Disabled` on a DR database.
+- A fenced process that cannot name the shard it serves.
+- A fenced process whose shard number differs from the row in the database.
+  A shard database holds its own row only.
+- A fenced process on a DR **standby**: a database with a DR subscription, or
+  a server in recovery. No Harvest process writes to a standby. The runbook
+  starts processes only after promotion.
 
 **Shard identity.** A pin needs a shard number. A worker takes it from its
-sharded pool or from `with_shard_assignments`. With neither, `Auto` reads it
-from the database: exactly one `harvest_shard_generation` row names the shard.
-Zero or several rows give no answer, and the process refuses to start.
+sharded pool or from `with_shard_assignments`. With neither, the process
+reads it from the database: exactly one `harvest_shard_generation` row names
+the shard. Zero or several rows give no answer, and the process refuses to
+start.
 
-**Cost.** A database with no marker pays one probe query per shard at
-startup. The claim query stays the byte-for-byte pre-#954 statement. The
-persist path issues no extra statement, and no DR sampler starts.
+**What `Auto` cannot see.** Some DR setups leave no marker until the first
+fence. A physical standby that follows the primary with no `harvest_dr` slot
+(the `application_name` fallback above) is one. So are replicas that an HA
+manager such as Patroni or a managed cloud service creates. For these, set
+`with_dr_fencing(true)` on every process, or run one process with it once.
+That process provisions the row, and the row then marks the database for
+`Auto`.
+
+**Cost.** A database with no marker pays one probe per shard at startup: two
+catalog reads. The claim query stays the byte-for-byte pre-#954 statement.
+The persist path issues no extra statement, and no DR sampler starts. A probe
+that fails is retried with backoff for a few seconds. If it still fails, the
+process refuses to start. It never guesses that a shard it cannot read is
+plain.
 
 With the fence on, each worker **pins** every assigned shard's
 `harvest_shard_generation` epoch at startup. It does this before it registers
-in the fleet and before its first poll. If the epoch cannot be read, the
-worker **refuses to start**. It never runs unfenced.
+in the fleet and before its first poll. If the worker cannot read the epoch,
+it **refuses to start**. It never runs unfenced.
 
 The sampler interval and slot prefix are still worker settings:
 
@@ -256,28 +276,47 @@ It stops with `HarvestError::ShardFenced` and increments
 
 Admin writes go through the same check as worker writes (issue #1823).
 
-- **Management API.** The plugin pins its shards at startup, before it serves
-  a request. Every mutating route then runs `assert_fence` for each pinned
-  shard before the handler runs. A fenced process answers `503` and names the
-  fence. It writes nothing. Read routes still answer, so you can inspect the
-  node. Most `harvest` CLI commands call this API, so they are fenced too.
-- **`harvest partition enable|maintain|disable`.** These connect to the shard
-  database directly. On a DR database they need `--expect-generation <N>`.
-  Read `N` from `harvest dr status` against the region that holds authority.
-  A shard at any other generation is refused. That catches a stale DSN to a
-  demoted primary, which a pin taken at connect time cannot.
+- **Management API.** `HarvestRunner::start` pins every storage shard before
+  it serves a request. That covers API-only nodes, which run no worker. Every
+  mutating management API, Vantage, MCP and webhook route then runs
+  `assert_fence` for each pinned shard, before its handler. A fenced node
+  answers `503` and the handler does not run. Read routes still answer, so
+  you can inspect the node. Most `harvest` CLI commands call this API, so
+  they are fenced too.
+- **Direct-database CLI writes.** `harvest partition enable|maintain|disable`
+  and `harvest shard rebalance|rebalance-resume|reconcile-migrated-seals`
+  connect to shard databases directly. On a DR database they need
+  `--expect-generation <N>`. Read `N` from `harvest dr status` against the
+  region that holds authority. The command refuses a shard at any other
+  generation. A stale DSN to a demoted primary then writes nothing. A pin
+  taken at connect time cannot catch that case. A rebalance dry run reads
+  only, so it needs no flag.
+- **In-process partition maintenance.** The retention janitor runs
+  `assert_fence` on each shard before it creates or drops partitions.
 
 These direct-database commands are exempt, by design:
 
 | Command | Why it is not fenced |
 | --- | --- |
-| `harvest dr fence`, `harvest dr promote` | They move write authority. Fencing them would block the failover. |
+| `harvest dr fence` | It moves write authority. Fencing it would block the failover. |
+| `harvest dr promote` | It runs during the failover, before workers start. It only advances sequences. |
 | `harvest migrate run` | Logical replication carries no DDL. You must migrate both regions. |
-| `harvest backup verify`, `harvest dr status` | Read-only. The session is pinned `READ ONLY`. |
+| `harvest backup verify`, `harvest dr status`, `harvest partition status`, `harvest migrate status` | They read only. |
 
-The management API check runs before the handler, not inside its
-transaction. Admin writes that append history are also checked inside the
-append transaction, by the persist assert.
+Three limits, stated plainly:
+
+- The management API check runs before the handler, not inside its
+  transaction. The persist assert also checks each admin write that appends
+  history, inside the append transaction. A write that appends no history,
+  such as a queue pause, has only the check before the handler.
+- The check reads every pinned shard on each admin write. If one shard
+  cannot be read, every admin write on the node answers `503`. That fails
+  closed. A node that has lost authority on one shard has lost it on the
+  failover the runbook performs for all shards.
+- `--expect-generation` takes one value for every `--shard` in a command.
+  After the runbook, all shards share one generation. Shards at different
+  generations need separate commands. The CLI probes with the default
+  `harvest_dr` prefix. With a custom prefix, always pass the flag.
 
 ### Invariants
 
@@ -358,18 +397,30 @@ operator-initiated, for four reasons:
    acts on a failed health check promotes during a partition too. Then two
    primaries accept writes, and histories fork.
 3. **A safe promoter needs a quorum witness in a third failure domain.**
-   Harvest has no such component, and adding one breaks the "Postgres only"
-   rule above.
+   Harvest has no such component, and adding one breaks the "no new
+   infrastructure in core" rule above.
 4. **Shards fail over at different points.** An unattended promoter would
    start workers shard by shard. The runbook forbids that order; see
    § *Multi-shard skew*.
 
 If you need unattended failover, use a Postgres HA manager that has a
 witness (for example Patroni with etcd, or your cloud's managed failover).
-Make it run the runbook in order: isolate, `harvest dr fence`,
-`harvest dr promote`, `harvest backup verify`, then start workers. The fence
-still protects you: a worker that reconnects to the promoted primary with
-the old epoch cannot claim or append.
+Make it run the runbook in order. Isolate the old primary first. Then fence
+and promote: fence first on a logical standby, and promote first on a
+physical standby, which is read-only until promotion. Then run
+`harvest dr promote` and `harvest backup verify`, and start workers last.
+
+Two rules matter more under automation:
+
+- **Do not publish the new endpoint until `harvest dr fence` completes on
+  every shard.** A worker that follows a DNS or VIP flip before the fence
+  still holds the old epoch, and that epoch is still current.
+- **Set `with_dr_fencing(true)` on every process.** `Auto` cannot see the
+  replicas that HA managers and managed services create. See § *When the
+  fence turns on*.
+
+After the fence, a worker that reconnects to the promoted primary with the
+old epoch cannot claim or append.
 
 ---
 

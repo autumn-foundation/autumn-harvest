@@ -5920,24 +5920,38 @@ async fn admit_mutation(
 
 /// Refuse an admin write when this process lost write authority (issue #1823).
 ///
-/// Every mutating route passes through here after authentication. The check
-/// runs [`autumn_harvest::replication::assert_fence`] for each shard this
-/// process pinned. A failover bumps the generation, so a stale node refuses
-/// every admin write and writes nothing. It costs one atomic load on a process
-/// that pinned nothing.
+/// Every route that [`admit_mutation`] gates runs this after authentication:
+/// the classified management API, Vantage and the MCP tools. It runs
+/// [`autumn_harvest::replication::assert_fence`] for each shard this process
+/// pinned. A failover bumps the generation, so a stale node refuses each admin
+/// write before its handler runs. A process that pinned nothing pays one
+/// atomic load.
+///
+/// The checks run concurrently, each with a bounded pool acquire. So one slow
+/// shard cannot hang every admin write. A shard that cannot be checked fails
+/// closed with `503`.
+///
+/// `pool_for` falls back to the default pool on purpose. On a single-database
+/// node, that pool is the database of whichever shard the node pinned.
 ///
 /// The check runs before the handler, not inside its transaction. A handler
 /// that appends history is also checked inside the append transaction.
-async fn enforce_dr_fence(api_state: &HarvestApiState) -> Result<(), AutumnError> {
+pub(crate) async fn enforce_dr_fence(api_state: &HarvestApiState) -> Result<(), AutumnError> {
     use autumn_harvest::replication::{FenceRegistry, assert_fence};
 
     if !FenceRegistry::is_enabled() {
         return Ok(());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
-    for (shard, _) in FenceRegistry::snapshot() {
-        let mut conn = acquire_conn(pool.pool_for(shard)).await?;
-        assert_fence(&mut conn, shard).await.map_err(map_error)?;
+    let checks = FenceRegistry::snapshot().into_iter().map(|(shard, _)| {
+        let shard_pool = pool.pool_for(shard).clone();
+        async move {
+            let mut conn = autumn_harvest::pool::acquire_within_pool_bound(&shard_pool).await?;
+            assert_fence(&mut conn, shard).await
+        }
+    });
+    for checked in futures::future::join_all(checks).await {
+        checked.map_err(map_error)?;
     }
     Ok(())
 }
@@ -45391,17 +45405,16 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         error @ HarvestError::LoadShed { .. } => AutumnError::bad_request_msg(error.to_string())
             .with_status(axum::http::StatusCode::TOO_MANY_REQUESTS),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
-        // The run moved after the authorizer hook checked it (issue #1803).
-        // Nothing was read or written on the new shard. The body is the
-        // retry hint only. The policy's reason never reaches the caller,
-        // and a `403` here would leak that a shard is denied.
-        error @ HarvestError::OutsideShardFence { .. } => {
-            AutumnError::service_unavailable_msg(error.to_string())
-        }
-        // This node lost write authority to another region (issue #1823).
-        // `503` tells a load balancer to send the caller to another node. A
-        // retry on this node fails the same way until it restarts.
-        error @ HarvestError::ShardFenced { .. } => {
+        // `OutsideShardFence`: the run moved after the authorizer hook
+        // checked it (issue #1803). Nothing was read or written on the new
+        // shard. The body is the retry hint only. The policy's reason never
+        // reaches the caller, and a `403` here would leak that a shard is
+        // denied.
+        //
+        // `ShardFenced`: this node lost write authority to another region
+        // (issue #1823). Nothing was written. A retry on this node fails the
+        // same way until the node restarts against the authoritative region.
+        error @ (HarvestError::OutsideShardFence { .. } | HarvestError::ShardFenced { .. }) => {
             AutumnError::service_unavailable_msg(error.to_string())
         }
         other => AutumnError::service_unavailable_msg(other.to_string()),

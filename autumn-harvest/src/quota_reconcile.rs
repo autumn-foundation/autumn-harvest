@@ -148,8 +148,8 @@
 //! release without writing a quota key derived from its own
 //! possibly-stale registry view, onto a database another region now
 //! owns. The assert is a cheap in-process check when this worker has no
-//! pinned generation for the shard. A deployment that never enables
-//! `dr_fencing` pays nothing extra.
+//! pinned generation for the shard. A process that pins no generation
+//! pays nothing extra.
 //!
 //! # Out of scope: `harvest_dead_letters.quota_key`
 //!

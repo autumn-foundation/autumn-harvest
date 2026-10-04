@@ -89,8 +89,32 @@ impl autumn_harvest::payload_codec::PayloadCodec for DrXorCodec {
 struct NoOpMetrics;
 impl autumn_harvest::telemetry::MetricsRecorder for NoOpMetrics {}
 
-async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    REGISTRY_SERIAL.lock().await
+/// Holds [`REGISTRY_SERIAL`]. On drop it clears the registry and the DR
+/// config, so a test that panics leaves no pin behind (issue #1823).
+struct RegistryGuard {
+    _serial: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        FenceRegistry::clear();
+        autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+    }
+}
+
+async fn registry_guard() -> RegistryGuard {
+    RegistryGuard {
+        _serial: REGISTRY_SERIAL.lock().await,
+    }
+}
+
+/// A slot prefix no other test uses, for a "plain database" assertion.
+///
+/// A physical slot covers the whole cluster. A slot that another test leaks
+/// with the default prefix would mark every database as DR. A unique prefix
+/// keeps the plain-database tests independent of that.
+fn unique_prefix(db: &str) -> String {
+    format!("{DR_PREFIX}_{db}")
 }
 
 /// The shared Postgres these tests create their per-test databases on.
@@ -1112,6 +1136,28 @@ async fn a_fenced_worker_cannot_claim_through_claim_task_batched() {
         .unwrap();
     assert_eq!(rows[0].state, "PENDING");
     assert_eq!(rows[0].attempt, 1, "a fenced claim must not burn a retry");
+
+    // Positive control: the row is claimable at the current epoch, so the
+    // `None` above comes from the fence, not from leftover row state.
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::new(1))],
+        ShardId::new(0),
+    )
+    .expect("pin the current epoch");
+    let current = claim_task_batched(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        BatchedClaimConfig::default(),
+    )
+    .await
+    .expect("claim");
+    FenceRegistry::clear();
+    assert!(current.is_some(), "the current epoch claims the row");
 }
 
 /// The fence bump is a **commit-order barrier**, not a racy read.
@@ -2050,9 +2096,11 @@ async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
 
 #[tokio::test]
 async fn the_probe_finds_no_dr_marker_on_a_plain_database() {
-    let (url, _db) = require_db!("probeplain");
+    let (url, db) = require_db!("probeplain");
     let mut conn = connect(&url).await;
-    let markers = probe_dr_markers(&mut conn, DR_PREFIX).await.expect("probe");
+    let markers = probe_dr_markers(&mut conn, &unique_prefix(&db))
+        .await
+        .expect("probe");
     assert_eq!(markers, DrMarkers::default(), "{markers:?}");
     assert!(!markers.is_dr());
 }
@@ -2089,6 +2137,14 @@ async fn the_probe_finds_a_logical_dr_slot_on_this_database_only() {
     }
     let markers = probe_dr_markers(&mut conn, DR_PREFIX).await;
     let other = probe_dr_markers(&mut conn, "no_such_prefix").await;
+    // The same slot, seen from another database, must not count there.
+    let elsewhere = match fresh_db("probeslotother").await {
+        Some((other_url, _)) => {
+            let mut other_conn = connect(&other_url).await;
+            Some(probe_dr_markers(&mut other_conn, &dr_slot).await)
+        }
+        None => None,
+    };
     for slot in [&dr_slot, &cdc_slot] {
         let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
             .bind::<diesel::sql_types::Text, _>(slot.clone())
@@ -2099,16 +2155,23 @@ async fn the_probe_finds_a_logical_dr_slot_on_this_database_only() {
     assert_eq!(markers.dr_slots, 1, "{markers:?}");
     assert!(markers.is_dr());
     assert!(!other.expect("probe").is_dr(), "only the DR prefix counts");
+    if let Some(elsewhere) = elsewhere {
+        assert_eq!(
+            elsewhere.expect("probe").dr_slots,
+            0,
+            "a logical slot marks its own database only"
+        );
+    }
 }
 
 #[tokio::test]
 async fn auto_mode_leaves_a_plain_database_unfenced() {
     let _serial = registry_guard().await;
-    let (url, _db) = require_db!("autoplain");
+    let (url, db) = require_db!("autoplain");
     let pool = dr_pool(&url);
     FenceRegistry::clear();
     let targets = Some((vec![(ShardId::new(2), pool.clone())], ShardId::new(2)));
-    let resolved = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool)
+    let resolved = pin_process_fence(DrFencing::Auto, &unique_prefix(&db), targets, &pool)
         .await
         .expect("a plain database starts");
     let enabled = FenceRegistry::is_enabled();
@@ -2230,10 +2293,11 @@ async fn disabled_mode_refuses_a_dr_database() {
     assert!(!enabled);
 
     // A plain database runs unfenced under Disabled, as before.
-    let (plain_url, _db) = require_db!("disabledplain");
+    let (plain_url, plain_db) = require_db!("disabledplain");
     let plain = dr_pool(&plain_url);
     let plain_targets = Some((vec![(ShardId::new(2), plain.clone())], ShardId::new(2)));
-    let resolved = pin_process_fence(DrFencing::Disabled, DR_PREFIX, plain_targets, &plain)
+    let prefix = unique_prefix(&plain_db);
+    let resolved = pin_process_fence(DrFencing::Disabled, &prefix, plain_targets, &plain)
         .await
         .expect("a plain database starts");
     assert!(resolved.is_none());
@@ -2316,6 +2380,149 @@ async fn a_default_worker_fences_a_dr_database() {
         .expect("worker task must not panic");
 }
 
+/// A DR subscription marks a logical standby. No process may start there,
+/// and nothing is provisioned: a local row would collide with the row that
+/// replication later delivers.
+#[tokio::test]
+async fn a_logical_standby_refuses_to_start_and_provisions_nothing() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("standbysub");
+    let mut conn = connect(&url).await;
+    let sub = format!("{DR_PREFIX}_sub_{db}");
+    diesel::sql_query(format!(
+        "CREATE SUBSCRIPTION {sub} CONNECTION 'dbname=unused' PUBLICATION harvest_dr \
+         WITH (connect = false)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("create a disconnected subscription");
+
+    let markers = probe_dr_markers(&mut conn, DR_PREFIX).await;
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool).await;
+    let row = current_generation(&mut conn, ShardId::new(0)).await;
+    let _ = diesel::sql_query(format!("ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)"))
+        .execute(&mut conn)
+        .await;
+    let _ = diesel::sql_query(format!("DROP SUBSCRIPTION {sub}"))
+        .execute(&mut conn)
+        .await;
+
+    let markers = markers.expect("probe");
+    assert_eq!(markers.dr_subscriptions, 1, "{markers:?}");
+    assert!(markers.is_dr() && markers.is_standby());
+    let Err(error) = refused else {
+        panic!("a standby must refuse to start");
+    };
+    assert!(error.to_string().contains("standby"), "{error}");
+    assert_eq!(
+        row.expect("read"),
+        None,
+        "nothing is provisioned on a standby"
+    );
+    assert!(!FenceRegistry::is_enabled());
+}
+
+/// A database without the fence table probes as plain. Before issue #1823 an
+/// unfenced process issued no DR query, so it must not fail now.
+#[tokio::test]
+async fn the_probe_tolerates_a_database_without_the_fence_table() {
+    let (url, db) = require_db!("probenotable");
+    let mut conn = connect(&url).await;
+    diesel::sql_query("DROP TABLE harvest_shard_generation CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("drop the fence table");
+    let markers = probe_dr_markers(&mut conn, &unique_prefix(&db))
+        .await
+        .expect("a missing table is not an error");
+    assert!(markers.generation_shards.is_empty());
+    assert!(!markers.is_dr());
+}
+
+/// A DR slot with no row yet still turns the fence on, and Auto provisions
+/// the row for the shard the process serves.
+#[tokio::test]
+async fn auto_mode_provisions_the_row_on_a_slot_only_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("autoslot");
+    if !wal_level_is_logical(&url).await {
+        eprintln!("SKIPPED autoslot: wal_level is not logical");
+        return;
+    }
+    let prefix = unique_prefix(&db);
+    let slot = format!("{prefix}_slot");
+    let mut conn = connect(&url).await;
+    diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
+        .bind::<diesel::sql_types::Text, _>(slot.clone())
+        .execute(&mut conn)
+        .await
+        .expect("create slot");
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(6), pool.clone())], ShardId::new(6)));
+    let resolved = pin_process_fence(DrFencing::Auto, &prefix, targets, &pool).await;
+    let pinned = FenceRegistry::expected(ShardId::new(6));
+    let row = current_generation(&mut conn, ShardId::new(6)).await;
+    let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+        .bind::<diesel::sql_types::Text, _>(slot)
+        .execute(&mut conn)
+        .await;
+    let Ok(resolved) = resolved else {
+        panic!("a slot-only DR database starts fenced");
+    };
+    assert!(resolved.is_some(), "the slot turns the fence on");
+    assert_eq!(pinned, Some(ShardGeneration::INITIAL));
+    assert_eq!(row.expect("read"), Some(ShardGeneration::INITIAL));
+}
+
+/// A database whose row names another shard is misconfigured. Pinning would
+/// add a second row that `harvest dr fence` never bumps.
+#[tokio::test]
+async fn a_process_that_names_the_wrong_shard_refuses_to_start() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("wrongshard");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(7))
+        .await
+        .unwrap();
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool).await;
+    let row = current_generation(&mut conn, ShardId::new(0)).await;
+    let Err(error) = refused else {
+        panic!("a shard mismatch must refuse to start");
+    };
+    assert!(error.to_string().contains("names shard"), "{error}");
+    assert_eq!(row.expect("read"), None, "no second row is provisioned");
+    assert!(!FenceRegistry::is_enabled());
+}
+
+/// `Enabled` with no shard identity reads the shard from a single row, and
+/// refuses when the database names none.
+#[tokio::test]
+async fn enabled_mode_without_shard_identity_needs_exactly_one_row() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("enablednoid");
+    let pool = dr_pool(&url);
+    let refused = pin_process_fence(DrFencing::Enabled, DR_PREFIX, None, &pool).await;
+    assert!(refused.is_err(), "no row and no identity: nothing to pin");
+    assert!(!FenceRegistry::is_enabled());
+
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(9))
+        .await
+        .unwrap();
+    let Ok(resolved) = pin_process_fence(DrFencing::Enabled, DR_PREFIX, None, &pool).await else {
+        panic!("one row names the shard");
+    };
+    assert!(resolved.is_some());
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(9)),
+        Some(ShardGeneration::INITIAL)
+    );
+}
+
 // ── Direct-database admin writes (issue #1823) ─────────────────────────────
 
 /// An admin write against a demoted primary is rejected. The operator states
@@ -2351,9 +2558,9 @@ async fn an_admin_write_against_a_demoted_shard_is_rejected() {
 /// On a DR database, an admin write with no stated epoch is refused.
 #[tokio::test]
 async fn an_admin_write_on_a_dr_database_must_state_the_epoch() {
-    let (url, _db) = require_db!("adminepoch");
+    let (url, db) = require_db!("adminepoch");
     let mut conn = connect(&url).await;
-    assert_admin_write_authority(&mut conn, ShardId::new(0), None, DR_PREFIX)
+    assert_admin_write_authority(&mut conn, ShardId::new(0), None, &unique_prefix(&db))
         .await
         .expect("a plain database needs no epoch");
 
