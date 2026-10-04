@@ -3373,6 +3373,104 @@ async fn exec(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<()> {
     Ok(())
 }
 
+/// The session limits in force before [`switch_off_session_limits`].
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct SessionLimits {
+    #[diesel(sql_type = Text)]
+    statement: String,
+    #[diesel(sql_type = Text)]
+    lock: String,
+    /// `None` before PostgreSQL 17, which has no `transaction_timeout`.
+    #[diesel(sql_type = Nullable<Text>)]
+    transaction: Option<String>,
+}
+
+/// Switch off the session statement and transaction limits for the current
+/// transaction only (issue #1788). Returns the limits it replaced.
+///
+/// A drain pass can run longer than a role limit. A limit there would stop
+/// every pass, so the backlog would never shrink. `transaction_timeout`
+/// exists only on PostgreSQL 17 or later. The guard skips it on an earlier
+/// server, where `set_config` would fail on the unknown name.
+///
+/// Inside a caller's transaction, Diesel runs this transaction as a
+/// savepoint. `RELEASE SAVEPOINT` keeps a `SET LOCAL`, so the success path
+/// must call [`restore_session_limits`]. A rollback undoes the change itself.
+#[cfg(feature = "db")]
+async fn switch_off_session_limits(conn: &mut AsyncPgConnection) -> HarvestResult<SessionLimits> {
+    let prior = diesel::sql_query(
+        "SELECT current_setting('statement_timeout') AS \"statement\", \
+         current_setting('lock_timeout') AS \"lock\", \
+         current_setting('transaction_timeout', true) AS \"transaction\"",
+    )
+    .get_result::<SessionLimits>(conn)
+    .await
+    .map_err(database_error)?;
+    exec(conn, "SET LOCAL statement_timeout = 0").await?;
+    if prior.transaction.is_some() {
+        exec(conn, "SET LOCAL transaction_timeout = 0").await?;
+    }
+    Ok(prior)
+}
+
+/// Run `body` with the session limits switched off, inside the caller's
+/// transaction (issue #1788).
+///
+/// Only a success restores the limits. An error aborts the transaction, so
+/// a restore would fail too and hide the cause. The rollback that follows
+/// the error restores the limits instead.
+#[cfg(feature = "db")]
+async fn with_session_limits_off<T>(
+    conn: &mut AsyncPgConnection,
+    body: impl AsyncFnOnce(&mut AsyncPgConnection) -> HarvestResult<T>,
+) -> HarvestResult<T> {
+    let prior = switch_off_session_limits(conn).await?;
+    let value = body(conn).await?;
+    restore_session_limits(conn, &prior).await?;
+    Ok(value)
+}
+
+/// Run one statement through [`with_session_limits_off`]. Tests use it
+/// (issue #1788). Call it inside a transaction.
+///
+/// # Errors
+///
+/// The statement's error, or an error of the limit switch.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn exec_with_session_limits_off(
+    conn: &mut AsyncPgConnection,
+    sql: &str,
+) -> HarvestResult<()> {
+    with_session_limits_off(conn, async |conn| exec(conn, sql).await).await
+}
+
+/// Put back the limits that [`switch_off_session_limits`] replaced. Also
+/// restores `lock_timeout`, which a drain step can set.
+#[cfg(feature = "db")]
+async fn restore_session_limits(
+    conn: &mut AsyncPgConnection,
+    prior: &SessionLimits,
+) -> HarvestResult<()> {
+    diesel::sql_query(
+        "SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)",
+    )
+    .bind::<Text, _>(&prior.statement)
+    .bind::<Text, _>(&prior.lock)
+    .execute(conn)
+    .await
+    .map_err(database_error)?;
+    if let Some(transaction) = &prior.transaction {
+        diesel::sql_query("SELECT set_config('transaction_timeout', $1, true)")
+            .bind::<Text, _>(transaction)
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "db")]
 async fn scalar_bool(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<bool> {
     Ok(diesel::sql_query(sql)
@@ -4750,43 +4848,58 @@ async fn drain_default_bounded_inner(
     max_rows: usize,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<usize> {
-    let width = match detect_layout(conn).await? {
-        EventLayout::Unpartitioned => return Ok(0),
-        EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
-    };
-    let has_rows = scalar_bool(
-        conn,
-        &format!("SELECT EXISTS (SELECT 1 FROM {DEFAULT_PARTITION}) AS v"),
-    )
-    .await?;
-    if !has_rows {
-        return Ok(0);
-    }
+    // The reads before the lock run in their own transaction, so `SET LOCAL`
+    // can switch off the session statement and transaction limits (issue
+    // #1788). The census
+    // scans the whole DEFAULT partition. On a large backlog it can need longer
+    // than a role default, and a timeout would then stop every pass.
+    let census = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        with_session_limits_off(conn, async |conn| {
+            let width = match detect_layout(conn).await? {
+                EventLayout::Unpartitioned => return Ok(None),
+                EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
+            };
+            let has_rows = scalar_bool(
+                conn,
+                &format!("SELECT EXISTS (SELECT 1 FROM {DEFAULT_PARTITION}) AS v"),
+            )
+            .await?;
+            if !has_rows {
+                return Ok(None);
+            }
 
-    // Review finding: the census below is unbounded by any statement
-    // timeout. It is a full scan of the DEFAULT partition, exactly the
-    // expensive case this whole function exists for. Nothing can tick
-    // between its rows, so a single tick before it starts is not enough
-    // on its own for a large backlog. Race it against a repeating timer,
-    // the same way the oversized-cohort move below does.
-    //
-    // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
-    // partition, and `cohort` carries no index — on the large backlog a
-    // maintenance gap leaves, exactly the case this budget exists for, it is
-    // the most expensive thing the pass does. Run after the `DETACH` it was
-    // unbounded work under the parent's ACCESS EXCLUSIVE, so the row budget
-    // bounded only what was MOVED while the shard stayed stopped for the whole
-    // scan. Here it takes ACCESS SHARE and costs bystanders nothing.
-    let census = {
-        let query = diesel::sql_query(format!(
-            "SELECT cohort AS v, count(*)::bigint AS n
-               FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
-        ))
-        .load::<CohortCountRow>(&mut *conn);
-        tokio::pin!(query);
-        await_with_heartbeat(query, &mut progress)
-            .await
-            .map_err(database_error)?
+            // Review finding: the census below is unbounded by any statement
+            // timeout. It is a full scan of the DEFAULT partition, exactly the
+            // expensive case this whole function exists for. Nothing can tick
+            // between its rows, so a single tick before it starts is not enough
+            // on its own for a large backlog. Race it against a repeating timer,
+            // the same way the oversized-cohort move below does.
+            //
+            // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
+            // partition, and `cohort` carries no index — on the large backlog a
+            // maintenance gap leaves, exactly the case this budget exists for, it is
+            // the most expensive thing the pass does. Run after the `DETACH` it was
+            // unbounded work under the parent's ACCESS EXCLUSIVE, so the row budget
+            // bounded only what was MOVED while the shard stayed stopped for the whole
+            // scan. Here it takes ACCESS SHARE and costs bystanders nothing.
+            let census = {
+                let query = diesel::sql_query(format!(
+                    "SELECT cohort AS v, count(*)::bigint AS n
+                   FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
+                ))
+                .load::<CohortCountRow>(&mut *conn);
+                tokio::pin!(query);
+                await_with_heartbeat(query, &mut progress)
+                    .await
+                    .map_err(database_error)?
+            };
+            Ok::<_, HarvestError>(Some((width, census)))
+        })
+        .await
+    }))
+    .await?;
+    let Some((width, census)) = census else {
+        return Ok(0);
     };
 
     // Take whole cohorts, oldest first, up to BOTH budgets — and always at
@@ -4814,47 +4927,158 @@ async fn drain_default_bounded_inner(
     }
 
     Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
-        exec(conn, "SET LOCAL lock_timeout = '5s'").await?;
         // No `statement_timeout` here — see the note above the budgets. It
-        // would discard a completed pass rather than bound one.
-        exec(
-            conn,
-            &format!("ALTER TABLE harvest_events DETACH PARTITION {DEFAULT_PARTITION}"),
-        )
-        .await?;
+        // would discard a completed pass rather than bound one. An engine
+        // pool or `ALTER ROLE` can set a session default (issue #1788), so
+        // switch it and `transaction_timeout` off for this transaction only.
+        with_session_limits_off(conn, async |conn| {
+            exec(conn, "SET LOCAL lock_timeout = '5s'").await?;
+            exec(
+                conn,
+                &format!("ALTER TABLE harvest_events DETACH PARTITION {DEFAULT_PARTITION}"),
+            )
+            .await?;
 
-        for cohort in &work {
-            if let Some(cb) = &mut progress {
-                cb();
+            for cohort in &work {
+                if let Some(cb) = &mut progress {
+                    cb();
+                }
+                ensure_cohort_with_width(conn, *cohort, width, Duration::from_secs(2)).await?;
             }
-            ensure_cohort_with_width(conn, *cohort, width, Duration::from_secs(2)).await?;
-        }
-        // The work list was read before the lock, so a row could have landed in
-        // `DEFAULT` between the census and the `DETACH`. Only ONE cohort can
-        // have: an append's cohort is `clock_timestamp()` floored, so a late
-        // arrival carries the currently-open cohort (or the next one, if the
-        // boundary rolled while the `DETACH` waited for its lock). Covering
-        // both makes the pre-lock list valid without re-scanning to revalidate
-        // it — and both are no-ops when a partition already exists.
-        //
-        // Without this the move could meet a row with no partition and fail
-        // with `no partition of relation found`, rolling the pass back. Not
-        // data loss, but a drain that never converges on a shard whose write
-        // window is uncovered, which is the shard that needs it.
-        if let Some(cutoff) = cutoff {
-            let now = Utc::now();
-            for ts in [now, now + chrono::Duration::seconds(width)] {
-                if cohort_start(ts, width) <= cutoff {
-                    ensure_cohort_with_width(conn, ts, width, Duration::from_secs(2)).await?;
+            // The work list was read before the lock, so a row could have landed in
+            // `DEFAULT` between the census and the `DETACH`. Only ONE cohort can
+            // have: an append's cohort is `clock_timestamp()` floored, so a late
+            // arrival carries the currently-open cohort (or the next one, if the
+            // boundary rolled while the `DETACH` waited for its lock). Covering
+            // both makes the pre-lock list valid without re-scanning to revalidate
+            // it — and both are no-ops when a partition already exists.
+            //
+            // Without this the move could meet a row with no partition and fail
+            // with `no partition of relation found`, rolling the pass back. Not
+            // data loss, but a drain that never converges on a shard whose write
+            // window is uncovered, which is the shard that needs it.
+            if let Some(cutoff) = cutoff {
+                let now = Utc::now();
+                for ts in [now, now + chrono::Duration::seconds(width)] {
+                    if cohort_start(ts, width) <= cutoff {
+                        ensure_cohort_with_width(conn, ts, width, Duration::from_secs(2)).await?;
+                    }
                 }
             }
-        }
-        let Some(cutoff) = cutoff else {
-            // Nothing with a usable cohort: re-attach and report no progress
-            // rather than leaving `DEFAULT` detached. Heartbeat-guarded
-            // the same way as the main path's re-`ATTACH` below. This one
-            // scans a `DEFAULT` no rows were moved out of. It is at least
-            // as large a scan.
+            let Some(cutoff) = cutoff else {
+                // Nothing with a usable cohort: re-attach and report no progress
+                // rather than leaving `DEFAULT` detached. Heartbeat-guarded
+                // the same way as the main path's re-`ATTACH` below. This one
+                // scans a `DEFAULT` no rows were moved out of. It is at least
+                // as large a scan.
+                let query = diesel::sql_query(format!(
+                    "ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"
+                ))
+                .execute(conn);
+                tokio::pin!(query);
+                await_with_heartbeat(query, &mut progress)
+                    .await
+                    .map_err(database_error)?;
+                return Ok(0);
+            };
+
+            // `INSERT … SELECT *` supplies `cohort` explicitly, so the DEFAULT does
+            // not re-fire and every row keeps the cohort it was written with. The
+            // integrity trigger is disabled for the move because a parked row whose
+            // execution has since been collected is exactly the orphan the sweeper
+            // is meant to reclaim later — re-validating it here would turn a
+            // maintenance drain into data loss.
+            //
+            // Disabled on EACH PARTITION, not just the parent: `ALTER TABLE …
+            // DISABLE TRIGGER` on a partitioned parent only recurses to its
+            // partitions from Postgres 14. On 12/13 the parent-only form is a
+            // silent no-op, the cloned trigger fires for every moved row, and the
+            // first orphan aborts the drain permanently. The ACCESS EXCLUSIVE lock
+            // held by the DETACH above makes this safe for the transaction.
+            let targets = diesel::sql_query(
+                "SELECT c.relname AS v
+               FROM pg_inherits i
+               JOIN pg_class p ON p.oid = i.inhparent
+               JOIN pg_class c ON c.oid = i.inhrelid
+               JOIN pg_namespace n ON n.oid = p.relnamespace
+              WHERE p.relname = 'harvest_events' AND n.nspname = current_schema()",
+            )
+            .load::<TextRow>(conn)
+            .await
+            .map_err(database_error)?;
+            exec(
+                conn,
+                &format!("ALTER TABLE harvest_events DISABLE TRIGGER {EXEC_FK_TRIGGER}"),
+            )
+            .await?;
+            for t in &targets {
+                exec(
+                    conn,
+                    &format!(
+                        "ALTER TABLE {} DISABLE TRIGGER {EXEC_FK_TRIGGER}",
+                        quote_ident(&t.v)
+                    ),
+                )
+                .await
+                .ok();
+            }
+
+            // Review finding: an oversized single cohort can still make this
+            // move itself run long. The row budget bounds the pass overall,
+            // but "always at least one" above means a cohort larger than
+            // `max_rows` is still taken whole.
+            //
+            // One statement, so the rows leave `DEFAULT` exactly as they arrive
+            // in their cohort partitions — there is no window in which a row
+            // exists in both, and no `TRUNCATE` that could discard a row this
+            // pass did not move. Nothing can tick between rows of one
+            // statement, so a tick right before it starts is not enough on its
+            // own for an oversized cohort. Race it against a repeating timer
+            // instead. The timer ticks liveness on the clock without ever
+            // touching `conn`. The statement stays exactly one round trip.
+            let moved = {
+                let query = diesel::sql_query(format!(
+                    "WITH moved AS (
+                     DELETE FROM {DEFAULT_PARTITION} WHERE cohort <= {} RETURNING *
+                 )
+                 INSERT INTO harvest_events SELECT * FROM moved",
+                    ts_literal(cutoff)
+                ))
+                .execute(conn);
+                tokio::pin!(query);
+                await_with_heartbeat(query, &mut progress)
+                    .await
+                    .map_err(database_error)?
+            };
+
+            for t in &targets {
+                exec(
+                    conn,
+                    &format!(
+                        "ALTER TABLE {} ENABLE TRIGGER {EXEC_FK_TRIGGER}",
+                        quote_ident(&t.v)
+                    ),
+                )
+                .await
+                .ok();
+            }
+            exec(
+                conn,
+                &format!("ALTER TABLE harvest_events ENABLE TRIGGER {EXEC_FK_TRIGGER}"),
+            )
+            .await?;
+            // No TRUNCATE: the move above already removed exactly the rows it
+            // copied, and anything still here belongs to a cohort this pass did not
+            // take. Truncating would destroy it.
+            //
+            // Review finding: this re-`ATTACH` makes Postgres prove no
+            // remaining row belongs to an existing partition. That is a full
+            // scan of whatever is left in `DEFAULT`, exactly as unbounded as
+            // the move above it. Left as a plain `exec`, nothing ticks
+            // `progress` while it runs. A large enough remainder ages the
+            // scanner past its staleness threshold. This statement is still
+            // the one holding the lock and making real progress.
+            // Heartbeat-guarded the same way the move is.
             let query = diesel::sql_query(format!(
                 "ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"
             ))
@@ -4863,115 +5087,9 @@ async fn drain_default_bounded_inner(
             await_with_heartbeat(query, &mut progress)
                 .await
                 .map_err(database_error)?;
-            return Ok(0);
-        };
-
-        // `INSERT … SELECT *` supplies `cohort` explicitly, so the DEFAULT does
-        // not re-fire and every row keeps the cohort it was written with. The
-        // integrity trigger is disabled for the move because a parked row whose
-        // execution has since been collected is exactly the orphan the sweeper
-        // is meant to reclaim later — re-validating it here would turn a
-        // maintenance drain into data loss.
-        //
-        // Disabled on EACH PARTITION, not just the parent: `ALTER TABLE …
-        // DISABLE TRIGGER` on a partitioned parent only recurses to its
-        // partitions from Postgres 14. On 12/13 the parent-only form is a
-        // silent no-op, the cloned trigger fires for every moved row, and the
-        // first orphan aborts the drain permanently. The ACCESS EXCLUSIVE lock
-        // held by the DETACH above makes this safe for the transaction.
-        let targets = diesel::sql_query(
-            "SELECT c.relname AS v
-               FROM pg_inherits i
-               JOIN pg_class p ON p.oid = i.inhparent
-               JOIN pg_class c ON c.oid = i.inhrelid
-               JOIN pg_namespace n ON n.oid = p.relnamespace
-              WHERE p.relname = 'harvest_events' AND n.nspname = current_schema()",
-        )
-        .load::<TextRow>(conn)
+            Ok::<_, HarvestError>(moved)
+        })
         .await
-        .map_err(database_error)?;
-        exec(
-            conn,
-            &format!("ALTER TABLE harvest_events DISABLE TRIGGER {EXEC_FK_TRIGGER}"),
-        )
-        .await?;
-        for t in &targets {
-            exec(
-                conn,
-                &format!(
-                    "ALTER TABLE {} DISABLE TRIGGER {EXEC_FK_TRIGGER}",
-                    quote_ident(&t.v)
-                ),
-            )
-            .await
-            .ok();
-        }
-
-        // Review finding: an oversized single cohort can still make this
-        // move itself run long. The row budget bounds the pass overall,
-        // but "always at least one" above means a cohort larger than
-        // `max_rows` is still taken whole.
-        //
-        // One statement, so the rows leave `DEFAULT` exactly as they arrive
-        // in their cohort partitions — there is no window in which a row
-        // exists in both, and no `TRUNCATE` that could discard a row this
-        // pass did not move. Nothing can tick between rows of one
-        // statement, so a tick right before it starts is not enough on its
-        // own for an oversized cohort. Race it against a repeating timer
-        // instead. The timer ticks liveness on the clock without ever
-        // touching `conn`. The statement stays exactly one round trip.
-        let moved = {
-            let query = diesel::sql_query(format!(
-                "WITH moved AS (
-                     DELETE FROM {DEFAULT_PARTITION} WHERE cohort <= {} RETURNING *
-                 )
-                 INSERT INTO harvest_events SELECT * FROM moved",
-                ts_literal(cutoff)
-            ))
-            .execute(conn);
-            tokio::pin!(query);
-            await_with_heartbeat(query, &mut progress)
-                .await
-                .map_err(database_error)?
-        };
-
-        for t in &targets {
-            exec(
-                conn,
-                &format!(
-                    "ALTER TABLE {} ENABLE TRIGGER {EXEC_FK_TRIGGER}",
-                    quote_ident(&t.v)
-                ),
-            )
-            .await
-            .ok();
-        }
-        exec(
-            conn,
-            &format!("ALTER TABLE harvest_events ENABLE TRIGGER {EXEC_FK_TRIGGER}"),
-        )
-        .await?;
-        // No TRUNCATE: the move above already removed exactly the rows it
-        // copied, and anything still here belongs to a cohort this pass did not
-        // take. Truncating would destroy it.
-        //
-        // Review finding: this re-`ATTACH` makes Postgres prove no
-        // remaining row belongs to an existing partition. That is a full
-        // scan of whatever is left in `DEFAULT`, exactly as unbounded as
-        // the move above it. Left as a plain `exec`, nothing ticks
-        // `progress` while it runs. A large enough remainder ages the
-        // scanner past its staleness threshold. This statement is still
-        // the one holding the lock and making real progress.
-        // Heartbeat-guarded the same way the move is.
-        let query = diesel::sql_query(format!(
-            "ALTER TABLE harvest_events ATTACH PARTITION {DEFAULT_PARTITION} DEFAULT"
-        ))
-        .execute(conn);
-        tokio::pin!(query);
-        await_with_heartbeat(query, &mut progress)
-            .await
-            .map_err(database_error)?;
-        Ok(moved)
     }))
     .await
 }

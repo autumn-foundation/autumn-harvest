@@ -78,6 +78,24 @@ async fn insert_execution(conn: &mut AsyncPgConnection) -> Uuid {
     id
 }
 
+/// Register a live worker with a unique id.
+///
+/// A test that claims a task holds it as this worker. The orphan reclaim of
+/// a concurrent test then leaves the claim alone. A claim by an unregistered
+/// worker is an orphan, and that reclaim would requeue it.
+async fn live_worker(conn: &mut AsyncPgConnection) -> String {
+    let worker = format!("live-{}", Uuid::new_v4().simple());
+    diesel::sql_query(
+        "INSERT INTO harvest_workers (worker_id, last_heartbeat_at, max_concurrency, host) \
+         VALUES ($1, NOW(), 10, 'localhost')",
+    )
+    .bind::<diesel::sql_types::Text, _>(&worker)
+    .execute(conn)
+    .await
+    .expect("insert live worker");
+    worker
+}
+
 async fn enqueue_activity(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
@@ -169,7 +187,8 @@ async fn record_heartbeat_stamps_the_database_clock() {
     let (mut conn, _c) = setup_db().await;
     let q = unique_queue("hb-clock");
     let task = enqueue_activity(&mut conn, &q, Some(Duration::seconds(30))).await;
-    let claimed = queue::claim_task(&mut conn, &[q], "w1", "", None, &[], &[])
+    let worker = live_worker(&mut conn).await;
+    let claimed = queue::claim_task(&mut conn, &[q], &worker, "", None, &[], &[])
         .await
         .expect("claim")
         .expect("claimable");
@@ -186,6 +205,44 @@ async fn record_heartbeat_stamps_the_database_clock() {
     assert_on_db_clock(&mut conn, "last_heartbeat_at", before, stamp).await;
 }
 
+/// A retried flush writes the database clock minus the heartbeat age
+/// (issue #1788). The worker measures the age on its monotonic clock, so a
+/// skewed host clock does not move the stamp.
+#[tokio::test]
+async fn an_aged_heartbeat_stamps_the_database_clock_minus_its_age() {
+    let (mut conn, _c) = setup_db().await;
+    let q = unique_queue("hb-aged");
+    let task = enqueue_activity(&mut conn, &q, Some(Duration::seconds(30))).await;
+    let worker = live_worker(&mut conn).await;
+    let claimed = queue::claim_task(&mut conn, &[q], &worker, "", None, &[], &[])
+        .await
+        .expect("claim")
+        .expect("claimable");
+    assert_eq!(claimed.id, task);
+    let claim = TaskClaim::of(&claimed).expect("claim");
+    let age = Duration::seconds(20);
+
+    let before = db_now(&mut conn).await;
+    let write = queue::record_heartbeat_sent_ago(
+        &mut conn,
+        &claim,
+        serde_json::json!({}),
+        age.to_std().expect("age"),
+    )
+    .await
+    .expect("heartbeat");
+    assert!(matches!(write, queue::ClaimWrite::Applied));
+
+    let stamp = read_column(&mut conn, "last_heartbeat_at", task).await;
+    assert_on_db_clock(
+        &mut conn,
+        "last_heartbeat_at plus its age",
+        before,
+        stamp + age,
+    )
+    .await;
+}
+
 /// A fresh heartbeat must keep a long-running task out of the timeout scan.
 /// A host 60 s behind the database used to push the stamp 60 s into the past.
 /// That is older than the 30 s timeout, so the scan selected a healthy task.
@@ -194,7 +251,8 @@ async fn a_fresh_heartbeat_is_not_a_false_heartbeat_timeout() {
     let (mut conn, _c) = setup_db().await;
     let q = unique_queue("hb-scan");
     let task = enqueue_activity(&mut conn, &q, Some(Duration::seconds(30))).await;
-    let claimed = queue::claim_task(&mut conn, &[q], "w1", "", None, &[], &[])
+    let worker = live_worker(&mut conn).await;
+    let claimed = queue::claim_task(&mut conn, &[q], &worker, "", None, &[], &[])
         .await
         .expect("claim")
         .expect("claimable");
@@ -234,7 +292,8 @@ async fn record_heartbeat_uses_the_live_clock_inside_a_transaction() {
     let (mut conn, _c) = setup_db().await;
     let q = unique_queue("hb-txn");
     let task = enqueue_activity(&mut conn, &q, Some(Duration::seconds(30))).await;
-    let claimed = queue::claim_task(&mut conn, &[q], "w1", "", None, &[], &[])
+    let worker = live_worker(&mut conn).await;
+    let claimed = queue::claim_task(&mut conn, &[q], &worker, "", None, &[], &[])
         .await
         .expect("claim")
         .expect("claimable");
@@ -265,16 +324,8 @@ async fn record_heartbeat_uses_the_live_clock_inside_a_transaction() {
 async fn stuck_task_requeue_stamps_scheduled_at_on_the_database_clock() {
     let (mut conn, _c) = setup_db().await;
     let exec_id = insert_execution(&mut conn).await;
-    let worker = format!("live-{}", Uuid::new_v4().simple());
+    let worker = live_worker(&mut conn).await;
     let task = Uuid::new_v4();
-    diesel::sql_query(
-        "INSERT INTO harvest_workers (worker_id, last_heartbeat_at, max_concurrency, host) \
-         VALUES ($1, NOW(), 10, 'localhost')",
-    )
-    .bind::<diesel::sql_types::Text, _>(&worker)
-    .execute(&mut conn)
-    .await
-    .expect("insert live worker");
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
          (id, queue_name, task_type, workflow_exec_id, input, state, worker_id, \

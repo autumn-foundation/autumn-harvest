@@ -3725,6 +3725,55 @@
           "description": "Inert per-tenant rate-limit buckets collected by the retention janitor's idle-bucket GC (issue #1127), by key family. harvest_rate_limit_buckets rows are auto-registered and were never deleted before this, so the two caller-keyed families (dyn-rate, start-throttle) grew one row per tenant forever. A flat zero while the table keeps growing means the GC is off (rate_limit_bucket_retention_secs = null) or every candidate is pinned by a live dependent \u2014 GET /admin/retention reports the per-shard count either way. The bucket key is deliberately NOT a label: it is the unbounded value this pass exists to collect."
         },
         {
+          "id": 832868,
+          "type": "timeseries",
+          "title": "Task queue — terminal rows deleted (issue #1811)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 100
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (state) (rate(harvest_retention_terminal_tasks_deleted_total[$__rate_interval]))",
+              "legendFormat": "{{state}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Terminal harvest_task_queue rows deleted by the terminal-task janitor (issue #1811), by task state. A flat zero while the table grows means the janitor is off (terminal_task_retention_secs = null) or the role lacks DELETE. GET /admin/retention reports the per-shard outcome and any error."
+        },
+        {
           "id": 931,
           "type": "timeseries",
           "title": "Dispatch rate by shard",
@@ -6976,6 +7025,117 @@
       "description": "1 per queue where a worker has an empty build_id and the queue has a build policy (issue #1805). That worker cannot claim pinned runs. Set a build_id on it."
     },
     {
+      "id": 177984,
+      "type": "row",
+      "title": "Database pool & Postgres timeouts (issue #1788)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 207
+      },
+      "panels": []
+    },
+    {
+      "id": 428323,
+      "type": "timeseries",
+      "title": "Pool acquire timeouts",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 208
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (site) (rate(harvest_db_pool_acquire_timeout_total[$__rate_interval]))",
+          "legendFormat": "{{site}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of pool acquires that hit their bound, per site (claim or heartbeat_flush). The bound is the pool's deadpool wait timeout, or 30 s when the pool has none. A steady rate means the pool is too small or a connection is stuck. See docs/operations/postgres-timeouts.md."
+    },
+    {
+      "id": 422004,
+      "type": "timeseries",
+      "title": "Heartbeat flush failures",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 208
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(harvest_heartbeat_flush_failed_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of activity heartbeat flushes that failed, per reason. The flusher keeps the payload and tries again on the next tick. A run of failures longer than heartbeat_timeout fails a healthy activity. See docs/operations/postgres-timeouts.md."
+    },
+    {
       "id": 461861,
       "type": "row",
       "title": "Database pool, queries & pollers (issue #1815)",
@@ -6983,7 +7143,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 207
+        "y": 216
       },
       "collapsed": true,
       "panels": [
@@ -6999,7 +7159,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 208
+            "y": 217
           },
           "fieldConfig": {
             "defaults": {
@@ -7066,7 +7226,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 208
+            "y": 217
           },
           "fieldConfig": {
             "defaults": {
@@ -7124,7 +7284,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 216
+            "y": 225
           },
           "fieldConfig": {
             "defaults": {
@@ -7182,7 +7342,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 216
+            "y": 225
           },
           "fieldConfig": {
             "defaults": {
@@ -7231,7 +7391,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 224
+            "y": 233
           },
           "fieldConfig": {
             "defaults": {

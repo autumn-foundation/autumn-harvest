@@ -49,9 +49,32 @@ jobs:
         run: |
           git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
           perl -0pi -e 's/\n+\z/\n/' RELEASE_NOTES.md
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Issue #1616. Build the client before the release exists, so a broken
+      # client stops the release. The package version must equal the tag.
+      - name: Build the TypeScript client
+        id: client
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version clients/typescript/package.json)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::clients/typescript/package.json is ${version}, the tag is ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          # The script logs to stderr. Its stdout is the tarball path only.
+          tarball="$(scripts/build-typescript-client.sh)"
+          if [ "$(basename "${tarball}")" != "autumn-harvest-client-${version}.tgz" ]; then
+            echo "::error::the client packed as $(basename "${tarball}"), not autumn-harvest-client-${version}.tgz"
+            exit 1
+          fi
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          files: ${{ steps.client.outputs.tarball }}
+          fail_on_unmatched_files: true
           body_path: RELEASE_NOTES.md
           draft: false
           prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}

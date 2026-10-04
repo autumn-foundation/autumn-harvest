@@ -4072,7 +4072,24 @@ pub mod db {
         // this while the code passed `budget` — the measured-phase ceiling —
         // so an injected budget bounded seeding too.
         let seed_outcome = connect_and_seed(db, scenario, super::setup_time_budget()).await;
+        measure_seeded_claims(db, scenario, seed_outcome, budget).await
+    }
 
+    /// Measure claims against a database that the caller already seeded.
+    ///
+    /// [`run_claim_scenario_with_budget`] seeds and then calls this. A bench
+    /// that must change the table between seed and measure calls [`seed`]
+    /// itself and then this (issue #1811).
+    ///
+    /// # Panics
+    ///
+    /// Panics if claiming fails.
+    pub async fn measure_seeded_claims(
+        db: &BenchDb,
+        scenario: Scenario,
+        seed_outcome: SeedOutcome,
+        budget: std::time::Duration,
+    ) -> ClaimReport {
         let pool = build_pool(&db.url, scenario.claimers);
         let queues = Arc::new(queue_names(scenario));
         let cb_set = Arc::new(circuit_breaker_set(scenario.gate));

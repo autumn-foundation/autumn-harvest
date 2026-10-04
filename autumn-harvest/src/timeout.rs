@@ -2676,10 +2676,10 @@ enum DeliveryRoute {
 ///
 /// `conn` is the connection the sweep already holds, checked out of the
 /// caller's own shard pool, with an open transaction and a `FOR UPDATE` lock on
-/// the outbox row. Harvest configures no deadpool `Timeouts`, so a bare
-/// `pool.get()` from that same pool would be an unbounded wait and could park
-/// the whole timeout checker (the hazard `codec_rotation.rs` and
-/// `audit_export.rs` were both fixed for). Three things prevent it:
+/// the outbox row. A pool may have no deadpool `Timeouts`. Then a bare
+/// `pool.get()` from that same pool is an unbounded wait. It can park the
+/// whole timeout checker. That is the hazard `codec_rotation.rs` and
+/// `audit_export.rs` were both fixed for. Three things prevent it:
 ///
 /// * A deployment expecting **one** shard short-circuits here with no fan-out
 ///   at all, so the single-shard default is exactly what it was pre-#1146.
