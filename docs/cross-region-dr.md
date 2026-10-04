@@ -292,7 +292,11 @@ Admin writes go through the same check as worker writes (issue #1823).
   region that holds authority. The command refuses a shard at any other
   generation. A stale DSN to a demoted primary then writes nothing. A pin
   taken at connect time cannot catch that case. A rebalance dry run reads
-  only, so it needs no flag.
+  only, so it needs no flag. A standby carries the primary's generation, so
+  the epoch alone cannot reject it. Every command therefore refuses a server
+  in recovery. A rebalance writes rows, so it also refuses a logical standby.
+  The partition commands may run on a logical standby: logical replication
+  carries no DDL, so the partitioned layout must be built on both sides.
 - **In-process partition maintenance.** The retention janitor runs
   `assert_fence` on each shard before it creates or drops partitions.
 

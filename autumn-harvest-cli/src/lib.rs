@@ -6010,12 +6010,14 @@ async fn direct_write_authority(
     conn: &mut autumn_harvest::diesel_async::AsyncPgConnection,
     shard_id: i32,
     expect_generation: Option<i64>,
+    kind: autumn_harvest::replication::AdminWrite,
 ) -> Result<(), String> {
     autumn_harvest::replication::assert_admin_write_authority(
         conn,
         autumn_harvest::types::ShardId::new(shard_id),
         expect_generation.map(autumn_harvest::replication::ShardGeneration::new),
         autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX,
+        kind,
     )
     .await
     .map_err(|error| match error {
@@ -6039,9 +6041,14 @@ async fn shard_pool_write_authority(
             .get()
             .await
             .map_err(|e| CliError::InvalidInput(format!("cannot connect to shard {shard}: {e}")))?;
-        direct_write_authority(&mut conn, shard.as_i32(), expect_generation)
-            .await
-            .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
+        direct_write_authority(
+            &mut conn,
+            shard.as_i32(),
+            expect_generation,
+            autumn_harvest::replication::AdminWrite::Data,
+        )
+        .await
+        .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
     }
     Ok(())
 }
@@ -6346,8 +6353,13 @@ async fn run_partition_enable(
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) =
-            direct_write_authority(&mut conn, target.shard_id, expect_generation).await
+        if let Err(error) = direct_write_authority(
+            &mut conn,
+            target.shard_id,
+            expect_generation,
+            autumn_harvest::replication::AdminWrite::SchemaOnly,
+        )
+        .await
         {
             row.error = Some(error);
             out.push(row);
@@ -6393,8 +6405,13 @@ async fn run_partition_maintain(
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) =
-            direct_write_authority(&mut conn, target.shard_id, expect_generation).await
+        if let Err(error) = direct_write_authority(
+            &mut conn,
+            target.shard_id,
+            expect_generation,
+            autumn_harvest::replication::AdminWrite::SchemaOnly,
+        )
+        .await
         {
             row.error = Some(error);
             out.push(row);
@@ -6450,8 +6467,13 @@ async fn run_partition_disable(
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) =
-            direct_write_authority(&mut conn, target.shard_id, expect_generation).await
+        if let Err(error) = direct_write_authority(
+            &mut conn,
+            target.shard_id,
+            expect_generation,
+            autumn_harvest::replication::AdminWrite::SchemaOnly,
+        )
+        .await
         {
             row.error = Some(error);
             out.push(row);

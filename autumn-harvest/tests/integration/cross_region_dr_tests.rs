@@ -34,9 +34,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_harvest::replication::{
-    DrFencing, DrMarkers, FenceRegistry, ReplicationStatus, ShardGeneration, WatermarkReading,
-    assert_admin_write_authority, assert_fence, bump_generation, current_generation,
-    ensure_generation_row, pin_process_fence, probe_dr_markers, query_replication_status,
+    AdminWrite, DrFencing, DrMarkers, FenceRegistry, ReplicationStatus, ShardGeneration,
+    WatermarkReading, assert_admin_write_authority, assert_fence, bump_generation,
+    current_generation, ensure_generation_row, pin_process_fence, probe_dr_markers,
+    query_replication_status,
 };
 use autumn_harvest::types::{ExecutionId, ShardId};
 use futures::FutureExt as _;
@@ -2535,10 +2536,15 @@ async fn an_admin_write_against_a_demoted_shard_is_rejected() {
     ensure_generation_row(&mut conn, shard).await.unwrap();
 
     // The promoted primary is at generation 1. This database never saw it.
-    let error =
-        assert_admin_write_authority(&mut conn, shard, Some(ShardGeneration::new(1)), DR_PREFIX)
-            .await
-            .expect_err("a demoted shard must refuse the write");
+    let error = assert_admin_write_authority(
+        &mut conn,
+        shard,
+        Some(ShardGeneration::new(1)),
+        DR_PREFIX,
+        AdminWrite::Data,
+    )
+    .await
+    .expect_err("a demoted shard must refuse the write");
     match error {
         autumn_harvest::error::HarvestError::ShardFenced {
             shard_id,
@@ -2550,9 +2556,15 @@ async fn an_admin_write_against_a_demoted_shard_is_rejected() {
         other => panic!("expected ShardFenced, got {other:?}"),
     }
 
-    assert_admin_write_authority(&mut conn, shard, Some(ShardGeneration::INITIAL), DR_PREFIX)
-        .await
-        .expect("the stated epoch matches, so the write may run");
+    assert_admin_write_authority(
+        &mut conn,
+        shard,
+        Some(ShardGeneration::INITIAL),
+        DR_PREFIX,
+        AdminWrite::Data,
+    )
+    .await
+    .expect("the stated epoch matches, so the write may run");
 }
 
 /// On a DR database, an admin write with no stated epoch is refused.
@@ -2560,20 +2572,80 @@ async fn an_admin_write_against_a_demoted_shard_is_rejected() {
 async fn an_admin_write_on_a_dr_database_must_state_the_epoch() {
     let (url, db) = require_db!("adminepoch");
     let mut conn = connect(&url).await;
-    assert_admin_write_authority(&mut conn, ShardId::new(0), None, &unique_prefix(&db))
-        .await
-        .expect("a plain database needs no epoch");
+    assert_admin_write_authority(
+        &mut conn,
+        ShardId::new(0),
+        None,
+        &unique_prefix(&db),
+        AdminWrite::Data,
+    )
+    .await
+    .expect("a plain database needs no epoch");
 
     ensure_generation_row(&mut conn, ShardId::new(0))
         .await
         .unwrap();
-    let error = assert_admin_write_authority(&mut conn, ShardId::new(0), None, DR_PREFIX)
-        .await
-        .expect_err("a DR database needs a stated epoch");
+    let error = assert_admin_write_authority(
+        &mut conn,
+        ShardId::new(0),
+        None,
+        DR_PREFIX,
+        AdminWrite::Data,
+    )
+    .await
+    .expect_err("a DR database needs a stated epoch");
     assert!(
         matches!(error, autumn_harvest::error::HarvestError::Config(_)),
         "{error:?}"
     );
+}
+
+/// A data write on a logical standby is refused even when the stated epoch
+/// matches: the standby carries the replicated row at the same generation.
+/// A schema-only write (partition DDL) is allowed there, because logical
+/// replication carries no DDL and the docs require it on both sides.
+#[tokio::test]
+async fn an_admin_data_write_on_a_logical_standby_is_refused() {
+    let (url, db) = require_db!("adminstandby");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let sub = format!("{DR_PREFIX}_sub_{db}");
+    diesel::sql_query(format!(
+        "CREATE SUBSCRIPTION {sub} CONNECTION 'dbname=unused' PUBLICATION harvest_dr \
+         WITH (connect = false)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("create a disconnected subscription");
+
+    let data = assert_admin_write_authority(
+        &mut conn,
+        ShardId::new(0),
+        Some(ShardGeneration::INITIAL),
+        DR_PREFIX,
+        AdminWrite::Data,
+    )
+    .await;
+    let schema = assert_admin_write_authority(
+        &mut conn,
+        ShardId::new(0),
+        Some(ShardGeneration::INITIAL),
+        DR_PREFIX,
+        AdminWrite::SchemaOnly,
+    )
+    .await;
+    let _ = diesel::sql_query(format!("ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)"))
+        .execute(&mut conn)
+        .await;
+    let _ = diesel::sql_query(format!("DROP SUBSCRIPTION {sub}"))
+        .execute(&mut conn)
+        .await;
+
+    let error = data.expect_err("a data write on a standby must be refused");
+    assert!(error.to_string().contains("standby"), "{error}");
+    schema.expect("partition DDL runs on both sides of logical replication");
 }
 
 /// Counts `harvest.shard.fenced`; every other metric is the default no-op.

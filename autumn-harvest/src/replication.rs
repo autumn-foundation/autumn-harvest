@@ -524,6 +524,19 @@ impl DrFencing {
     }
 }
 
+/// What a direct-database admin write changes (issue #1823).
+///
+/// The kind decides whether the write may run on a logical standby.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminWrite {
+    /// Schema only, such as partition DDL. Logical replication carries no
+    /// DDL, so the docs run it on both sides. Allowed on a logical standby.
+    SchemaOnly,
+    /// Rows, such as a shard rebalance. On a logical standby it would collide
+    /// with replicated rows. Refused on any standby.
+    Data,
+}
+
 /// What a startup probe found in one shard database (issue #1823).
 ///
 /// Any one signal means DR is configured for the database.
@@ -1417,24 +1430,41 @@ mod db {
     /// - `Some(expected)`: the shard must be at exactly that generation.
     /// - `None`: allowed only on a database with no DR marker.
     ///
+    /// A logical standby carries the replicated row at the primary's
+    /// generation, so a matching epoch does not prove authority there. The
+    /// probe therefore always runs. A server in recovery refuses every write.
+    /// A DR subscription refuses an [`AdminWrite::Data`] write.
+    ///
     /// The check is a preflight read, not a commit-order barrier.
     ///
     /// # Errors
     ///
     /// [`crate::error::HarvestError::ShardFenced`] when the shard is at another
     /// generation, or has no row. [`crate::error::HarvestError::Config`] when
-    /// `expected` is `None` on a DR database.
+    /// `expected` is `None` on a DR database, or the write may not run on this
+    /// standby.
     /// [`crate::error::HarvestError::Database`] on query failure.
     pub async fn assert_admin_write_authority(
         conn: &mut AsyncPgConnection,
         shard: ShardId,
         expected: Option<ShardGeneration>,
         slot_prefix: &str,
+        kind: super::AdminWrite,
     ) -> HarvestResult<()> {
+        let markers = probe_dr_markers(conn, slot_prefix).await?;
+        let standby_refuses = markers.in_recovery
+            || (kind == super::AdminWrite::Data && markers.dr_subscriptions > 0);
+        if standby_refuses {
+            return Err(crate::error::HarvestError::Config(format!(
+                "shard {} is a DR standby, so this admin write may not run here. Point it at \
+                 the primary, or promote this database first.",
+                shard.as_i32()
+            )));
+        }
         if let Some(expected) = expected {
             return assert_generation(conn, shard, expected).await;
         }
-        if probe_dr_markers(conn, slot_prefix).await?.is_dr() {
+        if markers.is_dr() {
             return Err(crate::error::HarvestError::Config(format!(
                 "shard {} is a DR database, so an admin write must state the generation that \
                  holds write authority. Read it from the promoted primary.",
