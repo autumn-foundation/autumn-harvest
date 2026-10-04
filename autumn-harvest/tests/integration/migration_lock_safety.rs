@@ -233,6 +233,17 @@ impl History {
             .cloned()
     }
 
+    /// Forget every index on `table`.
+    ///
+    /// The match ignores the schema, so it may forget too much. A forgotten
+    /// index is unknown, and an unknown index counts as hot.
+    fn forget_table(&mut self, table: &str) {
+        for tables in self.indexes.values_mut() {
+            tables.retain(|t| base(t) != base(table));
+        }
+        self.indexes.retain(|_, tables| !tables.is_empty());
+    }
+
     /// Build the history that `migrations` leave behind, in order.
     fn of<'a>(migrations: impl IntoIterator<Item = &'a str>) -> Self {
         let mut history = Self::default();
@@ -1240,12 +1251,15 @@ fn resolve(
                 .insert(table.clone());
         }
         // A drop that surely runs removes the name. A later index of that name
-        // is then unknown, which fails closed.
-        if let (Some(index), "DROP INDEX") = (&raw.index, raw.verb)
-            && toks[raw.at].runs
-            && unconditional[raw.at]
-        {
-            history.indexes.remove(&index_key(index, index));
+        // is then unknown, which fails closed. A table drop takes every index
+        // on the table with it.
+        if toks[raw.at].runs && unconditional[raw.at] {
+            if let (Some(index), "DROP INDEX") = (&raw.index, raw.verb) {
+                history.indexes.remove(&index_key(index, index));
+            }
+            if let (Some(table), "DROP TABLE") = (&table, raw.verb) {
+                history.forget_table(table);
+            }
         }
         let hot = table.as_deref().is_none_or(|t| {
             history.is_hot(t)
@@ -1480,7 +1494,8 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
         Some("table") => {
             for table in s.name_list(s.skip_if_exists(k + 2)) {
                 raws.extend(
-                    referenced(history, &table).map(|t| Raw::lock(k, "DROP TABLE", Some(t))),
+                    referenced(history, &table)
+                        .map(|t| Raw::lock(k, "DROP TABLE (foreign key)", Some(t))),
                 );
                 raws.push(Raw::lock(k, "DROP TABLE", Some(table)));
             }
@@ -1774,28 +1789,17 @@ fn bounds_wait(s: &Stmts, k: usize) -> bool {
 
 /// Read Diesel's `run_in_transaction` out of a `metadata.toml`.
 ///
-/// `autumn_harvest::migrate` has the full parser, but it needs the `db`
-/// feature. This lint runs without it, so it accepts only the one key.
+/// Diesel and `autumn_harvest::migrate` parse the file with the `toml` crate.
+/// This lint uses the same crate, so all three read the file the same way.
+/// `migrate` needs the `db` feature, which this lint runs without.
 fn run_in_transaction(metadata: &str) -> bool {
-    for line in metadata.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        // Diesel reads the key at top level only. A table header ends that.
-        if line.starts_with('[') {
-            break;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        // TOML also allows a quoted key.
-        if key.trim().trim_matches(['"', '\'']) == "run_in_transaction" {
-            return match value.trim() {
-                "true" => true,
-                "false" => false,
-                other => panic!("run_in_transaction must be true or false, found {other}"),
-            };
-        }
-    }
-    true
+    let table: toml::Table =
+        toml::from_str(metadata).unwrap_or_else(|e| panic!("metadata.toml is not TOML: {e}"));
+    table.get("run_in_transaction").is_none_or(|value| {
+        value
+            .as_bool()
+            .unwrap_or_else(|| panic!("run_in_transaction must be a boolean, found {value}"))
+    })
 }
 
 /// One migration read from disk.
@@ -3263,6 +3267,27 @@ fn a_non_ascii_dollar_tag_quotes_a_body() {
                ALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn metadata_is_read_as_toml() {
+    // A key inside a multiline string is text, not a key.
+    assert!(run_in_transaction(
+        "description = \"\"\"\nrun_in_transaction = false\n\"\"\"\n"
+    ));
+    assert!(!run_in_transaction("run_in_transaction = false\n"));
+}
+
+#[test]
+fn a_sure_table_drop_forgets_its_indexes() {
+    // The drop takes every index on the table with it.
+    let history = [
+        "CREATE INDEX idx_shared ON harvest_schedules (id);",
+        "DROP TABLE harvest_schedules;",
+    ];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
