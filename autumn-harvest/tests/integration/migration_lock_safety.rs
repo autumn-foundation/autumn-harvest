@@ -1756,13 +1756,26 @@ fn foreign_do_bodies(
 
 /// The `LANGUAGE` clause of the statement that starts at `k`, if any.
 ///
+/// The clause is a `LANGUAGE` keyword outside any parentheses, followed by a
+/// name. So a routine or a parameter named `language` is not the clause.
 /// The lexer folds an unquoted name to lower case. A quoted name keeps its
 /// case, so `"PLPGSQL"` names another language.
 fn language<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
     let depth = s.toks[k].depth;
-    (k..s.end(k))
-        .find(|&j| s.toks[j].depth == depth && s.keyword(j, "language"))
-        .and_then(|j| s.word(j + 1).or_else(|| s.string(j + 1)))
+    let mut parens = 0_usize;
+    for j in (k..s.end(k)).filter(|&j| s.toks[j].depth == depth) {
+        if s.is_punct(j, '(') {
+            parens += 1;
+        } else if s.is_punct(j, ')') {
+            parens = parens.saturating_sub(1);
+        } else if parens == 0
+            && s.keyword(j, "language")
+            && let Some(name) = s.word(j + 1).or_else(|| s.string(j + 1))
+        {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// The verb of a lock that code in another language may take.
@@ -5373,6 +5386,30 @@ fn a_uescape_clause_follows_a_comment() {
             "{findings:?}"
         );
     }
+}
+
+#[test]
+fn the_language_clause_follows_the_routine_signature() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    for create in [
+        "CREATE FUNCTION language() RETURNS void LANGUAGE plpython3u AS $$ pass $$;",
+        "CREATE FUNCTION public.language() RETURNS void LANGUAGE plpython3u AS $$ pass $$;",
+        "CREATE FUNCTION f(language text) RETURNS void LANGUAGE plpython3u AS $$ pass $$;",
+    ] {
+        let call = if create.contains("f(") {
+            "SELECT f('x');"
+        } else {
+            "SELECT language();"
+        };
+        let sql = format!("{create}\n{set}{call}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    }
+    // A parameter named `language` is not the clause.
+    let sql = format!(
+        "CREATE FUNCTION g(language text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\n{set}SELECT g('x');"
+    );
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
