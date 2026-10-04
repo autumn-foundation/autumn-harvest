@@ -33963,11 +33963,16 @@ pub async fn quarantine_workflow_task_timeout(
 /// a session timeout (issue #1788) no scanner would then find it, and the
 /// orphan reclaimer skips a live worker. Release it too. The handler may
 /// already have run, so the activity can run again. That is the
-/// at-least-once contract a crash gives as well. Another database error is
-/// not released: it may repeat, and a release would skip the retry policy.
+/// at-least-once contract a crash gives as well. A deadlock or serialization
+/// abort is released for the same reason (issue #1822). Postgres rolled the
+/// write back, and `fail_execution_on_error` passes the error through. Another
+/// database error is not released: it may repeat, and a release would skip
+/// the retry policy.
 fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
     task_type == "workflow"
-        || (task_type == "activity" && crate::pool::is_transient_db_error(error))
+        || (task_type == "activity"
+            && (crate::pool::is_transient_db_error(error)
+                || crate::tx_retry::classify_conflict(error).is_some()))
 }
 
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
@@ -37165,6 +37170,22 @@ mod tests {
         assert!(!releases_claim_after_error("activity", &other));
         assert!(releases_claim_after_error("workflow", &timeout));
         assert!(releases_claim_after_error("workflow", &other));
+    }
+
+    /// A conflict abort releases an activity claim (issue #1822).
+    ///
+    /// `fail_execution_on_error` passes a conflict through without failing
+    /// the task. Postgres rolled the write back. Without a release, an
+    /// activity with no deadline would stay `RUNNING` under a live worker.
+    #[test]
+    fn a_conflict_abort_releases_an_activity_claim() {
+        let deadlock = crate::error::HarvestError::Database("deadlock detected".into());
+        let serialization = crate::error::HarvestError::Database(
+            "could not serialize access due to concurrent update".into(),
+        );
+        assert!(releases_claim_after_error("activity", &deadlock));
+        assert!(releases_claim_after_error("activity", &serialization));
+        assert!(releases_claim_after_error("workflow", &deadlock));
     }
 
     /// A setup error after `on_dispatch` admitted the half-open probe must

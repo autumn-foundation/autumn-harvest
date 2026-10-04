@@ -29,7 +29,9 @@ the English message text, because Diesel keeps no SQLSTATE. The module is
 
 `fail_execution_on_error` now passes a conflict error through, like a
 capability miss. A conflict that outlasts the retries of a wired site therefore
-resets the task and does not fail the workflow.
+resets the task and does not fail the workflow. The dispatcher also releases an
+activity claim after a conflict, as it does after a session timeout. Otherwise
+an activity with no deadline would stay `RUNNING` under a live worker.
 
 **Metrics.** `harvest.db.transaction_retry{site, reason}` counts each retry.
 `harvest.db.transaction_retry_exhausted{site, reason}` counts a conflict that
