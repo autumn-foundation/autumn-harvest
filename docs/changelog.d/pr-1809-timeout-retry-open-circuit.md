@@ -31,8 +31,9 @@ decision.
   retry keeps `crash_strikes`, so poison-pill quarantine still counts
   crashes. A timeout retry counts in `harvest.activity.retries`.
 - `worker.rs`: `timeout_retry_delay`, and the open-circuit deferral in
-  `process_activity_task`. The delay is the time to the next probe, or the
-  cooldown, clamped to 100 ms – 30 s, plus up to 25% jitter.
+  `process_activity_task`. The delay is the time to the next probe. With no
+  probe scheduled, it is the cooldown, but at least 5 s. It is clamped to
+  100 ms – 30 s, plus up to 25% jitter.
   `CircuitProbeGuard` releases a half-open probe on every early return, so
   an error cannot leave the breaker half-open for good.
 - `queue.rs`: `mark_claim_handler_started`,

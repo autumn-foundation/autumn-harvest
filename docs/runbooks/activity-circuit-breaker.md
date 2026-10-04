@@ -40,7 +40,9 @@ behaviour exactly (no breaker; the full retry policy applies).
 - **Open** (tripped): in defer mode, each new dispatch goes back to
   `PENDING`. It waits for the time until the next probe, plus up to 25%
   jitter. When no probe time is known (a forced-open breaker, or a probe in
-  flight), it waits for the cooldown. The wait is clamped to 100 ms – 30 s.
+  flight), it waits for the cooldown, but at least 5 s. A short cooldown
+  then cannot make a deferred backlog poll the database many times a
+  second. The wait is clamped to 100 ms – 30 s.
   In fail-fast mode, new dispatches fail with
   `ActivityFailure { error_type: "CircuitOpen", non_retryable: true, .. }`.
   This is a terminal failure for the in-flight attempt — the workflow author

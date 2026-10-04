@@ -82,8 +82,10 @@ window.
 
 - `CircuitOpenMode::Defer` (default). The worker puts the claimed task back
   to `PENDING`. The delay is the time until the next probe, clamped, plus
-  jitter. The write lowers `attempt` again, keeps `error` and
-  `crash_strikes`, and appends no event. The deferral uses no attempt. The
+  jitter. A forced-open breaker, or a probe in flight, schedules no probe.
+  The delay is then the cooldown, but at least 5 s, so a deferred backlog
+  does not poll the database many times a second. The write lowers
+  `attempt` again, keeps `error` and `crash_strikes`, and appends no event. The deferral uses no attempt. The
   `harvest.activity.circuit.deferred` counter counts each deferral.
 - `CircuitOpenMode::FailFast`. The behaviour before this ADR: a
   non-retryable `CircuitOpen` failure.

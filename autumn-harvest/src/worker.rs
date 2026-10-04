@@ -16008,20 +16008,26 @@ const CIRCUIT_DEFER_MIN: Duration = Duration::from_millis(100);
 /// task then checks again at least this often, so it runs soon after a
 /// recovery.
 const CIRCUIT_DEFER_MAX: Duration = Duration::from_secs(30);
+/// Lower bound on a deferral when no probe is scheduled (issue #1809). A
+/// forced-open breaker, or a probe in flight, reports no probe time. The
+/// cooldown then says nothing about when work can run, so a short one must not
+/// set a short poll. Without this bound, a large backlog under a forced-open
+/// breaker is rewritten about ten times a second.
+const CIRCUIT_DEFER_UNSCHEDULED: Duration = Duration::from_secs(5);
 
 /// The delay of a task that an open breaker defers (issue #1809).
 ///
 /// The base is the time until the next probe. With no such time, the base is
-/// the cooldown. The base is clamped to `[CIRCUIT_DEFER_MIN,
-/// CIRCUIT_DEFER_MAX]`. Jitter adds up to a quarter of the base, so the
-/// deferred tasks do not all wake at the same instant.
+/// the cooldown, but at least `CIRCUIT_DEFER_UNSCHEDULED`. The base is clamped
+/// to `[CIRCUIT_DEFER_MIN, CIRCUIT_DEFER_MAX]`. Jitter adds up to a quarter of
+/// the base, so the deferred tasks do not all wake at the same instant.
 fn circuit_defer_delay(
     retry_after: Option<Duration>,
     cooldown: Duration,
     task: &TaskQueueItem,
 ) -> chrono::Duration {
     let base = retry_after
-        .unwrap_or(cooldown)
+        .unwrap_or_else(|| cooldown.max(CIRCUIT_DEFER_UNSCHEDULED))
         .clamp(CIRCUIT_DEFER_MIN, CIRCUIT_DEFER_MAX);
     let jitter = crate::policy::full_jitter(base / 4, retry_stream_seed(task), task_attempt(task));
     chrono::Duration::from_std(base + jitter).unwrap_or(chrono::Duration::seconds(1))
@@ -44242,6 +44248,23 @@ mod tests {
         let task = retry_after_test_task(1, 3);
         let delay = circuit_defer_delay(Some(Duration::from_millis(1)), Duration::ZERO, &task);
         assert!(delay >= chrono::Duration::from_std(CIRCUIT_DEFER_MIN).unwrap());
+    }
+
+    #[test]
+    fn circuit_defer_delay_backs_off_when_no_probe_is_scheduled() {
+        // A forced-open breaker, or a probe in flight, reports no probe time.
+        // A short cooldown must not then set a short poll.
+        let task = retry_after_test_task(1, 3);
+        let floor = chrono::Duration::from_std(CIRCUIT_DEFER_UNSCHEDULED).unwrap();
+        for cooldown in [
+            Duration::ZERO,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        ] {
+            assert!(circuit_defer_delay(None, cooldown, &task) >= floor);
+        }
+        let max = chrono::Duration::from_std(CIRCUIT_DEFER_MAX + CIRCUIT_DEFER_MAX / 4).unwrap();
+        assert!(circuit_defer_delay(None, Duration::from_secs(3600), &task) <= max);
     }
 
     #[test]
