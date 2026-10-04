@@ -102,10 +102,31 @@ async fn drain_stubborn(
 // Helpers.
 // ---------------------------------------------------------------------------
 
+/// Counts the retries that a worker enqueues for `drain_cooperative`.
+#[derive(Default)]
+struct RetryCounter(AtomicU32);
+
+impl autumn_harvest::telemetry::MetricsRecorder for RetryCounter {
+    fn record_activity_retried(&self, activity_name: &str, _queue: &str) {
+        if activity_name == "drain_cooperative" {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+static COOPERATIVE_RETRIES: std::sync::LazyLock<Arc<RetryCounter>> =
+    std::sync::LazyLock::new(Arc::default);
+
 fn registry() -> Arc<HandlerRegistry> {
-    Arc::new(HandlerRegistry::new(
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: Arc::clone(&*COOPERATIVE_RETRIES) as _,
+        ..Default::default()
+    });
+    Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![drain_wf_info()],
         activities![drain_cooperative, drain_stubborn],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
     ))
 }
 
@@ -455,6 +476,11 @@ async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
         "the peer runs attempt 2"
     );
     assert_eq!(AtomicU32::load(&COOPERATIVE_STARTS, Ordering::SeqCst), 2);
+    assert_eq!(
+        AtomicU32::load(&COOPERATIVE_RETRIES.0, Ordering::SeqCst),
+        1,
+        "the drain release counts as one enqueued retry"
+    );
     let row = activity_row(&url, exec_id).await.expect("activity row");
     assert_eq!(row.state, "COMPLETED", "{row:?}");
     b.stop().await;

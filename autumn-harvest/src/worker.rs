@@ -15714,11 +15714,14 @@ const WORKER_SHUTDOWN_ERROR: &str = "worker shutdown";
 /// The retry is due at once. The attempt counts, so an old claim epoch never
 /// matches a later claim. The release skips the retry delay and the attempt
 /// cap, as orphan reclaim does. A deploy must not fail an activity. A lost
-/// claim is a no-op.
+/// claim is a no-op. An applied release counts one enqueued retry in the
+/// metrics, as the normal retry path does.
 async fn release_drained_activity(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     payload: &str,
+    activity_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
 ) -> HarvestResult<()> {
     let claim = claim_of_task(task)?;
     let message = crate::failure::parse_error_payload_full(payload).message;
@@ -15727,6 +15730,8 @@ async fn release_drained_activity(
         queue::requeue_claimed_task_for_retry(conn, &claim, chrono::Duration::zero(), &error)
             .await?;
     if write == queue::ClaimWrite::Applied {
+        // The release enqueues a retry, as the normal retry path does.
+        metrics.record_activity_retried(activity_name, &task.queue_name);
         tracing::info!(
             task_id = %task.id,
             worker_id = %claim.worker_id,
@@ -17455,7 +17460,14 @@ async fn process_activity_task(
         && !failure_is_non_retryable(payload, retry_policy.as_ref())
     {
         let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
-        return release_drained_activity(&mut conn, task, payload).await;
+        return release_drained_activity(
+            &mut conn,
+            task,
+            payload,
+            activity_name,
+            registry.telemetry().metrics.as_ref(),
+        )
+        .await;
     }
     let attempt = ActivityAttempt {
         task,

@@ -57,6 +57,7 @@ epoch never matches a later claim.
 **Scope.** Running workflow tasks are not cancelled. `workflow_task_timeout`
 bounds them, and #1184 fences their writes. A drained attempt still counts as
 a failed attempt in `harvest.activity.attempts` and `harvest.activity.failed`.
+Its release counts as one retry in `harvest.activity.retries`.
 Issue #1552, which this issue lists, shipped in #1778. The plugin's default
 drain deadline and the connector's `shutdown_timeout` now use
 `DEFAULT_SHUTDOWN_TIMEOUT`.
