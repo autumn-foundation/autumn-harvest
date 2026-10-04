@@ -1186,16 +1186,19 @@ fn is_keyword(t: &Token, w: &str) -> bool {
 /// run dynamic SQL too. The `EXECUTE FUNCTION` of a trigger does not. A
 /// top-level `EXECUTE` runs a prepared statement, so its arguments are data.
 fn in_execute_statement(toks: &[Token], depth: usize) -> bool {
-    // The open statement, last token first.
+    // The open statement, last token first. So `open[i + 1]` comes before
+    // `open[i]`, and `open[i - 1]` comes after it.
     let open = open_statement(toks, depth);
-    let routine = |i: usize| {
-        i > 0 && (is_keyword(open[i - 1], "function") || is_keyword(open[i - 1], "procedure"))
+    let dynamic = |i: usize| {
+        let before = open.get(i + 1);
+        let after = i.checked_sub(1).map(|j| open[j]);
+        let opens = before.is_none_or(|t| ["in", "query", "for"].iter().any(|w| is_keyword(t, w)));
+        let routine =
+            after.is_some_and(|t| is_keyword(t, "function") || is_keyword(t, "procedure"));
+        let assigned = after.is_some_and(|t| matches!(t.tok, Tok::Punct(':' | '=')));
+        is_keyword(open[i], "execute") && opens && !routine && !assigned
     };
-    depth > 0
-        && open
-            .iter()
-            .enumerate()
-            .any(|(i, t)| is_keyword(t, "execute") && !routine(i))
+    depth > 0 && (0..open.len()).any(dynamic)
 }
 
 /// Whether the next token at `depth` is the body of a `CREATE FUNCTION` or
@@ -3434,8 +3437,17 @@ fn execute_at(s: &Stmts, k: usize) -> usize {
 /// It may open a statement or follow `FOR ... IN`, `RETURN QUERY` or
 /// `OPEN ... FOR`. The `EXECUTE FUNCTION` of a trigger runs no dynamic SQL.
 fn dynamic_execute(s: &Stmts, k: usize) -> bool {
+    // `EXECUTE` is a non-reserved word, so elsewhere it names a column or a
+    // variable, as in `PERFORM execute FROM t` or `execute := 1`.
+    let opens = s.starts[k] == k
+        || ["in", "query", "for"]
+            .iter()
+            .any(|w| k > 0 && s.keyword(k - 1, w));
+    let assigned = s.is_punct(k + 1, ':') || s.is_punct(k + 1, '=');
     s.keyword(k, "execute")
         && s.toks[k].depth > 0
+        && opens
+        && !assigned
         && !s.keyword(k + 1, "function")
         && !s.keyword(k + 1, "procedure")
 }
@@ -7034,6 +7046,19 @@ fn a_routine_search_path_may_shadow_set_config() {
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
     let sql = body("pg_catalog.set_config");
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn an_execute_column_is_not_dynamic_sql() {
+    // `EXECUTE` is a non-reserved word, so it may name a column or a variable.
+    for statement in [
+        "PERFORM execute FROM cold_table;",
+        "SELECT execute INTO v FROM cold_table;",
+        "execute := 1;",
+    ] {
+        let sql = format!("DO $$\nDECLARE v int;\nBEGIN\n    {statement}\nEND $$;");
+        assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    }
 }
 
 #[test]
