@@ -34,8 +34,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_harvest::replication::{
-    FenceRegistry, ReplicationStatus, ShardGeneration, WatermarkReading, assert_fence,
-    bump_generation, current_generation, ensure_generation_row, query_replication_status,
+    DrFencing, DrMarkers, FenceRegistry, ReplicationStatus, ShardGeneration, WatermarkReading,
+    assert_admin_write_authority, assert_fence, bump_generation, current_generation,
+    ensure_generation_row, pin_process_fence, probe_dr_markers, query_replication_status,
 };
 use autumn_harvest::types::{ExecutionId, ShardId};
 use futures::FutureExt as _;
@@ -1970,7 +1971,7 @@ async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
     let shard = ShardId::new(3);
     FenceRegistry::clear();
     autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig {
-        fencing: true,
+        fencing: DrFencing::Enabled,
         sample_interval: std::time::Duration::from_millis(300),
         watermark_retain: std::time::Duration::from_secs(3600),
         slot_prefix: DR_PREFIX.to_string(),
@@ -2043,6 +2044,329 @@ async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
 
     FenceRegistry::clear();
     autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+}
+
+// ── Fence on by default where DR is configured (issue #1823) ───────────────
+
+#[tokio::test]
+async fn the_probe_finds_no_dr_marker_on_a_plain_database() {
+    let (url, _db) = require_db!("probeplain");
+    let mut conn = connect(&url).await;
+    let markers = probe_dr_markers(&mut conn, DR_PREFIX).await.expect("probe");
+    assert_eq!(markers, DrMarkers::default(), "{markers:?}");
+    assert!(!markers.is_dr());
+}
+
+#[tokio::test]
+async fn the_probe_finds_a_generation_row() {
+    let (url, _db) = require_db!("proberow");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(5))
+        .await
+        .expect("provision");
+    let markers = probe_dr_markers(&mut conn, DR_PREFIX).await.expect("probe");
+    assert_eq!(markers.generation_shards, vec![ShardId::new(5)]);
+    assert!(markers.is_dr());
+}
+
+/// A DR slot on THIS database marks it. A slot with another prefix does not.
+#[tokio::test]
+async fn the_probe_finds_a_logical_dr_slot_on_this_database_only() {
+    let (url, db) = require_db!("probeslot");
+    if !wal_level_is_logical(&url).await {
+        eprintln!("SKIPPED probeslot: wal_level is not logical");
+        return;
+    }
+    let mut conn = connect(&url).await;
+    let dr_slot = format!("{DR_PREFIX}_{db}");
+    let cdc_slot = format!("cdc_{db}");
+    for slot in [&dr_slot, &cdc_slot] {
+        diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
+            .bind::<diesel::sql_types::Text, _>(slot.clone())
+            .execute(&mut conn)
+            .await
+            .expect("create slot");
+    }
+    let markers = probe_dr_markers(&mut conn, DR_PREFIX).await;
+    let other = probe_dr_markers(&mut conn, "no_such_prefix").await;
+    for slot in [&dr_slot, &cdc_slot] {
+        let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+            .bind::<diesel::sql_types::Text, _>(slot.clone())
+            .execute(&mut conn)
+            .await;
+    }
+    let markers = markers.expect("probe");
+    assert_eq!(markers.dr_slots, 1, "{markers:?}");
+    assert!(markers.is_dr());
+    assert!(!other.expect("probe").is_dr(), "only the DR prefix counts");
+}
+
+#[tokio::test]
+async fn auto_mode_leaves_a_plain_database_unfenced() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("autoplain");
+    let pool = dr_pool(&url);
+    FenceRegistry::clear();
+    let targets = Some((vec![(ShardId::new(2), pool.clone())], ShardId::new(2)));
+    let resolved = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool)
+        .await
+        .expect("a plain database starts");
+    let enabled = FenceRegistry::is_enabled();
+    let mut conn = connect(&url).await;
+    let row = current_generation(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
+    FenceRegistry::clear();
+    assert!(resolved.is_none(), "no marker means no fence");
+    assert!(!enabled, "nothing is pinned");
+    assert_eq!(row, None, "Auto never provisions a plain database");
+}
+
+#[tokio::test]
+async fn auto_mode_pins_a_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("autodr");
+    let pool = dr_pool(&url);
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
+    bump_generation(&mut conn, ShardId::new(2), "earlier failover", "test")
+        .await
+        .unwrap();
+    FenceRegistry::clear();
+    let targets = Some((vec![(ShardId::new(2), pool.clone())], ShardId::new(2)));
+    let resolved = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool)
+        .await
+        .expect("a DR database starts fenced");
+    let pinned = FenceRegistry::expected(ShardId::new(2));
+    FenceRegistry::clear();
+    assert_eq!(
+        resolved.map(|targets| targets.len()),
+        Some(1),
+        "the fence is on"
+    );
+    assert_eq!(
+        pinned,
+        Some(ShardGeneration::new(1)),
+        "pins the current epoch"
+    );
+}
+
+/// With no shard identity, Auto reads the shard from the single row.
+#[tokio::test]
+async fn auto_mode_reads_the_shard_from_a_single_generation_row() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("autoinfer");
+    let pool = dr_pool(&url);
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(7))
+        .await
+        .unwrap();
+    FenceRegistry::clear();
+    let resolved = pin_process_fence(DrFencing::Auto, DR_PREFIX, None, &pool)
+        .await
+        .expect("one row names the shard");
+    let pinned = FenceRegistry::expected(ShardId::new(7));
+    let unencoded = FenceRegistry::expected(ShardId::UNENCODED);
+    FenceRegistry::clear();
+    assert_eq!(
+        resolved.map(|targets| targets.iter().map(|(s, _)| *s).collect::<Vec<_>>()),
+        Some(vec![ShardId::new(7)])
+    );
+    assert_eq!(pinned, Some(ShardGeneration::INITIAL));
+    assert_eq!(
+        unencoded,
+        Some(ShardGeneration::INITIAL),
+        "default shard is 7"
+    );
+}
+
+/// A DR database with no row and no shard identity cannot be fenced. The
+/// process refuses to start rather than invent shard 0.
+#[tokio::test]
+async fn auto_mode_refuses_a_dr_database_it_cannot_name() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("autononame");
+    let pool = dr_pool(&url);
+    let mut conn = connect(&url).await;
+    for shard in [1, 2] {
+        ensure_generation_row(&mut conn, ShardId::new(shard))
+            .await
+            .unwrap();
+    }
+    FenceRegistry::clear();
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, None, &pool).await;
+    let enabled = FenceRegistry::is_enabled();
+    FenceRegistry::clear();
+    let Err(error) = refused else {
+        panic!("two rows name no single shard");
+    };
+    assert!(error.to_string().contains("shard"), "{error}");
+    assert!(!enabled, "a refused start pins nothing");
+}
+
+#[tokio::test]
+async fn disabled_mode_refuses_a_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("disableddr");
+    let pool = dr_pool(&url);
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
+    FenceRegistry::clear();
+    let targets = Some((vec![(ShardId::new(2), pool.clone())], ShardId::new(2)));
+    let refused = pin_process_fence(DrFencing::Disabled, DR_PREFIX, targets.clone(), &pool).await;
+    let enabled = FenceRegistry::is_enabled();
+    FenceRegistry::clear();
+    let Err(error) = refused else {
+        panic!("Disabled on a DR database must refuse to start");
+    };
+    assert!(
+        matches!(error, autumn_harvest::error::HarvestError::Config(_)),
+        "{error:?}"
+    );
+    assert!(!enabled);
+
+    // A plain database runs unfenced under Disabled, as before.
+    let (plain_url, _db) = require_db!("disabledplain");
+    let plain = dr_pool(&plain_url);
+    let plain_targets = Some((vec![(ShardId::new(2), plain.clone())], ShardId::new(2)));
+    let resolved = pin_process_fence(DrFencing::Disabled, DR_PREFIX, plain_targets, &plain)
+        .await
+        .expect("a plain database starts");
+    assert!(resolved.is_none());
+}
+
+/// A worker configured `Disabled` does not start on a DR database: it never
+/// registers in the fleet and never claims.
+#[tokio::test]
+async fn a_worker_configured_disabled_refuses_to_start_on_a_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("workerdisabled");
+    let shard = ShardId::new(3);
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, shard).await.unwrap();
+    }
+    FenceRegistry::clear();
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_dr_fencing(false),
+    );
+    config.shard_assignments = vec![shard];
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = autumn_harvest::worker::Worker::new(config, registry).expect("worker builds");
+    let pool = dr_pool(&url);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), worker.run(&pool)).await;
+    let enabled = FenceRegistry::is_enabled();
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+    outcome.expect("a disagreeing worker must stop at once, not run");
+    assert!(!enabled, "a refused worker pins nothing");
+    assert_eq!(
+        count_on(&url, "SELECT COUNT(*) AS n FROM harvest_workers").await,
+        0,
+        "a refused worker never registers in the fleet"
+    );
+}
+
+/// The default worker config fences a DR database with no extra setting.
+#[tokio::test]
+async fn a_default_worker_fences_a_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("workerauto");
+    let shard = ShardId::new(4);
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, shard).await.unwrap();
+    }
+    FenceRegistry::clear();
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_replication_sample_interval(std::time::Duration::from_millis(300)),
+    );
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = autumn_harvest::worker::Worker::new(config, registry).expect("worker builds");
+    let pool = dr_pool(&url);
+    let run = tokio::spawn(async move { worker.run(&pool).await });
+    eventually(
+        "the default worker to pin its generation",
+        std::time::Duration::from_secs(30),
+        || async move { FenceRegistry::expected(shard).is_some() },
+    )
+    .await;
+    {
+        let mut conn = connect(&url).await;
+        bump_generation(&mut conn, shard, "failover", "test")
+            .await
+            .unwrap();
+    }
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), run).await;
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+    stopped
+        .expect("a fenced default worker must stop")
+        .expect("worker task must not panic");
+}
+
+// ── Direct-database admin writes (issue #1823) ─────────────────────────────
+
+/// An admin write against a demoted primary is rejected. The operator states
+/// the epoch that holds authority; the old primary still has the older one.
+#[tokio::test]
+async fn an_admin_write_against_a_demoted_shard_is_rejected() {
+    let (url, _db) = require_db!("admindemoted");
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+    ensure_generation_row(&mut conn, shard).await.unwrap();
+
+    // The promoted primary is at generation 1. This database never saw it.
+    let error =
+        assert_admin_write_authority(&mut conn, shard, Some(ShardGeneration::new(1)), DR_PREFIX)
+            .await
+            .expect_err("a demoted shard must refuse the write");
+    match error {
+        autumn_harvest::error::HarvestError::ShardFenced {
+            shard_id,
+            pinned,
+            current,
+        } => {
+            assert_eq!((shard_id, pinned, current), (0, 1, Some(0)));
+        }
+        other => panic!("expected ShardFenced, got {other:?}"),
+    }
+
+    assert_admin_write_authority(&mut conn, shard, Some(ShardGeneration::INITIAL), DR_PREFIX)
+        .await
+        .expect("the stated epoch matches, so the write may run");
+}
+
+/// On a DR database, an admin write with no stated epoch is refused.
+#[tokio::test]
+async fn an_admin_write_on_a_dr_database_must_state_the_epoch() {
+    let (url, _db) = require_db!("adminepoch");
+    let mut conn = connect(&url).await;
+    assert_admin_write_authority(&mut conn, ShardId::new(0), None, DR_PREFIX)
+        .await
+        .expect("a plain database needs no epoch");
+
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let error = assert_admin_write_authority(&mut conn, ShardId::new(0), None, DR_PREFIX)
+        .await
+        .expect_err("a DR database needs a stated epoch");
+    assert!(
+        matches!(error, autumn_harvest::error::HarvestError::Config(_)),
+        "{error:?}"
+    );
 }
 
 /// Counts `harvest.shard.fenced`; every other metric is the default no-op.

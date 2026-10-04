@@ -327,6 +327,15 @@ pub enum PartitionCommand {
         #[arg(long = "i-understand-the-lock-window")]
         confirm: bool,
 
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. A shard at
+        /// any other generation is refused, so a stale DSN to a demoted
+        /// primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "N")]
+        expect_generation: Option<i64>,
+
         /// Convert even when a logical-replication publication covers
         /// `harvest_events` without `publish_via_partition_root`.
         ///
@@ -361,6 +370,15 @@ pub enum PartitionCommand {
         #[arg(long, value_name = "N", default_value_t = 32)]
         max_drops: usize,
 
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. A shard at
+        /// any other generation is refused, so a stale DSN to a demoted
+        /// primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "N")]
+        expect_generation: Option<i64>,
+
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
         format: DrFormat,
@@ -379,6 +397,15 @@ pub enum PartitionCommand {
         /// Acknowledge that this rewrites `harvest_events` in full.
         #[arg(long = "i-understand-this-rewrites-the-table")]
         confirm: bool,
+
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. A shard at
+        /// any other generation is refused, so a stale DSN to a demoted
+        /// primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "N")]
+        expect_generation: Option<i64>,
 
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
@@ -5948,6 +5975,32 @@ async fn dr_connect_read_only(
 
 // ── `harvest partition` (issue #958) ───────────────────────────────────────
 
+/// Refuse a partition write on a shard without write authority (issue #1823).
+///
+/// `harvest partition` connects to the shard database directly, so the
+/// management API fence never sees it. The operator states the generation
+/// that holds authority. A demoted primary is still at an older one.
+async fn partition_write_authority(
+    conn: &mut autumn_harvest::diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    expect_generation: Option<i64>,
+) -> Result<(), String> {
+    autumn_harvest::replication::assert_admin_write_authority(
+        conn,
+        autumn_harvest::types::ShardId::new(shard_id),
+        expect_generation.map(autumn_harvest::replication::ShardGeneration::new),
+        autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX,
+    )
+    .await
+    .map_err(|error| match error {
+        autumn_harvest::HarvestError::Config(_) => format!(
+            "{error} Pass --expect-generation <N>, where N is the generation `harvest dr \
+             status` reports on the promoted primary."
+        ),
+        other => other.to_string(),
+    })
+}
+
 /// What `harvest partition disable` did on one shard.
 ///
 /// A named enum rather than `Option<Option<_>>`: "already unpartitioned" is a
@@ -6115,6 +6168,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
             lookahead_cohorts,
             lock_timeout_secs,
             confirm,
+            expect_generation,
             allow_incompatible_publications,
             format,
         } => {
@@ -6136,17 +6190,28 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
             };
             opts.validate()
                 .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-            run_partition_enable(shards, &opts, *format).await
+            run_partition_enable(shards, &opts, *expect_generation, *format).await
         }
         PartitionCommand::Maintain {
             shards,
             lookahead_cohorts,
             max_drops,
+            expect_generation,
             format,
-        } => run_partition_maintain(shards, *lookahead_cohorts, *max_drops, *format).await,
+        } => {
+            run_partition_maintain(
+                shards,
+                *lookahead_cohorts,
+                *max_drops,
+                *expect_generation,
+                *format,
+            )
+            .await
+        }
         PartitionCommand::Disable {
             shards,
             confirm,
+            expect_generation,
             format,
         } => {
             if !confirm {
@@ -6157,7 +6222,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
                         .to_string(),
                 ));
             }
-            run_partition_disable(shards, *format).await
+            run_partition_disable(shards, *expect_generation, *format).await
         }
     }
 }
@@ -6217,6 +6282,7 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
 async fn run_partition_enable(
     shards: &[String],
     opts: &autumn_harvest::partition::EnableOptions,
+    expect_generation: Option<i64>,
     format: DrFormat,
 ) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
@@ -6235,6 +6301,13 @@ async fn run_partition_enable(
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        if let Err(error) =
+            partition_write_authority(&mut conn, target.shard_id, expect_generation).await
+        {
+            row.error = Some(error);
+            out.push(row);
+            continue;
+        }
         // Per-shard independence is deliberate: a shard is a database, and a
         // half-converted cluster is a supported state (each shard's layout is
         // detected at runtime), so one shard's lock timeout must not abort the
@@ -6252,6 +6325,7 @@ async fn run_partition_maintain(
     shards: &[String],
     lookahead_cohorts: u32,
     max_drops: usize,
+    expect_generation: Option<i64>,
     format: DrFormat,
 ) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
@@ -6274,6 +6348,13 @@ async fn run_partition_maintain(
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        if let Err(error) =
+            partition_write_authority(&mut conn, target.shard_id, expect_generation).await
+        {
+            row.error = Some(error);
+            out.push(row);
+            continue;
+        }
         match autumn_harvest::partition::maintain(
             &mut conn,
             autumn_harvest::chrono::Utc::now(),
@@ -6303,7 +6384,11 @@ async fn run_partition_maintain(
     emit_partition_report(&out, format, "maintain")
 }
 
-async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<(), CliError> {
+async fn run_partition_disable(
+    shards: &[String],
+    expect_generation: Option<i64>,
+    format: DrFormat,
+) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
@@ -6320,6 +6405,13 @@ async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<()
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        if let Err(error) =
+            partition_write_authority(&mut conn, target.shard_id, expect_generation).await
+        {
+            row.error = Some(error);
+            out.push(row);
+            continue;
+        }
         match autumn_harvest::partition::disable_partitioning(&mut conn).await {
             Ok(report) => {
                 row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);

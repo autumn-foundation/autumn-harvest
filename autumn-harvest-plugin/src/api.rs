@@ -5909,11 +5909,37 @@ async fn admit_mutation(
         .get::<crate::api_token::TokenPrincipal>()
         .is_some();
     let session = request.extensions().get::<Session>().cloned();
-    if mutation_admitted(api_state, has_token, session).await {
-        next.run(request).await
-    } else {
-        AutumnError::unauthorized_msg("authentication required").into_response()
+    if !mutation_admitted(api_state, has_token, session).await {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
     }
+    if let Err(refusal) = enforce_dr_fence(api_state).await {
+        return refusal.into_response();
+    }
+    next.run(request).await
+}
+
+/// Refuse an admin write when this process lost write authority (issue #1823).
+///
+/// Every mutating route passes through here after authentication. The check
+/// runs [`autumn_harvest::replication::assert_fence`] for each shard this
+/// process pinned. A failover bumps the generation, so a stale node refuses
+/// every admin write and writes nothing. It costs one atomic load on a process
+/// that pinned nothing.
+///
+/// The check runs before the handler, not inside its transaction. A handler
+/// that appends history is also checked inside the append transaction.
+async fn enforce_dr_fence(api_state: &HarvestApiState) -> Result<(), AutumnError> {
+    use autumn_harvest::replication::{FenceRegistry, assert_fence};
+
+    if !FenceRegistry::is_enabled() {
+        return Ok(());
+    }
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    for (shard, _) in FenceRegistry::snapshot() {
+        let mut conn = acquire_conn(pool.pool_for(shard)).await?;
+        assert_fence(&mut conn, shard).await.map_err(map_error)?;
+    }
+    Ok(())
 }
 
 /// Whether the mutation gate admits a caller (issue #1802).
@@ -45370,6 +45396,12 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         // retry hint only. The policy's reason never reaches the caller,
         // and a `403` here would leak that a shard is denied.
         error @ HarvestError::OutsideShardFence { .. } => {
+            AutumnError::service_unavailable_msg(error.to_string())
+        }
+        // This node lost write authority to another region (issue #1823).
+        // `503` tells a load balancer to send the caller to another node. A
+        // retry on this node fails the same way until it restarts.
+        error @ HarvestError::ShardFenced { .. } => {
             AutumnError::service_unavailable_msg(error.to_string())
         }
         other => AutumnError::service_unavailable_msg(other.to_string()),

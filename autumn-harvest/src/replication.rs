@@ -49,12 +49,17 @@
 //! optional one. See `docs/cross-region-dr.md` and
 //! `docs/runbooks/cross-region-failover.md`.
 //!
-//! # Opt-in by construction
+//! # On by default where DR is configured (issue #1823)
 //!
-//! A deployment that never registers a generation pays nothing: [`FenceRegistry`]
-//! reports [`FenceRegistry::is_enabled`] `false`, `claim_task` issues the
-//! byte-for-byte unchanged claim SQL, and [`assert_fence`] issues no statement
-//! at all.
+//! [`pin_process_fence`] runs at process startup. In the default
+//! [`DrFencing::Auto`] mode it probes each shard database for a DR marker
+//! ([`DrMarkers`]) and fences only when it finds one. A process configured
+//! [`DrFencing::Disabled`] refuses to start on a DR database.
+//!
+//! A process that pins nothing pays one probe per shard at startup, and
+//! nothing after. [`FenceRegistry::is_enabled`] reports `false`. `claim_task`
+//! issues the byte-for-byte unchanged claim SQL. [`assert_fence`] issues no
+//! statement at all.
 //!
 //! # Measured RPO
 //!
@@ -437,8 +442,8 @@ impl ReplicationStatus {
 // breaking change we accept in exchange for the setter being usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrConfig {
-    /// Whether write-authority fencing is enabled for this process.
-    pub fencing: bool,
+    /// How this process decides whether to fence (issue #1823).
+    pub fencing: DrFencing,
     /// DR sampler cadence: the RPO's resolution floor and the bound on
     /// fence-detection latency.
     pub sample_interval: std::time::Duration,
@@ -461,10 +466,11 @@ pub struct DrConfig {
 }
 
 impl Default for DrConfig {
-    /// Fencing **off**, which is byte-for-byte the pre-#954 runtime.
+    /// Fencing in [`DrFencing::Auto`] mode. A database with no DR marker runs
+    /// the byte-for-byte pre-#954 runtime.
     fn default() -> Self {
         Self {
-            fencing: false,
+            fencing: DrFencing::Auto,
             sample_interval: std::time::Duration::from_secs(15),
             watermark_retain: std::time::Duration::from_secs(3600),
             slot_prefix: DEFAULT_DR_SLOT_PREFIX.to_string(),
@@ -474,6 +480,69 @@ impl Default for DrConfig {
 
 /// The slot-name prefix `docs/cross-region-dr.md`'s setup SQL prescribes.
 pub const DEFAULT_DR_SLOT_PREFIX: &str = "harvest_dr";
+
+/// How a process decides whether to fence its writes (issue #1823).
+///
+/// The fence used to be opt-in per process. A process started without it
+/// could write to a demoted primary after a failover. `Auto` closes that gap:
+/// a process on a DR database fences itself with no setting at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrFencing {
+    /// Fence when a shard database carries a DR marker. See [`DrMarkers`].
+    #[default]
+    Auto,
+    /// Always fence. Provision the generation row when it is absent.
+    Enabled,
+    /// Never fence. A shard database with a DR marker refuses this process.
+    Disabled,
+}
+
+impl DrFencing {
+    /// Decide whether to fence, from whether any shard has a DR marker.
+    ///
+    /// # Errors
+    ///
+    /// A message for the operator when the mode disagrees with the database:
+    /// [`Self::Disabled`] on a database that carries a DR marker. The process
+    /// must refuse to start. An unfenced writer on a DR database is the
+    /// split-brain hazard the fence exists to stop.
+    pub fn resolve(self, dr_configured: bool) -> Result<bool, String> {
+        match (self, dr_configured) {
+            (Self::Auto, found) => Ok(found),
+            (Self::Enabled, _) => Ok(true),
+            (Self::Disabled, false) => Ok(false),
+            (Self::Disabled, true) => Err(
+                "DR fencing is Disabled, but a shard database carries a DR marker (a \
+                 harvest_shard_generation row, a DR replication slot or a DR subscription). An \
+                 unfenced process could write to a demoted primary after a failover. Remove \
+                 with_dr_fencing(false) to use the default Auto mode."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// What a startup probe found in one shard database (issue #1823).
+///
+/// Any one signal means DR is configured for the database.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DrMarkers {
+    /// The shards that have a `harvest_shard_generation` row here.
+    pub generation_shards: Vec<ShardId>,
+    /// Replication slots with the DR prefix, scoped like the RPO metric.
+    pub dr_slots: i64,
+    /// Subscriptions in this database with the DR prefix.
+    pub dr_subscriptions: i64,
+}
+
+impl DrMarkers {
+    /// Whether any DR signal is present.
+    #[must_use]
+    pub fn is_dr(&self) -> bool {
+        !self.generation_shards.is_empty() || self.dr_slots > 0 || self.dr_subscriptions > 0
+    }
+}
 
 static DR_CONFIG: RwLock<Option<DrConfig>> = RwLock::new(None);
 
@@ -973,8 +1042,9 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
     use super::{
-        BUMP_LOCK_TIMEOUT_MS, FenceRegistry, PROMOTE_STATEMENT_TIMEOUT_MS, ReplicationStatus,
-        ShardGeneration, SlotLag, StandbyLag, WatermarkReading, qualified, quote_ident,
+        BUMP_LOCK_TIMEOUT_MS, DrMarkers, FenceRegistry, PROMOTE_STATEMENT_TIMEOUT_MS,
+        ReplicationStatus, ShardGeneration, SlotLag, StandbyLag, WatermarkReading, qualified,
+        quote_ident,
     };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ShardId;
@@ -1173,24 +1243,227 @@ mod db {
             return Ok(());
         };
         let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+        assert_generation(conn, resolved, pinned).await
+    }
 
+    /// Fail with `ShardFenced` unless `shard` is at `expected`.
+    ///
+    /// The one check both the persist assert and the admin check run. It
+    /// takes the row `FOR SHARE`; see [`assert_fence`] for why. An absent row
+    /// fails closed.
+    async fn assert_generation(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        expected: ShardGeneration,
+    ) -> HarvestResult<()> {
         let rows: Vec<GenerationRow> = diesel::sql_query(
             "SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 FOR SHARE",
         )
-        .bind::<Integer, _>(resolved.as_i32())
+        .bind::<Integer, _>(shard.as_i32())
         .load(conn)
         .await
         .map_err(database_error)?;
 
         let current = rows.into_iter().next().map(|r| r.generation);
-        if current == Some(pinned.as_i64()) {
+        if current == Some(expected.as_i64()) {
             return Ok(());
         }
         Err(crate::error::HarvestError::ShardFenced {
-            shard_id: resolved.as_i32(),
-            pinned: pinned.as_i64(),
+            shard_id: shard.as_i32(),
+            pinned: expected.as_i64(),
             current,
         })
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct TableRow {
+        #[diesel(sql_type = Bool)]
+        present: bool,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MarkerRow {
+        #[diesel(sql_type = diesel::sql_types::Array<Integer>)]
+        generation_shards: Vec<i32>,
+        #[diesel(sql_type = BigInt)]
+        dr_slots: i64,
+        #[diesel(sql_type = BigInt)]
+        dr_subscriptions: i64,
+    }
+
+    /// Probe this database for DR markers (issue #1823).
+    ///
+    /// The slot test uses the same scope as the RPO metric. A logical slot
+    /// counts for its own database. A physical slot has no database, so it
+    /// counts for every database on the cluster. Physical replication copies
+    /// the whole cluster, so that is the correct answer. `starts_with` is
+    /// used rather than `LIKE`, for the reason the RPO queries give: `_` is a
+    /// wildcard in `LIKE`.
+    ///
+    /// Every catalog read here needs no special grant. `pg_subscription`
+    /// hides only its connection string from ordinary roles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn probe_dr_markers(
+        conn: &mut AsyncPgConnection,
+        slot_prefix: &str,
+    ) -> HarvestResult<DrMarkers> {
+        // A database without the fence table has no generation row. Before
+        // issue #1823 an unfenced process issued no DR query at all, so a
+        // missing table must not fail its start now.
+        let has_table: TableRow = diesel::sql_query(
+            "SELECT to_regclass('harvest_shard_generation') IS NOT NULL AS present",
+        )
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+        let generation_shards = if has_table.present {
+            "ARRAY(SELECT shard_id FROM harvest_shard_generation ORDER BY shard_id)"
+        } else {
+            "ARRAY[]::integer[]"
+        };
+        let row: MarkerRow = diesel::sql_query(format!(
+            "SELECT \
+                 {generation_shards} AS generation_shards, \
+                 (SELECT COUNT(*) FROM pg_replication_slots s \
+                  WHERE (s.database IS NULL OR s.database = current_database()) \
+                    AND starts_with(s.slot_name, $1)) AS dr_slots, \
+                 (SELECT COUNT(*) FROM pg_subscription s \
+                  JOIN pg_database d ON d.oid = s.subdbid \
+                  WHERE d.datname = current_database() \
+                    AND starts_with(s.subname::text, $1)) AS dr_subscriptions"
+        ))
+        .bind::<Text, _>(slot_prefix)
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(DrMarkers {
+            generation_shards: row
+                .generation_shards
+                .into_iter()
+                .map(ShardId::new)
+                .collect(),
+            dr_slots: row.dr_slots,
+            dr_subscriptions: row.dr_subscriptions,
+        })
+    }
+
+    /// Check that a direct-database admin write may run on `shard`
+    /// (issue #1823).
+    ///
+    /// A CLI process pins nothing, so [`assert_fence`] cannot help it. A pin
+    /// taken at connect time would match a demoted primary too. The operator
+    /// therefore states the epoch that holds authority, as `expected`.
+    ///
+    /// - `Some(expected)`: the shard must be at exactly that generation.
+    /// - `None`: allowed only on a database with no DR marker.
+    ///
+    /// The check is a preflight read, not a commit-order barrier.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::ShardFenced`] when the shard is at another
+    /// generation, or has no row. [`crate::error::HarvestError::Config`] when
+    /// `expected` is `None` on a DR database.
+    /// [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn assert_admin_write_authority(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        expected: Option<ShardGeneration>,
+        slot_prefix: &str,
+    ) -> HarvestResult<()> {
+        if let Some(expected) = expected {
+            return assert_generation(conn, shard, expected).await;
+        }
+        if probe_dr_markers(conn, slot_prefix).await?.is_dr() {
+            return Err(crate::error::HarvestError::Config(format!(
+                "shard {} is a DR database, so an admin write must state the generation that \
+                 holds write authority. Read it from the promoted primary.",
+                shard.as_i32()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve this process's fencing mode and pin every shard it serves
+    /// (issue #1823).
+    ///
+    /// Workers and the management API both call this at startup, before
+    /// they write anything.
+    ///
+    /// `targets` is the `(shard, pool)` set and the default shard, when the
+    /// caller knows its shard identity. With `None`, the probe runs on
+    /// `fallback_pool`. If the fence turns on, exactly one
+    /// `harvest_shard_generation` row there names the shard. That row is how
+    /// an operator addressed this database with `harvest dr fence`.
+    ///
+    /// Returns the fenced targets, or `None` when the process runs unfenced.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Config`] when the process must refuse to
+    /// start. Three causes: the mode disagrees with the database, the shard
+    /// cannot be named, or a pin conflicts with one already in this process.
+    /// A database error also refuses the start. A fenced process never falls
+    /// back to unfenced.
+    pub async fn pin_process_fence(
+        mode: super::DrFencing,
+        slot_prefix: &str,
+        targets: Option<(Vec<(ShardId, crate::worker::DbPool)>, ShardId)>,
+        fallback_pool: &crate::worker::DbPool,
+    ) -> HarvestResult<Option<Vec<(ShardId, crate::worker::DbPool)>>> {
+        let probe_pools: Vec<&crate::worker::DbPool> = targets.as_ref().map_or_else(
+            || vec![fallback_pool],
+            |(targets, _)| targets.iter().map(|(_, pool)| pool).collect(),
+        );
+        let mut dr_configured = false;
+        let mut fallback_markers = DrMarkers::default();
+        for pool in probe_pools {
+            let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+            let markers = probe_dr_markers(&mut conn, slot_prefix).await?;
+            dr_configured |= markers.is_dr();
+            fallback_markers = markers;
+        }
+        if !mode
+            .resolve(dr_configured)
+            .map_err(crate::error::HarvestError::Config)?
+        {
+            return Ok(None);
+        }
+
+        let (targets, default_shard) = match targets {
+            Some(targets) => targets,
+            None => match fallback_markers.generation_shards.as_slice() {
+                [shard] => (vec![(*shard, fallback_pool.clone())], *shard),
+                rows => {
+                    return Err(crate::error::HarvestError::Config(format!(
+                        "DR fencing is on, but this process has no shard identity and the \
+                         database names {} shards in harvest_shard_generation. Set \
+                         WorkerConfig::with_shard_assignments([shard]) or use a sharded pool. \
+                         Refusing to start rather than pin a guessed shard.",
+                        rows.len()
+                    )));
+                }
+            },
+        };
+
+        let mut pins = Vec::with_capacity(targets.len());
+        for (shard, pool) in &targets {
+            let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+            pins.push((*shard, ensure_generation_row(&mut conn, *shard).await?));
+        }
+        FenceRegistry::publish(&pins, default_shard)
+            .map_err(|conflict| crate::error::HarvestError::Config(conflict.to_string()))?;
+        for (shard, generation) in &pins {
+            tracing::info!(
+                shard_id = shard.as_i32(),
+                generation = generation.as_i64(),
+                "pinned shard write-authority generation for cross-region DR fencing"
+            );
+        }
+        Ok(Some(targets))
     }
 
     // ── Replication lag ────────────────────────────────────────────────────
@@ -1972,8 +2245,9 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    advance_sequences_after_promotion, assert_fence, bump_generation, current_generation,
-    ensure_generation_row, measure_rpo, query_replication_status, record_replication_heartbeat,
+    advance_sequences_after_promotion, assert_admin_write_authority, assert_fence, bump_generation,
+    current_generation, ensure_generation_row, measure_rpo, pin_process_fence, probe_dr_markers,
+    query_replication_status, record_replication_heartbeat,
 };
 
 #[cfg(test)]
@@ -2444,6 +2718,67 @@ mod tests {
         assert_eq!(
             qualified("public", "harvest_events"),
             "\"public\".\"harvest_events\""
+        );
+    }
+
+    // ── fencing mode (issue #1823) ─────────────────────────────────────────
+    #[test]
+    fn the_default_mode_is_auto() {
+        assert_eq!(DrFencing::default(), DrFencing::Auto);
+        assert_eq!(DrConfig::default().fencing, DrFencing::Auto);
+    }
+
+    #[test]
+    fn auto_fences_exactly_when_a_dr_marker_is_found() {
+        assert_eq!(DrFencing::Auto.resolve(false), Ok(false));
+        assert_eq!(DrFencing::Auto.resolve(true), Ok(true));
+    }
+
+    #[test]
+    fn enabled_always_fences() {
+        assert_eq!(DrFencing::Enabled.resolve(false), Ok(true));
+        assert_eq!(DrFencing::Enabled.resolve(true), Ok(true));
+    }
+
+    #[test]
+    fn disabled_refuses_a_dr_database() {
+        assert_eq!(DrFencing::Disabled.resolve(false), Ok(false));
+        let refusal = DrFencing::Disabled
+            .resolve(true)
+            .expect_err("a disagreeing config must refuse to start");
+        assert!(refusal.contains("Disabled"), "{refusal}");
+        assert!(refusal.contains("DR"), "{refusal}");
+    }
+
+    #[test]
+    fn markers_report_dr_when_any_signal_is_present() {
+        assert!(!DrMarkers::default().is_dr());
+        let row = DrMarkers {
+            generation_shards: vec![ShardId::new(4)],
+            ..DrMarkers::default()
+        };
+        assert!(row.is_dr());
+        let slot = DrMarkers {
+            dr_slots: 1,
+            ..DrMarkers::default()
+        };
+        assert!(slot.is_dr());
+        let subscription = DrMarkers {
+            dr_subscriptions: 1,
+            ..DrMarkers::default()
+        };
+        assert!(subscription.is_dr());
+    }
+
+    #[test]
+    fn the_mode_serializes_in_snake_case() {
+        assert_eq!(
+            serde_json::to_value(DrFencing::Auto).unwrap(),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            serde_json::to_value(DrFencing::Disabled).unwrap(),
+            serde_json::json!("disabled")
         );
     }
 

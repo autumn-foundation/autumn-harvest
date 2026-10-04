@@ -245,8 +245,15 @@ outbox `*Requested` rows and parent/child pairs.
 
 ### 4. Start workers
 
-Only now. Point the fleet's DSNs at the promoted region and start it with
-`dr_fencing` still enabled — each worker pins the **new** epoch at startup.
+Only now. Point the fleet's DSNs at the promoted region and start it. The
+default `Auto` mode finds the generation row and fences each worker, and
+each worker pins the **new** epoch at startup. A worker configured
+`with_dr_fencing(false)` refuses to start here; remove that setting. Restart
+the management API nodes too: they pin at startup like workers.
+
+For `harvest partition` writes, pass the new epoch:
+`--expect-generation <N>`, where `N` is the generation `harvest dr status`
+reports.
 
 ```bash
 harvest worker health --output json

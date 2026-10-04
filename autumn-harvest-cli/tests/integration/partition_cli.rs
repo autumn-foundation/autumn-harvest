@@ -132,3 +132,56 @@ fn the_cohort_width_and_lookahead_are_operator_settable() {
     .expect("enable accepts the sizing settings");
     assert!(rendered.contains("604800"), "{rendered}");
 }
+
+/// Every partition write accepts the epoch that holds write authority (issue
+/// #1823). The check itself is proven in the core crate's
+/// `cross_region_dr_tests`.
+#[test]
+fn every_partition_write_accepts_the_expected_generation() {
+    for args in [
+        &[
+            "harvest",
+            "partition",
+            "enable",
+            "--shard",
+            "postgres://h/s0",
+            "--i-understand-the-lock-window",
+            "--expect-generation",
+            "3",
+        ][..],
+        &[
+            "harvest",
+            "partition",
+            "maintain",
+            "--shard",
+            "postgres://h/s0",
+            "--expect-generation",
+            "3",
+        ][..],
+        &[
+            "harvest",
+            "partition",
+            "disable",
+            "--shard",
+            "postgres://h/s0",
+            "--i-understand-this-rewrites-the-table",
+            "--expect-generation",
+            "3",
+        ][..],
+    ] {
+        let rendered = parse(args).expect("the flag parses");
+        assert!(
+            rendered.contains("expect_generation: Some(3)"),
+            "{rendered}"
+        );
+    }
+    let rendered = parse(&[
+        "harvest",
+        "partition",
+        "maintain",
+        "--shard",
+        "postgres://h/s0",
+    ])
+    .expect("the flag is optional at parse time");
+    assert!(rendered.contains("expect_generation: None"), "{rendered}");
+}

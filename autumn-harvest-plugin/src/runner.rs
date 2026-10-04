@@ -1120,6 +1120,26 @@ impl HarvestRunner {
             );
         }
 
+        // Issue #1823: pin the DR fence before this process writes anything.
+        // An API-only node owns no worker, so it must pin here. The management
+        // API checks these pins before every admin write. An in-process worker
+        // pins the same generations again, which is idempotent.
+        autumn_harvest::replication::pin_process_fence(
+            prepared.worker_runtime_config.dr.fencing,
+            &prepared.worker_runtime_config.dr.slot_prefix,
+            autumn_harvest::worker::dr_fence_targets(
+                &prepared.worker_runtime_config,
+                &harvest_pool,
+            ),
+            &harvest_pool,
+        )
+        .await
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "refusing to start: cross-region DR fencing could not be resolved: {error}"
+            ))
+        })?;
+
         // Sync static triggers before starting workers (issue #517)
         for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
             let mut conn = shard_pool.get().await.map_err(|e| {

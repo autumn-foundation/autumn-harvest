@@ -2814,8 +2814,9 @@ the count never decays on its own.
 
 ### Safe actions
 
-- Restart the fenced workers against the region that currently holds authority,
-  with `dr_fencing` still enabled. They pin the current epoch at startup.
+- Restart the fenced workers against the region that currently holds authority.
+  The default `Auto` fencing mode finds the generation row, so they fence
+  again and pin the current epoch at startup.
 - If the fence was a mistake, the recovery is still to **restart the fleet**.
   Generations only go up; there is no un-bump, and bumping again does not undo
   anything — it fences the fleet a second time.
@@ -2880,8 +2881,8 @@ mutually exclusive and neither can fire on a stale reading.
 
 - A single tick during a role change or a failover, where the connection is
   re-established as a different role. The `for: 10m` window covers that.
-- A deployment that has not enabled DR at all but did enable `dr_fencing`: the
-  sampler runs and finds nothing to read. Silence this shard explicitly rather
+- A deployment that has not configured DR at all but set
+  `with_dr_fencing(true)`: the sampler runs and finds nothing to read. Silence this shard explicitly rather
   than letting it become background noise.
 
 ### Safe actions
