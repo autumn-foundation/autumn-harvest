@@ -450,13 +450,14 @@ mod scanner {
     /// `WorkflowFailed` event path (issue #367 AC4 — no new event variant).
     ///
     /// Only transitions executions still in `RUNNING`; a workflow that already
-    /// reached a terminal state is left untouched. Returns the
-    /// `(workflow_id, workflow_name, schedule_id, origin, shard_id)` of the execution when
-    /// (and only when) it actually transitioned `RUNNING` → `FAILED`, so the
-    /// caller can count the failure toward schedule auto-pause once the
-    /// transaction commits (with the correct origin so backfill quarantines are
-    /// not mis-attributed to the cadence counter).
-    /// The shard labels the canary failure for a quarantined probe (#1816).
+    /// reached a terminal state is left untouched.
+    ///
+    /// Returns `(workflow_id, workflow_name, schedule_id, origin, shard_id)`
+    /// only when the execution moved from `RUNNING` to `FAILED`. After the
+    /// transaction commits, the caller counts the failure toward schedule
+    /// auto-pause. The origin keeps a backfill quarantine out of the cadence
+    /// counter. The shard labels the canary failure for a quarantined probe
+    /// (#1816).
     #[allow(clippy::too_many_lines)]
     async fn fail_owning_workflow(
         conn: &mut AsyncPgConnection,

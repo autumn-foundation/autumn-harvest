@@ -439,9 +439,9 @@ async fn quarantine_writes_dlq_and_fails_execution() {
 
 /// A quarantined canary probe is a canary failure (issue #1816).
 ///
-/// The quarantine path skips the business terminal for a probe. Without a
-/// canary failure, the probe is lost from every SLI: its task timeouts are
-/// left out of the workflow-task SLO, and the canary SLO sees no failure.
+/// The quarantine path skips the business terminal for a probe. The
+/// workflow-task SLO leaves out probe timeouts. So without a canary failure,
+/// no SLO sees the failed probe.
 #[tokio::test]
 async fn quarantine_of_a_canary_probe_records_a_canary_failure() {
     let (mut conn, pool, _container) = setup().await;
