@@ -480,6 +480,8 @@ timeout scanner, a cancel through a signal and a race-loser cancel.
 `telemetry::build_id_label` caps the values. A process admits the first 16
 distinct builds that it sees (`MAX_BUILD_ID_LABELS`), and it never evicts one.
 A later build, or a build id longer than 128 bytes, reports `__other__`. A
+real build id equal to a sentinel, or one that starts with `build:`, gets a
+`build:` prefix, so it never merges with a sentinel or another build. A
 worker process normally reports only its own build.
 `harvest.workflow.non_determinism` goes through the same cap.
 

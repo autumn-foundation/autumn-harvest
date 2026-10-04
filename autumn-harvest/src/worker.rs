@@ -8218,7 +8218,7 @@ async fn block_workflow_for_non_determinism(
     // pattern already established in this codebase).
     telemetry.metrics.record_workflow_non_determinism(
         &execution.workflow_name,
-        crate::telemetry::build_id_label(build_id),
+        &crate::telemetry::build_id_label(build_id),
     );
 
     if parked_paused {
@@ -8242,7 +8242,7 @@ async fn block_workflow_for_non_determinism(
         .record_workflow_nondeterministic_block_for_build(
             &execution.workflow_name,
             &task.queue_name,
-            crate::telemetry::build_id_label(build_id),
+            &crate::telemetry::build_id_label(build_id),
         );
     tracing::warn!(
         execution_id = %exec_id,
@@ -15735,6 +15735,7 @@ async fn process_activity_task(
                 .into_error_payload();
         let telemetry = registry.telemetry().clone();
         let build_label = crate::telemetry::build_id_label(build_id);
+        let build_label = build_label.as_ref();
         telemetry.metrics.record_activity_completed_for_build(
             activity_name,
             &task.queue_name,
@@ -16161,6 +16162,7 @@ async fn process_activity_task(
     };
     // Issue #1814: label the outcome and latency with this worker's build.
     let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
     telemetry.metrics.record_activity_completed_for_build(
         activity_name,
         &task.queue_name,
@@ -19959,6 +19961,7 @@ fn emit_pending_workflow_metrics(
 ) {
     // Issue #1814: label the outcome and latency with this worker's build.
     let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
     if !pending.is_canary {
         telemetry.metrics.record_workflow_completed_for_build(
             &execution.workflow_name,
@@ -20023,7 +20026,7 @@ fn emit_pending_workflow_metrics(
             if *had_nd_details {
                 telemetry.metrics.record_workflow_non_determinism(
                     &execution.workflow_name,
-                    crate::telemetry::build_id_label(build_id),
+                    &crate::telemetry::build_id_label(build_id),
                 );
             }
             if pending.is_canary {
@@ -21071,6 +21074,7 @@ async fn fail_workflow_for_history_cap(
     crate::execution::emit_start_cancel_metrics(&*telemetry.metrics, &pending_cancel_metrics);
     // Issue #1814: label the outcome and latency with this worker's build.
     let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
     telemetry.metrics.record_workflow_completed_for_build(
         &execution.workflow_name,
         &task.queue_name,
@@ -32642,7 +32646,7 @@ pub(crate) async fn quarantine_workflow_task_timeout_for_build(
                     metrics,
                     workflow_name,
                     &q,
-                    crate::telemetry::build_id_label(build_id),
+                    &crate::telemetry::build_id_label(build_id),
                     crate::telemetry::WorkflowStatus::Failed,
                 );
                 if let Some(exec_uuid) = exec_id_opt {

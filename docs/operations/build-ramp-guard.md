@@ -213,8 +213,13 @@ families, and it labels both.
 `telemetry::build_id_label` caps the label values. A process admits the first
 16 distinct build ids that it sees (`MAX_BUILD_ID_LABELS`). It never evicts a
 build. A later build id, or one longer than 128 bytes, gets `__other__`. An
-empty build id gets `none`. A real build id equal to `none` or `__other__` gets
-`build:none` or `build:__other__`, so the two sentinels keep one meaning.
+empty build id gets `none`.
+
+A real build id equal to a sentinel gets the escape prefix `build:`. A real
+build id that already starts with `build:` gets the prefix too. So `none`
+reports `build:none`, and `build:none` reports `build:build:none`. The
+encoding is one-to-one: no two builds share a series, and no build shares a
+sentinel. The length bound applies to the label after the prefix.
 
 A worker keeps one build id for its whole life, and a process normally hosts
 one build. The cap therefore holds the active builds in practice. A process

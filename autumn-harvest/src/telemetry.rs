@@ -1886,15 +1886,14 @@ pub const BUILD_ID_LABEL_NONE: &str = "none";
 /// [`MAX_BUILD_ID_LABELS`] distinct builds, and for a build id longer than
 /// [`MAX_BUILD_ID_LABEL_LEN`] bytes.
 pub const BUILD_ID_LABEL_OTHER: &str = "__other__";
-/// `build_id` label value for a worker whose real build id is `none`
-/// (issue #1814).
+/// The escape prefix of a `build_id` label value (issue #1814).
 ///
-/// The real id must not merge with the [`BUILD_ID_LABEL_NONE`] sentinel, so
-/// [`build_id_label`] reports it under this reserved value instead.
-pub const BUILD_ID_LABEL_REAL_NONE: &str = "build:none";
-/// `build_id` label value for a worker whose real build id is `__other__`
-/// (issue #1814). See [`BUILD_ID_LABEL_REAL_NONE`].
-pub const BUILD_ID_LABEL_REAL_OTHER: &str = "build:__other__";
+/// [`build_id_label`] adds it to a real build id that equals a sentinel, and
+/// to a real build id that already starts with it. So `none` reports
+/// `build:none`, and `build:none` reports `build:build:none`. The encoding is
+/// one-to-one, so no two real builds share a series, and no real build shares
+/// a sentinel series.
+pub const BUILD_ID_LABEL_ESCAPE_PREFIX: &str = "build:";
 /// The maximum number of distinct `build_id` label values in one process
 /// (issue #1814).
 ///
@@ -1955,45 +1954,50 @@ impl BuildIdLabelCap {
 
     /// Return the label value for `raw`.
     ///
-    /// An empty `raw` gets [`BUILD_ID_LABEL_NONE`]. A `raw` longer than
-    /// [`MAX_BUILD_ID_LABEL_LEN`] bytes gets [`BUILD_ID_LABEL_OTHER`]. A real
-    /// build id equal to a sentinel gets a reserved value, such as
-    /// [`BUILD_ID_LABEL_REAL_NONE`], so a sentinel always means what it says.
+    /// An empty `raw` gets [`BUILD_ID_LABEL_NONE`]. A real build id that
+    /// equals a sentinel, or starts with [`BUILD_ID_LABEL_ESCAPE_PREFIX`],
+    /// gets that prefix added, so the encoding is one-to-one. A label longer
+    /// than [`MAX_BUILD_ID_LABEL_LEN`] bytes gets [`BUILD_ID_LABEL_OTHER`].
     #[must_use]
-    pub fn label<'a>(&self, raw: &'a str) -> &'a str {
+    pub fn label<'a>(&self, raw: &'a str) -> std::borrow::Cow<'a, str> {
+        use std::borrow::Cow;
+
         if raw.is_empty() {
-            return BUILD_ID_LABEL_NONE;
+            return Cow::Borrowed(BUILD_ID_LABEL_NONE);
         }
-        if raw.len() > MAX_BUILD_ID_LABEL_LEN {
-            return BUILD_ID_LABEL_OTHER;
-        }
-        let raw = match raw {
-            BUILD_ID_LABEL_NONE => BUILD_ID_LABEL_REAL_NONE,
-            BUILD_ID_LABEL_OTHER => BUILD_ID_LABEL_REAL_OTHER,
-            other => other,
+        let escape = raw == BUILD_ID_LABEL_NONE
+            || raw == BUILD_ID_LABEL_OTHER
+            || raw.starts_with(BUILD_ID_LABEL_ESCAPE_PREFIX);
+        let label: Cow<'a, str> = if escape {
+            Cow::Owned(format!("{BUILD_ID_LABEL_ESCAPE_PREFIX}{raw}"))
+        } else {
+            Cow::Borrowed(raw)
         };
+        if label.len() > MAX_BUILD_ID_LABEL_LEN {
+            return Cow::Borrowed(BUILD_ID_LABEL_OTHER);
+        }
         let admitted = self
             .admitted
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(raw);
+            .contains(label.as_ref());
         if admitted {
-            return raw;
+            return label;
         }
         let mut set = self
             .admitted
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Check again under the write lock: another thread can admit `raw`
-        // between the two locks.
-        if set.contains(raw) {
-            return raw;
+        // Check again under the write lock: another thread can admit the
+        // label between the two locks.
+        if set.contains(label.as_ref()) {
+            return label;
         }
         if set.len() >= self.max {
-            return BUILD_ID_LABEL_OTHER;
+            return Cow::Borrowed(BUILD_ID_LABEL_OTHER);
         }
-        set.insert(raw.into());
-        raw
+        set.insert(label.as_ref().into());
+        label
     }
 }
 
@@ -2002,7 +2006,7 @@ impl BuildIdLabelCap {
 /// One process-wide [`BuildIdLabelCap`] of [`MAX_BUILD_ID_LABELS`] holds the
 /// admitted values.
 #[must_use]
-pub fn build_id_label(raw: &str) -> &str {
+pub fn build_id_label(raw: &str) -> std::borrow::Cow<'_, str> {
     static CAP: std::sync::LazyLock<BuildIdLabelCap> =
         std::sync::LazyLock::new(|| BuildIdLabelCap::new(MAX_BUILD_ID_LABELS));
     CAP.label(raw)
@@ -5840,18 +5844,41 @@ mod tests {
     }
 
     #[test]
-    fn a_real_build_id_equal_to_a_sentinel_gets_a_reserved_label() {
-        let cap = BuildIdLabelCap::new(4);
-        assert_eq!(cap.label(BUILD_ID_LABEL_NONE), BUILD_ID_LABEL_REAL_NONE);
-        assert_eq!(cap.label(BUILD_ID_LABEL_OTHER), BUILD_ID_LABEL_REAL_OTHER);
+    fn the_label_encoding_is_one_to_one_and_keeps_sentinels_apart() {
+        let cap = BuildIdLabelCap::new(16);
+        assert_eq!(cap.label(BUILD_ID_LABEL_NONE), "build:none");
+        assert_eq!(cap.label(BUILD_ID_LABEL_OTHER), "build:__other__");
+        assert_eq!(cap.label("build:none"), "build:build:none");
+        assert_eq!(cap.label("build:x"), "build:build:x");
+        assert_eq!(cap.label("v1"), "v1");
+        // Distinct real ids give distinct labels, none of them a sentinel.
+        let ids = [
+            "none",
+            "build:none",
+            "build:build:none",
+            "__other__",
+            "build:__other__",
+            "v1",
+        ];
+        let labels: std::collections::HashSet<String> =
+            ids.iter().map(|id| cap.label(id).into_owned()).collect();
+        assert_eq!(labels.len(), ids.len());
+        assert!(!labels.contains(BUILD_ID_LABEL_NONE));
+        assert!(!labels.contains(BUILD_ID_LABEL_OTHER));
         // The sentinels still mean "no build" and "over the cap" only.
         assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
-        assert_ne!(BUILD_ID_LABEL_REAL_NONE, BUILD_ID_LABEL_NONE);
-        assert_ne!(BUILD_ID_LABEL_REAL_OTHER, BUILD_ID_LABEL_OTHER);
-        // A reserved label uses a slot like any real build.
-        let one = BuildIdLabelCap::new(1);
-        assert_eq!(one.label(BUILD_ID_LABEL_NONE), BUILD_ID_LABEL_REAL_NONE);
-        assert_eq!(one.label("v1"), BUILD_ID_LABEL_OTHER);
+    }
+
+    #[test]
+    fn an_escaped_label_over_the_length_bound_is_bucketed() {
+        let cap = BuildIdLabelCap::new(4);
+        let id = format!("build:{}", "y".repeat(MAX_BUILD_ID_LABEL_LEN - 6));
+        assert_eq!(id.len(), MAX_BUILD_ID_LABEL_LEN);
+        assert_eq!(
+            cap.label(&id),
+            BUILD_ID_LABEL_OTHER,
+            "the prefix pushes it over"
+        );
     }
 
     #[test]
@@ -5940,7 +5967,7 @@ mod tests {
             &rec,
             "orders",
             "default",
-            build_id_label(""),
+            &build_id_label(""),
             WorkflowStatus::Failed,
         );
         assert_eq!(

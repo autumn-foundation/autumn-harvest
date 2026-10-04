@@ -49,8 +49,9 @@ the task. They are `harvest.workflow.terminal`, `harvest.activity.attempts`,
 `harvest.workflow.nondeterministic_block`, `harvest.workflow.duration` and
 `harvest.activity.duration`. An outcome that no worker code produced reports
 `none`. The cap admits 16 distinct builds per process. A later build, or an id
-over 128 bytes, reports `__other__`. A real build id equal to a sentinel
-reports `build:none` or `build:__other__`. New `MetricsRecorder` methods with a
+over 128 bytes, reports `__other__`. A real build id equal to a sentinel, or
+one that starts with `build:`, gets a `build:` prefix. So no two builds share a
+series, and no build shares a sentinel. New `MetricsRecorder` methods with a
 `_for_build` suffix carry the build. Their defaults call the old methods, so a
 custom recorder needs no change.
 
