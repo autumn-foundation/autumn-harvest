@@ -1713,7 +1713,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         &mut timeouts,
         &mut body_timeouts,
     );
-    let new_tables = new_table_spans(&s, &created);
+    let new_tables = new_table_spans(&s, &created, history);
     let hits = resolve(raws, &s, &unconditional, &new_tables, path_change, history);
 
     let statement_count = (0..toks.len())
@@ -1837,8 +1837,8 @@ fn unreadable_settings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
 /// While the setting is off, each top-level statement with a backslash on its
 /// lines counts as unreadable too. The lock sits on that statement, so an
 /// annotation on the setter cannot cover it. A session value outlives its
-/// file, so the state carries into later files. Without a backslash, the
-/// setting changes nothing.
+/// file, so the state carries into later files. A top-level local value ends
+/// at the commit. Without a backslash, the setting changes nothing.
 fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut Vec<Raw>) {
     let backslash_lines: BTreeSet<usize> = sql
         .lines()
@@ -1846,57 +1846,75 @@ fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
         .filter(|(_, text)| text.contains('\\'))
         .map(|(n, _)| n + 1)
         .collect();
-    // The value when the transaction began, and whether the transaction has
-    // turned the setting off. A rollback restores the saved value. A rollback
-    // to a savepoint may restore any value from the transaction.
-    let mut saved = history.nonstandard_strings;
-    let mut any_off = saved;
+    // The session value, and a transaction-local `off` above it. The session
+    // value when the transaction began, and whether the transaction has turned
+    // either value off. A rollback restores the saved value. A rollback to a
+    // savepoint may restore any value from the transaction.
+    let mut session = history.nonstandard_strings;
+    let mut local = false;
+    let mut saved = session;
+    let (mut any_session_off, mut any_local_off) = (session, false);
     for k in 0..s.toks.len() {
         if s.starts[k] == k {
             let end = s.keyword(k, "end") && s.toks[k].depth == 0;
             if s.keyword(k, "commit") || end {
-                saved = history.nonstandard_strings;
-                any_off = saved;
+                local = false;
+                saved = session;
+                (any_session_off, any_local_off) = (session, false);
             } else if s.keyword(k, "rollback") || s.keyword(k, "abort") {
-                let to_savepoint = (k + 1..=k + 2).any(|j| s.keyword(j, "to"));
-                history.nonstandard_strings = if to_savepoint {
-                    history.nonstandard_strings || any_off
+                if (k + 1..=k + 2).any(|j| s.keyword(j, "to")) {
+                    session |= any_session_off;
+                    local |= any_local_off;
                 } else {
-                    saved
-                };
+                    session = saved;
+                    local = false;
+                }
             }
         }
         let top_start = s.starts[k] == k && s.toks[k].depth == 0 && !s.is_punct(k, ';');
-        if top_start && history.nonstandard_strings {
+        if top_start && (session || local) {
             let last = s.end(k).saturating_sub(1).max(k);
             let lines = s.toks[k].line..=s.toks[last].line;
             if backslash_lines.range(lines).next().is_some() {
                 raws.push(Raw::lock(k, NONSTANDARD_STRINGS, None));
             }
         }
-        match conforming_change(s, k) {
-            Some(false) => {
+        // A routine body may run in a later transaction, so only a top-level
+        // local value ends at the commit.
+        let top = s.toks[k].depth == 0;
+        match conforming_change(s, k).map(|(on, local)| (on, local && top)) {
+            Some((false, true)) => {
                 raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
-                history.nonstandard_strings = true;
-                any_off = true;
+                local = true;
+                any_local_off = true;
             }
-            Some(true) => history.nonstandard_strings = false,
+            Some((false, false)) => {
+                raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
+                (session, local) = (true, false);
+                any_session_off = true;
+            }
+            Some((true, _)) => (session, local) = (false, false),
             None => {}
         }
     }
+    // The file ends its transaction, so only the session value carries.
+    history.nonstandard_strings = session;
 }
 
 /// The new `standard_conforming_strings` value that the token at `k` sets, if
-/// any. A value the lint cannot read counts as `false`, which fails closed.
+/// any, and whether that value is local to the transaction. A value the lint
+/// cannot read counts as `false`, which fails closed.
 ///
 /// Only a session value counts as `true`. A transaction-local `on` ends at
-/// the commit and restores the session value, so it changes nothing.
-fn conforming_change(s: &Stmts, k: usize) -> Option<bool> {
+/// the commit and restores the session value, so it changes nothing. A scope
+/// the lint cannot read counts as the session.
+fn conforming_change(s: &Stmts, k: usize) -> Option<(bool, bool)> {
     let literal = |j: usize| s.word(j).or_else(|| s.string(j));
     let on = |j: usize| literal(j).is_some_and(pg_true);
     let start = s.starts[k] == k;
     if start && s.keyword(k, "reset") {
-        return (s.is(k + 1, "standard_conforming_strings") || s.is(k + 1, "all")).then_some(true);
+        let resets = s.is(k + 1, "standard_conforming_strings") || s.is(k + 1, "all");
+        return resets.then_some((true, false));
     }
     if start && s.keyword(k, "set") {
         let name = if s.is(k + 1, "local") || s.is(k + 1, "session") {
@@ -1912,17 +1930,18 @@ fn conforming_change(s: &Stmts, k: usize) -> Option<bool> {
         let local = s.is(k + 1, "local");
         return s
             .is(name, "standard_conforming_strings")
-            .then(|| on(value))
-            .filter(|&on| !(on && local));
+            .then(|| (on(value), local))
+            .filter(|&(on, local)| !(on && local));
     }
     let named = s.is(k, "set_config")
         && s.is_punct(k + 1, '(')
         && s.string(k + 2)
             .is_some_and(|n| n.trim().eq_ignore_ascii_case("standard_conforming_strings"));
-    let session = s.is_punct(k + 5, ',') && literal(k + 6).is_some_and(pg_false);
+    let scope = |read: fn(&str) -> bool| s.is_punct(k + 5, ',') && literal(k + 6).is_some_and(read);
+    let (session, local) = (scope(pg_false), scope(pg_true));
     named
-        .then(|| s.is_punct(k + 3, ',') && on(k + 4))
-        .filter(|&on| !on || session)
+        .then(|| (s.is_punct(k + 3, ',') && on(k + 4), local))
+        .filter(|&(on, _)| !on || session)
 }
 
 /// The verb of a lock that an `ALTER` of a routine may expose.
@@ -2244,16 +2263,25 @@ fn arity(s: &Stmts, open: usize) -> Option<usize> {
 /// the range of an unqualified name for the same reason.
 ///
 /// Any later `COMMIT` ends every range. After it, other sessions can see the
-/// new table and lock it.
+/// new table and lock it. So does a call of a routine from this file or an
+/// earlier migration, or code that the lint cannot read.
 fn new_table_spans(
     s: &Stmts,
     created: &BTreeMap<String, usize>,
+    history: &History,
 ) -> BTreeMap<String, (usize, usize)> {
     let toks = s.toks;
     let mut ends: Vec<(SpanEnd, usize)> = Vec::new();
+    // A routine from this file or an earlier migration may drop the table.
+    let inherited = [
+        &history.clearing_routines,
+        &history.foreign_routines,
+        &history.locking_routines,
+    ];
     let bases: BTreeSet<&str> = (0..toks.len())
         .filter_map(|k| s.qualified_name(routine_keyword(s, k)? + 1))
         .filter_map(|(_, next)| s.word(next - 1))
+        .chain(inherited.into_iter().flatten().map(String::as_str))
         .collect();
     for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
         let commit = s.is(k, "commit") || (s.is(k, "end") && toks[k].depth == 0);
@@ -5832,6 +5860,48 @@ fn nonstandard_strings_carry_into_later_migrations() {
 }
 
 #[test]
+fn a_local_nonstandard_setting_ends_at_the_commit() {
+    let allow = "-- lock-safety: allow lock-timeout #1810 test fixture\n";
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let tainted = |findings: &[Finding]| {
+        findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings"))
+    };
+    for local in [
+        "SET LOCAL standard_conforming_strings = off;",
+        "SELECT set_config('standard_conforming_strings', 'off', true);",
+    ] {
+        // The file ends its transaction, so a later migration reads as `on`.
+        let earlier = format!("{allow}{local}");
+        let findings = lint_with_history(&[&earlier], hidden, true);
+        assert!(!tainted(&findings), "{earlier}\n{findings:?}");
+        // A `COMMIT` ends the local value inside the file too.
+        let sql = format!("{allow}{local}\nCOMMIT;\n{hidden}");
+        let findings = lint_with_history(&[], &sql, false);
+        assert!(!tainted(&findings), "{sql}\n{findings:?}");
+        // Before the commit, the local value hides the body.
+        let sql = format!("{allow}{local}\n{hidden}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(tainted(&findings), "{sql}\n{findings:?}");
+    }
+    // A routine body may run its local value in any later transaction.
+    let earlier = format!(
+        "{allow}CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+         PERFORM set_config('standard_conforming_strings', 'off', true);\nEND $$;"
+    );
+    let findings = lint_with_history(&[&earlier], hidden, true);
+    assert!(tainted(&findings), "{earlier}\n{findings:?}");
+    // A session value under a local one still carries.
+    let earlier = format!(
+        "{allow}SET standard_conforming_strings = off;\n\
+         {allow}SET LOCAL standard_conforming_strings = off;"
+    );
+    let findings = lint_with_history(&[&earlier], hidden, true);
+    assert!(tainted(&findings), "{earlier}\n{findings:?}");
+}
+
+#[test]
 fn a_quoted_object_name_is_not_its_target_keyword() {
     for sql in [
         "CREATE TRIGGER \"on\" BEFORE INSERT ON harvest_events FOR EACH ROW EXECUTE FUNCTION f();",
@@ -5899,6 +5969,27 @@ fn a_call_or_unreadable_code_ends_a_new_table() {
                 .iter()
                 .any(|f| f.detail.contains("ALTER TABLE locks harvest_events")),
             "{sql}\n{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_call_of_an_earlier_routine_ends_a_new_table() {
+    let locks = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 DROP TABLE scratch.harvest_events;\nEND $$;";
+    let clears = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                  PERFORM set_config('lock_timeout', '0', true);\nEND $$;";
+    let foreign = "CREATE FUNCTION f() RETURNS void LANGUAGE plpython3u AS $$\npass\n$$;";
+    let sql = "CREATE TABLE harvest_events (id BIGINT);\nSELECT f();\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    // A routine from an earlier migration may drop or rename the new table.
+    for history in [locks, clears, foreign] {
+        let findings = lint_with_history(&[history], sql, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.contains("ALTER TABLE locks harvest_events")),
+            "{history}\n{findings:?}"
         );
     }
 }

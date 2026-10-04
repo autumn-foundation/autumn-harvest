@@ -41,7 +41,8 @@ table again.
 A drop or rename ends it with or without a schema in the name. A `search_path`
 change ends it for a name without a schema. A `COMMIT` ends every exemption,
 because other sessions can then see the new table and lock it. So does a call
-of a routine, or code the lint cannot read, because it may drop the table.
+of a routine from this file or an earlier migration, or code the lint cannot
+read, because it may drop the table.
 The lock must name the table exactly as the create does, schema included.
 
 A partition of a hot table is hot too, because it takes the live writes of its
@@ -284,7 +285,8 @@ that no longer matches a finding also fails the build.
   table that no bound covers. While it is off, each statement with a
   backslash counts the same way, later in the file and in later migrations,
   until a reset. A `ROLLBACK` restores the value from the start of its
-  transaction.
+  transaction. A top-level `SET LOCAL` ends at the commit. A local value in a
+  routine body carries, because the body may run in any later transaction.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
   call of a routine in another language, counts as a lock on an unknown table.
   No bound covers that lock, because the code may clear the bound first. It
