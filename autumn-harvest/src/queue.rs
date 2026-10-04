@@ -2808,6 +2808,49 @@ pub(crate) async fn later_claim_shares_strikes(
         .map_err(crate::error::database_error)
 }
 
+/// Record that the timeout enforcer timed out the claim that started at
+/// `started_at` (issue #1809).
+///
+/// The enforcer calls this inside its transaction, after its write applied.
+/// The worker that held the claim reads it back with
+/// [`claim_timed_out`]. A later timeout overwrites the value.
+///
+/// # Errors
+///
+/// Returns a database error if the update fails.
+pub(crate) async fn record_timed_out_claim(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    started_at: DateTime<Utc>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    diesel::update(dsl::harvest_task_queue.find(task_id))
+        .set(dsl::timed_out_started_at.eq(Some(started_at)))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Whether the timeout enforcer timed out the claim of `task_id` that started
+/// at `started_at` (issue #1809). Any other loss of the claim, and a failed
+/// read, is not a timeout.
+pub(crate) async fn claim_timed_out(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    started_at: DateTime<Utc>,
+) -> bool {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .select(dsl::timed_out_started_at)
+        .first::<Option<DateTime<Utc>>>(conn)
+        .await
+        .is_ok_and(|marker| marker == Some(started_at))
+}
+
 /// Record that the handler of `claim` started (issue #1809).
 ///
 /// The write sets `handler_started_attempt` to the claim's `attempt`. The

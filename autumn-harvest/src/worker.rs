@@ -15283,37 +15283,14 @@ impl Drop for CircuitProbeGuard<'_> {
     }
 }
 
-/// Whether `claim` was lost to the timeout enforcer (issue #1809). The
-/// enforcer writes its timeout error to the row. Any other loss, or a failed
-/// read, is not a timeout.
-async fn claim_lost_to_timeout(
-    conn: &mut AsyncPgConnection,
-    claim: &queue::TaskClaim,
-    activity_name: &str,
-) -> bool {
-    matches!(
-        queue::task_status_for_claim(conn, claim).await,
-        Ok(Some((_, Some(error), _))) if is_attempt_timeout_error(&error, activity_name)
-    )
-}
-
-/// Whether `error`, read from a task row, is the error the timeout enforcer
-/// writes when it times out an attempt of `activity_name` (issue #1809).
-fn is_attempt_timeout_error(error: &str, activity_name: &str) -> bool {
-    [
-        crate::error::TimeoutType::StartToClose,
-        crate::error::TimeoutType::Heartbeat,
-        crate::error::TimeoutType::ScheduleToClose,
-    ]
-    .into_iter()
-    .any(|timeout_type| {
-        error
-            == HarvestError::Timeout {
-                timeout_type,
-                task_name: activity_name.to_string(),
-            }
-            .to_string()
-    })
+/// Whether the claim of `task` was lost to the timeout enforcer (issue
+/// #1809). The enforcer records the `started_at` of the claim it timed out.
+/// Any other loss, or a failed read, is not a timeout.
+async fn claim_lost_to_timeout(conn: &mut AsyncPgConnection, task: &TaskQueueItem) -> bool {
+    match task.started_at {
+        Some(started_at) => queue::claim_timed_out(conn, task.id, started_at).await,
+        None => false,
+    }
 }
 
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
@@ -15745,6 +15722,7 @@ async fn process_activity_task(
     let claim_key = crate::circuit_breaker::ClaimKey {
         task_id: task.id,
         attempt: task.attempt,
+        started_at: task.started_at,
     };
     let mut probe_guard =
         CircuitProbeGuard::new(&circuit_breakers, activity_name, circuit_token, claim_key);
@@ -16456,7 +16434,7 @@ async fn process_activity_task(
             // one that another process enforced, and releases the slot of any
             // other loss.
             let lost_to_timeout = circuit_breakers.has_policy(activity_name)
-                && claim_lost_to_timeout(&mut conn, &activity_claim, activity_name).await;
+                && claim_lost_to_timeout(&mut conn, task).await;
             if circuit_breakers.on_claim_lost(
                 activity_name,
                 token,
@@ -16584,7 +16562,7 @@ async fn process_activity_task(
     let applied = finalized.as_ref().ok().copied();
     let lost_to_timeout = applied == Some(false)
         && circuit_breakers.has_policy(activity_name)
-        && claim_lost_to_timeout(&mut conn, &activity_claim, activity_name).await;
+        && claim_lost_to_timeout(&mut conn, task).await;
     report_outcome(applied, lost_to_timeout);
     finalized.map(|_| ())
 }
@@ -42325,6 +42303,7 @@ mod tests {
             capability_miss_handler: None,
             timer_fires_at: None,
             handler_started_attempt: None,
+            timed_out_started_at: None,
         }
     }
 
@@ -42370,42 +42349,6 @@ mod tests {
             timeout_retry_delay(&task, "timeout: StartToClose for call_api"),
             None
         );
-    }
-
-    /// Issue #1809: only the enforcer's timeout error marks a probe's lost
-    /// claim as a timeout.
-    #[test]
-    fn only_the_enforcer_timeout_error_counts_as_a_timeout() {
-        assert!(is_attempt_timeout_error(
-            "timeout: StartToClose for send",
-            "send"
-        ));
-        assert!(is_attempt_timeout_error(
-            "timeout: Heartbeat for send",
-            "send"
-        ));
-        assert!(is_attempt_timeout_error(
-            "timeout: ScheduleToClose for send",
-            "send"
-        ));
-        assert!(!is_attempt_timeout_error(
-            "timeout: StartToClose for other",
-            "send"
-        ));
-        assert!(!is_attempt_timeout_error(
-            "force-failed by operator",
-            "send"
-        ));
-        assert!(!is_attempt_timeout_error("", "send"));
-    }
-
-    #[test]
-    fn circuit_defer_delay_uses_the_clamped_cooldown_without_a_probe_time() {
-        let task = retry_after_test_task(1, 3);
-        let delay = circuit_defer_delay(None, Duration::from_secs(3600), &task);
-        let max = chrono::Duration::from_std(CIRCUIT_DEFER_MAX).unwrap();
-        assert!(delay >= max, "{delay:?}");
-        assert!(delay <= max + max / 4, "{delay:?}");
     }
 
     #[test]

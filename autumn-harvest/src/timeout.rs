@@ -1337,6 +1337,7 @@ async fn enforce_activity_timeout(
     let claim_key = crate::circuit_breaker::ClaimKey {
         task_id: task.id,
         attempt: task.attempt,
+        started_at: task.started_at,
     };
     // The guard rolls the mark back on every exit that does not confirm it,
     // including a dropped future. A mark left provisional would hold a late
@@ -1590,7 +1591,10 @@ async fn enforce_activity_timeout(
                         )
                         .await?
                         {
-                            queue::ClaimWrite::Applied => outcome(true),
+                            queue::ClaimWrite::Applied => {
+                                record_timed_out_claim(conn, task).await?;
+                                outcome(true)
+                            }
                             queue::ClaimWrite::LeaseLost => None,
                         },
                     );
@@ -1609,6 +1613,7 @@ async fn enforce_activity_timeout(
             )
             .await?;
             queue::fail_task(conn, task.id, &error).await?;
+            record_timed_out_claim(conn, task).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(outcome(false))
         }),
@@ -1645,6 +1650,19 @@ async fn enforce_activity_timeout(
         metrics.record_circuit_tripped(activity_name);
     }
     Ok(())
+}
+
+/// Record the timed-out claim on its row, so the worker that held it can tell
+/// this timeout from any other loss of its claim (issue #1809). A `PENDING`
+/// task holds no claim and records nothing.
+async fn record_timed_out_claim(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> HarvestResult<()> {
+    match task.started_at {
+        Some(started_at) => queue::record_timed_out_claim(conn, task.id, started_at).await,
+        None => Ok(()),
+    }
 }
 
 /// A provisional timeout mark on one claim (issue #1809).
@@ -5839,6 +5857,7 @@ mod tests {
             let claim = ClaimKey {
                 task_id: uuid::Uuid::from_u128(1809),
                 attempt: 1,
+                started_at: None,
             };
             reg.begin_claim("send", claim, probe);
             let trips = Trips::default();
@@ -5883,6 +5902,7 @@ mod tests {
         let claim = ClaimKey {
             task_id: uuid::Uuid::from_u128(1809),
             attempt: 1,
+            started_at: None,
         };
         reg.begin_claim("send", claim, probe);
         let metrics = crate::telemetry::NoOpMetrics;

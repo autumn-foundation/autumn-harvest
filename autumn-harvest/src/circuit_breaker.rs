@@ -120,6 +120,9 @@ pub struct ClaimKey {
     pub task_id: Uuid,
     /// The row's `attempt` value that the claim wrote.
     pub attempt: i32,
+    /// The claim's `started_at` epoch. A deferral lowers `attempt`, so the
+    /// epoch keeps two claims of one row apart.
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// A claim that this process dispatched and that has not reported yet.
@@ -144,6 +147,11 @@ enum ClaimState {
     Held(AttemptOutcome, DispatchToken, u32),
     /// The enforcer timed the claim out. A later result does not count.
     TimedOut,
+    /// The worker found the claim lost to a timeout while enforcers here were
+    /// still deciding, this many of them. A confirm settles it as their
+    /// timeout. When the last one rolls back, another process enforced it,
+    /// and it counts here then.
+    LostPending(u32),
 }
 
 /// Outcome of consulting the breaker before dispatching an activity attempt.
@@ -505,8 +513,9 @@ impl CircuitBreakerRegistry {
     ///
     /// - A loss that was not a timeout (a cancellation, an operator action,
     ///   an orphan reclaim) only releases the claim's probe slot.
-    /// - A timeout that an enforcer in this process marked is settled by that
-    ///   enforcer. This only releases the probe slot.
+    /// - A timeout that an enforcer in this process confirmed is settled by
+    ///   that enforcer. This only releases the probe slot. While an enforcer
+    ///   here is still deciding, the loss waits for its decision.
     /// - A timeout that no enforcer here marked was enforced by another
     ///   process. Breaker state is per process, so it counts here as a
     ///   failure. A failed probe re-opens the breaker. A closed breaker adds
@@ -525,18 +534,24 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        let marked_here = st
-            .in_flight_claims
-            .remove(&claim)
-            .is_some_and(|entry| entry.state != ClaimState::Running);
-        if !lost_to_timeout || marked_here {
+        let state = st.in_flight_claims.get(&claim).map(|entry| entry.state);
+        if lost_to_timeout
+            && let Some(ClaimState::Provisional(deciding) | ClaimState::Held(_, _, deciding)) =
+                state
+        {
+            // An enforcer here is still deciding. Keep the loss until it
+            // confirms the timeout, or the last one rolls back.
+            if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                entry.state = ClaimState::LostPending(deciding);
+            }
+            return None;
+        }
+        st.in_flight_claims.remove(&claim);
+        if !lost_to_timeout || state == Some(ClaimState::TimedOut) {
             apply_cancelled(st, token, now);
             return None;
         }
-        if apply_cancelled(st, token, now) {
-            return Some(CircuitTransition::Tripped);
-        }
-        apply_external_failure(st, policy, now)
+        count_remote_timeout(st, policy, token, now)
     }
 
     /// Register `claim` as dispatched by this process (issue #1809).
@@ -569,7 +584,7 @@ impl CircuitBreakerRegistry {
         if let Some(st) = states.get_mut(activity_name)
             && !matches!(
                 st.in_flight_claims.get(&claim).map(|entry| entry.state),
-                Some(ClaimState::Held(..))
+                Some(ClaimState::Held(..) | ClaimState::LostPending(_))
             )
         {
             st.in_flight_claims.remove(&claim);
@@ -603,6 +618,9 @@ impl CircuitBreakerRegistry {
                     ClaimState::Held(outcome, token, deciding.saturating_add(1))
                 }
                 ClaimState::TimedOut => ClaimState::TimedOut,
+                ClaimState::LostPending(deciding) => {
+                    ClaimState::LostPending(deciding.saturating_add(1))
+                }
             };
         }
     }
@@ -625,7 +643,7 @@ impl CircuitBreakerRegistry {
         let st = states.get_mut(activity_name)?;
         let entry = st.in_flight_claims.get(&claim).copied()?;
         match entry.state {
-            ClaimState::Held(..) => {
+            ClaimState::Held(..) | ClaimState::LostPending(_) => {
                 st.in_flight_claims.remove(&claim);
             }
             ClaimState::Provisional(_) => {
@@ -666,6 +684,16 @@ impl CircuitBreakerRegistry {
             ClaimState::Provisional(_) => {
                 entry.state = ClaimState::Running;
                 None
+            }
+            ClaimState::LostPending(deciding) if deciding > 1 => {
+                entry.state = ClaimState::LostPending(deciding - 1);
+                None
+            }
+            ClaimState::LostPending(_) => {
+                // No enforcer here timed it out, so another process did.
+                let token = entry.token;
+                st.in_flight_claims.remove(&claim);
+                count_remote_timeout(st, policy, token, now)
             }
             ClaimState::Running | ClaimState::TimedOut => None,
         }
@@ -918,6 +946,21 @@ fn apply_result(
     }
 }
 
+/// Count a timeout that another process enforced on a claim of this one
+/// (issue #1809). A failed probe re-opens the breaker. Otherwise a closed
+/// breaker adds the failure to its window.
+fn count_remote_timeout(
+    st: &mut BreakerState,
+    policy: CircuitBreakerPolicy,
+    token: DispatchToken,
+    now: Instant,
+) -> Option<CircuitTransition> {
+    if apply_cancelled(st, token, now) {
+        return Some(CircuitTransition::Tripped);
+    }
+    apply_external_failure(st, policy, now)
+}
+
 /// Count one out-of-band failure, such as an enforced timeout.
 fn apply_external_failure(
     st: &mut BreakerState,
@@ -1035,6 +1078,7 @@ mod tests {
         ClaimKey {
             task_id: Uuid::from_u128(1809),
             attempt,
+            started_at: None,
         }
     }
 
@@ -1229,10 +1273,11 @@ mod tests {
         );
         assert_eq!(rolling(&reg, t0), 1);
 
-        // A timeout that an enforcer here marked: that enforcer counts it.
+        // A timeout that an enforcer here confirmed: that enforcer counts it.
         let token = dispatch(&reg, t0);
         reg.begin_claim("send_email", claim(2), token);
         reg.mark_claim_timed_out("send_email", claim(2));
+        let _ = reg.confirm_claim_timed_out("send_email", claim(2), t0);
         assert_eq!(
             reg.on_claim_lost("send_email", token, claim(2), true, t0),
             None

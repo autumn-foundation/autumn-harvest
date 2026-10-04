@@ -117,9 +117,11 @@ including an error.
   counts.
 - Breaker state is per process. The enforcing process counts a timeout in
   its breaker. The process that ran the attempt finds its claim lost and
-  reads the row. When the row carries the enforcer's timeout error and no
-  enforcer in that process marked the claim, it counts the timeout in its
-  own breaker too. So the process that dispatches the calls stops them. It
+  reads the row. The enforcer records the timed-out claim's `started_at` in
+  `timed_out_started_at`. When that matches the lost claim and no enforcer in
+  that process confirmed the timeout, it counts the timeout in its own
+  breaker too. While an enforcer there is still deciding, the loss waits for
+  its decision. So the process that dispatches the calls stops them. It
   drops the attempt's late outcome, so no breaker counts the attempt twice.
   A shared breaker would count once for the fleet. It is out of scope.
 - The SQLite backend keeps terminal timeouts and has no breaker feed. It
