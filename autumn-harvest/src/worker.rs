@@ -15647,7 +15647,9 @@ async fn process_activity_task(
                         std::time::Instant::now(),
                     );
                 }
-                return deferred.map(|_| ());
+                // Issue #1815: a deferral that failed to persist is a failed
+                // setup write. A persisted or lease-lost deferral is skipped.
+                return count_setup_failure(task_outcomes, deferred).map(|_| ());
             }
         }
     }
@@ -15705,15 +15707,18 @@ async fn process_activity_task(
             let scheduled_at = chrono::Utc::now()
                 + chrono::Duration::from_std(refill_delay)
                     .unwrap_or_else(|_| chrono::Duration::seconds(5));
-            // A lost lease is a no-op (issue #1789).
-            if queue::defer_claimed_rate_limited_task(
-                &mut conn,
-                &claim_of_task(task)?,
-                scheduled_at,
-            )
-            .await?
-                == queue::ClaimWrite::LeaseLost
-            {
+            // A lost lease is a no-op (issue #1789). A failed write is a failed
+            // setup write (issue #1815).
+            let deferred = count_setup_failure(
+                task_outcomes,
+                queue::defer_claimed_rate_limited_task(
+                    &mut conn,
+                    &claim_of_task(task)?,
+                    scheduled_at,
+                )
+                .await,
+            )?;
+            if deferred == queue::ClaimWrite::LeaseLost {
                 log_lease_lost(task, "rate-limit deferral");
             }
             return Ok(());
@@ -15832,6 +15837,7 @@ async fn process_activity_task(
             &task.queue_name,
             ActivityStatus::Failed,
         );
+        let rejected_at = std::time::Instant::now();
         let finalized = async {
             let mut conn = pool.get().await.map_err(crate::error::database_error)?;
             let retry_policy_result = configured_retry_policy(task);
@@ -15867,7 +15873,7 @@ async fn process_activity_task(
         // any attempt.
         let write = finalize_write_for_outcome(&finalized);
         if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write) {
-            task_outcomes.record(failed, Duration::ZERO);
+            task_outcomes.record(failed, rejected_at.elapsed());
         }
         return finalized.map(|_| ());
     }
@@ -16244,7 +16250,8 @@ async fn process_activity_task(
     // is skipped, as in the circuit breaker.
     let record_outcome = |finalized: Option<queue::ClaimWrite>| {
         if let Some(failed) = activity_attempt_outcome(status, was_cancelled, finalized) {
-            task_outcomes.record(failed, attempt_elapsed);
+            // Through finalization: a slow persist path is part of the attempt.
+            task_outcomes.record(failed, attempt_clock_start.elapsed());
         }
     };
     // Parse the structured payload once and reuse for both the histogram
@@ -30599,18 +30606,20 @@ impl Worker {
                 fleet_stale_secs: capability_miss_fleet_stale_secs(
                     self.config.worker_heartbeat_interval,
                 ),
-                cohort: crate::workers::worker_cohort(
-                    &self.config.queues,
-                    &self.config.queue_weights,
-                    &self.config.build_id,
-                    &self.config.labels,
-                    crate::workers::SlotPolicy::of(
+                cohort: crate::workers::worker_cohort(&crate::workers::CohortPolicy {
+                    queues: &self.config.queues,
+                    queue_weights: &self.config.queue_weights,
+                    build_id: &self.config.build_id,
+                    labels: &self.config.labels,
+                    slots: crate::workers::SlotPolicy::of(
                         self.config.max_concurrent_workflows,
                         self.config.max_concurrent_activities,
                         self.config.slot_tuner.as_ref(),
                     ),
-                    self.config.max_concurrent_sessions,
-                ),
+                    session_slots: self.config.max_concurrent_sessions,
+                    priority_aging_secs: self.config.priority_aging_secs,
+                    ineligible_activities: &self.ineligible_activities,
+                }),
                 compare: true,
                 slot: shard_slot,
                 shard_peers: Arc::clone(&self.outlier_peers),

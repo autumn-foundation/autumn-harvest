@@ -161,14 +161,16 @@ fn window(tasks: u32, fail_every: Option<u32>) -> Arc<TaskOutcomeWindow> {
 
 /// The cohort key of a worker that polls `queue` alone, with no weights.
 fn cohort(queue: &str) -> String {
-    workers::worker_cohort(
-        &[queue.to_owned()],
-        &HashMap::new(),
-        "",
-        &HashMap::<String, String>::new(),
-        workers::SlotPolicy::of(1, 1, None),
-        0,
-    )
+    workers::worker_cohort(&workers::CohortPolicy {
+        queues: &[queue.to_owned()],
+        queue_weights: &HashMap::new(),
+        build_id: "",
+        labels: &HashMap::new(),
+        slots: workers::SlotPolicy::of(1, 1, None),
+        session_slots: 0,
+        priority_aging_secs: None,
+        ineligible_activities: &[],
+    })
 }
 
 fn probe(queue: &str, window: Arc<TaskOutcomeWindow>, metrics: Arc<Recording>) -> OutlierProbe {
@@ -613,14 +615,16 @@ async fn a_long_cohort_key_still_stores() {
     let id = unique_id("w-long");
     register(&mut conn, &id, &queue).await;
     let queues: Vec<String> = (0..400).map(|_| uuid::Uuid::new_v4().to_string()).collect();
-    let key = workers::worker_cohort(
-        &queues,
-        &HashMap::new(),
-        "",
-        &HashMap::<String, String>::new(),
-        workers::SlotPolicy::of(1, 1, None),
-        0,
-    );
+    let key = workers::worker_cohort(&workers::CohortPolicy {
+        queues: &queues,
+        queue_weights: &HashMap::new(),
+        build_id: "",
+        labels: &HashMap::new(),
+        slots: workers::SlotPolicy::of(1, 1, None),
+        session_slots: 0,
+        priority_aging_secs: None,
+        ineligible_activities: &[],
+    });
     assert!(key.len() > 10_000, "the key is long: {}", key.len());
     workers::upsert_worker_task_stats(&mut conn, &id, &key, &WorkerTaskStats::default())
         .await

@@ -883,20 +883,25 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   these labels, sorted by key.
 /// - `sessions`: the worker's session capacity. Session member activities are
 ///   pinned to the session's host, so only a worker with capacity gets them.
+/// - `priority_aging_secs` and `ineligible_activities`: the claim query orders
+///   and filters tasks by them.
 /// - `slots`: the worker's [`SlotPolicy`]. A worker with no slot for one kind
 ///   claims only the other. Under load, the claim gate gives each worker a
 ///   task mix that follows its slots, so two sizes are two cohorts.
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
-pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
-    queues: &[String],
-    weights: &std::collections::HashMap<String, u32, S>,
-    build_id: &str,
-    labels: &std::collections::HashMap<String, String, L>,
-    slots: SlotPolicy,
-    session_slots: i32,
-) -> String {
+pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
+    let CohortPolicy {
+        queues,
+        queue_weights: weights,
+        build_id,
+        labels,
+        slots,
+        session_slots,
+        priority_aging_secs,
+        ineligible_activities,
+    } = *policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
         names.sort_unstable();
@@ -912,14 +917,48 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    let mut ineligible: Vec<&str> = ineligible_activities.iter().map(String::as_str).collect();
+    ineligible.sort_unstable();
+    ineligible.dedup();
     serde_json::json!({
         "queues": routing,
         "build_id": build_id,
         "labels": labels,
         "slots": slots.key(),
         "sessions": session_slots.max(0),
+        "priority_aging_secs": priority_aging_secs,
+        "ineligible_activities": ineligible,
     })
     .to_string()
+}
+
+/// The settings that decide which tasks a worker can claim, and in which mix
+/// (issue #1815). [`worker_cohort`] keys a worker's cohort on all of them.
+///
+/// The fields mirror the inputs of
+/// [`queue::claim_task_of_kind_on_shard`](crate::queue::claim_task_of_kind_on_shard)
+/// and of the poll loop around it. Two inputs stay out on purpose. The worker
+/// id is unique to each worker. The open circuit breakers are the worker's
+/// own health, which the comparison measures. A new claim input belongs here.
+#[derive(Debug, Clone, Copy)]
+pub struct CohortPolicy<'a> {
+    /// The queues the worker polls.
+    pub queues: &'a [String],
+    /// The worker's `queue_weights`.
+    pub queue_weights: &'a std::collections::HashMap<String, u32>,
+    /// The worker's build id.
+    pub build_id: &'a str,
+    /// The worker's capability labels.
+    pub labels: &'a std::collections::HashMap<String, String>,
+    /// The worker's slots per task kind.
+    pub slots: SlotPolicy,
+    /// The worker's session capacity.
+    pub session_slots: i32,
+    /// The worker's priority aging, which orders a mixed-priority backlog.
+    pub priority_aging_secs: Option<u32>,
+    /// Activities the worker does not claim, because its labels do not meet
+    /// their requirements.
+    pub ineligible_activities: &'a [String],
 }
 
 /// How a worker sizes its slots per task kind, as its cohort key records it
@@ -2845,14 +2884,16 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        super::worker_cohort(
-            &queues,
-            &weights,
-            build,
-            &labels,
-            super::SlotPolicy::of(1, 1, None),
-            0,
-        )
+        super::worker_cohort(&super::CohortPolicy {
+            queues: &queues,
+            queue_weights: &weights,
+            build_id: build,
+            labels: &labels,
+            slots: super::SlotPolicy::of(1, 1, None),
+            session_slots: 0,
+            priority_aging_secs: None,
+            ineligible_activities: &[],
+        })
     }
 
     /// Issue #1815: a worker with no slot for one task kind claims only the
@@ -2864,14 +2905,16 @@ mod tests {
         let none = std::collections::HashMap::<String, u32>::new();
         let labels = std::collections::HashMap::<String, String>::new();
         let slots = |workflows, activities| {
-            super::worker_cohort(
-                &queues,
-                &none,
-                "v1",
-                &labels,
-                super::SlotPolicy::of(workflows, activities, None),
-                0,
-            )
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(workflows, activities, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+            })
         };
         assert_ne!(slots(10, 0), slots(0, 10));
         assert_ne!(slots(10, 10), slots(10, 0));
@@ -2888,14 +2931,16 @@ mod tests {
         let none = std::collections::HashMap::<String, u32>::new();
         let labels = std::collections::HashMap::<String, String>::new();
         let sessions = |n| {
-            super::worker_cohort(
-                &queues,
-                &none,
-                "v1",
-                &labels,
-                super::SlotPolicy::of(10, 10, None),
-                n,
-            )
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: n,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+            })
         };
         assert_ne!(sessions(0), sessions(4));
         assert_ne!(sessions(4), sessions(8));
@@ -2904,6 +2949,35 @@ mod tests {
             sessions(-1),
             "a negative capacity is no capacity"
         );
+    }
+
+    /// Issue #1815: the claim query orders a mixed-priority backlog by the
+    /// priority aging, and skips the activities a worker is not eligible for.
+    /// Workers that differ in either claim different tasks, so they are in
+    /// different cohorts.
+    #[test]
+    fn the_cohort_key_includes_priority_aging_and_eligibility() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let gpu = vec!["render".to_owned(), "encode".to_owned()];
+        let gpu_reordered = vec!["encode".to_owned(), "render".to_owned()];
+        let cohort = |aging, ineligible: &[String]| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: aging,
+                ineligible_activities: ineligible,
+            })
+        };
+        assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
+        assert_ne!(cohort(Some(30), &[]), cohort(Some(60), &[]));
+        assert_ne!(cohort(None, &[]), cohort(None, &gpu));
+        assert_eq!(cohort(None, &gpu), cohort(None, &gpu_reordered));
     }
 
     /// Issue #1815: a slot tuner clamps the configured maximums into its band
@@ -2943,14 +3017,16 @@ mod tests {
         let none = std::collections::HashMap::<String, u32>::new();
         let labels = std::collections::HashMap::<String, String>::new();
         let slots = |workflows, activities| {
-            super::worker_cohort(
-                &queues,
-                &none,
-                "v1",
-                &labels,
-                super::SlotPolicy::of(workflows, activities, None),
-                0,
-            )
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(workflows, activities, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+            })
         };
         assert_ne!(slots(100, 1), slots(1, 100));
         assert_ne!(slots(100, 100), slots(50, 100));

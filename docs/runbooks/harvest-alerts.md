@@ -3395,19 +3395,21 @@ the gauge reads `1` when either worker is an outlier.
 
 The peers are the live, `Active` workers that poll the same queues with the
 same `queue_weights`, on the same build with the same labels, and with the
-same `max_concurrent_workflows` and `max_concurrent_activities`. A worker
-with a slot tuner is keyed on the tuner's band and its initial target per
-kind instead, because the tuner sizes its slots from there. Session capacity counts too, because session member
-activities are pinned to the session's host. Those decide which tasks a
-worker can claim, and in which mix under load. So workers of two sizes are
-two cohorts. A worker on a slow queue is not compared with
-workers on a fast queue. A worker that favours a bulk queue is not compared
-with one that favours an interactive queue. During a rolling deployment, each
-build is its own cohort. A GPU worker that takes capability-routed tasks is
-not compared with a CPU worker. Each heartbeat reads only its own cohort.
-`GET /admin/status` runs the same comparison over every shard. It lists the
-worst 20 outliers under `workers.outliers`, and `workers.outliers_total`
-gives the full count.
+same `max_concurrent_workflows` and `max_concurrent_activities`. A worker with
+a slot tuner is keyed on the tuner's band and its initial target per kind
+instead, because the tuner sizes its slots from there. Session capacity counts
+too, because session member activities are pinned to the session's host. So do
+`priority_aging_secs` and the activities the worker's labels make it
+ineligible for, because the claim query orders and filters tasks by them.
+Those decide which tasks a worker can claim, and in which mix under load. So
+workers of two sizes are two cohorts. A worker on a slow queue is not compared
+with workers on a fast queue. A worker that favours a bulk queue is not
+compared with one that favours an interactive queue. During a rolling
+deployment, each build is its own cohort. A GPU worker that takes
+capability-routed tasks is not compared with a CPU worker. Each heartbeat
+reads only its own cohort. `GET /admin/status` runs the same comparison over
+every shard. It lists the worst 20 outliers under `workers.outliers`, and
+`workers.outliers_total` gives the full count.
 
 The rule flags a failure ratio at least 20 points above the peer median. That
 ratio must also be at least twice the median. The rule flags a p99 latency
