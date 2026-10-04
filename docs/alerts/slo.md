@@ -197,6 +197,10 @@ The `schedule_to_start` records need `by (queue)` only.
   each process does not count.
 - A cycle can, in rare cases, add a good sample and then also time out.
   It then counts twice.
+- A task timeout reads its labels from the database. If that read fails,
+  the timeout gets `workflow="unknown"`. A canary probe's timeout then
+  also counts in `workflow_task`, so one failed probe burns both budgets.
+  This needs a database error at that moment.
 - If more than one series holds the same objective, as with a Thanos
   ruler that adds replica labels, the alerts read the largest value.
 

@@ -482,8 +482,8 @@ async fn quarantine_of_a_canary_probe_records_a_canary_failure() {
     );
 }
 
-/// The caller's workflow name can be the `unknown` fallback label.
-/// The quarantine reads the execution row, so it must use that name.
+/// The caller's labels can be the `unknown` and `default` fallbacks.
+/// The quarantine reads the execution row, so it must use its name and queue.
 #[tokio::test]
 async fn quarantine_finds_a_canary_probe_behind_an_unknown_label() {
     let (mut conn, pool, _container) = setup().await;
@@ -493,6 +493,11 @@ async fn quarantine_finds_a_canary_probe_behind_an_unknown_label() {
         autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX
     );
     let exec_id = insert_running_workflow_named(&mut conn, &probe, 1).await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET queue_name = 'email' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .execute(&mut conn)
+        .await
+        .expect("put the probe on the email queue");
     let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
 
     let metrics = RecordingMetrics::default();
@@ -514,8 +519,8 @@ async fn quarantine_finds_a_canary_probe_behind_an_unknown_label() {
     assert!(quarantined, "the quarantine must commit");
     assert_eq!(
         *metrics.canary_failures.lock().unwrap(),
-        vec![("default".to_owned(), 1)],
-        "the execution row names the probe, so it is a canary failure"
+        vec![("email".to_owned(), 1)],
+        "the execution row names the probe and its queue"
     );
     assert!(
         metrics.terminal.lock().unwrap().is_empty(),
