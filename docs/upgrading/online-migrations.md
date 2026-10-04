@@ -246,9 +246,9 @@ that no longer matches a finding also fails the build.
   That includes a `format()` template, where each placeholder is an unknown
   name. The lint cannot read SQL built with `||` or held in a variable, so
   such an `EXECUTE` counts as a lock on an unknown table.
-- The lint scans a dollar-quoted string as code. A statement inside one can
-  fail the lint. That error is on the safe side. A single-quoted `DO` body is
-  code too.
+- The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
+  as code, in any quote form. A function body runs later, so its locks count
+  but its setters do not. Any other string is data.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.

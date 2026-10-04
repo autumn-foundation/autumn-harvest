@@ -715,14 +715,30 @@ fn lex(
             let body = &chars[body_start..body_end];
             // Only a `DO` body runs now. Any other body, such as a
             // function body or a string, runs later or never.
-            let body_runs = runs && in_do_statement(toks, depth);
-            if in_execute_statement(toks, depth) {
+            // A `DO` body and the SQL that `EXECUTE` runs are code that runs
+            // now. A function body after `AS` is code that runs later. Any
+            // other dollar body is a string, such as a `set_config` argument.
+            let after = |word: &str| {
+                toks.iter()
+                    .rev()
+                    .find(|t| t.depth == depth)
+                    .is_some_and(|t| t.tok == Tok::Word(word.to_string()))
+            };
+            if in_execute_statement(toks, depth) || (depth > 0 && after("execute")) {
                 let filled: Vec<char> = fill_placeholders(&body.iter().collect::<String>())
                     .chars()
                     .collect();
                 lex(&filled, line, depth + 1, runs, toks, comments);
-            } else {
+            } else if in_do_statement(toks, depth) || after("as") {
+                let body_runs = runs && in_do_statement(toks, depth);
                 lex(body, line, depth + 1, body_runs, toks, comments);
+            } else {
+                toks.push(Token {
+                    tok: Tok::Str(body.iter().collect()),
+                    line,
+                    depth,
+                    runs,
+                });
             }
             line += body.iter().filter(|c| **c == '\n').count();
             i = (body_end + len).min(chars.len());
@@ -958,8 +974,12 @@ fn fill_placeholders(sql: &str) -> String {
         {
             j += 1;
         }
-        if matches!(chars.get(j), Some('I' | 's' | 'L')) {
+        // `%s` inserts any text, so `EXECUTE` marks it as SQL it cannot read.
+        if matches!(chars.get(j), Some('I' | 'L')) {
             out.push_str("\"%\"");
+            i = j + 1;
+        } else if chars.get(j) == Some(&'s') {
+            out.push_str("\"%s\"");
             i = j + 1;
         } else {
             out.push(c);
@@ -1373,18 +1393,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 raws.push(Raw::lock(k, "CLUSTER", table));
             }
             Some("vacuum") if start => raws.extend(vacuum_full(&s, k)),
-            // The lint reads only constant SQL. An `EXECUTE` of a variable or
-            // of built SQL may lock anything.
-            Some("execute") if start && tok.depth > 0 => {
-                let end = s.end(k);
-                let constant = (k + 1..end).any(|j| toks[j].depth > tok.depth);
-                let built = (k..end).any(|j| {
-                    toks[j].depth == tok.depth && s.is_punct(j, '|') && s.is_punct(j + 1, '|')
-                });
-                if !constant || built {
-                    raws.push(Raw::lock(k, "EXECUTE of SQL the lint cannot read", None));
-                }
-            }
+            Some("execute") if start && tok.depth > 0 => raws.extend(unreadable_execute(&s, k)),
             Some("reindex") if start => raws.extend(reindex(&s, k)),
             Some("references") => {
                 let owner = s.statement_table(s.starts[k]);
@@ -1589,6 +1598,12 @@ fn resolve(
                 history.indexes.remove(&index_key(index, index));
             }
             if let (Some(table), "DROP TABLE") = (&table, raw.verb) {
+                history.forget_table(table);
+            }
+            // A table moves its indexes with it to the new schema.
+            if let (Some(table), "ALTER TABLE") = (&table, raw.verb)
+                && s.has_pair(raw.at, "set", "schema")
+            {
                 history.forget_table(table);
             }
         }
@@ -1940,6 +1955,23 @@ fn touches_a_foreign_key(s: &Stmts, k: usize) -> bool {
             && (s.is(j - 1, "data") || s.is(j - 2, "column") || s.is(j - 2, "alter"));
         drops || retypes
     })
+}
+
+/// A lock on an unknown table for the PL/pgSQL `EXECUTE` at `k`, when the
+/// lint cannot read the SQL it runs.
+///
+/// The lint reads only constant SQL. A variable, SQL built with `||`, or a
+/// `format()` `%s` placeholder may hold any statement.
+fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
+    let toks = s.toks;
+    let depth = toks[k].depth;
+    let end = s.end(k);
+    let constant = (k + 1..end).any(|j| toks[j].depth > depth);
+    let built =
+        (k..end).any(|j| toks[j].depth == depth && s.is_punct(j, '|') && s.is_punct(j + 1, '|'));
+    let text_placeholder = (k + 1..end).any(|j| toks[j].depth > depth && s.is(j, "%s"));
+    (!constant || built || text_placeholder)
+        .then(|| Raw::lock(k, "EXECUTE of SQL the lint cannot read", None))
 }
 
 /// Remember `child` as hot when its `parent` is hot.
@@ -3902,6 +3934,39 @@ fn execute_of_sql_the_lint_cannot_read_fails_closed() {
     // A top-level `EXECUTE` runs a prepared statement. Its arguments are data.
     let sql = "EXECUTE plan('ALTER TABLE harvest_events ADD COLUMN x INT');";
     assert_eq!(lint_with_history(&[], sql, true), []);
+}
+
+#[test]
+fn a_dollar_literal_argument_is_a_string() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               SELECT set_config($$lock_timeout$$, $$0$$, true);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    let sql = "SELECT set_config($$lock_timeout$$, $$5s$$, true);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], sql, true), []);
+}
+
+#[test]
+fn a_table_schema_move_forgets_its_indexes() {
+    // Postgres moves the indexes with the table.
+    let history = [
+        "CREATE INDEX idx_shared ON public.harvest_schedules (id);",
+        "ALTER TABLE public.harvest_schedules SET SCHEMA archive;",
+    ];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX public.idx_shared;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_format_text_placeholder_makes_execute_unreadable() {
+    // `%s` inserts any text, so it can carry a whole statement.
+    let sql = "DO $$\nDECLARE ddl TEXT := 'ALTER TABLE harvest_events ADD COLUMN x INT';\n\
+               BEGIN\n    EXECUTE format('%s', ddl);\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
