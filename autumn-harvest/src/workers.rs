@@ -934,12 +934,17 @@ pub enum SlotPolicy {
         activity: usize,
     },
     /// A slot tuner sizes both kinds within one band, so the worker claims
-    /// both kinds.
+    /// both kinds. Each kind starts at its configured maximum, clamped into
+    /// the band, and the tuner resizes it from there.
     Tuned {
         /// The band floor, after normalization.
         min: usize,
         /// The band cap, after normalization.
         max: usize,
+        /// The initial workflow target.
+        workflow: usize,
+        /// The initial activity target.
+        activity: usize,
         /// The tuner's name.
         tuner: &'static str,
     },
@@ -967,6 +972,8 @@ impl SlotPolicy {
                 Self::Tuned {
                     min,
                     max,
+                    workflow: crate::slot_tuner::initial_target(workflow_max, min, max),
+                    activity: crate::slot_tuner::initial_target(activity_max, min, max),
                     tuner: config.tuner.name(),
                 }
             },
@@ -978,9 +985,21 @@ impl SlotPolicy {
             Self::Fixed { workflow, activity } => {
                 serde_json::json!({ "workflow": workflow, "activity": activity })
             }
-            Self::Tuned { min, max, tuner } => {
-                serde_json::json!({ "tuned": { "min": min, "max": max, "tuner": tuner } })
-            }
+            Self::Tuned {
+                min,
+                max,
+                workflow,
+                activity,
+                tuner,
+            } => serde_json::json!({
+                "tuned": {
+                    "min": min,
+                    "max": max,
+                    "workflow": workflow,
+                    "activity": activity,
+                    "tuner": tuner,
+                }
+            }),
         }
     }
 }
@@ -2898,8 +2917,13 @@ mod tests {
         let tuned = |workflows, activities| SlotPolicy::of(workflows, activities, Some(&band));
         assert_eq!(
             tuned(0, 10),
-            tuned(30, 40),
-            "the tuner, not the configured maximum, sizes the slots"
+            tuned(3, 10),
+            "both clamp to the same initial targets"
+        );
+        assert_ne!(
+            tuned(100, 1),
+            tuned(1, 100),
+            "the initial target per kind follows the configured maximum"
         );
         assert_ne!(
             tuned(0, 10),

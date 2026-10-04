@@ -15542,7 +15542,8 @@ async fn process_activity_task(
     // `persist_scheduled_activities` succeeds, but their `handler` fn is a
     // stub that must never actually run.
     // Issue #1815: a reserved session activity counts in the outlier window
-    // when it finalizes or fails, as any activity does.
+    // when it finalizes or fails, as any activity does, with its duration.
+    let session_started = std::time::Instant::now();
     let session_result = if activity_name == crate::context::SESSION_ACQUIRE_ACTIVITY_NAME {
         Some(
             handle_session_acquire(
@@ -15574,7 +15575,7 @@ async fn process_activity_task(
     };
     if let Some(result) = session_result {
         if let Some(failed) = session_task_outcome(&result) {
-            task_outcomes.record(failed, Duration::ZERO);
+            task_outcomes.record(failed, session_started.elapsed());
         }
         return result.map(|_| ());
     }
@@ -15864,7 +15865,7 @@ async fn process_activity_task(
         // a failure. Otherwise the ratio would improve while the worker rejects
         // work. A rejection whose claim a later owner took is skipped, as for
         // any attempt.
-        let write = finalized.as_ref().ok().copied();
+        let write = finalize_write_for_outcome(&finalized);
         if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write) {
             task_outcomes.record(failed, Duration::ZERO);
         }
@@ -16406,7 +16407,7 @@ async fn process_activity_task(
         registry.payload_codecs(),
     )
     .await;
-    record_outcome(finalized.as_ref().ok().copied());
+    record_outcome(finalize_write_for_outcome(&finalized));
     finalized.map(|_| ())
 }
 
@@ -16421,10 +16422,30 @@ fn count_setup_failure<T>(
 ) -> HarvestResult<T> {
     if let Err(error) = &result
         && error.handler_not_registered().is_none()
+        && error.terminal_write_claim_ambiguous().is_none()
     {
         window.record(true, Duration::ZERO);
     }
     result
+}
+
+/// The claim write a finalize result stands for, for the outlier window
+/// (issue #1815). `None` means the finalize failed.
+///
+/// A finalize that cannot confirm its claim returns
+/// [`HarvestError::TerminalWriteClaimAmbiguous`]. The dispatch path then
+/// releases the task, so no owner decided the outcome. It counts as a lost
+/// claim.
+const fn finalize_write_for_outcome(
+    result: &HarvestResult<queue::ClaimWrite>,
+) -> Option<queue::ClaimWrite> {
+    match result {
+        Ok(write) => Some(*write),
+        Err(error) if error.terminal_write_claim_ambiguous().is_some() => {
+            Some(queue::ClaimWrite::LeaseLost)
+        }
+        Err(_) => None,
+    }
 }
 
 /// How a reserved session activity enters the outlier window (issue #1815).
@@ -16438,6 +16459,8 @@ const fn session_task_outcome(result: &HarvestResult<Option<queue::ClaimWrite>>)
     match result {
         Ok(Some(queue::ClaimWrite::Applied)) => Some(false),
         Ok(Some(queue::ClaimWrite::LeaseLost) | None) => None,
+        // The dispatch path releases an ambiguous claim, as for any task.
+        Err(error) if error.terminal_write_claim_ambiguous().is_some() => None,
         Err(_) => Some(true),
     }
 }
@@ -40257,6 +40280,38 @@ mod tests {
             (1, 1),
             "a lost setup write fails"
         );
+        let ambiguous: HarvestResult<()> = Err(HarvestError::TerminalWriteClaimAmbiguous {
+            task_id: uuid::Uuid::nil(),
+        });
+        assert!(count_setup_failure(&window, ambiguous).is_err());
+        assert_eq!(
+            window.snapshot().tasks,
+            1,
+            "an ambiguous claim is released, so it is skipped"
+        );
+    }
+
+    /// Issue #1815: a finalize that cannot confirm its claim is released, so
+    /// it is skipped like a lost claim. Another error is a failed finalize.
+    #[test]
+    fn an_ambiguous_finalize_is_skipped_like_a_lost_claim() {
+        use queue::ClaimWrite::{Applied, LeaseLost};
+        let ambiguous = || -> HarvestResult<queue::ClaimWrite> {
+            Err(HarvestError::TerminalWriteClaimAmbiguous {
+                task_id: uuid::Uuid::nil(),
+            })
+        };
+        assert_eq!(finalize_write_for_outcome(&ambiguous()), Some(LeaseLost));
+        assert_eq!(finalize_write_for_outcome(&Ok(Applied)), Some(Applied));
+        assert_eq!(
+            finalize_write_for_outcome(&Err(HarvestError::Config("db".into()))),
+            None
+        );
+        let session: HarvestResult<Option<queue::ClaimWrite>> =
+            Err(HarvestError::TerminalWriteClaimAmbiguous {
+                task_id: uuid::Uuid::nil(),
+            });
+        assert_eq!(session_task_outcome(&session), None);
     }
 
     /// Issue #1815: a finalization that errors counts as a failure. One that
