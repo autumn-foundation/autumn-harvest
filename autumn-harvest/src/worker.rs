@@ -15816,23 +15816,27 @@ async fn execute_activity_future_with_cancellation(
             &cancel,
         )
     };
-    // The setup can outlast the join window. A handler that reaches this
-    // point after the drain cancel never starts. It then cannot begin a new
+    // The setup can outlast the join window. The drain arm comes first, so
+    // a cancel that is already set wins before the handler's first poll. A
+    // handler that was never polled never starts. It then cannot begin a new
     // side effect after the cancel point (issue #1813).
-    if drain_cancel.is_cancelled() {
-        cancel.cancel();
-        return ActivityRun {
-            result: Err(DRAIN_BEFORE_START_ERROR.to_string()),
-            drained: true,
-            started: false,
-        };
-    }
+    let polled = std::sync::atomic::AtomicBool::new(false);
+    let mut handler = std::future::poll_fn(|cx| {
+        polled.store(true, Ordering::Relaxed);
+        std::pin::Pin::new(&mut *activity_future).poll(cx)
+    });
     async {
         tokio::select! {
             biased;
-            result = &mut *activity_future => ActivityRun { result, drained: false, started: true },
             () = drain_cancel.cancelled() => {
                 cancel.cancel();
+                if !std::sync::atomic::AtomicBool::load(&polled, Ordering::Relaxed) {
+                    return ActivityRun {
+                        result: Err(DRAIN_BEFORE_START_ERROR.to_string()),
+                        drained: true,
+                        started: false,
+                    };
+                }
                 tracing::info!(
                     task_id = %task_id,
                     activity = %activity_name,
@@ -15845,17 +15849,18 @@ async fn execute_activity_future_with_cancellation(
                 tokio::pin!(keep_alive);
                 tokio::select! {
                     biased;
-                    result = &mut *activity_future => ActivityRun { result, drained: true, started: true },
+                    result = &mut handler => ActivityRun { result, drained: true, started: true },
                     never = &mut keep_alive => match never {},
                     () = &mut cancellation_observer => ActivityRun {
-                        result: unwind(activity_future).await,
+                        result: unwind(&mut handler).await,
                         drained: false,
                         started: true,
                     },
                 }
             }
+            result = &mut handler => ActivityRun { result, drained: false, started: true },
             () = &mut cancellation_observer => ActivityRun {
-                result: unwind(activity_future).await,
+                result: unwind(&mut handler).await,
                 drained: false,
                 started: true,
             },
@@ -33902,20 +33907,12 @@ impl Worker {
                         biased;
                         () = &mut done => {
                             // The last body can end with a failed write. Its
-                            // claim joins the ended set as the tracker empties,
-                            // so sweep once more before the keeper stops.
-                            let swept = tokio::time::timeout(bound, async {
-                                let mut conn = crate::pool::acquire(&pool, bound).await?;
-                                release_abandoned_claims(&mut conn, &worker_id, &live_claims)
-                                    .await
-                            })
-                            .await;
-                            if !matches!(swept, Ok(Ok(_))) {
-                                tracing::warn!(
-                                    worker_id = %worker_id,
-                                    "the final sweep of abandoned claims failed; orphan reclaim recovers them"
-                                );
-                            }
+                            // claim joins the ended set as the tracker empties.
+                            // A replacement worker with the same id can keep
+                            // the row fresh, so orphan reclaim may never take
+                            // that claim. Sweep until it succeeds.
+                            final_abandoned_claim_sweep(&pool, &worker_id, &live_claims, interval)
+                                .await;
                             return;
                         }
                         () = tokio::time::sleep_until(next) => {
@@ -34014,6 +34011,48 @@ fn next_lease_refresh(heartbeat_interval: Duration, refreshed: bool) -> Duration
         heartbeat_interval / 2
     } else {
         crate::pool::ZERO_WAIT_RETRY_SPACING.min(heartbeat_interval / 2)
+    }
+}
+
+/// Run the abandoned-claim sweep after the last body ends, until it succeeds
+/// (issue #1813).
+///
+/// It skips the database when no claim is in the ended set, which is the
+/// usual case. A failed try retries after half a heartbeat interval. Only
+/// the first failure is logged.
+async fn final_abandoned_claim_sweep(
+    pool: &DbPool,
+    worker_id: &str,
+    claims: &LiveClaims,
+    heartbeat_interval: Duration,
+) {
+    let bound = lease_refresh_bound(heartbeat_interval);
+    let mut warned = false;
+    loop {
+        let pending = !claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ended
+            .is_empty();
+        if !pending {
+            return;
+        }
+        let swept = tokio::time::timeout(bound, async {
+            let mut conn = crate::pool::acquire(pool, bound).await?;
+            release_abandoned_claims(&mut conn, worker_id, claims).await
+        })
+        .await;
+        if matches!(swept, Ok(Ok(_))) {
+            return;
+        }
+        if !warned {
+            warned = true;
+            tracing::warn!(
+                worker_id = %worker_id,
+                "the final sweep of abandoned claims failed; retrying"
+            );
+        }
+        tokio::time::sleep(next_lease_refresh(heartbeat_interval, true)).await;
     }
 }
 
