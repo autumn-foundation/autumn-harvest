@@ -48,8 +48,8 @@ pub struct WorkerRegistration {
     pub version: Option<String>,
     /// Immutable build identifier for this worker binary (issue #171).
     ///
-    /// Empty string = legacy worker that can claim any task regardless of
-    /// `required_build_id`. Operators should set this to a stable per-build
+    /// Empty string = no build identity. Such a worker cannot claim a task
+    /// with a `required_build_id` (issue #1805). Operators should set this to a stable per-build
     /// token (Git SHA, semver, CI job ID, etc.) to enable build-aware routing.
     pub build_id: String,
     /// Optional human-readable deployment name, e.g. `"prod-blue"` (issue #171).
@@ -826,8 +826,7 @@ pub struct LiveWorker {
     /// `capability_miss_workers` set when it misses.
     #[diesel(sql_type = diesel::sql_types::Text)]
     pub worker_id: String,
-    /// The worker's build id (#171). Empty for a legacy worker, which may
-    /// claim anything.
+    /// The worker's build id (#171). An empty id claims no pinned task (#1805).
     #[diesel(sql_type = diesel::sql_types::Text)]
     pub build_id: String,
     /// The worker's labels, matched against a task's `required_capabilities`
