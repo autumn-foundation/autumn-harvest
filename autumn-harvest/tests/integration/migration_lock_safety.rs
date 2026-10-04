@@ -1759,10 +1759,21 @@ fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
         let Some(body) = (k..end).find(|&b| !s.toks[b].runs && s.toks[b].depth > depth) else {
             continue;
         };
-        for set in (k..end)
-            .filter(|&t| s.toks[t].depth == depth && s.is(t, "set") && s.is(t + 1, "lock_timeout"))
-        {
-            let value = if s.is_punct(set + 2, '=') || s.is(set + 2, "to") {
+        // A clause sits outside the parentheses of the signature, and starts
+        // with an unquoted `SET`.
+        let mut parens = 0_usize;
+        let mut sets = Vec::new();
+        for t in (k..end).filter(|&t| s.toks[t].depth == depth) {
+            if s.is_punct(t, '(') {
+                parens += 1;
+            } else if s.is_punct(t, ')') {
+                parens = parens.saturating_sub(1);
+            } else if parens == 0 && s.keyword(t, "set") && s.is(t + 1, "lock_timeout") {
+                sets.push(t);
+            }
+        }
+        for set in sets {
+            let value = if s.is_punct(set + 2, '=') || s.keyword(set + 2, "to") {
                 set + 3
             } else {
                 set + 2
@@ -2565,7 +2576,7 @@ fn resolve(
 /// Nothing in a `DO` body in another language surely runs.
 fn unconditional(s: &Stmts) -> Vec<bool> {
     let toks = s.toks;
-    let handler = |j: usize| s.is(j, "exception") && !(j > 0 && s.is(j - 1, "raise"));
+    let handler = |j: usize| s.keyword(j, "exception") && !(j > 0 && s.keyword(j - 1, "raise"));
     // A block with an exception handler runs as a subtransaction. An error
     // rolls the whole block back, so nothing in that block surely happens.
     let mut rolled_back = vec![false; toks.len()];
@@ -2606,9 +2617,10 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
             state.resize(depth + 1, (0, false));
         }
         let (branches, skippable) = &mut state[depth];
-        let after_end = k > 0 && s.is(k - 1, "end");
-        match s.word(k) {
-            Some("end") if ["if", "loop", "case"].iter().any(|w| s.is(k + 1, w)) => {
+        let after_end = k > 0 && s.keyword(k - 1, "end");
+        // A quoted word, such as the label in `END "if"`, is never a keyword.
+        match s.word(k).filter(|_| !tok.quoted) {
+            Some("end") if ["if", "loop", "case"].iter().any(|w| s.keyword(k + 1, w)) => {
                 *branches = branches.saturating_sub(1);
             }
             // A control-flow `IF` starts a statement. The `IF [NOT] EXISTS` of
@@ -2649,13 +2661,13 @@ fn handled_blocks(s: &Stmts, from: usize, to: usize) -> Option<Vec<(usize, usize
     let mut expression_cases = 0_usize;
     let mut blocks = Vec::new();
     for j in from..to {
-        match s.word(j) {
+        match s.word(j).filter(|_| !s.toks[j].quoted) {
             Some("begin") => open.push((j, false)),
-            Some("exception") if !(j > 0 && s.is(j - 1, "raise")) => {
+            Some("exception") if !(j > 0 && s.keyword(j - 1, "raise")) => {
                 open.last_mut()?.1 = true;
             }
             Some("case") if s.starts[j] != j => expression_cases += 1,
-            Some("end") if ["if", "loop", "case"].iter().any(|w| s.is(j + 1, w)) => {}
+            Some("end") if ["if", "loop", "case"].iter().any(|w| s.keyword(j + 1, w)) => {}
             Some("end") if expression_cases > 0 => expression_cases -= 1,
             Some("end") => {
                 let (begin, handled) = open.pop()?;
@@ -5232,6 +5244,29 @@ fn a_routine_that_calls_a_clearing_routine_clears() {
     );
     let findings = lint_with_history(&[], &sql, true);
     assert!(unbounded(&findings), "{findings:?}");
+}
+
+#[test]
+fn a_quoted_label_does_not_end_a_branch() {
+    // `END "if"` closes a block labelled `if`, not the `IF` around it.
+    let sql = "DO $$\nBEGIN\n    IF random() < 0.5 THEN\n        <<\"if\">>\n        BEGIN\n            \
+               NULL;\n        END \"if\";\n        SET LOCAL lock_timeout = '5s';\n    END IF;\n\
+               END $$;\nALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_set_in_a_routine_signature_is_no_setting() {
+    // `"set"` names a parameter here, so the routine sets no timeout.
+    let sql = "CREATE FUNCTION f(\"set\" lock_timeout = '5s') RETURNS void LANGUAGE plpgsql AS $$\n\
+               BEGIN\n    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // The clause after the signature still sets one.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql SET lock_timeout = '5s' AS $$\n\
+               BEGIN\n    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
 }
 
 #[test]
