@@ -628,6 +628,8 @@ struct Token {
     /// Whether the token runs when the migration runs. A function body does
     /// not, because it runs only when something calls the function.
     runs: bool,
+    /// Whether the token is a quoted identifier, which is never a keyword.
+    quoted: bool,
 }
 
 /// A `--` comment, without the dashes.
@@ -796,6 +798,7 @@ fn lex(
                     line: start_line,
                     depth,
                     runs,
+                    quoted: false,
                 });
             }
         } else if c == '"' {
@@ -821,6 +824,7 @@ fn lex(
                 line: start_line,
                 depth,
                 runs,
+                quoted: true,
             });
         } else if let Some(len) = dollar_tag_len(&chars[i..]) {
             // Find the matching close first, then lex only the body.
@@ -855,6 +859,7 @@ fn lex(
                     line,
                     depth,
                     runs,
+                    quoted: false,
                 });
             }
             line += body.iter().filter(|c| **c == '\n').count();
@@ -906,6 +911,7 @@ fn lex(
                 line: start_line,
                 depth,
                 runs,
+                quoted: quote == '"',
             });
         } else if is_ident(c) {
             let start = i;
@@ -918,6 +924,7 @@ fn lex(
                 line,
                 depth,
                 runs,
+                quoted: false,
             });
         } else {
             toks.push(Token {
@@ -925,6 +932,7 @@ fn lex(
                 line: line,
                 depth,
                 runs,
+                quoted: false,
             });
             i += 1;
         }
@@ -1267,6 +1275,11 @@ impl<'a> Stmts<'a> {
 
     fn is(&self, k: usize, expected: &str) -> bool {
         self.word(k) == Some(expected)
+    }
+
+    /// Whether the token at `k` is the unquoted keyword `expected`.
+    fn keyword(&self, k: usize, expected: &str) -> bool {
+        self.is(k, expected) && !self.toks[k].quoted
     }
 
     fn is_punct(&self, k: usize, expected: char) -> bool {
@@ -2247,19 +2260,19 @@ fn create(s: &Stmts, k: usize, raws: &mut Vec<Raw>, created: &mut BTreeMap<Strin
 ///
 /// `j` is the token after `INDEX`.
 fn create_index(s: &Stmts, k: usize, mut j: usize) -> Option<Raw> {
-    let concurrent = s.is(j, "concurrently");
+    let concurrent = s.keyword(j, "concurrently");
     j = s.skip_if_exists(j + usize::from(concurrent));
     let mut index = None;
-    if !s.is(j, "on") {
+    if !s.keyword(j, "on") {
         let (name, next) = s.qualified_name(j)?;
         index = Some(name);
         j = next;
     }
-    if !s.is(j, "on") {
+    if !s.keyword(j, "on") {
         return None;
     }
     j += 1;
-    if s.is(j, "only") {
+    if s.keyword(j, "only") {
         j += 1;
     }
     let (table, _) = s.qualified_name(j)?;
@@ -2279,7 +2292,7 @@ fn create_index(s: &Stmts, k: usize, mut j: usize) -> Option<Raw> {
 fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
     match s.word(k + 1) {
         Some("index") => {
-            let concurrent = s.is(k + 2, "concurrently");
+            let concurrent = s.keyword(k + 2, "concurrently");
             let j = s.skip_if_exists(k + 2 + usize::from(concurrent));
             raws.extend(s.name_list(j).into_iter().map(|index| Raw {
                 at: k,
@@ -2645,7 +2658,7 @@ fn reindex(s: &Stmts, k: usize) -> Option<Raw> {
         return None;
     }
     j += 1;
-    if s.is(j, "concurrently") {
+    if s.keyword(j, "concurrently") {
         concurrent = true;
         j += 1;
     }
@@ -4868,6 +4881,33 @@ fn a_drop_that_may_remove_a_new_table_ends_its_exemption() {
                ALTER TABLE public.harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+}
+
+#[test]
+fn a_quoted_name_is_not_a_keyword() {
+    for (quoted, plain) in [
+        (
+            "CREATE INDEX \"concurrently\" ON harvest_task_queue (scheduled_at);",
+            "CREATE INDEX idx ON harvest_task_queue (scheduled_at);",
+        ),
+        (
+            "CREATE INDEX \"on\" ON harvest_task_queue (scheduled_at);",
+            "CREATE INDEX idx ON harvest_task_queue (scheduled_at);",
+        ),
+        ("DROP INDEX \"concurrently\";", "DROP INDEX idx;"),
+    ] {
+        let history = [
+            "CREATE INDEX \"concurrently\" ON harvest_task_queue (id);",
+            "CREATE INDEX idx ON harvest_task_queue (id);",
+        ];
+        let expected = rules(&lint_with_history(&history, plain, false));
+        assert!(!expected.is_empty(), "{plain}");
+        assert_eq!(
+            rules(&lint_with_history(&history, quoted, false)),
+            expected,
+            "{quoted}"
+        );
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
