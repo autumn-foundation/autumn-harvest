@@ -709,6 +709,28 @@ fn lex(
             lex(body, line, depth + 1, body_runs, toks, comments);
             line += body.iter().filter(|c| **c == '\n').count();
             i = (body_end + len).min(chars.len());
+        } else if matches!(c, 'u' | 'U')
+            && next == Some('&')
+            && matches!(at(i + 2), Some('"' | '\''))
+        {
+            // `U&"..."` and `U&'...'` take Unicode escapes.
+            let quote = chars[i + 2];
+            let start_line = line;
+            let (raw, end) = quoted(chars, i + 3, quote);
+            line += raw.matches('\n').count();
+            i = end;
+            let escape = uescape(chars, &mut i, &mut line).unwrap_or('\\');
+            let value = decode_unicode(&raw, escape);
+            toks.push(Token {
+                tok: if quote == '"' {
+                    Tok::Word(value)
+                } else {
+                    Tok::Str(value)
+                },
+                line: start_line,
+                depth,
+                runs,
+            });
         } else if is_ident(c) {
             let start = i;
             while at(i).is_some_and(|c| is_ident(c) || c == '$') {
@@ -731,6 +753,91 @@ fn lex(
             i += 1;
         }
     }
+}
+
+/// The body of a quoted token that opens before `from`, and the index after
+/// its closing quote. A doubled quote is one quote.
+fn quoted(chars: &[char], from: usize, quote: char) -> (String, usize) {
+    let mut value = String::new();
+    let mut i = from;
+    while let Some(&c) = chars.get(i) {
+        if c == quote && chars.get(i + 1) == Some(&quote) {
+            value.push(quote);
+            i += 2;
+        } else if c == quote {
+            return (value, i + 1);
+        } else {
+            value.push(c);
+            i += 1;
+        }
+    }
+    (value, i)
+}
+
+/// The escape character of a `UESCAPE 'c'` clause at `*i`, if there is one.
+///
+/// The clause is consumed only when it is there.
+fn uescape(chars: &[char], i: &mut usize, line: &mut usize) -> Option<char> {
+    let mut j = *i;
+    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+        j += 1;
+    }
+    let word: String = chars.get(j..j + 7)?.iter().collect();
+    if !word.eq_ignore_ascii_case("uescape") {
+        return None;
+    }
+    j += 7;
+    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+        j += 1;
+    }
+    let (Some('\''), Some(&escape), Some('\'')) =
+        (chars.get(j), chars.get(j + 1), chars.get(j + 2))
+    else {
+        return None;
+    };
+    *line += chars[*i..j].iter().filter(|c| **c == '\n').count();
+    *i = j + 3;
+    Some(escape)
+}
+
+/// Decode the `\XXXX` and `\+XXXXXX` escapes of a `U&` token.
+///
+/// `escape` replaces the backslash. A doubled escape is one escape. A bad
+/// escape stays as it is.
+fn decode_unicode(raw: &str, escape: char) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        if c != escape {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if chars.get(i + 1) == Some(&escape) {
+            out.push(escape);
+            i += 2;
+            continue;
+        }
+        let (from, len) = if chars.get(i + 1) == Some(&'+') {
+            (i + 2, 6)
+        } else {
+            (i + 1, 4)
+        };
+        let decoded = chars
+            .get(from..from + len)
+            .map(|hex| hex.iter().collect::<String>())
+            .and_then(|hex| u32::from_str_radix(&hex, 16).ok())
+            .and_then(char::from_u32);
+        if let Some(d) = decoded {
+            out.push(d);
+            i = from + len;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Whether the open statement at `depth` starts with `DO`.
@@ -821,19 +928,32 @@ impl<'a> Stmts<'a> {
     fn new(toks: &'a [Token]) -> Self {
         let mut starts = Vec::with_capacity(toks.len());
         let mut start = 0;
+        // How many SQL `CASE` expressions are open. Their `THEN` and `ELSE`
+        // belong to the expression, not to PL/pgSQL control flow.
+        let mut open_cases = 0_usize;
         for k in 0..toks.len() {
             // `BEGIN`, `THEN`, `ELSE` and `LOOP` open a statement only inside a
             // PL/pgSQL body. At top level they belong to SQL, such as `CASE`.
-            let boundary = k == 0
-                || toks[k].depth != toks[k - 1].depth
-                || toks[k - 1].tok == Tok::Punct(';')
+            let hard =
+                k == 0 || toks[k].depth != toks[k - 1].depth || toks[k - 1].tok == Tok::Punct(';');
+            if hard {
+                open_cases = 0;
+            }
+            let boundary = hard
                 || (toks[k].depth > 0
-                    && matches!(
-                        &toks[k - 1].tok,
-                        Tok::Word(w) if ["begin", "then", "else", "loop"].contains(&w.as_str())
-                    ));
+                    && match &toks[k - 1].tok {
+                        Tok::Word(w) if ["begin", "loop"].contains(&w.as_str()) => true,
+                        Tok::Word(w) if ["then", "else"].contains(&w.as_str()) => open_cases == 0,
+                        _ => false,
+                    });
             if boundary {
                 start = k;
+            }
+            // A `CASE` that does not start a statement is an expression.
+            match &toks[k].tok {
+                Tok::Word(w) if w == "case" && !boundary => open_cases += 1,
+                Tok::Word(w) if w == "end" && open_cases > 0 => open_cases -= 1,
+                _ => {}
             }
             starts.push(start);
         }
@@ -1244,18 +1364,28 @@ fn resolve(
 ) -> Vec<Hit> {
     let toks = s.toks;
     raws.sort_by_key(|raw| raw.at);
+    // After a `search_path` change, the lint cannot tell the schema of an
+    // unqualified name. Such a name is never placed or learnt.
+    let path_change = (0..toks.len()).find(|&k| s.starts[k] == k && changes_search_path(s, k));
+    let unplaced =
+        |name: &str, at: usize| !name.contains('.') && path_change.is_some_and(|c| c < at);
     let mut hits = Vec::with_capacity(raws.len());
     for raw in raws {
-        let table = raw
-            .table
-            .or_else(|| raw.index.as_deref().and_then(|i| history.index_table(i)));
+        let table = raw.table.or_else(|| {
+            raw.index
+                .as_deref()
+                .filter(|i| !unplaced(i, raw.at))
+                .and_then(|i| history.index_table(i))
+        });
         // The history only grows, so a later build of the same name cannot
         // hide a hot table. A cold table is learnt only from a build that
         // surely runs: not conditional, and not `IF NOT EXISTS`, which may do
         // nothing. A hot table is always learnt, because it can only make a
         // later drop stricter.
-        let sure =
-            toks[raw.at].runs && unconditional[raw.at] && !s.has_pair(raw.at, "not", "exists");
+        let sure = toks[raw.at].runs
+            && unconditional[raw.at]
+            && !s.has_pair(raw.at, "not", "exists")
+            && !table.as_deref().is_some_and(|t| unplaced(t, raw.at));
         let learn = sure || table.as_deref().is_some_and(|t| history.is_hot(t));
         if let (Some(index), Some(table), "CREATE INDEX", true) =
             (&raw.index, &table, raw.verb, learn)
@@ -1270,7 +1400,9 @@ fn resolve(
         // is then unknown, which fails closed. A table drop takes every index
         // on the table with it.
         if toks[raw.at].runs && unconditional[raw.at] {
-            if let (Some(index), "DROP INDEX") = (&raw.index, raw.verb) {
+            if let (Some(index), "DROP INDEX") = (&raw.index, raw.verb)
+                && !unplaced(index, raw.at)
+            {
                 history.indexes.remove(&index_key(index, index));
             }
             if let (Some(table), "DROP TABLE") = (&table, raw.verb) {
@@ -3368,6 +3500,53 @@ fn every_postgres_false_spelling_is_session_scope() {
             "{is_local}: {findings:?}"
         );
     }
+}
+
+#[test]
+fn a_unicode_escaped_identifier_is_decoded() {
+    for table in [
+        r#"U&"harvest_events""#,
+        r#"U&"harvest\005fevents""#,
+        r#"u&"harvest\+00005fevents""#,
+        r#"U&"harvest!005fevents" UESCAPE '!'"#,
+    ] {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN x INT;");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{table}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_search_path_change_leaves_an_unqualified_index_unplaced() {
+    // After the change, Postgres resolves the table through the new path. The
+    // lint cannot follow it, so the index has no known schema.
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let history =
+        ["SET search_path = staging;\nCREATE INDEX idx_shared ON harvest_schedules (id);"];
+    let findings = lint_with_history(
+        &history,
+        &format!("{set}DROP INDEX public.idx_shared;"),
+        true,
+    );
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+    let history = ["CREATE INDEX idx_shared ON harvest_schedules (id);"];
+    let sql = format!("SET search_path = staging;\n{set}DROP INDEX idx_shared;");
+    let findings = lint_with_history(&history, &sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_case_expression_in_a_do_body_does_not_split_the_statement() {
+    let sql = "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    \
+               ALTER TABLE harvest_events \
+               ADD CHECK (CASE WHEN true THEN true ELSE false END), ADD UNIQUE (event_id);\n\
+               END $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
