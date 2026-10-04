@@ -6,9 +6,10 @@
 )]
 //! A task whose run deadline has passed is not executed (issue #1824).
 //!
-//! The claim fails such a task with a `deadline_exceeded` error and hands
-//! out the next eligible task instead. The timeout scanner still times out
-//! the run itself, and it keeps the task's error.
+//! The claim skips a task of a `RUNNING` run that is past `deadline_at` or
+//! `chain_deadline_at`. The task stays `PENDING` and no worker gets it. The
+//! timeout scanner then times out the run. It fails the task with an error
+//! that starts with `deadline_exceeded`.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres.
 //! Otherwise a fresh testcontainers Postgres boots with the full bundle.
@@ -56,6 +57,13 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8])
 }
 
+/// A past deadline, in seconds from now.
+///
+/// The claim compares against the database clock. The scanner compares
+/// against the host clock. A full minute keeps a small skew from hiding
+/// the deadline from either one.
+const EXPIRED: i32 = -60;
+
 /// Which deadline column a fixture run sets, and its offset from now.
 #[derive(Clone, Copy)]
 enum Deadline {
@@ -90,38 +98,73 @@ async fn insert_execution(conn: &mut AsyncPgConnection, state: &str, deadline: D
     id
 }
 
-async fn enqueue(conn: &mut AsyncPgConnection, queue: &str, kind: TaskType, exec_id: Uuid) -> Uuid {
+/// Enqueue a task of `exec_id`. An aged row sorts ahead of fresh rows.
+async fn enqueue(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    kind: TaskType,
+    exec_id: Uuid,
+    aged: bool,
+) -> Uuid {
     let mut params = EnqueueParams::new(queue, kind, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id);
     if kind == TaskType::Activity {
         params.activity_name = Some("noop".to_string());
         params.activity_id = Some(Uuid::new_v4());
     }
-    queue::enqueue(conn, &params).await.expect("enqueue")
+    let id = queue::enqueue(conn, &params).await.expect("enqueue");
+    if aged {
+        age(conn, id).await;
+    }
+    id
+}
+
+async fn age(conn: &mut AsyncPgConnection, id: Uuid) {
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET scheduled_at = scheduled_at - INTERVAL '1 minute' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .execute(conn)
+    .await
+    .expect("age row");
 }
 
 #[derive(diesel::QueryableByName, Debug)]
 struct Row {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     error: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    has_completed_at: bool,
 }
 
 async fn row(conn: &mut AsyncPgConnection, id: Uuid) -> Row {
-    diesel::sql_query(
-        "SELECT state, error, completed_at IS NOT NULL AS has_completed_at \
-         FROM harvest_task_queue WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(id)
-    .get_result(conn)
-    .await
-    .expect("row")
+    diesel::sql_query("SELECT state, attempt, error FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .get_result(conn)
+        .await
+        .expect("row")
 }
 
-fn assert_deadline_exceeded(row: &Row) {
+/// The claim did not hand the task out: it is still `PENDING`, unclaimed.
+async fn assert_skipped(conn: &mut AsyncPgConnection, id: Uuid) {
+    let row = row(conn, id).await;
+    assert_eq!(row.state, "PENDING", "the task is not executed: {row:?}");
+    assert_eq!(row.attempt, 0, "no claim consumed an attempt: {row:?}");
+}
+
+/// Run the timeout scanner, then check the task and the run outcome.
+async fn assert_recorded_as_deadline_exceeded(conn: &mut AsyncPgConnection, task: Uuid) {
+    autumn_harvest::timeout::enforce_workflow_execution_timeouts(
+        conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("scanner");
+
+    let row = row(conn, task).await;
     assert_eq!(row.state, "FAILED", "the task is terminal: {row:?}");
     assert!(
         row.error
@@ -129,7 +172,21 @@ fn assert_deadline_exceeded(row: &Row) {
             .is_some_and(|e| e.starts_with(DEADLINE_EXCEEDED_ERROR)),
         "the task records a deadline-exceeded outcome: {row:?}"
     );
-    assert!(row.has_completed_at, "the outcome has a time: {row:?}");
+
+    #[derive(diesel::QueryableByName)]
+    struct Run {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    let run: Run = diesel::sql_query(
+        "SELECT e.state FROM harvest_workflow_executions e \
+         JOIN harvest_task_queue t ON t.workflow_exec_id = e.id WHERE t.id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task)
+    .get_result(conn)
+    .await
+    .expect("run state");
+    assert_eq!(run.state, "TIMED_OUT", "the scanner times out the run");
 }
 
 async fn claim_one(conn: &mut AsyncPgConnection, queue: &str, worker: &str) -> Option<Uuid> {
@@ -145,60 +202,81 @@ async fn claim_one(conn: &mut AsyncPgConnection, queue: &str, worker: &str) -> O
 async fn workflow_task_past_its_run_deadline_is_not_claimed() {
     let (mut conn, _container) = setup_db().await;
     let queue = unique("dl-wf");
-    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(-1)).await;
-    let task = enqueue(&mut conn, &queue, TaskType::Workflow, exec).await;
+    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(EXPIRED)).await;
+    let task = enqueue(&mut conn, &queue, TaskType::Workflow, exec, false).await;
 
     assert_eq!(claim_one(&mut conn, &queue, &unique("w")).await, None);
-    assert_deadline_exceeded(&row(&mut conn, task).await);
+    assert_skipped(&mut conn, task).await;
+    assert_recorded_as_deadline_exceeded(&mut conn, task).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn activity_task_past_its_run_deadline_is_not_claimed() {
     let (mut conn, _container) = setup_db().await;
     let queue = unique("dl-act");
-    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(-1)).await;
-    let task = enqueue(&mut conn, &queue, TaskType::Activity, exec).await;
+    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(EXPIRED)).await;
+    let task = enqueue(&mut conn, &queue, TaskType::Activity, exec, false).await;
 
     assert_eq!(claim_one(&mut conn, &queue, &unique("w")).await, None);
-    assert_deadline_exceeded(&row(&mut conn, task).await);
+    assert_skipped(&mut conn, task).await;
+    assert_recorded_as_deadline_exceeded(&mut conn, task).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn chain_deadline_also_stops_the_claim() {
     let (mut conn, _container) = setup_db().await;
     let queue = unique("dl-chain");
-    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Chain(-1)).await;
-    let task = enqueue(&mut conn, &queue, TaskType::Activity, exec).await;
+    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Chain(EXPIRED)).await;
+    let task = enqueue(&mut conn, &queue, TaskType::Activity, exec, false).await;
 
     assert_eq!(claim_one(&mut conn, &queue, &unique("w")).await, None);
-    assert_deadline_exceeded(&row(&mut conn, task).await);
+    assert_skipped(&mut conn, task).await;
+    assert_recorded_as_deadline_exceeded(&mut conn, task).await;
 }
 
-/// One claim call skips the expired row and returns the live row behind it.
-/// So an expired backlog does not idle the slot for a poll interval.
+/// The worker's own claim passes a task kind (issue #1787). That variant
+/// skips an expired run too.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_kind_filtered_claim_skips_an_expired_task() {
+    let (mut conn, _container) = setup_db().await;
+    let queue = unique("dl-kind");
+    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(EXPIRED)).await;
+    let task = enqueue(&mut conn, &queue, TaskType::Workflow, exec, false).await;
+
+    let claimed = queue::claim_task_of_kind_on_shard(
+        &mut conn,
+        std::slice::from_ref(&queue),
+        &unique("w"),
+        "",
+        None,
+        &[],
+        &[],
+        None,
+        Some(TaskType::Workflow),
+    )
+    .await
+    .expect("kind claim");
+    assert!(claimed.is_none(), "an expired task is not handed out");
+    assert_skipped(&mut conn, task).await;
+}
+
+/// One claim call passes over the expired rows and returns the live row
+/// behind them. So an expired backlog does not idle the slot.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expired_task_does_not_block_the_live_task_behind_it() {
     let (mut conn, _container) = setup_db().await;
     let queue = unique("dl-skip");
     let mut expired = Vec::new();
-    for _ in 0..3 {
-        let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(-1)).await;
-        expired.push(enqueue(&mut conn, &queue, TaskType::Activity, exec).await);
+    for _ in 0..12 {
+        let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(EXPIRED)).await;
+        expired.push(enqueue(&mut conn, &queue, TaskType::Activity, exec, true).await);
     }
     let live_exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(3600)).await;
-    let live = enqueue(&mut conn, &queue, TaskType::Activity, live_exec).await;
-    diesel::sql_query(
-        "UPDATE harvest_task_queue SET scheduled_at = NOW() - INTERVAL '1 minute' \
-         WHERE id = ANY($1)",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&expired)
-    .execute(&mut conn)
-    .await
-    .expect("age expired rows");
+    let live = enqueue(&mut conn, &queue, TaskType::Activity, live_exec, false).await;
 
     assert_eq!(claim_one(&mut conn, &queue, &unique("w")).await, Some(live));
     for id in expired {
-        assert_deadline_exceeded(&row(&mut conn, id).await);
+        assert_skipped(&mut conn, id).await;
     }
 }
 
@@ -211,20 +289,20 @@ async fn tasks_with_a_future_or_no_deadline_are_claimed() {
     for deadline in [Deadline::None, Deadline::Run(3600), Deadline::Chain(3600)] {
         let queue = unique("dl-live");
         let exec = insert_execution(&mut conn, "RUNNING", deadline).await;
-        let task = enqueue(&mut conn, &queue, TaskType::Activity, exec).await;
+        let task = enqueue(&mut conn, &queue, TaskType::Activity, exec, false).await;
         assert_eq!(claim_one(&mut conn, &queue, &worker).await, Some(task));
         assert_eq!(row(&mut conn, task).await.state, "RUNNING");
     }
 }
 
 /// Resume moves a paused run's deadline forward, and the scanner skips
-/// paused runs. So the claim must not fail a paused run's activity either.
+/// paused runs. So the claim does not skip a paused run's activity either.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paused_run_past_its_deadline_keeps_its_activity() {
     let (mut conn, _container) = setup_db().await;
     let queue = unique("dl-paused");
-    let exec = insert_execution(&mut conn, "PAUSED", Deadline::Run(-1)).await;
-    let task = enqueue(&mut conn, &queue, TaskType::Activity, exec).await;
+    let exec = insert_execution(&mut conn, "PAUSED", Deadline::Run(EXPIRED)).await;
+    let task = enqueue(&mut conn, &queue, TaskType::Activity, exec, false).await;
 
     assert_eq!(claim_one(&mut conn, &queue, &unique("w")).await, Some(task));
     assert_eq!(row(&mut conn, task).await.state, "RUNNING");
@@ -236,8 +314,8 @@ async fn a_paused_run_past_its_deadline_keeps_its_activity() {
 async fn by_id_claim_does_not_claim_an_expired_task() {
     let (mut conn, _container) = setup_db().await;
     let queue = unique("dl-byid");
-    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(-1)).await;
-    let task = enqueue(&mut conn, &queue, TaskType::Workflow, exec).await;
+    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(EXPIRED)).await;
+    let task = enqueue(&mut conn, &queue, TaskType::Workflow, exec, false).await;
 
     let claimed = queue::claim_task_by_id_on_shard(
         &mut conn,
@@ -253,28 +331,26 @@ async fn by_id_claim_does_not_claim_an_expired_task() {
     .await
     .expect("by-id claim");
     assert!(claimed.is_none(), "an expired task is not handed out");
-    assert_deadline_exceeded(&row(&mut conn, task).await);
+    assert_skipped(&mut conn, task).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn batched_claim_skips_an_expired_task() {
     let (mut conn, _container) = setup_db().await;
     let queue = unique("dl-batch");
-    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(-1)).await;
-    let expired = enqueue(&mut conn, &queue, TaskType::Activity, exec).await;
+    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(EXPIRED)).await;
+    let expired = enqueue(&mut conn, &queue, TaskType::Activity, exec, true).await;
     let live_exec = insert_execution(&mut conn, "RUNNING", Deadline::None).await;
-    let live = enqueue(&mut conn, &queue, TaskType::Activity, live_exec).await;
-    diesel::sql_query(
-        "UPDATE harvest_task_queue SET scheduled_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(expired)
-    .execute(&mut conn)
-    .await
-    .expect("age expired row");
+    let live = enqueue(&mut conn, &queue, TaskType::Activity, live_exec, false).await;
 
-    let claimed = queue::claim_task_batched(
-        &mut conn,
-        std::slice::from_ref(&queue),
+    assert_eq!(claim_one_batched(&mut conn, &queue).await, Some(live));
+    assert_skipped(&mut conn, expired).await;
+}
+
+async fn claim_one_batched(conn: &mut AsyncPgConnection, queue: &str) -> Option<Uuid> {
+    queue::claim_task_batched(
+        conn,
+        &[queue.to_owned()],
         &unique("w"),
         "",
         None,
@@ -284,41 +360,60 @@ async fn batched_claim_skips_an_expired_task() {
     )
     .await
     .expect("batched claim")
-    .map(|t| t.id);
-    assert_eq!(claimed, Some(live));
-    assert_deadline_exceeded(&row(&mut conn, expired).await);
+    .map(|t| t.id)
 }
 
-// ── The timeout scanner keeps the outcome ─────────────────────────────────────
+// ── A skipped task spends no rate-limit token ─────────────────────────────────
 
-/// The scanner times out the run later. It only rewrites open rows, so the
-/// task keeps its deadline-exceeded error.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_timeout_scanner_times_out_the_run_and_keeps_the_task_outcome() {
-    let (mut conn, _container) = setup_db().await;
-    let queue = unique("dl-scan");
-    let exec = insert_execution(&mut conn, "RUNNING", Deadline::Run(-1)).await;
-    let task = enqueue(&mut conn, &queue, TaskType::Workflow, exec).await;
-    assert_eq!(claim_one(&mut conn, &queue, &unique("w")).await, None);
-
-    autumn_harvest::timeout::enforce_workflow_execution_timeouts(
-        &mut conn,
-        &autumn_harvest::telemetry::NoOpMetrics,
-    )
-    .await
-    .expect("scanner");
-
-    #[derive(diesel::QueryableByName)]
-    struct State {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        state: String,
+/// Enqueue an aged or fresh activity task that spends a token from `bucket`.
+async fn rate_limited(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    bucket: &str,
+    deadline: Deadline,
+    aged: bool,
+) -> Uuid {
+    let exec = insert_execution(conn, "RUNNING", deadline).await;
+    let mut params = EnqueueParams::new(queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(bucket.to_owned());
+    let id = queue::enqueue(conn, &params).await.expect("enqueue");
+    if aged {
+        age(conn, id).await;
     }
-    let run: State =
-        diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
-            .bind::<diesel::sql_types::Uuid, _>(exec)
-            .get_result(&mut conn)
-            .await
-            .expect("run state");
-    assert_eq!(run.state, "TIMED_OUT");
-    assert_deadline_exceeded(&row(&mut conn, task).await);
+    id
+}
+
+/// A one-token bucket. An expired task ahead of a live task must not spend
+/// the token, or the live task cannot run until the bucket refills.
+async fn one_token_backlog(conn: &mut AsyncPgConnection, queue: &str) -> (Uuid, Uuid) {
+    let bucket = unique("dl-bucket");
+    queue::ensure_rate_limit_bucket(conn, &bucket, 0.0, 1.0)
+        .await
+        .expect("bucket");
+    let expired = rate_limited(conn, queue, &bucket, Deadline::Run(EXPIRED), true).await;
+    let live = rate_limited(conn, queue, &bucket, Deadline::None, false).await;
+    (expired, live)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skipped_task_spends_no_rate_limit_token() {
+    let (mut conn, _container) = setup_db().await;
+    let queue = unique("dl-rl");
+    let (expired, live) = one_token_backlog(&mut conn, &queue).await;
+
+    assert_eq!(claim_one(&mut conn, &queue, &unique("w")).await, Some(live));
+    assert_skipped(&mut conn, expired).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batched_skip_spends_no_rate_limit_token() {
+    let (mut conn, _container) = setup_db().await;
+    let queue = unique("dl-rl-b");
+    let (expired, live) = one_token_backlog(&mut conn, &queue).await;
+
+    assert_eq!(claim_one_batched(&mut conn, &queue).await, Some(live));
+    assert_skipped(&mut conn, expired).await;
 }

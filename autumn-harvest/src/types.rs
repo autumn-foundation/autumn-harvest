@@ -1357,9 +1357,10 @@ impl fmt::Display for DeploymentName {
 
 /// Task priority for within-queue ordering (issue #249).
 ///
-/// Workers claim tasks in `priority DESC, available_at ASC` order, so
-/// higher-priority tasks are claimed before lower-priority ones that arrived
-/// earlier.  Same-priority tasks are FIFO by `available_at`.
+/// Workers claim tasks in `priority DESC` order, then by due time
+/// (`scheduled_at`). So a higher-priority task goes before a lower-priority
+/// task that arrived earlier. Within one priority, a continuation goes
+/// before a new start. See *Continuations* below.
 ///
 /// The numeric values are chosen so that `Normal = 0` preserves backward
 /// compatibility: pre-upgrade rows written with `priority = 0` continue to

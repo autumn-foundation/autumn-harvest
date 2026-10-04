@@ -6,9 +6,10 @@
 )]
 //! Continuations outrank new starts at claim (issue #1824).
 //!
-//! A continuation is any task of a run that already started: a woken
-//! workflow task, or an activity task. A new start is the first workflow
-//! task of a run. That row has never been claimed, so its `attempt` is 0.
+//! A new start is the first workflow task of a freshly admitted run. The
+//! start path marks it, and its `attempt` is 0. Every other task is a
+//! continuation. Examples are an activity task, a woken workflow task, and the
+//! first task of a child, a continue-as-new or a workflow retry.
 //!
 //! Within one priority level, a new start sorts as if it were due
 //! `NEW_START_HANDICAP_SECS` later. A new start that waits longer than that
@@ -185,11 +186,14 @@ async fn exec_of(conn: &mut AsyncPgConnection, task_id: Uuid) -> Uuid {
     row.workflow_exec_id
 }
 
-/// Move a row's due time `secs` seconds into the past.
+/// Move a row's due time `secs` seconds further into the past.
+///
+/// The shift is relative to the row's own due time, so every fixture row
+/// stays on the host clock that `enqueue` and `wake_workflow_task` use.
 async fn age(conn: &mut AsyncPgConnection, task_id: Uuid, secs: i32) {
     diesel::sql_query(
         "UPDATE harvest_task_queue \
-         SET scheduled_at = NOW() - make_interval(secs => $2) WHERE id = $1",
+         SET scheduled_at = scheduled_at - make_interval(secs => $2) WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Integer, _>(secs)
@@ -199,7 +203,17 @@ async fn age(conn: &mut AsyncPgConnection, task_id: Uuid, secs: i32) {
 }
 
 async fn claim_one(conn: &mut AsyncPgConnection, queue: &str, worker: &str) -> Option<Uuid> {
-    queue::claim_task(conn, &[queue.to_owned()], worker, "", None, &[], &[])
+    claim_aged(conn, queue, worker, None).await
+}
+
+/// Claim one row with the given priority ageing interval.
+async fn claim_aged(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    worker: &str,
+    aging_secs: Option<u32>,
+) -> Option<Uuid> {
+    queue::claim_task(conn, &[queue.to_owned()], worker, "", aging_secs, &[], &[])
         .await
         .expect("claim")
         .map(|t| t.id)
@@ -481,4 +495,124 @@ async fn the_start_path_marks_only_a_fresh_admission() {
                 .expect("marker");
         assert_eq!(row.new_start, expected);
     }
+}
+
+// ── The worker's own claim path ───────────────────────────────────────────────
+
+/// A worker with a full activity pool claims workflow tasks only (issue
+/// #1787). Woken runs still go before new starts on that path.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_kind_filtered_claim_takes_woken_runs_before_new_starts() {
+    let (mut conn, _container) = setup_db().await;
+    let worker = unique("w");
+    let backlog = backlog(&mut conn, &worker).await;
+
+    let mut order = Vec::new();
+    while let Some(task) = queue::claim_task_of_kind_on_shard(
+        &mut conn,
+        std::slice::from_ref(&backlog.queue),
+        &worker,
+        "",
+        None,
+        &[],
+        &[],
+        None,
+        Some(TaskType::Workflow),
+    )
+    .await
+    .expect("kind claim")
+    {
+        order.push(task.id);
+    }
+    let woken = &backlog.continuations[2..];
+    assert_eq!(order.len(), woken.len() + backlog.starts.len());
+    for id in &order[..woken.len()] {
+        assert!(woken.contains(id), "woken runs go first; got {order:?}");
+    }
+}
+
+// ── Priority ageing and the band ──────────────────────────────────────────────
+
+/// Priority ageing reads `scheduled_at`. An interval longer than the age of
+/// the start leaves the band in force.
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_priority_ageing_keeps_the_band() {
+    let (mut conn, _container) = setup_db().await;
+    let worker = unique("w");
+    let queue = unique("age-slow");
+    let start = new_start(&mut conn, &queue, 0).await;
+    age(&mut conn, start, FIFO_LEAD_SECS).await;
+    let fresh = activity_continuation(&mut conn, &queue).await;
+
+    let aging = Some(60);
+    assert_eq!(
+        claim_aged(&mut conn, &queue, &worker, aging).await,
+        Some(fresh)
+    );
+    assert_eq!(
+        claim_aged(&mut conn, &queue, &worker, aging).await,
+        Some(start)
+    );
+}
+
+/// An ageing interval shorter than the age of the start lifts it one
+/// priority level. That outranks the band, as the docs state.
+#[tokio::test(flavor = "multi_thread")]
+async fn fast_priority_ageing_lifts_an_aged_start_over_the_band() {
+    let (mut conn, _container) = setup_db().await;
+    let worker = unique("w");
+    let queue = unique("age-fast");
+    let start = new_start(&mut conn, &queue, 0).await;
+    age(&mut conn, start, FIFO_LEAD_SECS).await;
+    let fresh = activity_continuation(&mut conn, &queue).await;
+
+    let aging = Some(10);
+    assert_eq!(
+        claim_aged(&mut conn, &queue, &worker, aging).await,
+        Some(start)
+    );
+    assert_eq!(
+        claim_aged(&mut conn, &queue, &worker, aging).await,
+        Some(fresh)
+    );
+}
+
+// ── Starvation under simulated time ───────────────────────────────────────────
+
+/// Time passes in steps instead of by backdating one row. Each round adds two
+/// fresh continuations, claims one, then ages every `PENDING` row of the
+/// queue by 10 seconds. The continuation backlog grows without bound. The
+/// new start must yield at first and still be claimed in bounded rounds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_start_progresses_while_time_passes_under_continuation_load() {
+    let (mut conn, _container) = setup_db().await;
+    let worker = unique("w");
+    let queue = unique("sim");
+    let start = new_start(&mut conn, &queue, 0).await;
+
+    let mut claimed_in = None;
+    for round in 0..16 {
+        activity_continuation(&mut conn, &queue).await;
+        activity_continuation(&mut conn, &queue).await;
+        let id = claim_one(&mut conn, &queue, &worker)
+            .await
+            .expect("a row is due every round");
+        if id == start {
+            claimed_in = Some(round);
+            break;
+        }
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET scheduled_at = scheduled_at - INTERVAL '10 seconds' \
+             WHERE queue_name = $1 AND state = 'PENDING'",
+        )
+        .bind::<diesel::sql_types::Text, _>(&queue)
+        .execute(&mut conn)
+        .await
+        .expect("advance time");
+    }
+    let round = claimed_in.expect("the new start is claimed in bounded rounds");
+    assert!(
+        round >= 3,
+        "the new start yields at first; claimed in round {round}"
+    );
 }
