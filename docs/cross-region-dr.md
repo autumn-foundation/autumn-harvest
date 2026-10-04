@@ -221,10 +221,22 @@ That process provisions the row, and the row then marks the database for
 
 **Cost.** A database with no marker pays one probe per shard at startup: two
 catalog reads. The claim query stays the byte-for-byte pre-#954 statement.
-The persist path issues no extra statement, and no DR sampler starts. A probe
-that fails is retried with backoff for a few seconds. If it still fails, the
-process refuses to start. It never guesses that a shard it cannot read is
-plain.
+The persist path issues no extra statement, and no DR sampler starts.
+
+**A shard the probe cannot reach.** The process never guesses that such a
+shard is plain:
+
+- A worker **holds** the shard. It starts, registers and serves its other
+  shards, as before (issue #961). The held shard is pinned to a sentinel
+  generation that no row holds, so the worker claims nothing there and every
+  append there fails closed. A background task probes again with backoff. A
+  shard with no marker is released and runs unfenced. A shard with a marker
+  stops the worker, because a pin is fixed for the life of a process. The
+  restarted worker pins it.
+- A fenced worker with a shard it cannot reach refuses to start. It cannot
+  pin that shard.
+- `HarvestRunner::start` retries the probe with backoff for a few seconds,
+  then refuses to start.
 
 With the fence on, each worker **pins** every assigned shard's
 `harvest_shard_generation` epoch at startup. It does this before it registers

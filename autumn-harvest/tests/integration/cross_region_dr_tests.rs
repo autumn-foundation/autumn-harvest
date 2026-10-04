@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use autumn_harvest::replication::{
     AdminWrite, DrFencing, DrMarkers, FenceRegistry, ReplicationStatus, ShardGeneration,
     WatermarkReading, assert_admin_write_authority, assert_fence, bump_generation,
-    current_generation, ensure_generation_row, pin_process_fence, probe_dr_markers,
-    query_replication_status,
+    current_generation, ensure_generation_row, pin_process_fence, pin_worker_fence,
+    probe_dr_markers, query_replication_status, resolve_held,
 };
 use autumn_harvest::types::{ExecutionId, ShardId};
 use futures::FutureExt as _;
@@ -2460,6 +2460,90 @@ async fn a_standby_whose_subscription_slot_has_the_dr_prefix_refuses_to_start() 
     };
     assert!(error.to_string().contains("standby"), "{error}");
     assert!(!enabled, "a refused start pins nothing");
+}
+
+/// A worker that cannot probe a shard at boot holds it instead of refusing
+/// to start (issues #961, #1823). A held shard claims nothing until the
+/// resolver releases it.
+#[tokio::test]
+async fn a_worker_holds_a_shard_it_cannot_probe_and_claims_nothing_there() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("holdshard");
+    let unreachable = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    let targets = Some((
+        vec![(ShardId::new(0), unreachable.clone())],
+        ShardId::new(0),
+    ));
+    let Ok((fenced, mut held)) =
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &unreachable).await
+    else {
+        panic!("an unreachable shard is held, not refused");
+    };
+    assert!(fenced.is_none());
+    assert_eq!(held.len(), 1);
+    assert!(FenceRegistry::is_held(ShardId::new(0)));
+
+    // The held shard claims nothing, even on a database that has work.
+    let mut conn = connect(&url).await;
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-held",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+    async fn claim(
+        conn: &mut AsyncPgConnection,
+    ) -> autumn_harvest::error::HarvestResult<Option<autumn_harvest::models::TaskQueueItem>> {
+        autumn_harvest::queue::claim_task_on_shard(
+            conn,
+            &["q-held".to_string()],
+            "w-held",
+            "",
+            None,
+            &[],
+            &[],
+            Some(ShardId::new(0)),
+        )
+        .await
+    }
+    let while_held = claim(&mut conn).await.expect("claim query runs");
+
+    // The shard comes back with no DR marker: the resolver releases it.
+    let plain = dr_pool(&url);
+    held[0].1 = plain;
+    resolve_held(&mut held, &unique_prefix(&db))
+        .await
+        .expect("a plain shard is released");
+    let after_release = claim(&mut conn).await.expect("claim query runs");
+
+    assert!(while_held.is_none(), "a held shard must claim nothing");
+    assert!(held.is_empty(), "the released shard leaves the held list");
+    assert!(!FenceRegistry::is_held(ShardId::new(0)));
+    assert!(after_release.is_some(), "a released shard claims normally");
+}
+
+/// A held shard that turns out to carry a DR marker stops the worker. A pin
+/// is fixed for the life of a process, so it restarts and pins at startup.
+#[tokio::test]
+async fn a_held_shard_with_a_dr_marker_stops_the_worker() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holddr");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::hold(&[ShardId::new(0)], ShardId::new(0)).expect("hold");
+    let mut held = vec![(ShardId::new(0), dr_pool(&url))];
+    let Err(error) = resolve_held(&mut held, DR_PREFIX).await else {
+        panic!("a DR shard found after startup must stop the worker");
+    };
+    assert!(error.to_string().contains("Restart"), "{error}");
+    assert!(
+        FenceRegistry::is_held(ShardId::new(0)),
+        "the shard stays held until the process stops"
+    );
 }
 
 /// A database without the fence table probes as plain. Before issue #1823 an

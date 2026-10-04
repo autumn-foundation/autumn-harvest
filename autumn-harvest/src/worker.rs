@@ -29824,10 +29824,11 @@ impl Worker {
         // it had not yet pinned. A subsequent `pin_dr_generations` failure
         // then left those registrations behind, with no heartbeat started
         // to clean them up.
-        let Ok(dr_targets) = self.pin_dr_generations(default_pool).await else {
+        let Ok((dr_targets, held)) = self.pin_dr_generations(default_pool).await else {
             self.shutdown.cancel();
             return;
         };
+        let _held_resolver = self.spawn_held_resolver(held);
 
         // The retry guards live as long as this run (issue #1788).
         let (registration_pending_per_shard, _bucket_retries) =
@@ -30302,10 +30303,11 @@ impl Worker {
         // `may_claim_tasks` for why an unregistered worker must not claim.
         // Fence FIRST: pinning must precede fleet registration and the first
         // poll, so a DR-enabled worker is never briefly unfenced (issue #954).
-        let Ok(dr_targets) = self.pin_dr_generations(pool).await else {
+        let Ok((dr_targets, held)) = self.pin_dr_generations(pool).await else {
             self.shutdown.cancel();
             return;
         };
+        let _held_resolver = self.spawn_held_resolver(held);
 
         let registration_pending =
             Arc::new(AtomicBool::new(self.register_in_fleet(pool, None).await));
@@ -30417,8 +30419,10 @@ impl Worker {
     /// epoch in force. From then on the claim gate and the persist assert
     /// compare against that pinned value.
     ///
-    /// Returns the fenced `(shard, pool)` targets, `Ok(None)` when the worker
-    /// runs unfenced, or `Err(())` when it must not start.
+    /// Returns the fenced `(shard, pool)` targets (`None` when the worker runs
+    /// unfenced) and the shards it holds, or `Err(())` when it must not start.
+    /// A held shard is one the worker could not probe. See
+    /// [`crate::replication::pin_worker_fence`].
     ///
     /// # Fail closed
     ///
@@ -30428,11 +30432,18 @@ impl Worker {
     /// failed start. A failed start is visible, and a supervisor retries it.
     /// A silent downgrade is found only during a failover.
     #[cfg(feature = "db")]
+    #[allow(clippy::type_complexity)]
     async fn pin_dr_generations(
         &self,
         fallback_pool: &DbPool,
-    ) -> Result<Option<Vec<(crate::types::ShardId, DbPool)>>, ()> {
-        crate::replication::pin_process_fence(
+    ) -> Result<
+        (
+            Option<Vec<(crate::types::ShardId, DbPool)>>,
+            Vec<(crate::types::ShardId, DbPool)>,
+        ),
+        (),
+    > {
+        crate::replication::pin_worker_fence(
             self.config.dr.fencing,
             &self.config.dr.slot_prefix,
             self.dr_fence_targets(fallback_pool),
@@ -30446,6 +30457,48 @@ impl Worker {
                 "refusing to start: cross-region DR fencing could not be resolved"
             );
         })
+    }
+
+    /// Re-probe the shards this worker held at startup (issue #1823).
+    ///
+    /// Retries with backoff until every held shard is released. A held shard
+    /// that now carries a DR marker stops the worker, so it restarts and pins.
+    /// The task ends with the run, because the guard aborts it on drop.
+    #[cfg(feature = "db")]
+    fn spawn_held_resolver(
+        &self,
+        held: Vec<(crate::types::ShardId, DbPool)>,
+    ) -> Option<AbortOnDrop> {
+        if held.is_empty() {
+            return None;
+        }
+        let shutdown = self.shutdown.clone();
+        let worker_id = self.config.worker_id.clone();
+        let slot_prefix = self.config.dr.slot_prefix.clone();
+        Some(AbortOnDrop::new(tokio::spawn(async move {
+            let mut held = held;
+            let mut delay = Duration::from_secs(1);
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {}
+                }
+                if let Err(error) = crate::replication::resolve_held(&mut held, &slot_prefix).await
+                {
+                    tracing::error!(
+                        worker_id = %worker_id,
+                        error = %error,
+                        "stopping: a held shard needs a DR pin"
+                    );
+                    shutdown.cancel();
+                    return;
+                }
+                if held.is_empty() {
+                    return;
+                }
+                delay = (delay * 2).min(Duration::from_secs(10));
+            }
+        })))
     }
 
     /// This worker's DR fence targets. See [`dr_fence_targets`].

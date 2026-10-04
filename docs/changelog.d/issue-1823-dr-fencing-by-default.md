@@ -18,8 +18,11 @@ refuses to start when its configuration disagrees with the database:
 - a fenced process on a DR standby (a DR subscription, or recovery).
 
 A database with no marker pays one probe per shard at startup (two catalog
-reads) and runs the unchanged pre-#954 claim and persist paths. A failed
-probe is retried with backoff, then refuses the start.
+reads) and runs the unchanged pre-#954 claim and persist paths. A worker
+that cannot probe a shard holds it: the worker starts, but claims nothing
+and appends nothing there until a background probe releases the shard or,
+on finding a DR marker, stops the worker so it restarts and pins.
+`HarvestRunner::start` retries a failed probe, then refuses to start.
 
 **Admin writes go through the fence.**
 
