@@ -16239,96 +16239,108 @@ async fn process_activity_task(
     // RUNNING and can retry) rather than a raw `?` that would strand it. A
     // non-WASM activity takes the native path below byte-for-byte unchanged.
     #[cfg(feature = "wasm-activities")]
-    let wasm_dispatch: Option<crate::wasm_store::WasmDispatch> =
-        match (registry.wasm_binding(activity_name), registry.wasm_store()) {
-            (Some(binding), Some(store)) => Some(match pool.get().await {
-                Ok(mut conn) => {
-                    let dispatch = crate::wasm_store::resolve_wasm_dispatch(
-                        &mut conn,
-                        store,
-                        binding,
-                        activity_name,
-                        wasm_effective_deadline(
-                            task.start_to_close,
-                            activity.default_start_to_close,
-                        ),
-                        // Thread the task cancellation token so a cancelled guest
-                        // is cooperatively interrupted (issue #965 review) within
-                        // ~1 epoch tick, instead of holding a blocking-pool thread
-                        // until its wall-clock ceiling.
-                        Some(cancel.clone()),
-                        // Thread the start-to-close anchor so `invoke` charges the
-                        // whole pre-guest interval — resolution (this checkout +
-                        // active-hash lookup + cold-cache byte fetch) plus compile
-                        // — against the guest deadline, not just compile (issue
-                        // #965 review round 7). `attempt_clock_start` was captured
-                        // above, just before this dispatch resolution began, so it
-                        // APPROXIMATES the start-to-close anchor (issue #965
-                        // review round 10 — it does not equal it). The
-                        // authoritative anchor is `task.started_at`, set at claim,
-                        // and `ActivityStarted` is appended earlier still, so the
-                        // setup between them is not charged to the guest. Under
-                        // pool contention the guest's budget therefore starts
-                        // slightly later than the timeout scanner's. That is
-                        // safe-direction — the scanner fires first, the guest's own
-                        // epoch ceiling still bounds it, and a late result lands on
-                        // an already-terminal task — and it matches native
-                        // activities, which are equally unaware of `started_at`.
-                        attempt_clock_start,
-                    )
-                    .await;
-                    // The guest runs next, so its handler starts now (issue
-                    // #1809). The write is fenced by the claim, so it waits for
-                    // a timeout in flight and then changes nothing. A failed
-                    // write only keeps a timeout of this attempt out of the
-                    // breaker.
-                    //
-                    // A lost claim means a timeout or another path already
-                    // settled this attempt, and a retry may own the task. The
-                    // guest then must not start. The attempt ends as a lost
-                    // claim, and every write it tries is fenced.
-                    if matches!(dispatch, crate::wasm_store::WasmDispatch::Invoke(_)) {
-                        match queue::mark_claim_handler_started(&mut conn, &activity_claim).await {
-                            Ok(queue::ClaimWrite::Applied) => dispatch,
-                            Ok(queue::ClaimWrite::LeaseLost) => {
-                                use crate::failure::IntoActivityErrorString as _;
-                                log_lease_lost(task, "wasm handler start marker");
-                                cancel.cancel();
-                                crate::wasm_store::WasmDispatch::Fail(
-                                    crate::failure::ActivityFailure::retryable(
-                                        "ClaimLost",
-                                        "the claim was lost before the wasm guest started",
-                                    )
-                                    .into_error_payload(),
+    let wasm_dispatch: Option<crate::wasm_store::WasmDispatch> = match (
+        registry.wasm_binding(activity_name),
+        registry.wasm_store(),
+    ) {
+        (Some(binding), Some(store)) => Some(match pool.get().await {
+            Ok(mut conn) => {
+                let dispatch = crate::wasm_store::resolve_wasm_dispatch(
+                    &mut conn,
+                    store,
+                    binding,
+                    activity_name,
+                    wasm_effective_deadline(task.start_to_close, activity.default_start_to_close),
+                    // Thread the task cancellation token so a cancelled guest
+                    // is cooperatively interrupted (issue #965 review) within
+                    // ~1 epoch tick, instead of holding a blocking-pool thread
+                    // until its wall-clock ceiling.
+                    Some(cancel.clone()),
+                    // Thread the start-to-close anchor so `invoke` charges the
+                    // whole pre-guest interval — resolution (this checkout +
+                    // active-hash lookup + cold-cache byte fetch) plus compile
+                    // — against the guest deadline, not just compile (issue
+                    // #965 review round 7). `attempt_clock_start` was captured
+                    // above, just before this dispatch resolution began, so it
+                    // APPROXIMATES the start-to-close anchor (issue #965
+                    // review round 10 — it does not equal it). The
+                    // authoritative anchor is `task.started_at`, set at claim,
+                    // and `ActivityStarted` is appended earlier still, so the
+                    // setup between them is not charged to the guest. Under
+                    // pool contention the guest's budget therefore starts
+                    // slightly later than the timeout scanner's. That is
+                    // safe-direction — the scanner fires first, the guest's own
+                    // epoch ceiling still bounds it, and a late result lands on
+                    // an already-terminal task — and it matches native
+                    // activities, which are equally unaware of `started_at`.
+                    attempt_clock_start,
+                )
+                .await;
+                // The guest runs next, so its handler starts now (issue
+                // #1809). The write is fenced by the claim, so it waits for
+                // a timeout in flight and then changes nothing. A failed
+                // write only keeps a timeout of this attempt out of the
+                // breaker.
+                //
+                // A lost claim means a timeout or another path already
+                // settled this attempt, and a retry may own the task. The
+                // guest then must not start. The attempt ends as a lost
+                // claim, and every write it tries is fenced.
+                //
+                // A failed write leaves the start unrecorded, so a later
+                // timeout of the guest would feed no breaker. The guest
+                // does not start then either. The attempt fails as a
+                // retry, and the cancel keeps it out of the breaker.
+                if matches!(dispatch, crate::wasm_store::WasmDispatch::Invoke(_)) {
+                    match queue::mark_claim_handler_started(&mut conn, &activity_claim).await {
+                        Ok(queue::ClaimWrite::Applied) => dispatch,
+                        Ok(queue::ClaimWrite::LeaseLost) => {
+                            use crate::failure::IntoActivityErrorString as _;
+                            log_lease_lost(task, "wasm handler start marker");
+                            cancel.cancel();
+                            crate::wasm_store::WasmDispatch::Fail(
+                                crate::failure::ActivityFailure::retryable(
+                                    "ClaimLost",
+                                    "the claim was lost before the wasm guest started",
                                 )
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    task_id = %task.id,
-                                    error = %error,
-                                    "could not record the wasm handler start"
-                                );
-                                dispatch
-                            }
+                                .into_error_payload(),
+                            )
                         }
-                    } else {
-                        dispatch
+                        Err(error) => {
+                            use crate::failure::IntoActivityErrorString as _;
+                            tracing::warn!(
+                                task_id = %task.id,
+                                error = %error,
+                                "could not record the wasm handler start; the guest does not start"
+                            );
+                            cancel.cancel();
+                            crate::wasm_store::WasmDispatch::Fail(
+                                crate::failure::ActivityFailure::retryable(
+                                    "ActivityStartNotRecorded",
+                                    format!("could not record the wasm handler start: {error}"),
+                                )
+                                .into_error_payload(),
+                            )
+                        }
                     }
-                    // `conn` is dropped at the end of this arm, before the guest runs.
+                } else {
+                    dispatch
                 }
-                Err(e) => {
-                    use crate::failure::IntoActivityErrorString as _;
-                    crate::wasm_store::WasmDispatch::Fail(
-                        crate::failure::ActivityFailure::wasm_module_lookup_failed(format!(
-                            "failed to acquire a database connection to resolve the wasm module \
+                // `conn` is dropped at the end of this arm, before the guest runs.
+            }
+            Err(e) => {
+                use crate::failure::IntoActivityErrorString as _;
+                crate::wasm_store::WasmDispatch::Fail(
+                    crate::failure::ActivityFailure::wasm_module_lookup_failed(format!(
+                        "failed to acquire a database connection to resolve the wasm module \
                              for activity '{activity_name}': {e}"
-                        ))
-                        .into_error_payload(),
-                    )
-                }
-            }),
-            _ => None,
-        };
+                    ))
+                    .into_error_payload(),
+                )
+            }
+        }),
+        _ => None,
+    };
 
     // A `map_or_else` here would nest the ~50-line WASM-invoke terminal closure
     // inside a closure argument, which is markedly harder to read than the match.

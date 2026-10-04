@@ -1204,35 +1204,41 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
     );
 }
 
-/// A WASM guest must not start after its claim is lost (issue #1809). The
-/// start marker is the last claim-fenced write before the guest runs. A
-/// trigger makes that write match no row, as a timeout committed in
-/// between would. The worker then stops, so no `ActivityCompleted` appears.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wasm_guest_does_not_start_after_a_lost_claim() {
+/// Make the WASM start-marker write on `queue` behave as `action` (issue
+/// #1809), run the echo guest, and return its history. The trigger is gone
+/// when this returns.
+async fn run_echo_with_start_marker_trigger(
+    queue: &str,
+    worker_id: &str,
+    action: &str,
+) -> Vec<WorkflowEvent> {
     use diesel_async::SimpleAsyncConnection as _;
     let (url, _c) = setup_db().await;
-    let queue = "q-wasm-lost-claim";
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
-    conn.batch_execute(
-        "CREATE OR REPLACE FUNCTION t1809_lose_wasm_claim() RETURNS trigger AS $$ \
+    conn.batch_execute(&format!(
+        "CREATE OR REPLACE FUNCTION t1809_start_marker() RETURNS trigger AS $$ \
          BEGIN \
-           IF NEW.queue_name = 'q-wasm-lost-claim' \
+           IF NEW.queue_name = '{queue}' \
               AND NEW.handler_started_attempt IS DISTINCT FROM OLD.handler_started_attempt THEN \
-             RETURN NULL; \
+             {action}; \
            END IF; \
            RETURN NEW; \
          END $$ LANGUAGE plpgsql; \
-         DROP TRIGGER IF EXISTS t1809_lose_wasm_claim ON harvest_task_queue; \
-         CREATE TRIGGER t1809_lose_wasm_claim BEFORE UPDATE ON harvest_task_queue \
-           FOR EACH ROW EXECUTE FUNCTION t1809_lose_wasm_claim();",
-    )
+         DROP TRIGGER IF EXISTS t1809_start_marker ON harvest_task_queue; \
+         CREATE TRIGGER t1809_start_marker BEFORE UPDATE ON harvest_task_queue \
+           FOR EACH ROW EXECUTE FUNCTION t1809_start_marker();"
+    ))
     .await
     .expect("install the trigger");
 
-    let input = serde_json::json!({"hello": "lost"});
-    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input, queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_run_wasm",
+        serde_json::json!({"hello": "unrecorded"}),
+        queue,
+    )
+    .await;
     let registry = build_wasm_registry(
         vec![wf_info("wf_run_wasm", wf_run_wasm)],
         vec![WasmActivitySpec {
@@ -1245,7 +1251,7 @@ async fn wasm_guest_does_not_start_after_a_lost_claim() {
         }],
         Arc::new(RecordingMetrics::default()),
     );
-    let worker = build_worker("w-wasm-lost-claim", queue, Arc::clone(&registry));
+    let worker = build_worker(worker_id, queue, Arc::clone(&registry));
     let pool = build_pool(&url);
     let runner = Arc::clone(&worker);
     let pool_for_run = pool.clone();
@@ -1269,15 +1275,43 @@ async fn wasm_guest_does_not_start_after_a_lost_claim() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     worker.shutdown();
     handle.await.expect("worker joins cleanly");
-    conn.batch_execute("DROP TRIGGER IF EXISTS t1809_lose_wasm_claim ON harvest_task_queue")
+    conn.batch_execute("DROP TRIGGER IF EXISTS t1809_start_marker ON harvest_task_queue")
         .await
         .expect("drop the trigger");
+    load_history(&url, exec_id).await
+}
 
-    let history = load_history(&url, exec_id).await;
+/// A WASM guest must not start after its claim is lost (issue #1809). The
+/// start marker is the last claim-fenced write before the guest runs. The
+/// trigger makes that write match no row, as a timeout committed in between
+/// would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_guest_does_not_start_after_a_lost_claim() {
+    let history =
+        run_echo_with_start_marker_trigger("q-wasm-lost-claim", "w-wasm-lost-claim", "RETURN NULL")
+            .await;
     assert_eq!(
         find_activity_completed(&history),
         None,
         "a guest whose claim was lost must not run: {history:?}"
+    );
+}
+
+/// A WASM guest must not start when its start marker cannot be written
+/// (issue #1809). A later timeout of an unrecorded start would feed no
+/// breaker. The attempt fails as a retry instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_guest_does_not_start_when_its_start_is_not_recorded() {
+    let history = run_echo_with_start_marker_trigger(
+        "q-wasm-unrecorded-start",
+        "w-wasm-unrecorded-start",
+        "RAISE EXCEPTION 'start marker refused'",
+    )
+    .await;
+    assert_eq!(
+        find_activity_completed(&history),
+        None,
+        "a guest whose start was not recorded must not run: {history:?}"
     );
 }
 
