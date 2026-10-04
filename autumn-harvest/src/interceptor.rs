@@ -256,6 +256,16 @@ pub trait ActivityInterceptor: Send + Sync + 'static {
         input: serde_json::Value,
         next: ActivityInterceptorNext<'a>,
     ) -> ActivityInterceptorFuture<'a>;
+
+    /// A stable description of what this interceptor does, for the worker's
+    /// cohort key (issue #1815).
+    ///
+    /// An interceptor can short-circuit a call or change its result, so
+    /// workers with different chains are not peers. The default is the type
+    /// name. An interceptor whose settings change its behavior adds them.
+    fn policy(&self) -> String {
+        std::any::type_name::<Self>().to_owned()
+    }
 }
 
 /// Build the dispatch future for one activity execution, wrapping the terminal
@@ -448,6 +458,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out, serde_json::json!({"wrapped": 42}));
+    }
+
+    /// Issue #1815: the default policy names the interceptor's type, so two
+    /// different interceptors give two cohort keys.
+    #[test]
+    fn the_default_policy_is_the_type_name() {
+        struct Audit;
+        impl ActivityInterceptor for Audit {
+            fn intercept<'a>(
+                &'a self,
+                _invocation: &'a ActivityInvocation<'a>,
+                _ctx: &'a ActivityContext,
+                input: serde_json::Value,
+                next: ActivityInterceptorNext<'a>,
+            ) -> ActivityInterceptorFuture<'a> {
+                next.run(input)
+            }
+        }
+        struct Retry;
+        impl ActivityInterceptor for Retry {
+            fn intercept<'a>(
+                &'a self,
+                _invocation: &'a ActivityInvocation<'a>,
+                _ctx: &'a ActivityContext,
+                input: serde_json::Value,
+                next: ActivityInterceptorNext<'a>,
+            ) -> ActivityInterceptorFuture<'a> {
+                next.run(input)
+            }
+            fn policy(&self) -> String {
+                "retry attempts=3".to_owned()
+            }
+        }
+        let chain: Vec<std::sync::Arc<dyn ActivityInterceptor>> =
+            vec![std::sync::Arc::new(Audit), std::sync::Arc::new(Retry)];
+        let policies: Vec<String> = chain.iter().map(|i| i.policy()).collect();
+        assert!(policies[0].ends_with("Audit"), "{policies:?}");
+        assert_eq!(policies[1], "retry attempts=3");
     }
 
     #[tokio::test]

@@ -190,6 +190,7 @@ fn probe(queue: &str, window: Arc<TaskOutcomeWindow>, metrics: Arc<Recording>) -
         config: OutlierConfig::default(),
         fleet_stale_secs: 60,
         cohort: cohort(queue),
+        codecs: None,
         compare: true,
         slot: 0,
         // Fresh boards keep each probe apart from other tests in the process.

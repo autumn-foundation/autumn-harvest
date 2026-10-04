@@ -65,12 +65,16 @@ heartbeat check only. A worker that was alive but sick passed that check.
   `workflow_panic_max_attempts`, `poison_pill_threshold`), and payload policy
   (`max_activity_input_bytes`, `max_workflow_input_bytes`,
   `max_activity_result_bytes`, `max_signal_payload_bytes`,
-  `max_current_details_bytes`, the history policy, the offload threshold,
-  the registered codec key ids and the activity interceptor count), with
+  `max_current_details_bytes`, the history policy, the offload threshold and
+  the activity interceptor chain), and the registered codec key ids, which the
+  heartbeat reads on every tick because a reload can change them, with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A
   worker on a slow queue is not compared with a fast queue. Each heartbeat
   reads only its own cohort, so the read stays small in a large fleet.
+- `ActivityInterceptor` gains `policy()`, a stable description of what the
+  interceptor does. It defaults to the type name. The cohort key holds the
+  policy of each interceptor, in chain order.
 - `SlotTuner` gains `policy()`, a stable description of every setting
   that changes `decide`. It defaults to `name()`. `DefaultSlotTuner`
   includes its grow step, shrink step and wait threshold. A custom tuner

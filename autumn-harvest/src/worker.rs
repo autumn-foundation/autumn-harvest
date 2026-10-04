@@ -1232,8 +1232,11 @@ impl HandlerRegistry {
                 .payload_offloader
                 .as_ref()
                 .map(|offloader| offloader.threshold()),
-            codec_key_ids: self.payload_codecs.registered_key_ids(),
-            activity_interceptors: self.activity_interceptors.len(),
+            activity_interceptors: self
+                .activity_interceptors
+                .iter()
+                .map(|interceptor| interceptor.policy())
+                .collect(),
         }
     }
 
@@ -31902,6 +31905,7 @@ impl Worker {
                     },
                     payload: self.registry.payload_policy(),
                 }),
+                codecs: Some(self.registry.payload_codecs().clone()),
                 compare: true,
                 slot: shard_slot,
                 shard_peers: Arc::clone(&self.outlier_peers),

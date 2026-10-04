@@ -701,8 +701,11 @@ pub struct OutlierProbe {
     /// A peer whose heartbeat or stats are older than this is not compared.
     pub fleet_stale_secs: i64,
     /// This worker's cohort key, from [`worker_cohort`]. The heartbeat reads
-    /// only the peers in this cohort.
+    /// only the peers in this cohort. See [`OutlierProbe::cohort_key`].
     pub cohort: String,
+    /// The worker's payload codecs. [`OutlierProbe::cohort_key`] adds their
+    /// registered key ids on every tick, because a reload can change them.
+    pub codecs: Option<crate::payload_codec::PayloadCodecs>,
     /// Whether this heartbeat compares the worker and sets the gauge.
     ///
     /// A multi-shard worker runs one heartbeat per shard, and each one
@@ -725,6 +728,7 @@ impl std::fmt::Debug for OutlierProbe {
             .field("config", &self.config)
             .field("fleet_stale_secs", &self.fleet_stale_secs)
             .field("cohort", &self.cohort)
+            .field("codecs", &self.codecs.is_some())
             .field("compare", &self.compare)
             .field("slot", &self.slot)
             .finish_non_exhaustive()
@@ -732,6 +736,29 @@ impl std::fmt::Debug for OutlierProbe {
 }
 
 impl OutlierProbe {
+    /// The cohort key this tick writes and reads (issue #1815).
+    ///
+    /// It is [`OutlierProbe::cohort`] with the codecs' registered key ids
+    /// added. A worker cannot decode a payload under a key id it lacks, so
+    /// the ids are part of the cohort. A reload can register or retire a key
+    /// while the worker runs, so they are read now, not at startup.
+    #[must_use]
+    pub fn cohort_key(&self) -> String {
+        let Some(codecs) = &self.codecs else {
+            return self.cohort.clone();
+        };
+        match serde_json::from_str::<serde_json::Value>(&self.cohort) {
+            Ok(serde_json::Value::Object(mut key)) => {
+                key.insert(
+                    "codec_key_ids".to_owned(),
+                    serde_json::json!(codecs.registered_key_ids()),
+                );
+                serde_json::Value::Object(key).to_string()
+            }
+            _ => self.cohort.clone(),
+        }
+    }
+
     /// Record `flagged` as this worker's verdict and set the gauge to the OR
     /// of every local worker's verdict.
     fn publish(&self, worker_id: &str, flagged: &[OutlierDimension]) {
@@ -1077,8 +1104,10 @@ pub struct CohortPolicy<'a> {
 /// the attempt, and an oversized input or signal fails the workflow task that
 /// sends it. The history policy decides when a workflow continues as new or
 /// fails on its hard cap. An offloader moves a large payload out instead of
-/// failing it. A stored payload under a key id the worker lacks cannot be
-/// decoded. An interceptor can change any outcome.
+/// failing it. An interceptor can change any outcome.
+///
+/// The registered codec key ids are not here: they can change at runtime, so
+/// [`OutlierProbe::cohort_key`] reads them on every tick.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PayloadPolicy {
     /// `max_activity_input_bytes`.
@@ -1099,10 +1128,8 @@ pub struct PayloadPolicy {
     pub continue_as_new_deadline_fraction: f64,
     /// The payload offloader's threshold. `None` without an offloader.
     pub offload_threshold: Option<u64>,
-    /// The registered payload-codec key ids, sorted.
-    pub codec_key_ids: Vec<String>,
-    /// How many activity interceptors the worker runs.
-    pub activity_interceptors: usize,
+    /// The `policy()` of each activity interceptor, in chain order.
+    pub activity_interceptors: Vec<String>,
 }
 
 impl PayloadPolicy {
@@ -1117,7 +1144,6 @@ impl PayloadPolicy {
             "event_hard_cap": self.event_hard_cap,
             "continue_as_new_deadline_fraction": self.continue_as_new_deadline_fraction,
             "offload_threshold": self.offload_threshold,
-            "codec_key_ids": self.codec_key_ids,
             "activity_interceptors": self.activity_interceptors,
         })
     }
@@ -1563,9 +1589,10 @@ pub async fn run_outlier_tick(
 ) -> HarvestResult<Vec<OutlierDimension>> {
     // A row of the worker's previous process can hold a higher sequence. The
     // first write then moves the counter above it, and a fresh capture follows.
+    let cohort = probe.cohort_key();
     for _ in 0..2 {
         let (own, seq) = capture_task_stats(&probe.window);
-        if write_task_stats_snapshot(conn, worker_id, &probe.cohort, &own, seq).await?
+        if write_task_stats_snapshot(conn, worker_id, &cohort, &own, seq).await?
             != SnapshotWrite::Foreign
         {
             break;
@@ -1576,8 +1603,7 @@ pub async fn run_outlier_tick(
     if !probe.metrics.is_enabled() {
         return Ok(Vec::new());
     }
-    let live =
-        load_live_worker_task_stats(conn, probe.fleet_stale_secs, Some(&probe.cohort)).await?;
+    let live = load_live_worker_task_stats(conn, probe.fleet_stale_secs, Some(&cohort)).await?;
     if !probe.compare {
         probe.shard_peers.store(probe.slot, live);
         return Ok(Vec::new());
@@ -3099,6 +3125,7 @@ mod tests {
             config: crate::worker_outlier::OutlierConfig::default(),
             fleet_stale_secs: 60,
             cohort: "[\"q\"]".to_owned(),
+            codecs: None,
             compare: true,
             slot,
             shard_peers: std::sync::Arc::clone(shard_peers),
@@ -3747,18 +3774,62 @@ mod tests {
                 ..base.clone()
             },
             PayloadPolicy {
-                codec_key_ids: vec!["k1".to_owned()],
+                activity_interceptors: vec!["a::Retry".to_owned()],
                 ..base.clone()
             },
             PayloadPolicy {
-                activity_interceptors: 1,
-                ..base.clone()
+                activity_interceptors: vec!["a::Retry".to_owned(), "a::Audit".to_owned()],
+                ..base
             },
         ];
         for variant in variants {
             assert_ne!(cohort(base.clone()), cohort(variant.clone()), "{variant:?}");
         }
         assert_eq!(cohort(base), cohort(PayloadPolicy::default()));
+        let chain = |names: &[&str]| PayloadPolicy {
+            activity_interceptors: names.iter().map(|n| (*n).to_owned()).collect(),
+            ..PayloadPolicy::default()
+        };
+        assert_ne!(
+            cohort(chain(&["a::Retry"])),
+            cohort(chain(&["a::Audit"])),
+            "two chains of one interceptor each"
+        );
+        assert_ne!(
+            cohort(chain(&["a::Retry", "a::Audit"])),
+            cohort(chain(&["a::Audit", "a::Retry"])),
+            "the chain order"
+        );
+    }
+
+    /// Issue #1815: a reload can register a codec key while the worker runs.
+    /// The next tick's cohort key carries it, so the worker leaves peers that
+    /// cannot decode the same payloads.
+    #[test]
+    fn the_cohort_key_follows_the_codec_keys_at_runtime() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        };
+        let before = probe.cohort_key();
+        assert!(before.contains("\"codec_key_ids\":[]"), "{before}");
+
+        codecs
+            .register_key("k1", std::sync::Arc::new(IdentityCodec))
+            .expect("register a key");
+        let after = probe.cohort_key();
+        assert_ne!(before, after, "the key follows the registration");
+        assert!(after.contains("\"codec_key_ids\":[\"k1\"]"), "{after}");
+        assert!(after.contains("\"queues\":[\"a\"]"), "{after}");
+
+        let without = super::OutlierProbe {
+            codecs: None,
+            ..probe
+        };
+        assert_eq!(without.cohort_key(), without.cohort);
     }
 
     /// Issue #1815: under load, the claim gate gives each worker a task mix
