@@ -16,7 +16,8 @@ Design decisions:
 - The signal comes from `harvest_workflow_executions`, grouped by
   `assigned_build_id`. It is fleet-wide and durable, and it needs no metrics
   backend. The window starts at the policy row's `updated_at`, which is the
-  current ramp step.
+  current ramp step. The counts merge over pools per ramp generation (queue,
+  both builds and `ramp_id`), so one ramp's failures never count for another.
 - Failure is `FAILED` or `TIMED_OUT`. Cancel and terminate are operator
   actions and do not count. ND-block is a `RUNNING` or `PAUSED` row with
   `nd_blocked_at` set. Canary probes do not count.

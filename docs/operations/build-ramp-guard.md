@@ -75,6 +75,12 @@ The two rates are:
 
 A rate with a zero denominator is 0.
 
+The guard adds up the counts of every pool that holds the same ramp
+generation. A generation is the queue, both builds and the `ramp_id`. A
+partial fan-out can leave two generations with the same builds on different
+pools. The guard judges each generation on its own counts, so the failures of
+an old ramp cannot abort a new one.
+
 The migration `20261003212318_harvest_ramp_guard_outcome_index` adds the
 index `idx_harvest_we_ramp_guard_outcome` on
 `(queue_name, assigned_build_id, created_at)`. The query reads only the runs

@@ -796,8 +796,10 @@ async fn guard_merges_pools_clears_each_and_audits_once() {
     let mut conn_2 = AsyncPgConnection::establish(&url_2)
         .await
         .expect("connect 2");
+    // The API fan-out writes one `ramp_id` to every pool.
+    let ramp_id = uuid::Uuid::new_v4();
     for conn in [&mut conn_1, &mut conn_2] {
-        set_ramp(conn).await;
+        set_ramp_with_id(conn, ramp_id).await;
         seed_healthy_base(conn, 5).await;
         // Three failed target runs per pool: below min_samples on each pool
         // alone, above it once merged.
@@ -816,6 +818,37 @@ async fn guard_merges_pools_clears_each_and_audits_once() {
     assert!(!ramp_is_active(&mut conn_2).await);
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
     assert_eq!(auto_abort_audit_rows(&mut conn_2).await, 0);
+}
+
+/// Two pools hold ramps with the same builds but different `ramp_id`s. The
+/// guard judges each ramp on its own counts, so failures of one ramp cannot
+/// abort the other.
+#[tokio::test]
+async fn ramps_with_different_ids_are_judged_apart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_ramp_with_id(conn, uuid::Uuid::new_v4()).await;
+        seed_healthy_base(conn, 5).await;
+        // Three failed target runs per ramp: below min_samples for each one.
+        for _ in 0..3 {
+            seed(conn, true, "FAILED", false).await;
+        }
+    }
+    let config = guard_config().with_min_samples(6);
+    let pools = [pool_1.clone(), pool_2.clone()];
+
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "the counts do not merge: {aborts:?}");
+    assert!(ramp_is_active(&mut conn_1).await);
+    assert!(ramp_is_active(&mut conn_2).await);
 }
 
 /// With the base build promoted to the target, the ramp is not a ramp.
