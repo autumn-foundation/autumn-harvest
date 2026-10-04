@@ -1220,9 +1220,10 @@ impl SpanEnd {
 ///
 /// `SET`, `RESET` and a `set_config` call count, wherever they sit.
 fn changes_search_path(s: &Stmts, k: usize) -> bool {
-    let set = s.is(k, "set")
-        && (s.is(k + 1, "search_path")
-            || ((s.is(k + 1, "local") || s.is(k + 1, "session")) && s.is(k + 2, "search_path")));
+    // `SET SCHEMA` is an alias of `SET search_path`.
+    let scope = usize::from(s.is(k + 1, "local") || s.is(k + 1, "session"));
+    let set =
+        s.is(k, "set") && (s.is(k + 1 + scope, "search_path") || s.is(k + 1 + scope, "schema"));
     let reset = s.is(k, "reset") && (s.is(k + 1, "search_path") || s.is(k + 1, "all"));
     let call = (k..s.end(k)).any(|j| s.is(j, "set_config"))
         && (k..s.end(k)).any(|j| {
@@ -1404,7 +1405,8 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
         }
         "set_config"
             if s.is_punct(k + 1, '(')
-                && s.string(k + 2) == Some("lock_timeout")
+                && s.string(k + 2)
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("lock_timeout"))
                 && s.is_punct(k + 3, ',') =>
         {
             // A query runs the function once per row, so a filter can skip it.
@@ -1413,14 +1415,26 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
             let bounds = bounds_wait(s, k + 4);
             // Only a literal false is session-level. Any other third argument
             // may be true, and a local value ends with the transaction.
-            let is_false = |v: &str| ["false", "f", "off", "no", "0"].contains(&v.trim());
-            let session = s.word(k + 6).is_some_and(is_false) && s.is_punct(k + 7, ')')
-                || s.string(k + 6).is_some_and(is_false) && s.is_punct(k + 7, ')');
+            let session = s.word(k + 6).is_some_and(pg_false) && s.is_punct(k + 7, ')')
+                || s.string(k + 6).is_some_and(pg_false) && s.is_punct(k + 7, ')');
             let local = !session;
             (!bounds || s.is_bare_call(k)).then_some(Timeout::Set { bounds, local })
         }
         _ => None,
     }
+}
+
+/// Whether Postgres reads `value` as boolean false.
+///
+/// Postgres trims the value and ignores case. It accepts any unique prefix of
+/// `false`, `no` or `off`, and `0`. `o` alone is ambiguous, so it fails.
+fn pg_false(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    !v.is_empty()
+        && ("false".starts_with(&v)
+            || "no".starts_with(&v)
+            || (v.len() > 1 && "off".starts_with(&v))
+            || v == "0")
 }
 
 /// `CREATE INDEX`, `CREATE TABLE`, and the trigger, rule and policy forms.
@@ -3214,6 +3228,8 @@ fn a_search_path_change_ends_an_unqualified_exemption() {
         "RESET search_path;",
         "RESET ALL;",
         "SELECT set_config('search_path', 'public', false);",
+        // `SET SCHEMA` is an alias of `SET search_path`.
+        "SET SCHEMA 'public';",
     ] {
         let sql = format!(
             "SET search_path = scratch;\nCREATE TABLE harvest_events (id INT);\n{change}\n\
@@ -3324,6 +3340,34 @@ fn concurrently_cannot_reach_a_partitioned_child() {
     let leaf = ["CREATE TABLE events_p PARTITION OF harvest_events FOR VALUES FROM (1) TO (2);"];
     let sql = "CREATE INDEX CONCURRENTLY idx_x ON events_p (id);";
     assert_eq!(lint_with_history(&leaf, sql, false), []);
+}
+
+#[test]
+fn a_set_config_name_is_case_insensitive() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               SELECT set_config('LOCK_TIMEOUT', '0', true);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn every_postgres_false_spelling_is_session_scope() {
+    // A session clear outlives the commit. A local clear would not, and the
+    // old session bound would come back.
+    for is_local in ["'FALSE'", "'n'", "'Off'", "' no '", "'fal'", "FALSE"] {
+        let sql = format!(
+            "SET lock_timeout = '5s';\n\
+             SELECT set_config('lock_timeout', '0', {is_local});\nCOMMIT;\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{is_local}: {findings:?}"
+        );
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
