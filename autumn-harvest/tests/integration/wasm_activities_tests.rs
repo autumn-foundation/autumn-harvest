@@ -28,7 +28,7 @@ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -1182,6 +1182,25 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
     assert!(
         !types.iter().any(|t| t.to_lowercase().contains("wasm")),
         "no wasm-specific event variant may appear: {types:?}"
+    );
+
+    // The guest's start marker is written once its module resolves, not in
+    // the `ActivityStarted` transaction (issue #1809).
+    let markers: Vec<(Option<i32>, i32)> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select((
+            harvest_task_queue::handler_started_attempt,
+            harvest_task_queue::attempt,
+        ))
+        .load(&mut conn)
+        .await
+        .expect("load the activity task");
+    assert_eq!(markers.len(), 1, "one activity task: {markers:?}");
+    assert_eq!(
+        markers[0].0,
+        Some(markers[0].1),
+        "the guest that ran marks its attempt started"
     );
 }
 

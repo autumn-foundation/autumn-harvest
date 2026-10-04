@@ -15899,6 +15899,14 @@ async fn process_activity_task(
     // a deferred task never records a start it did not run. It serves the
     // fail-fast short-circuit path (start + CircuitOpen failure) and the
     // real-call path.
+    // A WASM guest starts only after its module resolves, which can wait on
+    // a pool checkout and a fetch (issue #1809). Its start marker is written
+    // then, so a timeout during that local setup does not feed the breaker.
+    #[cfg(feature = "wasm-activities")]
+    let wasm_bound =
+        registry.wasm_binding(activity_name).is_some() && registry.wasm_store().is_some();
+    #[cfg(not(feature = "wasm-activities"))]
+    let wasm_bound = false;
     let started = {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let started_result = append_activity_started_if_pending(
@@ -15909,7 +15917,7 @@ async fn process_activity_task(
             worker_id,
             registry.payload_codecs(),
             // A short circuit admitted no dispatch token and runs no handler.
-            circuit_token.is_some(),
+            circuit_token.is_some() && !wasm_bound,
         )
         .await;
         let Some(started) = fail_execution_on_error(
@@ -16190,7 +16198,7 @@ async fn process_activity_task(
         match (registry.wasm_binding(activity_name), registry.wasm_store()) {
             (Some(binding), Some(store)) => Some(match pool.get().await {
                 Ok(mut conn) => {
-                    crate::wasm_store::resolve_wasm_dispatch(
+                    let dispatch = crate::wasm_store::resolve_wasm_dispatch(
                         &mut conn,
                         store,
                         binding,
@@ -16223,7 +16231,26 @@ async fn process_activity_task(
                         // activities, which are equally unaware of `started_at`.
                         attempt_clock_start,
                     )
-                    .await
+                    .await;
+                    // The guest runs next, so its handler starts now (issue
+                    // #1809). The write is fenced by the claim, so it waits for
+                    // a timeout in flight and then changes nothing. A failed
+                    // write only keeps a timeout of this attempt out of the
+                    // breaker.
+                    if matches!(dispatch, crate::wasm_store::WasmDispatch::Invoke(_)) {
+                        match queue::mark_claim_handler_started(&mut conn, &activity_claim).await {
+                            Ok(queue::ClaimWrite::Applied) => {}
+                            Ok(queue::ClaimWrite::LeaseLost) => {
+                                log_lease_lost(task, "wasm handler start marker");
+                            }
+                            Err(error) => tracing::warn!(
+                                task_id = %task.id,
+                                error = %error,
+                                "could not record the wasm handler start"
+                            ),
+                        }
+                    }
+                    dispatch
                     // `conn` is dropped at the end of this arm, before the guest runs.
                 }
                 Err(e) => {

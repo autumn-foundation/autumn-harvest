@@ -2876,7 +2876,9 @@ pub(crate) async fn take_timed_out_claim(
 /// The write sets `handler_started_attempt` to the claim's `attempt`. The
 /// timeout enforcer feeds the circuit breaker only when the two are equal.
 /// Call it in the transaction that appends `ActivityStarted`, after
-/// [`lock_claim_for_update`] returns [`ClaimLock::Held`].
+/// [`lock_claim_for_update`] returns [`ClaimLock::Held`]. A WASM activity
+/// calls it after its module resolves instead. The claim fence then makes it
+/// wait for a timeout in flight, and change nothing after one.
 ///
 /// # Errors
 ///

@@ -55,6 +55,11 @@ column. The transaction that appends `ActivityStarted` also writes the
 claim's `attempt` there. Each claim increments `attempt`, so the column
 equals `attempt` only after the current claim started its handler.
 
+A WASM activity resolves its module after `ActivityStarted`. That can wait
+on a pool checkout and a fetch. So it writes the column only once the module
+resolves, with a claim-fenced write. A timeout during that local setup does
+not feed the breaker.
+
 Timeouts of a `PENDING` task never feed the breaker. No handler ran.
 
 A late result of a timed-out attempt does not move the breaker. The enforcer
