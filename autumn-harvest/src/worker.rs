@@ -15220,8 +15220,9 @@ impl Drop for CircuitProbeGuard<'_> {
 }
 
 /// Whether an attempt ran past its start-to-close budget (issue #1809).
-/// `elapsed` is measured from after the claim, so it never exceeds the
-/// enforcer's elapsed time. A missing or negative budget never overruns.
+/// `elapsed` is measured from when the claim query returned, so it never
+/// exceeds the enforcer's elapsed time. A missing or negative budget never
+/// overruns.
 fn attempt_overran(start_to_close: Option<chrono::Duration>, elapsed: Duration) -> bool {
     start_to_close
         .and_then(|budget| budget.to_std().ok())
@@ -16361,11 +16362,14 @@ async fn process_activity_task(
     // An attempt that ran past its start-to-close budget timed out, whichever
     // process enforces that (issue #1809). Breaker state is per process, so a
     // timeout enforced elsewhere sets no mark here. Its late outcome must not
-    // move this breaker either. The clock starts after the claim, so the
-    // check never fires before the enforcer's deadline. A self-committed
-    // activity sealed its own success and keeps it.
-    let overran = !committed_transactionally
-        && attempt_overran(task.start_to_close, attempt_clock_start.elapsed());
+    // move this breaker either. The scanner measures from `started_at`, the
+    // claim time. `dispatched_at` is taken as soon as the claim query
+    // returns, before the permit wait and the setup. Only the claim round
+    // trip separates the two anchors, so the check never fires early and
+    // misses at most that round trip. A self-committed activity sealed its
+    // own success and keeps it.
+    let overran =
+        !committed_transactionally && attempt_overran(task.start_to_close, dispatched_at.elapsed());
     let circuit_outcome = if was_cancelled || overran {
         if let Some(token) = circuit_token {
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
