@@ -105,7 +105,10 @@ fn the_abba_rationale_is_intact() {
 fn every_row_names_its_locks_site_and_reason() {
     let doc = architecture();
     let rows = table_rows(table_section(&doc));
-    assert!(rows.len() >= 8, "the table lists every known order; got {rows:?}");
+    assert!(
+        rows.len() >= 8,
+        "the table lists every known order; got {rows:?}"
+    );
     for row in &rows {
         assert_eq!(row.len(), 5, "each row has five cells: {row:?}");
         for cell in &row[1..4] {

@@ -133,12 +133,13 @@ async fn gate_waiters(conn: &mut AsyncPgConnection, gate_key: i32) -> i64 {
 /// persist transaction holds the execution row lock of its own run.
 async fn install_gate(
     conn: &mut AsyncPgConnection,
+    name: &str,
     gate_key: i32,
     event_type: &str,
     ids: &[ExecutionId],
 ) {
     let sql = format!(
-        "CREATE OR REPLACE FUNCTION harvest_test_tx1822_gate() RETURNS trigger AS $gate$
+        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger AS $gate$
          BEGIN
            IF NEW.event_type = '{event_type}'
               AND NEW.workflow_exec_id IN ({ids}) THEN
@@ -148,9 +149,9 @@ async fn install_gate(
            RETURN NEW;
          END
          $gate$ LANGUAGE plpgsql;
-         DROP TRIGGER IF EXISTS harvest_test_tx1822_gate ON harvest_events;
-         CREATE TRIGGER harvest_test_tx1822_gate AFTER INSERT ON harvest_events
-           FOR EACH ROW EXECUTE FUNCTION harvest_test_tx1822_gate();",
+         DROP TRIGGER IF EXISTS {name} ON harvest_events;
+         CREATE TRIGGER {name} AFTER INSERT ON harvest_events
+           FOR EACH ROW EXECUTE FUNCTION {name}();",
         ids = ids
             .iter()
             .map(|id| format!("'{}'::uuid", id.as_uuid()))
@@ -176,13 +177,84 @@ async fn set_gate(conn: &mut AsyncPgConnection, gate_key: i32, closed: bool) {
         .expect("set gate");
 }
 
-async fn remove_gate(conn: &mut AsyncPgConnection) {
-    conn.batch_execute(
-        "DROP TRIGGER IF EXISTS harvest_test_tx1822_gate ON harvest_events;
-         DROP FUNCTION IF EXISTS harvest_test_tx1822_gate();",
-    )
+async fn remove_gate(conn: &mut AsyncPgConnection, name: &str) {
+    conn.batch_execute(&format!(
+        "DROP TRIGGER IF EXISTS {name} ON harvest_events;
+         DROP FUNCTION IF EXISTS {name}();"
+    ))
     .await
     .expect("remove gate trigger");
+}
+
+/// Serializes the trigger tests.
+///
+/// The gate DDL takes a table lock on `harvest_events`. A parked persist of
+/// another trigger test holds a conflicting lock until its gate opens, so two
+/// trigger tests in parallel would wait on each other.
+static TRIGGER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Wait until `count` persist transactions park on the gate.
+///
+/// On a timeout, open the gate first. The trigger DDL would otherwise wait
+/// behind the parked transactions.
+async fn wait_for_parked(
+    conn: &mut AsyncPgConnection,
+    gate: &mut AsyncPgConnection,
+    name: &str,
+    gate_key: i32,
+    count: i64,
+) {
+    let parked = tokio::time::timeout(Duration::from_secs(20), async {
+        while gate_waiters(conn, gate_key).await < count {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if parked.is_err() {
+        set_gate(gate, gate_key, false).await;
+        remove_gate(conn, name).await;
+        panic!("{count} persist transaction(s) must park on the gate");
+    }
+}
+
+/// Start one run of `workflow_name` on the `default` queue.
+async fn start_run(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    exec_id: ExecutionId,
+    input: serde_json::Value,
+) {
+    let workflow_id = format!("{workflow_name}-{}", exec_id.as_uuid());
+    autumn_harvest::execution::start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams::new(workflow_name, &workflow_id, exec_id, input, "default"),
+        None,
+    )
+    .await
+    .expect("start workflow");
+}
+
+/// Spawn a worker for `workflow` with a recording metrics sink.
+fn spawn_worker(
+    url: &str,
+    worker_id: &str,
+    workflow: autumn_harvest::info::WorkflowInfo,
+) -> (
+    Arc<RetryMetrics>,
+    Arc<autumn_harvest::worker::Worker>,
+    tokio::task::JoinHandle<()>,
+) {
+    let metrics = Arc::new(RetryMetrics::default());
+    let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics.clone()).build());
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![workflow],
+        vec![],
+        empty_shared_state(),
+        telemetry,
+    ));
+    let worker = build_runtime_worker(worker_id, 4, 4, registry);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(url));
+    (metrics, worker, handle)
 }
 
 async fn wait_for_terminal(url: &str, exec_id: ExecutionId) -> String {
@@ -207,6 +279,8 @@ async fn wait_for_terminal(url: &str, exec_id: ExecutionId) -> String {
 /// after a retry. The retry shows in the metric.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_persist_transactions_deadlock_and_both_commit() {
+    const GATE: &str = "harvest_test_tx1822_mutual_gate";
+    let _serial = TRIGGER_TESTS.lock().await;
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let mut gate = connect(&url).await;
@@ -214,49 +288,24 @@ async fn two_persist_transactions_deadlock_and_both_commit() {
 
     let a = ExecutionId::new_for_shard(ShardId::new(0));
     let b = ExecutionId::new_for_shard(ShardId::new(0));
-    install_gate(&mut conn, gate_key, "ExternalSignalRequested", &[a, b]).await;
+    install_gate(
+        &mut conn,
+        GATE,
+        gate_key,
+        "ExternalSignalRequested",
+        &[a, b],
+    )
+    .await;
     set_gate(&mut gate, gate_key, true).await;
-
-    let suffix = uuid::Uuid::new_v4();
-    let (a_id, b_id) = (format!("tx1822-a-{suffix}"), format!("tx1822-b-{suffix}"));
-    for (exec_id, workflow_id, peer) in [(a, &a_id, b), (b, &b_id, a)] {
-        autumn_harvest::execution::start_or_load_workflow_execution(
-            &mut conn,
-            StartWorkflowParams::new(
-                "tx1822_signal_peer",
-                workflow_id,
-                exec_id,
-                serde_json::json!({ "peer": peer.to_string() }),
-                "default",
-            ),
-            None,
-        )
-        .await
-        .expect("start workflow");
+    for (exec_id, peer) in [(a, b), (b, a)] {
+        let input = serde_json::json!({ "peer": peer.to_string() });
+        start_run(&mut conn, "tx1822_signal_peer", exec_id, input).await;
     }
-
-    let metrics = Arc::new(RetryMetrics::default());
-    let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics.clone()).build());
-    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
-        vec![tx1822_signal_peer_info()],
-        vec![],
-        empty_shared_state(),
-        telemetry,
-    ));
-    let worker = build_runtime_worker("tx1822-worker", 4, 4, registry);
-    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    let (metrics, worker, handle) =
+        spawn_worker(&url, "tx1822-mutual-worker", tx1822_signal_peer_info());
 
     // Both persist transactions hold their own row and wait on the gate.
-    let parked = tokio::time::timeout(Duration::from_secs(20), async {
-        while gate_waiters(&mut conn, gate_key).await < 2 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    if parked.is_err() {
-        remove_gate(&mut conn).await;
-        panic!("both persist transactions must park on the gate");
-    }
+    wait_for_parked(&mut conn, &mut gate, GATE, gate_key, 2).await;
 
     // Open the gate. Each transaction now asks for the row of its peer.
     set_gate(&mut gate, gate_key, false).await;
@@ -265,7 +314,7 @@ async fn two_persist_transactions_deadlock_and_both_commit() {
     let b_state = wait_for_terminal(&url, b).await;
     worker.shutdown();
     let _ = handle.await;
-    remove_gate(&mut conn).await;
+    remove_gate(&mut conn, GATE).await;
 
     assert_eq!(
         (a_state.as_str(), b_state.as_str()),
@@ -359,51 +408,30 @@ async fn waits_on_a_lock(conn: &mut AsyncPgConnection, pid: i32) -> bool {
 /// persist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deadlocked_terminal_persist_runs_the_cycle_again() {
+    const GATE: &str = "harvest_test_tx1822_terminal_gate";
+    let _serial = TRIGGER_TESTS.lock().await;
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let mut gate = connect(&url).await;
     let gate_key = i32::try_from(std::process::id() % 1_000_000 + 1_000_000).expect("fits i32");
 
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    install_gate(&mut conn, gate_key, "WorkflowCompleted", &[exec_id]).await;
+    install_gate(&mut conn, GATE, gate_key, "WorkflowCompleted", &[exec_id]).await;
     set_gate(&mut gate, gate_key, true).await;
-
-    let workflow_id = format!("tx1822-tag-{}", uuid::Uuid::new_v4());
-    autumn_harvest::execution::start_or_load_workflow_execution(
+    start_run(
         &mut conn,
-        StartWorkflowParams::new(
-            "tx1822_tag_and_complete",
-            &workflow_id,
-            exec_id,
-            serde_json::json!({}),
-            "default",
-        ),
-        None,
+        "tx1822_tag_and_complete",
+        exec_id,
+        serde_json::json!({}),
     )
-    .await
-    .expect("start workflow");
-
-    let metrics = Arc::new(RetryMetrics::default());
-    let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics.clone()).build());
-    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
-        vec![tx1822_tag_and_complete_info()],
-        vec![],
-        empty_shared_state(),
-        telemetry,
-    ));
-    let worker = build_runtime_worker("tx1822-terminal-worker", 2, 2, registry);
-    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
-
-    let parked = tokio::time::timeout(Duration::from_secs(20), async {
-        while gate_waiters(&mut conn, gate_key).await < 1 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
     .await;
-    if parked.is_err() {
-        remove_gate(&mut conn).await;
-        panic!("the terminal persist must park on the gate");
-    }
+    let (metrics, worker, handle) = spawn_worker(
+        &url,
+        "tx1822-terminal-worker",
+        tx1822_tag_and_complete_info(),
+    );
+
+    wait_for_parked(&mut conn, &mut gate, GATE, gate_key, 1).await;
 
     let mut blocker = connect(&url).await;
     let blocker_pid = backend_pid(&mut blocker).await;
@@ -428,9 +456,13 @@ async fn a_deadlocked_terminal_persist_runs_the_cycle_again() {
             .await
             .expect("rollback blocker");
     });
-    while !waits_on_a_lock(&mut conn, blocker_pid).await {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !waits_on_a_lock(&mut conn, blocker_pid).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the blocker must wait on the execution row");
 
     set_gate(&mut gate, gate_key, false).await;
     blocked.await.expect("join blocker");
@@ -438,7 +470,7 @@ async fn a_deadlocked_terminal_persist_runs_the_cycle_again() {
     let state = wait_for_terminal(&url, exec_id).await;
     worker.shutdown();
     let _ = handle.await;
-    remove_gate(&mut conn).await;
+    remove_gate(&mut conn, GATE).await;
 
     assert_eq!(state, "COMPLETED", "the cycle runs again and commits");
     assert_eq!(
