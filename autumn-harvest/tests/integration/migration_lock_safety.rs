@@ -2021,11 +2021,11 @@ fn conforming_change(s: &Stmts, k: usize, path_change: Option<usize>) -> Option<
     // change, may be a user function. So it never turns the setting on. A
     // name that the lint cannot read counts as a session `off`.
     let schema = (k >= 2 && s.is_punct(k - 1, '.')).then(|| s.word(k - 2));
-    let built_in = match schema {
-        Some(name) => name == Some("pg_catalog"),
-        // A call resolves before its own statement changes the path.
-        None => path_change.is_none_or(|c| c >= s.starts[k]),
-    };
+    // An unqualified call resolves before its own statement changes the path.
+    let built_in = schema.map_or_else(
+        || path_change.is_none_or(|c| c >= s.starts[k]),
+        |name| name == Some("pg_catalog"),
+    );
     if call && !built_in {
         return None;
     }
