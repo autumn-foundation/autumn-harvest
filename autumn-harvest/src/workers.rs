@@ -904,7 +904,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         shard_assignments,
         registered_workflows,
         registered_activities,
-    } = *policy;
+    } = policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
         names.sort_unstable();
@@ -931,7 +931,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "build_id": build_id,
         "labels": labels,
         "slots": slots.key(),
-        "sessions": session_slots.max(0),
+        "sessions": (*session_slots).max(0),
         "priority_aging_secs": priority_aging_secs,
         "ineligible_activities": sorted_names(ineligible_activities),
         "shards": shards,
@@ -957,7 +957,7 @@ fn sorted_names(names: &[String]) -> Vec<&str> {
 /// and of the poll loop around it. Two inputs stay out on purpose. The worker
 /// id is unique to each worker. The open circuit breakers are the worker's
 /// own health, which the comparison measures. A new claim input belongs here.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CohortPolicy<'a> {
     /// The queues the worker polls.
     pub queues: &'a [String],
@@ -987,7 +987,7 @@ pub struct CohortPolicy<'a> {
 
 /// How a worker sizes its slots per task kind, as its cohort key records it
 /// (issue #1815).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotPolicy {
     /// Fixed slots per kind. A kind with 0 slots is not claimed.
     Fixed {
@@ -1008,8 +1008,8 @@ pub enum SlotPolicy {
         workflow: usize,
         /// The initial activity target.
         activity: usize,
-        /// The tuner's name.
-        tuner: &'static str,
+        /// The tuner's policy: see [`crate::slot_tuner::SlotTuner::policy`].
+        tuner: String,
     },
 }
 
@@ -1037,13 +1037,13 @@ impl SlotPolicy {
                     max,
                     workflow: crate::slot_tuner::initial_target(workflow_max, min, max),
                     activity: crate::slot_tuner::initial_target(activity_max, min, max),
-                    tuner: config.tuner.name(),
+                    tuner: config.tuner.policy(),
                 }
             },
         )
     }
 
-    fn key(self) -> serde_json::Value {
+    fn key(&self) -> serde_json::Value {
         match self {
             Self::Fixed { workflow, activity } => {
                 serde_json::json!({ "workflow": workflow, "activity": activity })
@@ -3084,6 +3084,56 @@ mod tests {
         );
         let wider = SlotTunerConfig::new(5, 60);
         assert_ne!(tuned(0, 10), SlotPolicy::of(0, 10, Some(&wider)));
+    }
+
+    /// Issue #1815: two tuners can share a name and still resize slots
+    /// differently. A tuned worker is keyed on the policy of its tuner, not
+    /// only on its name.
+    #[test]
+    fn a_tuned_worker_is_keyed_on_its_tuner_policy() {
+        use super::SlotPolicy;
+        use crate::slot_tuner::{DefaultSlotTuner, SlotTunerConfig};
+        let policy = |tuner: DefaultSlotTuner| {
+            SlotPolicy::of(
+                10,
+                10,
+                Some(&SlotTunerConfig::with_tuner(
+                    5,
+                    50,
+                    std::sync::Arc::new(tuner),
+                )),
+            )
+        };
+        let default = policy(DefaultSlotTuner::default());
+        assert_eq!(
+            default,
+            SlotPolicy::of(10, 10, Some(&SlotTunerConfig::new(5, 50))),
+            "the same settings give the same key"
+        );
+        assert_ne!(
+            default,
+            policy(DefaultSlotTuner {
+                grow_step: 8,
+                ..DefaultSlotTuner::default()
+            }),
+            "the grow step changes the key"
+        );
+        assert_ne!(
+            default,
+            policy(DefaultSlotTuner {
+                shrink_step: 1,
+                ..DefaultSlotTuner::default()
+            }),
+            "the shrink step changes the key"
+        );
+        assert_ne!(
+            default,
+            policy(DefaultSlotTuner {
+                permit_wait_grow_threshold: std::time::Duration::from_millis(500),
+                ..DefaultSlotTuner::default()
+            }),
+            "the wait threshold changes the key"
+        );
     }
 
     /// Issue #1815: under load, the claim gate gives each worker a task mix

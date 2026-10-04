@@ -53,12 +53,18 @@ heartbeat check only. A worker that was alive but sick passed that check.
   verdicts.
 - The peers are the live `Active` workers that poll the same queues with the
   same `queue_weights`, on the same build with the same labels and the same
-  slots per task kind (or the same slot-tuner band), session capacity,
+  slots per task kind (or the same slot-tuner band and tuner policy),
+  session capacity,
   priority aging, activity eligibility, shards and registered handlers, with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A
   worker on a slow queue is not compared with a fast queue. Each heartbeat
   reads only its own cohort, so the read stays small in a large fleet.
+- `SlotTuner` gains `policy()`, a stable description of every setting
+  that changes `decide`. It defaults to `name()`. `DefaultSlotTuner`
+  includes its grow step, shrink step and wait threshold. A custom tuner
+  with settings overrides it, so that differently tuned workers are not
+  peers.
 - A worker is an outlier on failure ratio when its ratio is at least 20
   points above the peer median. The ratio must also be at least twice the
   median.

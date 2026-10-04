@@ -149,6 +149,16 @@ pub trait SlotTuner: Send + Sync {
     fn name(&self) -> &'static str {
         "custom"
     }
+
+    /// A stable description of every setting that changes `decide`.
+    ///
+    /// Workers compare their task outcomes only with peers whose tuners
+    /// return the same policy (issue #1815). Two tuners with one `name` can
+    /// resize slots differently, so a configurable tuner includes its
+    /// settings here. The default is `name`.
+    fn policy(&self) -> String {
+        self.name().to_owned()
+    }
 }
 
 /// The harvest-provided default controller.
@@ -205,6 +215,16 @@ impl SlotTuner for DefaultSlotTuner {
 
     fn name(&self) -> &'static str {
         "harvest-default"
+    }
+
+    fn policy(&self) -> String {
+        format!(
+            "{} grow={} shrink={} wait_ns={}",
+            self.name(),
+            self.grow_step,
+            self.shrink_step,
+            self.permit_wait_grow_threshold.as_nanos()
+        )
     }
 }
 
@@ -865,6 +885,27 @@ impl TunedSlot {
 #[allow(clippy::significant_drop_tightening, clippy::collection_is_never_read)]
 mod tests {
     use super::*;
+
+    /// Issue #1815: a tuner without settings of its own reports its name as
+    /// its policy. The default tuner adds every setting that changes
+    /// `decide`.
+    #[test]
+    fn policy_defaults_to_the_name_and_the_default_tuner_adds_its_settings() {
+        struct Named;
+        impl SlotTuner for Named {
+            fn decide(&self, _observations: &SlotObservations) -> SlotTunerAction {
+                SlotTunerAction::Hold
+            }
+            fn name(&self) -> &'static str {
+                "named"
+            }
+        }
+        assert_eq!(Named.policy(), "named");
+        assert_eq!(
+            DefaultSlotTuner::default().policy(),
+            "harvest-default grow=2 shrink=2 wait_ns=50000000"
+        );
+    }
 
     fn observations(
         current_target: usize,
