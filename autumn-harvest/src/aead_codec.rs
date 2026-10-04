@@ -43,7 +43,9 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
@@ -178,18 +180,31 @@ impl From<KeyProviderError> for HarvestError {
     }
 }
 
+/// The future that a [`KeyProvider`] or [`KmsDecrypt`] method returns.
+pub type KeyFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// A source of data keys for [`AeadCodec`].
 ///
 /// [`AeadCodec::load`] calls the provider once per key id, at startup. The
 /// encode and decode paths never call it.
-#[async_trait::async_trait]
+///
+/// Implement it with `#[async_trait]` on the `impl` block and an `async fn`.
+/// The signature here is the one that `#[async_trait]` generates. It is
+/// written out because `#[async_trait]` on the trait adds a `#[must_use]`
+/// that clippy rejects as `double_must_use`.
 pub trait KeyProvider: Send + Sync {
     /// Return the data key for `key_id`.
     ///
-    /// # Errors
-    ///
-    /// [`KeyProviderError`] when the key is unknown, invalid or unavailable.
-    async fn data_key(&self, key_id: &str) -> Result<DataKey, KeyProviderError>;
+    /// The future fails with [`KeyProviderError`] when the key is unknown,
+    /// invalid or unavailable.
+    fn data_key<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        key_id: &'life1 str,
+    ) -> KeyFuture<'async_trait, Result<DataKey, KeyProviderError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 }
 
 /// An AES-256-GCM [`PayloadCodec`] that holds one data key.
@@ -307,13 +322,15 @@ impl PayloadCodec for AeadCodec {
         if key_id != self.key_id.as_bytes() {
             return Err(key_id_mismatch(key_id, &self.key_id));
         }
+        // The version and key id match, so the stored header equals
+        // `self.header`.
         let (nonce, body) = rest.split_at(NONCE_BYTES);
         let (ciphertext, tag) = body.split_at(body.len() - TAG_BYTES);
         let mut plaintext = ciphertext.to_vec();
         self.cipher
             .decrypt_in_place_detached(
                 Nonce::from_slice(nonce),
-                &encoded[..2 + key_len],
+                &self.header,
                 &mut plaintext,
                 Tag::from_slice(tag),
             )
@@ -335,14 +352,14 @@ fn key_id_mismatch(found: &[u8], expected: &str) -> CodecError {
     let found = std::str::from_utf8(found)
         .ok()
         .filter(|id| validate_key_id(id).is_ok());
-    CodecError(match found {
-        Some(found) => format!(
-            "aes-256-gcm: the payload uses codec key id {found:?}, but this codec holds {expected:?}"
-        ),
-        None => format!(
-            "aes-256-gcm: the payload has an invalid key id; this codec holds {expected:?}"
-        ),
-    })
+    CodecError(found.map_or_else(
+        || format!("aes-256-gcm: the payload has an invalid key id; this codec holds {expected:?}"),
+        |found| {
+            format!(
+                "aes-256-gcm: the payload uses codec key id {found:?}, but this codec holds {expected:?}"
+            )
+        },
+    ))
 }
 
 /// Map a [`DataKeyError`] to [`KeyProviderError::InvalidKey`].
@@ -399,12 +416,15 @@ impl KeyProvider for EnvKeyProvider {
             key_id: key_id.to_string(),
             reason: format!("environment variable {var} is not set"),
         })?;
-        let value = Zeroizing::new(value.into_string().map_err(|_| {
-            KeyProviderError::InvalidKey {
-                key_id: key_id.to_string(),
-                reason: format!("environment variable {var} is not valid UTF-8"),
-            }
-        })?);
+        let value =
+            Zeroizing::new(
+                value
+                    .into_string()
+                    .map_err(|_| KeyProviderError::InvalidKey {
+                        key_id: key_id.to_string(),
+                        reason: format!("environment variable {var} is not valid UTF-8"),
+                    })?,
+            );
         DataKey::from_base64(&value).map_err(|err| invalid_key(key_id, err))
     }
 }
@@ -455,22 +475,26 @@ impl KeyProvider for FileKeyProvider {
 /// The one KMS call that [`KmsKeyProvider`] needs.
 ///
 /// The `aws-kms` feature implements this for `aws_sdk_kms::Client`. Other
-/// KMS products can implement it too.
-#[async_trait::async_trait]
+/// KMS products can implement it too. Implement it with `#[async_trait]`, as
+/// for [`KeyProvider`].
 pub trait KmsDecrypt: Send + Sync {
     /// Unwrap `wrapped` with the KMS key `kms_key_id`. Send `context` as
     /// the encryption context.
     ///
-    /// # Errors
-    ///
-    /// A reason string when the KMS refuses or cannot be reached. The string
-    /// must not hold key material.
-    async fn decrypt(
-        &self,
-        kms_key_id: &str,
-        wrapped: &[u8],
-        context: &BTreeMap<String, String>,
-    ) -> Result<Zeroizing<Vec<u8>>, String>;
+    /// The future fails with a reason string when the KMS refuses or cannot
+    /// be reached. The string must not hold key material.
+    fn decrypt<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        kms_key_id: &'life1 str,
+        wrapped: &'life2 [u8],
+        context: &'life3 BTreeMap<String, String>,
+    ) -> KeyFuture<'async_trait, Result<Zeroizing<Vec<u8>>, String>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait;
 }
 
 /// Unwraps wrapped data keys through a KMS (envelope encryption).
@@ -684,7 +708,10 @@ mod tests {
     fn a_different_key_id_fails_decode() {
         let stored = codec("k1", KEY_A).encode(b"secret").unwrap();
         let err = codec("k2", KEY_A).decode(&stored).unwrap_err();
-        assert!(err.0.contains("\"k1\"") && err.0.contains("\"k2\""), "{err}");
+        assert!(
+            err.0.contains("\"k1\"") && err.0.contains("\"k2\""),
+            "{err}"
+        );
     }
 
     // ── construction and key material ──────────────────────────────────
@@ -820,10 +847,13 @@ mod tests {
         }
     }
 
+    /// One recorded KMS call: KMS key id, wrapped key and context.
+    type KmsCall = (String, Vec<u8>, BTreeMap<String, String>);
+
     /// A fake KMS that unwraps by XOR with `0xFF` and records each call.
     #[derive(Default)]
     struct FakeKms {
-        calls: Mutex<Vec<(String, Vec<u8>, BTreeMap<String, String>)>>,
+        calls: Mutex<Vec<KmsCall>>,
         fail: bool,
     }
 
@@ -860,7 +890,7 @@ mod tests {
         let stored = self::codec("k1", KEY_A).encode(b"x").unwrap();
         assert_eq!(codec.decode(&stored).unwrap(), b"x");
 
-        let calls = kms.calls.lock().unwrap();
+        let calls = std::mem::take(&mut *kms.calls.lock().unwrap());
         assert_eq!(calls.len(), 1);
         let (kms_key_id, wrapped, context) = &calls[0];
         assert_eq!(kms_key_id, "arn:aws:kms:eu-west-1:1:key/abc");
@@ -933,10 +963,7 @@ mod tests {
         let mut stored = codecs
             .encode_event(&started(json!({"user": "alice"})))
             .unwrap();
-        assert_eq!(
-            codec_envelope_key_id(&stored["data"]["input"]),
-            Some("k1")
-        );
+        assert_eq!(codec_envelope_key_id(&stored["data"]["input"]), Some("k1"));
 
         codecs.set_active_key("k2").unwrap();
         let outcome = reencrypt_event_payload_fields(&codecs, &mut stored).unwrap();

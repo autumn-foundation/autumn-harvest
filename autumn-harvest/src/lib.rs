@@ -194,10 +194,10 @@ pub fn test_partitioned_layout_requested() -> bool {
 
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
-/// AES-256-GCM payload codec and data-key providers (issue #1825).
-pub mod aead_codec;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
+/// AES-256-GCM payload codec and data-key providers (issue #1825).
+pub mod aead_codec;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Pure token-secret helpers shared by the mint route and the CLI (issue #942).

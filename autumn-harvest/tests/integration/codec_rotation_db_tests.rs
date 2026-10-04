@@ -32,6 +32,9 @@
 //!   covered in the plugin crate's `codec_rotation_admin_integration.rs`.
 //! - **AC8** (composition with offload / erasure) —
 //!   [`offload_envelopes_and_tombstones_survive_a_sweep_untouched`].
+//! - **Issue #1825** (the production AES-256-GCM codec rotates and replays
+//!   byte-identically) — [`replay_fidelity_is_byte_identical_across_a_sweep`]
+//!   runs once with the XOR fixture codec and once with `AeadCodec`.
 //! - **Issue #1251** (a sweep batch cannot commit a row under a key retired
 //!   mid-batch) —
 //!   [`a_batch_pinned_to_a_key_blocks_its_retirement_through_a_double_rotation`].
