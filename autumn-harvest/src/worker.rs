@@ -5628,6 +5628,9 @@ async fn append_activity_started_if_pending(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Whether the handler runs after this start (issue #1809). A fail-fast
+    // short circuit appends `ActivityStarted` but calls no handler.
+    handler_runs: bool,
 ) -> HarvestResult<Option<StartedActivity>> {
     Box::pin(
         conn.transaction::<Option<StartedActivity>, HarvestError, _>(async |conn| {
@@ -5643,12 +5646,15 @@ async fn append_activity_started_if_pending(
             if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
                 return Ok(None);
             }
-            // This claim appends `ActivityStarted` now (issue #1809). Only such
-            // an attempt can time out against the downstream, so only its
-            // timeout feeds the circuit breaker.
-            queue::mark_claim_handler_started(conn, &claim_of_task(task)?)
-                .await?
-                .require_applied(task.id)?;
+            // This claim starts its handler now (issue #1809). Only such an
+            // attempt can time out against the downstream, so only its
+            // timeout feeds the circuit breaker. A fail-fast short circuit
+            // calls no handler, so it sets no marker.
+            if handler_runs {
+                queue::mark_claim_handler_started(conn, &claim_of_task(task)?)
+                    .await?
+                    .require_applied(task.id)?;
+            }
 
             let started_event = WorkflowEvent::ActivityStarted {
                 activity_id,
@@ -5688,7 +5694,7 @@ pub async fn append_activity_started_for_test(
     worker_id: &str,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<ActivityExecId>> {
-    append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs)
+    append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs, true)
         .await
         .map(|started| started.map(|s| s.activity_id))
 }
@@ -15191,8 +15197,8 @@ impl<'a> CircuitProbeGuard<'a> {
         token: Option<crate::circuit_breaker::DispatchToken>,
         claim: crate::circuit_breaker::ClaimKey,
     ) -> Self {
-        if token.is_some() {
-            breakers.begin_claim(activity_name, claim);
+        if let Some(token) = token {
+            breakers.begin_claim(activity_name, claim, token);
         }
         Self {
             breakers,
@@ -15809,6 +15815,8 @@ async fn process_activity_task(
             activity_name,
             worker_id,
             registry.payload_codecs(),
+            // A short circuit admitted no dispatch token and runs no handler.
+            circuit_token.is_some(),
         )
         .await;
         let Some(started) = fail_execution_on_error(

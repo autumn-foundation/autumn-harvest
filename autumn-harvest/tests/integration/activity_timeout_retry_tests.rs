@@ -1323,6 +1323,16 @@ async fn fail_fast_mode_fails_the_attempt() {
         )
     });
     assert!(failed, "the activity fails with CircuitOpen");
+    // A short circuit calls no handler, so its timeout must not feed the
+    // breaker (issue #1809).
+    let markers: Vec<Option<i32>> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select(harvest_task_queue::handler_started_attempt)
+        .load(&mut conn)
+        .await
+        .expect("the activity task");
+    assert_eq!(markers, vec![None], "a short circuit starts no handler");
 
     worker.shutdown();
     handle.await.expect("worker joins");

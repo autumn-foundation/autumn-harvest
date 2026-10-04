@@ -122,6 +122,15 @@ pub struct ClaimKey {
     pub attempt: i32,
 }
 
+/// A claim that this process dispatched and that has not reported yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InFlightClaim {
+    /// The token of its dispatch. A confirmed timeout releases a probe slot
+    /// with it, before the handler returns.
+    token: DispatchToken,
+    state: ClaimState,
+}
+
 /// Where a claim of this process stands against the timeout enforcer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimState {
@@ -237,7 +246,7 @@ struct BreakerState {
     /// concurrency limit of claims, so the map stays small. Every exit of a
     /// dispatch removes its entry, so no mark can expire while its claim can
     /// still report.
-    in_flight_claims: HashMap<ClaimKey, ClaimState>,
+    in_flight_claims: HashMap<ClaimKey, InFlightClaim>,
 }
 
 impl Default for BreakerState {
@@ -472,10 +481,11 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        match st.in_flight_claims.get(&claim).copied() {
+        match st.in_flight_claims.get(&claim).map(|entry| entry.state) {
             Some(ClaimState::Provisional(deciding)) => {
-                st.in_flight_claims
-                    .insert(claim, ClaimState::Held(outcome, token, deciding));
+                if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                    entry.state = ClaimState::Held(outcome, token, deciding);
+                }
                 None
             }
             Some(ClaimState::TimedOut) => {
@@ -494,13 +504,19 @@ impl CircuitBreakerRegistry {
     ///
     /// Only a registered claim can be marked. Call [`end_claim`](Self::end_claim)
     /// or a claim-aware report on every exit of the dispatch.
-    pub fn begin_claim(&self, activity_name: &str, claim: ClaimKey) {
+    pub fn begin_claim(&self, activity_name: &str, claim: ClaimKey, token: DispatchToken) {
         if !self.policies.contains_key(activity_name) {
             return;
         }
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-        st.in_flight_claims.insert(claim, ClaimState::Running);
+        st.in_flight_claims.insert(
+            claim,
+            InFlightClaim {
+                token,
+                state: ClaimState::Running,
+            },
+        );
     }
 
     /// Remove `claim` from the in-flight set without a result (issue #1809).
@@ -512,7 +528,10 @@ impl CircuitBreakerRegistry {
         }
         let mut states = self.lock();
         if let Some(st) = states.get_mut(activity_name)
-            && !matches!(st.in_flight_claims.get(&claim), Some(ClaimState::Held(..)))
+            && !matches!(
+                st.in_flight_claims.get(&claim).map(|entry| entry.state),
+                Some(ClaimState::Held(..))
+            )
         {
             st.in_flight_claims.remove(&claim);
         }
@@ -532,11 +551,11 @@ impl CircuitBreakerRegistry {
             return;
         }
         let mut states = self.lock();
-        if let Some(state) = states
+        if let Some(entry) = states
             .get_mut(activity_name)
             .and_then(|st| st.in_flight_claims.get_mut(&claim))
         {
-            *state = match *state {
+            entry.state = match entry.state {
                 ClaimState::Running => ClaimState::Provisional(1),
                 ClaimState::Provisional(deciding) => {
                     ClaimState::Provisional(deciding.saturating_add(1))
@@ -549,8 +568,10 @@ impl CircuitBreakerRegistry {
         }
     }
 
-    /// The enforcer timed `claim` out (issue #1809). A held result is dropped
-    /// and releases its probe slot. A later result does not count.
+    /// The enforcer timed `claim` out (issue #1809). The claim's probe slot,
+    /// if it holds one, is released now, so a stuck handler cannot keep the
+    /// breaker half-open. A held result is dropped. A later result does not
+    /// count.
     pub fn confirm_claim_timed_out(&self, activity_name: &str, claim: ClaimKey, now: Instant) {
         if !self.policies.contains_key(activity_name) {
             return;
@@ -559,16 +580,21 @@ impl CircuitBreakerRegistry {
         let Some(st) = states.get_mut(activity_name) else {
             return;
         };
-        match st.in_flight_claims.get(&claim).copied() {
-            Some(ClaimState::Held(_, token, _)) => {
+        let Some(entry) = st.in_flight_claims.get(&claim).copied() else {
+            return;
+        };
+        match entry.state {
+            ClaimState::Held(..) => {
                 st.in_flight_claims.remove(&claim);
-                apply_cancelled(st, token, now);
             }
-            Some(ClaimState::Provisional(_)) => {
-                st.in_flight_claims.insert(claim, ClaimState::TimedOut);
+            ClaimState::Provisional(_) => {
+                if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                    entry.state = ClaimState::TimedOut;
+                }
             }
-            _ => {}
+            ClaimState::Running | ClaimState::TimedOut => return,
         }
+        apply_cancelled(st, entry.token, now);
     }
 
     /// The enforcer did not time `claim` out after all (issue #1809). A held
@@ -582,26 +608,25 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.get_mut(activity_name)?;
-        match st.in_flight_claims.get(&claim).copied() {
-            Some(ClaimState::Held(outcome, token, deciding)) if deciding > 1 => {
-                st.in_flight_claims
-                    .insert(claim, ClaimState::Held(outcome, token, deciding - 1));
+        let entry = st.in_flight_claims.get_mut(&claim)?;
+        match entry.state {
+            ClaimState::Held(outcome, token, deciding) if deciding > 1 => {
+                entry.state = ClaimState::Held(outcome, token, deciding - 1);
                 None
             }
-            Some(ClaimState::Held(outcome, token, _)) => {
+            ClaimState::Held(outcome, token, _) => {
                 st.in_flight_claims.remove(&claim);
                 apply_result(st, policy, outcome, token, now)
             }
-            Some(ClaimState::Provisional(deciding)) if deciding > 1 => {
-                st.in_flight_claims
-                    .insert(claim, ClaimState::Provisional(deciding - 1));
+            ClaimState::Provisional(deciding) if deciding > 1 => {
+                entry.state = ClaimState::Provisional(deciding - 1);
                 None
             }
-            Some(ClaimState::Provisional(_)) => {
-                st.in_flight_claims.insert(claim, ClaimState::Running);
+            ClaimState::Provisional(_) => {
+                entry.state = ClaimState::Running;
                 None
             }
-            _ => None,
+            ClaimState::Running | ClaimState::TimedOut => None,
         }
     }
 
@@ -948,6 +973,12 @@ mod tests {
         assert!(reg.is_empty());
     }
 
+    /// A token for claims whose probe role does not matter to the test.
+    const TOKEN: DispatchToken = DispatchToken {
+        generation: 0,
+        is_probe: false,
+    };
+
     fn claim(attempt: i32) -> ClaimKey {
         ClaimKey {
             task_id: Uuid::from_u128(1809),
@@ -968,7 +999,7 @@ mod tests {
         let reg = registry();
         let t0 = Instant::now();
         let token = dispatch(&reg, t0);
-        reg.begin_claim("send_email", claim(1));
+        reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         reg.confirm_claim_timed_out("send_email", claim(1), t0);
         let _ = reg.on_external_failure("send_email", t0);
@@ -991,7 +1022,7 @@ mod tests {
         let reg = registry();
         let t0 = Instant::now();
         let token = dispatch(&reg, t0);
-        reg.begin_claim("send_email", claim(1));
+        reg.begin_claim("send_email", claim(1), TOKEN);
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
         reg.mark_claim_timed_out("send_email", claim(1));
         reg.confirm_claim_timed_out("send_email", claim(1), t0);
@@ -1010,17 +1041,18 @@ mod tests {
         let t1 = t0 + Duration::from_secs(61);
         let probe = dispatch(&reg, t1);
         assert!(probe.is_probe());
-        reg.begin_claim("send_email", claim(1));
+        reg.begin_claim("send_email", claim(1), probe);
         reg.mark_claim_timed_out("send_email", claim(1));
         reg.confirm_claim_timed_out("send_email", claim(1), t1);
-        let late = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t1);
-        assert_eq!(late, None, "a timed-out probe does not close the breaker");
+        // The handler has not returned. The confirm alone frees the slot.
         assert_eq!(
             reg.snapshot("send_email", t1).expect("tracked").state,
             "open"
         );
         let t2 = t1 + Duration::from_secs(61);
         assert!(dispatch(&reg, t2).is_probe(), "a fresh probe is admitted");
+        let late = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t2);
+        assert_eq!(late, None, "a timed-out probe does not close the breaker");
     }
 
     /// The enforcer marks before its transaction and unmarks when the
@@ -1031,7 +1063,7 @@ mod tests {
         let t0 = Instant::now();
         fail(&reg, t0);
         let token = dispatch(&reg, t0);
-        reg.begin_claim("send_email", claim(1));
+        reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
@@ -1054,7 +1086,7 @@ mod tests {
         }
         let t1 = t0 + Duration::from_secs(61);
         let probe = dispatch(&reg, t1);
-        reg.begin_claim("send_email", claim(1));
+        reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         let held = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t1);
         assert_eq!(held, None, "the result waits for the enforcer");
@@ -1070,7 +1102,7 @@ mod tests {
         let t0 = Instant::now();
         fail(&reg, t0);
         let token = dispatch(&reg, t0);
-        reg.begin_claim("send_email", claim(1));
+        reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
         reg.confirm_claim_timed_out("send_email", claim(1), t0);
@@ -1091,7 +1123,7 @@ mod tests {
             let t0 = Instant::now();
             fail(&reg, t0);
             let token = dispatch(&reg, t0);
-            reg.begin_claim("send_email", claim(1));
+            reg.begin_claim("send_email", claim(1), TOKEN);
             reg.mark_claim_timed_out("send_email", claim(1));
             reg.mark_claim_timed_out("send_email", claim(1));
             if rollback_first {
@@ -1113,7 +1145,7 @@ mod tests {
         let t0 = Instant::now();
         fail(&reg, t0);
         let token = dispatch(&reg, t0);
-        reg.begin_claim("send_email", claim(1));
+        reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         reg.mark_claim_timed_out("send_email", claim(1));
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
@@ -1135,7 +1167,7 @@ mod tests {
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(9), t0);
         assert_eq!(rolling(&reg, t0), 0, "a foreign mark does not fence");
 
-        reg.begin_claim("send_email", claim(1));
+        reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         reg.end_claim("send_email", claim(1));
         let states = reg.lock();
