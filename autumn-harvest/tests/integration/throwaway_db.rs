@@ -51,12 +51,13 @@ fn url_scheme_len(dsn: &str) -> Option<usize> {
 
 /// The keyword/value DSN `dsn` with `key` set to `value`. The result quotes
 /// every value, so a value with spaces or quotes stays whole.
+///
+/// libpq takes the last of a repeated key. So the rewrite removes every copy
+/// of `key` and appends the new value at the end.
 fn set_conninfo(dsn: &str, key: &str, value: &str) -> String {
     let mut pairs = parse_conninfo(dsn);
-    match pairs.iter_mut().find(|(k, _)| k == key) {
-        Some(pair) => pair.1 = value.to_string(),
-        None => pairs.push((key.to_string(), value.to_string())),
-    }
+    pairs.retain(|(k, _)| k != key);
+    pairs.push((key.to_string(), value.to_string()));
     pairs
         .iter()
         .map(|(k, v)| format!("{k}='{}'", v.replace('\\', "\\\\").replace('\'', "\\'")))
@@ -218,10 +219,10 @@ mod tests {
     }
 
     #[test]
-    fn a_keyword_dsn_gets_its_dbname_replaced() {
+    fn a_keyword_dsn_gets_its_dbname_moved_to_the_end() {
         assert_eq!(
             with_database("host=h user=u dbname=postgres sslmode=require", "t1"),
-            "host='h' user='u' dbname='t1' sslmode='require'"
+            "host='h' user='u' sslmode='require' dbname='t1'"
         );
     }
 
@@ -242,7 +243,7 @@ mod tests {
                 r"host = h dbname='test db' password='a \'b\' = c' sslmode=require",
                 "t1"
             ),
-            r"host='h' dbname='t1' password='a \'b\' = c' sslmode='require'"
+            r"host='h' password='a \'b\' = c' sslmode='require' dbname='t1'"
         );
     }
 
@@ -258,6 +259,16 @@ mod tests {
         assert_eq!(
             with_application_name(dsn, "app"),
             "host='db' password='https://secret' dbname='postgres' application_name='app'"
+        );
+    }
+
+    /// libpq takes the last of a repeated key. The rewrite must leave no
+    /// earlier or later copy that could win over the throwaway database.
+    #[test]
+    fn a_repeated_dbname_cannot_override_the_throwaway_database() {
+        assert_eq!(
+            with_database("dbname=postgres host=h dbname=admin", "t1"),
+            "host='h' dbname='t1'"
         );
     }
 
