@@ -30260,18 +30260,9 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
-        // Draining: transition status on every shard pool. Bounded (issue
-        // #1209): sequential visits mean one exhausted shard pool would
-        // otherwise park this loop and never reach its peers.
+        // Bounded (issue #1209): the shutdown writes visit the shards one by
+        // one, so one exhausted shard pool must not park the others' writes.
         let shutdown_acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
-        for (_, shard_pool) in &shard_targets {
-            self.transition_fleet_status(
-                shard_pool,
-                crate::workers::WorkerStatus::Draining,
-                shutdown_acquire_bound,
-            )
-            .await;
-        }
         self.drain_releasing_sticky_pins(&shard_targets, shutdown_acquire_bound)
             .await;
 
@@ -30727,18 +30718,21 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
-        // Transition to Draining before waiting for in-flight tasks. `None`:
-        // the single-shard path has no peer to strand, so it uses the pool's
-        // own bound (issue #1788).
-        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
-            .await;
-
-        // This worker claims no new task now. Release its pins before the
-        // drain, so a wake during the drain does not re-arm them.
-        self.release_sticky_pins(pool, None).await;
-
+        // Mark the worker Draining and release its pins while the drain
+        // runs. `None`: the single-shard path has no peer to strand, so it
+        // uses the pool's own bound (issue #1788). This worker claims no new
+        // task now, so a wake during the drain does not re-arm a pin.
+        //
+        // The drain starts at once, so its deadline and cancel point count
+        // from the signal. A slow pool cannot spend the grace period on
+        // this bookkeeping first (issue #1813).
+        let bookkeeping = async {
+            self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
+                .await;
+            self.release_sticky_pins(pool, None).await;
+        };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
-        self.drain_in_flight().await;
+        tokio::join!(bookkeeping, self.drain_in_flight());
         self.keep_lease_while_handlers_run(vec![pool.clone()]);
 
         // A decision that parked during the drain pinned its task again.
@@ -32896,22 +32890,37 @@ impl Worker {
     }
 
     /// Drain in-flight tasks of a multi-shard worker, with a sticky-pin
-    /// release on every shard pool before and after the drain (issue #1798).
+    /// release on every shard pool at drain start and after the drain (issue
+    /// #1798).
     ///
     /// The first release stops a wake during the drain from re-arming a pin.
     /// A decision that parks during the drain pins its task again, so the
     /// second release clears that pin. A task that outlives the drain keeps
     /// its pin.
+    ///
+    /// The Draining writes and the first release run while the drain runs.
+    /// The drain deadline and cancel point then count from the signal, and
+    /// slow shard pools cannot spend the grace period first (issue #1813).
     async fn drain_releasing_sticky_pins(
         &self,
         shard_targets: &[(crate::types::ShardId, DbPool)],
         acquire_bound: Option<Duration>,
     ) {
-        for (_, shard_pool) in shard_targets {
-            self.release_sticky_pins(shard_pool, acquire_bound).await;
-        }
+        let bookkeeping = async {
+            for (_, shard_pool) in shard_targets {
+                self.transition_fleet_status(
+                    shard_pool,
+                    crate::workers::WorkerStatus::Draining,
+                    acquire_bound,
+                )
+                .await;
+            }
+            for (_, shard_pool) in shard_targets {
+                self.release_sticky_pins(shard_pool, acquire_bound).await;
+            }
+        };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
-        self.drain_in_flight().await;
+        tokio::join!(bookkeeping, self.drain_in_flight());
         self.keep_lease_while_handlers_run(
             shard_targets.iter().map(|(_, pool)| pool.clone()).collect(),
         );
