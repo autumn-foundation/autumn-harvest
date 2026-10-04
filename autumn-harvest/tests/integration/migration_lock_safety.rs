@@ -2163,6 +2163,8 @@ fn resolve(
 
 /// Whether each token runs on every path through its `DO` body.
 ///
+/// A token in nested SQL surely runs only when its enclosing statement does.
+///
 /// A token inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`, `EXIT` or
 /// `CONTINUE`, may not run. Nothing in a body with an `EXCEPTION` handler surely runs, because
 /// the handler rolls the block back. A `CASE` expression that ends in a bare `END` leaves the rest of the
@@ -2226,7 +2228,13 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
             Some("exception") if handler(k) => *skippable = true,
             _ => {}
         }
-        out.push(depth == 0 || (*branches == 0 && !*skippable && !rolled_back[k]));
+        let here = *branches == 0 && !*skippable && !rolled_back[k];
+        // Nested SQL, such as the SQL of an `EXECUTE`, runs only when the
+        // statement around it runs. Depth 0 always runs.
+        let around = state
+            .get(1..depth)
+            .is_none_or(|outer| outer.iter().all(|&(b, skip)| b == 0 && !skip));
+        out.push(depth == 0 || (here && around));
     }
     out
 }
@@ -5285,6 +5293,24 @@ fn foreign_code_never_inherits_a_bound() {
     let sql = format!(
         "CREATE FUNCTION g() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\n{set}SELECT g();"
     );
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn an_execute_in_a_branch_sets_no_bound() {
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let set = "EXECUTE 'SET LOCAL lock_timeout = ''5s''';";
+    for body in [
+        format!("IF false THEN\n        {set}\n    END IF;"),
+        format!("LOOP\n        {set}\n        EXIT;\n    END LOOP;"),
+        format!("RETURN;\n    {set}"),
+    ] {
+        let sql = format!("DO $$\nBEGIN\n    {body}\nEND $$;\n{lock}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    }
+    // An unconditional EXECUTE still sets the bound.
+    let sql = format!("DO $$\nBEGIN\n    {set}\nEND $$;\n{lock}");
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
