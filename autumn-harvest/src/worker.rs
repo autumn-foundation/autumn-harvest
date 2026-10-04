@@ -32495,9 +32495,11 @@ impl Worker {
     /// can outlive `run`, as an embedded runtime does. Without this keeper, a
     /// peer would then start a second copy while the first one still runs.
     ///
-    /// The keeper refreshes `last_heartbeat_at` on each pool at the heartbeat
-    /// interval. It stops when the last dispatch body ends. It also stops when
-    /// the process exits, and orphan reclaim then recovers the task.
+    /// One keeper task for each pool refreshes `last_heartbeat_at` at the
+    /// heartbeat interval. A stalled shard pool therefore cannot stop the
+    /// refresh of another shard. Each keeper stops when the last dispatch body
+    /// ends. It also stops when the process exits, and orphan reclaim then
+    /// recovers the task.
     fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
         if self.dispatched.is_empty() {
             return;
@@ -32507,20 +32509,22 @@ impl Worker {
             running = self.dispatched.len(),
             "drain ended with handlers still running; the worker keeps its lease until they return"
         );
-        let dispatched = self.dispatched.clone();
-        let worker_id = self.config.worker_id.clone();
         let interval = self.config.worker_heartbeat_interval;
-        // Detached on purpose: the handlers it guards are detached too.
-        tokio::spawn(async move {
-            let done = dispatched.wait();
-            tokio::pin!(done);
-            let mut tick = tokio::time::interval(interval);
-            loop {
-                tokio::select! {
-                    biased;
-                    () = &mut done => return,
-                    _ = tick.tick() => {
-                        for pool in &pools {
+        // One task for each pool, so a stalled shard pool cannot stop the
+        // refresh of another shard. Detached on purpose: the handlers they
+        // guard are detached too.
+        for pool in pools {
+            let dispatched = self.dispatched.clone();
+            let worker_id = self.config.worker_id.clone();
+            tokio::spawn(async move {
+                let done = dispatched.wait();
+                tokio::pin!(done);
+                let mut tick = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = &mut done => return,
+                        _ = tick.tick() => {
                             let touched = match pool.get().await {
                                 Ok(mut conn) => {
                                     crate::workers::touch_worker_liveness(&mut conn, &worker_id)
@@ -32538,8 +32542,8 @@ impl Worker {
                         }
                     }
                 }
-            }
-        });
+            });
+        }
     }
 
     /// Releases the cached workflows once the in-flight drain ends (issue
