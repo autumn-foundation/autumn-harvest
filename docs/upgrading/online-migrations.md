@@ -120,7 +120,9 @@ cannot read the body it reaches. The lint does not compare parameter types, so
 a call also ends the bound when any such `CREATE` may clear it. A call of a
 clearing routine that an earlier migration created ends the bound too.
 After a `search_path` change, only `pg_catalog.set_config` sets a bound,
-because another schema may hold a `set_config` that shadows the built-in. Set the bound again after the call. A change
+because another schema may hold a `set_config` that shadows the built-in. An
+unqualified call after such a change also ends the bound. A session change
+outlives its file, so the rule holds for every later migration too. Set the bound again after the call. A change
 in the expression of an `EXECUTE` takes effect before the SQL runs. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
 `EXIT` or `CONTINUE`, does not count either, because it may not run. Nothing in a block with an
 `EXCEPTION` handler counts, because the handler rolls the block back. A clear inside a
@@ -265,6 +267,9 @@ that no longer matches a finding also fails the build.
   with `%s` anywhere in its text, even in a comment or a quoted name.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
   as code, in any quote form. Any other string is data.
+- The lint reads string literals as `standard_conforming_strings = on` does.
+  A statement that may turn the setting off counts as a lock on an unknown
+  table that no bound covers.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
   call of a routine in another language, counts as a lock on an unknown table.
   No bound covers that lock, because the code may clear the bound first. It

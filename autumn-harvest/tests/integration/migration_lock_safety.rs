@@ -242,6 +242,9 @@ struct History {
     /// Each routine in a language that the lint cannot read, without its
     /// schema. A call of such a routine may lock any table.
     foreign_routines: BTreeSet<String>,
+    /// Whether an earlier migration may have changed `search_path`. A session
+    /// value outlives its file, so a later file starts after the change.
+    search_path_changed: bool,
 }
 
 impl History {
@@ -488,7 +491,7 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
 /// A lock that unreadable `EXECUTE` SQL takes never counts as bounded.
 fn bound_in_force(analysis: &Analysis, hit: &Hit) -> bool {
     // The hidden code may clear the bound before it locks.
-    if hit.verb == UNREADABLE_EXECUTE || hit.verb == FOREIGN_CODE {
+    if [UNREADABLE_EXECUTE, FOREIGN_CODE, NONSTANDARD_STRINGS].contains(&hit.verb) {
         return false;
     }
     let Some(from) = hit.body_start else {
@@ -1598,7 +1601,10 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     // Its locks still count, which fails closed.
     let mut not_run: BTreeMap<String, usize> = BTreeMap::new();
     let unconditional = unconditional(&s);
-    let path_change = (0..toks.len()).find(|&k| s.starts[k] == k && changes_search_path(&s, k));
+    let local_path_change =
+        (0..toks.len()).find(|&k| s.starts[k] == k && changes_search_path(&s, k));
+    let path_change = local_path_change.or_else(|| history.search_path_changed.then_some(0));
+    history.search_path_changed |= local_path_change.is_some();
 
     for (k, tok) in toks.iter().enumerate() {
         let start = s.starts[k] == k;
@@ -1673,7 +1679,15 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 
     function_settings(&s, &mut body_timeouts);
     foreign_do_bodies(&s, &mut raws, &mut timeouts, &mut body_timeouts);
-    call_clears(&s, history, &mut raws, &mut timeouts, &mut body_timeouts);
+    nonstandard_strings(&s, &mut raws);
+    call_clears(
+        &s,
+        history,
+        path_change,
+        &mut raws,
+        &mut timeouts,
+        &mut body_timeouts,
+    );
     let new_tables = new_table_spans(&s, &created);
     let hits = resolve(raws, &s, &unconditional, &new_tables, history);
 
@@ -1778,6 +1792,43 @@ fn language<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
     None
 }
 
+/// The verb of a lock that any string literal may hide once
+/// `standard_conforming_strings` is off.
+const NONSTANDARD_STRINGS: &str = "SQL after standard_conforming_strings is off";
+
+/// Treat each statement that may turn `standard_conforming_strings` off as
+/// unreadable code.
+///
+/// With the setting off, a plain `'...'` literal takes backslash escapes, as
+/// `E'...'` does. The lint then misreads every later `DO`, routine and
+/// `EXECUTE` body, so the statement counts as a lock that no bound covers.
+fn nonstandard_strings(s: &Stmts, raws: &mut Vec<Raw>) {
+    let off = |j: usize| !s.word(j).or_else(|| s.string(j)).is_some_and(pg_true);
+    for k in 0..s.toks.len() {
+        let set = s.starts[k] == k && s.keyword(k, "set") && {
+            let name = if s.is(k + 1, "local") || s.is(k + 1, "session") {
+                k + 2
+            } else {
+                k + 1
+            };
+            let value = if s.is_punct(name + 1, '=') || s.is(name + 1, "to") {
+                name + 2
+            } else {
+                name + 1
+            };
+            s.is(name, "standard_conforming_strings") && off(value)
+        };
+        let call = s.is(k, "set_config")
+            && s.is_punct(k + 1, '(')
+            && s.string(k + 2)
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case("standard_conforming_strings"))
+            && (!s.is_punct(k + 3, ',') || off(k + 4));
+        if set || call {
+            raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
+        }
+    }
+}
+
 /// The verb of a lock that code in another language may take.
 const FOREIGN_CODE: &str = "code in another language";
 
@@ -1817,13 +1868,15 @@ struct Routine {
 /// same name as written and the same number of parameters. Any other `CALL`
 /// clears, because it may reach a routine from another file. A call also
 /// clears when any such `CREATE` clears, or when an earlier migration created
-/// a clearing routine of that name.
+/// a clearing routine of that name. After a `search_path` change, an
+/// unqualified call matches no `CREATE`.
 ///
 /// A routine in another language may lock any table and clear the bound. A
 /// call of such a routine counts as a lock on an unknown table.
 fn call_clears(
     s: &Stmts,
     history: &mut History,
+    path_change: Option<usize>,
     raws: &mut Vec<Raw>,
     timeouts: &mut Vec<(usize, Timeout)>,
     body_timeouts: &mut Vec<(usize, Timeout)>,
@@ -1860,7 +1913,11 @@ fn call_clears(
             r.at < call.at && r.name == call.name && r.arity.is_some() && r.arity == call.arity
         });
         let first = matches.next();
-        !inherited.contains(base(&call.name))
+        // After a `search_path` change, an unqualified name may reach a
+        // routine in another schema.
+        let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c < call.at);
+        !unplaced
+            && !inherited.contains(base(&call.name))
             && first.is_some()
             && first
                 .into_iter()
@@ -5440,6 +5497,55 @@ fn a_composed_format_template_is_unreadable() {
         );
         assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
     }
+}
+
+#[test]
+fn an_unqualified_call_after_a_path_change_is_unresolved() {
+    let keeps =
+        "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n    RAISE NOTICE 'hi';\nEND $$;\n";
+    let clears = "CREATE PROCEDURE other.p() LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                  PERFORM set_config('lock_timeout', '0', true);\nEND $$;\n";
+    let sql = format!(
+        "{keeps}{clears}SET LOCAL lock_timeout = '5s';\nSET LOCAL search_path = other, public;\n\
+         CALL p();\nALTER TABLE harvest_events ADD COLUMN x INT;"
+    );
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+}
+
+#[test]
+fn nonstandard_strings_make_the_migration_unreadable() {
+    for set in [
+        "SET standard_conforming_strings = off;",
+        "SET LOCAL standard_conforming_strings TO 'false';",
+        "SELECT set_config('standard_conforming_strings', 'off', false);",
+    ] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = '5s';\n{set}\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(rules(&findings).contains(&Rule::LockTimeout), "{sql}");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.contains("standard_conforming_strings")),
+            "{findings:?}"
+        );
+    }
+    // Turning it on is the default and changes nothing.
+    let sql = "SET standard_conforming_strings = on;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_path_change_in_an_earlier_migration_taints_set_config() {
+    let earlier = "SET search_path = app, pg_catalog;";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let sql = format!("SELECT set_config('lock_timeout', '5s', true);\n{lock}");
+    let findings = lint_with_history(&[earlier], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    let sql = format!("SELECT pg_catalog.set_config('lock_timeout', '5s', true);\n{lock}");
+    assert_eq!(lint_with_history(&[earlier], &sql, true), [], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
