@@ -286,14 +286,15 @@ that no longer matches a finding also fails the build.
   A statement that may turn the setting off counts as a lock on an unknown
   table that no bound covers. While it is off, each statement with a
   backslash counts the same way, later in the file and in later migrations,
-  until a reset. A `ROLLBACK` restores the value from the start of its
+  until a reset that surely runs. A reset in a function body or in a branch
+  does not count. A `ROLLBACK` restores the value from the start of its
   transaction. A top-level `SET LOCAL` ends at the commit. A local value in a
   routine body carries, because the body may run in any later transaction.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
   call of a routine in another language, counts as a lock on an unknown table.
   No bound covers that lock, because the code may clear the bound first. It
-  also ends the bound for what comes after it. Avoid such code in a
-  migration.
+  also ends the bound for what comes after it. Text in such a body never sets
+  a bound or makes a table new. Avoid such code in a migration.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.

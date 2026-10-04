@@ -1724,7 +1724,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 
     function_settings(&s, &mut body_timeouts);
     foreign_do_bodies(&s, &mut raws, &mut timeouts, &mut body_timeouts);
-    unreadable_settings(&s, sql, history, &mut raws);
+    unreadable_settings(&s, sql, &unconditional, history, &mut raws);
     call_clears(
         &s,
         history,
@@ -1792,10 +1792,7 @@ fn foreign_do_bodies(
     timeouts: &mut Vec<(usize, Timeout)>,
     body_timeouts: &mut Vec<(usize, Timeout)>,
 ) {
-    for k in (0..s.toks.len()).filter(|&k| s.starts[k] == k && s.keyword(k, "do")) {
-        if language(s, k).is_none_or(|l| l == "plpgsql") {
-            continue;
-        }
+    for k in (0..s.toks.len()).filter(|&k| foreign_do(s, k)) {
         let end = s.end(k);
         raws.push(Raw::lock(k, FOREIGN_CODE, None));
         let list = if s.toks[k].runs {
@@ -1811,6 +1808,11 @@ fn foreign_do_bodies(
             },
         ));
     }
+}
+
+/// Whether a `DO` in a language other than PL/pgSQL starts at `k`.
+fn foreign_do(s: &Stmts, k: usize) -> bool {
+    s.starts[k] == k && s.keyword(k, "do") && language(s, k).is_some_and(|l| l != "plpgsql")
 }
 
 /// The `LANGUAGE` clause of the statement that starts at `k`, if any.
@@ -1842,8 +1844,14 @@ fn language<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
 const NONSTANDARD_STRINGS: &str = "SQL after standard_conforming_strings is off";
 
 /// Add the locks of settings that may hide or expose a lock.
-fn unreadable_settings(s: &Stmts, sql: &str, history: &mut History, raws: &mut Vec<Raw>) {
-    nonstandard_strings(s, sql, history, raws);
+fn unreadable_settings(
+    s: &Stmts,
+    sql: &str,
+    unconditional: &[bool],
+    history: &mut History,
+    raws: &mut Vec<Raw>,
+) {
+    nonstandard_strings(s, sql, unconditional, history, raws);
     routine_resets(s, raws);
 }
 
@@ -1859,7 +1867,13 @@ fn unreadable_settings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
 /// annotation on the setter cannot cover it. A session value outlives its
 /// file, so the state carries into later files. A top-level local value ends
 /// at the commit. Without a backslash, the setting changes nothing.
-fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut Vec<Raw>) {
+fn nonstandard_strings(
+    s: &Stmts,
+    sql: &str,
+    unconditional: &[bool],
+    history: &mut History,
+    raws: &mut Vec<Raw>,
+) {
     let backslash_lines: BTreeSet<usize> = sql
         .lines()
         .enumerate()
@@ -1874,8 +1888,11 @@ fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
     let mut local = false;
     let mut saved = session;
     let (mut any_session_off, mut any_local_off) = (session, false);
-    for k in 0..s.toks.len() {
-        if s.starts[k] == k {
+    for (k, &surely_runs) in unconditional.iter().enumerate() {
+        // An `off` counts wherever it sits, which fails closed. An `on`, a
+        // commit or a rollback counts only where it surely runs.
+        let sure = s.toks[k].runs && surely_runs;
+        if sure && s.starts[k] == k {
             let end = s.keyword(k, "end") && s.toks[k].depth == 0;
             if s.keyword(k, "commit") || end {
                 local = false;
@@ -1913,8 +1930,8 @@ fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
                 (session, local) = (true, false);
                 any_session_off = true;
             }
-            Some((true, _)) => (session, local) = (false, false),
-            None => {}
+            Some((true, _)) if sure => (session, local) = (false, false),
+            Some((true, _)) | None => {}
         }
     }
     // The file ends its transaction, so only the session value carries.
@@ -2545,6 +2562,7 @@ fn resolve(
 /// `CONTINUE`, may not run. Nothing in a body with an `EXCEPTION` handler surely runs, because
 /// the handler rolls the block back. A `CASE` expression that ends in a bare `END` leaves the rest of the
 /// body conditional, which fails closed. A top-level token always runs.
+/// Nothing in a `DO` body in another language surely runs.
 fn unconditional(s: &Stmts) -> Vec<bool> {
     let toks = s.toks;
     let handler = |j: usize| s.is(j, "exception") && !(j > 0 && s.is(j - 1, "raise"));
@@ -2611,6 +2629,12 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
             .get(1..depth)
             .is_none_or(|outer| outer.iter().all(|&(b, skip)| b == 0 && !skip));
         out.push(depth == 0 || (here && around));
+    }
+    // The lint cannot read a body in another language, so nothing in it
+    // surely runs. A lock in it still counts, which fails closed.
+    for k in (0..toks.len()).filter(|&k| foreign_do(s, k)) {
+        let end = s.end(k).min(toks.len());
+        out[k + 1..end].fill(false);
     }
     out
 }
@@ -6056,6 +6080,45 @@ fn a_local_nonstandard_setting_ends_at_the_commit() {
     );
     let findings = lint_with_history(&[&earlier], hidden, true);
     assert!(tainted(&findings), "{earlier}\n{findings:?}");
+}
+
+#[test]
+fn a_conforming_strings_change_that_may_not_run_keeps_the_taint() {
+    let off = "-- lock-safety: allow lock-timeout #1810 test fixture\n\
+               SET standard_conforming_strings = off;\n";
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    // A function body runs later, and a branch may not run.
+    for maybe in [
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+         SET standard_conforming_strings = on;\nEND $$;",
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+         PERFORM set_config('standard_conforming_strings', 'on', false);\nEND $$;",
+        "DO $$\nBEGIN\n    IF random() < 0.5 THEN\n        \
+         RESET standard_conforming_strings;\n    END IF;\nEND $$;",
+    ] {
+        let sql = format!("{off}{maybe}\n{hidden}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.contains("standard_conforming_strings")),
+            "{sql}\n{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_foreign_do_body_makes_no_table_new() {
+    let sql = "-- lock-safety: allow lock-timeout #1810 test fixture\n\
+               DO $$\n# ; CREATE TABLE harvest_events (id BIGINT);\npass\n$$ LANGUAGE plpython3u;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events")),
+        "{findings:?}"
+    );
 }
 
 #[test]
