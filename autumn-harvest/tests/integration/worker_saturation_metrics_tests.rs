@@ -174,6 +174,7 @@ fn cohort(queue: &str) -> String {
         registered_workflows: &[],
         registered_activities: &[],
         circuit_breakers: &autumn_harvest::circuit_breaker::CircuitBreakerRegistry::empty(),
+        dispatch_channel: false,
     })
 }
 
@@ -632,6 +633,7 @@ async fn a_long_cohort_key_still_stores() {
         registered_workflows: &[],
         registered_activities: &[],
         circuit_breakers: &autumn_harvest::circuit_breaker::CircuitBreakerRegistry::empty(),
+        dispatch_channel: false,
     });
     assert!(key.len() > 10_000, "the key is long: {}", key.len());
     workers::upsert_worker_task_stats(&mut conn, &id, &key, &WorkerTaskStats::default())

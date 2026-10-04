@@ -3404,7 +3404,9 @@ ineligible for, because the claim query orders and filters tasks by them. So
 do the shards and the registered handlers, because a task without a handler is
 released and never counts. So do the circuit-breaker policies, because an
 activity with a breaker skips the claim-time rate-limit gate. The open state
-of a breaker is left out, because it is the worker's own health. Those decide which tasks a worker can claim, and in
+of a breaker is left out, because it is the worker's own health. So does the
+dispatch route, because a dispatch channel ignores `queue_weights` and the
+Postgres claim applies them. Those decide which tasks a worker can claim, and in
 which mix under load. So workers of two sizes are two cohorts. A worker on a
 slow queue is not compared with workers on a fast queue. A worker that favours
 a bulk queue is not compared with one that favours an interactive queue.

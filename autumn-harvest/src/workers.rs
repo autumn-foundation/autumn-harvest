@@ -891,6 +891,9 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 /// - `circuit_breakers`: each activity with a breaker policy, with that
 ///   policy. Such an activity skips the claim-time rate-limit gate, and its
 ///   breaker fails it fast while open. The open state stays out of the key.
+/// - `dispatch_channel`: a channel orders delivery by priority and ignores
+///   `queue_weights`. The Postgres claim applies the weights. So the two
+///   routes give two task mixes under load.
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -908,6 +911,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         registered_workflows,
         registered_activities,
         circuit_breakers,
+        dispatch_channel,
     } = policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -942,6 +946,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "workflows": sorted_names(registered_workflows),
         "activities": sorted_names(registered_activities),
         "circuit_breakers": breaker_policies(circuit_breakers),
+        "dispatch_channel": dispatch_channel,
     })
     .to_string()
 }
@@ -1012,6 +1017,8 @@ pub struct CohortPolicy<'a> {
     pub registered_activities: &'a [String],
     /// The worker's circuit breakers. Only their policies enter the key.
     pub circuit_breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
+    /// Whether the worker reads task references from a dispatch channel.
+    pub dispatch_channel: bool,
 }
 
 /// How a worker sizes its slots per task kind, as its cohort key records it
@@ -2950,6 +2957,7 @@ mod tests {
             registered_workflows: &[],
             registered_activities: &[],
             circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+            dispatch_channel: false,
         })
     }
 
@@ -2975,6 +2983,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: false,
             })
         };
         assert_ne!(slots(10, 0), slots(0, 10));
@@ -3005,6 +3014,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: false,
             })
         };
         assert_ne!(sessions(0), sessions(4));
@@ -3041,6 +3051,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: false,
             })
         };
         assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
@@ -3071,6 +3082,7 @@ mod tests {
                 registered_workflows: workflows,
                 registered_activities: activities,
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: false,
             })
         };
         let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
@@ -3194,6 +3206,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: breakers,
+                dispatch_channel: false,
             })
         };
         let tracking = |threshold| {
@@ -3219,6 +3232,35 @@ mod tests {
         assert_eq!(cohort(&tracking(5)), cohort(&tracking(5)));
     }
 
+    /// Issue #1815: a dispatch channel delivers by priority and ignores
+    /// `queue_weights`, while the Postgres claim applies them. Workers on the
+    /// two routes do different work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_dispatch_route() {
+        let queues = vec!["a".to_owned(), "b".to_owned()];
+        let weights = std::collections::HashMap::from([("b".to_owned(), 5_u32)]);
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let cohort = |dispatch_channel| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &weights,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel,
+            })
+        };
+        assert_ne!(cohort(true), cohort(false));
+    }
+
     /// Issue #1815: under load, the claim gate gives each worker a task mix
     /// that follows its slots per kind. Workers with different slot counts
     /// therefore do different work, so they are in different cohorts.
@@ -3241,6 +3283,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: false,
             })
         };
         assert_ne!(slots(100, 1), slots(1, 100));

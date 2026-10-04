@@ -29857,6 +29857,15 @@ impl Worker {
             .map(|installed| Arc::clone(&installed.channel))
     }
 
+    /// Whether this worker reads task references from a dispatch channel
+    /// (issue #1815). The poll loop uses a per-shard channel, or the global
+    /// binding when the span allows it. The run boundary has bound the global
+    /// channel before the heartbeat asks.
+    fn claims_through_dispatch(&self) -> bool {
+        !self.shard_dispatch.is_empty()
+            || (self.global_dispatch_binding().is_some() && self.dispatch_span_allowed())
+    }
+
     /// Whether this worker's span allows the single-shard channel.
     fn dispatch_span_allowed(&self) -> bool {
         #[cfg(feature = "db")]
@@ -31822,6 +31831,7 @@ impl Worker {
                     registered_workflows: &registered_workflows,
                     registered_activities: &registered_activities,
                     circuit_breakers: &self.registry.circuit_breakers(),
+                    dispatch_channel: self.claims_through_dispatch(),
                 }),
                 compare: true,
                 slot: shard_slot,
