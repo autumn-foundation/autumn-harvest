@@ -1459,11 +1459,18 @@ pub const METRIC_DB_POOL_ACQUIRE_TIMEOUT: &str = "harvest.db.pool_acquire_timeou
 /// Counter: Postgres aborted a transaction and the engine ran it again
 /// (issue #1822).
 ///
-/// Labelled `{site, reason}`. `site` is `persist`, `claim` or `scanner`.
-/// `reason` is `deadlock` (`40P01`) or `serialization_failure` (`40001`).
-/// A steady `deadlock` rate points to a lock-order defect. See the lock-order
-/// table in `docs/architecture.md`.
+/// Labelled `{site, reason}`. `site` is `persist`, `workflow_task`, `claim`
+/// or `scanner`. `reason` is `deadlock` (`40P01`) or `serialization_failure`
+/// (`40001`). A steady `deadlock` rate points to a lock-order defect. See the
+/// lock-order table in `docs/architecture.md`.
 pub const METRIC_DB_TRANSACTION_RETRY: &str = "harvest.db.transaction_retry";
+
+/// Counter: a transaction still hit a conflict abort after its last retry
+/// (issue #1822).
+///
+/// Labelled `{site, reason}` like [`METRIC_DB_TRANSACTION_RETRY`]. The error
+/// then reaches the caller, so any non-zero rate needs attention.
+pub const METRIC_DB_TRANSACTION_RETRY_EXHAUSTED: &str = "harvest.db.transaction_retry_exhausted";
 
 /// Counter: an activity heartbeat flush failed (issue #1788).
 ///
@@ -2762,9 +2769,18 @@ pub trait MetricsRecorder: Send + Sync {
     /// Postgres aborted a transaction and the engine runs it again
     /// (issue #1822).
     ///
-    /// `site` is `persist`, `claim` or `scanner`. `reason` is `deadlock` or
-    /// `serialization_failure`. Additive with a no-op default.
+    /// `site` is `persist`, `workflow_task`, `claim` or `scanner`. `reason`
+    /// is `deadlock` or `serialization_failure`. Additive with a no-op default.
     fn record_db_transaction_retry(&self, site: &str, reason: &str) {
+        let _ = (site, reason);
+    }
+
+    /// A transaction still hit a conflict abort after its last retry
+    /// (issue #1822).
+    ///
+    /// Labels as [`Self::record_db_transaction_retry`]. Additive with a no-op
+    /// default.
+    fn record_db_transaction_retry_exhausted(&self, site: &str, reason: &str) {
         let _ = (site, reason);
     }
 

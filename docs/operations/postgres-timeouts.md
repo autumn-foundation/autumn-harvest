@@ -214,8 +214,48 @@ Start with a 10 minute threshold. Tune it to your longest legitimate
 transaction. `idle_in_transaction_session_timeout` ends an idle transaction
 before this alert fires. A long active statement still needs the alert.
 
+## Deadlock and serialization retries
+
+Postgres aborts one transaction of a lock cycle with `40P01`. It aborts a
+transaction that cannot serialize with `40001`. The engine runs these sites
+again (issue #1822):
+
+| `site` | What runs again |
+|---|---|
+| `persist` | The inline external signal and cancel persist, in place. |
+| `workflow_task` | The workflow-task persist. The task resets to `PENDING`, and replay derives the same decision. |
+| `claim` | A task claim, in place. |
+| `scanner` | A debounce or throttle fire batch, in place. |
+
+`harvest.db.transaction_retry{site, reason}` counts each retry.
+`harvest.db.transaction_retry_exhausted{site, reason}` counts a conflict that
+remains after the last in-place retry. A workflow-task error then resets the
+task too, so the run does not fail.
+
+Each in-place site makes up to 5 attempts. The sleeps add at most 300 ms.
+Postgres waits `deadlock_timeout` (1 s by default) before it aborts a victim.
+Five deadlocked attempts can therefore take about 5 s.
+
+What to do:
+
+- **A low `deadlock` rate.** The known cycles in the
+  [lock-order table](../architecture.md#lock-order-table) can cause it. The
+  retry absorbs it. No action is necessary.
+- **A steady or rising `deadlock` rate.** Set `log_lock_waits = on`. The
+  Postgres log line `DETAIL: Process ... waits for ...` names the relations of
+  the cycle. Report it as a lock-order defect.
+- **Any `serialization_failure` rate.** The engine pins `READ COMMITTED` on its
+  hot paths. Check `default_transaction_isolation` on the role and the
+  database. Set it back to `read committed` if someone raised it.
+- **Any `exhausted` rate.** The retry did not resolve the conflict. Find the
+  cycle as for a steady `deadlock` rate.
+
+The engine detects these aborts from the English message text. Diesel keeps no
+SQLSTATE. With a non-English `lc_messages`, the retry is off. Keep
+`lc_messages` at `C` or an English locale, as for the session-timeout checks.
+
 ## Related
 
-- [`docs/telemetry.md`](../telemetry.md) lists the two counters.
+- [`docs/telemetry.md`](../telemetry.md) lists the counters.
 - [`docs/architecture.md`](../architecture.md) describes `pool.rs` and
   `heartbeat.rs`.

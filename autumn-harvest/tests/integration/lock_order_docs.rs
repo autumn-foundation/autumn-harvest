@@ -1,9 +1,9 @@
 //! Guards the lock-order table in `docs/architecture.md` (issue #1822).
 //!
-//! The table is the one place that lists every lock-ordering rule. These
-//! guards keep it next to the ABBA argument, keep that argument intact, and
-//! keep each cited pin test real. A renamed or deleted test fails here, so
-//! the table cannot drift from the code that proves it.
+//! The table lists the main lock-ordering rules of the engine. These guards
+//! keep it next to the ABBA argument, keep that argument intact, and keep each
+//! cited pin test real. A renamed or deleted test fails here, so the table
+//! cannot drift from the code that proves it.
 
 use std::path::{Path, PathBuf};
 
@@ -35,25 +35,68 @@ fn table_section(doc: &str) -> &str {
     &body[..end]
 }
 
-/// Data rows of every Markdown table in `section`, as trimmed cells.
+/// Cells of one Markdown table line, trimmed.
+fn cells(line: &str) -> Vec<String> {
+    line.trim_matches('|')
+        .split(" | ")
+        .map(|cell| cell.trim().to_owned())
+        .collect()
+}
+
+/// A separator line such as `|---|:---:|`.
+fn is_separator(line: &str) -> bool {
+    line.contains('-') && line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Data rows of every Markdown table in `section`.
+///
+/// Each table must start with the `# | Lock order | ...` header, so a renamed
+/// header fails here and does not pass as a data row.
 fn table_rows(section: &str) -> Vec<Vec<String>> {
-    section
+    let lines: Vec<&str> = section
         .lines()
         .filter(|line| line.starts_with('|'))
-        .filter(|line| !line.contains("---"))
-        .map(|line| {
-            line.trim_matches('|')
-                .split(" | ")
-                .map(|cell| cell.trim().to_owned())
-                .collect::<Vec<_>>()
-        })
-        .filter(|cells| cells.first().is_some_and(|c| c != "#"))
-        .collect()
+        .collect();
+    let mut rows = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if is_separator(line) {
+            continue;
+        }
+        let row = cells(line);
+        if row.first().is_some_and(|c| c == "#") {
+            assert_eq!(
+                row[1..],
+                ["Lock order", "Where", "Why", "Pinned by"],
+                "unexpected table header {row:?}"
+            );
+            assert!(
+                lines.get(i + 1).is_some_and(|next| is_separator(next)),
+                "a separator line must follow the header"
+            );
+        } else {
+            rows.push(row);
+        }
+    }
+    rows
 }
 
 /// Backticked names in `cell`.
 fn backticked(cell: &str) -> Vec<&str> {
     cell.split('`').skip(1).step_by(2).collect()
+}
+
+/// Whether `text` defines `name` as a test function.
+///
+/// The test attribute must sit within the five lines above the `fn` line.
+fn is_test_fn(text: &str, name: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    let needle = format!("fn {name}(");
+    lines.iter().enumerate().any(|(i, line)| {
+        line.contains(&needle)
+            && lines[i.saturating_sub(5)..i]
+                .iter()
+                .any(|above| above.contains("#[test]") || above.contains("#[tokio::test"))
+    })
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -106,8 +149,8 @@ fn every_row_names_its_locks_site_and_reason() {
     let doc = architecture();
     let rows = table_rows(table_section(&doc));
     assert!(
-        rows.len() >= 8,
-        "the table lists every known order; got {rows:?}"
+        rows.len() >= 12,
+        "the table lists the known orders; got {rows:?}"
     );
     for row in &rows {
         assert_eq!(row.len(), 5, "each row has five cells: {row:?}");
@@ -124,7 +167,7 @@ fn every_cited_pin_test_exists() {
     let mut sources = Vec::new();
     rust_sources(&repo_root().join("autumn-harvest/src"), &mut sources);
     rust_sources(&repo_root().join("autumn-harvest/tests"), &mut sources);
-    let corpus: String = sources
+    let texts: Vec<String> = sources
         .iter()
         .map(|path| std::fs::read_to_string(path).unwrap_or_default())
         .collect();
@@ -134,7 +177,7 @@ fn every_cited_pin_test_exists() {
         for name in backticked(&row[4]) {
             cited += 1;
             assert!(
-                corpus.contains(&format!("fn {name}(")),
+                texts.iter().any(|text| is_test_fn(text, name)),
                 "the lock-order table cites `{name}`, but no test has that name"
             );
         }

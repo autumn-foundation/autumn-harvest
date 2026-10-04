@@ -10,6 +10,10 @@
 //! Without the retry, the victim fails its workflow. The first test then
 //! fails on the `COMPLETED` assertion.
 //!
+//! Two tests cover the claim and scanner sites. A trigger raises one
+//! synthetic `40P01` inside the claim or the fire batch. A sequence counts
+//! the raises, and a rollback does not undo `nextval`, so the retry passes.
+//!
 //! The other tests drive [`run_with_conflict_retry`] directly.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres. Otherwise
@@ -25,7 +29,8 @@ use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::tx_retry::{
-    SITE_PERSIST, SITE_SCANNER, TxRetryPolicy, run_with_conflict_retry,
+    SITE_CLAIM, SITE_PERSIST, SITE_SCANNER, SITE_WORKFLOW_TASK, TxRetryPolicy,
+    run_with_conflict_retry,
 };
 use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::{ExecutionId, ShardId, StartWorkflowParams};
@@ -47,6 +52,7 @@ const SECOND_GATE_CLASS: i32 = 1823;
 #[derive(Default)]
 struct RetryMetrics {
     retries: Mutex<Vec<(String, String)>>,
+    exhausted: Mutex<Vec<(String, String)>>,
 }
 
 impl RetryMetrics {
@@ -62,11 +68,22 @@ impl RetryMetrics {
     fn total(&self) -> usize {
         self.retries.lock().unwrap().len()
     }
+
+    fn exhausted(&self) -> Vec<(String, String)> {
+        self.exhausted.lock().unwrap().clone()
+    }
 }
 
 impl MetricsRecorder for RetryMetrics {
     fn record_db_transaction_retry(&self, site: &str, reason: &str) {
         self.retries
+            .lock()
+            .unwrap()
+            .push((site.to_owned(), reason.to_owned()));
+    }
+
+    fn record_db_transaction_retry_exhausted(&self, site: &str, reason: &str) {
+        self.exhausted
             .lock()
             .unwrap()
             .push((site.to_owned(), reason.to_owned()));
@@ -129,8 +146,9 @@ async fn gate_waiters(conn: &mut AsyncPgConnection, gate_key: i32) -> i64 {
 
 /// Install a trigger that parks the persist of `ids` on the gate lock.
 ///
-/// The trigger fires on the insert of an `event_type` event. By then the
-/// persist transaction holds the execution row lock of its own run.
+/// The trigger fires on the insert of an `event_type` event. It first takes
+/// `FOR KEY SHARE` on the execution row of the run, then waits on the gates.
+/// The persist therefore always holds a lock on its own row while it waits.
 async fn install_gate(
     conn: &mut AsyncPgConnection,
     name: &str,
@@ -143,6 +161,8 @@ async fn install_gate(
          BEGIN
            IF NEW.event_type = '{event_type}'
               AND NEW.workflow_exec_id IN ({ids}) THEN
+             PERFORM 1 FROM harvest_workflow_executions
+               WHERE id = NEW.workflow_exec_id FOR KEY SHARE;
              PERFORM pg_advisory_xact_lock_shared({GATE_CLASS}, {gate_key});
              PERFORM pg_advisory_xact_lock_shared({SECOND_GATE_CLASS}, {gate_key});
            END IF;
@@ -189,9 +209,53 @@ async fn remove_gate(conn: &mut AsyncPgConnection, name: &str) {
 /// Serializes the trigger tests.
 ///
 /// The gate DDL takes a table lock on `harvest_events`. A parked persist of
-/// another trigger test holds a conflicting lock until its gate opens, so two
-/// trigger tests in parallel would wait on each other.
+/// another trigger test holds a conflicting lock until its gate opens. Two
+/// trigger tests in parallel would then wait on each other.
 static TRIGGER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Drop every test trigger, function and sequence that a failed run left.
+///
+/// A leftover trigger on `harvest_events` makes partition enable and disable
+/// refuse on a shared database. Call this under [`TRIGGER_TESTS`].
+async fn sweep_stale_test_objects(conn: &mut AsyncPgConnection) {
+    conn.batch_execute(
+        r"DO $sweep$
+          DECLARE r record;
+          BEGIN
+            FOR r IN SELECT tgname, tgrelid::regclass AS rel FROM pg_trigger
+                     WHERE tgname LIKE 'harvest\_test\_tx1822\_%' AND tgparentid = 0
+            LOOP
+              EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', r.tgname, r.rel);
+            END LOOP;
+            FOR r IN SELECT oid::regprocedure AS f FROM pg_proc
+                     WHERE proname LIKE 'harvest\_test\_tx1822\_%'
+            LOOP
+              EXECUTE format('DROP FUNCTION IF EXISTS %s', r.f);
+            END LOOP;
+            FOR r IN SELECT relname FROM pg_class
+                     WHERE relkind = 'S' AND relname LIKE 'harvest\_test\_tx1822\_%'
+            LOOP
+              EXECUTE format('DROP SEQUENCE IF EXISTS %I', r.relname);
+            END LOOP;
+          END
+          $sweep$;",
+    )
+    .await
+    .expect("sweep stale test objects");
+}
+
+async fn is_superuser(conn: &mut AsyncPgConnection) -> bool {
+    #[derive(diesel::QueryableByName)]
+    struct Super {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        on: bool,
+    }
+    diesel::sql_query("SELECT current_setting('is_superuser') = 'on' AS on")
+        .get_result::<Super>(conn)
+        .await
+        .expect("read is_superuser")
+        .on
+}
 
 /// Wait until `count` persist transactions park on the gate.
 ///
@@ -284,6 +348,7 @@ async fn two_persist_transactions_deadlock_and_both_commit() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let mut gate = connect(&url).await;
+    sweep_stale_test_objects(&mut conn).await;
     let gate_key = i32::try_from(std::process::id() % 1_000_000).expect("fits i32");
 
     let a = ExecutionId::new_for_shard(ShardId::new(0));
@@ -325,6 +390,10 @@ async fn two_persist_transactions_deadlock_and_both_commit() {
         metrics.count(SITE_PERSIST, "deadlock"),
         1,
         "exactly one persist retry after the deadlock"
+    );
+    assert!(
+        metrics.exhausted().is_empty(),
+        "the retry resolves the cycle"
     );
     // The rollback removes the first run of the victim, so no event repeats.
     for exec_id in [a, b] {
@@ -413,6 +482,13 @@ async fn a_deadlocked_terminal_persist_runs_the_cycle_again() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let mut gate = connect(&url).await;
+    sweep_stale_test_objects(&mut conn).await;
+    // `SET LOCAL deadlock_timeout` below needs a superuser. Without it the
+    // blocker can become the victim, so the test cannot force the cycle.
+    if !is_superuser(&mut conn).await {
+        eprintln!("skipped: the test role is not a superuser");
+        return;
+    }
     let gate_key = i32::try_from(std::process::id() % 1_000_000 + 1_000_000).expect("fits i32");
 
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
@@ -445,7 +521,7 @@ async fn a_deadlocked_terminal_persist_runs_the_cycle_again() {
         .execute(&mut blocker)
         .await
         .expect("blocker takes the second gate");
-    let blocked = tokio::spawn(async move {
+    let waiter = tokio::spawn(async move {
         diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .execute(&mut blocker)
@@ -465,7 +541,7 @@ async fn a_deadlocked_terminal_persist_runs_the_cycle_again() {
     .expect("the blocker must wait on the execution row");
 
     set_gate(&mut gate, gate_key, false).await;
-    blocked.await.expect("join blocker");
+    waiter.await.expect("join blocker");
 
     let state = wait_for_terminal(&url, exec_id).await;
     worker.shutdown();
@@ -474,7 +550,7 @@ async fn a_deadlocked_terminal_persist_runs_the_cycle_again() {
 
     assert_eq!(state, "COMPLETED", "the cycle runs again and commits");
     assert_eq!(
-        metrics.count(SITE_PERSIST, "deadlock"),
+        metrics.count(SITE_WORKFLOW_TASK, "deadlock"),
         1,
         "the persist conflict is counted once"
     );
@@ -506,7 +582,9 @@ async fn a_forced_deadlock_between_two_helper_transactions_retries_once() {
                     conn.transaction::<(), HarvestError, _>(async |conn| {
                         lock_xact(conn, first).await?;
                         if run == 0 {
-                            barrier.wait().await;
+                            tokio::time::timeout(Duration::from_secs(20), barrier.wait())
+                                .await
+                                .expect("both sides reach the barrier");
                         }
                         lock_xact(conn, second).await
                     })
@@ -590,7 +668,9 @@ async fn a_serialization_failure_is_retried_on_a_fresh_snapshot() {
                     .map_err(autumn_harvest::error::database_error)?;
                 if run == 0 {
                     read_done.notify_one();
-                    writer_done.notified().await;
+                    tokio::time::timeout(Duration::from_secs(20), writer_done.notified())
+                        .await
+                        .expect("the concurrent writer commits");
                 }
                 conn.batch_execute(update)
                     .await
@@ -650,6 +730,11 @@ async fn retries_are_bounded_and_the_last_error_surfaces() {
     assert!(matches!(result, Err(HarvestError::Database(ref m)) if m.contains("deadlock")));
     assert_eq!(AtomicU32::load(&runs, Ordering::SeqCst), 3);
     assert_eq!(metrics.count(SITE_PERSIST, "deadlock"), 2, "one per retry");
+    assert_eq!(
+        metrics.exhausted(),
+        vec![(SITE_PERSIST.to_owned(), "deadlock".to_owned())],
+        "the last conflict counts as exhausted"
+    );
 }
 
 /// Any other error returns at once.
@@ -737,4 +822,193 @@ async fn a_clean_commit_records_no_retry() {
 
     assert_eq!(value, "ok");
     assert_eq!(metrics.total(), 0);
+}
+
+/// Completes at once.
+#[workflow]
+#[allow(clippy::unused_async)] // The `#[workflow]` macro requires an `async fn`.
+async fn tx1822_noop(
+    _ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    Ok(input)
+}
+
+/// Install a trigger that raises one synthetic `40P01`.
+///
+/// `name` names the trigger, its function and its sequence. `timing_event`
+/// is the trigger timing and event, and `table` is the table. `condition`
+/// selects the row. The sequence counts raises. A rollback does not undo
+/// `nextval`, so only the first matching run fails.
+async fn install_one_deadlock(
+    conn: &mut AsyncPgConnection,
+    name: &str,
+    timing_event: &str,
+    table: &str,
+    condition: &str,
+) {
+    let sql = format!(
+        "CREATE SEQUENCE {name};
+         CREATE FUNCTION {name}() RETURNS trigger AS $once$
+         BEGIN
+           IF ({condition}) AND nextval('{name}') = 1 THEN
+             RAISE EXCEPTION 'deadlock detected' USING ERRCODE = '40P01';
+           END IF;
+           RETURN COALESCE(NEW, OLD);
+         END
+         $once$ LANGUAGE plpgsql;
+         CREATE TRIGGER {name} {timing_event} ON {table}
+           FOR EACH ROW EXECUTE FUNCTION {name}();"
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("install one-deadlock trigger");
+}
+
+/// The claim site retries a conflict inside the claim transaction.
+///
+/// Without the claim wrapper, the poll logs the error and a later poll claims
+/// the task. The workflow still completes, but the claim counter stays at 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflict_in_a_claim_is_retried_at_the_claim_site() {
+    let _serial = TRIGGER_TESTS.lock().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    sweep_stale_test_objects(&mut conn).await;
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    install_one_deadlock(
+        &mut conn,
+        "harvest_test_tx1822_claim_once",
+        "BEFORE UPDATE",
+        "harvest_task_queue",
+        &format!(
+            "NEW.workflow_exec_id = '{}'::uuid AND NEW.state = 'RUNNING' \
+             AND OLD.state <> 'RUNNING'",
+            exec_id.as_uuid()
+        ),
+    )
+    .await;
+    start_run(&mut conn, "tx1822_noop", exec_id, serde_json::json!({})).await;
+    let (metrics, worker, handle) = spawn_worker(&url, "tx1822-claim-worker", tx1822_noop_info());
+
+    let state = wait_for_terminal(&url, exec_id).await;
+    worker.shutdown();
+    let _ = handle.await;
+    sweep_stale_test_objects(&mut conn).await;
+
+    assert_eq!(state, "COMPLETED");
+    assert_eq!(metrics.count(SITE_CLAIM, "deadlock"), 1, "one claim retry");
+    assert!(metrics.exhausted().is_empty());
+}
+
+/// The scanner site retries a conflict inside the debounce fire batch.
+#[tokio::test]
+async fn a_conflict_in_a_debounce_fire_batch_is_retried_at_the_scanner_site() {
+    use autumn_harvest::debounce::{
+        AdmitDebounceParams, DebounceStartOptions, admit_debounced_start, fire_due_debounced_starts,
+    };
+
+    let _serial = TRIGGER_TESTS.lock().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    sweep_stale_test_objects(&mut conn).await;
+
+    let key = format!("tx1822:{}", uuid::Uuid::new_v4());
+    let workflow_id = format!("tx1822-debounce-{}", uuid::Uuid::new_v4());
+    admit_debounced_start(
+        &mut conn,
+        AdmitDebounceParams {
+            workflow_name: "tx1822_noop",
+            debounce_key: &key,
+            workflow_id: &workflow_id,
+            queue_name: "tx1822-scanner-q",
+            last_input: serde_json::json!({}),
+            start_options: DebounceStartOptions::default(),
+            window: Duration::from_millis(1),
+            max_wait: Duration::from_secs(1),
+            shard_id: 0,
+        },
+        false,
+    )
+    .await
+    .expect("admit")
+    .expect("an ungated admission returns an outcome");
+    install_one_deadlock(
+        &mut conn,
+        "harvest_test_tx1822_scanner_once",
+        "BEFORE DELETE",
+        "harvest_debounce",
+        &format!("OLD.debounce_key = '{key}'"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let metrics = RetryMetrics::default();
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics).await;
+    sweep_stale_test_objects(&mut conn).await;
+
+    assert!(fired.expect("the batch commits after one retry") >= 1);
+    assert_eq!(
+        metrics.count(SITE_SCANNER, "deadlock"),
+        1,
+        "one scanner retry"
+    );
+    assert!(metrics.exhausted().is_empty());
+}
+
+/// A conflict that reaches `fail_execution_on_error` does not fail the run.
+///
+/// This covers a conflict that outlasts the retries of a wired site. The
+/// dispatcher then resets the task, and the cycle runs again.
+#[tokio::test]
+async fn a_conflict_error_does_not_fail_the_execution() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = format!("tx1822-pass-{}", uuid::Uuid::new_v4());
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_id = format!("tx1822-pass-{}", exec_id.as_uuid());
+    autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams::new(
+            "tx1822_noop",
+            &workflow_id,
+            exec_id,
+            serde_json::json!({}),
+            &queue,
+        ),
+        None,
+    )
+    .await
+    .expect("start workflow");
+    let task = autumn_harvest::queue::claim_task(
+        &mut conn,
+        std::slice::from_ref(&queue),
+        "tx1822-pass-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("the task is claimable");
+
+    let result = autumn_harvest::worker::fail_execution_on_error(
+        &mut conn,
+        &task,
+        "tx1822-pass-worker",
+        Err::<(), _>(synthetic_deadlock()),
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(HarvestError::Database(_))),
+        "the error passes through"
+    );
+    assert_eq!(
+        load_execution_from_url(&url, exec_id).await.state,
+        "RUNNING"
+    );
 }

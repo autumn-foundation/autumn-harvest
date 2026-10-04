@@ -297,3 +297,22 @@ fn record_db_transaction_retry_bridges_counter_with_site_and_reason_labels() {
         "issue #1822"
     );
 }
+
+#[test]
+fn record_db_transaction_retry_exhausted_bridges_counter_with_site_and_reason_labels() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_db_transaction_retry_exhausted("claim", "serialization_failure");
+    });
+    let key = find_key(
+        &keys,
+        "harvest.db.transaction_retry_exhausted",
+        InstrumentKind::Counter,
+    );
+    let mut labels = labels_of(key);
+    labels.sort_unstable();
+    assert_eq!(
+        labels,
+        vec![("reason", "serialization_failure"), ("site", "claim")],
+        "issue #1822"
+    );
+}

@@ -14,9 +14,9 @@
 //! the batch by the advisory-lock id each row will take. Every transaction
 //! then visits shared locks in the same order.
 //!
-//! The fire batch now also runs under [`crate::tx_retry`]. The retry is a
+//! The fire batch also runs under [`crate::tx_retry`]. The retry is a
 //! backstop for a cycle this sort does not cover. It does not replace the
-//! sort. See row 6 of the lock-order table in `docs/architecture.md`.
+//! sort. See the lock-order table in `docs/architecture.md`.
 
 use std::collections::{BTreeSet, HashMap};
 

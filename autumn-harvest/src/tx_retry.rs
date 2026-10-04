@@ -8,13 +8,21 @@
 //! [`run_with_conflict_retry`] runs one top-level transaction.
 //! It runs the transaction again after a `40P01` or `40001` abort, with a
 //! capped and jittered backoff. Each retry increments
-//! `harvest.db.transaction_retry{site, reason}`.
+//! `harvest.db.transaction_retry{site, reason}`. A conflict after the last
+//! retry increments `harvest.db.transaction_retry_exhausted{site, reason}`.
 //!
 //! # Safety contract
 //!
 //! The caller passes the whole transaction, from `BEGIN` to `COMMIT`.
-//! The transaction must have no effect outside the database before it commits.
 //! Collect follow-up work and run it after the helper returns.
+//! An effect outside the database that runs before the commit repeats on each
+//! retry. Keep such effects to counters and logs.
+//!
+//! # Latency
+//!
+//! With [`TxRetryPolicy::DEFAULT`] the sleeps add at most 300 ms. Postgres
+//! also waits `deadlock_timeout` (1 s by default) before it aborts a victim.
+//! Five deadlocked runs can therefore take about 5 s.
 //!
 //! The helper does not retry inside an open transaction. A savepoint retry
 //! keeps the locks of the outer transaction, so the same cycle can form again.
@@ -27,8 +35,13 @@ use diesel_async::AsyncPgConnection;
 use crate::error::{HarvestError, HarvestResult};
 use crate::telemetry::MetricsRecorder;
 
-/// Site label for the workflow-task persist transaction.
+/// Site label for a persist transaction that runs again in place.
 pub const SITE_PERSIST: &str = "persist";
+/// Site label for a workflow-task persist that the dispatcher runs again.
+///
+/// The task resets to `PENDING`, and replay derives the same decision. The
+/// persist itself does not run under [`run_with_conflict_retry`].
+pub const SITE_WORKFLOW_TASK: &str = "workflow_task";
 /// Site label for a task claim transaction.
 pub const SITE_CLAIM: &str = "claim";
 /// Site label for a scanner fire transaction.
@@ -65,19 +78,21 @@ impl TxConflict {
 
 /// Classify `error` as a retryable conflict abort.
 ///
-/// Return `None` for every other error.
+/// Returns `None` for every other error.
 ///
-/// The check reads the message text. Diesel keeps no SQLSTATE, so a server
-/// with a non-English `lc_messages` matches on the code only when the code is
-/// in the text. See [`crate::pool::is_session_timeout`] for the same limit.
+/// The check reads the English message text, because Diesel keeps no
+/// SQLSTATE. A server with a non-English `lc_messages` never matches, so the
+/// retry is off there. See [`crate::pool::is_session_timeout`] for the same
+/// limit. A bare code is not matched. A number such as `140001` in a message
+/// would otherwise match it.
 #[must_use]
 pub fn classify_conflict(error: &HarvestError) -> Option<TxConflict> {
     let HarvestError::Database(msg) = error else {
         return None;
     };
-    if msg.contains("40P01") || msg.contains("deadlock detected") {
+    if msg.contains("deadlock detected") {
         Some(TxConflict::Deadlock)
-    } else if msg.contains("40001") || msg.contains("could not serialize access") {
+    } else if msg.contains("could not serialize access") {
         Some(TxConflict::SerializationFailure)
     } else {
         None
@@ -109,7 +124,9 @@ impl TxRetryPolicy {
     ///
     /// The ceiling is `base_delay * 2^(retry - 1)`, capped at `max_delay`.
     /// The sleep is half the ceiling plus a jittered share of the other half.
-    /// The fixed half keeps two victims apart. The jitter spreads them out.
+    /// The fixed half gives the winner time to commit. The jitter spreads out
+    /// retries that start together. With the default policy, the first retry
+    /// sleeps 10 to 20 ms.
     #[must_use]
     pub fn backoff(&self, retry: u32, jitter: f64) -> Duration {
         let doublings = retry.saturating_sub(1).min(31);
@@ -185,6 +202,7 @@ where
             return Err(error);
         };
         if run >= policy.max_attempts || !at_top_level(conn) {
+            metrics.record_db_transaction_retry_exhausted(site, conflict.as_str());
             tracing::warn!(
                 site,
                 reason = conflict.as_str(),
@@ -236,10 +254,6 @@ mod tests {
             classify_conflict(&db("deadlock detected")),
             Some(TxConflict::Deadlock)
         );
-        assert_eq!(
-            classify_conflict(&db("ERROR 40P01: lock cycle")),
-            Some(TxConflict::Deadlock)
-        );
     }
 
     #[test]
@@ -249,9 +263,17 @@ mod tests {
             Some(TxConflict::SerializationFailure)
         );
         assert_eq!(
-            classify_conflict(&db("SQLSTATE 40001")),
+            classify_conflict(&db(
+                "could not serialize access due to read/write dependencies among transactions"
+            )),
             Some(TxConflict::SerializationFailure)
         );
+    }
+
+    #[test]
+    fn a_number_that_looks_like_a_code_does_not_classify() {
+        assert_eq!(classify_conflict(&db("value 140001 is out of range")), None);
+        assert_eq!(classify_conflict(&db("order 40P01 not found")), None);
     }
 
     #[test]

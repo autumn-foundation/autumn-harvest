@@ -3817,9 +3817,11 @@ async fn persist_external_signal_inline(
     // conflict that fails the caller even though delivery succeeded (issue #492).
     // Issue #1822: two workflows that signal each other in one cycle lock
     // their own row, then the row of the peer. Postgres aborts one side with
-    // `40P01`. The retry runs the whole transaction again, so the victim does
-    // not fail its workflow. Follow-up work runs after the commit, below.
-    // A completion-trigger counter inside an inline cancel can count twice.
+    // `40P01`. The retry runs the whole transaction again. A conflict after
+    // the last retry passes through `fail_execution_on_error`, so the task
+    // runs again and the workflow does not fail. Follow-up work runs after the
+    // commit, below. A completion-trigger counter inside an inline cancel can
+    // count twice.
     let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = Box::pin(crate::tx_retry::run_with_conflict_retry(
         conn,
         crate::tx_retry::SITE_PERSIST,
@@ -18786,6 +18788,13 @@ pub async fn fail_execution_on_error<T>(
     if error.terminal_write_claim_ambiguous().is_some() {
         return Err(error);
     }
+    // Issue #1822: Postgres aborted the write to break a deadlock or a
+    // serialization conflict. The workload made no error, so pass it
+    // through. The dispatcher resets the task, and the cycle runs again.
+    // This also covers a conflict that outlasts the retries of a wired site.
+    if crate::tx_retry::classify_conflict(&error).is_some() {
+        return Err(error);
+    }
     fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await?;
     Err(error)
 }
@@ -24619,10 +24628,10 @@ async fn process_workflow_task(
             // again. The persist closure records metrics before it commits, so
             // an in-place re-run would count them twice.
             if let Some(conflict) = crate::tx_retry::classify_conflict(&error) {
-                registry
-                    .telemetry()
-                    .metrics
-                    .record_db_transaction_retry(crate::tx_retry::SITE_PERSIST, conflict.as_str());
+                registry.telemetry().metrics.record_db_transaction_retry(
+                    crate::tx_retry::SITE_WORKFLOW_TASK,
+                    conflict.as_str(),
+                );
                 return Err(error);
             }
             // Issue #946, Codex round-3/round-4 review: `persist_terminal_
