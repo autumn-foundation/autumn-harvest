@@ -1699,7 +1699,8 @@ impl Raw {
 
 /// Analyse one `up.sql`, and add what it creates to `history`.
 fn analyse(sql: &str, history: &mut History) -> Analysis {
-    let (toks, comments) = tokenize(sql);
+    let (mut toks, comments) = tokenize(sql);
+    blank_foreign_bodies(&mut toks);
     let s = Stmts::new(&toks);
     let mut raws: Vec<Raw> = Vec::new();
     let mut timeouts = Vec::new();
@@ -1793,7 +1794,6 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         &mut timeouts,
         &mut body_timeouts,
     );
-    drop_foreign_body_locks(&s, &mut raws);
     let new_tables = new_table_spans(&s, &created, history);
     let hits = resolve(raws, &s, &unconditional, &new_tables, path_change, history);
 
@@ -2829,22 +2829,37 @@ fn routine_bodies(s: &Stmts) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Drop each lock in the body of a routine or `DO` in another language.
+/// Blank the body of each routine or `DO` in another language.
 ///
-/// Postgres only stores the source of such a routine, so text in it that
-/// reads as SQL takes no lock. A call of the routine counts as foreign code
-/// instead. A foreign `DO` counts as one lock at the `DO` token.
-fn drop_foreign_body_locks(s: &Stmts, raws: &mut Vec<Raw>) {
-    // A foreign `DO` keeps its own lock, at the `DO` token itself.
-    let foreign: Vec<(usize, usize)> = (0..s.toks.len())
-        .filter(|&k| language(s, k).is_some_and(|l| l != "plpgsql" && l != "sql"))
-        .filter_map(|k| routine_body(s, k).or_else(|| foreign_do(s, k).then(|| (k + 1, s.end(k)))))
-        .collect();
-    raws.retain(|raw| {
-        !foreign
-            .iter()
-            .any(|&(from, to)| from <= raw.at && raw.at < to)
-    });
+/// Postgres only stores the source of such a routine, so no text in it is SQL:
+/// it takes no lock and changes no setting. A call of the routine counts as
+/// foreign code instead, and a foreign `DO` counts as one lock at the `DO`.
+/// Only tokens deeper than the statement go, so a trailing `LANGUAGE` clause
+/// stays.
+fn blank_foreign_bodies(toks: &mut [Token]) {
+    let ranges: Vec<(usize, usize, usize)> = {
+        let s = Stmts::new(toks);
+        (0..toks.len())
+            .filter(|&k| language(&s, k).is_some_and(|l| l != "plpgsql" && l != "sql"))
+            .filter_map(|k| {
+                let (from, to) =
+                    routine_body(&s, k).or_else(|| foreign_do(&s, k).then(|| (k + 1, s.end(k))))?;
+                Some((from, to, toks[k].depth))
+            })
+            .collect()
+    };
+    for (from, to, depth) in ranges {
+        for j in from..to {
+            // The lexer reads a quoted `LANGUAGE 'name'` in a `DO` as body
+            // text, but it names the language.
+            let names = j > 0 && toks[j - 1].depth == depth && is_keyword(&toks[j - 1], "language");
+            if toks[j].depth <= depth || names {
+                continue;
+            }
+            toks[j].tok = Tok::Punct(' ');
+            toks[j].quoted = false;
+        }
+    }
 }
 
 /// The first token and the end of the body of the routine that `CREATE`
@@ -5637,6 +5652,17 @@ fn a_foreign_routine_body_is_not_sql() {
     let sql = format!("{sql}\nSET LOCAL lock_timeout = '5s';\nSELECT f();");
     let findings = lint_with_history(&[], &sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn foreign_routine_text_changes_no_setting() {
+    let routine = "CREATE FUNCTION f() RETURNS void LANGUAGE plpython3u AS $$\n\
+                   # ; SET standard_conforming_strings = off;\npass\n$$;";
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    // Postgres only stores the source, so the setting stays on.
+    assert_eq!(lint_with_history(&[routine], hidden, true), [], "{hidden}");
+    let sql = format!("{routine}\n{hidden}");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
 #[test]
