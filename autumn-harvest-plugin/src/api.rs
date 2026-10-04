@@ -14175,13 +14175,15 @@ fn local_build_id_from_workers(workers: &[WorkerRow], local_worker_id: Option<&s
 /// Can ANY single live worker actually claim this task?
 ///
 /// Queue coverage alone is not the claim predicate. `queue::claim_task` also
-/// enforces the task's `required_build_id` (exact, `harvest_build_compat`
-/// declared, or legacy empty-build worker), its `required_capabilities` (the
-/// same Exact/In label match), and its **session pin** -- so a task sitting on
-/// a well-covered queue can still be permanently unclaimable because no poller
-/// runs the right build, advertises the right labels, or *is* the session's
-/// pinned host. This endpoint must report that as a stall, not healthy
-/// progress.
+/// enforces three more rules. The first is the task's `required_build_id`: an
+/// exact or `harvest_build_compat` match, never an empty `build_id`. The second
+/// is its `required_capabilities`, the same Exact/In label match. The third is
+/// its **session pin**.
+///
+/// So a task on a well-covered queue can still be permanently unclaimable.
+/// No poller may run the right build, advertise the right labels, or *be* the
+/// session's pinned host. This endpoint must report that as a stall, not
+/// healthy progress.
 ///
 /// Every dimension is checked against the **same** worker, exactly as the
 /// stranded-work sampler does (`worker.rs`): a task needing both a build and a
@@ -56927,14 +56929,14 @@ mod tests {
             &compat,
             ""
         ));
-        // A legacy worker (empty build_id) may claim anything.
+        // An empty-build worker cannot claim a pinned task (issue #1805).
         let legacy = vec![eligibility_worker(
             "w-legacy",
             &["default"],
             "",
             serde_json::json!({}),
         )];
-        assert!(task_has_eligible_worker(
+        assert!(!task_has_eligible_worker(
             &legacy,
             0,
             TaskClaimRequirements {

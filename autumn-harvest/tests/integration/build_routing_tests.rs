@@ -106,12 +106,44 @@ fn task_with_no_required_build_claimed_by_any_worker() {
 }
 
 #[test]
-fn legacy_worker_empty_build_id_can_claim_any_task() {
+fn empty_build_id_worker_cannot_claim_a_pinned_task() {
     let compat = BuildCompatibilitySet::new();
-    // Workers with an empty build id are treated as legacy workers that
-    // pre-date build routing; they retain the ability to claim any task.
-    assert!(compat.is_eligible("", Some("v1.0")));
-    assert!(compat.is_eligible("", Some("v2.0")));
+    // Pinning fails closed (#1805).
+    assert!(!compat.is_eligible("", Some("v1.0")));
+    assert!(!compat.is_eligible("", Some("v2.0")));
+}
+
+#[test]
+fn empty_build_worker_is_flagged_only_on_queues_with_a_policy() {
+    use autumn_harvest::build_routing::{BuildPolicy, empty_build_policy_queues};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    let policy = |queue: &str| BuildPolicy {
+        id: Uuid::new_v4(),
+        queue_name: queue.to_string(),
+        build_id: "A".to_string(),
+        deployment_name: None,
+        target_build_id: None,
+        ramp_percent: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let queues = vec!["default".to_string(), "bulk".to_string()];
+    let policies = vec![policy("default"), policy("other")];
+
+    assert_eq!(
+        empty_build_policy_queues("", &queues, &policies),
+        vec!["default".to_string()]
+    );
+    assert_eq!(
+        empty_build_policy_queues("A", &queues, &policies),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        empty_build_policy_queues("", &queues, &[]),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -811,17 +843,17 @@ mod db_tests {
     }
 
     #[tokio::test]
-    async fn legacy_worker_empty_build_id_claims_any_task() {
+    async fn empty_build_worker_cannot_claim_a_pinned_task() {
         let (mut conn, _c) = setup().await;
 
         let exec_id = Uuid::new_v4();
-        insert_exec_and_task(&mut conn, exec_id, Some("v1.0")).await;
+        insert_exec_and_task(&mut conn, exec_id, Some("A")).await;
 
-        // Legacy worker with empty build_id can claim anything.
+        // Pinning fails closed (#1805).
         let task = queue::claim_task(
             &mut conn,
             &["default".to_string()],
-            "worker-legacy",
+            "worker-empty",
             "",
             None,
             &[],
@@ -829,10 +861,42 @@ mod db_tests {
         )
         .await
         .expect("claim_task");
-        assert!(
-            task.is_some(),
-            "legacy worker should claim build-tagged task"
-        );
+        assert!(task.is_none(), "empty-build worker must not claim build A");
+
+        // The row stays claimable by its own build.
+        let task = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-a",
+            "A",
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("claim_task");
+        assert!(task.is_some(), "build A worker must claim build A");
+    }
+
+    #[tokio::test]
+    async fn empty_build_worker_claims_unpinned_task_without_policy() {
+        let (mut conn, _c) = setup().await;
+
+        let exec_id = Uuid::new_v4();
+        insert_exec_and_task(&mut conn, exec_id, None).await;
+
+        let task = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-empty",
+            "",
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("claim_task");
+        assert!(task.is_some(), "no policy keeps today's behaviour");
     }
 
     #[tokio::test]
