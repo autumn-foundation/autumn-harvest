@@ -323,6 +323,12 @@ impl From<BuildPolicyRow> for BuildPolicy {
 /// `required_build_id = build_id`. Existing in-flight executions are not
 /// affected.
 ///
+/// A policy update keeps an active ramp, but it starts a new ramp step. So
+/// it gives the ramp a new `ramp_id` (issue #1814). The new id derives from
+/// the old id and the new base build. Every shard pool that held the same
+/// ramp derives the same new id, so the fan-out keeps one ramp identity. An
+/// old ramp guard abort marker does not match the new id.
+///
 /// # Errors
 ///
 /// Returns `HarvestError::Database` on failure.
@@ -339,6 +345,9 @@ pub async fn set_build_policy(
          ON CONFLICT (queue_name) DO UPDATE \
              SET build_id = EXCLUDED.build_id, \
                  deployment_name = EXCLUDED.deployment_name, \
+                 ramp_id = CASE WHEN harvest_build_policies.ramp_id IS NULL THEN NULL \
+                     ELSE md5(harvest_build_policies.ramp_id::text || ':' \
+                              || EXCLUDED.build_id)::uuid END, \
                  updated_at = NOW() \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))

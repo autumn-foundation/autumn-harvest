@@ -32,11 +32,13 @@ Design decisions:
   adds it to the durable marker list `ramp_aborted` in the same UPDATE. A
   newer abort keeps the older markers. A marker records whether the abort
   was reported. A pass reports an abort whose marker stayed unreported past
-  `report_grace`, with reason `unreported`. The recovery claim is a lease,
+  `report_grace`, with reason `unreported`. The recovery claim is a lease
+  that covers the claimer's own writes,
   and a marker turns reported only after its audit row commits. A pass
   removes a reported marker once no pool holds its ramp. A trigger clears
   `ramp_id` when an `UPDATE` changes a ramp without a new id, so a replica
-  from before the migration cannot reuse an old id. After
+  from before the migration cannot reuse an old id. A base-build change
+  gives an active ramp a new id that every pool derives the same way. After
   a restart, the guard matches markers to ramps by id and base build, not by
   clocks, to finish a partial clear. A clear has a server-side timeout, so it cannot commit late. After a
   cancel, a pass starts no new clear.

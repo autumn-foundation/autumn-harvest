@@ -1462,12 +1462,73 @@ async fn a_recovery_claim_that_did_not_report_is_retried_after_its_lease() {
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
 
-    // After the lease, a pass claims it again and reports it once.
-    tokio::time::sleep(grace + Duration::from_millis(200)).await;
+    // After the lease, a pass claims it again and reports it once. With one
+    // pool and a bound of 1 s, the lease is 5 s.
+    tokio::time::sleep(Duration::from_secs(5) + Duration::from_millis(300)).await;
     let aborts = guard_once(&pools, &pool, &config, None).await;
     assert_eq!(aborts.len(), 1, "{aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
     assert_eq!(marker_reported(&mut conn, ramp_id).await, Some(true));
+}
+
+/// A base-build change keeps an active ramp. It gives the ramp a new
+/// `ramp_id`, and every pool derives the same one. So the ramp keeps one
+/// identity across pools, and no old marker matches it.
+#[tokio::test]
+async fn a_base_change_gives_the_ramp_a_new_shared_id() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_policy(conn, QUEUE, BUILD_C, None)
+            .await
+            .expect("set new base");
+        assert!(ramp_is_active(conn).await, "the ramp stays");
+    }
+    let new_1 = policy_ramp_id(&mut conn_1)
+        .await
+        .expect("pool 1 keeps an id");
+    let new_2 = policy_ramp_id(&mut conn_2)
+        .await
+        .expect("pool 2 keeps an id");
+    assert_eq!(new_1, new_2, "both pools derive the same id");
+    assert_ne!(new_1, old_id, "the new step has a new id");
+}
+
+/// A recovery claim stays leased while its guard reports, even with a zero
+/// report grace. Another pass therefore does not report the abort again.
+#[tokio::test]
+async fn a_zero_grace_still_leases_a_recovery_claim() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+    );
+    // Another guard has just claimed the recovery and is still reporting.
+    assert!(
+        claim_unreported_abort(&mut conn, QUEUE, ramp_id, Duration::ZERO, CLEAR_BOUND)
+            .await
+            .expect("claim")
+    );
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
+    assert!(aborts.is_empty(), "the fresh claim holds: {aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
 }
 
 /// A split ramp with no abort marker is not cleared.

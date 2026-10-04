@@ -208,13 +208,19 @@ The guard fails safe: when it cannot read, it does not abort.
   changes the target, the percentage or `updated_at` but keeps the old
   `ramp_id`. A ramp therefore keeps an id only when an id-aware writer set
   it. This covers an API replica from before the migration during a rolling
-  upgrade, and a base-build change through `set_build_policy`. Such a ramp
-  has no id, so no old marker can clear it. The guard judges it as usual.
+  upgrade. Such a ramp has no id, so no old marker can clear it. The guard
+  judges it as usual.
+- A base-build change through `set_build_policy` keeps an active ramp and
+  starts a new step. It gives the ramp a new `ramp_id`, derived from the old
+  id and the new base build. Every pool that held the same ramp derives the
+  same new id, so the ramp keeps one identity. No old marker matches it.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported, older than `report_grace`, and whose ramp no
-  pool holds. It claims the abort with a lease of `report_grace`, and only
-  the guard that took the claim reports. The claim leaves the marker
+  pool holds. It claims the abort with a lease, and only the guard that took
+  the claim reports. The lease covers every write that the claimer can
+  still make: one claim, one audit row and one mark per pool. It is at least
+  `report_grace`. With one pool and a bound of 30 s, the lease is 150 s. The claim leaves the marker
   unreported. That guard reports the abort with reason `unreported`, no
   rates and `ramp_percent=0`, because the verdict is gone. After the audit
   row commits, it marks the markers as reported. A guard that stops before

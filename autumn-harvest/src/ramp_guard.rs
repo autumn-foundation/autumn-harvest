@@ -907,12 +907,14 @@ async fn read_pool_ramps(
 /// A marker whose ramp no pool holds is finished. Every pool was read, so
 /// no pool can still hold that ramp. A finished, reported marker can go. A
 /// finished, unreported marker older than `report_grace` is an abort that
-/// a stopped guard did not report.
+/// a stopped guard did not report. A marker with a claim younger than
+/// `claim_lease` waits, because its guard can still be reporting.
 #[cfg(feature = "db")]
 async fn read_ramps(
     pools: &[crate::worker::DbPool],
     bound: Duration,
     report_grace: Duration,
+    claim_lease: Duration,
 ) -> Option<FleetRead> {
     let reads = pools.iter().map(|pool| read_pool_ramps(pool, bound));
     let mut merged: std::collections::BTreeMap<GenerationKey, ObservedRamp> =
@@ -956,6 +958,7 @@ async fn read_ramps(
         })
         .collect();
     let grace_ms = i64::try_from(report_grace.as_millis()).unwrap_or(i64::MAX);
+    let lease_ms = i64::try_from(claim_lease.as_millis()).unwrap_or(i64::MAX);
     let mut finished: std::collections::BTreeMap<(usize, String), Vec<uuid::Uuid>> =
         std::collections::BTreeMap::new();
     let mut unreported: std::collections::BTreeMap<(String, uuid::Uuid), UnreportedAbort> =
@@ -968,7 +971,7 @@ async fn read_ramps(
             if marker.reported {
                 finished.entry((index, queue)).or_default().push(marker.id);
             } else if marker.age_ms >= grace_ms
-                && marker.claim_age_ms.is_none_or(|claim| claim >= grace_ms)
+                && marker.claim_age_ms.is_none_or(|claim| claim >= lease_ms)
             {
                 let entry = unreported
                     .entry((queue.clone(), marker.id))
@@ -1463,6 +1466,21 @@ impl RampGuard {
         self.config.interval().min(MAX_READ_TIMEOUT)
     }
 
+    /// The lease of a recovery claim over `pool_count` pools.
+    ///
+    /// A claimer can still write for one claim, one audit row and one mark
+    /// per pool. Each claim and mark waits at most twice the bound, and the
+    /// audit write at most one bound. The lease covers all of them, so no
+    /// other guard reclaims while the claimer still reports. It is never
+    /// shorter than `report_grace`.
+    fn claim_lease(&self, pool_count: usize) -> Duration {
+        let writes =
+            u32::try_from(pool_count.saturating_mul(2).saturating_add(3)).unwrap_or(u32::MAX);
+        self.config
+            .report_grace()
+            .max(self.bound().saturating_mul(writes))
+    }
+
     /// Run one guard pass over every ramp in `pools`.
     ///
     /// `pools` holds one pool per physical database, in a fixed order. The
@@ -1494,7 +1512,7 @@ impl RampGuard {
             () = cancel.cancelled() => return aborts,
             read = tokio::time::timeout(
                 bound,
-                read_ramps(pools, bound, self.config.report_grace()),
+                read_ramps(pools, bound, self.config.report_grace(), self.claim_lease(pools.len())),
             ) => read,
         };
         let Ok(read) = read else {
@@ -1600,7 +1618,7 @@ impl RampGuard {
                 audit_pool,
                 metrics,
                 lost,
-                self.config.report_grace(),
+                self.claim_lease(pools.len()),
                 bound,
                 cancel,
             )
