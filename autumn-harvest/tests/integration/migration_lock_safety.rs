@@ -1781,6 +1781,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 /// Postgres applies the clause on each call, before the body runs. So the
 /// clause counts as a session value at the first token of the body.
 fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
+    let mut settings = Vec::new();
     for k in (0..s.toks.len()).filter(|&k| routine_keyword(s, k).is_some()) {
         let depth = s.toks[k].depth;
         let end = s.end(k);
@@ -1807,7 +1808,7 @@ fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
                 set + 2
             };
             let bounds = bounds_wait(s, value);
-            body_timeouts.push((
+            settings.push((
                 body,
                 Timeout::Set {
                     bounds,
@@ -1816,8 +1817,12 @@ fn function_settings(s: &Stmts, body_timeouts: &mut Vec<(usize, Timeout)>) {
             ));
         }
     }
-    // `timeout_in_force` reads the changes in token order.
-    body_timeouts.sort_by_key(|(k, _)| *k);
+    // `timeout_in_force` reads the changes in token order. Postgres applies
+    // a clause before the body runs, so the stable sort keeps each clause
+    // ahead of a body change at the same token.
+    settings.append(body_timeouts);
+    settings.sort_by_key(|(k, _)| *k);
+    *body_timeouts = settings;
 }
 
 /// Treat each `DO` body in another language as unreadable code.
@@ -5421,6 +5426,15 @@ fn a_quoted_label_does_not_end_a_branch() {
     let sql = "DO $$\nBEGIN\n    IF random() < 0.5 THEN\n        <<\"if\">>\n        BEGIN\n            \
                NULL;\n        END \"if\";\n        SET LOCAL lock_timeout = '5s';\n    END IF;\n\
                END $$;\nALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_body_change_at_the_body_start_follows_the_routine_setting() {
+    // Postgres applies the clause first, so the body's `RESET` clears it.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE sql SET lock_timeout = '5s' \
+               AS 'RESET lock_timeout; ALTER TABLE harvest_events ADD COLUMN x INT';";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
