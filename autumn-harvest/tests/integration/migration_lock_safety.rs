@@ -247,6 +247,9 @@ struct History {
     search_path_changed: bool,
     /// Whether an earlier migration left `standard_conforming_strings` off.
     nonstandard_strings: bool,
+    /// Each routine whose body may take a lock, without its schema. A call of
+    /// such a routine in a later migration counts as a lock.
+    locking_routines: BTreeSet<String>,
 }
 
 impl History {
@@ -1979,25 +1982,15 @@ fn call_clears(
     timeouts: &mut Vec<(usize, Timeout)>,
     body_timeouts: &mut Vec<(usize, Timeout)>,
 ) {
-    let routines: Vec<Routine> = (0..s.toks.len())
-        .filter_map(|k| {
-            let (name, open) = s.qualified_name(routine_keyword(s, k)? + 1)?;
-            let arity = arity(s, open);
-            let foreign = language(s, k).is_some_and(|l| l != "plpgsql" && l != "sql");
-            Some(Routine {
-                name,
-                arity,
-                at: k,
-                foreign,
-            })
-        })
-        .collect();
+    let routines = file_routines(s);
     let inherited = history.clearing_routines.clone();
     let inherited_foreign = history.foreign_routines.clone();
+    let inherited_locking = history.locking_routines.clone();
     let bases: BTreeSet<&str> = routines
         .iter()
         .map(|r| base(&r.name))
         .chain(inherited.iter().map(String::as_str))
+        .chain(inherited_locking.iter().map(String::as_str))
         .collect();
     let calls: Vec<Routine> = (0..s.toks.len())
         .filter_map(|k| call_target(s, k, &bases))
@@ -2060,6 +2053,17 @@ fn call_clears(
         if foreign {
             raws.push(Raw::lock(call.at, FOREIGN_CODE, None));
         }
+        // A `CALL` that no earlier `CREATE` here matches, or a call of a
+        // locking routine from an earlier migration, may take any lock.
+        let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c <= call.at);
+        let resolved = !unplaced
+            && routines.iter().any(|r| {
+                r.at < call.at && r.name == call.name && r.arity.is_some() && r.arity == call.arity
+            });
+        let unread = s.keyword(call.at, "call") || inherited_locking.contains(callee);
+        if !foreign && !resolved && unread {
+            raws.push(Raw::lock(call.at, UNREAD_CALL, None));
+        }
         if keeps(call, &clearing) {
             continue;
         }
@@ -2069,18 +2073,57 @@ fn call_clears(
             body_timeouts.push((call.at, clear));
         }
     }
-    for &i in &clearing {
-        history
-            .clearing_routines
-            .insert(base(&routines[i].name).to_string());
-    }
-    for r in routines.iter().filter(|r| r.foreign) {
-        history.foreign_routines.insert(base(&r.name).to_string());
-    }
+    record_routines(s, &routines, &clearing, raws, history);
     // `timeout_in_force` reads the changes in token order.
     timeouts.sort_by_key(|(k, _)| *k);
     body_timeouts.sort_by_key(|(k, _)| *k);
 }
+
+/// Each routine that the file creates.
+fn file_routines(s: &Stmts) -> Vec<Routine> {
+    (0..s.toks.len())
+        .filter_map(|k| {
+            let (name, open) = s.qualified_name(routine_keyword(s, k)? + 1)?;
+            let arity = arity(s, open);
+            let foreign = language(s, k).is_some_and(|l| l != "plpgsql" && l != "sql");
+            Some(Routine {
+                name,
+                arity,
+                at: k,
+                foreign,
+            })
+        })
+        .collect()
+}
+
+/// Teach the history which routines of this file clear the bound, run
+/// foreign code or take a lock, for the calls in later migrations.
+fn record_routines(
+    s: &Stmts,
+    routines: &[Routine],
+    clearing: &BTreeSet<usize>,
+    raws: &[Raw],
+    history: &mut History,
+) {
+    for &i in clearing {
+        history
+            .clearing_routines
+            .insert(base(&routines[i].name).to_string());
+    }
+    for r in routines {
+        let name = base(&r.name).to_string();
+        if r.foreign {
+            history.foreign_routines.insert(name.clone());
+        }
+        let body = r.at + 1..s.end(r.at);
+        if raws.iter().any(|raw| body.contains(&raw.at)) {
+            history.locking_routines.insert(name);
+        }
+    }
+}
+
+/// The verb of a lock that a call of an unread routine may take.
+const UNREAD_CALL: &str = "call of a routine the lint cannot read";
 
 /// The routine call at `k`, if any.
 ///
@@ -2106,13 +2149,15 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
         .then(|| s.word(k - 2))
         .flatten();
     let first = if schema.is_some() { k - 2 } else { k };
-    let ddl = first > 0
-        && ["function", "procedure", "routine"]
+    // The name after `CALL` belongs to the `CALL` above, so it is not a
+    // second call.
+    let not_a_call = first > 0
+        && ["function", "procedure", "routine", "call"]
             .iter()
             .any(|w| s.is(first - 1, w));
     let name = schema.map_or_else(|| callee.to_string(), |schema| format!("{schema}.{callee}"));
     let arity = arity(s, k + 1);
-    (!ddl).then_some(Routine {
+    (!not_a_call).then_some(Routine {
         name,
         arity,
         at: k,
@@ -5805,6 +5850,25 @@ fn a_call_or_unreadable_code_ends_a_new_table() {
                 .any(|f| f.detail.contains("ALTER TABLE locks harvest_events")),
             "{sql}\n{findings:?}"
         );
+    }
+}
+
+#[test]
+fn a_call_of_an_unread_or_locking_routine_is_a_lock() {
+    let procedure = "CREATE PROCEDURE legacy_p() LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                     ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;";
+    let function = "CREATE FUNCTION legacy_f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                    ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;";
+    for (history, call) in [
+        (vec![procedure], "CALL legacy_p();"),
+        (vec![function], "SELECT legacy_f();"),
+        (vec![], "CALL mystery();"),
+    ] {
+        let findings = lint_with_history(&history, call, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{call}");
+        // A bound before the call covers the lock.
+        let sql = format!("SET LOCAL lock_timeout = '5s';\n{call}");
+        assert_eq!(lint_with_history(&history, &sql, true), [], "{sql}");
     }
 }
 
