@@ -530,39 +530,70 @@ impl ShardPeerViews {
         self.slots().remove(&slot);
     }
 
-    /// Drop the rows of `slot`. Return `true` when no other slot holds rows
-    /// stored within `max_age`.
+    /// Drop the rows of `slot`. When no other slot holds rows stored within
+    /// `max_age`, run `on_idle`.
     ///
-    /// One lock covers both steps. So when the last two slots release at
-    /// once, at least one of them sees no fresh slot left.
-    #[must_use]
-    pub fn release(&self, slot: usize, max_age: Duration) -> bool {
+    /// `on_idle` runs under the slot lock. So when the last two slots release
+    /// at once, at least one of them sees no fresh slot left. A tick that
+    /// stores a view also publishes under this lock, so a clear cannot
+    /// overwrite a verdict from a newer view.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn release(&self, slot: usize, max_age: Duration, on_idle: impl FnOnce()) {
         let now = std::time::Instant::now();
         let mut slots = self.slots();
         slots.remove(&slot);
-        !slots
+        let idle = !slots
             .values()
-            .any(|(at, _)| now.saturating_duration_since(*at) <= max_age)
+            .any(|(at, _)| now.saturating_duration_since(*at) <= max_age);
+        if idle {
+            on_idle();
+        }
+    }
+
+    /// Replace the rows of `slot`, then pass the merged rows to `then` and
+    /// return its result.
+    ///
+    /// `then` runs under the slot lock. The heartbeats of one worker then
+    /// publish in the order in which they store, so the last verdict comes
+    /// from the newest view.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn store_then<R>(
+        &self,
+        slot: usize,
+        rows: Vec<LiveWorkerTaskStats>,
+        max_age: Duration,
+        then: impl FnOnce(&[LiveWorkerTaskStats]) -> R,
+    ) -> R {
+        let now = std::time::Instant::now();
+        let mut slots = self.slots();
+        slots.insert(slot, (now, rows));
+        let merged = Self::merge(&slots, now, max_age);
+        then(&merged)
     }
 
     /// The rows of every slot stored within `max_age`, one per worker. When
     /// two shards hold a row for the same worker, the newest row wins.
     #[must_use]
     pub fn merged(&self, max_age: Duration) -> Vec<LiveWorkerTaskStats> {
-        let now = std::time::Instant::now();
-        let rows: Vec<LiveWorkerTaskStats> = self
-            .slots()
-            .values()
-            .filter(|(at, _)| now.saturating_duration_since(*at) <= max_age)
-            .flat_map(|(_, rows)| rows.iter().cloned())
-            .collect();
+        Self::merge(&self.slots(), std::time::Instant::now(), max_age)
+    }
+
+    fn merge(
+        slots: &std::collections::BTreeMap<usize, (std::time::Instant, Vec<LiveWorkerTaskStats>)>,
+        now: std::time::Instant,
+        max_age: Duration,
+    ) -> Vec<LiveWorkerTaskStats> {
         let mut by_worker: std::collections::BTreeMap<String, LiveWorkerTaskStats> =
             std::collections::BTreeMap::new();
-        for row in rows {
+        let fresh = slots
+            .values()
+            .filter(|(at, _)| now.saturating_duration_since(*at) <= max_age)
+            .flat_map(|(_, rows)| rows.iter());
+        for row in fresh {
             match by_worker.get(&row.worker_id) {
                 Some(kept) if !row.is_fresher_than(kept) => {}
                 _ => {
-                    by_worker.insert(row.worker_id.clone(), row);
+                    by_worker.insert(row.worker_id.clone(), row.clone());
                 }
             }
         }
@@ -724,10 +755,12 @@ impl OutlierProbe {
     /// the verdict live. With none left, an unknown state reads as "not an
     /// outlier", so a stale 1 cannot keep an alert firing.
     pub fn clear_gauge(&self, worker_id: &str) {
-        let idle = self.shard_peers.release(self.slot, self.view_max_age());
-        if self.compare && idle {
-            self.publish(worker_id, &[]);
-        }
+        self.shard_peers
+            .release(self.slot, self.view_max_age(), || {
+                if self.compare {
+                    self.publish(worker_id, &[]);
+                }
+            });
     }
 
     /// Drop this heartbeat's peer rows when it stops. The last heartbeat of
@@ -735,12 +768,14 @@ impl OutlierProbe {
     ///
     /// A stopped worker then cannot keep the process-wide OR at 1.
     pub fn retire(&self, worker_id: &str) {
-        let idle = self.shard_peers.release(self.slot, self.view_max_age());
-        if self.compare && idle {
-            let _ = self
-                .process_flags
-                .update(worker_id, None, |any| self.emit(any));
-        }
+        self.shard_peers
+            .release(self.slot, self.view_max_age(), || {
+                if self.compare {
+                    let _ = self
+                        .process_flags
+                        .update(worker_id, None, |any| self.emit(any));
+                }
+            });
     }
 }
 
@@ -798,19 +833,32 @@ impl LiveWorkerTaskStats {
 /// The next task-stats snapshot sequence of this process (issue #1815).
 ///
 /// The sequence starts at the host clock in microseconds and then counts up
-/// by one. So it rises within a process, even if the host clock steps back. A
-/// restarted worker on the same host starts above its last value. Only one
-/// worker's rows are compared with each other, so hosts need not agree.
+/// by one. So it rises within a process, even if the host clock steps back.
+/// Only one worker's rows are compared with each other, so hosts need not
+/// agree.
+///
+/// A restarted worker can keep its id and start below the rows of its
+/// previous process. [`upsert_worker_task_stats`] therefore stores a value
+/// above the old row, and [`observe_snapshot_seq`] moves the counter above it.
 pub fn next_snapshot_seq() -> i64 {
-    static SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
-        std::sync::LazyLock::new(|| {
-            let micros = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| since.as_micros());
-            std::sync::atomic::AtomicI64::new(i64::try_from(micros).unwrap_or(0))
-        });
-    SEQ.fetch_add(1, Ordering::Relaxed)
+    SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
+
+/// Move the snapshot sequence above `stored`, a value already in a stats row
+/// (issue #1815).
+///
+/// Every later snapshot of this process then outranks that row on every shard.
+pub fn observe_snapshot_seq(stored: i64) {
+    SNAPSHOT_SEQ.fetch_max(stored.saturating_add(1), Ordering::Relaxed);
+}
+
+static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
+    std::sync::LazyLock::new(|| {
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_micros());
+        std::sync::atomic::AtomicI64::new(i64::try_from(micros).unwrap_or(0))
+    });
 
 /// The cohort key for a worker's `queues` JSON: the sorted, deduplicated
 /// queue names, as a JSON array.
@@ -829,6 +877,10 @@ fn queue_cohort(queues: &serde_json::Value) -> String {
 /// The write is an upsert. It fails on the foreign key when the worker row is
 /// missing. The next heartbeat heals the worker row and then retries.
 ///
+/// The stored sequence is above the old row's sequence, also when a previous
+/// process of the same worker wrote that row. The process counter then moves
+/// above the stored value.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError`] on database failure.
@@ -838,7 +890,7 @@ pub async fn upsert_worker_task_stats(
     stats: &WorkerTaskStats,
 ) -> HarvestResult<()> {
     let to_i32 = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
-    diesel::sql_query(
+    let stored = diesel::sql_query(
         "INSERT INTO harvest_worker_task_stats \
              (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, \
               updated_at) \
@@ -847,8 +899,10 @@ pub async fn upsert_worker_task_stats(
              window_tasks = EXCLUDED.window_tasks, \
              window_failures = EXCLUDED.window_failures, \
              p99_latency_ms = EXCLUDED.p99_latency_ms, \
-             snapshot_seq = EXCLUDED.snapshot_seq, \
-             updated_at = EXCLUDED.updated_at",
+             snapshot_seq = GREATEST(harvest_worker_task_stats.snapshot_seq + 1, \
+                                     EXCLUDED.snapshot_seq), \
+             updated_at = EXCLUDED.updated_at \
+         RETURNING snapshot_seq",
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Integer, _>(to_i32(stats.tasks))
@@ -859,10 +913,17 @@ pub async fn upsert_worker_task_stats(
             .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
     )
     .bind::<diesel::sql_types::BigInt, _>(next_snapshot_seq())
-    .execute(conn)
+    .get_result::<StoredSnapshotSeq>(conn)
     .await
     .map_err(crate::error::database_error)?;
+    observe_snapshot_seq(stored.snapshot_seq);
     Ok(())
+}
+
+#[derive(diesel::QueryableByName)]
+struct StoredSnapshotSeq {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    snapshot_seq: i64,
 }
 
 /// Delete task-stats rows older than [`WORKER_TASK_STATS_RETENTION`] (issue
@@ -976,27 +1037,31 @@ pub async fn run_outlier_tick(
         return Ok(Vec::new());
     }
     let live = load_live_worker_task_stats(conn, probe.fleet_stale_secs).await?;
-    probe.shard_peers.store(probe.slot, live);
     if !probe.compare {
+        probe.shard_peers.store(probe.slot, live);
         return Ok(Vec::new());
     }
-    let flagged = if draining {
-        Vec::new()
-    } else {
-        let live = probe.shard_peers.merged(probe.view_max_age());
-        live.iter()
-            .find(|row| row.worker_id == worker_id)
-            .map(|me| {
-                let peers: Vec<WorkerTaskStats> = live
-                    .iter()
-                    .filter(|row| row.worker_id != worker_id && row.cohort == me.cohort)
-                    .map(|row| row.stats)
-                    .collect();
-                outlier_dimensions(&own, &peers, &probe.config)
-            })
-            .unwrap_or_default()
-    };
-    probe.publish(worker_id, &flagged);
+    let flagged = probe
+        .shard_peers
+        .store_then(probe.slot, live, probe.view_max_age(), |live| {
+            let flagged = if draining {
+                Vec::new()
+            } else {
+                live.iter()
+                    .find(|row| row.worker_id == worker_id)
+                    .map(|me| {
+                        let peers: Vec<WorkerTaskStats> = live
+                            .iter()
+                            .filter(|row| row.worker_id != worker_id && row.cohort == me.cohort)
+                            .map(|row| row.stats)
+                            .collect();
+                        outlier_dimensions(&own, &peers, &probe.config)
+                    })
+                    .unwrap_or_default()
+            };
+            probe.publish(worker_id, &flagged);
+            flagged
+        });
     Ok(flagged)
 }
 
@@ -2518,6 +2583,56 @@ mod tests {
         );
         second.clear_gauge("me");
         assert!(flags.set("peer", &[]).is_empty(), "no shard can compare");
+    }
+
+    /// Records whether each gauge write ran while `views` was locked.
+    struct LockProbe {
+        views: std::sync::Arc<super::ShardPeerViews>,
+        locked: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl crate::telemetry::MetricsRecorder for LockProbe {
+        fn record_worker_outlier(
+            &self,
+            _dimension: crate::worker_outlier::OutlierDimension,
+            _is_outlier: bool,
+        ) {
+            let locked = self.views.0.try_lock().is_err();
+            self.locked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(locked);
+        }
+    }
+
+    /// Issue #1815: a tick that clears the verdict does so under the view
+    /// lock. A healthy tick then cannot store a view and publish a verdict
+    /// between the idle check and the clear.
+    #[test]
+    fn clearing_the_verdict_holds_the_shard_view_lock() {
+        use crate::worker_outlier::OutlierDimension::FailureRatio;
+        let views: std::sync::Arc<super::ShardPeerViews> = std::sync::Arc::default();
+        let recorder = std::sync::Arc::new(LockProbe {
+            views: std::sync::Arc::clone(&views),
+            locked: std::sync::Mutex::default(),
+        });
+        let flags = std::sync::Arc::default();
+        let mut probe = probe_for_slot(0, &views, &flags);
+        probe.metrics = recorder.clone();
+        let _ = flags.set("me", &[FailureRatio]);
+
+        probe.clear_gauge("me");
+        probe.retire("me");
+        let locked = recorder
+            .locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(!locked.is_empty(), "the gauge is written");
+        assert!(
+            locked.iter().all(|held| *held),
+            "every gauge write holds the view lock: {locked:?}"
+        );
     }
 
     /// Issue #1815: an aborted heartbeat still retires its verdict, so a

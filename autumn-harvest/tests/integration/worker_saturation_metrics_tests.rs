@@ -512,6 +512,54 @@ async fn frozen_stats_leave_the_live_set_and_old_rows_are_pruned() {
     );
 }
 
+/// A restarted worker keeps its id. Its new process can start with a lower
+/// sequence, for example on a host with a slower clock. The upsert still
+/// stores a sequence above the old process's row, and the process counter
+/// continues above it.
+#[tokio::test]
+async fn a_restarted_worker_outranks_the_rows_of_its_previous_process() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("restart-q");
+    let id = unique_id("w-restart");
+    register(&mut conn, &id, &queue).await;
+    let stats = WorkerTaskStats {
+        tasks: 30,
+        failures: 0,
+        p99_latency_ms: Some(5),
+    };
+    workers::upsert_worker_task_stats(&mut conn, &id, &stats)
+        .await
+        .expect("first upsert");
+    // The previous process ran on a host whose clock was far ahead.
+    let previous = workers::next_snapshot_seq() + 1_000_000_000_000;
+    diesel::sql_query(
+        "UPDATE harvest_worker_task_stats SET snapshot_seq = $2 WHERE worker_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&id)
+    .bind::<diesel::sql_types::BigInt, _>(previous)
+    .execute(&mut conn)
+    .await
+    .expect("seed the previous process's row");
+
+    workers::upsert_worker_task_stats(&mut conn, &id, &stats)
+        .await
+        .expect("upsert after the restart");
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+        .await
+        .expect("load");
+    let stored = rows
+        .iter()
+        .find(|r| r.worker_id == id)
+        .expect("the row is live")
+        .snapshot_seq;
+    assert!(stored > previous, "{stored} must exceed {previous}");
+    assert!(
+        workers::next_snapshot_seq() > stored,
+        "the process counter continues above the stored sequence"
+    );
+}
+
 /// An upsert for a worker with no row fails on the foreign key. The heartbeat
 /// logs it and retries on the next tick.
 #[tokio::test]
