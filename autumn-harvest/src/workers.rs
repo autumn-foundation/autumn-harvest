@@ -493,10 +493,11 @@ pub const WORKER_TASK_STATS_RETENTION: Duration = Duration::from_secs(3600);
 /// The live peer rows that each shard heartbeat of one worker read last
 /// (issue #1815).
 ///
-/// A multi-shard worker compares itself on one heartbeat only. That heartbeat
-/// merges the rows every shard heartbeat stored here. So a peer that lives on
-/// another of the worker's shards still counts. A slot expires when its shard
-/// heartbeat stops reading, so a lost shard cannot keep stale peers alive.
+/// Each shard heartbeat of a worker compares the worker over the rows that
+/// every shard heartbeat stored here. So a peer that lives on another of the
+/// worker's shards still counts, and all heartbeats see the same peer set. A
+/// slot expires when its shard heartbeat stops reading, so a lost shard cannot
+/// keep stale peers alive.
 #[derive(Debug, Default)]
 pub struct ShardPeerViews(
     Mutex<std::collections::BTreeMap<usize, (std::time::Instant, Vec<LiveWorkerTaskStats>)>>,
@@ -527,6 +528,21 @@ impl ShardPeerViews {
     /// Drop the rows of `slot`, for example after its shard heartbeat fails.
     pub fn clear(&self, slot: usize) {
         self.slots().remove(&slot);
+    }
+
+    /// Drop the rows of `slot`. Return `true` when no other slot holds rows
+    /// stored within `max_age`.
+    ///
+    /// One lock covers both steps. So when the last two slots release at
+    /// once, at least one of them sees no fresh slot left.
+    #[must_use]
+    pub fn release(&self, slot: usize, max_age: Duration) -> bool {
+        let now = std::time::Instant::now();
+        let mut slots = self.slots();
+        slots.remove(&slot);
+        !slots
+            .values()
+            .any(|(at, _)| now.saturating_duration_since(*at) <= max_age)
     }
 
     /// The rows of every slot stored within `max_age`, one per worker. When
@@ -655,8 +671,9 @@ pub struct OutlierProbe {
     /// Whether this heartbeat compares the worker and sets the gauge.
     ///
     /// A multi-shard worker runs one heartbeat per shard, and each one
-    /// publishes the stats. Only one of them compares. The gauge has no shard
-    /// label, so two comparisons with different peer sets would make it flap.
+    /// compares. They all merge the same peer set from `shard_peers`, so the
+    /// unlabelled gauge does not flap between peer sets. When one shard fails,
+    /// a healthy shard keeps the verdict live.
     pub compare: bool,
     /// This heartbeat's slot in `shard_peers`, one slot per shard.
     pub slot: usize,
@@ -687,6 +704,12 @@ impl OutlierProbe {
             .update(worker_id, Some(flagged), |any| self.emit(any));
     }
 
+    /// A slot older than this belongs to a shard heartbeat that stopped
+    /// reading, so the comparison leaves its rows out.
+    fn view_max_age(&self) -> Duration {
+        Duration::from_secs(u64::try_from(self.fleet_stale_secs).unwrap_or(0))
+    }
+
     fn emit(&self, any: &[OutlierDimension]) {
         for dimension in OutlierDimension::ALL {
             self.metrics
@@ -694,28 +717,52 @@ impl OutlierProbe {
         }
     }
 
-    /// Drop this heartbeat's peer rows, clear this worker's verdict and
-    /// refresh the gauge.
+    /// Drop this heartbeat's peer rows. When no shard heartbeat of this
+    /// worker holds fresh rows, also clear the verdict and refresh the gauge.
     ///
-    /// A tick that cannot compare calls this. An unknown state then reads as
-    /// "not an outlier", and a stale 1 cannot keep an alert firing.
+    /// A tick that cannot compare calls this. A healthy shard heartbeat keeps
+    /// the verdict live. With none left, an unknown state reads as "not an
+    /// outlier", so a stale 1 cannot keep an alert firing.
     pub fn clear_gauge(&self, worker_id: &str) {
-        self.shard_peers.clear(self.slot);
-        if self.compare {
+        let idle = self.shard_peers.release(self.slot, self.view_max_age());
+        if self.compare && idle {
             self.publish(worker_id, &[]);
         }
     }
 
-    /// Forget this worker when its heartbeat stops, and refresh the gauge.
+    /// Drop this heartbeat's peer rows when it stops. The last heartbeat of
+    /// this worker to stop also forgets its verdict and refreshes the gauge.
     ///
     /// A stopped worker then cannot keep the process-wide OR at 1.
     pub fn retire(&self, worker_id: &str) {
-        self.shard_peers.clear(self.slot);
-        if self.compare {
+        let idle = self.shard_peers.release(self.slot, self.view_max_age());
+        if self.compare && idle {
             let _ = self
                 .process_flags
                 .update(worker_id, None, |any| self.emit(any));
         }
+    }
+}
+
+/// Retires a worker's outlier verdict when the heartbeat future drops
+/// (issue #1815).
+///
+/// An owner can abort the heartbeat task, so its loop does not always reach
+/// its end. The drop still runs, so the verdict is always retired.
+struct RetireOnDrop {
+    probe: OutlierProbe,
+    worker_id: String,
+}
+
+impl RetireOnDrop {
+    const fn new(probe: OutlierProbe, worker_id: String) -> Self {
+        Self { probe, worker_id }
+    }
+}
+
+impl Drop for RetireOnDrop {
+    fn drop(&mut self) {
+        self.probe.retire(&self.worker_id);
     }
 }
 
@@ -878,7 +925,7 @@ pub async fn load_live_worker_task_stats(
 ///
 /// The tick prunes old rows and reads the live peers into
 /// `probe.shard_peers`. When `probe.compare` holds, it then compares the
-/// worker with its peers and sets the outlier gauge.
+/// worker with the peers of all its shards and sets the outlier gauge.
 ///
 /// The comparison merges the peer rows of all this worker's shards. It uses
 /// only peers in the worker's own queue cohort. A draining worker, or a worker
@@ -913,10 +960,7 @@ pub async fn run_outlier_tick(
     let flagged = if draining {
         Vec::new()
     } else {
-        // A slot older than the fleet window belongs to a shard that stopped
-        // reading, so its rows are left out.
-        let max_age = Duration::from_secs(u64::try_from(probe.fleet_stale_secs).unwrap_or(0));
-        let live = probe.shard_peers.merged(max_age);
+        let live = probe.shard_peers.merged(probe.view_max_age());
         live.iter()
             .find(|row| row.worker_id == worker_id)
             .map(|me| {
@@ -2165,6 +2209,8 @@ pub fn spawn_worker_heartbeat(
     outliers: OutlierProbe,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Retires the verdict on every exit, an abort included.
+        let _retire = RetireOnDrop::new(outliers.clone(), registration.worker_id.clone());
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
         loop {
             tokio::select! {
@@ -2237,7 +2283,6 @@ pub fn spawn_worker_heartbeat(
                 }
             }
         }
-        outliers.retire(&registration.worker_id);
     })
 }
 
@@ -2394,6 +2439,65 @@ mod tests {
             .map(|r| r.worker_id)
             .collect();
         assert_eq!(ids, vec!["me".to_string()], "an expired slot is skipped");
+    }
+
+    fn probe_for_slot(
+        slot: usize,
+        shard_peers: &std::sync::Arc<super::ShardPeerViews>,
+        process_flags: &std::sync::Arc<super::ProcessOutlierFlags>,
+    ) -> super::OutlierProbe {
+        super::OutlierProbe {
+            window: std::sync::Arc::default(),
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            config: crate::worker_outlier::OutlierConfig::default(),
+            fleet_stale_secs: 60,
+            compare: true,
+            slot,
+            shard_peers: std::sync::Arc::clone(shard_peers),
+            process_flags: std::sync::Arc::clone(process_flags),
+        }
+    }
+
+    /// Issue #1815: a failed shard heartbeat leaves the verdict to a healthy
+    /// one. The last failed heartbeat clears it.
+    #[test]
+    fn a_failed_shard_keeps_the_verdict_while_another_shard_is_healthy() {
+        use crate::worker_outlier::OutlierDimension::FailureRatio;
+        let peers = std::sync::Arc::default();
+        let flags = std::sync::Arc::default();
+        let first = probe_for_slot(0, &peers, &flags);
+        let second = probe_for_slot(1, &peers, &flags);
+        first.shard_peers.store(0, vec![live("me", 50)]);
+        second.shard_peers.store(1, vec![live("me", 50)]);
+        let _ = flags.set("me", &[FailureRatio]);
+
+        first.clear_gauge("me");
+        assert_eq!(
+            flags.set("peer", &[]),
+            vec![FailureRatio],
+            "a healthy shard still holds the verdict"
+        );
+        second.clear_gauge("me");
+        assert!(flags.set("peer", &[]).is_empty(), "no shard can compare");
+    }
+
+    /// Issue #1815: an aborted heartbeat still retires its verdict, so a
+    /// stopped worker cannot hold the shared gauge at 1.
+    #[tokio::test]
+    async fn an_aborted_heartbeat_retires_its_verdict() {
+        use crate::worker_outlier::OutlierDimension::FailureRatio;
+        let peers = std::sync::Arc::default();
+        let flags: std::sync::Arc<super::ProcessOutlierFlags> = std::sync::Arc::default();
+        let probe = probe_for_slot(0, &peers, &flags);
+        let _ = flags.set("me", &[FailureRatio]);
+        let task = tokio::spawn(async move {
+            let _retire = super::RetireOnDrop::new(probe, "me".to_owned());
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(flags.set("peer", &[]).is_empty(), "the verdict is retired");
     }
 
     /// Issue #1815: a healthy worker in the same process cannot clear a sick

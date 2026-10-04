@@ -33,9 +33,11 @@ heartbeat check only. A worker that was alive but sick passed that check.
   A workflow task counts as a failure when it returns an error or times out.
   A release is not counted.
 - Every liveness heartbeat writes a snapshot to the new table
-  `harvest_worker_task_stats` and reads the live peers of its shard. One
-  heartbeat per worker then compares the worker with the peers of all its
-  shards. So the gauge does not flap between peer sets.
+  `harvest_worker_task_stats` and reads the live peers of its shard. Each
+  heartbeat then compares the worker with the merged peers of all its
+  shards. They all see the same peer set, so the gauge does not flap. A
+  healthy shard keeps the verdict live when another shard fails.
+- A stopped or aborted heartbeat retires the worker's verdict.
 - Two workers in one process share the gauge, so it reports the OR of their
   verdicts.
 - The peers are the live `Active` workers that poll the same queues, with

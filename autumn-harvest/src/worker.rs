@@ -30346,9 +30346,9 @@ impl Worker {
         activity_slot_target: Arc<AtomicUsize>,
         heartbeat_cancel: CancellationToken,
         registration_pending: Arc<AtomicBool>,
-        // Issue #1815: this heartbeat's shard slot. Slot 0 compares the worker
-        // with its peers. Exactly one heartbeat per worker has it: the single
-        // pool's, or the first shard's in `run_multi_shard`.
+        // Issue #1815: this heartbeat's slot in the worker's shard peer views.
+        // The single pool uses slot 0. `run_multi_shard` gives each shard its
+        // own slot.
         shard_slot: usize,
     ) -> tokio::task::JoinHandle<()> {
         // Spawn the heartbeat background task with a dedicated cancel token so
@@ -30366,7 +30366,6 @@ impl Worker {
         let max_concurrency =
             i32::try_from(self.workflow_permit_total + self.activity_permit_total)
                 .unwrap_or(i32::MAX);
-        let compare_outliers = shard_slot == 0;
         crate::workers::spawn_worker_heartbeat(
             pool.clone(),
             crate::workers::WorkerRegistration {
@@ -30402,7 +30401,7 @@ impl Worker {
                 fleet_stale_secs: capability_miss_fleet_stale_secs(
                     self.config.worker_heartbeat_interval,
                 ),
-                compare: compare_outliers,
+                compare: true,
                 slot: shard_slot,
                 shard_peers: Arc::clone(&self.outlier_peers),
                 process_flags: crate::workers::ProcessOutlierFlags::for_recorder(
