@@ -22,8 +22,10 @@ the drain. Now:
   activities. The join window is `cancellation_grace_period`, capped at half
   the drain. A later remote deadline cannot undo the cancel.
 - The drain cancels the activity context only. The heartbeat flusher runs
-  until the handler returns, so a handler that ignores the cancel keeps
-  heartbeating.
+  until the handler returns. The cancel stops the handler's own heartbeats,
+  so the worker then re-sends the last checkpoint at
+  `heartbeat_timeout / 3`. The heartbeat timeout therefore cannot fail a
+  handler that ignores the cancel.
 - A cancelled handler that returns a retryable error gives its claim back
   through `queue::requeue_claimed_task_for_retry`, due at once. The stored
   error is `worker shutdown: <handler message>`. The attempt counts. The

@@ -81,13 +81,19 @@ static STUBBORN_STARTS: AtomicU32 = AtomicU32::new(0);
 static STUBBORN_GO: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Ignores cancellation. Returns only when the test lets it go.
-#[activity(start_to_close = "600s")]
+///
+/// Its auto-heartbeat stops at the drain cancel. The 2 s heartbeat timeout
+/// then runs out while the handler still runs.
+#[activity(start_to_close = "600s", heartbeat_timeout = "2s")]
 async fn drain_stubborn(
-    _ctx: &ActivityContext,
+    ctx: &ActivityContext,
     input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let _ = input;
     STUBBORN_STARTS.fetch_add(1, Ordering::SeqCst);
+    let _beat = ctx
+        .start_auto_heartbeat_default()
+        .map_err(|e| e.to_string())?;
     STUBBORN_GO.notified().await;
     Ok(serde_json::json!("done"))
 }
@@ -430,8 +436,9 @@ async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
 ///
 /// The host process outlives `run`, as an embedded runtime does. Both workers
 /// use a 1 s heartbeat, so orphan reclaim judges the drained worker stale
-/// after 2 s. The test waits longer than that. The drained worker must keep
-/// its lease while the handler runs.
+/// after 2 s. The activity has a 2 s heartbeat timeout. The test waits longer
+/// than both. The drained worker must keep its lease and the task heartbeat
+/// while the handler runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
     let (url, _container) = setup_test_database_url_or_env().await;
@@ -457,8 +464,8 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         "the drain must end at its deadline: took {drain:?}"
     );
 
-    // Outlast the stale window (2 s) and a reclaimer tick (1 s) on the live
-    // peer. It must not take the claim.
+    // Outlast the stale window (2 s), the heartbeat timeout (2 s) and a
+    // reclaimer tick (1 s) on the live peer. It must not take the claim.
     tokio::time::sleep(Duration::from_secs(5)).await;
     let row = activity_row(&url, exec_id).await.expect("activity row");
     assert_eq!(row.state, "RUNNING", "the claim stays held: {row:?}");

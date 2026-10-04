@@ -15791,6 +15791,7 @@ async fn execute_activity_future_with_cancellation(
     mut cancellation_observer: impl std::future::Future<Output = ()> + Send + Unpin,
     cancel: tokio_util::sync::CancellationToken,
     drain_cancel: &CancellationToken,
+    keep_alive: impl std::future::Future<Output = std::convert::Infallible> + Send,
     span: tracing::Span,
 ) -> ActivityRun {
     use tracing::Instrument;
@@ -15815,10 +15816,14 @@ async fn execute_activity_future_with_cancellation(
                     "drain deadline near; cancelling running activity"
                 );
                 // The drain never drops the handler. A handler that ignores
-                // the cancel keeps its claim (issue #1813).
+                // the cancel keeps its claim and its task heartbeat (issue
+                // #1813).
+                let keep_alive = keep_alive;
+                tokio::pin!(keep_alive);
                 tokio::select! {
                     biased;
                     result = &mut *activity_future => ActivityRun { result, drained: true },
+                    never = &mut keep_alive => match never {},
                     () = &mut cancellation_observer => ActivityRun {
                         result: unwind(activity_future).await,
                         drained: false,
@@ -17238,6 +17243,7 @@ async fn process_activity_task(
         cancellation_observer,
         cancel.clone(),
         drain_cancel,
+        ctx.keep_alive_after_drain(),
         span,
     )
     .await;

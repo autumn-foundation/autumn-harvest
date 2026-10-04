@@ -170,8 +170,10 @@ handler.
   resume from the last checkpoint.
 - A handler that returns `Ok` completes as usual.
 - A handler that ignores the cancel keeps its claim until it returns. The
-  worker keeps its lease alive meanwhile. If the process exits, orphan
-  reclaim recovers the task.
+  worker keeps its lease alive meanwhile. The cancel stops the handler's own
+  heartbeats, so the worker re-sends the last checkpoint at
+  `heartbeat_timeout / 3`. If the process exits, orphan reclaim recovers the
+  task.
 
 ### `heartbeat_details` across a cancel signal
 
