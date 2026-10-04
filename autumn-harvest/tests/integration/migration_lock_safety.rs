@@ -441,7 +441,12 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
 ///
 /// A lock in a function body runs when something calls the function, maybe
 /// long after the migration. Only a bound set earlier in the same body holds.
+/// A lock that unreadable `EXECUTE` SQL takes never counts as bounded.
 fn bound_in_force(analysis: &Analysis, hit: &Hit) -> bool {
+    // The hidden SQL may clear the bound before it locks.
+    if hit.verb == UNREADABLE_EXECUTE {
+        return false;
+    }
     let Some(from) = hit.body_start else {
         return timeout_in_force(&analysis.timeouts, hit.at);
     };
@@ -1493,23 +1498,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             Some("drop") if start => drop(&s, k, history, &mut raws),
             Some("alter") if start => alter(&s, k, history, &mut raws),
             Some("rename") if s.is(k + 1, "to") => rename(&s, k, history),
-            Some(verb @ ("lock" | "truncate")) if start => {
-                let j = if s.is(k + 1, "table") { k + 2 } else { k + 1 };
-                let verb = if verb == "lock" {
-                    "LOCK TABLE"
-                } else {
-                    "TRUNCATE"
-                };
-                raws.extend(
-                    s.name_list(j)
-                        .into_iter()
-                        .map(|t| Raw::lock(k, verb, Some(t))),
-                );
-                // CASCADE also truncates every table whose key reaches these.
-                if (k..s.end(k)).any(|j| s.is(j, "cascade")) {
-                    raws.push(Raw::lock(k, "TRUNCATE ... CASCADE", None));
-                }
-            }
+            Some("lock" | "truncate") if start => raws.extend(lock_or_truncate(&s, k)),
             Some("cluster") if start => {
                 let j = if s.is(k + 1, "verbose") { k + 2 } else { k + 1 };
                 // A bare `CLUSTER` rewrites every clustered table.
@@ -1517,23 +1506,27 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 raws.push(Raw::lock(k, "CLUSTER", table));
             }
             Some("vacuum") if start => raws.extend(vacuum_full(&s, k)),
-            Some("execute") if start && tok.depth > 0 => raws.extend(unreadable_execute(&s, k)),
-            Some("reindex") if start => raws.extend(reindex(&s, k)),
-            Some("references") => {
-                let owner = s.statement_table(s.starts[k]);
-                if let Some((target, _)) = s.qualified_name(k + 1) {
-                    // A key that may never exist is remembered too, which
-                    // fails closed when its table is dropped later.
-                    if let Some(owner) = owner {
-                        history
-                            .references
-                            .entry(base(&owner).to_string())
-                            .or_default()
-                            .insert(target.clone());
-                    }
-                    raws.push(Raw::lock(s.starts[k], "REFERENCES", Some(target)));
+            // SQL the lint cannot read may lock anything, and may also clear
+            // the bound for what comes after it.
+            Some("execute") if start && tok.depth > 0 => {
+                if let Some(raw) = unreadable_execute(&s, k) {
+                    raws.push(raw);
+                    let list = if tok.runs {
+                        &mut timeouts
+                    } else {
+                        &mut body_timeouts
+                    };
+                    list.push((
+                        k,
+                        Timeout::Set {
+                            bounds: false,
+                            local: false,
+                        },
+                    ));
                 }
             }
+            Some("reindex") if start => raws.extend(reindex(&s, k)),
+            Some("references") => raws.extend(references(&s, k, history)),
             Some("partition") if s.is(k + 1, "of") => {
                 let parent = s.qualified_name(k + 2).map(|(t, _)| t);
                 let child = s.statement_table(s.starts[k]);
@@ -1872,11 +1865,11 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
                 local: false,
             })
         }
-        // A top-level `DO` may end its transaction too. Inside PL/pgSQL, `END`
-        // closes a block, so it counts only at top level.
+        // A `DO` body or a procedure may end its transaction too. Inside
+        // PL/pgSQL, `END` closes a block, so it counts only at top level.
         "end" if start && s.toks[k].depth == 0 => Some(Timeout::Commit),
-        "commit" if start && (s.toks[k].depth == 0 || s.toks[k].runs) => Some(Timeout::Commit),
-        "rollback" | "abort" if start && (s.toks[k].depth == 0 || s.toks[k].runs) => {
+        "commit" if start => Some(Timeout::Commit),
+        "rollback" | "abort" if start => {
             // `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] s` restores the value
             // from the savepoint, which the lint does not track.
             if (k + 1..=k + 2).any(|j| s.is(j, "to")) {
@@ -2182,9 +2175,11 @@ fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     };
     let tail_ok = rest.is_some_and(|j| j >= end || s.is(j, "into") || s.is(j, "using"));
     let text_placeholder = (k + 1..end).any(|j| toks[j].depth > depth && s.is(j, "%s"));
-    (!constant || !tail_ok || text_placeholder)
-        .then(|| Raw::lock(k, "EXECUTE of SQL the lint cannot read", None))
+    (!constant || !tail_ok || text_placeholder).then(|| Raw::lock(k, UNREADABLE_EXECUTE, None))
 }
+
+/// The verb of a lock that unreadable `EXECUTE` SQL may take.
+const UNREADABLE_EXECUTE: &str = "EXECUTE of SQL the lint cannot read";
 
 /// The `)` that closes the `(` at `open`, at the same depth.
 fn closing_paren(s: &Stmts, open: usize) -> Option<usize> {
@@ -2207,6 +2202,42 @@ fn closing_paren(s: &Stmts, open: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// `LOCK [TABLE] a, b` or `TRUNCATE [TABLE] a, b` at `k`.
+fn lock_or_truncate(s: &Stmts, k: usize) -> Vec<Raw> {
+    let j = if s.is(k + 1, "table") { k + 2 } else { k + 1 };
+    let verb = if s.is(k, "lock") {
+        "LOCK TABLE"
+    } else {
+        "TRUNCATE"
+    };
+    let mut raws: Vec<Raw> = s
+        .name_list(j)
+        .into_iter()
+        .map(|t| Raw::lock(k, verb, Some(t)))
+        .collect();
+    // CASCADE also truncates every table whose key reaches these.
+    if (k..s.end(k)).any(|j| s.is(j, "cascade")) {
+        raws.push(Raw::lock(k, "TRUNCATE ... CASCADE", None));
+    }
+    raws
+}
+
+/// The lock that a foreign key `REFERENCES` at `k` takes on its target.
+///
+/// A key that may never exist is remembered too, which fails closed when its
+/// table is dropped later.
+fn references(s: &Stmts, k: usize, history: &mut History) -> Option<Raw> {
+    let (target, _) = s.qualified_name(k + 1)?;
+    if let Some(owner) = s.statement_table(s.starts[k]) {
+        history
+            .references
+            .entry(base(&owner).to_string())
+            .or_default()
+            .insert(target.clone());
+    }
+    Some(Raw::lock(s.starts[k], "REFERENCES", Some(target)))
 }
 
 /// Remember `child` as hot when its `parent` is hot.
@@ -4396,6 +4427,34 @@ fn a_commit_in_a_do_body_ends_the_transaction() {
         let findings = lint_with_history(&[], &sql, false);
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{end}: {findings:?}");
     }
+}
+
+#[test]
+fn unreadable_execute_may_clear_the_bound() {
+    // The hidden SQL may run `RESET lock_timeout` before any lock.
+    let sql = "DO $$\nDECLARE ddl TEXT := 'RESET lock_timeout';\nBEGIN\n    \
+               PERFORM set_config('lock_timeout', '5s', true);\n    EXECUTE ddl;\n    \
+               ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(
+        rules(&findings),
+        [Rule::LockTimeout, Rule::LockTimeout],
+        "{findings:?}"
+    );
+    assert!(
+        findings.iter().any(|f| f.detail.contains("harvest_events")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_commit_in_a_procedure_body_ends_its_bound() {
+    // `CALL` runs the body, and a procedure may commit.
+    let sql = "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n    \
+               PERFORM set_config('lock_timeout', '5s', true);\n    COMMIT;\n    \
+               ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;\nCALL p();";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
