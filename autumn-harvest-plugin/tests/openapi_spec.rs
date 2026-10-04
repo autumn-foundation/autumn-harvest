@@ -339,7 +339,7 @@ fn read_only_classification_is_published() {
 /// Pin the classification of four routes by hand.
 ///
 /// The sweep above compares the document against `CLASSIFIED_ROUTES`, which is
-/// also what the transform reads. These four are written out, so a wrong entry
+/// also what the transform reads. These entries are written out, so a wrong entry
 /// in that table shows up as a failure here rather than as agreement.
 #[test]
 fn known_routes_carry_their_expected_class() {
@@ -347,6 +347,8 @@ fn known_routes_carry_their_expected_class() {
     for (method, path, class, waives_auth) in [
         ("get", "/openapi.json", "public_safe", true),
         ("get", "/health", "public_safe", true),
+        ("get", "/health/live", "public_safe", true),
+        ("get", "/health/ready", "public_safe", true),
         ("get", "/workflows", "read_only", false),
         ("post", "/workflows/{id}/cancel", "mutating", false),
     ] {
