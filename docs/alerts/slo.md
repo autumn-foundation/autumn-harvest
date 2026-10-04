@@ -57,6 +57,10 @@ Notes on each SLI:
     120 probes an hour.
   - At 99.9%, two failed probes in an hour can page. The objective is 99%
     for that reason.
+  - A probe that a quarantine fails counts as a canary failure. That covers
+    the task-timeout quarantine and the crash quarantine. Their task
+    timeouts are left out of `workflow_task`, so each failed probe counts
+    once.
 
 When an SLI has no traffic, its ratio is `0 / 0`. That value is `NaN`, and
 `NaN` is never above a threshold. So an idle fleet does not page.

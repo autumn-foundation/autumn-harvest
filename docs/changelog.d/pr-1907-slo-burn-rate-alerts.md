@@ -42,5 +42,12 @@ rules` with a pinned, checksummed `promtool` 3.5.0. The guard suite
 pairs, the objectives in the docs, the runbook links, the metric names, and
 the CI step.
 
-No engine change: no new `WorkflowEvent` variant, no migration, no new
-metric.
+**Engine fix.** A canary probe that a quarantine failed recorded no
+`harvest.canary.failure`. The terminal helper skips probes, and the two
+quarantine paths had no canary branch. Such a probe fell out of both SLIs.
+`quarantine_workflow_task_timeout` (`worker.rs`) and the crash quarantine
+(`poison_pill.rs`) now record a canary failure on the probe's queue and
+shard. DB-backed tests in `workflow_task_timeout_tests.rs` and
+`poison_pill_tests.rs` cover both paths.
+
+No new `WorkflowEvent` variant, no migration, no new metric.

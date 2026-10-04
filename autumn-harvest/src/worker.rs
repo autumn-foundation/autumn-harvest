@@ -33581,6 +33581,8 @@ pub async fn quarantine_workflow_task_timeout(
     let mut workflow_id_str = String::new();
     let mut schedule_id_opt: Option<uuid::Uuid> = None;
     let mut origin_opt: Option<String> = None;
+    // The canary failure metric needs the probe's shard (issue #1816).
+    let mut shard_id: i32 = 0;
     let (owner, severity) = match exec_id_opt {
         Some(exec_uuid) => {
             let res = exec_dsl::harvest_workflow_executions
@@ -33593,6 +33595,7 @@ pub async fn quarantine_workflow_task_timeout(
                     exec_dsl::workflow_id,
                     exec_dsl::schedule_id,
                     exec_dsl::origin,
+                    exec_dsl::shard_id,
                 ))
                 .first::<(
                     Option<String>,
@@ -33602,6 +33605,7 @@ pub async fn quarantine_workflow_task_timeout(
                     String,
                     Option<uuid::Uuid>,
                     Option<String>,
+                    i32,
                 )>(&mut conn)
                 .await
                 .optional();
@@ -33613,8 +33617,9 @@ pub async fn quarantine_workflow_task_timeout(
                 }
             };
             match res {
-                Some((o, s, p, pcp, wid, sched_id, orig)) => {
+                Some((o, s, p, pcp, wid, sched_id, orig, shard)) => {
                     exec_exists = true;
+                    shard_id = shard;
                     parent_id_opt = p;
                     parent_close_policy_opt = pcp;
                     workflow_id_str = wid;
@@ -33833,6 +33838,11 @@ pub async fn quarantine_workflow_task_timeout(
                     &q,
                     crate::telemetry::WorkflowStatus::Failed,
                 );
+                // The terminal above skips a canary probe. A quarantined probe
+                // is a failed probe, so the canary SLI must count it.
+                if crate::canary::is_canary_workflow(workflow_name) {
+                    metrics.record_canary_failure(&q, u16::try_from(shard_id).unwrap_or(0));
+                }
                 if let Some(exec_uuid) = exec_id_opt {
                     let exec_id = execution_id_from_uuid(exec_uuid);
                     check_and_report_unfinished_handlers_for_worker(
