@@ -814,7 +814,8 @@ pub struct LiveWorkerTaskStats {
     /// The worker's cohort key, from [`worker_cohort`].
     ///
     /// Workers in one cohort poll the same queues with the same weights. They
-    /// also share a build, labels and task kinds, so they do the same work. A
+    /// also share a build, labels and slots per task kind, so they do the same
+    /// work. A
     /// worker is compared only with peers in its own cohort.
     pub cohort: String,
     /// The published snapshot.
@@ -880,8 +881,9 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   only to a matching build.
 /// - `labels`: the claim predicate matches `required_capabilities` against
 ///   these labels, sorted by key.
-/// - `kinds`: the task kinds the worker has slots for. A worker with no slot
-///   for one kind claims only the other.
+/// - `slots`: the configured slots per task kind. A worker with no slot for
+///   one kind claims only the other. Under load, the claim gate gives each
+///   worker a task mix that follows its slots, so two sizes are two cohorts.
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -890,8 +892,8 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
     weights: &std::collections::HashMap<String, u32, S>,
     build_id: &str,
     labels: &std::collections::HashMap<String, String, L>,
-    takes_workflows: bool,
-    takes_activities: bool,
+    workflow_slots: usize,
+    activity_slots: usize,
 ) -> String {
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -908,18 +910,11 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let kinds: Vec<&str> = [
-        (takes_workflows, "workflow"),
-        (takes_activities, "activity"),
-    ]
-    .into_iter()
-    .filter_map(|(takes, kind)| takes.then_some(kind))
-    .collect();
     serde_json::json!({
         "queues": routing,
         "build_id": build_id,
         "labels": labels,
-        "kinds": kinds,
+        "slots": { "workflow": workflow_slots, "activity": activity_slots },
     })
     .to_string()
 }
@@ -1186,10 +1181,8 @@ pub async fn run_outlier_tick(
 ) -> HarvestResult<Vec<OutlierDimension>> {
     // A row of the worker's previous process can hold a higher sequence. The
     // first write then moves the counter above it, and a fresh capture follows.
-    let mut own = WorkerTaskStats::default();
     for _ in 0..2 {
-        let (stats, seq) = capture_task_stats(&probe.window);
-        own = stats;
+        let (own, seq) = capture_task_stats(&probe.window);
         if write_task_stats_snapshot(conn, worker_id, &probe.cohort, &own, seq).await?
             != SnapshotWrite::Foreign
         {
@@ -1221,7 +1214,9 @@ pub async fn run_outlier_tick(
                             .filter(|row| row.worker_id != worker_id && row.cohort == me.cohort)
                             .map(|row| row.stats)
                             .collect();
-                        outlier_dimensions(&own, &peers, &probe.config)
+                        // The newest self row, which a sibling shard
+                        // heartbeat can hold, not this tick's own capture.
+                        outlier_dimensions(&me.stats, &peers, &probe.config)
                     })
                     .unwrap_or_default()
             };
@@ -2765,7 +2760,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        super::worker_cohort(&queues, &weights, build, &labels, true, true)
+        super::worker_cohort(&queues, &weights, build, &labels, 1, 1)
     }
 
     /// Issue #1815: a worker with no slot for one task kind claims only the
@@ -2776,13 +2771,28 @@ mod tests {
         let queues = vec!["a".to_owned()];
         let none = std::collections::HashMap::<String, u32>::new();
         let labels = std::collections::HashMap::<String, String>::new();
-        let kinds = |workflows, activities| {
+        let slots = |workflows, activities| {
             super::worker_cohort(&queues, &none, "v1", &labels, workflows, activities)
         };
-        assert_ne!(kinds(true, false), kinds(false, true));
-        assert_ne!(kinds(true, true), kinds(true, false));
-        assert_ne!(kinds(true, true), kinds(false, true));
-        assert_eq!(kinds(true, true), kinds(true, true));
+        assert_ne!(slots(10, 0), slots(0, 10));
+        assert_ne!(slots(10, 10), slots(10, 0));
+        assert_ne!(slots(10, 10), slots(0, 10));
+        assert_eq!(slots(10, 10), slots(10, 10));
+    }
+
+    /// Issue #1815: under load, the claim gate gives each worker a task mix
+    /// that follows its slots per kind. Workers with different slot counts
+    /// therefore do different work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_slots_per_kind() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let slots = |workflows, activities| {
+            super::worker_cohort(&queues, &none, "v1", &labels, workflows, activities)
+        };
+        assert_ne!(slots(100, 1), slots(1, 100));
+        assert_ne!(slots(100, 100), slots(50, 100));
     }
 
     /// Issue #1815: workers that poll the same queues with different weights

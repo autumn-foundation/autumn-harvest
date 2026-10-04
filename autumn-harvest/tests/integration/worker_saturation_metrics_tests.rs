@@ -166,8 +166,8 @@ fn cohort(queue: &str) -> String {
         &HashMap::new(),
         "",
         &HashMap::<String, String>::new(),
-        true,
-        true,
+        1,
+        1,
     )
 }
 
@@ -565,6 +565,70 @@ async fn a_late_write_of_an_older_snapshot_is_dropped() {
         .expect("the row is live");
     assert_eq!(row.stats, newer, "the newer snapshot stays");
     assert_eq!(row.snapshot_seq, newer_seq);
+}
+
+/// A heartbeat judges the worker on its newest snapshot. Another shard
+/// heartbeat of the worker can hold a newer self row than this tick wrote,
+/// for example when this tick's write lost to it. The tick then compares that
+/// row, not its own older capture.
+#[tokio::test]
+async fn a_tick_judges_the_newest_self_row() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("fresh-q");
+    let me = unique_id("w-fresh");
+    register(&mut conn, &me, &queue).await;
+    healthy_peers(&mut conn, &queue, 3).await;
+
+    // Another shard heartbeat of this worker holds a newer, sick self row.
+    let metrics = Arc::new(Recording::default());
+    let late = probe(&queue, window(100, None), Arc::clone(&metrics));
+    let sick = WorkerTaskStats {
+        tasks: 100,
+        failures: 50,
+        p99_latency_ms: Some(20),
+    };
+    late.shard_peers.store(
+        1,
+        vec![LiveWorkerTaskStats {
+            worker_id: me.clone(),
+            cohort: cohort(&queue),
+            stats: sick,
+            snapshot_seq: i64::MAX,
+        }],
+    );
+
+    // This tick captured a healthy window, but the newest self row is sick.
+    let flagged = tick(&mut conn, &me, &late).await;
+    assert_eq!(flagged, vec![OutlierDimension::FailureRatio]);
+}
+
+/// A cohort key can be long, for a worker with many queues or labels. The
+/// stats write still succeeds, because the index does not hold the key.
+#[tokio::test]
+async fn a_long_cohort_key_still_stores() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("long-q");
+    let id = unique_id("w-long");
+    register(&mut conn, &id, &queue).await;
+    let queues: Vec<String> = (0..400).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    let key = workers::worker_cohort(
+        &queues,
+        &HashMap::new(),
+        "",
+        &HashMap::<String, String>::new(),
+        1,
+        1,
+    );
+    assert!(key.len() > 10_000, "the key is long: {}", key.len());
+    workers::upsert_worker_task_stats(&mut conn, &id, &key, &WorkerTaskStats::default())
+        .await
+        .expect("a long cohort key stores");
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60, Some(&key))
+        .await
+        .expect("load by the long key");
+    assert!(rows.iter().any(|r| r.worker_id == id));
 }
 
 /// A frozen stats row leaves the live set. The prune deletes a row once it
