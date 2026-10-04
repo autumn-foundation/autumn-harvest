@@ -25,10 +25,12 @@
 //!
 //! A worker is eligible to claim a task when **any** of the following hold:
 //! 1. The task has no `required_build_id` (legacy / pre-policy execution).
-//! 2. The worker's `build_id` is empty (legacy worker, pre-dates routing).
-//! 3. The worker's `build_id` exactly equals the task's `required_build_id`.
-//! 4. There is an explicit compatibility declaration: worker build is declared
+//! 2. The worker's `build_id` exactly equals the task's `required_build_id`.
+//! 3. There is an explicit compatibility declaration: worker build is declared
 //!    compatible with the task's `required_build_id`.
+//!
+//! An empty worker `build_id` matches no pinned task (issue #1805). Pinning
+//! fails closed, so one misconfigured worker cannot take pinned work.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -51,7 +53,6 @@ use crate::types::ExecutionId;
 ///
 /// ```text
 /// eligible = task.required_build_id is None
-///          OR worker.build_id == ""           -- legacy worker
 ///          OR worker.build_id == required
 ///          OR compat_set contains (worker.build_id → required)
 /// ```
@@ -95,9 +96,9 @@ impl BuildCompatibilitySet {
             // No requirement — any worker may claim.
             None => true,
             Some(req) => {
-                // Legacy worker (empty build_id) can claim anything.
+                // An empty build_id never matches a pinned task (issue #1805).
                 if worker_build.is_empty() {
-                    return true;
+                    return false;
                 }
                 // Same build always compatible.
                 if worker_build == req {
@@ -110,6 +111,27 @@ impl BuildCompatibilitySet {
             }
         }
     }
+}
+
+/// Queues where a worker with an empty `build_id` cannot claim pinned work.
+///
+/// Returns each of `worker_queues` that has a row in `policies`, but only
+/// when `worker_build` is empty (issue #1805). Callers warn and set a gauge
+/// for each returned queue.
+#[must_use]
+pub fn empty_build_policy_queues(
+    worker_build: &str,
+    worker_queues: &[String],
+    policies: &[BuildPolicy],
+) -> Vec<String> {
+    if !worker_build.is_empty() {
+        return Vec::new();
+    }
+    worker_queues
+        .iter()
+        .filter(|queue| policies.iter().any(|p| &p.queue_name == *queue))
+        .cloned()
+        .collect()
 }
 
 // ── DB model structs ──────────────────────────────────────────────────────────
