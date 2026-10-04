@@ -406,7 +406,7 @@ metric is emitted in the source code.
 | `harvest.queue.oldest_pending_age` | `queue` |
 | `harvest.load_shed.active` | `queue` — only queues with a load-shed policy (issue #1794) |
 | `harvest.load_shed.rejected` | `queue` — only queues with a load-shed policy (issue #1794) |
-| `harvest.build.ramp_aborted` | `queue`, `reason` (`failure_rate\|nd_block_rate`) (issue #1814) |
+| `harvest.build.ramp_aborted` | `queue`, `reason` (`failure_rate\|nd_block_rate\|unreported`) (issue #1814) |
 | `harvest.dlq.entries` | `shard` |
 | `harvest.shard.stranded_pending` | `shard` |
 | `harvest.shard.dispatched` | `shard` |

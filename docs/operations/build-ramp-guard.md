@@ -38,6 +38,7 @@ from your own loop.
 | `min_samples` | 20 | 1 or more | Runs of each build needed for a verdict. |
 | `max_failure_rate_increase` | 0.05 | 0 to 1 | Allowed failure-rate increase over the base build. |
 | `max_nd_block_rate_increase` | 0.05 | 0 to 1 | Allowed ND-block-rate increase over the base build. |
+| `report_grace` | 10 min | 0 to 24 h | Age after which a pass reports an abort that a stopped guard did not report. |
 
 The setters clamp a value outside its range. A `NaN` rate keeps the value
 that the config had before. A threshold of 1 turns its check off, because no
@@ -148,6 +149,7 @@ After the clear, the guard does these steps once per abort:
   both builds and the sample counts.
 - It increments `harvest.build.ramp_aborted{queue, reason}`.
 - It logs a warning.
+- It marks the abort markers of the ramp as reported.
 
 Many replicas can run the guard. A replica reports an abort only after it
 cleared a pool itself, so a failed clear never reports a change that did not
@@ -183,11 +185,12 @@ The guard fails safe: when it cannot read, it does not abort.
 - A failed audit write logs a warning and does not undo the clear.
 - A guard keeps its pending clears in memory. Each operator ramp also has a
   `ramp_id`, which the API fan-out writes to every shard pool. Each finished
-  clear adds the abort marker `{"id": ramp_id, "base": build_id}` to the
-  list `harvest_build_policies.ramp_aborted` in the same `UPDATE`, so the
-  marker cannot be lost. A newer abort on the same row keeps the older
-  markers. A pass that reads every pool removes a marker once no pool holds
-  its ramp. A marker therefore stays until its abort finishes. After a
+  clear adds an abort marker to the list
+  `harvest_build_policies.ramp_aborted` in the same `UPDATE`, so the marker
+  cannot be lost. A marker holds `id` (the `ramp_id`), `base`, `target`,
+  `reported` and `at`, the clear time. A newer abort on the same row keeps the older
+  markers. A pass that reads every pool removes a reported marker once no
+  pool holds its ramp. A marker therefore stays until its abort finishes. After a
   restart, a pool can still hold a ramp whose `ramp_id` and base build match a marker on
   another pool. The guard then clears that ramp with no new verdict and no
   new audit row. A base-build change keeps the `ramp_id`, but the base no
@@ -200,6 +203,15 @@ The guard fails safe: when it cannot read, it does not abort.
   The guard reads the marker anyway. It clears only the pools whose `ramp_id`
   matches a marker. The newer ramp stays, and the next pass judges it on its
   own counts.
+- A guard can stop after its clear commits and before it reports. Its
+  marker then stays unreported. A pass finds a marker that is unreported,
+  older than `report_grace`, and whose ramp no pool holds. It claims the
+  abort: it marks the marker as reported, and only the guard whose mark
+  changed the row goes on. That guard reports the abort with reason
+  `unreported`, no rates and `ramp_percent=0`, because the verdict is gone.
+  A guard that reported but could not mark its markers can cause a second
+  report after the grace. An extra audit row is better than an abort with
+  none.
 - After a cancel, a pass lets the clear in flight finish and starts no new
   clear. Shutdown therefore waits for one bounded clear at most, plus the
   audit write of a clear that the pass made.

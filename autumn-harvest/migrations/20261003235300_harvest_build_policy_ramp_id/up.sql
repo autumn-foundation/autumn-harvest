@@ -7,8 +7,8 @@
 -- routing stays split across pools.
 --
 -- `ramp_id` names one operator ramp. The fan-out that sets a ramp writes the
--- same id to every pool. The guard's compare-and-swap clear adds the marker
--- `{"id": ramp_id, "base": build_id}` to `ramp_aborted` in the same UPDATE, so
+-- same id to every pool. The guard's compare-and-swap clear adds a marker
+-- (`id`, `base`, `target`, `reported`, `at`) to `ramp_aborted` in the same UPDATE, so
 -- the marker commits with the clear. A later guard finishes a ramp whose
 -- `ramp_id` and base build match a marker on another pool. The match uses the
 -- id, not database clocks, so clock skew between pools cannot clear a newer

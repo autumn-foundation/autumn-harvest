@@ -30,8 +30,10 @@ Design decisions:
   pool clear stays pending, and the next pass retries it with no new verdict.
   Each operator ramp has a `ramp_id`, the same on every pool. The clear
   adds it to the durable marker list `ramp_aborted` in the same UPDATE. A
-  newer abort keeps the older markers. A pass removes a marker once no pool
-  holds its ramp. After
+  newer abort keeps the older markers. A marker records whether the abort
+  was reported. A pass reports an abort whose marker stayed unreported past
+  `report_grace`, with reason `unreported`. A pass removes a reported marker
+  once no pool holds its ramp. After
   a restart, the guard matches markers to ramps by id and base build, not by
   clocks, to finish a partial clear. A clear has a server-side timeout, so it cannot commit late. After a
   cancel, a pass starts no new clear.
@@ -61,7 +63,7 @@ custom recorder needs no change.
 
 New surface: the `ramp_guard` module (`RampGuardConfig`, `RampGuard`,
 `evaluate`, `wilson_lower_bound`, `guard_once`, `run_ramp_guard`,
-`abort_ramp`). Also new: the audit operation `build_routing.ramp.auto_abort`,
+`abort_ramp`, `mark_abort_reported`, `ramp_aborted_by_guard`). Also new: the audit operation `build_routing.ramp.auto_abort`,
 the counter `harvest.build.ramp_aborted{queue, reason}` with a dashboard
 panel, and `telemetry::{build_id_label, BuildIdLabelCap}`.
 

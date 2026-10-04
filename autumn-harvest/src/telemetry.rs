@@ -1248,8 +1248,9 @@ pub const METRIC_LOAD_SHED_REJECTED: &str = "harvest.load_shed.rejected";
 ///
 /// Labels:
 ///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the queue of the ramp.
-///   - `"reason"` (= [`METRIC_LABEL_REASON`]) — `"failure_rate"` or
-///     `"nd_block_rate"`, from `ramp_guard::RampAbortReason::as_str`.
+///   - `"reason"` (= [`METRIC_LABEL_REASON`]) — `"failure_rate"`,
+///     `"nd_block_rate"` or `"unreported"`, from
+///     `ramp_guard::RampAbortReason::as_str`.
 pub const METRIC_BUILD_RAMP_ABORTED: &str = "harvest.build.ramp_aborted";
 
 /// Gauge: current available tokens in a rate limit bucket.

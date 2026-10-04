@@ -19,7 +19,8 @@ use autumn_harvest::build_routing::{
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::ramp_guard::{
-    RampAbortReason, RampGuardConfig, abort_ramp, guard_once, ramp_aborted_by_guard, run_ramp_guard,
+    RampAbortReason, RampGuardConfig, abort_ramp, guard_once, mark_abort_reported,
+    ramp_aborted_by_guard, run_ramp_guard,
 };
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::{
@@ -1231,15 +1232,23 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
             .await
             .expect("clear old ramp")
     );
+    // The guard that cleared each ramp also reported it.
+    mark_abort_reported(&mut conn_1, QUEUE, old_id, CLEAR_BOUND)
+        .await
+        .expect("mark old ramp");
     // Many newer ramps on pool 1 are aborted there too.
     for _ in 0..12 {
-        set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+        let new_id = uuid::Uuid::new_v4();
+        set_ramp_with_id(&mut conn_1, new_id).await;
         let step = policy_step(&mut conn_1).await;
         assert!(
             abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
                 .await
                 .expect("clear newer ramp")
         );
+        mark_abort_reported(&mut conn_1, QUEUE, new_id, CLEAR_BOUND)
+            .await
+            .expect("mark newer ramp");
     }
     assert_eq!(
         abort_marker_count(&mut conn_1).await,
@@ -1265,6 +1274,44 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
         "finished markers go"
     );
     assert_eq!(abort_marker_count(&mut conn_2).await, 0);
+}
+
+/// A guard can stop after its clear commits and before its report. A later
+/// pass reports that abort once, from the marker, after the report grace.
+#[tokio::test]
+async fn an_unreported_abort_is_reported_once_from_its_marker() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_ramp_with_id(&mut conn, uuid::Uuid::new_v4()).await;
+    // The old guard cleared the ramp, then stopped before its report.
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+    );
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+
+    // Within the default grace, a pass reports nothing and keeps the marker.
+    let pools = [pool.clone()];
+    let aborts = guard_once(&pools, &pool, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn).await, 1);
+
+    // After the grace, a pass reports the abort from the marker.
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0].reason, RampAbortReason::Unreported);
+    assert_eq!(aborts[0].target_build_id, BUILD_B);
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
+
+    // The next pass reports nothing more and prunes the marker.
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1, "reported once");
+    assert_eq!(abort_marker_count(&mut conn).await, 0);
 }
 
 /// A split ramp with no abort marker is not cleared.
