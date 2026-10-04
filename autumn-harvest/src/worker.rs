@@ -6090,6 +6090,28 @@ pub(crate) fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
     u16::try_from(raw).unwrap_or(0)
 }
 
+/// The `shard` metric label of the pool that serves `shard` (issue #1815).
+///
+/// An unencoded id, from an execution that predates sharding, routes to the
+/// default shard's pool. It takes that shard's label, so its pool waits line
+/// up with the claim path and the pool gauges. With no global sharded pool,
+/// the default shard is shard 0, as in a single-pool worker.
+fn pool_shard_label(shard: crate::types::ShardId) -> u16 {
+    let resolved = if shard.is_unencoded() {
+        crate::shard::GLOBAL_SHARDED_POOL
+            .read()
+            .ok()
+            .and_then(|pool| {
+                pool.as_ref()
+                    .map(crate::shard::ShardedDbPool::default_shard)
+            })
+            .unwrap_or_else(|| crate::types::ShardId::new(0))
+    } else {
+        shard
+    };
+    shard_metric_label(resolved)
+}
+
 /// The `shard_assignments` slice a single per-shard monitor should scan
 /// (issue #961 review, Codex P1).
 ///
@@ -15786,7 +15808,7 @@ async fn process_activity_task(
         pool.clone(),
         cancel.clone(),
         Arc::clone(&registry.telemetry().metrics),
-        shard_metric_label(exec_id.shard()),
+        pool_shard_label(exec_id.shard()),
     );
     let trace_carrier = task
         .trace_context
@@ -39912,6 +39934,15 @@ mod tests {
             reason.contains("never missed this task"),
             "the operator's next step is the live peer, not the deploy: {reason}"
         );
+    }
+
+    /// Issue #1815: an unencoded execution id reports its default shard pool,
+    /// never the `0xFFFF` sentinel.
+    #[test]
+    fn pool_shard_label_resolves_the_unencoded_sentinel() {
+        use crate::types::ShardId;
+        assert_eq!(pool_shard_label(ShardId::new(3)), 3);
+        assert_ne!(pool_shard_label(ShardId::UNENCODED), u16::MAX);
     }
 
     /// Issue #1815: the pool gauges split open connections into lent and idle.
