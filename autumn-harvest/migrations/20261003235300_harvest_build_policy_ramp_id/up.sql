@@ -15,7 +15,7 @@
 -- ramp or strand an old one.
 --
 -- `ramp_aborted` is a list, newest first, so a newer abort on a pool keeps the
--- older markers. The guard keeps the 8 newest.
+-- older markers. A guard pass removes a marker once no pool holds its ramp.
 --
 -- Additive. A ramp set before this migration has no id, so the guard cannot
 -- finish its partial abort after a restart.

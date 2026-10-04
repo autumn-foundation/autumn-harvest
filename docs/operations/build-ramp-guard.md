@@ -186,8 +186,9 @@ The guard fails safe: when it cannot read, it does not abort.
   clear adds the abort marker `{"id": ramp_id, "base": build_id}` to the
   list `harvest_build_policies.ramp_aborted` in the same `UPDATE`, so the
   marker cannot be lost. A newer abort on the same row keeps the older
-  markers. The list keeps the 8 newest (`MAX_ABORT_MARKERS`). After a restart, a pool
-  can still hold a ramp whose `ramp_id` and base build match a marker on
+  markers. A pass that reads every pool removes a marker once no pool holds
+  its ramp. A marker therefore stays until its abort finishes. After a
+  restart, a pool can still hold a ramp whose `ramp_id` and base build match a marker on
   another pool. The guard then clears that ramp with no new verdict and no
   new audit row. A base-build change keeps the `ramp_id`, but the base no
   longer matches, so the marker does not clear the new step. The

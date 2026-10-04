@@ -1191,6 +1191,82 @@ async fn a_newer_abort_keeps_an_older_marker() {
     );
 }
 
+/// The number of abort markers that one pool holds for the test queue.
+async fn abort_marker_count(conn: &mut AsyncPgConnection) -> i64 {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query(
+        "SELECT jsonb_array_length(ramp_aborted)::bigint AS n \
+         FROM harvest_build_policies WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .get_result::<Row>(conn)
+    .await
+    .expect("count markers")
+    .n
+}
+
+/// A marker stays while any pool holds its ramp, however many newer aborts
+/// the pool takes. Once no pool holds the ramp, a pass removes the marker.
+#[tokio::test]
+async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear old ramp")
+    );
+    // Many newer ramps on pool 1 are aborted there too.
+    for _ in 0..12 {
+        set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+        let step = policy_step(&mut conn_1).await;
+        assert!(
+            abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+                .await
+                .expect("clear newer ramp")
+        );
+    }
+    assert_eq!(
+        abort_marker_count(&mut conn_1).await,
+        13,
+        "no marker is evicted"
+    );
+
+    // The pass finishes the old ramp on pool 2.
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the old ramp on pool 2 is finished"
+    );
+
+    // No pool holds a marked ramp now, so the next pass prunes every marker.
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(
+        abort_marker_count(&mut conn_1).await,
+        0,
+        "finished markers go"
+    );
+    assert_eq!(abort_marker_count(&mut conn_2).await, 0);
+}
+
 /// A split ramp with no abort marker is not cleared.
 #[tokio::test]
 async fn a_split_ramp_without_an_abort_marker_stays() {

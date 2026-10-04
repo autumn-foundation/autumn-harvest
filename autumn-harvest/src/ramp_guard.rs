@@ -371,32 +371,39 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
      GROUP BY assigned_build_id"
 }
 
-/// The number of abort markers that one policy row keeps (issue #1814).
-///
-/// A marker is needed only until its partial abort finishes. A newer abort on
-/// the same row keeps the older markers, up to this number.
-pub const MAX_ABORT_MARKERS: usize = 8;
-
 /// SQL for the compare-and-swap clear of one ramp step.
 ///
 /// The binds are the queue, the base build, the target build and the step
 /// start. The row must still hold the same step, so a verdict about an old
 /// step cannot clear a new one. The same UPDATE adds the abort marker
 /// `{"id": ramp_id, "base": build_id}` to the front of `ramp_aborted`, so
-/// the marker commits with the clear. The list keeps the
-/// [`MAX_ABORT_MARKERS`] newest markers. A ramp with no `ramp_id` adds no
-/// marker.
+/// the marker commits with the clear. A newer abort keeps the older markers.
+/// A ramp with no `ramp_id` adds no marker.
 #[must_use]
 pub const fn abort_ramp_query() -> &'static str {
     "UPDATE harvest_build_policies \
      SET ramp_aborted = CASE WHEN ramp_id IS NULL THEN ramp_aborted ELSE \
-             jsonb_path_query_array( \
-                 jsonb_build_array(jsonb_build_object('id', ramp_id, 'base', build_id)) \
-                     || ramp_aborted, \
-                 '$[0 to 7]') END, \
+             jsonb_build_array(jsonb_build_object('id', ramp_id, 'base', build_id)) \
+                 || ramp_aborted END, \
          ramp_id = NULL, target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
      WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
        AND updated_at = $4"
+}
+
+/// SQL that removes finished abort markers from one policy row.
+///
+/// The binds are the queue and the `ramp_id`s of the finished markers. The
+/// UPDATE keeps the order of the other markers. It does not change
+/// `updated_at`, so the ramp step stays the same.
+#[must_use]
+pub const fn prune_abort_markers_query() -> &'static str {
+    "UPDATE harvest_build_policies \
+     SET ramp_aborted = COALESCE( \
+             (SELECT jsonb_agg(entry ORDER BY position) \
+              FROM jsonb_array_elements(ramp_aborted) WITH ORDINALITY AS m(entry, position) \
+              WHERE NOT (entry->>'id' = ANY($2))), \
+             '[]'::jsonb) \
+     WHERE queue_name = $1"
 }
 
 /// Clear the ramp of `queue` when it still ramps `base` to `target` at `step`.
@@ -665,15 +672,17 @@ async fn read_pool_ramps(
 /// base build holds its `ramp_id`. The match is by id, so clock skew between pools does not
 /// matter. An operator ramp set after the abort has a new id, so it is not
 /// marked.
+///
+/// A marker whose ramp no pool holds is finished. The read returns it, so
+/// the pass can remove it. Every pool was read, so no pool can still hold
+/// that ramp.
 #[cfg(feature = "db")]
-async fn read_ramps(
-    pools: &[crate::worker::DbPool],
-    bound: Duration,
-) -> Option<std::collections::BTreeMap<GenerationKey, ObservedRamp>> {
+async fn read_ramps(pools: &[crate::worker::DbPool], bound: Duration) -> Option<FleetRead> {
     let reads = pools.iter().map(|pool| read_pool_ramps(pool, bound));
     let mut merged: std::collections::BTreeMap<GenerationKey, ObservedRamp> =
         std::collections::BTreeMap::new();
     let mut markers: std::collections::BTreeSet<AbortMarker> = std::collections::BTreeSet::new();
+    let mut pool_markers_by_index = Vec::with_capacity(pools.len());
     for (index, result) in futures::future::join_all(reads)
         .await
         .into_iter()
@@ -693,13 +702,92 @@ async fn read_ramps(
             slot.target = slot.target.plus(ramp.target);
             slot.steps.push((index, ramp.step));
         }
-        markers.extend(pool_markers);
+        markers.extend(pool_markers.iter().cloned());
+        pool_markers_by_index.push(pool_markers);
     }
     for (((queue, base, _), ramp_id), ramp) in &mut merged {
         ramp.abort_marked = ramp_id
             .is_some_and(|ramp_id| markers.contains(&(queue.clone(), base.clone(), ramp_id)));
     }
-    Some(merged)
+    let live: std::collections::BTreeSet<AbortMarker> = merged
+        .keys()
+        .filter_map(|((queue, base, _), ramp_id)| {
+            ramp_id.map(|ramp_id| (queue.clone(), base.clone(), ramp_id))
+        })
+        .collect();
+    let mut finished: std::collections::BTreeMap<(usize, String), Vec<uuid::Uuid>> =
+        std::collections::BTreeMap::new();
+    for (index, pool_markers) in pool_markers_by_index.into_iter().enumerate() {
+        for marker in pool_markers {
+            if !live.contains(&marker) {
+                let (queue, _, ramp_id) = marker;
+                finished.entry((index, queue)).or_default().push(ramp_id);
+            }
+        }
+    }
+    Some(FleetRead {
+        ramps: merged,
+        finished_markers: finished
+            .into_iter()
+            .map(|((index, queue), ids)| (index, queue, ids))
+            .collect(),
+    })
+}
+
+/// One read of every pool.
+#[cfg(feature = "db")]
+struct FleetRead {
+    /// The active ramps, merged per generation.
+    ramps: std::collections::BTreeMap<GenerationKey, ObservedRamp>,
+    /// The finished abort markers: the pool index, the queue and the marker
+    /// ids. No pool holds the ramp of such a marker.
+    finished_markers: Vec<(usize, String, Vec<uuid::Uuid>)>,
+}
+
+/// Remove finished abort markers from one pool, within `bound`.
+///
+/// The removal is best effort. A failure logs a warning, and the next pass
+/// tries again. A kept marker does no harm, because no pool holds its ramp.
+#[cfg(feature = "db")]
+async fn prune_finished_markers(
+    pool: &crate::worker::DbPool,
+    index: usize,
+    queue: &str,
+    ramp_ids: &[uuid::Uuid],
+    bound: Duration,
+) {
+    use diesel::sql_types::{Array, Text};
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+
+    let ids: Vec<String> = ramp_ids.iter().map(ToString::to_string).collect();
+    let timeout_ms = bound.as_millis().max(1);
+    let prune = async {
+        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        conn.transaction(async |conn| -> crate::error::HarvestResult<()> {
+            for setting in ["lock_timeout", "statement_timeout"] {
+                diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            diesel::sql_query(prune_abort_markers_query())
+                .bind::<Text, _>(queue)
+                .bind::<Array<Text>, _>(&ids)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())
+    };
+    match tokio::time::timeout(bound.saturating_mul(2), prune).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard marker prune failed");
+        }
+        Err(_) => tracing::warn!(queue = %queue, pool = index, "ramp guard marker prune timed out"),
+    }
 }
 
 /// The result of one compare-and-swap clear on one pool.
@@ -1061,7 +1149,11 @@ impl RampGuard {
             tracing::warn!("ramp guard read timed out; no verdict this pass");
             return aborts;
         };
-        let Some(ramps) = read else {
+        let Some(FleetRead {
+            ramps,
+            finished_markers,
+        }) = read
+        else {
             return aborts;
         };
 
@@ -1114,6 +1206,15 @@ impl RampGuard {
                 .await
             {
                 aborts.push(abort);
+            }
+        }
+        // A cancel starts no new write, so the prune waits for a later pass.
+        for (index, queue, ramp_ids) in finished_markers {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if let Some(pool) = pools.get(index) {
+                prune_finished_markers(pool, index, &queue, &ramp_ids, bound).await;
             }
         }
         aborts
@@ -1570,9 +1671,12 @@ mod tests {
             "the clear pins the step"
         );
         assert!(abort_sql.contains("target_build_id = $3"));
-        // The marker list keeps exactly MAX_ABORT_MARKERS entries.
-        let slice = format!("'$[0 to {}]'", MAX_ABORT_MARKERS - 1);
-        assert!(abort_sql.contains(&slice), "the clear caps the markers");
+        // The clear never evicts a marker. Only a prune of a finished
+        // marker removes one, and a prune keeps the step.
+        assert!(!abort_sql.contains("jsonb_path_query_array"));
+        let prune_sql = prune_abort_markers_query();
+        assert!(prune_sql.contains("$1") && prune_sql.contains("$2"));
+        assert!(!prune_sql.contains("updated_at"), "a prune keeps the step");
     }
 
     #[cfg(feature = "db")]
