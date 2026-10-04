@@ -906,7 +906,7 @@ fn lex(
                 toks.iter()
                     .rev()
                     .find(|t| t.depth == depth)
-                    .is_some_and(|t| t.tok == Tok::Word(word.to_string()))
+                    .is_some_and(|t| is_keyword(t, word))
             };
             if in_execute_statement(toks, depth) || (depth > 0 && after("execute")) {
                 let sql: String = body.iter().collect();
@@ -1155,27 +1155,30 @@ fn decode_unicode(raw: &str, escape: char) -> String {
 
 /// Whether the open statement at `depth` starts with `DO`.
 fn in_do_statement(toks: &[Token], depth: usize) -> bool {
-    statement_head(toks, depth).is_some_and(|t| t.tok == Tok::Word("do".to_string()))
+    statement_head(toks, depth).is_some_and(|t| is_keyword(t, "do"))
+}
+
+/// Whether `t` is the unquoted keyword `w`. A quoted name is never a keyword.
+fn is_keyword(t: &Token, w: &str) -> bool {
+    !t.quoted && t.tok == Tok::Word(w.to_string())
 }
 
 /// Whether the open statement at `depth` is a PL/pgSQL `EXECUTE`.
 ///
 /// A top-level `EXECUTE` runs a prepared statement. Its arguments are data.
 fn in_execute_statement(toks: &[Token], depth: usize) -> bool {
-    depth > 0
-        && statement_head(toks, depth).is_some_and(|t| t.tok == Tok::Word("execute".to_string()))
+    depth > 0 && statement_head(toks, depth).is_some_and(|t| is_keyword(t, "execute"))
 }
 
 /// Whether the next token at `depth` is the body of a `CREATE FUNCTION` or
 /// `CREATE PROCEDURE`: the statement starts with `CREATE`, and `AS` is the
 /// last token.
 fn function_body_follows(toks: &[Token], depth: usize) -> bool {
-    let word = |t: &Token, w: &str| t.tok == Tok::Word(w.to_string());
     toks.iter()
         .rev()
         .find(|t| t.depth == depth)
-        .is_some_and(|t| word(t, "as"))
-        && statement_head(toks, depth).is_some_and(|t| word(t, "create"))
+        .is_some_and(|t| is_keyword(t, "as"))
+        && statement_head(toks, depth).is_some_and(|t| is_keyword(t, "create"))
 }
 
 /// The first token of the open statement at `depth`.
@@ -1682,7 +1685,8 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 
     for (k, tok) in toks.iter().enumerate() {
         let start = s.starts[k] == k;
-        match s.word(k) {
+        // A quoted word is a name, never a statement keyword.
+        match s.word(k).filter(|_| !tok.quoted) {
             Some("create") if start => {
                 let sure = tok.runs && unconditional[k];
                 let created = if sure { &mut created } else { &mut not_run };
@@ -5387,6 +5391,19 @@ fn a_quoted_column_name_is_no_drop_clause() {
         findings.iter().any(|f| f.detail.contains("harvest_events")),
         "{findings:?}"
     );
+}
+
+#[test]
+fn a_quoted_statement_head_does_not_make_code() {
+    // `"do"` and `"execute"` name variables here, so each value is data.
+    for name in ["do", "execute"] {
+        let sql = format!(
+            "DO $$\nDECLARE \"{name}\" text;\nBEGIN\n    \
+             \"{name}\" := $sql$ALTER TABLE harvest_events ADD COLUMN x INT$sql$;\n    \
+             \"{name}\" := 'ALTER TABLE harvest_events ADD COLUMN y INT';\nEND $$;"
+        );
+        assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    }
 }
 
 #[test]
