@@ -31820,6 +31820,7 @@ impl Worker {
                     shard_assignments: &self.config.shard_assignments,
                     registered_workflows: &registered_workflows,
                     registered_activities: &registered_activities,
+                    circuit_breakers: &self.registry.circuit_breakers(),
                 }),
                 compare: true,
                 slot: shard_slot,

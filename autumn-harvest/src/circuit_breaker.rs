@@ -290,6 +290,12 @@ impl CircuitBreakerRegistry {
         self.policies.is_empty()
     }
 
+    /// The declared policy of `activity_name`, or `None` if it has none.
+    #[must_use]
+    pub fn policy(&self, activity_name: &str) -> Option<CircuitBreakerPolicy> {
+        self.policies.get(activity_name).copied()
+    }
+
     /// Whether `activity_name` has a declared policy.
     #[must_use]
     pub fn has_policy(&self, activity_name: &str) -> bool {

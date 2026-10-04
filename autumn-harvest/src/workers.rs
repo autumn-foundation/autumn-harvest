@@ -888,6 +888,9 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 /// - `slots`: the worker's [`SlotPolicy`]. A worker with no slot for one kind
 ///   claims only the other. Under load, the claim gate gives each worker a
 ///   task mix that follows its slots, so two sizes are two cohorts.
+/// - `circuit_breakers`: each activity with a breaker policy, with that
+///   policy. Such an activity skips the claim-time rate-limit gate, and its
+///   breaker fails it fast while open. The open state stays out of the key.
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -904,6 +907,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         shard_assignments,
         registered_workflows,
         registered_activities,
+        circuit_breakers,
     } = policy;
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -937,8 +941,30 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "shards": shards,
         "workflows": sorted_names(registered_workflows),
         "activities": sorted_names(registered_activities),
+        "circuit_breakers": breaker_policies(circuit_breakers),
     })
     .to_string()
+}
+
+/// Each activity with a circuit-breaker policy and that policy, sorted by
+/// name, for a cohort key. Durations are in nanoseconds.
+fn breaker_policies(
+    registry: &crate::circuit_breaker::CircuitBreakerRegistry,
+) -> Vec<serde_json::Value> {
+    registry
+        .tracked_activity_names()
+        .iter()
+        .filter_map(|name| {
+            registry.policy(name).map(|policy| {
+                serde_json::json!([
+                    name,
+                    policy.failure_threshold,
+                    policy.window.as_nanos(),
+                    policy.cooldown.as_nanos(),
+                ])
+            })
+        })
+        .collect()
 }
 
 /// `names`, sorted and deduplicated, for a cohort key.
@@ -955,8 +981,9 @@ fn sorted_names(names: &[String]) -> Vec<&str> {
 /// The fields mirror the inputs of
 /// [`queue::claim_task_of_kind_on_shard`](crate::queue::claim_task_of_kind_on_shard)
 /// and of the poll loop around it. Two inputs stay out on purpose. The worker
-/// id is unique to each worker. The open circuit breakers are the worker's
-/// own health, which the comparison measures. A new claim input belongs here.
+/// id is unique to each worker. The state of its circuit breakers is the
+/// worker's own health, which the comparison measures. Their policies are
+/// configuration, so they are in. A new claim input belongs here.
 #[derive(Debug, Clone)]
 pub struct CohortPolicy<'a> {
     /// The queues the worker polls.
@@ -983,6 +1010,8 @@ pub struct CohortPolicy<'a> {
     pub registered_workflows: &'a [String],
     /// The activities the worker has handlers for.
     pub registered_activities: &'a [String],
+    /// The worker's circuit breakers. Only their policies enter the key.
+    pub circuit_breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
 }
 
 /// How a worker sizes its slots per task kind, as its cohort key records it
@@ -2920,6 +2949,7 @@ mod tests {
             shard_assignments: &[],
             registered_workflows: &[],
             registered_activities: &[],
+            circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
         })
     }
 
@@ -2944,6 +2974,7 @@ mod tests {
                 shard_assignments: &[],
                 registered_workflows: &[],
                 registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
             })
         };
         assert_ne!(slots(10, 0), slots(0, 10));
@@ -2973,6 +3004,7 @@ mod tests {
                 shard_assignments: &[],
                 registered_workflows: &[],
                 registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
             })
         };
         assert_ne!(sessions(0), sessions(4));
@@ -3008,6 +3040,7 @@ mod tests {
                 shard_assignments: &[],
                 registered_workflows: &[],
                 registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
             })
         };
         assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
@@ -3037,6 +3070,7 @@ mod tests {
                 shard_assignments: shards,
                 registered_workflows: workflows,
                 registered_activities: activities,
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
             })
         };
         let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
@@ -3136,6 +3170,55 @@ mod tests {
         );
     }
 
+    /// Issue #1815: an activity with a circuit-breaker policy skips the
+    /// claim-time rate-limit gate and fails fast while its breaker is open.
+    /// Workers with different policies are therefore in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_circuit_breaker_policies() {
+        use crate::circuit_breaker::CircuitBreakerRegistry;
+        use crate::policy::CircuitBreakerPolicy;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let cohort = |breakers: &CircuitBreakerRegistry| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: breakers,
+            })
+        };
+        let tracking = |threshold| {
+            CircuitBreakerRegistry::new(std::collections::HashMap::from([(
+                "charge".to_owned(),
+                CircuitBreakerPolicy::new(
+                    threshold,
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(60),
+                ),
+            )]))
+        };
+        assert_ne!(
+            cohort(&CircuitBreakerRegistry::empty()),
+            cohort(&tracking(5)),
+            "a tracked activity changes the cohort"
+        );
+        assert_ne!(
+            cohort(&tracking(5)),
+            cohort(&tracking(10)),
+            "the policy changes the cohort"
+        );
+        assert_eq!(cohort(&tracking(5)), cohort(&tracking(5)));
+    }
+
     /// Issue #1815: under load, the claim gate gives each worker a task mix
     /// that follows its slots per kind. Workers with different slot counts
     /// therefore do different work, so they are in different cohorts.
@@ -3157,6 +3240,7 @@ mod tests {
                 shard_assignments: &[],
                 registered_workflows: &[],
                 registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
             })
         };
         assert_ne!(slots(100, 1), slots(1, 100));

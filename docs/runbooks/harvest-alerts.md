@@ -3396,13 +3396,15 @@ the gauge reads `1` when either worker is an outlier.
 The peers are the live, `Active` workers that poll the same queues with the
 same `queue_weights`, on the same build with the same labels, and with the
 same `max_concurrent_workflows` and `max_concurrent_activities`. A worker with
-a slot tuner is keyed on the tuner's band and its initial target per kind
-instead, because the tuner sizes its slots from there. Session capacity counts
+a slot tuner is keyed on the tuner's band, its initial target per kind and
+the tuner's `policy()` instead, because the tuner sizes its slots from there. Session capacity counts
 too, because session member activities are pinned to the session's host. So do
 `priority_aging_secs` and the activities the worker's labels make it
 ineligible for, because the claim query orders and filters tasks by them. So
 do the shards and the registered handlers, because a task without a handler is
-released and never counts. Those decide which tasks a worker can claim, and in
+released and never counts. So do the circuit-breaker policies, because an
+activity with a breaker skips the claim-time rate-limit gate. The open state
+of a breaker is left out, because it is the worker's own health. Those decide which tasks a worker can claim, and in
 which mix under load. So workers of two sizes are two cohorts. A worker on a
 slow queue is not compared with workers on a fast queue. A worker that favours
 a bulk queue is not compared with one that favours an interactive queue.
