@@ -3638,8 +3638,8 @@ pub struct WorkerConfig {
     /// Immutable build identifier for this worker binary (issue #171).
     ///
     /// Set to a stable per-build token (Git SHA, semver tag, CI job ID, etc.)
-    /// to enable build-aware task routing. Empty string = legacy behaviour
-    /// where the worker can claim any task regardless of `required_build_id`.
+    /// to enable build-aware task routing. Empty string = no build identity:
+    /// the worker cannot claim a task with a `required_build_id` (issue #1805).
     pub build_id: String,
     /// Optional human-readable deployment name for operator observability
     /// (issue #171), e.g. `"prod-blue"` or `"canary"`.
@@ -4215,8 +4215,8 @@ impl WorkerConfig {
     /// Set the immutable build identifier for this worker (issue #171).
     ///
     /// Use a stable per-build token — a Git SHA, semver tag, or CI job ID.
-    /// Workers without a build ID (the default empty string) behave as legacy
-    /// workers and can claim any task regardless of build routing policy.
+    /// A worker without a build ID (the default empty string) cannot claim a
+    /// task pinned to a build (issue #1805).
     #[must_use]
     pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
         self.build_id = build_id.into();
