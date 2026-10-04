@@ -695,7 +695,7 @@ fn lex(
                     break;
                 } else {
                     line += usize::from(c == '\n');
-                    value.push(c);
+                    value.push(if c == '.' { QUOTED_DOT } else { c });
                     i += 1;
                 }
             }
@@ -766,7 +766,7 @@ fn lex(
             }
             toks.push(Token {
                 tok: if quote == '"' {
-                    Tok::Word(value)
+                    Tok::Word(value.replace('.', &QUOTED_DOT.to_string()))
                 } else {
                     Tok::Str(value)
                 },
@@ -1300,6 +1300,12 @@ fn index_key(owner: &str, index: &str) -> String {
     format!("{schema}.{}", base(index))
 }
 
+/// Stands in for a `.` inside a quoted identifier.
+///
+/// `"a.b"` is one name, so it must never read as schema `a` and table `b`.
+/// This character never occurs in an unquoted name.
+const QUOTED_DOT: char = '\u{2024}';
+
 /// Whether `c` can be part of an unquoted identifier or a dollar tag.
 ///
 /// Postgres accepts every non-ASCII character there, as well as letters,
@@ -1735,7 +1741,7 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
         }
         // A named-argument call never sets a bound. When it may name
         // `lock_timeout`, it counts as a session clear, which fails closed.
-        "set_config" if s.is_punct(k + 1, '(') && named_lock_timeout_call(s, k + 1) => {
+        "set_config" if s.is_punct(k + 1, '(') && lock_timeout_call(s, k + 1) == Some(true) => {
             Some(Timeout::Set {
                 bounds: false,
                 local: false,
@@ -1758,13 +1764,23 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
             let local = !session;
             (!bounds || s.is_bare_call(k)).then_some(Timeout::Set { bounds, local })
         }
+        // Any other call that names `lock_timeout`, such as one with a cast,
+        // counts as a session clear. That fails closed.
+        "set_config" if s.is_punct(k + 1, '(') && lock_timeout_call(s, k + 1).is_some() => {
+            Some(Timeout::Set {
+                bounds: false,
+                local: false,
+            })
+        }
         _ => None,
     }
 }
 
-/// Whether the call whose `(` is at `open` uses named arguments and names
-/// `lock_timeout` in a string.
-fn named_lock_timeout_call(s: &Stmts, open: usize) -> bool {
+/// Whether the call whose `(` is at `open` names `lock_timeout` in a string.
+///
+/// `Some(true)` means the call also uses named arguments. `None` means it
+/// does not name the setting.
+fn lock_timeout_call(s: &Stmts, open: usize) -> Option<bool> {
     let mut parens = 0_usize;
     let mut named = false;
     let mut names_it = false;
@@ -1783,7 +1799,7 @@ fn named_lock_timeout_call(s: &Stmts, open: usize) -> bool {
             .string(j)
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("lock_timeout"));
     }
-    named && names_it
+    names_it.then_some(named)
 }
 
 /// Whether Postgres reads `value` as boolean false.
@@ -3967,6 +3983,40 @@ fn a_format_text_placeholder_makes_execute_unreadable() {
                BEGIN\n    EXECUTE format('%s', ddl);\nEND $$;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_quoted_dot_is_part_of_the_name() {
+    // `"public.harvest_events"` is one name, not a schema and a table.
+    let sql = "CREATE TABLE \"public.harvest_events\" (id INT);\n\
+               ALTER TABLE public.harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    let findings = lint_with_history(
+        &[],
+        "ALTER TABLE \"harvest_events\" ADD COLUMN x INT;",
+        true,
+    );
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn an_unparsed_set_config_of_lock_timeout_clears() {
+    for call in [
+        "set_config('lock_timeout'::text, '0', true)",
+        "set_config(('lock_timeout'), '0', true)",
+    ] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = '5s';\nSELECT {call};\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{call}: {findings:?}"
+        );
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
