@@ -53,8 +53,11 @@ Migration `20261003212318_harvest_ramp_guard_outcome_index` adds the partial
 index `idx_harvest_we_ramp_guard_outcome` on `harvest_workflow_executions
 (queue_name, assigned_build_id, created_at)`. Migration
 `20261003235300_harvest_build_policy_ramp_id` adds the columns
-`harvest_build_policies.ramp_id` and `ramp_aborted`. Neither migrates data,
-adds a `WorkflowEvent` variant or affects replay.
+`harvest_build_policies.ramp_id` and `ramp_aborted`, and a trigger that
+clears a stale `ramp_id`. Migration
+`20261004095020_harvest_ramp_abort_reports` adds the report ledger
+`harvest_ramp_abort_reports`, which makes each abort report exactly-once.
+None migrates data, adds a `WorkflowEvent` variant or affects replay.
 
 `build_id` label: five families now carry the build of the worker that ran
 the task. They are `harvest.workflow.terminal`, `harvest.activity.attempts`,

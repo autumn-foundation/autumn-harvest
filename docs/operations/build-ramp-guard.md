@@ -142,22 +142,30 @@ step therefore cannot clear a newer ramp that an operator set.
 
 After the clear, the guard does these steps once per abort:
 
-- It writes one audit row. The operation is `build_routing.ramp.auto_abort`.
+- It writes one row to the report ledger `harvest_ramp_abort_reports`, keyed
+  by the `ramp_id`, and one audit row, in one transaction on the audit pool.
+  When the ledger already holds the abort, another guard reported it, and
+  this guard writes nothing.
+- The audit operation is `build_routing.ramp.auto_abort`.
   The target is `build_routing` and the queue name. The actor is `system`,
   and the route is `background.ramp_guard`.
 - The audit summary holds the reason, both rates, the target lower bound,
   both builds and the sample counts.
-- It increments `harvest.build.ramp_aborted{queue, reason}`.
-- It logs a warning.
-- After the audit row commits, it marks the abort markers of the ramp as
-  reported. A failed audit write keeps them unreported.
+- After the audit row commits, it increments
+  `harvest.build.ramp_aborted{queue, reason}` and logs a warning.
+- It then marks the abort markers of the ramp as reported. Every clear
+  writes an unreported marker, and only a committed report, or a ledger row
+  from another guard, marks it. A failed audit write keeps the markers
+  unreported, so a later pass reports the abort.
 
 Many replicas can run the guard. A replica reports an abort only after it
 cleared a pool itself, so a failed clear never reports a change that did not
 happen. The first decisive clear, in pool order, elects the reporter. A
 clear is decisive when this guard won the pool, or when another guard won
 it. A failed clear, an operator change or an unknown change decides
-nothing. The abort marker tells a guard clear from an operator change. So
+nothing. The abort marker tells a guard clear from an operator change. The
+report ledger makes the report exactly-once for a ramp with a `ramp_id`,
+even when two replicas each elect themselves. So
 replicas that race over the same pools agree on one reporter, on a first
 attempt and on a retry alike.
 

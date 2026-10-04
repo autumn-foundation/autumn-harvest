@@ -20,7 +20,7 @@ use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::ramp_guard::{
     RampAbortReason, RampGuardConfig, abort_ramp, claim_unreported_abort, guard_once,
-    mark_abort_reported, ramp_aborted_by_guard, run_ramp_guard,
+    mark_abort_reported, ramp_aborted_by_guard, record_abort_report, run_ramp_guard,
 };
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::{
@@ -1265,7 +1265,15 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
         "the old ramp on pool 2 is finished"
     );
 
-    // No pool holds a marked ramp now, so the next pass prunes every marker.
+    // The finishing clear wrote an unreported marker on pool 2. The abort was
+    // reported on pool 1, so the next pass only marks pool 2.
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(marker_reported(&mut conn_2, old_id).await, Some(true));
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no new report");
+
+    // Every marker is reported and no pool holds a marked ramp, so the next
+    // pass prunes every marker.
     let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(
@@ -1655,6 +1663,91 @@ async fn a_partly_marked_abort_is_not_reported_again() {
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0);
     assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(true));
+}
+
+/// The report ledger records each abort once. A second record of the same
+/// `ramp_id` changes nothing.
+#[tokio::test]
+async fn the_report_ledger_records_an_abort_once() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    assert!(
+        record_abort_report(&mut conn, QUEUE, ramp_id)
+            .await
+            .expect("first record")
+    );
+    assert!(
+        !record_abort_report(&mut conn, QUEUE, ramp_id)
+            .await
+            .expect("second record")
+    );
+}
+
+/// A guard that wants to report an abort that the ledger already holds
+/// writes no audit row. It only marks the markers as reported. So two
+/// replicas that both think they won an abort report it once.
+#[tokio::test]
+async fn an_abort_in_the_report_ledger_is_not_reported_again() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+    );
+    // Another replica reported the abort, then stopped before its mark.
+    assert!(
+        record_abort_report(&mut conn, QUEUE, ramp_id)
+            .await
+            .expect("record")
+    );
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+    assert_eq!(marker_reported(&mut conn, ramp_id).await, Some(true));
+}
+
+/// A guard that finishes a partial abort keeps the abort unreported, so a
+/// later pass still reports an abort whose first guard stopped early.
+#[tokio::test]
+async fn finishing_an_unreported_abort_keeps_it_unreported() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    set_ramp_with_id(&mut conn_2, ramp_id).await;
+    // The first guard cleared pool 1 and stopped before its report.
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+    );
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(!ramp_is_active(&mut conn_2).await, "pool 2 is finished");
+    assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(false));
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert_eq!(aborts.len(), 1, "the abort is still reported: {aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
 }
 
 /// A split ramp with no abort marker is not cleared.

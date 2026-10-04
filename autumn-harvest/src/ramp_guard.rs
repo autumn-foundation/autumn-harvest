@@ -402,22 +402,23 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
 
 /// SQL for the compare-and-swap clear of one ramp step.
 ///
-/// The binds are the queue, the base build, the target build, the step
-/// start and the `reported` flag of the new marker. The row must still hold
-/// the same step, so a verdict about an old step cannot clear a new one.
+/// The binds are the queue, the base build, the target build and the step
+/// start. The row must still hold the same step, so a verdict about an old
+/// step cannot clear a new one.
 ///
 /// The same UPDATE adds an abort marker to the front of `ramp_aborted`, so
 /// the marker commits with the clear. The marker holds `id`, `base`,
 /// `target`, `reported` and `at`, the clear time in epoch milliseconds. A
 /// newer abort keeps the older markers. A ramp with no `ramp_id` adds no
-/// marker.
+/// marker. The new marker is always unreported. Only a committed report
+/// marks it.
 #[must_use]
 pub const fn abort_ramp_query() -> &'static str {
     "UPDATE harvest_build_policies \
      SET ramp_aborted = CASE WHEN ramp_id IS NULL THEN ramp_aborted ELSE \
              jsonb_build_array(jsonb_build_object( \
                  'id', ramp_id, 'base', build_id, 'target', target_build_id, \
-                 'reported', $5::boolean, \
+                 'reported', false, \
                  'at', (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)) \
                  || ramp_aborted END, \
          ramp_id = NULL, target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
@@ -569,6 +570,38 @@ pub async fn claim_unreported_abort(
     .await
 }
 
+/// Record the report of the abort of `ramp_id` on `queue` in the report
+/// ledger `harvest_ramp_abort_reports`.
+///
+/// Returns `true` when this call added the row, and `false` when the ledger
+/// already held it. Only the guard whose call returns `true` reports the
+/// abort, so a report is exactly-once. The guard calls this in the same
+/// transaction as its audit row.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
+pub async fn record_abort_report(
+    conn: &mut diesel_async::AsyncPgConnection,
+    queue: &str,
+    ramp_id: uuid::Uuid,
+) -> crate::error::HarvestResult<bool> {
+    use diesel::sql_types::Text;
+    use diesel_async::RunQueryDsl;
+
+    let added = diesel::sql_query(
+        "INSERT INTO harvest_ramp_abort_reports (ramp_id, queue_name) VALUES ($1, $2) \
+         ON CONFLICT (ramp_id) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
+    .bind::<Text, _>(queue)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(added > 0)
+}
+
 /// Clear the ramp of `queue` when it still ramps `base` to `target` at `step`.
 ///
 /// The clear is a compare-and-swap. `step` is the policy row's `updated_at`
@@ -597,21 +630,7 @@ pub async fn abort_ramp(
     step: chrono::DateTime<chrono::Utc>,
     bound: Duration,
 ) -> crate::error::HarvestResult<bool> {
-    clear_ramp(conn, queue, base, target, step, bound, false).await
-}
-
-/// [`abort_ramp`] with the `reported` flag of the new marker.
-#[cfg(feature = "db")]
-async fn clear_ramp(
-    conn: &mut diesel_async::AsyncPgConnection,
-    queue: &str,
-    base: &str,
-    target: &str,
-    step: chrono::DateTime<chrono::Utc>,
-    bound: Duration,
-    reported: bool,
-) -> crate::error::HarvestResult<bool> {
-    use diesel::sql_types::{Bool, Text, Timestamptz};
+    use diesel::sql_types::{Text, Timestamptz};
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
     let timeout_ms = bound.as_millis().max(1);
@@ -627,7 +646,6 @@ async fn clear_ramp(
             .bind::<Text, _>(base)
             .bind::<Text, _>(target)
             .bind::<Timestamptz, _>(step)
-            .bind::<Bool, _>(reported)
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -1214,7 +1232,6 @@ async fn clear_on_pool(
     ramp_id: Option<uuid::Uuid>,
     step: chrono::DateTime<chrono::Utc>,
     bound: Duration,
-    reported: bool,
 ) -> ClearOutcome {
     let (queue, base, target) = key;
     // A checkout that fails or times out sent nothing to the server, so it
@@ -1231,7 +1248,7 @@ async fn clear_on_pool(
         }
     };
     let clear = async {
-        if clear_ramp(&mut conn, queue, base, target, step, bound, reported)
+        if abort_ramp(&mut conn, queue, base, target, step, bound)
             .await
             .map_err(|e| e.to_string())?
         {
@@ -1333,18 +1350,37 @@ fn abort_summary_tag(target: &str, base: &str) -> String {
     format!("target_build={target} base_build={base} ")
 }
 
-/// Write the audit row of one abort, within `bound`. Returns `true` when
-/// the row committed.
+/// The result of one attempt to report an abort.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportOutcome {
+    /// This guard wrote the ledger row and the audit row.
+    Recorded,
+    /// The report ledger already held the abort. Another guard reported it.
+    AlreadyReported,
+    /// The write failed or timed out. Nothing committed.
+    Failed,
+}
+
+/// Write the ledger row and the audit row of one abort in one transaction,
+/// within `bound`.
 ///
-/// A failed write logs a warning and does not undo the abort. The summary names a pool that did not clear by its index only,
-/// so no database error text reaches the audit log.
+/// For a ramp with a `ramp_id`, the ledger row comes first. When the ledger
+/// already holds the abort, the call writes nothing and returns
+/// `AlreadyReported`. A ramp with no `ramp_id` has no ledger row, so its
+/// report is not deduplicated.
+///
+/// A failed write logs a warning and does not undo the abort. The summary
+/// names a pool that did not clear by its index only, so no database error
+/// text reaches the audit log.
 #[cfg(feature = "db")]
 async fn record_abort(
     audit_pool: &crate::worker::DbPool,
     abort: &RampAbort,
+    ramp_id: Option<uuid::Uuid>,
     failed_pools: &[usize],
     bound: Duration,
-) -> bool {
+) -> ReportOutcome {
     let mut summary = format!(
         "reason={} {}ramp_percent={} \
          target_rate={:.4} target_lower_bound={:.4} base_rate={:.4} \
@@ -1386,20 +1422,30 @@ async fn record_abort(
         source: crate::audit::SOURCE_API,
     };
     let write = async {
+        use diesel_async::AsyncConnection;
+
         let mut conn = audit_pool.get().await.map_err(|e| e.to_string())?;
-        crate::audit::insert_audit(&mut conn, &record)
-            .await
-            .map_err(|e| e.to_string())
+        conn.transaction(async |conn| -> crate::error::HarvestResult<ReportOutcome> {
+            if let Some(ramp_id) = ramp_id
+                && !record_abort_report(conn, &abort.queue, ramp_id).await?
+            {
+                return Ok(ReportOutcome::AlreadyReported);
+            }
+            crate::audit::insert_audit(conn, &record).await?;
+            Ok(ReportOutcome::Recorded)
+        })
+        .await
+        .map_err(|e| e.to_string())
     };
     match tokio::time::timeout(bound, write).await {
-        Ok(Ok(_)) => true,
+        Ok(Ok(outcome)) => outcome,
         Ok(Err(error)) => {
             tracing::warn!(queue = %abort.queue, error = %error, "ramp guard audit write failed");
-            false
+            ReportOutcome::Failed
         }
         Err(_) => {
             tracing::warn!(queue = %abort.queue, "ramp guard audit write timed out");
-            false
+            ReportOutcome::Failed
         }
     }
 }
@@ -1445,20 +1491,25 @@ fn disposition(outcomes: &[ClearOutcome]) -> Disposition {
     }
 }
 
-/// Log, count and audit one abort. Returns `true` when the audit row
-/// committed.
+/// Audit, count and log one abort, once over all replicas.
 ///
-/// Only a committed audit row lets the guard mark the abort as reported. A
-/// failed write keeps the marker unreported, so a later pass reports the
-/// abort again. The counter then counts it twice.
+/// The ledger row and the audit row commit together. Only `Recorded` counts
+/// the metric and logs the abort. After `Recorded` or `AlreadyReported`,
+/// the caller marks the markers as reported. A failed write keeps them
+/// unreported, so a later pass reports the abort.
 #[cfg(feature = "db")]
 async fn report_abort(
     abort: &RampAbort,
+    ramp_id: Option<uuid::Uuid>,
     audit_pool: &crate::worker::DbPool,
     metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
     failed_pools: &[usize],
     bound: Duration,
-) -> bool {
+) -> ReportOutcome {
+    let outcome = record_abort(audit_pool, abort, ramp_id, failed_pools, bound).await;
+    if outcome != ReportOutcome::Recorded {
+        return outcome;
+    }
     tracing::warn!(
         queue = %abort.queue,
         base_build = %abort.base_build_id,
@@ -1473,7 +1524,7 @@ async fn report_abort(
     if let Some(m) = metrics {
         m.record_build_ramp_aborted(&abort.queue, abort.reason.as_str());
     }
-    record_abort(audit_pool, abort, failed_pools, bound).await
+    outcome
 }
 
 /// One pool clear to retry: the pool index, the step, and `true` when an
@@ -1737,7 +1788,7 @@ impl RampGuard {
             let outcome = if cancel.is_cancelled() {
                 ClearOutcome::Failed
             } else {
-                clear_on_pool(&pools[index], index, &key, ramp_id, step, bound, false).await
+                clear_on_pool(&pools[index], index, &key, ramp_id, step, bound).await
             };
             if matches!(outcome, ClearOutcome::Failed | ClearOutcome::Ambiguous) {
                 failed.push((index, step, outcome == ClearOutcome::Ambiguous));
@@ -1760,25 +1811,18 @@ impl RampGuard {
         match decision {
             Disposition::Report => {
                 let failed_pools: Vec<usize> = failed.iter().map(|&(index, _, _)| index).collect();
-                if report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await {
+                let outcome =
+                    report_abort(&abort, ramp_id, audit_pool, metrics, &failed_pools, bound).await;
+                if outcome != ReportOutcome::Failed {
                     let all: Vec<usize> = (0..pools.len()).collect();
                     mark_reported(pools, &all, &key.0, ramp_id, bound, cancel).await;
                 }
-                Some(abort)
+                (outcome != ReportOutcome::AlreadyReported).then_some(abort)
             }
-            Disposition::Drop => {
-                // Another guard owns the report. Its own marker records that.
-                // The markers of this guard's clears are marked now.
-                let cleared: Vec<usize> = steps
-                    .iter()
-                    .zip(&outcomes)
-                    .filter(|(_, outcome)| **outcome == ClearOutcome::Cleared)
-                    .map(|(&(index, _), _)| index)
-                    .collect();
-                mark_reported(pools, &cleared, &key.0, ramp_id, bound, cancel).await;
-                None
-            }
-            Disposition::Defer => None,
+            // Another guard owns the report. The markers of this guard's
+            // clears stay unreported until a report commits, so a guard that
+            // stops before its report cannot hide the abort.
+            Disposition::Drop | Disposition::Defer => None,
         }
     }
 
@@ -1809,10 +1853,7 @@ impl RampGuard {
                 failed.push((index, step, false));
                 continue;
             }
-            // The marker of the first clear records the report state, so this
-            // completion writes a reported marker.
-            let outcome =
-                clear_on_pool(&pools[index], index, key, *ramp_id, step, bound, true).await;
+            let outcome = clear_on_pool(&pools[index], index, key, *ramp_id, step, bound).await;
             match outcome {
                 ClearOutcome::Cleared => {
                     tracing::info!(queue = %key.0, pool = index, "ramp guard finished a marked abort");
@@ -1865,17 +1906,7 @@ impl RampGuard {
                     outcomes.push(ClearOutcome::Failed);
                     continue;
                 }
-                let already_reported = entry.unreported.is_none();
-                let raw = clear_on_pool(
-                    pool,
-                    index,
-                    &key,
-                    entry.ramp_id,
-                    step,
-                    bound,
-                    already_reported,
-                )
-                .await;
+                let raw = clear_on_pool(pool, index, &key, entry.ramp_id, step, bound).await;
                 let outcome = retry_outcome(raw, was_ambiguous);
                 match outcome {
                     ClearOutcome::Cleared => {
@@ -1897,11 +1928,22 @@ impl RampGuard {
                         abort.incomplete = !still_failed.is_empty();
                         let failed_pools: Vec<usize> =
                             still_failed.iter().map(|&(index, _, _)| index).collect();
-                        if report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await {
+                        let outcome = report_abort(
+                            &abort,
+                            entry.ramp_id,
+                            audit_pool,
+                            metrics,
+                            &failed_pools,
+                            bound,
+                        )
+                        .await;
+                        if outcome != ReportOutcome::Failed {
                             let all: Vec<usize> = (0..pools.len()).collect();
                             mark_reported(pools, &all, &key.0, entry.ramp_id, bound, cancel).await;
                         }
-                        reported.push(abort);
+                        if outcome != ReportOutcome::AlreadyReported {
+                            reported.push(abort);
+                        }
                     }
                     Disposition::Defer => unreported = Some(abort),
                     Disposition::Drop => {}
@@ -1955,10 +1997,11 @@ async fn mark_reported(
 /// unreported marker. The claim is a lease of `lease`. Only the guard that
 /// took the claim reports. The report has reason
 /// [`RampAbortReason::Unreported`] and no rates, because the verdict is
-/// gone. After a committed audit row, the guard marks every marker as
-/// reported. A guard that stops before that leaves the markers unreported,
-/// and after the lease another guard reports the abort. Returns the abort
-/// when this guard reported it.
+/// gone. The report ledger makes the report exactly-once. After a committed
+/// report, or when the ledger already held it, the guard marks every marker
+/// as reported. A guard that stops before that leaves the markers
+/// unreported, and after the lease another guard tries again. Returns the
+/// abort when this guard reported it.
 #[cfg(feature = "db")]
 async fn report_unreported(
     pools: &[crate::worker::DbPool],
@@ -1987,7 +2030,8 @@ async fn report_unreported(
         target: BuildOutcomeStats::default(),
         incomplete: false,
     };
-    if report_abort(&abort, audit_pool, metrics, &[], bound).await {
+    let outcome = report_abort(&abort, Some(lost.ramp_id), audit_pool, metrics, &[], bound).await;
+    if outcome != ReportOutcome::Failed {
         mark_reported(
             pools,
             &lost.pools,
@@ -1998,7 +2042,7 @@ async fn report_unreported(
         )
         .await;
     }
-    Some(abort)
+    (outcome == ReportOutcome::Recorded).then_some(abort)
 }
 
 /// Run one guard pass with a new guard that has no pending clears.
@@ -2285,7 +2329,10 @@ mod tests {
         let prune_sql = prune_abort_markers_query();
         assert!(prune_sql.contains("$1") && prune_sql.contains("$2"));
         assert!(!prune_sql.contains("updated_at"), "a prune keeps the step");
-        assert!(abort_sql.contains("'reported', $5::boolean"));
+        assert!(
+            abort_sql.contains("'reported', false"),
+            "a clear writes an unreported marker"
+        );
         let mark_sql = mark_abort_reported_query();
         assert!(!mark_sql.contains("updated_at"), "a mark keeps the step");
         assert!(
