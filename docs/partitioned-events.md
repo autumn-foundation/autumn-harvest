@@ -228,6 +228,17 @@ execution leaves orphan event rows, and the sweeper is their garbage collector.
 Orphans are invisible to every read path in the engine: all of them filter by a
 `workflow_exec_id` the caller already resolved to a live execution.
 
+### The append-only guard (issue #1817)
+
+The `harvest_events_append_only_trg` trigger rejects history rewrites on both
+layouts. `LIKE` copies no triggers, so each conversion reinstalls it. On the
+partitioned layout it sits on the parent, and Postgres clones it onto each
+partition. The legacy table drops its own copy before `ATTACH`, because
+`ATTACH` fails on a trigger name that the partition already has. The
+operator-trigger refusal exempts the guard by its exact shape. The guard lets
+`cohort` change, so a `cohort` update is not refused. See CLAUDE.md, Engine
+Invariants, for the rules.
+
 ### Reads do not prune
 
 History reads filter on `workflow_exec_id`, not on `cohort`, so each one probes

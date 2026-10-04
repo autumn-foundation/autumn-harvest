@@ -597,6 +597,10 @@ mod tests {
 
 /// CLAUDE.md names exactly two writers of stored `harvest_events.event_data`.
 /// This guard fails when a third source file writes that column in place.
+///
+/// The database also enforces the rule, through the trigger in
+/// [`crate::append_only`] (issue #1817). This grep finds a new writer at test
+/// time, before it reaches a database.
 #[cfg(test)]
 mod append_only_guard {
     use std::path::PathBuf;

@@ -1038,8 +1038,14 @@ mod db {
     /// assertion's `FOR SHARE` stays a commit-order barrier against a
     /// concurrent promotion.
     ///
-    /// The wrapper is skipped entirely when fencing is off, so the pre-#954
-    /// path is unchanged: no fence read, no savepoint, one UPDATE.
+    /// The fence read is skipped when fencing is off.
+    ///
+    /// The swap always runs in its own transaction (issue #1817). The
+    /// append-only guard trigger rejects an `event_data` rewrite unless the
+    /// transaction carries the [`EventRewrite::CodecRotation`] sanction.
+    /// A transaction-local setting needs a transaction to live in.
+    ///
+    /// [`EventRewrite::CodecRotation`]: crate::append_only::EventRewrite::CodecRotation
     ///
     /// `#[doc(hidden)] pub` purely so that race semantics can be exercised
     /// directly by an integration test (a stale `original` must not win), which
@@ -1059,19 +1065,21 @@ mod db {
         original: &Value,
         candidate: &Value,
     ) -> HarvestResult<bool> {
+        use crate::append_only::{EventRewrite, revoke, sanction};
         use diesel_async::AsyncConnection as _;
 
-        if crate::replication::FenceRegistry::is_enabled() {
-            let candidate = candidate.clone();
-            let original = original.clone();
-            return Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+        let candidate = candidate.clone();
+        let original = original.clone();
+        Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+            if crate::replication::FenceRegistry::is_enabled() {
                 crate::replication::assert_fence(conn, shard).await?;
-                let updated = swap_statement(conn, event_row_id, &original, &candidate).await?;
-                Ok(updated)
-            }))
-            .await;
-        }
-        swap_statement(conn, event_row_id, original, candidate).await
+            }
+            sanction(conn, EventRewrite::CodecRotation).await?;
+            let updated = swap_statement(conn, event_row_id, &original, &candidate).await?;
+            revoke(conn).await?;
+            Ok(updated)
+        }))
+        .await
     }
 
     async fn swap_statement(

@@ -19,6 +19,8 @@ mod activity_pause_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
 mod alert_pack_docs;
+#[cfg(feature = "db")]
+mod append_only_guard_tests;
 mod audit_export_docs;
 #[cfg(feature = "db")]
 mod audit_export_tests;

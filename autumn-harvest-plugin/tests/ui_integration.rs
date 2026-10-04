@@ -7653,7 +7653,7 @@ async fn tl960_set_event_ts(
         exec_id.as_uuid(),
         event_id,
     );
-    conn.batch_execute(&sql)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| c.batch_execute(&sql).await)
         .await
         .expect("update event timestamp");
 }

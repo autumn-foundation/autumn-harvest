@@ -200,6 +200,8 @@ pub mod admission_gate;
 pub mod analyzer;
 /// Pure token-secret helpers shared by the mint route and the CLI (issue #942).
 pub mod api_token;
+/// The database guard on append-only `harvest_events` (issue #1817).
+pub mod append_only;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;

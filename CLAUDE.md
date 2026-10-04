@@ -137,6 +137,33 @@ two `harvest_events` writers, not three.
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
 
+**Enforcement (issue #1817).** The database enforces this invariant. The
+`harvest_events_append_only_trg` trigger runs `BEFORE UPDATE` on every row:
+
+- `event_data` changes only when the transaction sets
+  `harvest.sanctioned_event_rewrite` to `erase` or `codec_rotation`. Each
+  writer sets it through `append_only::sanction` and clears it after the write.
+- The `type` key inside `event_data` never changes.
+- No other column changes, except `cohort`. The check compares whole rows, so
+  a new column is guarded by default.
+
+**`cohort` is sanctioned and unguarded.** It is storage placement, not
+history: it picks the partition. Replay and history reads do not read it. Its
+only writer is `partition::disable_partitioning`, which resets it to the inert
+`-infinity` on the new flat table.
+
+The partition layout changes rebuild `harvest_events` with `LIKE`, which copies
+no triggers. `enable_sql`, `migration_plan_steps` and `disable_partitioning`
+reinstall the guard, and `operator_triggers` exempts it by its exact shape. A
+new layout path must do the same.
+
+A test fixture that must rewrite a row uses `append_only::with_guard_off`. It
+needs a superuser. The guard stops mistakes. It is not a security boundary.
+DELETE and TRUNCATE are not guarded: retention and partition reclaim need them.
+
+A new sanctioned writer needs a new `EventRewrite` variant, a migration that
+adds its value to the trigger, and an entry in the list above.
+
 ## Project Documentation
 
 `CLAUDE.md` holds agent instructions and engine invariants only. Do not park
