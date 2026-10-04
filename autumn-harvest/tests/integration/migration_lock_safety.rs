@@ -365,7 +365,7 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
         .hits
         .iter()
         .filter(|hit| hit.hot && hit.kind != (Kind::Index { concurrent: true }))
-        .filter(|hit| !timeout_in_force(&analysis.timeouts, hit.at))
+        .filter(|hit| !bound_in_force(&analysis, hit))
         .filter(|hit| reported.insert(hit.at));
     for lock in unbounded {
         findings.push(Finding {
@@ -435,6 +435,23 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
         }
     }
     local.unwrap_or(session)
+}
+
+/// Whether a bound is in force for `hit`.
+///
+/// A lock in a function body runs when something calls the function, maybe
+/// long after the migration. Only a bound set earlier in the same body holds.
+fn bound_in_force(analysis: &Analysis, hit: &Hit) -> bool {
+    let Some(from) = hit.body_start else {
+        return timeout_in_force(&analysis.timeouts, hit.at);
+    };
+    let local: Vec<(usize, Timeout)> = analysis
+        .body_timeouts
+        .iter()
+        .filter(|(k, _)| *k >= from)
+        .copied()
+        .collect();
+    timeout_in_force(&local, hit.at)
 }
 
 /// One change to the session's `lock_timeout`.
@@ -1123,6 +1140,9 @@ struct Hit {
     kind: Kind,
     /// Whether the statement sits inside a dollar-quoted body.
     in_body: bool,
+    /// The first token of the code that does not run now around the
+    /// statement, such as a function body. `None` when the statement runs.
+    body_start: Option<usize>,
     /// Whether the table is hot here. An unknown table counts as hot.
     hot: bool,
 }
@@ -1147,6 +1167,8 @@ struct Analysis {
     hits: Vec<Hit>,
     /// Each `lock_timeout` change: its token index, and whether it sets a bound.
     timeouts: Vec<(usize, Timeout)>,
+    /// Each change in code that does not run now, such as a function body.
+    body_timeouts: Vec<(usize, Timeout)>,
     /// The number of top-level statements.
     statement_count: usize,
 }
@@ -1444,6 +1466,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     let s = Stmts::new(&toks);
     let mut raws: Vec<Raw> = Vec::new();
     let mut timeouts = Vec::new();
+    let mut body_timeouts = Vec::new();
     // A table counts as new from its `CREATE TABLE` on. `IF NOT EXISTS` can
     // do nothing, so it does not count.
     let mut created: BTreeMap<String, usize> = BTreeMap::new();
@@ -1524,13 +1547,18 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             }
             // A conditional setter cannot set a bound, but a conditional
             // clear may end one.
-            _ if tok.runs => {
+            // A function body keeps its own changes, for the locks in it.
+            _ => {
                 let change = timeout_change(&s, k).filter(|change| {
                     unconditional[k] || !matches!(change, Timeout::Set { bounds: true, .. })
                 });
-                timeouts.extend(change.map(|change| (k, change)));
+                let list = if tok.runs {
+                    &mut timeouts
+                } else {
+                    &mut body_timeouts
+                };
+                list.extend(change.map(|change| (k, change)));
             }
-            _ => {}
         }
     }
 
@@ -1544,6 +1572,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         comments,
         hits,
         timeouts,
+        body_timeouts,
         statement_count,
     }
 }
@@ -1734,6 +1763,13 @@ fn resolve(
             table,
             kind: raw.kind,
             in_body: toks[raw.at].depth > 0,
+            body_start: (!toks[raw.at].runs).then(|| {
+                (0..raw.at)
+                    .rev()
+                    .take_while(|&j| !toks[j].runs)
+                    .last()
+                    .unwrap_or(raw.at)
+            }),
             hot,
         });
     }
@@ -1916,6 +1952,19 @@ fn lock_timeout_call(s: &Stmts, open: usize) -> Option<bool> {
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("lock_timeout"));
     }
     names_it.then_some(named)
+}
+
+/// Whether Postgres reads `value` as boolean true.
+///
+/// Postgres trims the value and ignores case. It accepts any unique prefix of
+/// `true`, `yes` or `on`, and `1`. `o` alone is ambiguous, so it fails.
+fn pg_true(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    !v.is_empty()
+        && ("true".starts_with(&v)
+            || "yes".starts_with(&v)
+            || (v.len() > 1 && "on".starts_with(&v))
+            || v == "1")
 }
 
 /// Whether Postgres reads `value` as boolean false.
@@ -2315,9 +2364,9 @@ fn reindex(s: &Stmts, k: usize) -> Option<Raw> {
             // `CONCURRENTLY` alone, or with a true value, turns it on. Any
             // other value turns it off or is unknown, which fails closed.
             if s.is(j, "concurrently") {
-                let on = s.is_punct(j + 1, ',')
-                    || s.is_punct(j + 1, ')')
-                    || ["true", "on", "1"].iter().any(|v| s.is(j + 1, v));
+                let value = s.word(j + 1).or_else(|| s.string(j + 1));
+                let on =
+                    s.is_punct(j + 1, ',') || s.is_punct(j + 1, ')') || value.is_some_and(pg_true);
                 concurrent = on;
             }
             j += 1;
@@ -4281,6 +4330,39 @@ fn other_cascading_drops_lock_an_unknown_table() {
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
     }
     assert_eq!(lint_with_history(&[], "DROP TYPE that_type;", true), []);
+}
+
+#[test]
+fn a_lock_in_a_function_body_needs_a_bound_in_the_body() {
+    // The body runs when something calls the function, maybe much later.
+    // The migration's bound does not hold then, and a clear in the body counts.
+    let body = |inner: &str| {
+        format!(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n{inner}\n    \
+             ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;\nSELECT f();"
+        )
+    };
+    for sql in [
+        format!(
+            "SET LOCAL lock_timeout = '5s';\n{}",
+            body("    PERFORM set_config('lock_timeout', '0', true);")
+        ),
+        format!("SET LOCAL lock_timeout = '5s';\n{}", body("")),
+    ] {
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
+    // A bound set in the body holds for the lock after it.
+    let sql = body("    PERFORM set_config('lock_timeout', '5s', true);");
+    assert_eq!(lint_with_history(&[], &sql, true), []);
+}
+
+#[test]
+fn reindex_concurrently_reads_a_quoted_true() {
+    for value in ["'true'", "'on'", "TRUE"] {
+        let sql = format!("REINDEX (CONCURRENTLY {value}) TABLE harvest_task_queue;");
+        assert_eq!(lint_with_history(&[], &sql, false), [], "{value}");
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

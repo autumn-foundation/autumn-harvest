@@ -104,8 +104,10 @@ SET lock_timeout` does not change the current session. Inside a `DO` block,
 `PERFORM set_config('lock_timeout', '5s', true)` also counts. It must be a
 bare `SELECT` or `PERFORM` of the call. A query with a filter may never call
 the function, so it does not count. The same call in a
-function body does not count, because the body runs only when something calls
-the function. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
+function body does not count for the migration, because the body runs only
+when something calls the function. A lock in a function body needs its own
+bound earlier in the body, because the migration's bound may not hold when
+the function runs. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
 `EXIT` or `CONTINUE`, does not count either, because it may not run. Nothing in a block with an
 `EXCEPTION` handler counts, because the handler rolls the block back. A clear inside a
 branch does count, because the branch may run.
@@ -247,8 +249,7 @@ that no longer matches a finding also fails the build.
   name. The lint cannot read SQL built with `||` or held in a variable, so
   such an `EXECUTE` counts as a lock on an unknown table.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
-  as code, in any quote form. A function body runs later, so its locks count
-  but its setters do not. Any other string is data.
+  as code, in any quote form. Any other string is data.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.
