@@ -740,6 +740,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 ambiguous_task_id,
                 "dispatcher-a",
                 task.crash_strikes,
+                task.attempt,
             )
             .await?;
             Ok::<_, autumn_harvest::HarvestError>((probe_elapsed, released))
@@ -1203,6 +1204,7 @@ async fn a_release_from_a_stale_attempt_does_not_free_the_current_claim_1806() {
         fx.stale.id,
         &fx.worker_id,
         fx.stale.crash_strikes,
+        fx.stale.attempt,
     )
     .await
     .expect("release runs");
@@ -1213,4 +1215,15 @@ async fn a_release_from_a_stale_attempt_does_not_free_the_current_claim_1806() {
         (row.state.as_str(), row.attempt),
         ("RUNNING", fx.current.attempt)
     );
+
+    let released = queue::release_terminal_workflow_claim(
+        &mut conn,
+        fx.current.id,
+        &fx.worker_id,
+        fx.current.crash_strikes,
+        fx.current.attempt,
+    )
+    .await
+    .expect("release runs");
+    assert!(released, "the current claim must still release");
 }
