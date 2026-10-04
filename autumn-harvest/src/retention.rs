@@ -1407,6 +1407,32 @@ async fn run_terminal_task_pass(
     }
 }
 
+/// Whether this process has lost write authority on `shard` (issue #1823).
+///
+/// A fenced process must not create or drop partitions on a shard another
+/// region owns. `harvest partition maintain` makes the same check. With no
+/// pin, the check issues no statement. A fenced shard is reported as failed.
+#[cfg(feature = "db")]
+async fn partition_pass_is_fenced(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard: crate::types::ShardId,
+    monitor_task: &RetentionMonitor,
+) -> bool {
+    let Err(error) = crate::replication::assert_fence(conn, shard).await else {
+        return false;
+    };
+    tracing::warn!(
+        shard = %shard,
+        error = %error,
+        "harvest event-partition maintenance skipped: this process is fenced"
+    );
+    monitor_task.update_partitions(
+        shard,
+        crate::partition::MaintenanceOutcome::failed(error.to_string()),
+    );
+    true
+}
+
 /// One pass of engine-automated partition maintenance (issue #958, AC8):
 /// `ensure_partitions`, the reclamation sweep, and the DEFAULT-partition
 /// drain, for every shard.
@@ -1497,19 +1523,7 @@ async fn run_partition_maintenance_pass(
                 }
             },
         };
-        // A fenced process must not create or drop partitions on a shard
-        // another region owns (issue #1823). `harvest partition maintain`
-        // makes the same check. With no pin, this check issues no statement.
-        if let Err(error) = crate::replication::assert_fence(&mut conn, shard).await {
-            tracing::warn!(
-                shard = %shard,
-                error = %error,
-                "harvest event-partition maintenance skipped: this process is fenced"
-            );
-            monitor_task.update_partitions(
-                shard,
-                crate::partition::MaintenanceOutcome::failed(error.to_string()),
-            );
+        if partition_pass_is_fenced(&mut conn, shard, monitor_task).await {
             continue;
         }
         // Review finding: a standalone probe used to run here, before

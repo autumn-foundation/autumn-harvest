@@ -7537,6 +7537,10 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 /// attempt run in one transaction. The probe holds `ACCESS SHARE` on
 /// `harvest_shard_generation` until that transaction ends. The bump needs
 /// `ACCESS EXCLUSIVE`, so it cannot commit while a walk is in progress.
+///
+/// Known limit: a long walk holds that lock for its whole length. A
+/// `harvest dr fence` that waits behind it gives up at its 5-second lock
+/// timeout, and the operator runs it again. No claim is doubled.
 #[must_use]
 pub fn claim_task_batched_candidates_query_fenced() -> &'static str {
     static FENCED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {

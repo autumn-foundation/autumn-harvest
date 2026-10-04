@@ -282,7 +282,9 @@ Admin writes go through the same check as worker writes (issue #1823).
   `assert_fence` for each pinned shard, before its handler. A fenced node
   answers `503` and the handler does not run. Read routes still answer, so
   you can inspect the node. Most `harvest` CLI commands call this API, so
-  they are fenced too.
+  they are fenced too. An embedder that mounts `harvest_api_router` without
+  `HarvestRunner::start` must call `replication::pin_process_fence` at
+  startup. Otherwise the node pins nothing and checks nothing.
 - **Direct-database CLI writes.** `harvest partition enable|maintain|disable`
   and `harvest shard rebalance|rebalance-resume|reconcile-migrated-seals`
   connect to shard databases directly. On a DR database they need

@@ -2437,7 +2437,7 @@ async fn the_probe_tolerates_a_database_without_the_fence_table() {
     let markers = probe_dr_markers(&mut conn, &unique_prefix(&db))
         .await
         .expect("a missing table is not an error");
-    assert!(markers.generation_shards.is_empty());
+    assert_eq!(markers.generation_shards, Vec::<ShardId>::new());
     assert!(!markers.is_dr());
 }
 
