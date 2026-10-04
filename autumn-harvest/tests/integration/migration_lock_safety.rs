@@ -2485,9 +2485,12 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
             };
             // A unique, primary-key or exclusion constraint builds its index
             // under the ALTER TABLE lock. USING INDEX adopts an index instead,
-            // but only for the action that names it.
+            // but only for the action that names it. `USING INDEX TABLESPACE`
+            // only places the new index, so it still builds one.
             let builds_index = s.actions(k).into_iter().any(|(from, to)| {
-                let adopts = (from..to).any(|j| s.is(j, "using") && s.is(j + 1, "index"));
+                let adopts = (from..to).any(|j| {
+                    s.is(j, "using") && s.is(j + 1, "index") && !s.is(j + 2, "tablespace")
+                });
                 !adopts
                     && (from..to).any(|j| {
                         s.is(j, "unique")
@@ -4821,6 +4824,22 @@ fn a_commit_ends_a_new_table_after_a_search_path_change() {
     let sql = "CREATE TABLE harvest_events (id BIGINT);\nCOMMIT;\n\
                ALTER TABLE harvest_events ADD COLUMN x INT;";
     assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+}
+
+#[test]
+fn an_index_tablespace_clause_still_builds_an_index() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    for action in [
+        "ADD UNIQUE (id) USING INDEX TABLESPACE fast",
+        "ADD CONSTRAINT k PRIMARY KEY (id) USING INDEX TABLESPACE fast",
+    ] {
+        let sql = format!("{set}ALTER TABLE harvest_events {action};");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::BlockingIndex], "{sql}");
+    }
+    // `USING INDEX` with an index name adopts that index.
+    let sql = format!("{set}ALTER TABLE harvest_events ADD CONSTRAINT k UNIQUE USING INDEX k_idx;");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
