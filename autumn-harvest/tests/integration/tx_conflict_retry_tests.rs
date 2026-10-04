@@ -391,8 +391,9 @@ async fn two_persist_transactions_deadlock_and_both_commit() {
         1,
         "exactly one persist retry after the deadlock"
     );
-    assert!(
-        metrics.exhausted().is_empty(),
+    assert_eq!(
+        metrics.exhausted(),
+        Vec::<(String, String)>::new(),
         "the retry resolves the cycle"
     );
     // The rollback removes the first run of the victim, so no event repeats.
@@ -899,7 +900,7 @@ async fn a_conflict_in_a_claim_is_retried_at_the_claim_site() {
 
     assert_eq!(state, "COMPLETED");
     assert_eq!(metrics.count(SITE_CLAIM, "deadlock"), 1, "one claim retry");
-    assert!(metrics.exhausted().is_empty());
+    assert_eq!(metrics.exhausted(), Vec::<(String, String)>::new());
 }
 
 /// The scanner site retries a conflict inside the debounce fire batch.
@@ -954,7 +955,7 @@ async fn a_conflict_in_a_debounce_fire_batch_is_retried_at_the_scanner_site() {
         1,
         "one scanner retry"
     );
-    assert!(metrics.exhausted().is_empty());
+    assert_eq!(metrics.exhausted(), Vec::<(String, String)>::new());
 }
 
 /// A conflict that reaches `fail_execution_on_error` does not fail the run.
