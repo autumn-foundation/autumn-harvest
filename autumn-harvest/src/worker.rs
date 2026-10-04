@@ -16405,27 +16405,34 @@ async fn process_activity_task(
     // late result of that claim must not count again, and a late success must
     // not clear the failure window. `on_claim_result` checks the mark under
     // the breaker lock, so the check cannot race the enforcer.
-    if let Some(transition) = circuit_token
-        .zip(circuit_outcome)
-        .and_then(|(token, outcome)| {
-            circuit_breakers.on_claim_result(
-                activity_name,
-                outcome,
-                token,
-                claim_key,
-                std::time::Instant::now(),
-            )
-        })
-    {
-        match transition {
-            crate::circuit_breaker::CircuitTransition::Tripped => {
-                telemetry.metrics.record_circuit_tripped(activity_name);
-            }
-            crate::circuit_breaker::CircuitTransition::Closed => {
-                telemetry.metrics.record_circuit_closed(activity_name);
+    //
+    // The report runs after the claim-fenced finalization. An enforcer that
+    // wins the row first confirms its mark before this report, so the report
+    // is dropped. A finalization that wins leaves the enforcer nothing to do,
+    // so the attempt counts once.
+    let report_outcome = || {
+        if let Some(transition) = circuit_token
+            .zip(circuit_outcome)
+            .and_then(|(token, outcome)| {
+                circuit_breakers.on_claim_result(
+                    activity_name,
+                    outcome,
+                    token,
+                    claim_key,
+                    std::time::Instant::now(),
+                )
+            })
+        {
+            match transition {
+                crate::circuit_breaker::CircuitTransition::Tripped => {
+                    telemetry.metrics.record_circuit_tripped(activity_name);
+                }
+                crate::circuit_breaker::CircuitTransition::Closed => {
+                    telemetry.metrics.record_circuit_closed(activity_name);
+                }
             }
         }
-    }
+    };
 
     // Issue #680: a self-committed transactional activity has already sealed its
     // `ActivityCompleted` + task-COMPLETED atomically, so there is nothing left
@@ -16448,12 +16455,13 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
+        report_outcome();
         return Ok(());
     }
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
     // pass 0 so handle_activity_result skips the redundant cap check.
-    handle_activity_result(
+    let finalized = handle_activity_result(
         &mut conn,
         task,
         exec_id,
@@ -16468,7 +16476,10 @@ async fn process_activity_task(
         registry.retry_after_ceiling,
         registry.payload_codecs(),
     )
-    .await
+    .await;
+    // Report even when the write failed, so an admitted probe is released.
+    report_outcome();
+    finalized
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
