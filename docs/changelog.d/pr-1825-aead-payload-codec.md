@@ -15,13 +15,14 @@ rotate. This adds one.
   wrapped data key through the one-method `KmsDecrypt` trait, with the codec
   key id as the encryption context. The new `aws-kms` feature implements
   `KmsDecrypt` for `aws_sdk_kms::Client`. It is off by default.
-- **Key hygiene.** `DataKey` is zeroized on drop. The cipher uses the
-  `aes-gcm` `zeroize` feature. `Debug` output and errors never print key
-  bytes or plaintext.
+- **Key hygiene.** `DataKey` is boxed and zeroized on drop. The `aes`,
+  `ghash` and `polyval` `zeroize` features clear the cipher state. `Debug`
+  output and errors never print key bytes or plaintext.
 - **Rotation.** `AeadCodec::register_with` and
   `HarvestBuilder::aead_payload_codec_key` register a codec under its own key
   id. The issue #948 sweep then re-encrypts under the new key version with no
-  change.
+  change. The new default method `PayloadCodec::bound_key_id` lets
+  `register_key` refuse a codec under another key id, except `legacy`.
 - **Scope.** The codec covers the `harvest_events` payload fields only.
   ADR-0003 keeps denormalized columns, such as
   `harvest_workflow_executions.input`, in clear. `docs/security-posture.md`
@@ -30,10 +31,12 @@ rotate. This adds one.
 No new `WorkflowEvent` variant. No migration. The event JSON contract is
 unchanged.
 
-**Tests.** `aead_codec::tests` covers round trip, a flipped byte at every
-index, truncation, the wrong key, a different key id, an unknown version,
-each provider, redacted `Debug` output and a rotation re-encrypt.
-`tests/property/aead_codec_props.rs` proves `decode(encode(x)) == x` for
-arbitrary bytes and arbitrary JSON, and that any flipped bit fails decode.
+**Tests.** `aead_codec::tests` covers the round trip and a flipped byte at
+every index. It also covers a spliced header, truncation, the wrong key and a
+different key id. Other tests cover each provider, redacted `Debug` output and
+a rotation re-encrypt. `tests/property/aead_codec_props.rs` proves
+`decode(encode(x)) == x` for arbitrary bytes and arbitrary JSON. It also
+proves that any flipped bit fails decode.
 `replay_fidelity_is_byte_identical_across_a_sweep` now runs with the XOR
-fixture codec and with `AeadCodec`.
+fixture codec and with `AeadCodec`. It checks the stored `codec_id` and `kid`
+before and after the sweep.

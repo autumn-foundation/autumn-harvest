@@ -79,8 +79,9 @@ pub const KMS_CONTEXT_KEY_ID: &str = "harvest_codec_key_id";
 
 /// A 256-bit data key. The bytes are cleared on drop.
 ///
+/// The key lives on the heap, so a move copies a pointer, not the key.
 /// `Debug` prints a placeholder, never the key bytes.
-pub struct DataKey(Zeroizing<[u8; DATA_KEY_BYTES]>);
+pub struct DataKey(Box<Zeroizing<[u8; DATA_KEY_BYTES]>>);
 
 /// Why a byte string is not a valid [`DataKey`].
 ///
@@ -102,10 +103,12 @@ impl DataKey {
     ///
     /// [`DataKeyError::WrongLength`] when `bytes` has another length.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DataKeyError> {
-        let key: [u8; DATA_KEY_BYTES] = bytes
-            .try_into()
-            .map_err(|_| DataKeyError::WrongLength(bytes.len()))?;
-        Ok(Self(Zeroizing::new(key)))
+        if bytes.len() != DATA_KEY_BYTES {
+            return Err(DataKeyError::WrongLength(bytes.len()));
+        }
+        let mut key = Box::new(Zeroizing::new([0u8; DATA_KEY_BYTES]));
+        key.copy_from_slice(bytes);
+        Ok(Self(key))
     }
 
     /// Make a data key from standard base64 text. Leading and trailing
@@ -126,15 +129,15 @@ impl DataKey {
     /// Make a new random data key from the operating system RNG.
     #[must_use]
     pub fn generate() -> Self {
-        let mut key = Zeroizing::new([0u8; DATA_KEY_BYTES]);
-        rand::rngs::OsRng.fill_bytes(key.as_mut());
+        let mut key = Box::new(Zeroizing::new([0u8; DATA_KEY_BYTES]));
+        rand::rngs::OsRng.fill_bytes(key.as_mut_slice());
         Self(key)
     }
 
     /// The key as standard base64, for an operator who stores a new key.
     #[must_use]
     pub fn to_base64(&self) -> Zeroizing<String> {
-        Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(self.0.as_ref()))
+        Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(self.0.as_slice()))
     }
 }
 
@@ -234,7 +237,7 @@ impl AeadCodec {
         Ok(Self {
             key_id: key_id.to_string(),
             header,
-            cipher: Aes256Gcm::new(key.0.as_ref().into()),
+            cipher: Aes256Gcm::new(key.0.as_slice().into()),
         })
     }
 
@@ -258,8 +261,9 @@ impl AeadCodec {
 
     /// Register this codec in `codecs` under its own key id.
     ///
-    /// Use this, not [`PayloadCodecs::register_key`], so that the envelope
-    /// `kid` and the header key id are always equal.
+    /// The envelope `kid` and the header key id are then equal.
+    /// [`PayloadCodecs::register_key`] refuses any other id, except
+    /// [`CODEC_LEGACY_KEY_ID`](crate::payload_codec::CODEC_LEGACY_KEY_ID).
     ///
     /// # Errors
     ///
@@ -281,6 +285,10 @@ impl std::fmt::Debug for AeadCodec {
 impl PayloadCodec for AeadCodec {
     fn codec_id(&self) -> &'static str {
         AEAD_CODEC_ID
+    }
+
+    fn bound_key_id(&self) -> Option<&str> {
+        Some(&self.key_id)
     }
 
     fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
@@ -373,6 +381,9 @@ fn invalid_key(key_id: &str, err: DataKeyError) -> KeyProviderError {
 /// Reads each data key from an environment variable as standard base64.
 ///
 /// Map each key id to a variable name with [`EnvKeyProvider::with_key`].
+/// The key stays in the process environment, which the process cannot
+/// clear safely. Prefer [`FileKeyProvider`] or [`KmsKeyProvider`] in
+/// production.
 #[derive(Debug, Clone)]
 pub struct EnvKeyProvider {
     vars: BTreeMap<String, String>,
@@ -416,23 +427,19 @@ impl KeyProvider for EnvKeyProvider {
             key_id: key_id.to_string(),
             reason: format!("environment variable {var} is not set"),
         })?;
-        let value =
-            Zeroizing::new(
-                value
-                    .into_string()
-                    .map_err(|_| KeyProviderError::InvalidKey {
-                        key_id: key_id.to_string(),
-                        reason: format!("environment variable {var} is not valid UTF-8"),
-                    })?,
-            );
-        DataKey::from_base64(&value).map_err(|err| invalid_key(key_id, err))
+        let bytes = Zeroizing::new(value.into_encoded_bytes());
+        let text = std::str::from_utf8(&bytes).map_err(|_| KeyProviderError::InvalidKey {
+            key_id: key_id.to_string(),
+            reason: format!("environment variable {var} is not valid UTF-8"),
+        })?;
+        DataKey::from_base64(text).map_err(|err| invalid_key(key_id, err))
     }
 }
 
 /// Reads each data key from `<dir>/<key_id>.key` as standard base64.
 ///
-/// This suits a secret volume, for example a Kubernetes secret. A key id
-/// cannot hold `/`, so the path always stays inside `dir`.
+/// This suits a secret volume, for example a Kubernetes secret. The
+/// provider refuses a key id whose path is not a direct child of `dir`.
 #[derive(Debug, Clone)]
 pub struct FileKeyProvider {
     dir: PathBuf,
@@ -454,6 +461,12 @@ impl KeyProvider for FileKeyProvider {
             key_id: key_id.to_string(),
         })?;
         let path = self.dir.join(format!("{key_id}.key"));
+        // On Windows, a key id such as `C:x` makes `join` replace `dir`.
+        if path.parent() != Some(self.dir.as_path()) {
+            return Err(KeyProviderError::UnknownKey {
+                key_id: key_id.to_string(),
+            });
+        }
         // `std::fs`, not `tokio::fs`: loom and shuttle builds compile
         // `tokio::fs` out. The read is one small file at startup.
         let text = match std::fs::read_to_string(&path) {
@@ -521,6 +534,7 @@ impl<D> std::fmt::Debug for KmsKeyProvider<D> {
 
 impl<D: KmsDecrypt> KmsKeyProvider<D> {
     /// Make a provider that unwraps with the KMS key `kms_key_id`.
+    #[must_use]
     pub fn new(kms: D, kms_key_id: impl Into<String>) -> Self {
         Self {
             kms,
@@ -529,11 +543,34 @@ impl<D: KmsDecrypt> KmsKeyProvider<D> {
         }
     }
 
-    /// Add the wrapped data key for `key_id`.
+    /// Add the wrapped data key for `key_id` as raw bytes.
     #[must_use]
     pub fn with_wrapped_key(mut self, key_id: impl Into<String>, wrapped: Vec<u8>) -> Self {
         self.wrapped.insert(key_id.into(), wrapped);
         self
+    }
+
+    /// Add the wrapped data key for `key_id` as standard base64.
+    ///
+    /// This is the `CiphertextBlob` text that the AWS CLI prints with
+    /// `--output text`. Leading and trailing whitespace is ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyProviderError::InvalidKey`] when `wrapped` is not base64.
+    pub fn with_wrapped_key_base64(
+        self,
+        key_id: impl Into<String>,
+        wrapped: &str,
+    ) -> Result<Self, KeyProviderError> {
+        let key_id = key_id.into();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(wrapped.trim())
+            .map_err(|_| KeyProviderError::InvalidKey {
+                key_id: key_id.clone(),
+                reason: "the wrapped key must be standard base64".to_string(),
+            })?;
+        Ok(self.with_wrapped_key(key_id, bytes))
     }
 }
 
@@ -703,7 +740,6 @@ mod tests {
         let stored = codec("k1", KEY_A).encode(b"secret").unwrap();
         let err = codec("k1", KEY_B).decode(&stored).unwrap_err();
         assert!(err.0.contains("authentication failed"), "{err}");
-        assert!(!err.0.contains("secret"));
     }
 
     #[test]
@@ -714,6 +750,16 @@ mod tests {
             err.0.contains("\"k1\"") && err.0.contains("\"k2\""),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_spliced_header_fails_authentication() {
+        // The key id check passes, so only the associated data can catch this.
+        let stored = codec("k1", KEY_A).encode(b"secret").unwrap();
+        let mut spliced = stored;
+        spliced[2..4].copy_from_slice(b"k2");
+        let err = codec("k2", KEY_A).decode(&spliced).unwrap_err();
+        assert!(err.0.contains("authentication failed"), "{err}");
     }
 
     // ── construction and key material ──────────────────────────────────
@@ -749,9 +795,9 @@ mod tests {
     fn generated_keys_differ_and_round_trip_through_base64() {
         let first = DataKey::generate();
         let second = DataKey::generate();
-        assert_ne!(*first.0, *second.0);
+        assert_ne!(first.0.as_slice(), second.0.as_slice());
         let copy = DataKey::from_base64(&first.to_base64()).unwrap();
-        assert_eq!(*first.0, *copy.0);
+        assert_eq!(first.0.as_slice(), copy.0.as_slice());
     }
 
     #[test]
@@ -814,6 +860,18 @@ mod tests {
         assert!(!err.to_string().contains("c2hvcnQta2V5"), "{err}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_env_provider_rejects_a_non_utf8_value() {
+        let mut provider = EnvKeyProvider::new().with_key("k1", "V");
+        provider.lookup = |_| {
+            use std::os::unix::ffi::OsStringExt as _;
+            Some(OsString::from_vec(vec![0xFF, 0xFE]))
+        };
+        let err = provider.data_key("k1").await.unwrap_err();
+        assert!(matches!(err, KeyProviderError::InvalidKey { .. }), "{err}");
+    }
+
     #[tokio::test]
     async fn the_file_provider_reads_and_trims_a_key_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -844,8 +902,17 @@ mod tests {
         std::fs::write(root.path().join(".key"), b64(&KEY_A)).unwrap();
         std::fs::write(root.path().join("k1.key"), b64(&KEY_A)).unwrap();
         let provider = FileKeyProvider::new(&keys);
+        // `..` and `.` are valid key ids. They name `...key` and `..key`
+        // inside `keys`, so they must not reach `root/.key`.
+        // `../k1` and `/etc/passwd` are invalid key ids, so no path is built.
         for key_id in ["..", ".", "../k1", "/etc/passwd"] {
-            assert!(provider.data_key(key_id).await.is_err(), "{key_id}");
+            assert_eq!(
+                provider.data_key(key_id).await.unwrap_err(),
+                KeyProviderError::UnknownKey {
+                    key_id: key_id.to_string()
+                },
+                "{key_id}"
+            );
         }
     }
 
@@ -904,6 +971,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_kms_provider_accepts_a_base64_wrapped_key() {
+        let kms = Arc::new(FakeKms::default());
+        let text = format!("{}\n", b64(&wrap(&KEY_A)));
+        let provider = KmsKeyProvider::new(Arc::clone(&kms), "kms")
+            .with_wrapped_key_base64("k1", &text)
+            .unwrap();
+        let codec = AeadCodec::load(&provider, "k1").await.unwrap();
+        let stored = self::codec("k1", KEY_A).encode(b"x").unwrap();
+        assert_eq!(codec.decode(&stored).unwrap(), b"x");
+        assert!(matches!(
+            KmsKeyProvider::new(kms, "kms").with_wrapped_key_base64("k1", "not base64!"),
+            Err(KeyProviderError::InvalidKey { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn the_kms_provider_reports_unknown_failed_and_invalid_keys() {
         let kms = Arc::new(FakeKms::default());
         let provider =
@@ -955,6 +1038,22 @@ mod tests {
             AEAD_CODEC_ID
         );
         assert!(codec("k1", KEY_B).register_with(&codecs).is_err());
+    }
+
+    #[test]
+    fn register_key_refuses_a_key_id_the_codec_does_not_bind() {
+        let codecs = PayloadCodecs::default();
+        let err = codecs
+            .register_key("k2", Arc::new(codec("k1", KEY_A)))
+            .unwrap_err();
+        assert!(err.to_string().contains("\"k1\""), "{err}");
+        assert_eq!(codecs.registered_key_ids(), Vec::<String>::new());
+        codecs
+            .register_key(
+                crate::payload_codec::CODEC_LEGACY_KEY_ID,
+                Arc::new(codec("k1", KEY_A)),
+            )
+            .unwrap();
     }
 
     #[test]

@@ -598,6 +598,16 @@ pub trait PayloadCodec: Send + Sync {
     ///
     /// Returns [`CodecError`] when decoding fails.
     fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError>;
+    /// The codec key id that this codec binds into its own output, if any
+    /// (issue #1825).
+    ///
+    /// [`PayloadCodecs::register_key`] refuses a codec whose bound key id
+    /// differs from the registry key id. Otherwise the census and the sweep
+    /// track rows under a key id that does not name their key material.
+    /// The default is `None`: the codec binds no key id.
+    fn bound_key_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Represents an error that occurred during encoding or decoding.
@@ -868,9 +878,21 @@ impl PayloadCodecs {
     ///
     /// [`HarvestError::Config`] when `key_id` is empty, longer than
     /// [`MAX_CODEC_KEY_ID_BYTES`], contains anything outside ASCII
-    /// alphanumerics and `-_.:`, or is **already registered**.
+    /// alphanumerics and `-_.:`, or is **already registered**. The same
+    /// error applies when the codec's [`PayloadCodec::bound_key_id`] is a
+    /// different id and `key_id` is not [`CODEC_LEGACY_KEY_ID`].
     pub fn register_key(&self, key_id: &str, codec: Arc<dyn PayloadCodec>) -> HarvestResult<()> {
         validate_key_id(key_id)?;
+        // The legacy id may hold any codec: kid-less history predates key ids.
+        if let Some(bound) = codec.bound_key_id()
+            && bound != key_id
+            && key_id != CODEC_LEGACY_KEY_ID
+        {
+            return Err(HarvestError::Config(format!(
+                "codec key id {key_id:?} does not match the key id {bound:?} that the codec \
+                 binds into its output; register the codec under {bound:?}"
+            )));
+        }
         let mut guard = self.keys_write();
         if guard.keys.contains_key(key_id) {
             return Err(HarvestError::Config(format!(

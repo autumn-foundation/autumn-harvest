@@ -666,16 +666,18 @@ JSON. A workflow that carries PII or secrets must encrypt them. Use
 - Each payload starts with a header that holds the format version and the
   key id. The header is AEAD associated data, so it is authenticated.
 - Decode fails for a wrong key, a changed byte, a changed header or a
-  truncated payload. It never returns wrong plaintext.
-- `DataKey` clears its bytes on drop. `Debug` output and error text never
-  hold key material or plaintext.
+  truncated payload.
+- `DataKey` clears its bytes on drop. The AES round keys and the GHASH state
+  are also cleared on drop. On aarch64, upstream `polyval` does not yet clear
+  the GHASH state.
+- `Debug` output and error text never hold key material or plaintext.
 
 ### What the codec does not cover
 
 The codec encrypts the payload fields of `harvest_events.event_data` only:
 `input`, `output`, `payload`, `details`, `value` and
-`last_completion_result`. ADR-0003 keeps these columns in clear, so that
-operators can query them:
+`last_completion_result`. ADR-0003 and the current schema keep these columns
+in clear, so that operators can query them:
 
 - `harvest_workflow_executions.input`, `.output`, `.memo` and `.search_attrs`;
 - `harvest_task_queue.input`, `.output` and `.heartbeat_details`;
@@ -687,13 +689,18 @@ PII in a memo, a search attribute, a workflow id or a workflow name. If these
 columns must not hold PII, encrypt the value in workflow code before Harvest
 sees it. Also use Postgres disk encryption.
 
+The associated data binds the version and the key id, not the row. A writer
+with access to `harvest_events` can copy a ciphertext to another field, event
+or execution under the same key, and it decodes. Restrict write access to the
+Harvest database.
+
 ### Key providers
 
 Load each data key once, at startup, through a `KeyProvider`:
 
 | Provider | Key source |
 |----------|------------|
-| `EnvKeyProvider` | An environment variable that holds base64. |
+| `EnvKeyProvider` | An environment variable that holds base64. The key stays in the process environment. |
 | `FileKeyProvider` | `<dir>/<key_id>.key` that holds base64, for example a secret volume. |
 | `KmsKeyProvider` | A wrapped data key that a KMS unwraps (envelope encryption). |
 
@@ -707,32 +714,44 @@ aws kms generate-data-key --key-id "$KMS_KEY_ARN" --key-spec AES_256 \
   --query CiphertextBlob --output text > 2026-10.wrapped.b64
 ```
 
-Store the wrapped key. Never store the `Plaintext` field. KMS refuses to
+The CLI writes the wrapped key as base64. Load it with
+`with_wrapped_key_base64`. Never store the `Plaintext` field. KMS refuses to
 unwrap the key under another key id or another KMS key.
 
 ```rust,ignore
 use autumn_harvest::aead_codec::{AeadCodec, KmsKeyProvider};
 
 let kms = aws_sdk_kms::Client::new(&aws_config::load_from_env().await);
-let keys = KmsKeyProvider::new(kms, kms_key_arn).with_wrapped_key("2026-10", wrapped);
+let wrapped = std::fs::read_to_string("2026-10.wrapped.b64")?;
+let keys = KmsKeyProvider::new(kms, kms_key_arn).with_wrapped_key_base64("2026-10", &wrapped)?;
 let harvest = HarvestBuilder::new()
     .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
-    .build()?;
+    .try_build()?;
 ```
 
-Use `aead_payload_codec_key` from the first deployment. It writes the key id
-into each envelope, so a later rotation needs no `legacy` key.
+Use `aead_payload_codec_key`, not `payload_codec`, from the first deployment.
+It writes the key id into each envelope, so a later rotation needs no
+`legacy` key. In a fleet with more than one process, also activate the first
+key with `codec_rotation::activate_codec_key`. That call records the key and
+checks that every worker can read it.
+
+A deployment that already uses `payload_codec(AeadCodec)` has history with no
+`kid`. Keep that `payload_codec` call when you add keyed codecs. The kid-less
+history decodes through it.
 
 ### Rotation and the nonce limit
 
-Random 96-bit nonces make a nonce collision likely after about 2^32 encodes
-under one key. Rotate each key well before that count. For example, rotate
-each quarter, or sooner on a high-volume deployment. Also rotate at once after
-a key leak.
+A random 96-bit nonce can repeat. NIST SP 800-38D limits each key to 2^32
+encodes with random nonces. At that limit, the chance of any repeated nonce is
+about 2^-33. Each payload field is one encode. The rotation sweep re-encodes
+each stored field, so the sweep also counts against the new key. Rotate each
+key well before the limit, and at once after a key leak.
 
 To rotate, load a codec for the new key id and register it. Activate it with
 `codec_rotation::activate_codec_key`. The issue #948 sweep then re-encrypts
-stored history under the new key. After the sweep, retire the old key. See
+stored history under the new key. After the sweep, retire the old key. Do not
+destroy the old key material yet. The sweep does not re-encrypt offloaded
+blobs. See "What zero does and does not authorise" in
 [`operations/codec-key-rotation.md`](operations/codec-key-rotation.md).
 `replay_fidelity_is_byte_identical_across_a_sweep` proves that replay stays
 byte-identical across a sweep with this codec.

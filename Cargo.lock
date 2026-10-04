@@ -36,6 +36,7 @@ dependencies = [
  "cfg-if",
  "cipher 0.4.4",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -287,6 +288,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 name = "autumn-harvest"
 version = "0.6.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "async-trait",
  "autumn-harvest-macros",
@@ -301,11 +303,13 @@ dependencies = [
  "diesel-async",
  "diesel_migrations",
  "futures",
+ "ghash",
  "hmac 0.12.1",
  "loom",
  "lru 0.18.4",
  "metrics",
  "percent-encoding",
+ "polyval",
  "proc-macro2",
  "proptest",
  "rand 0.8.6",
@@ -2911,6 +2915,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -4675,6 +4680,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]

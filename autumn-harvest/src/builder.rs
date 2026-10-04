@@ -5740,6 +5740,19 @@ mod tests {
         );
     }
 
+    /// A duplicate AEAD key id must not boot (issue #1825).
+    #[test]
+    #[should_panic(expected = "invalid AEAD payload codec key")]
+    fn aead_payload_codec_key_panics_on_a_duplicate_key_id() {
+        use crate::aead_codec::{AeadCodec, DataKey};
+
+        let first = AeadCodec::new("k1", &DataKey::generate()).expect("codec");
+        let second = AeadCodec::new("k1", &DataKey::generate()).expect("codec");
+        let _ = HarvestBuilder::new()
+            .aead_payload_codec_key(first)
+            .aead_payload_codec_key(second);
+    }
+
     /// Both worker-parts hops must thread the configured durable-log policy
     /// into the `HandlerRegistry` (issue #790).
     ///

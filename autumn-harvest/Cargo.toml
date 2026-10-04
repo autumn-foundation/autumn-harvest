@@ -75,6 +75,12 @@ hot-code-swap = ["wasm-activities"]
 chaos = ["db"]
 # AWS KMS binding for the AEAD payload codec key provider (issue #1825).
 # Off by default. Without it, `KmsKeyProvider` still accepts any `KmsDecrypt`.
+#
+# This feature brings in `aws-lc-rs`, which needs cmake and a C compiler. It
+# also turns on rustls's `aws_lc_rs` provider beside `ring`. Every rustls
+# config in this crate must therefore name its provider, as `pg_tls.rs` does.
+# The locked `aws-sdk-kms` 1.99.0 needs Rust 1.88, so the effective MSRV does
+# not rise at the locked version. A newer 1.x can need a newer Rust.
 aws-kms = ["dep:aws-sdk-kms"]
 
 [dependencies]
@@ -88,9 +94,15 @@ base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
 # AES-256-GCM payload codec (issue #1825). `autumn-web` already pins 0.10.3 in
-# the lockfile. `zeroize` clears cipher state on drop. No default features: the
-# codec reads nonces from `rand`'s `OsRng`, so `aead/getrandom` is not needed.
+# the lockfile. No default features: the codec reads nonces from `rand`'s
+# `OsRng`, so `aead/getrandom` is not needed.
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
+# `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates
+# are already in the lockfile through `aes-gcm`.
+aes = { version = "0.8.4", features = ["zeroize"] }
+ghash = { version = "0.5.1", default-features = false, features = ["zeroize"] }
+polyval = { version = "0.6.2", default-features = false, features = ["zeroize"] }
 # Clears data-key bytes on drop (issue #1825). Already in the lockfile.
 zeroize = "1"
 url = "2"

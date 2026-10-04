@@ -18,33 +18,36 @@ Status: implementation plan (TDD: red, green, refactor).
 6. **Envelope encryption: load the data key once, at startup.** Chosen. The KMS
    provider unwraps a wrapped data key once. The codec then holds the key in memory.
 7. **A KMS provider hard-wired to the AWS SDK.** Rejected. It cannot be tested without
-   AWS. A small `KmsDecrypt` trait carries the one call. The AWS binding sits behind
-   the `aws-kms` feature.
-8. **A new rotation path for the AEAD codec.** Rejected. One `AeadCodec` per key id goes
+   AWS.
+8. **A one-method `KmsDecrypt` trait.** Chosen. A fake proves the provider offline. The
+   AWS binding sits behind the `aws-kms` feature.
+9. **A new rotation path for the AEAD codec.** Rejected. One `AeadCodec` per key id goes
    into the existing keyed registry. The issue #948 sweep then re-encrypts with no
    change.
 
-Selected: **1 + 4 + 6 + 7 + 8.**
+Selected: **1 + 4 + 6 + 8**, and the existing registry instead of 9.
 
-## 2. Reverse brainstorming — how do we make this fail?
+## 2. Reverse brainstorming — how to make this fail
 
 - **R1. Nonce reuse.** A repeated nonce under one key leaks the XOR of two plaintexts
   and the GHASH key. Foreclosed: every encode reads 96 bits from the OS RNG. A test
-  proves two encodes of one plaintext differ. Docs state the 2^32 messages-per-key
-  bound and tell operators to rotate first.
+  proves two encodes of one plaintext differ. Docs state the NIST limit of 2^32
+  encodes per key and tell operators to rotate first.
 - **R2. Silent wrong-key decode.** Foreclosed: GCM authenticates. A wrong key fails
   with a typed error. A test proves it.
 - **R3. Header swap.** An attacker relabels a ciphertext with another key id or
-  version. Foreclosed: the header is associated data. A test flips every byte.
+  version. Foreclosed: the header is associated data. A splice test rewrites the key
+  id and decodes with a codec that holds that id. Authentication fails.
 - **R4. Key material in logs.** Foreclosed: `DataKey` and `AeadCodec` print a redacted
   `Debug`. No error text carries key bytes or plaintext. Tests assert both.
-- **R5. Key bytes stay in freed memory.** Foreclosed: `DataKey` uses `Zeroizing`, and
-  the cipher state uses the `aes-gcm` `zeroize` feature.
-- **R6. Path traversal through a key id.** A key id of `..` must not leave the key
-  directory. Foreclosed: the key id alphabet has no `/`, and the file name has a
-  `.key` suffix. A test proves `..` stays inside the directory.
-- **R7. Registry id differs from header id.** Foreclosed: `AeadCodec::register_with`
-  registers the codec under its own key id.
+- **R5. Key bytes stay in freed memory.** Foreclosed: `DataKey` boxes a `Zeroizing`
+  array. The `aes`, `ghash` and `polyval` `zeroize` features clear the cipher state.
+  Upstream `polyval` does not yet clear its aarch64 state.
+- **R6. Path traversal through a key id.** A key id must not leave the key directory.
+  Foreclosed: the key id alphabet has no `/`, the file name has a `.key` suffix, and
+  the provider checks that the path is a direct child of the directory.
+- **R7. Registry id differs from header id.** Foreclosed: `register_key` refuses a
+  codec whose `bound_key_id` differs, except under `legacy`.
 - **R8. KMS unwraps a data key for the wrong codec key.** Foreclosed: the KMS call
   sends an encryption context that names the codec key id.
 - **R9. Rotation leaves old ciphertext behind.** Foreclosed by the issue #948 sweep.

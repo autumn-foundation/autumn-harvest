@@ -99,7 +99,7 @@ let harvest = HarvestBuilder::new()
     .payload_codec_key("2026-q3", MyNewCodec::new(new_key))
     // Flip: from here, every new write is encrypted under 2026-q3.
     .active_payload_codec_key("2026-q3")
-    .build()?;
+    .try_build()?;
 ```
 
 With the built-in AES-256-GCM codec (issue #1825), load one `AeadCodec` per
@@ -113,8 +113,11 @@ let harvest = HarvestBuilder::new()
     .aead_payload_codec_key(AeadCodec::load(&keys, "2026-q2").await?)
     .aead_payload_codec_key(AeadCodec::load(&keys, "2026-q3").await?)
     .active_payload_codec_key("2026-q3")
-    .build()?;
+    .try_build()?;
 ```
+
+`register_key` refuses an `AeadCodec` under a key id that differs from the
+codec's own key id. The one exception is `legacy`.
 
 See [`../security-posture.md`](../security-posture.md#payload-encryption-at-rest-issue-1825)
 for the key providers and the nonce limit.

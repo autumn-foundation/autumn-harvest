@@ -62,6 +62,7 @@ proptest! {
         codecs.set_default(Arc::new(AeadCodec::new("k1", &key).unwrap()));
         let stored = codecs.encode_payload(&payload).unwrap();
         prop_assert_ne!(&stored, &payload);
+        prop_assert!(stored.to_string().contains("\"codec_id\":\"aes-256-gcm\""));
         prop_assert_eq!(codecs.decode_payload(&stored).unwrap(), payload);
     }
 
