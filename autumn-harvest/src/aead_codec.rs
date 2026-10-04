@@ -100,7 +100,10 @@ impl DataKey {
     ///
     /// [`DataKeyError::WrongLength`] when `bytes` has another length.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DataKeyError> {
-        todo!()
+        let key: [u8; DATA_KEY_BYTES] = bytes
+            .try_into()
+            .map_err(|_| DataKeyError::WrongLength(bytes.len()))?;
+        Ok(Self(Zeroizing::new(key)))
     }
 
     /// Make a data key from standard base64 text. Leading and trailing
@@ -110,19 +113,26 @@ impl DataKey {
     ///
     /// [`DataKeyError::InvalidBase64`] or [`DataKeyError::WrongLength`].
     pub fn from_base64(text: &str) -> Result<Self, DataKeyError> {
-        todo!()
+        let bytes = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(text.trim())
+                .map_err(|_| DataKeyError::InvalidBase64)?,
+        );
+        Self::from_bytes(&bytes)
     }
 
     /// Make a new random data key from the operating system RNG.
     #[must_use]
     pub fn generate() -> Self {
-        todo!()
+        let mut key = Zeroizing::new([0u8; DATA_KEY_BYTES]);
+        rand::rngs::OsRng.fill_bytes(key.as_mut());
+        Self(key)
     }
 
     /// The key as standard base64, for an operator who stores a new key.
     #[must_use]
     pub fn to_base64(&self) -> Zeroizing<String> {
-        todo!()
+        Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(self.0.as_ref()))
     }
 }
 
@@ -199,7 +209,18 @@ impl AeadCodec {
     /// [`HarvestError::Config`] when `key_id` is not a valid codec key id.
     /// The rules are the same as for [`PayloadCodecs::register_key`].
     pub fn new(key_id: &str, key: &DataKey) -> HarvestResult<Self> {
-        todo!()
+        validate_key_id(key_id)?;
+        let key_len = u8::try_from(key_id.len())
+            .map_err(|_| HarvestError::Config(format!("codec key id {key_id:?} is too long")))?;
+        let mut header = Vec::with_capacity(2 + key_id.len());
+        header.push(AEAD_FORMAT_VERSION);
+        header.push(key_len);
+        header.extend_from_slice(key_id.as_bytes());
+        Ok(Self {
+            key_id: key_id.to_string(),
+            header,
+            cipher: Aes256Gcm::new(key.0.as_ref().into()),
+        })
     }
 
     /// Load the data key for `key_id` from `provider` and make a codec.
@@ -209,7 +230,9 @@ impl AeadCodec {
     /// [`HarvestError::Config`] when the provider fails or `key_id` is
     /// invalid.
     pub async fn load(provider: &dyn KeyProvider, key_id: &str) -> HarvestResult<Self> {
-        todo!()
+        validate_key_id(key_id)?;
+        let key = provider.data_key(key_id).await?;
+        Self::new(key_id, &key)
     }
 
     /// The codec key id that this codec writes into each header.
@@ -227,7 +250,8 @@ impl AeadCodec {
     ///
     /// As [`PayloadCodecs::register_key`].
     pub fn register_with(self, codecs: &PayloadCodecs) -> HarvestResult<()> {
-        todo!()
+        let key_id = self.key_id.clone();
+        codecs.register_key(&key_id, std::sync::Arc::new(self))
     }
 }
 
@@ -245,11 +269,87 @@ impl PayloadCodec for AeadCodec {
     }
 
     fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
-        todo!()
+        let mut nonce = [0u8; NONCE_BYTES];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut nonce)
+            .map_err(|_| CodecError("aes-256-gcm: the OS RNG is unavailable".to_string()))?;
+        let body_start = self.header.len() + NONCE_BYTES;
+        let mut out = Vec::with_capacity(body_start + raw.len() + TAG_BYTES);
+        out.extend_from_slice(&self.header);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(raw);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                &self.header,
+                &mut out[body_start..],
+            )
+            .map_err(|_| CodecError("aes-256-gcm: encryption failed".to_string()))?;
+        out.extend_from_slice(&tag);
+        Ok(out)
     }
 
     fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
-        todo!()
+        let truncated = || CodecError("aes-256-gcm: the payload is truncated".to_string());
+        let (&version, rest) = encoded.split_first().ok_or_else(truncated)?;
+        if version != AEAD_FORMAT_VERSION {
+            return Err(CodecError(format!(
+                "aes-256-gcm: format version {version} is not supported"
+            )));
+        }
+        let (&key_len, rest) = rest.split_first().ok_or_else(truncated)?;
+        let key_len = usize::from(key_len);
+        if rest.len() < key_len + NONCE_BYTES + TAG_BYTES {
+            return Err(truncated());
+        }
+        let (key_id, rest) = rest.split_at(key_len);
+        if key_id != self.key_id.as_bytes() {
+            return Err(key_id_mismatch(key_id, &self.key_id));
+        }
+        let (nonce, body) = rest.split_at(NONCE_BYTES);
+        let (ciphertext, tag) = body.split_at(body.len() - TAG_BYTES);
+        let mut plaintext = ciphertext.to_vec();
+        self.cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(nonce),
+                &encoded[..2 + key_len],
+                &mut plaintext,
+                Tag::from_slice(tag),
+            )
+            .map_err(|_| {
+                CodecError(
+                    "aes-256-gcm: authentication failed (wrong key or tampered ciphertext)"
+                        .to_string(),
+                )
+            })?;
+        Ok(plaintext)
+    }
+}
+
+/// The error for a header key id that differs from the codec key id.
+///
+/// The stored key id is not yet authenticated. It is printed only when it
+/// is a valid key id, so the message stays bounded and printable.
+fn key_id_mismatch(found: &[u8], expected: &str) -> CodecError {
+    let found = std::str::from_utf8(found)
+        .ok()
+        .filter(|id| validate_key_id(id).is_ok());
+    CodecError(match found {
+        Some(found) => format!(
+            "aes-256-gcm: the payload uses codec key id {found:?}, but this codec holds {expected:?}"
+        ),
+        None => format!(
+            "aes-256-gcm: the payload has an invalid key id; this codec holds {expected:?}"
+        ),
+    })
+}
+
+/// Map a [`DataKeyError`] to [`KeyProviderError::InvalidKey`].
+fn invalid_key(key_id: &str, err: DataKeyError) -> KeyProviderError {
+    KeyProviderError::InvalidKey {
+        key_id: key_id.to_string(),
+        reason: err.to_string(),
     }
 }
 
@@ -289,7 +389,23 @@ impl EnvKeyProvider {
 #[async_trait::async_trait]
 impl KeyProvider for EnvKeyProvider {
     async fn data_key(&self, key_id: &str) -> Result<DataKey, KeyProviderError> {
-        todo!()
+        let var = self
+            .vars
+            .get(key_id)
+            .ok_or_else(|| KeyProviderError::UnknownKey {
+                key_id: key_id.to_string(),
+            })?;
+        let value = (self.lookup)(var).ok_or_else(|| KeyProviderError::Unavailable {
+            key_id: key_id.to_string(),
+            reason: format!("environment variable {var} is not set"),
+        })?;
+        let value = Zeroizing::new(value.into_string().map_err(|_| {
+            KeyProviderError::InvalidKey {
+                key_id: key_id.to_string(),
+                reason: format!("environment variable {var} is not valid UTF-8"),
+            }
+        })?);
+        DataKey::from_base64(&value).map_err(|err| invalid_key(key_id, err))
     }
 }
 
@@ -313,7 +429,26 @@ impl FileKeyProvider {
 #[async_trait::async_trait]
 impl KeyProvider for FileKeyProvider {
     async fn data_key(&self, key_id: &str) -> Result<DataKey, KeyProviderError> {
-        todo!()
+        // An invalid key id names no key file. The id alphabet has no `/`.
+        validate_key_id(key_id).map_err(|_| KeyProviderError::UnknownKey {
+            key_id: key_id.to_string(),
+        })?;
+        let path = self.dir.join(format!("{key_id}.key"));
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => Zeroizing::new(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(KeyProviderError::UnknownKey {
+                    key_id: key_id.to_string(),
+                });
+            }
+            Err(err) => {
+                return Err(KeyProviderError::Unavailable {
+                    key_id: key_id.to_string(),
+                    reason: format!("cannot read {}: {}", path.display(), err.kind()),
+                });
+            }
+        };
+        DataKey::from_base64(&text).map_err(|err| invalid_key(key_id, err))
     }
 }
 
@@ -379,7 +514,52 @@ impl<D: KmsDecrypt> KmsKeyProvider<D> {
 #[async_trait::async_trait]
 impl<D: KmsDecrypt> KeyProvider for KmsKeyProvider<D> {
     async fn data_key(&self, key_id: &str) -> Result<DataKey, KeyProviderError> {
-        todo!()
+        let wrapped = self
+            .wrapped
+            .get(key_id)
+            .ok_or_else(|| KeyProviderError::UnknownKey {
+                key_id: key_id.to_string(),
+            })?;
+        let context = BTreeMap::from([(KMS_CONTEXT_KEY_ID.to_string(), key_id.to_string())]);
+        let plaintext = self
+            .kms
+            .decrypt(&self.kms_key_id, wrapped, &context)
+            .await
+            .map_err(|reason| KeyProviderError::Unavailable {
+                key_id: key_id.to_string(),
+                reason,
+            })?;
+        DataKey::from_bytes(&plaintext).map_err(|err| invalid_key(key_id, err))
+    }
+}
+
+/// AWS KMS binding for [`KmsKeyProvider`] (the `aws-kms` feature).
+///
+/// Build the client with `aws-config` as usual. `kms_key_id` is the KMS key
+/// id or ARN. KMS refuses a wrapped key made under another KMS key.
+#[cfg(feature = "aws-kms")]
+#[async_trait::async_trait]
+impl KmsDecrypt for aws_sdk_kms::Client {
+    async fn decrypt(
+        &self,
+        kms_key_id: &str,
+        wrapped: &[u8],
+        context: &BTreeMap<String, String>,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        let mut request = Self::decrypt(self)
+            .key_id(kms_key_id)
+            .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(wrapped));
+        for (key, value) in context {
+            request = request.encryption_context(key, value);
+        }
+        let output = request
+            .send()
+            .await
+            .map_err(|err| aws_sdk_kms::error::DisplayErrorContext(&err).to_string())?;
+        output
+            .plaintext
+            .map(|blob| Zeroizing::new(blob.into_inner()))
+            .ok_or_else(|| "KMS Decrypt returned no plaintext".to_string())
     }
 }
 

@@ -652,6 +652,93 @@ from the retention janitor and from PII erasure until released — see
 
 ---
 
+## Payload encryption at rest (issue #1825)
+
+By default, Harvest stores workflow payloads in `harvest_events` as plain
+JSON. A workflow that carries PII or secrets must encrypt them. Use
+`autumn_harvest::aead_codec::AeadCodec`.
+
+### What the codec does
+
+- It uses AES-256-GCM from the RustCrypto `aes-gcm` crate. Harvest implements
+  no cipher of its own.
+- Each encode reads a fresh 96-bit nonce from the operating system RNG.
+- Each payload starts with a header that holds the format version and the
+  key id. The header is AEAD associated data, so it is authenticated.
+- Decode fails for a wrong key, a changed byte, a changed header or a
+  truncated payload. It never returns wrong plaintext.
+- `DataKey` clears its bytes on drop. `Debug` output and error text never
+  hold key material or plaintext.
+
+### What the codec does not cover
+
+The codec encrypts the payload fields of `harvest_events.event_data` only:
+`input`, `output`, `payload`, `details`, `value` and
+`last_completion_result`. ADR-0003 keeps these columns in clear, so that
+operators can query them:
+
+- `harvest_workflow_executions.input`, `.output`, `.memo` and `.search_attrs`;
+- `harvest_task_queue.input`, `.output` and `.heartbeat_details`;
+- `harvest_signals.payload` and `harvest_dead_letters.input`;
+- other denormalized copies, for example schedule inputs and outbox rows.
+
+Event types, ids, timestamps and workflow names also stay in clear. Do not put
+PII in a memo, a search attribute, a workflow id or a workflow name. If these
+columns must not hold PII, encrypt the value in workflow code before Harvest
+sees it. Also use Postgres disk encryption.
+
+### Key providers
+
+Load each data key once, at startup, through a `KeyProvider`:
+
+| Provider | Key source |
+|----------|------------|
+| `EnvKeyProvider` | An environment variable that holds base64. |
+| `FileKeyProvider` | `<dir>/<key_id>.key` that holds base64, for example a secret volume. |
+| `KmsKeyProvider` | A wrapped data key that a KMS unwraps (envelope encryption). |
+
+The `aws-kms` feature implements `KmsDecrypt` for `aws_sdk_kms::Client`. To
+make a wrapped key, call `GenerateDataKey` with the codec key id as the
+encryption context:
+
+```sh
+aws kms generate-data-key --key-id "$KMS_KEY_ARN" --key-spec AES_256 \
+  --encryption-context harvest_codec_key_id=2026-10 \
+  --query CiphertextBlob --output text > 2026-10.wrapped.b64
+```
+
+Store the wrapped key. Never store the `Plaintext` field. KMS refuses to
+unwrap the key under another key id or another KMS key.
+
+```rust,ignore
+use autumn_harvest::aead_codec::{AeadCodec, KmsKeyProvider};
+
+let kms = aws_sdk_kms::Client::new(&aws_config::load_from_env().await);
+let keys = KmsKeyProvider::new(kms, kms_key_arn).with_wrapped_key("2026-10", wrapped);
+let harvest = HarvestBuilder::new()
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
+    .build()?;
+```
+
+Use `aead_payload_codec_key` from the first deployment. It writes the key id
+into each envelope, so a later rotation needs no `legacy` key.
+
+### Rotation and the nonce limit
+
+Random 96-bit nonces make a nonce collision likely after about 2^32 encodes
+under one key. Rotate each key well before that count. For example, rotate
+each quarter, or sooner on a high-volume deployment. Also rotate at once after
+a key leak.
+
+To rotate, load a codec for the new key id and register it. Activate it with
+`codec_rotation::activate_codec_key`. The issue #948 sweep then re-encrypts
+stored history under the new key. After the sweep, retire the old key. See
+[`operations/codec-key-rotation.md`](operations/codec-key-rotation.md).
+`replay_fidelity_is_byte_identical_across_a_sweep` proves that replay stays
+byte-identical across a sweep with this codec.
+
+---
+
 ## Production-readiness checklist
 
 Before deploying the Harvest management API to a production environment, verify
@@ -735,6 +822,12 @@ record. Without it, records default to `"anonymous"`.
 Authentication middleware applies uniformly across all shards because it wraps
 the router layer, not individual handlers. No extra configuration is needed for
 multi-shard deployments.
+
+### 6. Payloads that carry PII are encrypted
+
+If a workflow carries PII or secrets, register an `AeadCodec` with
+`aead_payload_codec_key`. Load the key from a `KeyProvider`, never from
+source code. Read [what the codec does not cover](#what-the-codec-does-not-cover).
 
 ---
 

@@ -94,13 +94,30 @@ use autumn_harvest::payload_codec::CODEC_LEGACY_KEY_ID;
 let harvest = HarvestBuilder::new()
     // Your existing codec, under the legacy key id, so already-stored
     // (kid-less) history keeps decoding.
-    .payload_codec_key(CODEC_LEGACY_KEY_ID, AesGcmCodec::new(old_key))
+    .payload_codec_key(CODEC_LEGACY_KEY_ID, MyOldCodec::new(old_key))
     // The incoming key.
-    .payload_codec_key("2026-q3", AesGcmCodec::new(new_key))
+    .payload_codec_key("2026-q3", MyNewCodec::new(new_key))
     // Flip: from here, every new write is encrypted under 2026-q3.
     .active_payload_codec_key("2026-q3")
     .build()?;
 ```
+
+With the built-in AES-256-GCM codec (issue #1825), load one `AeadCodec` per
+key id. `aead_payload_codec_key` registers each codec under its own key id:
+
+```rust
+use autumn_harvest::aead_codec::{AeadCodec, FileKeyProvider};
+
+let keys = FileKeyProvider::new("/run/secrets/harvest-codec");
+let harvest = HarvestBuilder::new()
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-q2").await?)
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-q3").await?)
+    .active_payload_codec_key("2026-q3")
+    .build()?;
+```
+
+See [`../security-posture.md`](../security-posture.md#payload-encryption-at-rest-issue-1825)
+for the key providers and the nonce limit.
 
 The registry's rotation state is **shared across clones**, so
 `PayloadCodecs::set_active_key` at runtime (a config reload) takes effect for

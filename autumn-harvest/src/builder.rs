@@ -1782,7 +1782,10 @@ impl HarvestBuilder {
     /// configuration bug that must not boot.
     #[must_use]
     pub fn aead_payload_codec_key(self, codec: crate::aead_codec::AeadCodec) -> Self {
-        todo!()
+        codec
+            .register_with(&self.payload_codecs)
+            .expect("invalid AEAD payload codec key");
+        self
     }
 
     /// Make an already-registered payload-codec key the **active** one — every
