@@ -377,6 +377,7 @@ async fn quarantine_writes_dlq_and_fails_execution() {
         task_id,
         Some(exec_id),
         "worker-1",
+        1,
         3,  // new_strikes (= threshold)
         10, // timeout_secs
         "timeout_wf",
@@ -417,6 +418,47 @@ async fn quarantine_writes_dlq_and_fails_execution() {
     );
 }
 
+/// A late quarantine does not touch a peer's claim (issue #1788).
+///
+/// The quarantine retries its acquire. In that time the stuck-running backstop
+/// can requeue the task, and a peer can claim it. The quarantine then must not
+/// fail the task, write a DLQ entry, or fail the execution that the peer runs.
+#[tokio::test]
+async fn quarantine_skips_a_task_that_a_peer_reclaimed() {
+    let (mut conn, pool, _container) = setup().await;
+
+    let exec_id = insert_running_workflow(&mut conn).await;
+    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET worker_id = 'worker-2', attempt = 2 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the peer's claim");
+
+    let metrics = RecordingMetrics::default();
+    let quarantined = quarantine_workflow_task_timeout(
+        &pool,
+        task_id,
+        Some(exec_id),
+        "worker-1",
+        1,
+        3,
+        10,
+        "timeout_wf",
+        "default",
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+
+    assert!(!quarantined, "a lost claim is not a committed quarantine");
+    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
+    assert_eq!(execution_state(&mut conn, exec_id).await, "RUNNING");
+    assert_eq!(dead_letter_count(&mut conn).await.expect("dlq count"), 0);
+}
+
 /// The DLQ entry carries a `WorkflowTaskTimeout` typed reason so operators
 /// can distinguish this from poison-pill quarantines.
 #[tokio::test]
@@ -432,6 +474,7 @@ async fn quarantine_writes_typed_dlq_reason() {
         task_id,
         Some(exec_id),
         "worker-1",
+        1,
         3,
         10,
         "timeout_wf",
@@ -486,6 +529,7 @@ async fn quarantine_with_no_exec_id_only_fails_task() {
         task_id,
         None, // no exec_id
         "worker-1",
+        1,
         3,
         10,
         "unknown",
@@ -551,6 +595,7 @@ async fn quarantine_does_not_overwrite_an_execution_that_already_completed() {
         task_id,
         Some(exec_id),
         "worker-1",
+        1,
         3,
         10,
         "timeout_wf",

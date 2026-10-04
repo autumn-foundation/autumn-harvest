@@ -6,8 +6,6 @@
 //! shared, so NATS, `RabbitMQ`, Pub/Sub and Kinesis adapters are follow-ups
 //! rather than rewrites.
 
-use async_trait::async_trait;
-
 use super::message::{InboundMessage, MessageHandle};
 
 /// Errors an event source can surface.
@@ -44,6 +42,10 @@ pub enum ConnectorError {
     },
 }
 
+/// The future that an [`EventSource`] or a dead-letter sink method returns.
+pub type ConnectorFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 /// A broker-agnostic pull-based message source.
 ///
 /// # Ack contract
@@ -64,9 +66,11 @@ pub enum ConnectorError {
 /// acknowledgement is a high-water mark (Kafka) must use
 /// [`super::disposition::OffsetTracker`] so a committed offset can never run
 /// ahead of an in-flight message.
-// `async_trait` adds its own `#[must_use]` to each method.
-#[allow(clippy::double_must_use)]
-#[async_trait]
+///
+/// Implement it with `#[async_trait]` on the `impl` block and `async fn`
+/// methods. The method signatures here are the ones that `#[async_trait]`
+/// generates. They are written out because `#[async_trait]` on the trait adds
+/// a `#[must_use]` that clippy rejects as `double_must_use`.
 pub trait EventSource: Send + Sync {
     /// The logical stream (topic or queue) this source consumes, matched
     /// against [`super::binding::SourceBinding::stream`].
@@ -81,11 +85,14 @@ pub trait EventSource: Send + Sync {
     ///
     /// Returns [`ConnectorError::Broker`] when the client fails, or
     /// [`ConnectorError::Closed`] once the source has shut down.
-    async fn receive(
-        &self,
+    fn receive<'life0, 'async_trait>(
+        &'life0 self,
         max: usize,
         timeout: std::time::Duration,
-    ) -> Result<Vec<InboundMessage>, ConnectorError>;
+    ) -> ConnectorFuture<'async_trait, Result<Vec<InboundMessage>, ConnectorError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait;
 
     /// Acknowledge a message: commit the offset, delete from the queue.
     ///
@@ -96,7 +103,14 @@ pub trait EventSource: Send + Sync {
     /// Returns [`ConnectorError::Broker`] when the acknowledgement fails. The
     /// runtime logs and continues — a failed ack is safe, because the message
     /// will simply be redelivered and dedupe as an idempotent replay.
-    async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError>;
+    fn ack<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        handle: &'life1 MessageHandle,
+    ) -> ConnectorFuture<'async_trait, Result<(), ConnectorError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Return a message to the broker for **retry** after a transient
     /// harvest-side failure.
@@ -114,7 +128,14 @@ pub trait EventSource: Send + Sync {
     /// Returns [`ConnectorError::Broker`] when the operation fails. Adapters
     /// with no explicit nack may implement this as a no-op: not acknowledging
     /// is already sufficient for redelivery.
-    async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError>;
+    fn abandon<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        handle: &'life1 MessageHandle,
+    ) -> ConnectorFuture<'async_trait, Result<(), ConnectorError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Return a **poison** message to the broker so its own dead-letter
     /// routing claims it.
@@ -134,8 +155,16 @@ pub trait EventSource: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ConnectorError::Broker`] when the operation fails.
-    async fn nack_for_dead_letter(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
-        self.abandon(handle).await
+    fn nack_for_dead_letter<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        handle: &'life1 MessageHandle,
+    ) -> ConnectorFuture<'async_trait, Result<(), ConnectorError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self.abandon(handle).await })
     }
 
     /// Commit a **high-water mark** for `partition`, asserting that everything
@@ -171,13 +200,23 @@ pub trait EventSource: Send + Sync {
     /// Returns [`ConnectorError::Broker`] when the commit fails. Like a failed
     /// ack this is safe: the messages below the mark are redelivered and dedupe
     /// as idempotent replays.
-    async fn commit_position(&self, partition: i32, position: i64) -> Result<(), ConnectorError> {
-        self.ack(&MessageHandle {
-            token: String::new(),
-            partition: Some(partition),
-            position: Some(position),
+    fn commit_position<'life0, 'async_trait>(
+        &'life0 self,
+        partition: i32,
+        position: i64,
+    ) -> ConnectorFuture<'async_trait, Result<(), ConnectorError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.ack(&MessageHandle {
+                token: String::new(),
+                partition: Some(partition),
+                position: Some(position),
+            })
+            .await
         })
-        .await
     }
 
     /// Current consumer lag, for adapters whose client exposes it.
@@ -196,8 +235,12 @@ pub trait EventSource: Send + Sync {
     /// so it never gives up first; an implementation that outruns the ceiling
     /// breaks the other half of the bargain, and abandoned samples accumulate
     /// against a broker that is already struggling.
-    async fn lag(&self) -> Option<i64> {
-        None
+    fn lag<'life0, 'async_trait>(&'life0 self) -> ConnectorFuture<'async_trait, Option<i64>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { None })
     }
 
     /// Rebuild this source's underlying client, so messages it has already
@@ -221,8 +264,14 @@ pub trait EventSource: Send + Sync {
     ///
     /// Returns [`ConnectorError::Config`] or [`ConnectorError::Broker`] when
     /// the rebuild itself fails.
-    async fn recover(&self) -> Result<bool, ConnectorError> {
-        Ok(false)
+    fn recover<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> ConnectorFuture<'async_trait, Result<bool, ConnectorError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(false) })
     }
 
     /// Whether [`Self::abandon`] actually causes the message to come back.
