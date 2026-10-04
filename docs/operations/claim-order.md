@@ -71,6 +71,10 @@ Now every claim skips a task of a `RUNNING` run that is past either
 deadline. The task stays `PENDING`. The claim spends no attempt, rate-limit
 token or concurrency slot on it, and takes the next eligible task instead.
 
+A claim can wait on a rate-limit bucket lock. It reads its clock after
+that wait and checks the run again, so a deadline that passes during the
+wait still stops the claim.
+
 The check skips a `PAUSED` run. A resume moves its deadline forward.
 
 The scanner then times out the run. It records `WorkflowExecutionTimedOut`

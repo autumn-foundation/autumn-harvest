@@ -944,6 +944,46 @@ macro_rules! expired_run_gate_sql {
     };
 }
 
+/// The run-deadline re-check after the bucket lock, for the single-row
+/// claim (issue #1824).
+///
+/// `rate_limit_debit` can wait on its bucket row lock. The run deadline can
+/// pass during that wait, and `NOW()` stays at the statement start. So
+/// `fresh_now` takes the bucket lock first and only then reads
+/// `clock_timestamp()`. The batched attempt uses the same order in its
+/// `now_ts` CTE. A task with no rate-limit debit takes no lock here.
+///
+/// `run_expired_now` checks the run of the candidate against that time. It
+/// reads the run row and takes no lock. Both `rate_limit_debit` and
+/// `claimed` require it to be false. So a run that expires during the wait
+/// gets no token and no claim.
+macro_rules! fresh_run_deadline_ctes_sql {
+    () => {
+        "fresh_now AS MATERIALIZED ( \
+             SELECT clock_timestamp() AS ts \
+             FROM (SELECT 1 AS one) base \
+             LEFT JOIN ( \
+                 SELECT 1 AS x FROM harvest_rate_limit_buckets b \
+                 JOIN candidate c ON b.key = c.rate_limit_key \
+                 WHERE NOT (c.activity_name = ANY($5)) \
+                 FOR UPDATE OF b \
+             ) locked ON TRUE \
+         ), \
+         run_expired_now AS MATERIALIZED ( \
+             SELECT EXISTS ( \
+                 SELECT 1 FROM candidate c \
+                 JOIN harvest_workflow_executions e ON e.id = c.workflow_exec_id \
+                 WHERE e.state = 'RUNNING' \
+                   AND (e.deadline_at < (SELECT ts FROM fresh_now) \
+                        OR e.chain_deadline_at < (SELECT ts FROM fresh_now)) \
+             ) AS expired \
+         )"
+    };
+}
+
+/// The `fresh_run_deadline_ctes_sql!` text as a value, for shape tests.
+pub const FRESH_RUN_DEADLINE_CTES_SQL: &str = fresh_run_deadline_ctes_sql!();
+
 /// The `expired_runs_cte_sql!` text as a value, for shape tests.
 pub const EXPIRED_RUNS_CTE_SQL: &str = expired_runs_cte_sql!();
 
@@ -1101,7 +1141,8 @@ pub const fn claim_task_query() -> &'static str {
         expired_runs_cte_sql!(),
         ", \
          candidate AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
+             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
+                    workflow_exec_id \
              FROM harvest_task_queue \
              CROSS JOIN worker_info \
              CROSS JOIN paused_queues \
@@ -1207,7 +1248,9 @@ pub const fn claim_task_query() -> &'static str {
         claim_order_due_sql!(),
         " ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
-        ), \
+        ), ",
+        fresh_run_deadline_ctes_sql!(),
+        ", \
         rate_limit_debit AS ( \
             UPDATE harvest_rate_limit_buckets b \
             SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) - 1.0, \
@@ -1215,6 +1258,7 @@ pub const fn claim_task_query() -> &'static str {
             FROM candidate \
             WHERE b.key = candidate.rate_limit_key \
               AND NOT (candidate.activity_name = ANY($5)) \
+              AND NOT (SELECT expired FROM run_expired_now) \
               AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
             RETURNING b.key AS debited_key \
         ), \
@@ -1245,6 +1289,7 @@ pub const fn claim_task_query() -> &'static str {
                   OR candidate.activity_name = ANY($5) \
                   OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = candidate.rate_limit_key) \
               ) \
+              AND NOT (SELECT expired FROM run_expired_now) \
             RETURNING harvest_task_queue.* \
         ) \
         SELECT * FROM claimed"
@@ -9046,6 +9091,46 @@ mod tests {
         assert!(
             sql.starts_with("WITH now_ts AS"),
             "now_ts stays the leading CTE"
+        );
+    }
+
+    /// The single-row claim re-checks the run deadline after the bucket lock,
+    /// and gates the debit and the claim on it (issue #1824).
+    #[test]
+    fn single_row_claim_rechecks_the_run_deadline_after_the_bucket_lock() {
+        let variants = [
+            claim_task_query(),
+            claim_task_query_fenced(),
+            claim_task_by_id_query(),
+            claim_task_by_id_query_fenced(),
+            claim_task_query_for_kind(TaskType::Workflow, false),
+            claim_task_query_for_kind(TaskType::Activity, true),
+        ];
+        for sql in variants {
+            assert_eq!(
+                sql.matches(FRESH_RUN_DEADLINE_CTES_SQL).count(),
+                1,
+                "got:\n{sql}"
+            );
+            assert_eq!(
+                sql.matches("AND NOT (SELECT expired FROM run_expired_now)")
+                    .count(),
+                2,
+                "the debit and the claim both read the re-check; got:\n{sql}"
+            );
+        }
+        let ctes = FRESH_RUN_DEADLINE_CTES_SQL;
+        let lock = ctes.find("FOR UPDATE OF b").expect("bucket lock");
+        let run = ctes.find("run_expired_now").expect("run check");
+        assert!(lock < run, "the clock is read after the lock");
+        assert!(
+            !ctes.contains("FOR KEY SHARE"),
+            "the run row is never locked"
+        );
+        assert_eq!(
+            ctes.matches("FOR UPDATE").count(),
+            1,
+            "only the bucket is locked"
         );
     }
 

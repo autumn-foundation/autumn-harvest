@@ -33,8 +33,14 @@ async fn connect(url: &str) -> AsyncPgConnection {
 }
 
 async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
+    let (conn, _url, container) = setup_db_with_url().await;
+    (conn, container)
+}
+
+/// [`setup_db`], plus the URL, for a test that needs a second connection.
+async fn setup_db_with_url() -> (AsyncPgConnection, String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        return (connect(&url).await, None);
+        return (connect(&url).await, url, None);
     }
     let container = Postgres::default()
         .with_tag("16")
@@ -48,7 +54,7 @@ async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migrations");
-    (conn, Some(container))
+    (conn, url, Some(container))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -469,5 +475,59 @@ async fn the_batched_attempt_rechecks_the_run_deadline() {
     assert!(
         (bucket_row.tokens - 1.0).abs() < f64::EPSILON,
         "the attempt spends no token"
+    );
+}
+
+/// A claim can wait on the rate-limit bucket lock. The run deadline can
+/// pass during that wait. The claim reads its clock after the lock, so it
+/// neither claims the task nor spends the token.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deadline_that_passes_during_the_bucket_lock_wait_stops_the_claim() {
+    let (mut conn, url, _container) = setup_db_with_url().await;
+    let queue = unique("dl-wait");
+    let bucket = unique("dl-bucket-w");
+    queue::ensure_rate_limit_bucket(&mut conn, &bucket, 0.0, 1.0)
+        .await
+        .expect("bucket");
+    let task = rate_limited(&mut conn, &queue, &bucket, Deadline::Run(2), false).await;
+
+    let mut holder = connect(&url).await;
+    holder
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin lock holder");
+    diesel::sql_query("SELECT 1 FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Text, _>(&bucket)
+        .execute(&mut holder)
+        .await
+        .expect("hold the bucket lock");
+
+    let claim_url = url.clone();
+    let claim_queue = queue.clone();
+    let claimer = tokio::spawn(async move {
+        let mut claim_conn = connect(&claim_url).await;
+        claim_one(&mut claim_conn, &claim_queue, &unique("w")).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(!claimer.is_finished(), "the claim waits on the bucket lock");
+    holder.batch_execute("COMMIT").await.expect("release");
+
+    assert_eq!(claimer.await.expect("claimer"), None);
+    assert_skipped(&mut conn, task).await;
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    let bucket_row: Tokens =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&bucket)
+            .get_result(&mut conn)
+            .await
+            .expect("bucket row");
+    assert!(
+        (bucket_row.tokens - 1.0).abs() < f64::EPSILON,
+        "the claim spends no token"
     );
 }
