@@ -1012,18 +1012,12 @@ fn quoted(chars: &[char], from: usize, quote: char) -> (String, usize) {
 ///
 /// The clause is consumed only when it is there.
 fn uescape(chars: &[char], i: &mut usize, line: &mut usize) -> Option<char> {
-    let mut j = *i;
-    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-        j += 1;
-    }
+    let mut j = skip_blank(chars, *i);
     let word: String = chars.get(j..j + 7)?.iter().collect();
     if !word.eq_ignore_ascii_case("uescape") {
         return None;
     }
-    j += 7;
-    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-        j += 1;
-    }
+    j = skip_blank(chars, j + 7);
     let (Some('\''), Some(&escape), Some('\'')) =
         (chars.get(j), chars.get(j + 1), chars.get(j + 2))
     else {
@@ -1032,6 +1026,40 @@ fn uescape(chars: &[char], i: &mut usize, line: &mut usize) -> Option<char> {
     *line += chars[*i..j].iter().filter(|c| **c == '\n').count();
     *i = j + 3;
     Some(escape)
+}
+
+/// The index of the first character at or after `i` that is not whitespace
+/// or a comment. Postgres reads a comment as whitespace. A `/* */` comment
+/// may nest.
+fn skip_blank(chars: &[char], mut i: usize) -> usize {
+    loop {
+        match (chars.get(i), chars.get(i + 1)) {
+            (Some(c), _) if c.is_whitespace() => i += 1,
+            (Some('-'), Some('-')) => {
+                while chars.get(i).is_some_and(|c| *c != '\n') {
+                    i += 1;
+                }
+            }
+            (Some('/'), Some('*')) => {
+                let mut depth = 0_usize;
+                while i < chars.len() {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            _ => return i,
+        }
+    }
 }
 
 /// Decode the `\XXXX` and `\+XXXXXX` escapes of a `U&` token.
@@ -1706,7 +1734,7 @@ fn foreign_do_bodies(
     body_timeouts: &mut Vec<(usize, Timeout)>,
 ) {
     for k in (0..s.toks.len()).filter(|&k| s.starts[k] == k && s.keyword(k, "do")) {
-        if language(s, k).is_none_or(|l| l.eq_ignore_ascii_case("plpgsql")) {
+        if language(s, k).is_none_or(|l| l == "plpgsql") {
             continue;
         }
         let end = s.end(k);
@@ -1727,6 +1755,9 @@ fn foreign_do_bodies(
 }
 
 /// The `LANGUAGE` clause of the statement that starts at `k`, if any.
+///
+/// The lexer folds an unquoted name to lower case. A quoted name keeps its
+/// case, so `"PLPGSQL"` names another language.
 fn language<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
     let depth = s.toks[k].depth;
     (k..s.end(k))
@@ -1788,9 +1819,7 @@ fn call_clears(
         .filter_map(|k| {
             let (name, open) = s.qualified_name(routine_keyword(s, k)? + 1)?;
             let arity = arity(s, open);
-            let foreign = language(s, k).is_some_and(|l| {
-                !l.eq_ignore_ascii_case("plpgsql") && !l.eq_ignore_ascii_case("sql")
-            });
+            let foreign = language(s, k).is_some_and(|l| l != "plpgsql" && l != "sql");
             Some(Routine {
                 name,
                 arity,
@@ -5312,6 +5341,38 @@ fn an_execute_in_a_branch_sets_no_bound() {
     // An unconditional EXECUTE still sets the bound.
     let sql = format!("DO $$\nBEGIN\n    {set}\nEND $$;\n{lock}");
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_quoted_language_name_keeps_its_case() {
+    let body = "$$ BEGIN NULL; END $$";
+    // A quoted name is not folded, so `"PLPGSQL"` is another language.
+    let sql = format!("DO LANGUAGE \"PLPGSQL\" {body};");
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    let sql = "CREATE FUNCTION f() RETURNS int LANGUAGE \"SQL\" AS $$ SELECT 1 $$;\nSELECT f();";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    // An unquoted name is folded, so `PLPGSQL` is PL/pgSQL.
+    let sql = format!("DO LANGUAGE PLPGSQL {body};");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_uescape_clause_follows_a_comment() {
+    for gap in [
+        "/* gap */ UESCAPE '!'",
+        "-- gap\n UESCAPE '!'",
+        "UESCAPE /* gap */ '!'",
+    ] {
+        let sql = format!("ALTER TABLE U&\"harvest_!0065vents\" {gap} ADD COLUMN x INT;");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        assert!(
+            findings[0].detail.contains("harvest_events"),
+            "{findings:?}"
+        );
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
