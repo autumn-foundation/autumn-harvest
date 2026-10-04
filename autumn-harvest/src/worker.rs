@@ -15651,7 +15651,7 @@ async fn process_activity_task(
                 }
                 // Issue #1815: a deferral that failed to persist is a failed
                 // setup write. A persisted or lease-lost deferral is skipped.
-                return count_setup_failure(task_outcomes, deferred).map(|_| ());
+                return count_setup_failure(task_outcomes, outlier_clock, deferred).map(|_| ());
             }
         }
     }
@@ -15672,10 +15672,12 @@ async fn process_activity_task(
     {
         let mut conn = count_setup_failure(
             task_outcomes,
+            outlier_clock,
             pool.get().await.map_err(crate::error::database_error),
         )?;
         if !count_setup_failure(
             task_outcomes,
+            outlier_clock,
             queue::try_consume_rate_limit_token(&mut conn, key).await,
         )? {
             // No token available (bucket empty, or fail-closed when the bucket
@@ -15713,6 +15715,7 @@ async fn process_activity_task(
             // setup write (issue #1815).
             let deferred = count_setup_failure(
                 task_outcomes,
+                outlier_clock,
                 queue::defer_claimed_rate_limited_task(
                     &mut conn,
                     &claim_of_task(task)?,
@@ -15736,6 +15739,7 @@ async fn process_activity_task(
     let started = {
         let mut conn = count_setup_failure(
             task_outcomes,
+            outlier_clock,
             pool.get().await.map_err(crate::error::database_error),
         )?;
         let started_result = append_activity_started_if_pending(
@@ -15749,6 +15753,7 @@ async fn process_activity_task(
         .await;
         let Some(started) = count_setup_failure(
             task_outcomes,
+            outlier_clock,
             fail_execution_on_error(
                 &mut conn,
                 task,
@@ -16423,16 +16428,18 @@ async fn process_activity_task(
 ///
 /// A setup step that loses its database write is a failed attempt, as a lost
 /// finalization is. A capability miss is a release, so it is not counted.
-/// The handler did not run, so the sample has no latency.
+/// The sample keeps the time since `started`, so a slow failing setup shows
+/// in the p99.
 fn count_setup_failure<T>(
     window: &crate::worker_outlier::TaskOutcomeWindow,
+    started: std::time::Instant,
     result: HarvestResult<T>,
 ) -> HarvestResult<T> {
     if let Err(error) = &result
         && error.handler_not_registered().is_none()
         && error.terminal_write_claim_ambiguous().is_none()
     {
-        window.record(true, Duration::ZERO);
+        window.record(true, started.elapsed());
     }
     result
 }
@@ -40280,16 +40287,16 @@ mod tests {
     #[test]
     fn a_failed_activity_setup_counts_but_a_capability_miss_does_not() {
         let window = crate::worker_outlier::TaskOutcomeWindow::default();
-        assert!(count_setup_failure(&window, Ok(())).is_ok());
+        assert!(count_setup_failure(&window, std::time::Instant::now(), Ok(())).is_ok());
         let miss: HarvestResult<()> = Err(HarvestError::HandlerNotRegistered {
             kind: "activity",
             name: "missing".to_owned(),
             phase: CapabilityMissPhase::BeforeHandler,
         });
-        assert!(count_setup_failure(&window, miss).is_err());
+        assert!(count_setup_failure(&window, std::time::Instant::now(), miss).is_err());
         assert_eq!(window.snapshot().tasks, 0, "a capability miss is a release");
         let lost: HarvestResult<()> = Err(crate::error::database_error("pool closed"));
-        assert!(count_setup_failure(&window, lost).is_err());
+        assert!(count_setup_failure(&window, std::time::Instant::now(), lost).is_err());
         let snap = window.snapshot();
         assert_eq!(
             (snap.tasks, snap.failures),
@@ -40299,12 +40306,26 @@ mod tests {
         let ambiguous: HarvestResult<()> = Err(HarvestError::TerminalWriteClaimAmbiguous {
             task_id: uuid::Uuid::nil(),
         });
-        assert!(count_setup_failure(&window, ambiguous).is_err());
+        assert!(count_setup_failure(&window, std::time::Instant::now(), ambiguous).is_err());
         assert_eq!(
             window.snapshot().tasks,
             1,
             "an ambiguous claim is released, so it is skipped"
         );
+    }
+
+    /// Issue #1815: a setup failure keeps the time the attempt spent before it
+    /// failed, so a slow failing setup shows in the p99.
+    #[test]
+    fn a_failed_setup_keeps_its_elapsed_time() {
+        let window = crate::worker_outlier::TaskOutcomeWindow::default();
+        let started = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("the clock is past two seconds");
+        let lost: HarvestResult<()> = Err(crate::error::database_error("pool timeout"));
+        assert!(count_setup_failure(&window, started, lost).is_err());
+        let p99 = window.snapshot().p99_latency_ms.expect("one sample");
+        assert!(p99 >= 2_000, "the sample keeps its 2 s: {p99} ms");
     }
 
     /// Issue #1815: a finalize that cannot confirm its claim is released, so
