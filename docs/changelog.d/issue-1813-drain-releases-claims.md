@@ -20,7 +20,9 @@ the drain. Now:
   counters. The worker also refunds a claim-time rate-limit debit.
 - One join window before the deadline, the drain cancels running
   activities. The join window is `cancellation_grace_period`, capped at half
-  the drain. A later remote deadline cannot undo the cancel.
+  the drain. A later remote deadline cannot undo the cancel. An activity
+  whose setup ends after the cancel never starts its handler. It goes back
+  at once, whatever its retry policy says.
 - The drain cancels the activity context only. The heartbeat flusher runs
   until the handler returns. The cancel stops the handler's own heartbeats,
   so the worker then re-sends the last checkpoint at

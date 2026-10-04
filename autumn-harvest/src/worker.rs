@@ -15708,6 +15708,10 @@ async fn defer_retry_for_budget(
 /// attempt (issue #1813). `ActivityContext::previous_failure` reports it.
 const WORKER_SHUTDOWN_ERROR: &str = "worker shutdown";
 
+/// The handler error of an attempt that the drain cancelled before its
+/// first poll (issue #1813).
+const DRAIN_BEFORE_START_ERROR: &str = "the handler never started";
+
 /// Requeue an activity whose handler the drain cancelled and joined (issue
 /// #1813).
 ///
@@ -15748,6 +15752,9 @@ struct ActivityRun {
     result: Result<serde_json::Value, String>,
     /// The drain cancelled the handler, and the handler then returned.
     drained: bool,
+    /// The handler was polled. It is `false` when the drain cancel came
+    /// before the first poll, so the handler never ran.
+    started: bool,
 }
 
 /// Give a handler whose claim is no longer current its grace period to
@@ -15809,10 +15816,21 @@ async fn execute_activity_future_with_cancellation(
             &cancel,
         )
     };
+    // The setup can outlast the join window. A handler that reaches this
+    // point after the drain cancel never starts. It then cannot begin a new
+    // side effect after the cancel point (issue #1813).
+    if drain_cancel.is_cancelled() {
+        cancel.cancel();
+        return ActivityRun {
+            result: Err(DRAIN_BEFORE_START_ERROR.to_string()),
+            drained: true,
+            started: false,
+        };
+    }
     async {
         tokio::select! {
             biased;
-            result = &mut *activity_future => ActivityRun { result, drained: false },
+            result = &mut *activity_future => ActivityRun { result, drained: false, started: true },
             () = drain_cancel.cancelled() => {
                 cancel.cancel();
                 tracing::info!(
@@ -15827,17 +15845,19 @@ async fn execute_activity_future_with_cancellation(
                 tokio::pin!(keep_alive);
                 tokio::select! {
                     biased;
-                    result = &mut *activity_future => ActivityRun { result, drained: true },
+                    result = &mut *activity_future => ActivityRun { result, drained: true, started: true },
                     never = &mut keep_alive => match never {},
                     () = &mut cancellation_observer => ActivityRun {
                         result: unwind(activity_future).await,
                         drained: false,
+                        started: true,
                     },
                 }
             }
             () = &mut cancellation_observer => ActivityRun {
                 result: unwind(activity_future).await,
                 drained: false,
+                started: true,
             },
         }
     }
@@ -17240,6 +17260,7 @@ async fn process_activity_task(
     let ActivityRun {
         result: activity_result,
         drained,
+        started,
     } = execute_activity_future_with_cancellation(
         activity_name,
         task.id,
@@ -17454,10 +17475,11 @@ async fn process_activity_task(
     // The drain cancelled the handler, and it returned a retryable error.
     // The handler is gone, so no peer can run beside it. Give the claim back
     // for an immediate retry (issue #1813). A non-retryable error takes the
-    // normal path below.
+    // normal path below. A handler that never started always goes back: a
+    // retry policy must not fail an activity that never ran.
     if drained
         && let Err(payload) = &activity_result
-        && !failure_is_non_retryable(payload, retry_policy.as_ref())
+        && (!started || !failure_is_non_retryable(payload, retry_policy.as_ref()))
     {
         let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
         return release_drained_activity(
@@ -38489,6 +38511,44 @@ mod tests {
         let (live, ended) = snapshot();
         assert!(live.is_empty());
         assert_eq!(ended.into_iter().collect::<Vec<_>>(), vec![(task, 2, at)]);
+    }
+
+    /// A handler that reaches dispatch after the drain cancel never starts
+    /// (issue #1813). It cannot begin a new side effect after the cancel
+    /// point.
+    #[tokio::test]
+    async fn an_activity_after_the_drain_cancel_never_starts() {
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&polled);
+        let mut handler = Box::pin(async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok(serde_json::Value::Null)
+        });
+        let cancel = CancellationToken::new();
+        let drain_cancel = CancellationToken::new();
+        drain_cancel.cancel();
+        let run = execute_activity_future_with_cancellation(
+            "act",
+            uuid::Uuid::new_v4(),
+            Duration::from_secs(1),
+            &mut handler,
+            std::future::pending::<()>(),
+            cancel.clone(),
+            &drain_cancel,
+            std::future::pending::<std::convert::Infallible>(),
+            tracing::Span::none(),
+        )
+        .await;
+        assert!(
+            !std::sync::atomic::AtomicBool::load(&polled, Ordering::SeqCst),
+            "the handler is never polled"
+        );
+        assert!(cancel.is_cancelled(), "the context reads as cancelled");
+        assert!(
+            run.drained && !run.started,
+            "the run is drained, not started"
+        );
+        assert!(run.result.is_err(), "the attempt ends with an error");
     }
 
     /// A claim that the drain released never joins the ended set (issue
