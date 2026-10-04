@@ -1423,7 +1423,7 @@ impl<'a> Stmts<'a> {
             || (k == start + 3
                 && self.is(start + 1, "pg_catalog")
                 && self.is_punct(start + 2, '.'));
-        if !named || !(self.is(start, "select") || self.is(start, "perform")) {
+        if !named || !(self.keyword(start, "select") || self.keyword(start, "perform")) {
             return false;
         }
         let mut parens = 0_usize;
@@ -1549,18 +1549,20 @@ impl<'a> Stmts<'a> {
     /// The table a `CREATE TABLE` or `ALTER TABLE` statement at `start` names.
     fn statement_table(&self, start: usize) -> Option<String> {
         let mut j = start + 1;
-        if self.is(start, "create") {
-            if self.is(j, "global") || self.is(j, "local") {
+        if self.keyword(start, "create") {
+            if self.keyword(j, "global") || self.keyword(j, "local") {
                 j += 1;
             }
             if ["temp", "temporary", "unlogged"]
                 .iter()
-                .any(|w| self.is(j, w))
+                .any(|w| self.keyword(j, w))
             {
                 j += 1;
             }
         }
-        if !(self.is(start, "create") || self.is(start, "alter")) || !self.is(j, "table") {
+        if !(self.keyword(start, "create") || self.keyword(start, "alter"))
+            || !self.keyword(j, "table")
+        {
             return None;
         }
         let mut j = self.skip_if_exists(j + 1);
@@ -1578,7 +1580,7 @@ fn moved_index_key(s: &Stmts, at: usize, index: &str) -> Option<String> {
     if let Some(j) = (at..end).find(|&j| s.keyword(j, "rename") && s.keyword(j + 1, "to")) {
         return Some(index_key(index, s.word(j + 2)?));
     }
-    let j = (at..end).find(|&j| s.is(j, "set") && s.is(j + 1, "schema"))?;
+    let j = (at..end).find(|&j| s.keyword(j, "set") && s.keyword(j + 1, "schema"))?;
     Some(format!("{}.{}", s.word(j + 2)?, base(index)))
 }
 
@@ -1705,13 +1707,13 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             }
             Some("reindex") if start => raws.extend(reindex(&s, k)),
             Some("references") => raws.extend(references(&s, k, history)),
-            Some("partition") if s.is(k + 1, "of") => {
+            Some("partition") if s.keyword(k + 1, "of") => {
                 let parent = s.qualified_name(k + 2).map(|(t, _)| t);
                 let child = s.statement_table(s.starts[k]);
                 learn_partition(history, parent.as_deref(), child.as_deref());
                 raws.push(Raw::lock(s.starts[k], "PARTITION OF", parent));
             }
-            Some("attach") if s.is(k + 1, "partition") => {
+            Some("attach") if s.keyword(k + 1, "partition") => {
                 let parent = s.statement_table(s.starts[k]);
                 let child = s.qualified_name(k + 2).map(|(t, _)| t);
                 learn_partition(history, parent.as_deref(), child.as_deref());
@@ -1968,21 +1970,21 @@ fn conforming_change(s: &Stmts, k: usize) -> Option<(bool, bool)> {
     let on = |j: usize| literal(j).is_some_and(pg_true);
     let start = s.starts[k] == k;
     if start && s.keyword(k, "reset") {
-        let resets = s.is(k + 1, "standard_conforming_strings") || s.is(k + 1, "all");
+        let resets = s.is(k + 1, "standard_conforming_strings") || s.keyword(k + 1, "all");
         return resets.then_some((true, false));
     }
     if start && s.keyword(k, "set") {
-        let name = if s.is(k + 1, "local") || s.is(k + 1, "session") {
+        let name = if s.keyword(k + 1, "local") || s.keyword(k + 1, "session") {
             k + 2
         } else {
             k + 1
         };
-        let value = if s.is_punct(name + 1, '=') || s.is(name + 1, "to") {
+        let value = if s.is_punct(name + 1, '=') || s.keyword(name + 1, "to") {
             name + 2
         } else {
             name + 1
         };
-        let local = s.is(k + 1, "local");
+        let local = s.keyword(k + 1, "local");
         return s
             .is(name, "standard_conforming_strings")
             .then(|| (on(value), local))
@@ -2019,10 +2021,10 @@ fn routine_resets(s: &Stmts, raws: &mut Vec<Raw>) {
         let drops = (k..s.end(k))
             .filter(|&j| s.toks[j].depth == depth)
             .any(|j| {
-                let reset =
-                    s.keyword(j, "reset") && (s.is(j + 1, "lock_timeout") || s.is(j + 1, "all"));
+                let reset = s.keyword(j, "reset")
+                    && (s.is(j + 1, "lock_timeout") || s.keyword(j + 1, "all"));
                 let set = s.keyword(j, "set") && s.is(j + 1, "lock_timeout") && {
-                    let value = if s.is_punct(j + 2, '=') || s.is(j + 2, "to") {
+                    let value = if s.is_punct(j + 2, '=') || s.keyword(j + 2, "to") {
                         j + 3
                     } else {
                         j + 2
@@ -2042,15 +2044,15 @@ const FOREIGN_CODE: &str = "code in another language";
 
 /// The index of `FUNCTION` or `PROCEDURE` when a routine `CREATE` starts at `k`.
 fn routine_keyword(s: &Stmts, k: usize) -> Option<usize> {
-    if s.starts[k] != k || !s.is(k, "create") {
+    if s.starts[k] != k || !s.keyword(k, "create") {
         return None;
     }
-    let j = if s.is(k + 1, "or") && s.is(k + 2, "replace") {
+    let j = if s.keyword(k + 1, "or") && s.keyword(k + 2, "replace") {
         k + 3
     } else {
         k + 1
     };
-    (s.is(j, "function") || s.is(j, "procedure")).then_some(j)
+    (s.keyword(j, "function") || s.keyword(j, "procedure")).then_some(j)
 }
 
 /// One routine call, or one routine that this file creates.
@@ -2297,7 +2299,7 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
     let not_a_call = first > 0
         && ["function", "procedure", "routine", "call"]
             .iter()
-            .any(|w| s.is(first - 1, w));
+            .any(|w| s.keyword(first - 1, w));
     let name = schema.map_or_else(|| callee.to_string(), |schema| format!("{schema}.{callee}"));
     let arity = arity(s, k + 1);
     (!not_a_call).then_some(Routine {
@@ -2363,24 +2365,25 @@ fn new_table_spans(
         .chain(inherited.into_iter().flatten().map(String::as_str))
         .collect();
     for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
-        let commit = s.is(k, "commit") || (s.is(k, "end") && toks[k].depth == 0);
+        let commit = s.keyword(k, "commit") || (s.keyword(k, "end") && toks[k].depth == 0);
         // `DROP SCHEMA` or `DROP OWNED` may drop any new table. The lint does
         // not track schemas or owners, so it ends every range.
-        let drops_any = s.is(k, "drop") && (s.is(k + 1, "schema") || s.is(k + 1, "owned"));
+        let drops_any =
+            s.keyword(k, "drop") && (s.keyword(k + 1, "schema") || s.keyword(k + 1, "owned"));
         // After a commit, other sessions can see and lock the new table. A
         // call or unreadable code may drop or rename it.
         let opaque = calls_or_hides(s, k, &bases);
-        if s.is(k, "rollback") || s.is(k, "abort") || drops_any || commit || opaque {
+        if s.keyword(k, "rollback") || s.keyword(k, "abort") || drops_any || commit || opaque {
             ends.push((SpanEnd::All, k));
-        } else if s.is(k, "drop") && s.is(k + 1, "table") {
+        } else if s.keyword(k, "drop") && s.keyword(k + 1, "table") {
             for name in s.name_list(s.skip_if_exists(k + 2)) {
                 ends.push((SpanEnd::Name(name), k));
             }
-        } else if s.is(k, "alter") && s.has_pair(k, "set", "schema") {
+        } else if s.keyword(k, "alter") && s.has_pair(k, "set", "schema") {
             // The new table moves away, so the name can mean the hot table.
             let end = s.statement_table(k).map_or(SpanEnd::All, SpanEnd::Name);
             ends.push((end, k));
-        } else if s.is(k, "alter") && s.has_pair(k, "rename", "to") {
+        } else if s.keyword(k, "alter") && s.has_pair(k, "rename", "to") {
             // A rename of anything but a table, such as a schema, may move
             // every new table.
             let end = s.statement_table(k).map_or(SpanEnd::All, SpanEnd::Name);
@@ -2440,10 +2443,10 @@ impl SpanEnd {
 /// `SET`, `RESET` and a `set_config` call count, wherever they sit.
 fn changes_search_path(s: &Stmts, k: usize) -> bool {
     // `SET SCHEMA` is an alias of `SET search_path`.
-    let scope = usize::from(s.is(k + 1, "local") || s.is(k + 1, "session"));
-    let set =
-        s.is(k, "set") && (s.is(k + 1 + scope, "search_path") || s.is(k + 1 + scope, "schema"));
-    let reset = s.is(k, "reset") && (s.is(k + 1, "search_path") || s.is(k + 1, "all"));
+    let scope = usize::from(s.keyword(k + 1, "local") || s.keyword(k + 1, "session"));
+    let set = s.keyword(k, "set")
+        && (s.is(k + 1 + scope, "search_path") || s.keyword(k + 1 + scope, "schema"));
+    let reset = s.keyword(k, "reset") && (s.is(k + 1, "search_path") || s.keyword(k + 1, "all"));
     // A call counts when it names `search_path`, or when its name is not one
     // plain literal, which may be `search_path` too.
     let call = (k..s.end(k)).any(|j| {
@@ -2699,15 +2702,15 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
     match s.word(k)? {
         "set" if start => {
             let mut j = k + 1;
-            let local = s.is(j, "local");
-            if local || s.is(j, "session") {
+            let local = s.keyword(j, "local");
+            if local || s.keyword(j, "session") {
                 j += 1;
             }
             if !s.is(j, "lock_timeout") {
                 return None;
             }
             j += 1;
-            if s.is_punct(j, '=') || s.is(j, "to") {
+            if s.is_punct(j, '=') || s.keyword(j, "to") {
                 j += 1;
             }
             Some(Timeout::Set {
@@ -2715,7 +2718,7 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
                 local,
             })
         }
-        "reset" if start && (s.is(k + 1, "lock_timeout") || s.is(k + 1, "all")) => {
+        "reset" if start && (s.is(k + 1, "lock_timeout") || s.keyword(k + 1, "all")) => {
             Some(Timeout::Set {
                 bounds: false,
                 local: false,
@@ -2728,7 +2731,7 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
         "rollback" | "abort" if start => {
             // `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] s` restores the value
             // from the savepoint, which the lint does not track.
-            if (k + 1..=k + 2).any(|j| s.is(j, "to")) {
+            if (k + 1..=k + 2).any(|j| s.keyword(j, "to")) {
                 Some(Timeout::RollbackToSavepoint)
             } else {
                 Some(Timeout::Rollback)
@@ -2842,17 +2845,17 @@ fn pg_false(value: &str) -> bool {
 /// `CREATE INDEX`, `CREATE TABLE`, and the trigger, rule and policy forms.
 fn create(s: &Stmts, k: usize, raws: &mut Vec<Raw>, created: &mut BTreeMap<String, usize>) {
     let mut j = k + 1;
-    if s.is(j, "or") && s.is(j + 1, "replace") {
+    if s.keyword(j, "or") && s.keyword(j + 1, "replace") {
         j += 2;
     }
-    if s.is(j, "unique") {
+    if s.keyword(j, "unique") {
         j += 1;
     }
-    if s.is(j, "index") {
+    if s.keyword(j, "index") {
         raws.extend(create_index(s, k, j + 1));
         return;
     }
-    if s.is(j, "constraint") {
+    if s.keyword(j, "constraint") {
         j += 1;
     }
     let target = match s.word(j) {
@@ -2867,7 +2870,7 @@ fn create(s: &Stmts, k: usize, raws: &mut Vec<Raw>, created: &mut BTreeMap<Strin
     }
     // A temporary table never counts. `ON COMMIT DROP` or the session end
     // drops it, and the name then means the hot table again.
-    let temporary = (k + 1..=k + 2).any(|j| s.is(j, "temp") || s.is(j, "temporary"));
+    let temporary = (k + 1..=k + 2).any(|j| s.keyword(j, "temp") || s.keyword(j, "temporary"));
     if let Some(table) = s.statement_table(k) {
         let guarded = s.has_pair(k, "not", "exists");
         if !guarded && !temporary {
@@ -2931,12 +2934,12 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                 raws.push(Raw::lock(k, "DROP TABLE", Some(table)));
             }
             // CASCADE also drops the foreign keys of every referencing table.
-            if (k..s.end(k)).any(|j| s.is(j, "cascade")) {
+            if (k..s.end(k)).any(|j| s.keyword(j, "cascade")) {
                 raws.push(Raw::lock(k, "DROP TABLE ... CASCADE", None));
             }
         }
         // Each drops every table it reaches, hot ones included.
-        Some("schema") if (k..s.end(k)).any(|j| s.is(j, "cascade")) => {
+        Some("schema") if (k..s.end(k)).any(|j| s.keyword(j, "cascade")) => {
             raws.push(Raw::lock(k, "DROP SCHEMA ... CASCADE", None));
         }
         Some("owned") => raws.push(Raw::lock(k, "DROP OWNED", None)),
@@ -2947,7 +2950,7 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
     }
     // Any other CASCADE may drop a column, default or trigger on a hot table,
     // as `DROP TYPE ... CASCADE` does.
-    let cascade = (k..s.end(k)).any(|j| s.is(j, "cascade"));
+    let cascade = (k..s.end(k)).any(|j| s.keyword(j, "cascade"));
     if cascade && !matches!(s.word(k + 1), Some("table" | "schema" | "owned")) {
         raws.push(Raw::lock(k, "DROP ... CASCADE", None));
     }
@@ -2959,7 +2962,7 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
 /// The old name keeps them too. Remembering a key that moved fails closed.
 fn rename(s: &Stmts, k: usize, history: &mut History) {
     let start = s.starts[k];
-    if !(s.is(start, "alter") && s.is(start + 1, "table")) {
+    if !(s.keyword(start, "alter") && s.keyword(start + 1, "table")) {
         return;
     }
     let (Some(old), Some((new, _))) = (s.statement_table(start), s.qualified_name(k + 2)) else {
@@ -3002,9 +3005,11 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
 fn drops_dependents(s: &Stmts, k: usize) -> bool {
     const KEEPS_KEYS: [&str; 4] = ["default", "not", "identity", "expression"];
     (k..s.end(k)).any(|j| {
-        let drops = s.is(j, "drop") && !KEEPS_KEYS.iter().any(|w| s.is(j + 1, w));
-        let retypes = s.is(j, "type")
-            && (s.is(j - 1, "data") || s.is(j - 2, "column") || s.is(j - 2, "alter"));
+        let drops = s.keyword(j, "drop") && !KEEPS_KEYS.iter().any(|w| s.keyword(j + 1, w));
+        let retypes = s.keyword(j, "type")
+            && (s.keyword(j - 1, "data")
+                || s.keyword(j - 2, "column")
+                || s.keyword(j - 2, "alter"));
         drops || retypes
     })
 }
@@ -3034,7 +3039,7 @@ fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     } else {
         after_literal.or(Some(end))
     };
-    let tail_ok = rest.is_some_and(|j| j >= end || s.is(j, "into") || s.is(j, "using"));
+    let tail_ok = rest.is_some_and(|j| j >= end || s.keyword(j, "into") || s.keyword(j, "using"));
     let text_placeholder = (k + 1..end).any(|j| toks[j].depth > depth && s.is(j, "%s"));
     (!constant || !tail_ok || text_placeholder).then(|| Raw::lock(k, UNREADABLE_EXECUTE, None))
 }
@@ -3118,7 +3123,7 @@ fn lock_or_truncate(s: &Stmts, k: usize) -> Vec<Raw> {
     } else {
         k + 1
     };
-    let verb = if s.is(k, "lock") {
+    let verb = if s.keyword(k, "lock") {
         "LOCK TABLE"
     } else {
         "TRUNCATE"
@@ -3129,7 +3134,7 @@ fn lock_or_truncate(s: &Stmts, k: usize) -> Vec<Raw> {
         .map(|t| Raw::lock(k, verb, Some(t)))
         .collect();
     // CASCADE also truncates every table whose key reaches these.
-    if (k..s.end(k)).any(|j| s.is(j, "cascade")) {
+    if (k..s.end(k)).any(|j| s.keyword(j, "cascade")) {
         raws.push(Raw::lock(k, "TRUNCATE ... CASCADE", None));
     }
     raws
@@ -3169,7 +3174,7 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
     match s.word(k + 1) {
         Some("table") => {
             // `ALTER TABLE ALL IN TABLESPACE` moves every table there.
-            if s.is(k + 2, "all") && s.is(k + 3, "in") {
+            if s.keyword(k + 2, "all") && s.keyword(k + 3, "in") {
                 raws.push(Raw::lock(k, "ALTER TABLE ALL IN TABLESPACE", None));
                 return;
             }
@@ -3182,7 +3187,9 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
             // only places the new index, so it still builds one.
             let builds_index = s.actions(k).into_iter().any(|(from, to)| {
                 let adopts = (from..to).any(|j| {
-                    s.is(j, "using") && s.is(j + 1, "index") && !s.is(j + 2, "tablespace")
+                    s.keyword(j, "using")
+                        && s.keyword(j + 1, "index")
+                        && !s.keyword(j + 2, "tablespace")
                 });
                 !adopts
                     && (from..to).any(|j| {
@@ -3209,13 +3216,13 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
             // ATTACH and DETACH PARTITION also lock the partition they name.
             // INHERIT and NO INHERIT also lock the parent.
             for j in k..s.end(k) {
-                if (s.is(j, "attach") || s.is(j, "detach"))
-                    && s.is(j + 1, "partition")
+                if (s.keyword(j, "attach") || s.keyword(j, "detach"))
+                    && s.keyword(j + 1, "partition")
                     && let Some((partition, _)) = s.qualified_name(j + 2)
                 {
                     raws.push(Raw::lock(k, "ALTER TABLE ... PARTITION", Some(partition)));
                 }
-                if s.is(j, "inherit")
+                if s.keyword(j, "inherit")
                     && let Some((parent, _)) = s.qualified_name(j + 1)
                 {
                     raws.push(Raw::lock(k, "ALTER TABLE ... INHERIT", Some(parent)));
@@ -3260,7 +3267,7 @@ fn vacuum_full(s: &Stmts, k: usize) -> Vec<Raw> {
     if s.is_punct(j, '(') {
         while j < s.toks.len() && !s.is_punct(j, ')') {
             // `FULL` may carry a boolean, as in `FULL false`.
-            if s.is(j, "full") {
+            if s.keyword(j, "full") {
                 let value = s.word(j + 1).or_else(|| s.string(j + 1));
                 full = !value.is_some_and(pg_false);
             }
@@ -3279,7 +3286,7 @@ fn vacuum_full(s: &Stmts, k: usize) -> Vec<Raw> {
     // Each table may carry a column list: `VACUUM FULL t (a, b), u`.
     let mut names = Vec::new();
     loop {
-        if s.is(j, "only") {
+        if s.keyword(j, "only") {
             j += 1;
         }
         let Some((name, mut next)) = s.qualified_name(j) else {
@@ -3318,7 +3325,7 @@ fn reindex(s: &Stmts, k: usize) -> Option<Raw> {
         while j < s.toks.len() && !s.is_punct(j, ')') {
             // `CONCURRENTLY` alone, or with a true value, turns it on. Any
             // other value turns it off or is unknown, which fails closed.
-            if s.is(j, "concurrently") {
+            if s.keyword(j, "concurrently") {
                 let value = s.word(j + 1).or_else(|| s.string(j + 1));
                 let on =
                     s.is_punct(j + 1, ',') || s.is_punct(j + 1, ')') || value.is_some_and(pg_true);
@@ -5251,6 +5258,19 @@ fn a_routine_that_calls_a_clearing_routine_clears() {
     );
     let findings = lint_with_history(&[], &sql, true);
     assert!(unbounded(&findings), "{findings:?}");
+}
+
+#[test]
+fn a_quoted_column_name_is_no_drop_clause() {
+    // `"default"` names a column here, and its key references a hot table.
+    let history =
+        ["CREATE TABLE cold (id INT, \"default\" BIGINT REFERENCES harvest_events (id));"];
+    let sql = "ALTER TABLE cold DROP \"default\";";
+    let findings = lint_with_history(&history, sql, true);
+    assert!(
+        findings.iter().any(|f| f.detail.contains("harvest_events")),
+        "{findings:?}"
+    );
 }
 
 #[test]
