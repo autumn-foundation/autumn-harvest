@@ -53349,6 +53349,26 @@ mod tests {
         );
     }
 
+    // Issue #1821: one poisoned state cell must not fail every later request.
+    #[test]
+    fn harvest_api_state_survives_a_poisoned_cell_1821() {
+        let state = HarvestApiState::new();
+        let cell = Arc::clone(&state.worker_stale_threshold);
+        let joined = std::thread::spawn(move || {
+            let _held = cell.lock();
+            panic!("poison the api state cell");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoner thread must panic");
+        assert!(state.worker_stale_threshold.is_poisoned());
+
+        state.set_worker_stale_threshold(std::time::Duration::from_secs(20));
+        assert_eq!(
+            state.worker_stale_threshold(),
+            std::time::Duration::from_secs(20)
+        );
+    }
+
     // -- Drain: AC #2 -- default deadline from shutdown timeout
 
     #[test]

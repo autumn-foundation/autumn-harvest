@@ -5305,4 +5305,50 @@ mod tests {
         assert_eq!(v["legal_hold_reason"], "subpoena");
         assert!(v.get("released").is_none(), "false flag is omitted");
     }
+
+    /// Builds a pool that never connects. Its host refuses every dial.
+    #[cfg(feature = "db")]
+    fn unconnected_pool() -> crate::worker::DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused:unused@127.0.0.1:1/unused");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds")
+    }
+
+    /// Returns an active lease guard whose `active_ids` lock is poisoned.
+    #[cfg(feature = "db")]
+    fn guard_with_poisoned_lock() -> RetentionLeaseGuard {
+        let active_ids = Arc::new(Mutex::new(vec![uuid::Uuid::new_v4()]));
+        let poisoner = Arc::clone(&active_ids);
+        let joined = std::thread::spawn(move || {
+            let _held = poisoner.lock();
+            panic!("poison the lease lock");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoner thread must panic");
+        assert!(active_ids.is_poisoned());
+        RetentionLeaseGuard {
+            pool: unconnected_pool(),
+            lease_id: "retention-lease-test".to_owned(),
+            active_ids,
+            active: true,
+        }
+    }
+
+    // Issue #1821: a panic in `Drop` during unwinding aborts the process.
+    #[tokio::test]
+    #[cfg(feature = "db")]
+    async fn lease_guard_drop_survives_a_poisoned_lock_1821() {
+        drop(guard_with_poisoned_lock());
+    }
+
+    // Issue #1821: a guard can drop after its runtime is gone.
+    #[test]
+    #[cfg(feature = "db")]
+    fn lease_guard_drop_survives_a_missing_runtime_1821() {
+        drop(guard_with_poisoned_lock());
+    }
 }
