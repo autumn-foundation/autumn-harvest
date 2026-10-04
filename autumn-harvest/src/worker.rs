@@ -15747,6 +15747,10 @@ async fn process_activity_task(
             &task.queue_name,
             ActivityStatus::Failed,
         );
+        // Issue #1815: a breaker is per worker, so a rejected attempt counts as
+        // a failure. Otherwise the ratio would improve while the worker rejects
+        // work.
+        task_outcomes.record(true, Duration::ZERO);
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let retry_policy_result = configured_retry_policy(task);
         let retry_policy = fail_execution_on_error(
@@ -25870,7 +25874,8 @@ fn pool_occupancy(status: &deadpool::Status) -> (u64, u64) {
 }
 
 /// One recorder's running poll loops per queue (issue #1815). The entry holds
-/// the recorder, so its address stays unique while the entry lives.
+/// the recorder, so its address stays unique while the entry lives. The entry
+/// leaves the registry when its last loop ends.
 type RecorderPollers = (
     Arc<dyn crate::telemetry::MetricsRecorder>,
     std::collections::HashMap<String, u64>,
@@ -25930,6 +25935,12 @@ impl PollerGuard {
                 count.saturating_sub(1)
             };
             self.metrics.record_worker_pollers(queue, *count);
+        }
+        // A recorder with no running loop leaves the registry, so a process
+        // that starts and stops many runtimes does not grow it without bound.
+        counts.retain(|_, count| *count > 0);
+        if counts.is_empty() {
+            by_recorder.remove(&crate::telemetry::recorder_key(&self.metrics));
         }
     }
 }
@@ -39958,6 +39969,16 @@ mod tests {
         let theirs: Vec<u64> = other.0.lock().unwrap().iter().map(|(_, n)| *n).collect();
         assert_eq!(mine[4..], [1, 0]);
         assert_eq!(theirs, vec![1, 0]);
+
+        // With no loop left, neither recorder stays in the registry.
+        let registered = |m: &Arc<dyn crate::telemetry::MetricsRecorder>| {
+            POLLERS_BY_RECORDER
+                .lock()
+                .unwrap()
+                .contains_key(&crate::telemetry::recorder_key(m))
+        };
+        assert!(!registered(&metrics));
+        assert!(!registered(&other_metrics));
     }
 
     #[test]

@@ -570,19 +570,25 @@ impl ProcessOutlierFlags {
     /// Workers that share a recorder share one gauge, so they share one set of
     /// verdicts. A runtime with its own recorder gets its own set, so one
     /// runtime's sick worker cannot raise another runtime's gauge.
+    ///
+    /// The registry holds each set weakly. A set lives while a probe holds it,
+    /// and each probe also holds its recorder. So a live set's key cannot be
+    /// reused, and a stopped runtime's set leaves the registry.
     #[must_use]
     pub fn for_recorder(metrics: &Arc<dyn MetricsRecorder>) -> Arc<Self> {
-        type Entry = (Arc<dyn MetricsRecorder>, Arc<ProcessOutlierFlags>);
-        static BY_RECORDER: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Entry>>> =
-            std::sync::LazyLock::new(Mutex::default);
+        static BY_RECORDER: std::sync::LazyLock<
+            Mutex<std::collections::HashMap<usize, std::sync::Weak<ProcessOutlierFlags>>>,
+        > = std::sync::LazyLock::new(Mutex::default);
         let mut by_recorder = BY_RECORDER
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The entry holds the recorder, so its address stays unique.
-        let (_, flags) = by_recorder
-            .entry(crate::telemetry::recorder_key(metrics))
-            .or_insert_with(|| (Arc::clone(metrics), Arc::default()));
-        let flags = Arc::clone(flags);
+        by_recorder.retain(|_, flags| flags.strong_count() > 0);
+        let key = crate::telemetry::recorder_key(metrics);
+        if let Some(flags) = by_recorder.get(&key).and_then(std::sync::Weak::upgrade) {
+            return flags;
+        }
+        let flags = Arc::new(Self::default());
+        by_recorder.insert(key, Arc::downgrade(&flags));
         drop(by_recorder);
         flags
     }
@@ -2377,10 +2383,19 @@ mod tests {
         let a_flags = super::ProcessOutlierFlags::for_recorder(&a);
         let a_again = super::ProcessOutlierFlags::for_recorder(&Arc::clone(&a));
         assert!(Arc::ptr_eq(&a_flags, &a_again));
-        assert!(!Arc::ptr_eq(
-            &a_flags,
-            &super::ProcessOutlierFlags::for_recorder(&b)
-        ));
+        let b_flags = super::ProcessOutlierFlags::for_recorder(&b);
+        assert!(!Arc::ptr_eq(&a_flags, &b_flags));
+
+        // The registry holds each set weakly, so a stopped runtime's set goes.
+        let weak = Arc::downgrade(&a_flags);
+        drop((a_flags, a_again));
+        assert_eq!(weak.strong_count(), 0, "the registry holds the set weakly");
+        let fresh = super::ProcessOutlierFlags::for_recorder(&a);
+        assert_eq!(
+            Arc::strong_count(&fresh),
+            1,
+            "a fresh set replaces the dropped one"
+        );
     }
 
     /// The fleet lookup that gates the capability-miss redelivery budget
