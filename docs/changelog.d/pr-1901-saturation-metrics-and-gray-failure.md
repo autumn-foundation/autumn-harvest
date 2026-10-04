@@ -27,8 +27,11 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - Each worker keeps a rolling window of its task outcomes. The window holds
   the last 5 minutes and at most 1024 samples.
 - A failed activity attempt counts as a failure. So does an attempt that an
-  open circuit breaker rejects, because the breaker belongs to the worker. A workflow task counts as a
-  failure when it returns an error or times out. A release is not counted.
+  open circuit breaker rejects, because the breaker belongs to the worker.
+  An activity that succeeds but does not finalize also counts as a failure.
+  A cancelled activity attempt is not counted.
+  A workflow task counts as a failure when it returns an error or times out.
+  A release is not counted.
 - Every liveness heartbeat writes a snapshot to the new table
   `harvest_worker_task_stats` and reads the live peers of its shard. One
   heartbeat per worker then compares the worker with the peers of all its

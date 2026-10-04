@@ -16146,8 +16146,15 @@ async fn process_activity_task(
     } else {
         ActivityStatus::Failed
     };
-    // Issue #1815: the attempt feeds this worker's outlier window.
-    task_outcomes.record(status == ActivityStatus::Failed, attempt_elapsed);
+    // Issue #1815: the attempt feeds this worker's outlier window after
+    // finalization. A failed finalization counts as a failure, so a worker
+    // that loses its writes cannot report a clean ratio. A cancelled attempt
+    // is skipped, as in the circuit breaker.
+    let record_outcome = |finalized: bool| {
+        if let Some(failed) = activity_attempt_outcome(status, was_cancelled, finalized) {
+            task_outcomes.record(failed, attempt_elapsed);
+        }
+    };
     // Parse the structured payload once and reuse for both the histogram
     // and the per-failure counter (so the `error.type` attribute is
     // consistent across `harvest.activity.duration` and
@@ -16188,16 +16195,29 @@ async fn process_activity_task(
     drop(activity_future);
 
     // Finalization phase: re-acquire a connection now that the handler is done.
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            record_outcome(false);
+            return Err(crate::error::database_error(error));
+        }
+    };
     let retry_policy_result = configured_retry_policy(task);
-    let retry_policy = fail_execution_on_error(
+    let retry_policy = match fail_execution_on_error(
         &mut conn,
         task,
         worker_id,
         retry_policy_result,
         registry.payload_codecs(),
     )
-    .await?;
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            record_outcome(false);
+            return Err(error);
+        }
+    };
 
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
@@ -16273,12 +16293,13 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
+        record_outcome(true);
         return Ok(());
     }
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
     // pass 0 so handle_activity_result skips the redundant cap check.
-    handle_activity_result(
+    let finalized = handle_activity_result(
         &mut conn,
         task,
         exec_id,
@@ -16293,7 +16314,23 @@ async fn process_activity_task(
         registry.retry_after_ceiling,
         registry.payload_codecs(),
     )
-    .await
+    .await;
+    record_outcome(finalized.is_ok());
+    finalized
+}
+
+/// How an activity attempt enters the outlier window (issue #1815).
+///
+/// `Some(true)` is a failure, `Some(false)` is a success, and `None` skips the
+/// attempt. A failed handler counts as a failure. A handler success that does
+/// not finalize also counts, because the work is lost. A cancelled attempt is
+/// skipped, because a cancellation says nothing about the worker.
+fn activity_attempt_outcome(
+    status: ActivityStatus,
+    was_cancelled: bool,
+    finalized: bool,
+) -> Option<bool> {
+    (!was_cancelled).then_some(status == ActivityStatus::Failed || !finalized)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -40011,6 +40048,26 @@ mod tests {
             reason.contains("never missed this task"),
             "the operator's next step is the live peer, not the deploy: {reason}"
         );
+    }
+
+    /// Issue #1815: a handler success that does not finalize counts as a
+    /// failed attempt. A cancelled attempt is skipped.
+    #[test]
+    fn activity_attempt_outcome_counts_lost_finalization_and_skips_cancellation() {
+        use ActivityStatus::{Completed, Failed};
+        assert_eq!(
+            activity_attempt_outcome(Completed, false, true),
+            Some(false)
+        );
+        assert_eq!(
+            activity_attempt_outcome(Completed, false, false),
+            Some(true)
+        );
+        assert_eq!(activity_attempt_outcome(Failed, false, true), Some(true));
+        assert_eq!(activity_attempt_outcome(Failed, false, false), Some(true));
+        for (status, finalized) in [(Completed, true), (Failed, true), (Failed, false)] {
+            assert_eq!(activity_attempt_outcome(status, true, finalized), None);
+        }
     }
 
     /// Issue #1815: two pools on one shard and sink sum. A pool that two
