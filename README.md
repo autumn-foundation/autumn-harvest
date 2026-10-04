@@ -1164,6 +1164,11 @@ reports `degraded` or `unavailable`. Only after the candidate row reports
 `readiness: "ready"` should you flip it into `writable_shards`. In-flight
 workflows drain on their original shard.
 
+For Kubernetes, probe `/api/harvest/health/live` and
+`/api/harvest/health/ready`. The readiness probe also honors the setting
+below. See
+[`docs/operations/kubernetes-probes.md`](docs/operations/kubernetes-probes.md).
+
 By default `/api/harvest/health` stays a cheap liveness check for local
 single-shard development. To make it a rollout/readiness probe that returns
 `503` until writable shard readiness is `ready`, enable:

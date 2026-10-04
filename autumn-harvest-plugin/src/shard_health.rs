@@ -1381,8 +1381,8 @@ mod tests {
         }
     }
 
-    /// An empty build-compatibility set: only exact-build and legacy-worker
-    /// (empty `build_id`) rules apply, matching a deployment with no declared
+    /// An empty build-compatibility set: only the exact-build rule applies,
+    /// matching a deployment with no declared
     /// cross-build compatibility.
     fn empty_compat() -> autumn_harvest::build_routing::BuildCompatibilitySet {
         autumn_harvest::build_routing::BuildCompatibilitySet::default()
@@ -2182,6 +2182,34 @@ mod tests {
             "should not fire when a covering worker satisfies the capabilities"
         );
         assert_eq!(blocking_reasons, [] as [std::string::String; 0]);
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_only_an_empty_build_worker_polls_a_pinned_queue() {
+        // An empty-build worker cannot claim pinned work (issue #1805).
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = build_routed_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.build_id = String::new();
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "an empty-build worker must not mask stranded pinned work"
+        );
     }
 
     #[test]

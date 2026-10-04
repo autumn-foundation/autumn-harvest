@@ -153,6 +153,19 @@ async fn standalone_token_mode_preserves_public_safe_routes() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Issue #1812: the probes need no token either. No runtime runs here, so
+/// readiness answers 503, not 401.
+#[tokio::test]
+async fn standalone_token_mode_preserves_the_probe_routes() {
+    let auth = StandaloneAdminAuth::new().with_api_tokens();
+
+    let live = get(standalone_app(&auth), "/api/harvest/health/live", None).await;
+    let ready = get(standalone_app(&auth), "/api/harvest/health/ready", None).await;
+
+    assert_eq!(live, StatusCode::OK);
+    assert_eq!(ready, StatusCode::SERVICE_UNAVAILABLE);
+}
+
 /// Without the opt-in the token layer is absent, so the same request falls
 /// through to the admin gate and is rejected there. This is the state every
 /// standalone mount was in.
