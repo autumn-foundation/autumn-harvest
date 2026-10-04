@@ -2801,18 +2801,35 @@ fn running_path_change(s: &Stmts, k: usize, local: bool) -> bool {
 
 /// The end of the first running call of a routine in this file whose body may
 /// change `search_path`. The change takes effect when that call returns.
+///
+/// A routine that calls such a routine may change the path too. The set grows
+/// until no routine joins it, as for clearing and locking routines.
 fn path_routine_call(s: &Stmts) -> Option<usize> {
     let routines = file_routines(s);
-    let changes_path = |r: &Routine| {
-        routine_body(s, r.at).is_some_and(|(from, to)| {
-            (from..to).any(|j| s.starts[j] == j && changes_search_path(s, j))
-        })
-    };
-    let names: BTreeSet<&str> = routines
+    let bodies = routine_bodies(s);
+    let own = |r: &Routine, j: usize| owns(s, &bodies, r.at, j);
+    let all: BTreeSet<&str> = routines.iter().map(|r| base(&r.name)).collect();
+    let mut names: BTreeSet<&str> = routines
         .iter()
-        .filter(|r| changes_path(r))
+        .filter(|r| {
+            (r.at..s.toks.len()).any(|j| own(r, j) && s.starts[j] == j && changes_search_path(s, j))
+        })
         .map(|r| base(&r.name))
         .collect();
+    loop {
+        let before = names.len();
+        for r in &routines {
+            let calls = (r.at..s.toks.len()).any(|j| {
+                own(r, j) && call_target(s, j, &all).is_some_and(|c| names.contains(base(&c.name)))
+            });
+            if calls {
+                names.insert(base(&r.name));
+            }
+        }
+        if names.len() == before {
+            break;
+        }
+    }
     (0..s.toks.len())
         .filter(|&k| s.toks[k].runs)
         .find(|&k| call_target(s, k, &names).is_some())
@@ -7241,10 +7258,15 @@ fn an_uncalled_body_does_not_change_the_path_of_its_file() {
     let history = format!("{routine}{index}");
     let drop = "DROP INDEX public.idx;";
     assert_eq!(lint_with_history(&[&history], drop, true), [], "{history}");
-    // A call of the routine in the same file runs the change.
-    let history = format!("{routine}SELECT f();\n{index}");
-    let findings = lint_with_history(&[&history], drop, true);
-    assert!(!findings.is_empty(), "{history}\n{findings:?}");
+    // A call of the routine in the same file runs the change, and so does a
+    // call of a routine that calls it.
+    let outer = "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 PERFORM f();\nEND $$;\n";
+    for call in ["SELECT f();\n", "SELECT g();\n"] {
+        let history = format!("{routine}{outer}{call}{index}");
+        let findings = lint_with_history(&[&history], drop, true);
+        assert!(!findings.is_empty(), "{history}\n{findings:?}");
+    }
 }
 
 #[test]
