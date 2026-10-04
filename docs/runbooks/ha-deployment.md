@@ -66,13 +66,18 @@ No. If the crashed replica successfully called `start_or_load_workflow_execution
 
 The `BufferOne` and `BufferAll` overlap policies store pending slots in `buffered_runs`. Each tick drains them before it fires due slots. The drain uses the same claim:
 
-1. Claim the row with the `UPDATE` above. A live claim held by a peer makes the drain skip the row.
-2. Read the row again, so the drain uses the current `buffered_runs` and `runs_started`.
-3. Start the buffered runs, then write `buffered_runs` and `runs_started`. The write clears the claim and matches only this replica's token.
+1. The drain skips a row with no free run slot or a matching admission gate. This check takes no claim and writes nothing.
+2. The drain generates a token and claims the row with the `UPDATE` above. If a peer holds a live claim, the drain skips the row.
+3. The drain reads the row again, so it uses the current `buffered_runs`, `runs_started` and capacity.
+4. The drain starts the buffered runs, then writes `buffered_runs` and `runs_started`. The write matches only this replica's token, and it clears the claim.
 
-Every other exit releases the claim, also fenced on the token. Thus one replica starts each buffered slot, and `runs_started` counts it once. This does not depend on `WorkflowIdReusePolicy`.
+Every other exit also releases the claim, but only while this replica's token still holds it. While the claim is live, one replica drains a row, and `runs_started` counts each slot once.
 
-The drain and the tick fire path use one claim, so they do not overlap on a row. A schedule `PATCH` returns `409` while a drain holds the claim, as it does during a fire. Retry the `PATCH`.
+The claim lasts 30 s, and the drain does not renew it. A drain that crashes or runs past 30 s can lose the claim to a peer. The peer then drains the same buffer again. `RejectDuplicate` on the deterministic workflow ID stops the second execution, as in the crash case above. The late drain's final write matches no row, so `runs_started` still counts each slot once.
+
+The drain and the tick fire path use one claim, so they do not overlap on a row while the claim is live. A schedule `PATCH` returns `409` while a drain holds the claim, as it does during a fire. The claim lasts at most 30 s. Retry the `PATCH`.
+
+The drain does not emit `harvest.schedule.fire_attempts`. A drain that skips a claimed row logs at `debug` level only. A drain claim can make a peer's tick record `lost_race` and fire the due slot one tick later.
 
 ---
 

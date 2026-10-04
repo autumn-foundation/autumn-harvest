@@ -1173,12 +1173,14 @@ fn scheduled_fire_encodes_shard(wf_name: &str, is_dag: bool) -> bool {
 /// Mint the `ExecutionId` for one scheduled fire on `current_shard`.
 ///
 /// The **single** decision point for whether a fire's execution id encodes its
-/// home shard (issue #961, AC4). Both the main dispatch loop and the
-/// buffered-overlap drain (`drain_buffered_schedule_runs`) call this, so the two
-/// cannot drift — they previously did: the drain gated on
-/// `schedule.dag_name.is_some()` alone, so a **canary** schedule (a non-DAG
-/// whose fire must land ON the shard it probes) drained a buffered slot onto the
-/// *default* shard, silently un-pinning the shard-coverage signal.
+/// home shard (issue #961, AC4). The main dispatch loop and the
+/// buffered-overlap drain (`drain_claimed_buffered_schedule`) both call this.
+/// Thus the two cannot drift.
+///
+/// They drifted before. The drain gated on `schedule.dag_name.is_some()` alone.
+/// A **canary** schedule is a non-DAG whose fire must land ON the shard it
+/// probes. The drain put its buffered slot on the *default* shard instead.
+/// That silently un-pinned the shard-coverage signal.
 fn scheduled_fire_exec_id(wf_name: &str, is_dag: bool, current_shard: ShardId) -> ExecutionId {
     if scheduled_fire_encodes_shard(wf_name, is_dag) {
         ExecutionId::new_for_shard(current_shard)
@@ -3424,7 +3426,7 @@ pub async fn claim_and_fire_workflow_schedule(
             error = %error, workflow_name = %wf_name,
             "harvest: workflow schedule tick failed; continuing to next schedule"
         );
-        // Clear our own claim on error so a peer can retry promptly.
+        // Release this tick's claim on error, so a peer can retry promptly.
         release_fire_claim(conn, schedule.id, my_claim_token).await;
     }
 
@@ -6169,7 +6171,8 @@ pub(crate) fn buffered_runs_to_json(runs: &[DateTime<Utc>]) -> serde_json::Value
 /// Called on every scheduler tick. For each schedule with a non-empty
 /// `buffered_runs` column, dispatches buffered fire times in order until
 /// `max_active_runs` is reached, then updates the `buffered_runs` column.
-/// Each row is drained under its fire claim (issue #1820).
+/// [`claim_and_drain_buffered_schedule`] drains each row under its fire claim
+/// (issue #1820).
 #[cfg(feature = "db")]
 async fn drain_buffered_schedule_runs(
     conn: &mut AsyncPgConnection,
@@ -6218,6 +6221,26 @@ async fn drain_buffered_schedule_runs(
             continue;
         }
 
+        // Run the skip checks on the snapshot before the claim. A row that
+        // cannot drain then costs no write, and a PATCH meets no claim.
+        // A stale result delays the drain by one tick. The claimed pass
+        // checks the capacity again.
+        if buffered_drain_capacity(conn, &snapshot, wf_name)
+            .await?
+            .is_none()
+            || buffered_drain_gated(
+                &snapshot,
+                wf_name,
+                current_shard,
+                registered_dags,
+                registry,
+                metrics,
+                active_gates,
+            )
+        {
+            continue;
+        }
+
         claim_and_drain_buffered_schedule(
             conn,
             snapshot.id,
@@ -6226,12 +6249,79 @@ async fn drain_buffered_schedule_runs(
             registered_dags,
             registry,
             metrics,
-            active_gates,
         )
         .await?;
     }
 
     Ok(())
+}
+
+/// Return the free run slots of a buffered row, or `None` if it cannot drain.
+///
+/// A row cannot drain when its buffer is empty or it is at `max_active_runs`.
+#[cfg(feature = "db")]
+async fn buffered_drain_capacity(
+    conn: &mut AsyncPgConnection,
+    schedule: &HarvestSchedule,
+    wf_name: &str,
+) -> HarvestResult<Option<i64>> {
+    if parse_buffered_runs(&schedule.buffered_runs).is_empty() {
+        return Ok(None);
+    }
+    // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
+    // cross-type successors included per issue #1160, plus the #607
+    // pending-throttle backlog) -- see `schedule_running_basis`.
+    let running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
+    let available = i64::from(schedule.max_active_runs).saturating_sub(running);
+    Ok((available > 0).then_some(available))
+}
+
+/// Return `true` if an active admission gate blocks a buffered drain (#377).
+///
+/// A block records the skip metrics.
+#[cfg(feature = "db")]
+fn buffered_drain_gated(
+    schedule: &HarvestSchedule,
+    wf_name: &str,
+    current_shard: ShardId,
+    registered_dags: &DagCatalog,
+    registry: &crate::worker::HandlerRegistry,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+    active_gates: &[crate::admission_gate::AdmissionGate],
+) -> bool {
+    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+    let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name);
+    let owner = registry
+        .workflows
+        .get(wf_name)
+        .and_then(|i| i.owner)
+        .or_else(|| {
+            registered_dags
+                .get(dag_lookup_key)
+                .and_then(|d| d.owner.as_deref())
+        });
+    let Some(gate) = crate::admission_gate::check_admission(
+        active_gates,
+        wf_name,
+        dispatch_queue,
+        current_shard.as_i32(),
+        owner,
+    ) else {
+        return false;
+    };
+    tracing::info!(
+        workflow_name = %wf_name,
+        gate_id = %gate.id,
+        reason = %gate.reason,
+        "harvest: buffered drain skipped due to admission gate"
+    );
+    metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+    // issue #618, F-round17: also count the block in
+    // harvest.admission.blocked (see the tick path above) so the
+    // scheduler's buffered/overlap drain blocks appear like every other
+    // gated producer's.
+    metrics.record_admission_blocked(gate.scope.kind_str(), &gate.reason);
+    true
 }
 
 /// Whether a buffered drain pass cleared its own fire claim.
@@ -6240,22 +6330,27 @@ async fn drain_buffered_schedule_runs(
 enum DrainClaim {
     /// The final write cleared the claim, or the row is gone.
     Released,
-    /// The claim can still be set. The caller must release it.
+    /// This pass can still hold the claim. The caller must release it.
     Held,
 }
 
 /// Claim one buffered row, drain it, then release the claim (issue #1820).
 ///
-/// The drain takes the same fire claim as the tick fire path. A live claim
-/// held by a peer makes this call skip the row. Thus two replicas never drain
-/// one row at once, and the drain never overlaps a fire on that row.
-/// Without the claim, both replicas start the same slot. Both then add it to
-/// `runs_started`, and `WorkflowIdReusePolicy` hides only the second start.
+/// The drain takes the same fire claim as the tick fire path. If a peer holds
+/// a live claim, this call skips the row. Thus, while a claim is live, no other
+/// drain or fire uses that row.
+/// Without the claim, two replicas can start the same slot. Both then add it
+/// to `runs_started`. `RejectDuplicate` stops the second execution, but not the
+/// second count.
+///
+/// The claim lasts 30 s, and the drain does not renew it. A drain that runs
+/// longer can lose the claim to a peer. Its final write then matches no row,
+/// so `runs_started` still counts each slot once.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] when the claim, the re-read or a write
-/// fails. The claim is released before the error returns.
+/// Returns an error when the claim, the re-read, a start-path call or the
+/// final write fails. The call tries to release the claim first.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn claim_and_drain_buffered_schedule(
@@ -6266,7 +6361,6 @@ async fn claim_and_drain_buffered_schedule(
     registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-    active_gates: &[crate::admission_gate::AdmissionGate],
 ) -> HarvestResult<()> {
     // Same claim SQL as `claim_and_fire_workflow_schedule`, without the
     // `next_run_at` guard. A buffered slot is not the row's next cadence slot.
@@ -6300,7 +6394,6 @@ async fn claim_and_drain_buffered_schedule(
         registered_dags,
         registry,
         metrics,
-        active_gates,
     )
     .await;
     if !matches!(result, Ok(DrainClaim::Released)) {
@@ -6311,7 +6404,9 @@ async fn claim_and_drain_buffered_schedule(
 
 /// Drain the buffered slots of one row while `claim_token` holds its claim.
 ///
-/// Reads the row again first, so no decision uses the pre-claim snapshot.
+/// Reads the row again first, so the drain uses the current buffer, budget
+/// and capacity. The registered-DAG and admission-gate checks use the
+/// pre-claim snapshot.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn drain_claimed_buffered_schedule(
@@ -6323,7 +6418,6 @@ async fn drain_claimed_buffered_schedule(
     registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-    active_gates: &[crate::admission_gate::AdmissionGate],
 ) -> HarvestResult<DrainClaim> {
     use crate::schema::harvest_schedules::dsl;
     use diesel_async::RunQueryDsl;
@@ -6348,56 +6442,10 @@ async fn drain_claimed_buffered_schedule(
     };
 
     let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
-    if buffered.is_empty() {
+    let Some(available) = buffered_drain_capacity(conn, &schedule, wf_name).await? else {
         return Ok(DrainClaim::Held);
-    }
-
-    // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
-    // cross-type successors included per issue #1160, plus the #607
-    // pending-throttle backlog) -- see `schedule_running_basis`.
-    let running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
-
-    let available = i64::from(schedule.max_active_runs).saturating_sub(running);
-    if available <= 0 {
-        return Ok(DrainClaim::Held);
-    }
-
+    };
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
-
-    // issue #377: gate check — skip draining this schedule if any active gate matches.
-    {
-        let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name.as_str());
-        let owner = registry
-            .workflows
-            .get(wf_name.as_str())
-            .and_then(|i| i.owner)
-            .or_else(|| {
-                registered_dags
-                    .get(dag_lookup_key)
-                    .and_then(|d| d.owner.as_deref())
-            });
-        if let Some(gate) = crate::admission_gate::check_admission(
-            active_gates,
-            wf_name,
-            dispatch_queue,
-            current_shard.as_i32(),
-            owner,
-        ) {
-            tracing::info!(
-                workflow_name = %wf_name,
-                gate_id = %gate.id,
-                reason = %gate.reason,
-                "harvest: buffered drain skipped due to admission gate"
-            );
-            metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
-            // issue #618, F-round17: also count the block in
-            // harvest.admission.blocked (see the tick path above) so the
-            // scheduler's buffered/overlap drain blocks appear like every other
-            // gated producer's.
-            metrics.record_admission_blocked(gate.scope.kind_str(), &gate.reason);
-            return Ok(DrainClaim::Held);
-        }
-    }
 
     let mut dispatched: u32 = 0;
     // Set to true when the whole buffer is cleared because the first slot is already
@@ -6836,7 +6884,9 @@ async fn drain_claimed_buffered_schedule(
         )
         .set((
             dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
-            dsl::runs_started.eq(new_runs_started),
+            // DB-side increment, so a concurrent manual-trigger increment
+            // survives. The claim does not serialize manual triggers.
+            dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
             dsl::exhausted_at.eq(Some(now)),
             dsl::exhausted_reason.eq(exhausted_reason),
             dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
@@ -6871,8 +6921,10 @@ async fn drain_claimed_buffered_schedule(
         .map_err(crate::error::database_error)?
     };
     if written == 0 {
-        // The claim expired and a peer took it, or the row is exhausted.
-        // A peer that drains the row again sees the old buffer.
+        // The claim expired and a peer or a PATCH replaced it, or the row is
+        // exhausted. The stored buffer still holds the slots this pass started.
+        // The next drain starts them again, and `RejectDuplicate` returns the
+        // existing runs.
         tracing::warn!(
             schedule_id = %schedule.id,
             workflow_name = %wf_name,
