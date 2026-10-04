@@ -2602,6 +2602,7 @@ async fn an_admin_write_on_a_dr_database_must_state_the_epoch() {
 
 /// A data write on a logical standby is refused even when the stated epoch
 /// matches: the standby carries the replicated row at the same generation.
+/// The subscription's name does not matter.
 /// A schema-only write (partition DDL) is allowed there, because logical
 /// replication carries no DDL and the docs require it on both sides.
 #[tokio::test]
@@ -2611,7 +2612,9 @@ async fn an_admin_data_write_on_a_logical_standby_is_refused() {
     ensure_generation_row(&mut conn, ShardId::new(0))
         .await
         .unwrap();
-    let sub = format!("{DR_PREFIX}_sub_{db}");
+    // A custom name: deployments may set their own slot prefix, and the CLI
+    // cannot know it. The standby check must not depend on the name.
+    let sub = format!("custom_sub_{db}");
     diesel::sql_query(format!(
         "CREATE SUBSCRIPTION {sub} CONNECTION 'dbname=unused' PUBLICATION harvest_dr \
          WITH (connect = false)"

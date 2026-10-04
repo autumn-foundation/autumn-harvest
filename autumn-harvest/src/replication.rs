@@ -548,6 +548,11 @@ pub struct DrMarkers {
     pub dr_slots: i64,
     /// Subscriptions in this database with the DR prefix.
     pub dr_subscriptions: i64,
+    /// Every subscription in this database, whatever its name.
+    ///
+    /// Not a DR marker by itself. A direct-database data write refuses any
+    /// subscriber, because the CLI cannot know a custom DR prefix.
+    pub subscriptions: i64,
     /// Whether the server is a physical standby (`pg_is_in_recovery()`).
     pub in_recovery: bool,
 }
@@ -1317,6 +1322,8 @@ mod db {
         dr_slots: i64,
         #[diesel(sql_type = BigInt)]
         dr_subscriptions: i64,
+        #[diesel(sql_type = BigInt)]
+        subscriptions: i64,
         #[diesel(sql_type = Bool)]
         in_recovery: bool,
     }
@@ -1363,6 +1370,9 @@ mod db {
                   JOIN pg_database d ON d.oid = s.subdbid \
                   WHERE d.datname = current_database() \
                     AND starts_with(s.subname::text, $1)) AS dr_subscriptions, \
+                 (SELECT COUNT(*) FROM pg_subscription s \
+                  JOIN pg_database d ON d.oid = s.subdbid \
+                  WHERE d.datname = current_database()) AS subscriptions, \
                  pg_is_in_recovery() AS in_recovery"
         ))
         .bind::<Text, _>(slot_prefix)
@@ -1377,6 +1387,7 @@ mod db {
                 .collect(),
             dr_slots: row.dr_slots,
             dr_subscriptions: row.dr_subscriptions,
+            subscriptions: row.subscriptions,
             in_recovery: row.in_recovery,
         })
     }
@@ -1433,7 +1444,8 @@ mod db {
     /// A logical standby carries the replicated row at the primary's
     /// generation, so a matching epoch does not prove authority there. The
     /// probe therefore always runs. A server in recovery refuses every write.
-    /// A DR subscription refuses an [`AdminWrite::Data`] write.
+    /// Any subscription in the database refuses an [`AdminWrite::Data`]
+    /// write, whatever its name. The CLI cannot know a custom DR prefix.
     ///
     /// The check is a preflight read, not a commit-order barrier.
     ///
@@ -1452,8 +1464,8 @@ mod db {
         kind: super::AdminWrite,
     ) -> HarvestResult<()> {
         let markers = probe_dr_markers(conn, slot_prefix).await?;
-        let standby_refuses = markers.in_recovery
-            || (kind == super::AdminWrite::Data && markers.dr_subscriptions > 0);
+        let standby_refuses =
+            markers.in_recovery || (kind == super::AdminWrite::Data && markers.subscriptions > 0);
         if standby_refuses {
             return Err(crate::error::HarvestError::Config(format!(
                 "shard {} is a DR standby, so this admin write may not run here. Point it at \
