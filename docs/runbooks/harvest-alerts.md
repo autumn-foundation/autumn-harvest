@@ -3395,9 +3395,10 @@ the gauge reads `1` when either worker is an outlier.
 
 The peers are the live, `Active` workers that poll the same queues with the
 same `queue_weights`, on the same build with the same labels, and with the
-same `max_concurrent_workflows` and `max_concurrent_activities`. Those decide
-which tasks a worker can claim, and in which mix under load. So workers of
-two sizes are two cohorts. A worker on a slow queue is not compared with
+same `max_concurrent_workflows` and `max_concurrent_activities`. A worker
+with a slot tuner is keyed on the tuner's band instead, because the tuner
+sizes its slots. Those decide which tasks a worker can claim, and in which
+mix under load. So workers of two sizes are two cohorts. A worker on a slow queue is not compared with
 workers on a fast queue. A worker that favours a bulk queue is not compared
 with one that favours an interactive queue. During a rolling deployment, each
 build is its own cohort. A GPU worker that takes capability-routed tasks is

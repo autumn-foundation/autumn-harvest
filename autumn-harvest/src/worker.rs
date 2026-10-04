@@ -30545,8 +30545,11 @@ impl Worker {
                     &self.config.queue_weights,
                     &self.config.build_id,
                     &self.config.labels,
-                    self.config.max_concurrent_workflows,
-                    self.config.max_concurrent_activities,
+                    crate::workers::SlotPolicy::of(
+                        self.config.max_concurrent_workflows,
+                        self.config.max_concurrent_activities,
+                        self.config.slot_tuner.as_ref(),
+                    ),
                 ),
                 compare: true,
                 slot: shard_slot,

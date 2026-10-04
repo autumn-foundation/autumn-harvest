@@ -881,9 +881,9 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   only to a matching build.
 /// - `labels`: the claim predicate matches `required_capabilities` against
 ///   these labels, sorted by key.
-/// - `slots`: the configured slots per task kind. A worker with no slot for
-///   one kind claims only the other. Under load, the claim gate gives each
-///   worker a task mix that follows its slots, so two sizes are two cohorts.
+/// - `slots`: the worker's [`SlotPolicy`]. A worker with no slot for one kind
+///   claims only the other. Under load, the claim gate gives each worker a
+///   task mix that follows its slots, so two sizes are two cohorts.
 ///
 /// So workers on two builds are not compared during a rolling deployment. A
 /// build that fails everywhere is a fleet alert, not a gray failure.
@@ -892,8 +892,7 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
     weights: &std::collections::HashMap<String, u32, S>,
     build_id: &str,
     labels: &std::collections::HashMap<String, String, L>,
-    workflow_slots: usize,
-    activity_slots: usize,
+    slots: SlotPolicy,
 ) -> String {
     let routing = if weights.is_empty() {
         let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
@@ -914,9 +913,72 @@ pub fn worker_cohort<S: std::hash::BuildHasher, L: std::hash::BuildHasher>(
         "queues": routing,
         "build_id": build_id,
         "labels": labels,
-        "slots": { "workflow": workflow_slots, "activity": activity_slots },
+        "slots": slots.key(),
     })
     .to_string()
+}
+
+/// How a worker sizes its slots per task kind, as its cohort key records it
+/// (issue #1815).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotPolicy {
+    /// Fixed slots per kind. A kind with 0 slots is not claimed.
+    Fixed {
+        /// `max_concurrent_workflows`.
+        workflow: usize,
+        /// `max_concurrent_activities`.
+        activity: usize,
+    },
+    /// A slot tuner sizes both kinds within one band, so the worker claims
+    /// both kinds.
+    Tuned {
+        /// The band floor, after normalization.
+        min: usize,
+        /// The band cap, after normalization.
+        max: usize,
+        /// The tuner's name.
+        tuner: &'static str,
+    },
+}
+
+impl SlotPolicy {
+    /// The policy of a worker with these slot settings.
+    ///
+    /// A tuner clamps each configured maximum into its band and resizes it
+    /// later, so the configured maximums do not describe a tuned worker.
+    #[must_use]
+    pub fn of(
+        workflow_max: usize,
+        activity_max: usize,
+        tuner: Option<&crate::slot_tuner::SlotTunerConfig>,
+    ) -> Self {
+        tuner.map_or(
+            Self::Fixed {
+                workflow: workflow_max,
+                activity: activity_max,
+            },
+            |config| {
+                let (min, max) =
+                    crate::slot_tuner::effective_band(config.min_slots, config.max_slots);
+                Self::Tuned {
+                    min,
+                    max,
+                    tuner: config.tuner.name(),
+                }
+            },
+        )
+    }
+
+    fn key(self) -> serde_json::Value {
+        match self {
+            Self::Fixed { workflow, activity } => {
+                serde_json::json!({ "workflow": workflow, "activity": activity })
+            }
+            Self::Tuned { min, max, tuner } => {
+                serde_json::json!({ "tuned": { "min": min, "max": max, "tuner": tuner } })
+            }
+        }
+    }
 }
 
 /// What one task-stats write did (issue #1815).
@@ -2760,7 +2822,13 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        super::worker_cohort(&queues, &weights, build, &labels, 1, 1)
+        super::worker_cohort(
+            &queues,
+            &weights,
+            build,
+            &labels,
+            super::SlotPolicy::of(1, 1, None),
+        )
     }
 
     /// Issue #1815: a worker with no slot for one task kind claims only the
@@ -2772,12 +2840,41 @@ mod tests {
         let none = std::collections::HashMap::<String, u32>::new();
         let labels = std::collections::HashMap::<String, String>::new();
         let slots = |workflows, activities| {
-            super::worker_cohort(&queues, &none, "v1", &labels, workflows, activities)
+            super::worker_cohort(
+                &queues,
+                &none,
+                "v1",
+                &labels,
+                super::SlotPolicy::of(workflows, activities, None),
+            )
         };
         assert_ne!(slots(10, 0), slots(0, 10));
         assert_ne!(slots(10, 10), slots(10, 0));
         assert_ne!(slots(10, 10), slots(0, 10));
         assert_eq!(slots(10, 10), slots(10, 10));
+    }
+
+    /// Issue #1815: a slot tuner clamps the configured maximums into its band
+    /// and resizes them later. A tuned worker is keyed on its band, so a tuned
+    /// worker with a configured 0 is not taken for a worker without workflows.
+    #[test]
+    fn a_tuned_worker_is_keyed_on_its_band() {
+        use super::SlotPolicy;
+        use crate::slot_tuner::SlotTunerConfig;
+        let band = SlotTunerConfig::new(5, 50);
+        let tuned = |workflows, activities| SlotPolicy::of(workflows, activities, Some(&band));
+        assert_eq!(
+            tuned(0, 10),
+            tuned(30, 40),
+            "the tuner, not the configured maximum, sizes the slots"
+        );
+        assert_ne!(
+            tuned(0, 10),
+            SlotPolicy::of(0, 10, None),
+            "a tuned worker claims workflows"
+        );
+        let wider = SlotTunerConfig::new(5, 60);
+        assert_ne!(tuned(0, 10), SlotPolicy::of(0, 10, Some(&wider)));
     }
 
     /// Issue #1815: under load, the claim gate gives each worker a task mix
@@ -2789,7 +2886,13 @@ mod tests {
         let none = std::collections::HashMap::<String, u32>::new();
         let labels = std::collections::HashMap::<String, String>::new();
         let slots = |workflows, activities| {
-            super::worker_cohort(&queues, &none, "v1", &labels, workflows, activities)
+            super::worker_cohort(
+                &queues,
+                &none,
+                "v1",
+                &labels,
+                super::SlotPolicy::of(workflows, activities, None),
+            )
         };
         assert_ne!(slots(100, 1), slots(1, 100));
         assert_ne!(slots(100, 100), slots(50, 100));
