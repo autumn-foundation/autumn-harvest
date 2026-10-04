@@ -226,6 +226,9 @@ struct History {
     /// Each routine that may clear the bound, without its schema. A call of
     /// such a routine in a later migration clears the bound too.
     clearing_routines: BTreeSet<String>,
+    /// Each routine in a language that the lint cannot read, without its
+    /// schema. A call of such a routine may lock any table.
+    foreign_routines: BTreeSet<String>,
 }
 
 impl History {
@@ -471,8 +474,8 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
 /// long after the migration. Only a bound set earlier in the same body holds.
 /// A lock that unreadable `EXECUTE` SQL takes never counts as bounded.
 fn bound_in_force(analysis: &Analysis, hit: &Hit) -> bool {
-    // The hidden SQL may clear the bound before it locks.
-    if hit.verb == UNREADABLE_EXECUTE {
+    // The hidden code may clear the bound before it locks.
+    if hit.verb == UNREADABLE_EXECUTE || hit.verb == FOREIGN_CODE {
         return false;
     }
     let Some(from) = hit.body_start else {
@@ -1629,7 +1632,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 
     function_settings(&s, &mut body_timeouts);
     foreign_do_bodies(&s, &mut raws, &mut timeouts, &mut body_timeouts);
-    call_clears(&s, history, &mut timeouts, &mut body_timeouts);
+    call_clears(&s, history, &mut raws, &mut timeouts, &mut body_timeouts);
     let new_tables = new_table_spans(&s, &created);
     let hits = resolve(raws, &s, &unconditional, &new_tables, history);
 
@@ -1690,15 +1693,11 @@ fn foreign_do_bodies(
     body_timeouts: &mut Vec<(usize, Timeout)>,
 ) {
     for k in (0..s.toks.len()).filter(|&k| s.starts[k] == k && s.keyword(k, "do")) {
-        let depth = s.toks[k].depth;
-        let end = s.end(k);
-        let language = (k..end)
-            .find(|&j| s.toks[j].depth == depth && s.keyword(j, "language"))
-            .and_then(|j| s.word(j + 1).or_else(|| s.string(j + 1)));
-        if language.is_none_or(|l| l.eq_ignore_ascii_case("plpgsql")) {
+        if language(s, k).is_none_or(|l| l.eq_ignore_ascii_case("plpgsql")) {
             continue;
         }
-        raws.push(Raw::lock(k, "DO in another language", None));
+        let end = s.end(k);
+        raws.push(Raw::lock(k, FOREIGN_CODE, None));
         let list = if s.toks[k].runs {
             &mut *timeouts
         } else {
@@ -1713,6 +1712,17 @@ fn foreign_do_bodies(
         ));
     }
 }
+
+/// The `LANGUAGE` clause of the statement that starts at `k`, if any.
+fn language<'a>(s: &Stmts<'a>, k: usize) -> Option<&'a str> {
+    let depth = s.toks[k].depth;
+    (k..s.end(k))
+        .find(|&j| s.toks[j].depth == depth && s.keyword(j, "language"))
+        .and_then(|j| s.word(j + 1).or_else(|| s.string(j + 1)))
+}
+
+/// The verb of a lock that code in another language may take.
+const FOREIGN_CODE: &str = "code in another language";
 
 /// The index of `FUNCTION` or `PROCEDURE` when a routine `CREATE` starts at `k`.
 fn routine_keyword(s: &Stmts, k: usize) -> Option<usize> {
@@ -1735,6 +1745,8 @@ struct Routine {
     arity: Option<usize>,
     /// The first token: the `CALL`, the called name, or the `CREATE`.
     at: usize,
+    /// Whether the body is in a language other than PL/pgSQL or SQL.
+    foreign: bool,
 }
 
 /// Add a session clear at each call that may clear the bound.
@@ -1749,9 +1761,13 @@ struct Routine {
 /// clears, because it may reach a routine from another file. A call also
 /// clears when any such `CREATE` clears, or when an earlier migration created
 /// a clearing routine of that name.
+///
+/// A routine in another language may lock any table and clear the bound. A
+/// call of such a routine counts as a lock on an unknown table.
 fn call_clears(
     s: &Stmts,
     history: &mut History,
+    raws: &mut Vec<Raw>,
     timeouts: &mut Vec<(usize, Timeout)>,
     body_timeouts: &mut Vec<(usize, Timeout)>,
 ) {
@@ -1759,10 +1775,19 @@ fn call_clears(
         .filter_map(|k| {
             let (name, open) = s.qualified_name(routine_keyword(s, k)? + 1)?;
             let arity = arity(s, open);
-            Some(Routine { name, arity, at: k })
+            let foreign = language(s, k).is_some_and(|l| {
+                !l.eq_ignore_ascii_case("plpgsql") && !l.eq_ignore_ascii_case("sql")
+            });
+            Some(Routine {
+                name,
+                arity,
+                at: k,
+                foreign,
+            })
         })
         .collect();
     let inherited = history.clearing_routines.clone();
+    let inherited_foreign = history.foreign_routines.clone();
     let bases: BTreeSet<&str> = routines
         .iter()
         .map(|r| base(&r.name))
@@ -1795,7 +1820,7 @@ fn call_clears(
     };
     // A routine that calls a clearing routine clears too.
     let mut clearing: BTreeSet<usize> = (0..routines.len())
-        .filter(|&i| changes(&routines[i]))
+        .filter(|&i| routines[i].foreign || changes(&routines[i]))
         .collect();
     loop {
         let before = clearing.len();
@@ -1817,6 +1842,14 @@ fn call_clears(
         local: false,
     };
     for call in &calls {
+        let callee = base(&call.name);
+        let foreign = inherited_foreign.contains(callee)
+            || routines
+                .iter()
+                .any(|r| r.foreign && r.at < call.at && base(&r.name) == callee);
+        if foreign {
+            raws.push(Raw::lock(call.at, FOREIGN_CODE, None));
+        }
         if keeps(call, &clearing) {
             continue;
         }
@@ -1830,6 +1863,9 @@ fn call_clears(
         history
             .clearing_routines
             .insert(base(&routines[i].name).to_string());
+    }
+    for r in routines.iter().filter(|r| r.foreign) {
+        history.foreign_routines.insert(base(&r.name).to_string());
     }
     // `timeout_in_force` reads the changes in token order.
     timeouts.sort_by_key(|(k, _)| *k);
@@ -1845,7 +1881,12 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
     if s.starts[k] == k && s.keyword(k, "call") {
         let (name, open) = s.qualified_name(k + 1)?;
         let arity = arity(s, open);
-        return Some(Routine { name, arity, at: k });
+        return Some(Routine {
+            name,
+            arity,
+            at: k,
+            foreign: false,
+        });
     }
     let callee = s.word(k)?;
     if !bases.contains(callee) || !s.is_punct(k + 1, '(') {
@@ -1861,7 +1902,12 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
             .any(|w| s.is(first - 1, w));
     let name = schema.map_or_else(|| callee.to_string(), |schema| format!("{schema}.{callee}"));
     let arity = arity(s, k + 1);
-    (!ddl).then_some(Routine { name, arity, at: k })
+    (!ddl).then_some(Routine {
+        name,
+        arity,
+        at: k,
+        foreign: false,
+    })
 }
 
 /// The number of comma-separated items in the parentheses that open at `open`.
@@ -5167,13 +5213,17 @@ fn a_do_body_in_another_language_is_unreadable() {
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
         assert!(findings[0].detail.contains("unknown"), "{findings:?}");
     }
-    // The foreign body may also clear the bound.
+    // The foreign body may also clear the bound for what comes after it.
     let sql = format!(
         "SET LOCAL lock_timeout = '5s';\nDO LANGUAGE plpython3u {body};\n\
          ALTER TABLE harvest_events ADD COLUMN y INT;"
     );
     let findings = lint_with_history(&[], &sql, true);
-    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    assert_eq!(rules(&findings), [Rule::LockTimeout; 2], "{sql}");
+    assert!(
+        findings[1].detail.contains("harvest_events"),
+        "{findings:?}"
+    );
     // An explicit PL/pgSQL body is still read.
     let sql = "DO LANGUAGE plpgsql $$\nBEGIN\n    NULL;\nEND $$;";
     assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
@@ -5194,6 +5244,35 @@ fn a_clearing_function_from_an_earlier_migration_clears() {
         let findings = lint_with_history(&[earlier], &sql, true);
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
     }
+}
+
+#[test]
+fn foreign_code_never_inherits_a_bound() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let body = "$$ plpy.execute(\"ALTER TABLE harvest_events ADD COLUMN x int\") $$";
+    let function = format!("CREATE FUNCTION f() RETURNS void LANGUAGE plpython3u AS {body};\n");
+    // A foreign body may clear the bound before it locks.
+    let sql = format!("{set}DO LANGUAGE plpython3u {body};");
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    // A call of a foreign routine runs foreign code.
+    for (history, sql) in [
+        (vec![], format!("{function}{set}SELECT f();")),
+        (vec![function.as_str()], format!("{set}SELECT f();")),
+        (
+            vec![],
+            format!("{function}{set}DO $$\nBEGIN\n    PERFORM f();\nEND $$;"),
+        ),
+    ] {
+        let findings = lint_with_history(&history, &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        assert!(findings[0].detail.contains("unknown"), "{findings:?}");
+    }
+    // A SQL routine is still read.
+    let sql = format!(
+        "CREATE FUNCTION g() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\n{set}SELECT g();"
+    );
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

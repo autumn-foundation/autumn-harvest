@@ -265,8 +265,11 @@ that no longer matches a finding also fails the build.
   with `%s` anywhere in its text, even in a comment or a quoted name.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
   as code, in any quote form. Any other string is data.
-- The lint reads only PL/pgSQL. A `DO` body in another language counts as a
-  lock on an unknown table, and it ends the bound for what comes after it.
+- The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
+  call of a routine in another language, counts as a lock on an unknown table.
+  No bound covers that lock, because the code may clear the bound first. It
+  also ends the bound for what comes after it. Avoid such code in a
+  migration.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.
