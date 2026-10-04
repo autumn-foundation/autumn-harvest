@@ -1492,11 +1492,15 @@ impl<'a> Stmts<'a> {
 
     /// Skip `IF EXISTS` or `IF NOT EXISTS` at `k`.
     fn skip_if_exists(&self, k: usize) -> usize {
-        if !self.is(k, "if") {
+        if !self.keyword(k, "if") {
             return k;
         }
-        let j = if self.is(k + 1, "not") { k + 2 } else { k + 1 };
-        if self.is(j, "exists") { j + 1 } else { k }
+        let j = if self.keyword(k + 1, "not") {
+            k + 2
+        } else {
+            k + 1
+        };
+        if self.keyword(j, "exists") { j + 1 } else { k }
     }
 
     /// The name after the first unquoted `keyword` in the statement that
@@ -1553,7 +1557,7 @@ impl<'a> Stmts<'a> {
             return None;
         }
         let mut j = self.skip_if_exists(j + 1);
-        if self.is(j, "only") {
+        if self.keyword(j, "only") {
             j += 1;
         }
         self.qualified_name(j).map(|(name, _)| name)
@@ -1671,12 +1675,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             Some("alter") if start => alter(&s, k, history, &mut raws),
             Some("rename") if s.keyword(k + 1, "to") => rename(&s, k, history),
             Some("lock" | "truncate") if start => raws.extend(lock_or_truncate(&s, k)),
-            Some("cluster") if start => {
-                let j = if s.is(k + 1, "verbose") { k + 2 } else { k + 1 };
-                // A bare `CLUSTER` rewrites every clustered table.
-                let table = s.qualified_name(j).map(|(t, _)| t);
-                raws.push(Raw::lock(k, "CLUSTER", table));
-            }
+            Some("cluster") if start => raws.push(cluster(&s, k)),
             Some("vacuum") if start => raws.extend(vacuum_full(&s, k)),
             // SQL the lint cannot read may lock anything, and may also clear
             // the bound for what comes after it.
@@ -2191,16 +2190,40 @@ fn record_routines(
             .clearing_routines
             .insert(base(&routines[i].name).to_string());
     }
+    let body = |r: &Routine| r.at + 1..s.end(r.at);
+    let mut locking = history.locking_routines.clone();
     for r in routines {
         let name = base(&r.name).to_string();
         if r.foreign {
             history.foreign_routines.insert(name.clone());
         }
-        let body = r.at + 1..s.end(r.at);
-        if raws.iter().any(|raw| body.contains(&raw.at)) {
-            history.locking_routines.insert(name);
+        if raws.iter().any(|raw| body(r).contains(&raw.at)) {
+            locking.insert(name);
         }
     }
+    // A resolved call adds no lock, so a routine that calls a locking routine
+    // locks too. Repeat until no routine joins the set.
+    let names: BTreeSet<String> = routines
+        .iter()
+        .map(|r| base(&r.name).to_string())
+        .chain(locking.iter().cloned())
+        .collect();
+    let bases: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    loop {
+        let before = locking.len();
+        for r in routines {
+            let calls_locking = body(r).any(|j| {
+                call_target(s, j, &bases).is_some_and(|c| locking.contains(base(&c.name)))
+            });
+            if calls_locking {
+                locking.insert(base(&r.name).to_string());
+            }
+        }
+        if locking.len() == before {
+            break;
+        }
+    }
+    history.locking_routines = locking;
 }
 
 /// The verb of a lock that a call of an unread routine may take.
@@ -3037,9 +3060,21 @@ fn closing_paren(s: &Stmts, open: usize) -> Option<usize> {
     None
 }
 
+/// `CLUSTER [VERBOSE] [table]` at `k`.
+fn cluster(s: &Stmts, k: usize) -> Raw {
+    let j = k + 1 + usize::from(s.keyword(k + 1, "verbose"));
+    // A bare `CLUSTER` rewrites every clustered table.
+    let table = s.qualified_name(j).map(|(t, _)| t);
+    Raw::lock(k, "CLUSTER", table)
+}
+
 /// `LOCK [TABLE] a, b` or `TRUNCATE [TABLE] a, b` at `k`.
 fn lock_or_truncate(s: &Stmts, k: usize) -> Vec<Raw> {
-    let j = if s.is(k + 1, "table") { k + 2 } else { k + 1 };
+    let j = if s.keyword(k + 1, "table") {
+        k + 2
+    } else {
+        k + 1
+    };
     let verb = if s.is(k, "lock") {
         "LOCK TABLE"
     } else {
@@ -5109,6 +5144,70 @@ fn a_quoted_only_is_a_table_name() {
         findings.iter().any(|f| f.detail.contains("harvest_events")),
         "{findings:?}"
     );
+}
+
+#[test]
+fn a_quoted_table_word_is_a_table_name() {
+    for sql in [
+        "LOCK \"table\", harvest_events;",
+        "TRUNCATE \"table\", harvest_events;",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert!(
+            findings.iter().any(|f| f.detail.contains("harvest_events")),
+            "{sql}\n{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_routine_that_calls_a_locking_routine_locks() {
+    let inner = "CREATE PROCEDURE inner_p() LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;";
+    let middle = "CREATE FUNCTION middle_f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                  CALL inner_p();\nEND $$;";
+    let outer = "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 PERFORM middle_f();\nEND $$;";
+    let one_file = format!("{inner}\n{middle}\n{outer}");
+    // The lock passes up the call chain, in one file or across files.
+    for history in [vec![one_file.as_str()], vec![inner, middle, outer]] {
+        let findings = lint_with_history(&history, "SELECT outer_f();", true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{history:?}\n{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_routine_that_calls_a_clearing_routine_clears() {
+    let inner = "CREATE PROCEDURE inner_p() LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 PERFORM set_config('lock_timeout', '0', false);\nEND $$;";
+    let middle = "CREATE FUNCTION middle_f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                  CALL inner_p();\nEND $$;";
+    let outer = "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 PERFORM middle_f();\nEND $$;";
+    let one_file = format!("{inner}\n{middle}\n{outer}");
+    let sql = "SET LOCAL lock_timeout = '5s';\nSELECT outer_f();\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let unbounded = |findings: &[Finding]| {
+        findings
+            .iter()
+            .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events"))
+    };
+    // The clear passes up the call chain, in one file or across files.
+    for history in [vec![one_file.as_str()], vec![inner, middle, outer]] {
+        let findings = lint_with_history(&history, sql, true);
+        assert!(unbounded(&findings), "{history:?}\n{findings:?}");
+    }
+    // In the same file, the call clears the bound too.
+    let sql = format!(
+        "{one_file}\nSET LOCAL lock_timeout = '5s';\nSELECT outer_f();\n\
+         ALTER TABLE harvest_events ADD COLUMN x INT;"
+    );
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(unbounded(&findings), "{findings:?}");
 }
 
 #[test]

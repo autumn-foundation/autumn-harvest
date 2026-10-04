@@ -126,7 +126,8 @@ ends the bound, because the lint cannot read the body it reaches. Such a
 `CALL`, and any call of a locking routine from an earlier migration, also
 counts as a lock on an unknown table. A bound covers that lock only when the
 routine is known to lock and known not to clear. Otherwise the body may clear
-the bound before it locks, so no bound covers the call.
+the bound before it locks, so no bound covers the call. A routine that calls a
+locking routine counts as a locking routine too.
 A call of a clearing routine that an earlier migration created ends the bound
 too. Set the bound again after the call.
 
