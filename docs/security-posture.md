@@ -733,9 +733,28 @@ let harvest = HarvestBuilder::new()
 
 Use `aead_payload_codec_key`, not `payload_codec`, from the first deployment.
 It writes the key id into each envelope, so a later rotation needs no
-`legacy` key. In a fleet with more than one process, also activate the first
-key with `codec_rotation::activate_codec_key`. That call records the key and
-checks that every worker can read it.
+`legacy` key.
+
+The first key registered becomes active at once. That is safe for one
+process. In a fleet with more than one process, an upgraded process could
+then write keyed envelopes before every reader can decode them. So, for a
+fleet, do the rollout in two steps:
+
+1. Register `IdentityCodec` under `CODEC_LEGACY_KEY_ID` before the AEAD
+   codec. The legacy key stays active, so writes do not change. Deploy this
+   build to every process.
+2. Call `codec_rotation::activate_codec_key` for the AEAD key id. That call
+   checks that every live worker can read the key, records it, and then
+   switches new writes to it.
+
+```rust,ignore
+use autumn_harvest::payload_codec::{CODEC_LEGACY_KEY_ID, IdentityCodec};
+
+let harvest = HarvestBuilder::new()
+    .payload_codec_key(CODEC_LEGACY_KEY_ID, IdentityCodec)
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
+    .try_build()?;
+```
 
 A deployment that already uses `payload_codec(AeadCodec)` has history with no
 `kid`. Keep that `payload_codec` call when you add keyed codecs. The kid-less
@@ -751,9 +770,14 @@ key well before the limit, and at once after a key leak.
 
 To rotate, load a codec for the new key id and register it. Activate it with
 `codec_rotation::activate_codec_key`. The issue #948 sweep then re-encrypts
-stored history under the new key. After the sweep, retire the old key. Do not
-destroy the old key material yet. The sweep does not re-encrypt offloaded
-blobs. See "What zero does and does not authorise" in
+stored history under the new key.
+
+The sweep does not re-encrypt offloaded blobs (issue #524). Retirement
+removes the old codec from the registry, so the read path can no longer
+decode a blob that the old key encrypted. If you use payload offloading,
+re-key the offloaded blobs before you retire the old key. Then retire the old
+key. Destroy the old key material only after that. See "What zero does and
+does not authorise" in
 [`operations/codec-key-rotation.md`](operations/codec-key-rotation.md).
 `replay_fidelity_is_byte_identical_across_a_sweep` proves that replay stays
 byte-identical across a sweep with this codec.

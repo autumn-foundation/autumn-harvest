@@ -1030,6 +1030,30 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_identity_key_keeps_writes_unchanged_until_activation() {
+        // The fleet rollout recipe in `docs/security-posture.md`.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key(
+                crate::payload_codec::CODEC_LEGACY_KEY_ID,
+                Arc::new(crate::payload_codec::IdentityCodec),
+            )
+            .unwrap();
+        codec("2026-10", KEY_A).register_with(&codecs).unwrap();
+        assert_eq!(
+            codecs.active_key_id(),
+            crate::payload_codec::CODEC_LEGACY_KEY_ID
+        );
+        let payload = json!({"ssn": "123-45-6789"});
+        assert_eq!(codecs.encode_payload(&payload).unwrap(), payload);
+
+        codecs.set_active_key("2026-10").unwrap();
+        let stored = codecs.encode_payload(&payload).unwrap();
+        assert_eq!(codec_envelope_key_id(&stored), Some("2026-10"));
+        assert_eq!(codecs.decode_payload(&stored).unwrap(), payload);
+    }
+
+    #[test]
     fn rotation_re_encrypts_under_the_new_key_version() {
         let codecs = PayloadCodecs::default();
         codec("k1", KEY_A).register_with(&codecs).unwrap();
