@@ -789,6 +789,15 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
     ] {
         assert!(metrics.has(&wanted), "missing {wanted:?}");
     }
+    // A single-pool worker tags every wait with its own pool. The
+    // process-global sharded pool does not change the label.
+    assert!(
+        metrics
+            .samples()
+            .iter()
+            .all(|s| !matches!(s, Sample::PoolWait { shard } if *shard != 0)),
+        "every pool wait carries the label of the worker pool"
+    );
 
     worker.shutdown();
     handle.await.expect("worker joins");

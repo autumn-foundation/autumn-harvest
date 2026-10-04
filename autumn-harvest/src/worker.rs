@@ -6090,29 +6090,6 @@ pub(crate) fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
     u16::try_from(raw).unwrap_or(0)
 }
 
-/// The `shard` metric label of the pool that serves `exec_id` (issue #1815).
-///
-/// With a global sharded pool, the label follows its routing. An unencoded id
-/// routes to the default shard, and a retired shard forwards to its successor.
-/// So heartbeat waits line up with the claim path and the pool gauges. With no
-/// global sharded pool, an unencoded id takes shard 0, as in a single-pool
-/// worker.
-fn pool_shard_label(exec_id: ExecutionId) -> u16 {
-    let routed = crate::shard::GLOBAL_SHARDED_POOL
-        .read()
-        .ok()
-        .and_then(|pool| pool.as_ref().map(|p| p.routed_shard_for_execution(exec_id)));
-    let shard = routed.unwrap_or_else(|| {
-        let shard = exec_id.shard();
-        if shard.is_unencoded() {
-            ShardId::new(0)
-        } else {
-            shard
-        }
-    });
-    shard_metric_label(shard)
-}
-
 /// The `shard_assignments` slice a single per-shard monitor should scan
 /// (issue #961 review, Codex P1).
 ///
@@ -15487,6 +15464,7 @@ async fn process_activity_task(
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
     task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
+    pool_shard: u16,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -15809,7 +15787,7 @@ async fn process_activity_task(
         pool.clone(),
         cancel.clone(),
         Arc::clone(&registry.telemetry().metrics),
-        pool_shard_label(exec_id),
+        pool_shard,
     );
     let trace_carrier = task
         .trace_context
@@ -23723,6 +23701,8 @@ async fn process_task(
     workflow_body_timeout: Option<Duration>,
     // Issue #1815: the activity path records each attempt here.
     task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
+    // Issue #1815: the `shard` label of `pool`.
+    pool_shard: u16,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Issue #804 (Codex round-22 P2): the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
@@ -23788,6 +23768,7 @@ async fn process_task(
                 max_concurrent_sessions,
                 session_slots_in_use,
                 task_outcomes,
+                pool_shard,
             )
             .await;
             // Acquire only if we actually need to act on a capability miss or
@@ -30899,7 +30880,7 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                self.dispatch_task(task, pool, reservation, None);
+                self.dispatch_task(task, pool, shard, reservation, None);
                 ReferenceDisposition::Dispatched(lease)
             }
             Ok(None) => {
@@ -31978,7 +31959,7 @@ impl Worker {
                             "claimed task (weighted)"
                         );
                         let permit = permits.take(&task.task_type);
-                        self.dispatch_task(task, pool, None, permit);
+                        self.dispatch_task(task, pool, shard, None, permit);
                         return true;
                     }
                     Ok(None) => {
@@ -32029,7 +32010,7 @@ impl Worker {
                 // includes the `PENDING` wait behind a saturated worker (issue
                 // #1787) and the short permit wait after the claim.
                 let permit = permits.take(&task.task_type);
-                self.dispatch_task(task, pool, None, permit);
+                self.dispatch_task(task, pool, shard, None, permit);
                 true
             }
             Ok(None) => {
@@ -32047,11 +32028,15 @@ impl Worker {
     ///
     /// `held_permit` is the pool permit the poll gate took before the claim
     /// (issue #1787). Without it, the task acquires a permit on spawn.
+    ///
+    /// `shard` is the shard that `pool` serves. Its label tags the activity
+    /// heartbeat wait, as on the claim path (issue #1815).
     #[allow(clippy::too_many_lines)]
     fn dispatch_task(
         &self,
         task: TaskQueueItem,
         pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
         reservation: Option<DispatchReservation>,
         held_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
@@ -32127,6 +32112,7 @@ impl Worker {
             .record_task_dispatched(&task.queue_name);
 
         let pool = pool.clone();
+        let pool_shard = shard.map_or(0, shard_metric_label);
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
@@ -32281,6 +32267,7 @@ impl Worker {
                     capability_miss_policy,
                     Some(workflow_task_timeout),
                     &task_outcomes,
+                    pool_shard,
                 )
                 .await;
                 record_workflow_task_outcome(&task_outcomes, &outcome, dispatched_at);
@@ -32504,6 +32491,7 @@ impl Worker {
                     // not a workflow task" path, which was never wrapped.
                     None,
                     &task_outcomes,
+                    pool_shard,
                 )
                 .await;
                 // An activity records its own attempt in `process_activity_task`.
@@ -40023,21 +40011,6 @@ mod tests {
             reason.contains("never missed this task"),
             "the operator's next step is the live peer, not the deploy: {reason}"
         );
-    }
-
-    /// Issue #1815: an unencoded execution id reports its default shard pool,
-    /// never the `0xFFFF` sentinel.
-    #[test]
-    fn pool_shard_label_resolves_the_unencoded_sentinel() {
-        use crate::types::{ExecutionId, ShardId};
-        let encoded = ExecutionId::new_for_shard(ShardId::new(3));
-        assert_eq!(pool_shard_label(encoded), 3);
-        let legacy = ExecutionId::new();
-        assert!(
-            legacy.shard().is_unencoded(),
-            "`ExecutionId::new` is unencoded"
-        );
-        assert_ne!(pool_shard_label(legacy), u16::MAX);
     }
 
     /// Issue #1815: two pools on one shard and sink sum. A pool that two
