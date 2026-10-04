@@ -1744,17 +1744,23 @@ fn call_target<'a>(s: &Stmts<'a>, k: usize, known: &BTreeSet<&str>) -> Option<&'
 /// The range starts at the `CREATE TABLE`. It ends at the first later
 /// `DROP TABLE`, `ALTER TABLE ... RENAME TO` or `SET SCHEMA` of that name, or
 /// at any later `ROLLBACK`, which may undo the create. A `search_path` change
-/// ends the range of an unqualified name. After that the name can mean the hot
-/// table again.
+/// ends the range of an unqualified name. So does a `COMMIT` after such a
+/// change, because it restores a local value. After that the name can mean
+/// the hot table again.
 fn new_table_spans(
     s: &Stmts,
     created: &BTreeMap<String, usize>,
 ) -> BTreeMap<String, (usize, usize)> {
     let toks = s.toks;
     let mut ends: Vec<(SpanEnd, usize)> = Vec::new();
+    let mut path_changed = false;
     for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
+        let commit = s.is(k, "commit") || (s.is(k, "end") && toks[k].depth == 0);
         if s.is(k, "rollback") || s.is(k, "abort") {
             ends.push((SpanEnd::All, k));
+        } else if commit && path_changed {
+            // A `COMMIT` restores a local `search_path` value.
+            ends.push((SpanEnd::Unqualified, k));
         } else if s.is(k, "drop") && s.is(k + 1, "table") {
             for name in s.name_list(s.skip_if_exists(k + 2)) {
                 ends.push((SpanEnd::Name(name), k));
@@ -1769,6 +1775,7 @@ fn new_table_spans(
             let end = s.statement_table(k).map_or(SpanEnd::All, SpanEnd::Name);
             ends.push((end, k));
         } else if changes_search_path(s, k) {
+            path_changed = true;
             ends.push((SpanEnd::Unqualified, k));
         }
     }
@@ -4793,6 +4800,27 @@ fn a_call_may_clear_the_bound() {
     // A known body with no timeout change keeps the bound.
     let sql = format!("{set}{}CALL p();\n{lock}", procedure(keeps));
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_commit_ends_a_new_table_after_a_search_path_change() {
+    for path in [
+        "SET LOCAL search_path = scratch, public;",
+        "SELECT set_config('search_path', 'scratch, public', true);",
+    ] {
+        for end in ["COMMIT;", "END;"] {
+            let sql = format!(
+                "{path}\nCREATE TABLE harvest_events (id BIGINT);\n{end}\n\
+                 ALTER TABLE harvest_events ADD COLUMN x INT;"
+            );
+            let findings = lint_with_history(&[], &sql, true);
+            assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        }
+    }
+    // Without a `search_path` change, the new table stays exempt.
+    let sql = "CREATE TABLE harvest_events (id BIGINT);\nCOMMIT;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
