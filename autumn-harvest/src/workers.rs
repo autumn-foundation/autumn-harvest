@@ -596,33 +596,46 @@ impl ProcessOutlierFlags {
     /// local worker is an outlier.
     #[must_use]
     pub fn set(&self, worker_id: &str, flagged: &[OutlierDimension]) -> Vec<OutlierDimension> {
-        let mut verdicts = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        verdicts.insert(worker_id.to_owned(), flagged.to_vec());
-        let any: Vec<OutlierDimension> = OutlierDimension::ALL
-            .into_iter()
-            .filter(|d| verdicts.values().any(|v| v.contains(d)))
-            .collect();
-        drop(verdicts);
-        any
+        self.update(worker_id, Some(flagged), |_| {})
     }
 
     /// Forget `worker_id`, for example when its heartbeat stops, and return
     /// the dimensions on which any remaining local worker is an outlier.
     #[must_use]
     pub fn remove(&self, worker_id: &str) -> Vec<OutlierDimension> {
+        self.update(worker_id, None, |_| {})
+    }
+
+    /// Set (`Some`) or forget (`None`) `worker_id`'s verdict, then pass the OR
+    /// of all verdicts to `emit` and return it.
+    ///
+    /// `emit` runs while the lock is held. Two workers that update at once
+    /// then emit in the order of their updates, so a stale 0 cannot overwrite
+    /// a newer 1.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn update(
+        &self,
+        worker_id: &str,
+        flagged: Option<&[OutlierDimension]>,
+        emit: impl FnOnce(&[OutlierDimension]),
+    ) -> Vec<OutlierDimension> {
         let mut verdicts = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        verdicts.remove(worker_id);
+        match flagged {
+            Some(flagged) => {
+                verdicts.insert(worker_id.to_owned(), flagged.to_vec());
+            }
+            None => {
+                verdicts.remove(worker_id);
+            }
+        }
         let any: Vec<OutlierDimension> = OutlierDimension::ALL
             .into_iter()
             .filter(|d| verdicts.values().any(|v| v.contains(d)))
             .collect();
-        drop(verdicts);
+        emit(&any);
         any
     }
 }
@@ -669,8 +682,9 @@ impl OutlierProbe {
     /// Record `flagged` as this worker's verdict and set the gauge to the OR
     /// of every local worker's verdict.
     fn publish(&self, worker_id: &str, flagged: &[OutlierDimension]) {
-        let any = self.process_flags.set(worker_id, flagged);
-        self.emit(&any);
+        let _ = self
+            .process_flags
+            .update(worker_id, Some(flagged), |any| self.emit(any));
     }
 
     fn emit(&self, any: &[OutlierDimension]) {
@@ -698,8 +712,9 @@ impl OutlierProbe {
     pub fn retire(&self, worker_id: &str) {
         self.shard_peers.clear(self.slot);
         if self.compare {
-            let any = self.process_flags.remove(worker_id);
-            self.emit(&any);
+            let _ = self
+                .process_flags
+                .update(worker_id, None, |any| self.emit(any));
         }
     }
 }
@@ -2396,6 +2411,11 @@ mod tests {
         assert_eq!(flags.set("sick", &[]), vec![LatencyP99]);
         // A stopped worker leaves the map, so its flag cannot linger.
         assert_eq!(flags.remove("slow"), Vec::new());
+        // The emit callback sees the OR computed under the same lock.
+        let mut seen = Vec::new();
+        let any = flags.update("sick", Some(&[FailureRatio]), |any| seen = any.to_vec());
+        assert_eq!(seen, any);
+        assert_eq!(seen, vec![FailureRatio]);
     }
 
     /// Issue #1815: workers that share a recorder share verdicts, and a
