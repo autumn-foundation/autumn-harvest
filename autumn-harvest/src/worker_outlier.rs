@@ -135,12 +135,9 @@ impl TaskOutcomeWindow {
     #[must_use]
     pub fn snapshot_at(&self, now: Instant) -> WorkerTaskStats {
         let mut samples = self.lock();
-        while samples
-            .front()
-            .is_some_and(|s| now.saturating_duration_since(s.at) > self.max_age)
-        {
-            samples.pop_front();
-        }
+        // Two threads can insert out of time order, so an expired sample is
+        // not always at the front. Drop every expired sample.
+        samples.retain(|s| now.saturating_duration_since(s.at) <= self.max_age);
         let mut latencies: Vec<Duration> = samples.iter().map(|s| s.latency).collect();
         let failures = samples.iter().filter(|s| s.failed).count();
         drop(samples);
@@ -546,6 +543,22 @@ mod tests {
         let late = window.snapshot_at(start + Duration::from_secs(75));
         assert_eq!((late.tasks, late.failures), (1, 0));
         assert_eq!(late.p99_latency_ms, Some(10));
+    }
+
+    #[test]
+    fn window_drops_expired_samples_inserted_out_of_order() {
+        let window = TaskOutcomeWindow::new(100, Duration::from_secs(60));
+        let start = Instant::now();
+        // The newer success lands first, then the older failure.
+        window.record_at(
+            start + Duration::from_secs(30),
+            false,
+            Duration::from_millis(10),
+        );
+        window.record_at(start, true, Duration::from_millis(500));
+        let snap = window.snapshot_at(start + Duration::from_secs(75));
+        assert_eq!((snap.tasks, snap.failures), (1, 0));
+        assert_eq!(snap.p99_latency_ms, Some(10));
     }
 
     #[test]
