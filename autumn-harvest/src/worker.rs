@@ -6090,26 +6090,27 @@ pub(crate) fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
     u16::try_from(raw).unwrap_or(0)
 }
 
-/// The `shard` metric label of the pool that serves `shard` (issue #1815).
+/// The `shard` metric label of the pool that serves `exec_id` (issue #1815).
 ///
-/// An unencoded id, from an execution that predates sharding, routes to the
-/// default shard's pool. It takes that shard's label, so its pool waits line
-/// up with the claim path and the pool gauges. With no global sharded pool,
-/// the default shard is shard 0, as in a single-pool worker.
-fn pool_shard_label(shard: crate::types::ShardId) -> u16 {
-    let resolved = if shard.is_unencoded() {
-        crate::shard::GLOBAL_SHARDED_POOL
-            .read()
-            .ok()
-            .and_then(|pool| {
-                pool.as_ref()
-                    .map(crate::shard::ShardedDbPool::default_shard)
-            })
-            .unwrap_or_else(|| crate::types::ShardId::new(0))
-    } else {
-        shard
-    };
-    shard_metric_label(resolved)
+/// With a global sharded pool, the label follows its routing. An unencoded id
+/// routes to the default shard, and a retired shard forwards to its successor.
+/// So heartbeat waits line up with the claim path and the pool gauges. With no
+/// global sharded pool, an unencoded id takes shard 0, as in a single-pool
+/// worker.
+fn pool_shard_label(exec_id: ExecutionId) -> u16 {
+    let routed = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|pool| pool.as_ref().map(|p| p.routed_shard_for_execution(exec_id)));
+    let shard = routed.unwrap_or_else(|| {
+        let shard = exec_id.shard();
+        if shard.is_unencoded() {
+            ShardId::new(0)
+        } else {
+            shard
+        }
+    });
+    shard_metric_label(shard)
 }
 
 /// The `shard_assignments` slice a single per-shard monitor should scan
@@ -15808,7 +15809,7 @@ async fn process_activity_task(
         pool.clone(),
         cancel.clone(),
         Arc::clone(&registry.telemetry().metrics),
-        pool_shard_label(exec_id.shard()),
+        pool_shard_label(exec_id),
     );
     let trace_carrier = task
         .trace_context
@@ -40028,9 +40029,15 @@ mod tests {
     /// never the `0xFFFF` sentinel.
     #[test]
     fn pool_shard_label_resolves_the_unencoded_sentinel() {
-        use crate::types::ShardId;
-        assert_eq!(pool_shard_label(ShardId::new(3)), 3);
-        assert_ne!(pool_shard_label(ShardId::UNENCODED), u16::MAX);
+        use crate::types::{ExecutionId, ShardId};
+        let encoded = ExecutionId::new_for_shard(ShardId::new(3));
+        assert_eq!(pool_shard_label(encoded), 3);
+        let legacy = ExecutionId::new();
+        assert!(
+            legacy.shard().is_unencoded(),
+            "`ExecutionId::new` is unencoded"
+        );
+        assert_ne!(pool_shard_label(legacy), u16::MAX);
     }
 
     /// Issue #1815: two pools on one shard and sink sum. A pool that two
