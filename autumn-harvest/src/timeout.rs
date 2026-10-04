@@ -1634,8 +1634,13 @@ async fn enforce_activity_timeout(
             return other.map(|_| ());
         }
     };
-    if let Some(breakers) = circuit_breakers {
-        breakers.confirm_claim_timed_out(activity_name, claim_key, std::time::Instant::now());
+    // A timed-out probe re-opens the breaker here. Record that trip, since
+    // `on_external_failure` below skips a breaker that is already open.
+    if let Some(breakers) = circuit_breakers
+        && breakers.confirm_claim_timed_out(activity_name, claim_key, std::time::Instant::now())
+            == Some(crate::circuit_breaker::CircuitTransition::Tripped)
+    {
+        metrics.record_circuit_tripped(activity_name);
     }
     if enforced.retried {
         metrics.record_activity_retried(activity_name, &task.queue_name);

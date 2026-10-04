@@ -571,18 +571,20 @@ impl CircuitBreakerRegistry {
     /// The enforcer timed `claim` out (issue #1809). The claim's probe slot,
     /// if it holds one, is released now, so a stuck handler cannot keep the
     /// breaker half-open. A held result is dropped. A later result does not
-    /// count.
-    pub fn confirm_claim_timed_out(&self, activity_name: &str, claim: ClaimKey, now: Instant) {
+    /// count. A timed-out probe is a failed probe, so this returns
+    /// [`CircuitTransition::Tripped`] when it re-opens the breaker.
+    pub fn confirm_claim_timed_out(
+        &self,
+        activity_name: &str,
+        claim: ClaimKey,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
         if !self.policies.contains_key(activity_name) {
-            return;
+            return None;
         }
         let mut states = self.lock();
-        let Some(st) = states.get_mut(activity_name) else {
-            return;
-        };
-        let Some(entry) = st.in_flight_claims.get(&claim).copied() else {
-            return;
-        };
+        let st = states.get_mut(activity_name)?;
+        let entry = st.in_flight_claims.get(&claim).copied()?;
         match entry.state {
             ClaimState::Held(..) => {
                 st.in_flight_claims.remove(&claim);
@@ -592,9 +594,9 @@ impl CircuitBreakerRegistry {
                     entry.state = ClaimState::TimedOut;
                 }
             }
-            ClaimState::Running | ClaimState::TimedOut => return,
+            ClaimState::Running | ClaimState::TimedOut => return None,
         }
-        apply_cancelled(st, entry.token, now);
+        apply_cancelled(st, entry.token, now).then_some(CircuitTransition::Tripped)
     }
 
     /// The enforcer did not time `claim` out after all (issue #1809). A held
@@ -891,15 +893,18 @@ fn apply_result(
 }
 
 /// Release the breaker accounting of a cancelled or timed-out dispatch.
-fn apply_cancelled(st: &mut BreakerState, token: DispatchToken, now: Instant) {
+/// Returns whether it released a probe and re-opened the breaker.
+fn apply_cancelled(st: &mut BreakerState, token: DispatchToken, now: Instant) -> bool {
     if st.forced_open || token.generation != st.generation {
-        return;
+        return false;
     }
     // Only the in-flight half-open probe needs releasing; everything else
     // (closed-state cancellation, fully-open straggler) is a no-op.
     if token.is_probe && st.phase == CircuitPhase::HalfOpen && st.probe_in_flight {
         st.trip(now);
+        return true;
     }
+    false
 }
 
 #[cfg(test)]
@@ -1001,7 +1006,7 @@ mod tests {
         let token = dispatch(&reg, t0);
         reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
-        reg.confirm_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
         let _ = reg.on_external_failure("send_email", t0);
         assert_eq!(rolling(&reg, t0), 1);
 
@@ -1025,7 +1030,7 @@ mod tests {
         reg.begin_claim("send_email", claim(1), TOKEN);
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
         reg.mark_claim_timed_out("send_email", claim(1));
-        reg.confirm_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
         let _ = reg.on_external_failure("send_email", t0);
         assert_eq!(rolling(&reg, t0), 1);
     }
@@ -1043,7 +1048,11 @@ mod tests {
         assert!(probe.is_probe());
         reg.begin_claim("send_email", claim(1), probe);
         reg.mark_claim_timed_out("send_email", claim(1));
-        reg.confirm_claim_timed_out("send_email", claim(1), t1);
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), t1),
+            Some(CircuitTransition::Tripped),
+            "a timed-out probe re-trips the breaker"
+        );
         // The handler has not returned. The confirm alone frees the slot.
         assert_eq!(
             reg.snapshot("send_email", t1).expect("tracked").state,
@@ -1105,7 +1114,7 @@ mod tests {
         reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
-        reg.confirm_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
         assert_eq!(
             rolling(&reg, t0),
             1,
@@ -1128,9 +1137,9 @@ mod tests {
             reg.mark_claim_timed_out("send_email", claim(1));
             if rollback_first {
                 let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
-                reg.confirm_claim_timed_out("send_email", claim(1), t0);
+                let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
             } else {
-                reg.confirm_claim_timed_out("send_email", claim(1), t0);
+                let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
                 let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
             }
             let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
