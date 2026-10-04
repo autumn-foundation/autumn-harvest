@@ -123,7 +123,9 @@ number of parameters. The lint does not compare parameter types, so a call
 also ends the bound when any such `CREATE` may clear it. Any other `CALL` also
 ends the bound, because the lint cannot read the body it reaches. Such a
 `CALL`, and any call of a locking routine from an earlier migration, also
-counts as a lock on an unknown table, so a bound must be in force before it.
+counts as a lock on an unknown table. A bound covers that lock only when the
+routine is known to lock and known not to clear. Otherwise the body may clear
+the bound before it locks, so no bound covers the call.
 A call of a clearing routine that an earlier migration created ends the bound
 too. Set the bound again after the call.
 
@@ -281,7 +283,8 @@ that no longer matches a finding also fails the build.
   A statement that may turn the setting off counts as a lock on an unknown
   table that no bound covers. While it is off, each statement with a
   backslash counts the same way, later in the file and in later migrations,
-  until a reset.
+  until a reset. A `ROLLBACK` restores the value from the start of its
+  transaction.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
   call of a routine in another language, counts as a lock on an unknown table.
   No bound covers that lock, because the code may clear the bound first. It

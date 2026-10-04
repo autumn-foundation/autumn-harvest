@@ -514,6 +514,7 @@ fn bound_in_force(analysis: &Analysis, hit: &Hit) -> bool {
         FOREIGN_CODE,
         NONSTANDARD_STRINGS,
         ROUTINE_RESET,
+        UNREAD_CLEARING_CALL,
     ]
     .contains(&hit.verb)
     {
@@ -1845,7 +1846,26 @@ fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
         .filter(|(_, text)| text.contains('\\'))
         .map(|(n, _)| n + 1)
         .collect();
+    // The value when the transaction began, and whether the transaction has
+    // turned the setting off. A rollback restores the saved value. A rollback
+    // to a savepoint may restore any value from the transaction.
+    let mut saved = history.nonstandard_strings;
+    let mut any_off = saved;
     for k in 0..s.toks.len() {
+        if s.starts[k] == k {
+            let end = s.keyword(k, "end") && s.toks[k].depth == 0;
+            if s.keyword(k, "commit") || end {
+                saved = history.nonstandard_strings;
+                any_off = saved;
+            } else if s.keyword(k, "rollback") || s.keyword(k, "abort") {
+                let to_savepoint = (k + 1..=k + 2).any(|j| s.keyword(j, "to"));
+                history.nonstandard_strings = if to_savepoint {
+                    history.nonstandard_strings || any_off
+                } else {
+                    saved
+                };
+            }
+        }
         let top_start = s.starts[k] == k && s.toks[k].depth == 0 && !s.is_punct(k, ';');
         if top_start && history.nonstandard_strings {
             let last = s.end(k).saturating_sub(1).max(k);
@@ -1858,6 +1878,7 @@ fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
             Some(false) => {
                 raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
                 history.nonstandard_strings = true;
+                any_off = true;
             }
             Some(true) => history.nonstandard_strings = false,
             None => {}
@@ -2074,7 +2095,15 @@ fn call_clears(
             });
         let unread = s.keyword(call.at, "call") || inherited_locking.contains(callee);
         if !foreign && !resolved && unread {
-            raws.push(Raw::lock(call.at, UNREAD_CALL, None));
+            // A routine that may clear the bound before it locks makes the
+            // outside bound worthless. An unknown routine may do that too.
+            let may_clear = inherited.contains(callee) || !inherited_locking.contains(callee);
+            let verb = if may_clear {
+                UNREAD_CLEARING_CALL
+            } else {
+                UNREAD_CALL
+            };
+            raws.push(Raw::lock(call.at, verb, None));
         }
         if keeps(call, &clearing) {
             continue;
@@ -2136,6 +2165,10 @@ fn record_routines(
 
 /// The verb of a lock that a call of an unread routine may take.
 const UNREAD_CALL: &str = "call of a routine the lint cannot read";
+
+/// The verb of a lock that a call of an unread routine may take after it
+/// clears the bound. No outside bound covers it.
+const UNREAD_CLEARING_CALL: &str = "call of a routine that may clear lock_timeout";
 
 /// The routine call at `k`, if any.
 ///
@@ -5324,15 +5357,18 @@ fn a_call_may_clear_the_bound() {
         |body: &str| format!("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\n{body} $$;\n");
     let function =
         format!("CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\n{clears} $$;\n");
-    // A body that clears, or a body from another migration, may clear the bound.
+    // A body that clears may clear the bound.
     for sql in [
         format!("{set}{}CALL p();\n{lock}", procedure(clears)),
-        format!("{set}CALL p();\n{lock}"),
         format!("{set}{function}SELECT f();\n{lock}"),
     ] {
         let findings = lint_with_history(&[], &sql, true);
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
     }
+    // An unread body is an unbounded lock, and it may clear the bound.
+    let sql = format!("{set}CALL p();\n{lock}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout; 2], "{sql}");
     // A known body with no timeout change keeps the bound.
     let sql = format!("{set}{}CALL p();\n{lock}", procedure(keeps));
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
@@ -5446,14 +5482,15 @@ fn a_call_matches_a_routine_only_by_its_full_name_and_arity() {
     let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
     let keeps = "CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$\nBEGIN\n    RAISE NOTICE 'hi';\nEND $$;\n";
     // Another schema, another arity, or a call before the create may reach another routine.
+    // Each unread call is an unbounded lock, and the ALTER loses its bound.
     for call in ["CALL other.p(1);", "CALL p();", "CALL p(1, 2);"] {
         let sql = format!("{set}{keeps}{call}\n{lock}");
         let findings = lint_with_history(&[], &sql, true);
-        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+        assert_eq!(rules(&findings), [Rule::LockTimeout; 2], "{sql}");
     }
     let sql = format!("{set}CALL p(1);\n{keeps}{lock}");
     let findings = lint_with_history(&[], &sql, true);
-    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    assert_eq!(rules(&findings), [Rule::LockTimeout; 2], "{sql}");
     // The same name and arity after the create reach the known body.
     let sql = format!("{set}{keeps}CALL p(1);\n{lock}");
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
@@ -5681,8 +5718,9 @@ fn an_unqualified_call_after_a_path_change_is_unresolved() {
         "{keeps}{clears}SET LOCAL lock_timeout = '5s';\nSET LOCAL search_path = other, public;\n\
          CALL p();\nALTER TABLE harvest_events ADD COLUMN x INT;"
     );
+    // The unread call and the ALTER each lack a bound.
     let findings = lint_with_history(&[], &sql, true);
-    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    assert_eq!(rules(&findings), [Rule::LockTimeout; 2], "{sql}");
 }
 
 #[test]
@@ -5874,7 +5912,6 @@ fn a_call_of_an_unread_or_locking_routine_is_a_lock() {
     for (history, call) in [
         (vec![procedure], "CALL legacy_p();"),
         (vec![function], "SELECT legacy_f();"),
-        (vec![], "CALL mystery();"),
     ] {
         let findings = lint_with_history(&history, call, true);
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{call}");
@@ -5882,6 +5919,11 @@ fn a_call_of_an_unread_or_locking_routine_is_a_lock() {
         let sql = format!("SET LOCAL lock_timeout = '5s';\n{call}");
         assert_eq!(lint_with_history(&history, &sql, true), [], "{sql}");
     }
+    // An unknown routine may clear the bound before it locks, so no bound
+    // covers the call.
+    let sql = "SET LOCAL lock_timeout = '5s';\nCALL mystery();";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
 }
 
 #[test]
@@ -5918,6 +5960,30 @@ fn a_quoted_end_does_not_close_an_atomic_body() {
                SELECT \"end\" FROM t;\n    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+}
+
+#[test]
+fn a_call_of_a_routine_that_clears_and_locks_is_unbounded() {
+    let legacy = "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                  PERFORM set_config('lock_timeout', '0', false);\n    \
+                  ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;";
+    let sql = "SET LOCAL lock_timeout = '5s';\nCALL p();";
+    let findings = lint_with_history(&[legacy], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+}
+
+#[test]
+fn a_rollback_restores_the_conforming_strings_value() {
+    let off = "-- lock-safety: allow lock-timeout #1810 test fixture\nSET standard_conforming_strings = off;";
+    let sql = "SET standard_conforming_strings = on;\nROLLBACK;\nSET LOCAL lock_timeout = '5s';\n\
+               DO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let findings = lint_with_history(&[off], sql, false);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings")),
+        "{findings:?}"
+    );
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
