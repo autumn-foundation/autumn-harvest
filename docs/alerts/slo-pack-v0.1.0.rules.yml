@@ -9,6 +9,7 @@
 #   burn_3d  1x     3d    6h     10%           ticket
 #
 # To tune an objective, edit its harvest:slo_objective:ratio record.
+# Each group also checks its objective (harvest_slo_objective_invalid).
 # Docs: docs/alerts/slo.md. Tests: slo-pack-v0.1.0.test.yml.
 
 groups:
@@ -27,67 +28,67 @@ groups:
         expr: |
           (
             (sum(rate(harvest_workflow_duration_count{status="failed"}[5m])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[5m])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[5m])) or vector(0))
           )
           /
           (
             (sum(rate(harvest_workflow_duration_count[5m])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[5m])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[5m])) or vector(0))
           )
 
       - record: harvest:workflow_task_error:ratio_rate30m
         expr: |
           (
             (sum(rate(harvest_workflow_duration_count{status="failed"}[30m])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[30m])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[30m])) or vector(0))
           )
           /
           (
             (sum(rate(harvest_workflow_duration_count[30m])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[30m])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[30m])) or vector(0))
           )
 
       - record: harvest:workflow_task_error:ratio_rate1h
         expr: |
           (
             (sum(rate(harvest_workflow_duration_count{status="failed"}[1h])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[1h])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[1h])) or vector(0))
           )
           /
           (
             (sum(rate(harvest_workflow_duration_count[1h])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[1h])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[1h])) or vector(0))
           )
 
       - record: harvest:workflow_task_error:ratio_rate6h
         expr: |
           (
             (sum(rate(harvest_workflow_duration_count{status="failed"}[6h])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[6h])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[6h])) or vector(0))
           )
           /
           (
             (sum(rate(harvest_workflow_duration_count[6h])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[6h])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[6h])) or vector(0))
           )
 
       - record: harvest:workflow_task_error:ratio_rate3d
         expr: |
           (
             (sum(rate(harvest_workflow_duration_count{status="failed"}[3d])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[3d])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[3d])) or vector(0))
           )
           /
           (
             (sum(rate(harvest_workflow_duration_count[3d])) or vector(0))
-            + (sum(rate(harvest_workflow_task_timeout_total[3d])) or vector(0))
+            + (sum(rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[3d])) or vector(0))
           )
 
       - alert: harvest_slo_workflow_task_burn_1h
         expr: |
-          harvest:workflow_task_error:ratio_rate1h > 14.4 * (1 - scalar(harvest:slo_objective:ratio{slo="workflow_task"}))
+          harvest:workflow_task_error:ratio_rate1h > 14.4 * (1 - scalar(max(harvest:slo_objective:ratio{slo="workflow_task"})))
           and
-          harvest:workflow_task_error:ratio_rate5m > 14.4 * (1 - scalar(harvest:slo_objective:ratio{slo="workflow_task"}))
+          harvest:workflow_task_error:ratio_rate5m > 14.4 * (1 - scalar(max(harvest:slo_objective:ratio{slo="workflow_task"})))
         labels:
           severity: page
           slo: workflow_task
@@ -99,9 +100,9 @@ groups:
 
       - alert: harvest_slo_workflow_task_burn_6h
         expr: |
-          harvest:workflow_task_error:ratio_rate6h > 6 * (1 - scalar(harvest:slo_objective:ratio{slo="workflow_task"}))
+          harvest:workflow_task_error:ratio_rate6h > 6 * (1 - scalar(max(harvest:slo_objective:ratio{slo="workflow_task"})))
           and
-          harvest:workflow_task_error:ratio_rate30m > 6 * (1 - scalar(harvest:slo_objective:ratio{slo="workflow_task"}))
+          harvest:workflow_task_error:ratio_rate30m > 6 * (1 - scalar(max(harvest:slo_objective:ratio{slo="workflow_task"})))
         labels:
           severity: page
           slo: workflow_task
@@ -113,9 +114,9 @@ groups:
 
       - alert: harvest_slo_workflow_task_burn_3d
         expr: |
-          harvest:workflow_task_error:ratio_rate3d > 1 * (1 - scalar(harvest:slo_objective:ratio{slo="workflow_task"}))
+          harvest:workflow_task_error:ratio_rate3d > 1 * (1 - scalar(max(harvest:slo_objective:ratio{slo="workflow_task"})))
           and
-          harvest:workflow_task_error:ratio_rate6h > 1 * (1 - scalar(harvest:slo_objective:ratio{slo="workflow_task"}))
+          harvest:workflow_task_error:ratio_rate6h > 1 * (1 - scalar(max(harvest:slo_objective:ratio{slo="workflow_task"})))
         labels:
           severity: ticket
           slo: workflow_task
@@ -125,8 +126,27 @@ groups:
           description: "The workflow-task error ratio is over 1x budget in the 3d and 6h windows. At this rate, the 30-day budget runs out before the period ends."
           runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_workflow_task
 
+      # A bad tune breaks the alerts above with no error. A missing
+      # objective makes them silent. An objective of 1 or more makes the
+      # budget zero or negative, so they never reset. This alert reads the
+      # record in its own group, so the evaluation order is fixed.
+      - alert: harvest_slo_objective_invalid
+        expr: |
+          absent(harvest:slo_objective:ratio{slo="workflow_task"})
+          or harvest:slo_objective:ratio{slo="workflow_task"} <= 0
+          or harvest:slo_objective:ratio{slo="workflow_task"} >= 1
+        for: 10m
+        labels:
+          severity: ticket
+          slo: workflow_task
+        annotations:
+          summary: "An SLO objective is missing or out of range."
+          description: "Each SLO needs one harvest:slo_objective:ratio record with a value above 0 and below 1. Until you fix it, the burn alerts for that SLO are wrong."
+          runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_objective_invalid
+
   # Schedule-to-start latency. Objective: 99% of tasks start within 5 s.
   # The SLI is the share of tasks slower than the 5 s bucket bound.
+  # Both sides read buckets, so a worker without buckets adds nothing.
   # It needs bucketed histograms. See docs/telemetry.md.
   - name: harvest-slo-schedule-to-start
     rules:
@@ -139,53 +159,53 @@ groups:
       - record: harvest:schedule_to_start_slow:ratio_rate5m
         expr: |
           (
-            sum(rate(harvest_queue_schedule_to_start_count[5m]))
+            sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[5m]))
             - sum(rate(harvest_queue_schedule_to_start_bucket{le=~"5(\\.0+)?"}[5m]))
           )
           /
-          sum(rate(harvest_queue_schedule_to_start_count[5m]))
+          sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[5m]))
 
       - record: harvest:schedule_to_start_slow:ratio_rate30m
         expr: |
           (
-            sum(rate(harvest_queue_schedule_to_start_count[30m]))
+            sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[30m]))
             - sum(rate(harvest_queue_schedule_to_start_bucket{le=~"5(\\.0+)?"}[30m]))
           )
           /
-          sum(rate(harvest_queue_schedule_to_start_count[30m]))
+          sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[30m]))
 
       - record: harvest:schedule_to_start_slow:ratio_rate1h
         expr: |
           (
-            sum(rate(harvest_queue_schedule_to_start_count[1h]))
+            sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[1h]))
             - sum(rate(harvest_queue_schedule_to_start_bucket{le=~"5(\\.0+)?"}[1h]))
           )
           /
-          sum(rate(harvest_queue_schedule_to_start_count[1h]))
+          sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[1h]))
 
       - record: harvest:schedule_to_start_slow:ratio_rate6h
         expr: |
           (
-            sum(rate(harvest_queue_schedule_to_start_count[6h]))
+            sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[6h]))
             - sum(rate(harvest_queue_schedule_to_start_bucket{le=~"5(\\.0+)?"}[6h]))
           )
           /
-          sum(rate(harvest_queue_schedule_to_start_count[6h]))
+          sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[6h]))
 
       - record: harvest:schedule_to_start_slow:ratio_rate3d
         expr: |
           (
-            sum(rate(harvest_queue_schedule_to_start_count[3d]))
+            sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[3d]))
             - sum(rate(harvest_queue_schedule_to_start_bucket{le=~"5(\\.0+)?"}[3d]))
           )
           /
-          sum(rate(harvest_queue_schedule_to_start_count[3d]))
+          sum(rate(harvest_queue_schedule_to_start_bucket{le="+Inf"}[3d]))
 
       - alert: harvest_slo_schedule_to_start_burn_1h
         expr: |
-          harvest:schedule_to_start_slow:ratio_rate1h > 14.4 * (1 - scalar(harvest:slo_objective:ratio{slo="schedule_to_start"}))
+          harvest:schedule_to_start_slow:ratio_rate1h > 14.4 * (1 - scalar(max(harvest:slo_objective:ratio{slo="schedule_to_start"})))
           and
-          harvest:schedule_to_start_slow:ratio_rate5m > 14.4 * (1 - scalar(harvest:slo_objective:ratio{slo="schedule_to_start"}))
+          harvest:schedule_to_start_slow:ratio_rate5m > 14.4 * (1 - scalar(max(harvest:slo_objective:ratio{slo="schedule_to_start"})))
         labels:
           severity: page
           slo: schedule_to_start
@@ -197,9 +217,9 @@ groups:
 
       - alert: harvest_slo_schedule_to_start_burn_6h
         expr: |
-          harvest:schedule_to_start_slow:ratio_rate6h > 6 * (1 - scalar(harvest:slo_objective:ratio{slo="schedule_to_start"}))
+          harvest:schedule_to_start_slow:ratio_rate6h > 6 * (1 - scalar(max(harvest:slo_objective:ratio{slo="schedule_to_start"})))
           and
-          harvest:schedule_to_start_slow:ratio_rate30m > 6 * (1 - scalar(harvest:slo_objective:ratio{slo="schedule_to_start"}))
+          harvest:schedule_to_start_slow:ratio_rate30m > 6 * (1 - scalar(max(harvest:slo_objective:ratio{slo="schedule_to_start"})))
         labels:
           severity: page
           slo: schedule_to_start
@@ -211,9 +231,9 @@ groups:
 
       - alert: harvest_slo_schedule_to_start_burn_3d
         expr: |
-          harvest:schedule_to_start_slow:ratio_rate3d > 1 * (1 - scalar(harvest:slo_objective:ratio{slo="schedule_to_start"}))
+          harvest:schedule_to_start_slow:ratio_rate3d > 1 * (1 - scalar(max(harvest:slo_objective:ratio{slo="schedule_to_start"})))
           and
-          harvest:schedule_to_start_slow:ratio_rate6h > 1 * (1 - scalar(harvest:slo_objective:ratio{slo="schedule_to_start"}))
+          harvest:schedule_to_start_slow:ratio_rate6h > 1 * (1 - scalar(max(harvest:slo_objective:ratio{slo="schedule_to_start"})))
         labels:
           severity: ticket
           slo: schedule_to_start
@@ -222,6 +242,24 @@ groups:
           summary: "Schedule-to-start SLO: budget burn (1x budget)."
           description: "The share of tasks that wait over 5 s to start is over 1x budget in the 3d and 6h windows. At this rate, the 30-day budget runs out before the period ends."
           runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_schedule_to_start
+
+      # A bad tune breaks the alerts above with no error. A missing
+      # objective makes them silent. An objective of 1 or more makes the
+      # budget zero or negative, so they never reset. This alert reads the
+      # record in its own group, so the evaluation order is fixed.
+      - alert: harvest_slo_objective_invalid
+        expr: |
+          absent(harvest:slo_objective:ratio{slo="schedule_to_start"})
+          or harvest:slo_objective:ratio{slo="schedule_to_start"} <= 0
+          or harvest:slo_objective:ratio{slo="schedule_to_start"} >= 1
+        for: 10m
+        labels:
+          severity: ticket
+          slo: schedule_to_start
+        annotations:
+          summary: "An SLO objective is missing or out of range."
+          description: "Each SLO needs one harvest:slo_objective:ratio record with a value above 0 and below 1. Until you fix it, the burn alerts for that SLO are wrong."
+          runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_objective_invalid
 
   # Synthetic canary success. Objective: 99% of canary probes succeed.
   # It needs the opt-in synthetic liveness canary (issue #796).
@@ -280,9 +318,9 @@ groups:
 
       - alert: harvest_slo_canary_burn_1h
         expr: |
-          harvest:canary_error:ratio_rate1h > 14.4 * (1 - scalar(harvest:slo_objective:ratio{slo="canary"}))
+          harvest:canary_error:ratio_rate1h > 14.4 * (1 - scalar(max(harvest:slo_objective:ratio{slo="canary"})))
           and
-          harvest:canary_error:ratio_rate5m > 14.4 * (1 - scalar(harvest:slo_objective:ratio{slo="canary"}))
+          harvest:canary_error:ratio_rate5m > 14.4 * (1 - scalar(max(harvest:slo_objective:ratio{slo="canary"})))
         labels:
           severity: page
           slo: canary
@@ -294,9 +332,9 @@ groups:
 
       - alert: harvest_slo_canary_burn_6h
         expr: |
-          harvest:canary_error:ratio_rate6h > 6 * (1 - scalar(harvest:slo_objective:ratio{slo="canary"}))
+          harvest:canary_error:ratio_rate6h > 6 * (1 - scalar(max(harvest:slo_objective:ratio{slo="canary"})))
           and
-          harvest:canary_error:ratio_rate30m > 6 * (1 - scalar(harvest:slo_objective:ratio{slo="canary"}))
+          harvest:canary_error:ratio_rate30m > 6 * (1 - scalar(max(harvest:slo_objective:ratio{slo="canary"})))
         labels:
           severity: page
           slo: canary
@@ -308,9 +346,9 @@ groups:
 
       - alert: harvest_slo_canary_burn_3d
         expr: |
-          harvest:canary_error:ratio_rate3d > 1 * (1 - scalar(harvest:slo_objective:ratio{slo="canary"}))
+          harvest:canary_error:ratio_rate3d > 1 * (1 - scalar(max(harvest:slo_objective:ratio{slo="canary"})))
           and
-          harvest:canary_error:ratio_rate6h > 1 * (1 - scalar(harvest:slo_objective:ratio{slo="canary"}))
+          harvest:canary_error:ratio_rate6h > 1 * (1 - scalar(max(harvest:slo_objective:ratio{slo="canary"})))
         labels:
           severity: ticket
           slo: canary
@@ -319,3 +357,21 @@ groups:
           summary: "Canary SLO: budget burn (1x budget)."
           description: "The canary probe failure ratio is over 1x budget in the 3d and 6h windows. At this rate, the 30-day budget runs out before the period ends."
           runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_canary
+
+      # A bad tune breaks the alerts above with no error. A missing
+      # objective makes them silent. An objective of 1 or more makes the
+      # budget zero or negative, so they never reset. This alert reads the
+      # record in its own group, so the evaluation order is fixed.
+      - alert: harvest_slo_objective_invalid
+        expr: |
+          absent(harvest:slo_objective:ratio{slo="canary"})
+          or harvest:slo_objective:ratio{slo="canary"} <= 0
+          or harvest:slo_objective:ratio{slo="canary"} >= 1
+        for: 10m
+        labels:
+          severity: ticket
+          slo: canary
+        annotations:
+          summary: "An SLO objective is missing or out of range."
+          description: "Each SLO needs one harvest:slo_objective:ratio record with a value above 0 and below 1. Until you fix it, the burn alerts for that SLO are wrong."
+          runbook_url: docs/runbooks/harvest-alerts.md#harvest_slo_objective_invalid

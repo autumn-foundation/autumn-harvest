@@ -3377,9 +3377,9 @@ burn-rate pack (`docs/alerts/slo-pack-v0.1.0.rules.yml`, issue #1816):
 and its 99.9% objective are in [`docs/alerts/slo.md`](../alerts/slo.md).
 
 A workflow task is one executor cycle. A task fails when its cycle ends the
-run as `failed`, or when it times out and the worker abandons it
-(`harvest.workflow.task_timeout`). A `burn_1h` or `burn_6h` alert is a page.
-A `burn_3d` alert is a ticket.
+run as `failed`, or when it runs longer than `workflow_task_timeout` and the
+worker abandons it (`harvest.workflow.task_timeout`). A `burn_1h` or
+`burn_6h` alert is a page. A `burn_3d` alert is a ticket.
 
 ### Triage steps
 
@@ -3390,14 +3390,17 @@ A `burn_3d` alert is a ticket.
    with `sum by (workflow) (rate(harvest_workflow_task_timeout_total[1h]))`.
 3. If failed cycles lead, follow
    [`harvest_workflow_failure_rate`](#harvest_workflow_failure_rate).
-4. If timeouts lead, run `harvest worker health --output json`. Then
-   follow [`harvest_worker_saturation`](#harvest_worker_saturation).
+4. If timeouts lead, run
+   `harvest dlq aggregate --group-by workflow_name,failure_signature`.
+   A task that times out `poison_pill_threshold` times in a row goes to
+   the DLQ. The aggregate names its workflow type.
 
 ### Likely causes
 
 - A deploy that makes a workflow fail.
 - A downstream outage that exhausts activity retries.
-- Workers that are too slow or too few, so workflow tasks time out.
+- A workflow body that blocks or does slow work, so its cycle times out.
+- A worker that gets too little CPU time to finish a cycle.
 
 ### False positives
 
@@ -3408,7 +3411,7 @@ If a workflow type fails by design, remove it from the SLI with a
 ### Safe actions
 
 Roll back the release that caused the errors. Pause the schedules that feed
-a failing workflow type. Add worker capacity if timeouts lead.
+a failing workflow type. Give workers more CPU if timeouts lead.
 
 ### Escalation criteria
 
@@ -3423,6 +3426,10 @@ burn-rate pack: `harvest_slo_schedule_to_start_burn_1h`, `_burn_6h`, and
 eligibility to start. The objective is 99% within 5 s. See
 [`docs/alerts/slo.md`](../alerts/slo.md).
 
+A task adds a sample only when it starts. A task that never starts adds no
+sample. [`harvest_queue_uncovered`](#harvest_queue_uncovered) covers that
+case.
+
 ### Triage steps
 
 1. Read the `window` label. It tells you how fast the budget burns.
@@ -3435,7 +3442,8 @@ eligibility to start. The objective is 99% within 5 s. See
 ### Likely causes
 
 - Not enough worker slots for the load.
-- No live worker polls a queue.
+- A queue had no live worker. Its held tasks start late when a worker
+  comes back, and then they burn budget.
 - A paused queue, a concurrency limit, or a rate limit holds tasks back.
 
 ### False positives
@@ -3461,8 +3469,9 @@ pack: `harvest_slo_canary_burn_1h`, `_burn_6h`, and `_burn_3d`. The SLI is
 the share of synthetic liveness probes (issue #796) that fail. The
 objective is 99%. See [`docs/alerts/slo.md`](../alerts/slo.md).
 
-A canary probe runs the full start, dispatch, activity, timer, and complete
-path. A failed probe means that this path is broken for real workflows too.
+A canary probe runs the full start, dispatch, activity, durable timer, and
+complete path. A failed probe means that this path is broken for real
+workflows too.
 
 ### Triage steps
 
@@ -3476,7 +3485,7 @@ path. A failed probe means that this path is broken for real workflows too.
 
 - No live worker polls a probe queue.
 - A shard is unready, fenced, or not writable.
-- The scheduler does not fire, so timers do not complete.
+- Durable timers do not fire, so probes time out.
 
 ### False positives
 
@@ -3486,10 +3495,46 @@ or add a worker for it.
 
 ### Safe actions
 
-Restart a stuck worker. Drain and restart a shard only through the steps in
+Restart a stuck worker. If a shard is unready, use the safe actions in
 [`harvest_shard_unready`](#harvest_shard_unready).
 
 ### Escalation criteria
 
 Escalate to the platform owner at once when every probe fails. That
 pattern means the execution path is down for all workflows.
+
+## harvest_slo_objective_invalid
+
+This ticket comes from the optional burn-rate pack. An SLO has no
+`harvest:slo_objective:ratio` record, or its value is not above 0 and
+below 1. The `slo` label names the SLO. See
+[`docs/alerts/slo.md`](../alerts/slo.md).
+
+A missing objective makes the burn alerts for that SLO silent. An
+objective of 1 or more makes the budget zero or negative, so those alerts
+fire and do not reset.
+
+### Triage steps
+
+1. Query `harvest:slo_objective:ratio` in Prometheus.
+2. Compare each `slo` label and value with the rules file that you loaded.
+
+### Likely causes
+
+- A tune that writes a percentage, such as `99.9`, in place of `0.999`.
+- A typo in the `slo` label after an edit.
+- A rules file that Prometheus did not load.
+
+### False positives
+
+None after the first 10 minutes. The `for: 10m` clause covers a restart.
+
+### Safe actions
+
+Fix the objective record and reload Prometheus. Run
+`promtool check rules` on the file before the reload.
+
+### Escalation criteria
+
+Escalate to the owner of the Prometheus rules if the record is correct
+in the file but does not appear in Prometheus.

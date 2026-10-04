@@ -1,7 +1,7 @@
 //! Guards for the optional SLO burn-rate pack (issue #1816).
 //!
 //! `promtool` proves the rules load and fire. These tests pin what
-//! `promtool` cannot see. That is the Workbook burn-rate pairs, a fixture
+//! `promtool` cannot see. These are the Workbook burn-rate pairs, a fixture
 //! for each alert, the metric names, the runbook links, CI, and the docs.
 
 use serde_yaml::Value;
@@ -18,6 +18,9 @@ const CI_PATH: &str = ".github/workflows/ci.yml";
 
 /// The record that holds each SLO objective, keyed by an `slo` label.
 const OBJECTIVE_RECORD: &str = "harvest:slo_objective:ratio";
+
+/// The alert that catches a missing or out-of-range objective.
+const OBJECTIVE_ALERT: &str = "harvest_slo_objective_invalid";
 
 /// The windows that each SLI records an error ratio over.
 const WINDOWS: &[&str] = &["5m", "30m", "1h", "6h", "3d"];
@@ -124,7 +127,10 @@ fn every_sli_records_its_objective_and_each_window() {
 fn every_alert_uses_the_workbook_burn_rate_pair() {
     let rules = all_rules();
     for sli in SLIS {
-        let budget = format!("(1 - scalar({OBJECTIVE_RECORD}{{slo=\"{}\"}}))", sli.key);
+        let budget = format!(
+            "(1 - scalar(max({OBJECTIVE_RECORD}{{slo=\"{}\"}})))",
+            sli.key
+        );
         for tier in TIERS {
             let name = alert_name(sli, tier);
             let rule = rules
@@ -250,6 +256,14 @@ fn workflow_task_ratio_survives_a_missing_series() {
             4,
             "each of the four addends must default to zero: {expr}"
         );
+        assert_eq!(
+            expr.matches(
+                r#"harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}"#
+            )
+            .count(),
+            2,
+            "canary probe timeouts belong to the canary SLI: {expr}"
+        );
     }
 }
 
@@ -265,6 +279,53 @@ fn schedule_to_start_ratio_matches_both_bucket_label_forms() {
             expr.contains(r#"le=~"5(\\.0+)?""#),
             "the bucket matcher must accept le=\"5\" and le=\"5.0\": {expr}"
         );
+        assert!(
+            expr.contains(r#"le="+Inf""#) && !expr.contains("_count"),
+            "the total must come from the +Inf bucket, not _count. A worker with \
+             no buckets still exports _count, so its tasks would read as slow: {expr}"
+        );
+    }
+}
+
+/// A bad tune makes the burn alerts silent or stuck on, with no error.
+/// Each SLO group checks its own objective, so the order is fixed.
+#[test]
+fn each_sli_group_checks_its_own_objective() {
+    let groups = read_yaml(RULES_PATH)["groups"]
+        .as_sequence()
+        .cloned()
+        .expect("groups must be a list");
+    for sli in SLIS {
+        let objective = format!("{OBJECTIVE_RECORD}{{slo=\"{}\"}}", sli.key);
+        let group = groups
+            .iter()
+            .find(|group| {
+                group["rules"].as_sequence().is_some_and(|rules| {
+                    rules.iter().any(|rule| {
+                        rule["labels"]["slo"].as_str() == Some(sli.key)
+                            && rule["record"].as_str() == Some(OBJECTIVE_RECORD)
+                    })
+                })
+            })
+            .unwrap_or_else(|| panic!("no group records the slo={} objective", sli.key));
+        let check = group["rules"]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .find(|rule| rule["alert"].as_str() == Some(OBJECTIVE_ALERT))
+            .unwrap_or_else(|| panic!("the slo={} group has no {OBJECTIVE_ALERT}", sli.key));
+        let expr = squeeze(check["expr"].as_str().unwrap_or_default());
+        for clause in [
+            format!("absent({objective})"),
+            format!("{objective} <= 0"),
+            format!("{objective} >= 1"),
+        ] {
+            assert!(
+                expr.contains(&clause),
+                "{OBJECTIVE_ALERT} for slo={} must contain {clause}: {expr}",
+                sli.key
+            );
+        }
     }
 }
 
@@ -332,6 +393,7 @@ fn alert_name(sli: &Sli, tier: &Tier) -> String {
 fn all_alert_names() -> Vec<String> {
     SLIS.iter()
         .flat_map(|sli| TIERS.iter().map(move |tier| alert_name(sli, tier)))
+        .chain([OBJECTIVE_ALERT.to_owned()])
         .collect()
 }
 
