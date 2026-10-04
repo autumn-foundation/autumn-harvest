@@ -202,6 +202,8 @@ count. Override them per environment with
 - The **static alert pack** (`docs/alerts/starter-pack-v0.1.0.json`, the rest of
   this runbook) owns **PUSH alerting** — it tells you *when* to look.
 - **`/api/harvest/health`** is **liveness** — is the process up — not a rollup.
+  For probes, use `/api/harvest/health/live` and `/api/harvest/health/ready`. See
+  [`../operations/kubernetes-probes.md`](../operations/kubernetes-probes.md).
 - **`/api/harvest/admin/preflight`** is **startup validation** — is this
   deployment safe to promote — run at deploy time, not during an incident.
   One exception, added by issue #797: its `scanner_liveness` check is a *live*
