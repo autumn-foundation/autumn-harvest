@@ -32,7 +32,7 @@ const LOCK_SAFETY_CUTOFF: &str = "20260914165542";
 ///
 /// This is the newest migration on disk when the lint landed. A newer
 /// migration cannot be grandfathered, so it uses the in-file annotation.
-const GRANDFATHER_CEILING: &str = "20261002033903";
+const GRANDFATHER_CEILING: &str = "20261003201739";
 
 /// Tables that the engine reads or writes on every claim or workflow step.
 ///
@@ -142,6 +142,19 @@ const GRANDFATHERED: &[(&str, Rule, &str)] = &[
         "20261001192155_harvest_quota_reconcile_name_id_index",
         Rule::LockTimeout,
         "The guarded plain build has no lock bound. Shipped before this lint.",
+    ),
+    (
+        "20261003201739_harvest_task_queue_hygiene",
+        Rule::BlockingIndex,
+        "Drops three redundant task-queue indexes without CONCURRENTLY, after \
+         a guarded check that the replacement index is valid. Shipped before \
+         this lint.",
+    ),
+    (
+        "20261003201739_harvest_task_queue_hygiene",
+        Rule::LockTimeout,
+        "The index drops and the guarded EXECUTE build have no lock bound. \
+         Shipped before this lint.",
     ),
 ];
 
@@ -931,7 +944,7 @@ fn lex(
         } else {
             toks.push(Token {
                 tok: Tok::Punct(c),
-                line: line,
+                line,
                 depth,
                 runs,
                 quoted: false,

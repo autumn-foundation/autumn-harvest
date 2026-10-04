@@ -38,9 +38,9 @@ that no migration creates counts as hot.
 directly above the statement. A malformed annotation and an unused annotation
 both fail the build.
 
-**Grandfathering.** Seven shipped migrations after the cutoff break a rule,
+**Grandfathering.** Eight shipped migrations after the cutoff break a rule,
 `20260915231809` first. The `GRANDFATHERED` list names each one with the rule
-and a reason. An entry newer than `20261002033903` fails the build, and so
+and a reason. An entry newer than `20261003201739` fails the build, and so
 does an entry that no longer matches a finding. `20261001190405` drops a hot
 index through `EXECUTE`. The lint scans the constant SQL that `EXECUTE` runs,
 and treats SQL it cannot read as a lock on an unknown table.
