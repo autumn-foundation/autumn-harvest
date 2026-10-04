@@ -764,6 +764,9 @@ struct LockedTask {
     /// its handler started (issue #1809). A schedule-to-close timeout ends
     /// this claim, which can be later than the scanned one.
     current_started_claim: Option<chrono::DateTime<Utc>>,
+    /// The row-current `attempt`. With `current_started_claim`, it names the
+    /// claim that holds the row now.
+    attempt: i32,
     /// The heartbeat deadline has passed on the row-current values.
     heartbeat_expired: bool,
 }
@@ -826,6 +829,7 @@ async fn lock_task_for_timeout(
             handler_started: scanned_claim && current_handler_started,
             scanned_claim,
             current_started_claim: row.started_at.filter(|_| current_handler_started),
+            attempt: row.attempt,
             heartbeat_expired: row.heartbeat_expired,
             crash_strikes: row.crash_strikes,
             state: row.state,
@@ -1353,6 +1357,11 @@ async fn enforce_activity_timeout(
     // result, and with it a probe slot, for good.
     let mut provisional =
         ProvisionalTimeoutMark::new(circuit_breakers, activity_name, claim_key, metrics);
+    // A schedule-to-close timeout can end a later claim than the scanned
+    // one. The transaction marks that claim under its row lock, so the
+    // owner cannot see its loss before the mark. This guard rolls the mark
+    // back on every exit that does not confirm it.
+    let current_mark = std::sync::Mutex::new(None::<ProvisionalTimeoutMark<'_>>);
     // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
     // scope ties its publish to this transaction's commit.
     //
@@ -1627,9 +1636,25 @@ async fn enforce_activity_timeout(
                 codecs,
             )
             .await?;
-            queue::fail_task(conn, task.id, &error).await?;
             // A schedule-to-close timeout ends the claim that holds the row
-            // now, which can be later than the scanned one. Record that claim.
+            // now, which can be later than the scanned one. Mark and record
+            // that claim. The row lock holds until commit, so its owner sees
+            // the loss only after the mark.
+            if !locked.scanned_claim
+                && let Some(started_at) = locked.current_started_claim
+            {
+                let current = crate::circuit_breaker::ClaimKey {
+                    task_id: task.id,
+                    attempt: locked.attempt,
+                    started_at: Some(started_at),
+                };
+                *current_mark
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                    ProvisionalTimeoutMark::new(circuit_breakers, activity_name, current, metrics),
+                );
+            }
+            queue::fail_task(conn, task.id, &error).await?;
             record_timed_out_claim(conn, task.id, locked.current_started_claim).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(outcome(false))
@@ -1654,12 +1679,19 @@ async fn enforce_activity_timeout(
     // failure (#1785). The confirm also fences a late result of this attempt.
     //
     // A schedule-to-close timeout can end a later claim than the scanned
-    // one. The mark names the scanned claim, so it rolls back. The owner of
-    // the later claim finds the record and counts the timeout once.
+    // one. The scanned mark then rolls back, and the mark on the later claim
+    // counts its timeout here. An owner in this process waits for that
+    // confirm. An owner elsewhere counts the timeout from its record.
     if enforced.scanned_claim {
         provisional.confirm(enforced.handler_started);
     } else {
         drop(provisional);
+        if let Some(mut current) = current_mark
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            current.confirm(true);
+        }
     }
     if enforced.retried {
         metrics.record_activity_retried(activity_name, &task.queue_name);
