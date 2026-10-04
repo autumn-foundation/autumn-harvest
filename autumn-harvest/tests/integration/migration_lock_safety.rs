@@ -747,6 +747,10 @@ fn lex(
             } else if in_execute_statement(toks, depth) {
                 let body: Vec<char> = fill_placeholders(&value).chars().collect();
                 lex(&body, start_line, depth + 1, runs, toks, comments);
+            } else if function_body_follows(toks, depth) {
+                // A function body runs later, so it does not run now.
+                let body: Vec<char> = value.chars().collect();
+                lex(&body, start_line, depth + 1, false, toks, comments);
             } else {
                 toks.push(Token {
                     tok: Tok::Str(value),
@@ -1003,6 +1007,18 @@ fn in_do_statement(toks: &[Token], depth: usize) -> bool {
 fn in_execute_statement(toks: &[Token], depth: usize) -> bool {
     depth > 0
         && statement_head(toks, depth).is_some_and(|t| t.tok == Tok::Word("execute".to_string()))
+}
+
+/// Whether the next token at `depth` is the body of a `CREATE FUNCTION` or
+/// `CREATE PROCEDURE`: the statement starts with `CREATE`, and `AS` is the
+/// last token.
+fn function_body_follows(toks: &[Token], depth: usize) -> bool {
+    let word = |t: &Token, w: &str| t.tok == Tok::Word(w.to_string());
+    toks.iter()
+        .rev()
+        .find(|t| t.depth == depth)
+        .is_some_and(|t| word(t, "as"))
+        && statement_head(toks, depth).is_some_and(|t| word(t, "create"))
 }
 
 /// The first token of the open statement at `depth`.
@@ -1680,7 +1696,10 @@ fn resolve(
             if let (Some(table), "DROP TABLE") = (&table, raw.verb) {
                 history.forget_table(table);
             }
-            if matches!(raw.verb, "DROP SCHEMA ... CASCADE" | "DROP OWNED") {
+            if matches!(
+                raw.verb,
+                "DROP SCHEMA ... CASCADE" | "DROP OWNED" | "DROP ... CASCADE"
+            ) {
                 history.forget_cold_indexes();
             }
             // A table moves its indexes with it to the new schema. A dropped
@@ -1850,6 +1869,15 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
                 local: false,
             })
         }
+        // A name that is not one plain literal may still be `lock_timeout`.
+        "set_config"
+            if s.is_punct(k + 1, '(') && !(s.string(k + 2).is_some() && s.is_punct(k + 3, ',')) =>
+        {
+            Some(Timeout::Set {
+                bounds: false,
+                local: false,
+            })
+        }
         _ => None,
     }
 }
@@ -1998,6 +2026,12 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
         Some("policy") => raws.push(Raw::lock(k, "DROP POLICY", s.name_after(k + 2, "on"))),
         Some("rule") => raws.push(Raw::lock(k, "DROP RULE", s.name_after(k + 2, "on"))),
         _ => {}
+    }
+    // Any other CASCADE may drop a column, default or trigger on a hot table,
+    // as `DROP TYPE ... CASCADE` does.
+    let cascade = (k..s.end(k)).any(|j| s.is(j, "cascade"));
+    if cascade && !matches!(s.word(k + 1), Some("table" | "schema" | "owned")) {
+        raws.push(Raw::lock(k, "DROP ... CASCADE", None));
     }
 }
 
@@ -4189,6 +4223,44 @@ fn adjacent_string_literals_join() {
         findings[0].detail.contains("harvest_events"),
         "{findings:?}"
     );
+}
+
+#[test]
+fn a_computed_set_config_name_may_clear() {
+    let sql = "SET lock_timeout = '5s';\n\
+               SELECT set_config('lock_' || 'timeout', '0', false);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // A literal name of another setting leaves the bound alone.
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               SELECT set_config('statement_timeout', '0', true);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], sql, true), []);
+}
+
+#[test]
+fn a_single_quoted_function_body_is_scanned() {
+    // Its locks count, as in a dollar-quoted body.
+    let sql = "CREATE FUNCTION f() RETURNS void AS \
+               'BEGIN ALTER TABLE harvest_events ADD COLUMN x INT; END' LANGUAGE plpgsql;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn other_cascading_drops_lock_an_unknown_table() {
+    // A dependent column or default may sit on a hot table.
+    for sql in [
+        "DROP TYPE that_type CASCADE;",
+        "DROP DOMAIN d CASCADE;",
+        "DROP FUNCTION f() CASCADE;",
+        "DROP SEQUENCE s CASCADE;",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
+    assert_eq!(lint_with_history(&[], "DROP TYPE that_type;", true), []);
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
