@@ -1743,8 +1743,8 @@ fn call_target<'a>(s: &Stmts<'a>, k: usize, known: &BTreeSet<&str>) -> Option<&'
 ///
 /// The range starts at the `CREATE TABLE`. It ends at the first later
 /// `DROP TABLE`, `ALTER TABLE ... RENAME TO` or `SET SCHEMA` of that name,
-/// with or without a schema. It also ends at any later `DROP SCHEMA`, or at
-/// any later `ROLLBACK`, which may undo the create. A `search_path` change
+/// with or without a schema. It also ends at any later `DROP SCHEMA` or
+/// `DROP OWNED`, or at any later `ROLLBACK`, which may undo the create. A `search_path` change
 /// ends the range of an unqualified name. So does a `COMMIT` after such a
 /// change, because it restores a local value. After that the name can mean
 /// the hot table again.
@@ -1757,10 +1757,10 @@ fn new_table_spans(
     let mut path_changed = false;
     for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
         let commit = s.is(k, "commit") || (s.is(k, "end") && toks[k].depth == 0);
-        // A schema drop may drop any new table. The lint does not track
-        // the schema of an unqualified name, so it ends every range.
-        let schema_drop = s.is(k, "drop") && s.is(k + 1, "schema");
-        if s.is(k, "rollback") || s.is(k, "abort") || schema_drop {
+        // `DROP SCHEMA` or `DROP OWNED` may drop any new table. The lint does
+        // not track schemas or owners, so it ends every range.
+        let drops_any = s.is(k, "drop") && (s.is(k + 1, "schema") || s.is(k + 1, "owned"));
+        if s.is(k, "rollback") || s.is(k, "abort") || drops_any {
             ends.push((SpanEnd::All, k));
         } else if commit && path_changed {
             // A `COMMIT` restores a local `search_path` value.
@@ -4848,12 +4848,13 @@ fn an_index_tablespace_clause_still_builds_an_index() {
 }
 
 #[test]
-fn a_schema_or_qualified_drop_ends_a_new_table() {
+fn a_drop_that_may_remove_a_new_table_ends_its_exemption() {
     let create = "CREATE TABLE harvest_events (id BIGINT);\n";
     let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
     for drop in [
         "DROP SCHEMA scratch CASCADE;",
         "DROP SCHEMA IF EXISTS scratch;",
+        "DROP OWNED BY scratch_owner;",
         "DROP TABLE scratch.harvest_events;",
     ] {
         let sql =
