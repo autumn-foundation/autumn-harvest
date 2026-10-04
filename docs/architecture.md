@@ -199,7 +199,7 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 
 *Handler start marker (issue #1809).* The start transaction writes the claim's `attempt` to `handler_started_attempt`, after `lock_claim_for_update` returns `Held`. The column equals `attempt` only after the current claim started its handler, so no path needs to clear it. The timeout sweeper feeds the circuit breaker only for such an attempt. [ADR 0004](adr/0004-activity-timeout-retry-and-open-circuit.md) records why.
 
-*Timed-out claim marker (issue #1809).* When the sweeper times out a claimed attempt, its transaction appends the claim's `started_at` to `timed_out_claims`, which keeps the newest 32. The worker that held the claim reads it after it loses the claim. A match means a timeout took the claim, perhaps in another process, so the worker counts it in its own circuit breaker. Any other loss counts nothing.
+*Timed-out claim marker (issue #1809).* When the sweeper times out a claimed attempt whose handler started, its transaction appends the claim's `started_at` to `timed_out_claims`. The worker that held the claim looks for it after it loses the claim, and removes it in the same write. A match means a timeout took the claim, perhaps in another process, so the worker counts it in its own circuit breaker. Any other loss counts nothing. Because each owner removes its own entry, only the entries of owners that never settle, such as a crashed process, remain. The column keeps at most 32 of those, and drops the oldest first.
 
 A formal model of this protocol is tracked in issue #1819.
 

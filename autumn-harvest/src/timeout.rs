@@ -1592,7 +1592,7 @@ async fn enforce_activity_timeout(
                         .await?
                         {
                             queue::ClaimWrite::Applied => {
-                                record_timed_out_claim(conn, task).await?;
+                                record_timed_out_claim(conn, task, locked.handler_started).await?;
                                 outcome(true)
                             }
                             queue::ClaimWrite::LeaseLost => None,
@@ -1613,7 +1613,7 @@ async fn enforce_activity_timeout(
             )
             .await?;
             queue::fail_task(conn, task.id, &error).await?;
-            record_timed_out_claim(conn, task).await?;
+            record_timed_out_claim(conn, task, locked.handler_started).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(outcome(false))
         }),
@@ -1644,15 +1644,21 @@ async fn enforce_activity_timeout(
 }
 
 /// Record the timed-out claim on its row (issue #1809). The worker that held
-/// it can then tell this timeout from any other loss of its claim. A
-/// `PENDING` task holds no claim and records nothing.
+/// it can then tell this timeout from any other loss of its claim.
+///
+/// Only a claim whose handler started records. Any other timeout feeds no
+/// breaker, so its owner must not count it either. A `PENDING` task holds no
+/// claim and records nothing.
 async fn record_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
+    handler_started: bool,
 ) -> HarvestResult<()> {
     match task.started_at {
-        Some(started_at) => queue::record_timed_out_claim(conn, task.id, started_at).await,
-        None => Ok(()),
+        Some(started_at) if handler_started => {
+            queue::record_timed_out_claim(conn, task.id, started_at).await
+        }
+        _ => Ok(()),
     }
 }
 

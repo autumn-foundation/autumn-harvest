@@ -23,6 +23,7 @@ COMMENT ON COLUMN harvest_task_queue.handler_started_attempt IS
     'ActivityStarted. Equal to attempt only after the current claim started '
     'its handler. NULL when no attempt started.';
 COMMENT ON COLUMN harvest_task_queue.timed_out_claims IS
-    'The started_at of each recent claim that the timeout enforcer timed out, '
-    'newest last, at most 32 (issue #1809). The worker that held a claim looks '
-    'for its own started_at here to tell a timeout from any other lost claim.';
+    'The started_at of each claim that the timeout enforcer timed out after '
+    'its handler started, newest last (issue #1809). The worker that held a '
+    'claim takes its own started_at out of here to tell a timeout from any '
+    'other lost claim. At most 32 entries of owners that never settled remain.';

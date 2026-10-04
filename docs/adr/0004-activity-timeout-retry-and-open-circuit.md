@@ -118,9 +118,11 @@ including an error.
 - Breaker state is per process. The enforcing process counts a timeout in
   its breaker. The process that ran the attempt finds its claim lost and
   reads the row. The enforcer appends the timed-out claim's `started_at` to
-  `timed_out_claims`. When that holds the lost claim and no enforcer in
-  that process confirmed the timeout, it counts the timeout in its own
-  breaker too. While an enforcer there is still deciding, the loss waits for
+  `timed_out_claims`, when the handler started. The owner removes its own
+  entry as it reads it, so the list holds only unsettled owners, and its
+  cap of 32 drops only the entries of owners that never settle. When the
+  list holds the lost claim and no enforcer in that process confirmed the
+  timeout, it counts the timeout in its own breaker too. While an enforcer there is still deciding, the loss waits for
   its decision. So the process that dispatches the calls stops them. It
   drops the attempt's late outcome, so no breaker counts the attempt twice.
   A shared breaker would count once for the fleet. It is out of scope.

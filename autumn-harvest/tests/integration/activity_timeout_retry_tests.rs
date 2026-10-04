@@ -796,11 +796,16 @@ async fn unstarted_timeout_leaves_the_breaker_unchanged() {
     age_claim(&mut conn, task_id).await;
     enforce(&mut conn, Some(&breakers)).await;
 
-    assert_eq!(task_row(&mut conn, task_id).await.state, "FAILED");
+    let row = task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "FAILED");
     assert_eq!(
         breaker_state(&breakers, activity),
         ("closed", 0),
         "a handler that never started says nothing about the downstream"
+    );
+    assert_eq!(
+        row.timed_out_claims, None,
+        "the owner of an unstarted claim must not count its timeout either"
     );
 }
 
@@ -824,6 +829,12 @@ async fn started_timeout_feeds_the_breaker() {
     enforce(&mut conn, Some(&breakers)).await;
 
     assert_eq!(breaker_state(&breakers, activity).0, "open");
+    let row = task_row(&mut conn, task_id).await;
+    assert_eq!(
+        row.timed_out_claims,
+        Some(vec![row.started_at]),
+        "the owner of the claim reads this record to count the timeout"
+    );
 }
 
 /// ADR 0004 §2, on the retry path: a retried timeout of a started attempt
@@ -1258,9 +1269,24 @@ async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
         .first(&mut conn)
         .await
         .expect("the activity task");
-    age_claim(&mut conn, task_id).await;
+    // Shorten the deadline, and keep `started_at`. The owner finds its
+    // record by that epoch.
+    set_task(
+        &mut conn,
+        task_id,
+        "start_to_close = INTERVAL '1 millisecond'",
+    )
+    .await;
     enforce(&mut conn, Some(&breakers)).await;
     assert_eq!(breaker_state(&breakers, activity), ("closed", 1));
+    assert_eq!(
+        task_row(&mut conn, task_id)
+            .await
+            .timed_out_claims
+            .map(|claims| claims.len()),
+        Some(1),
+        "the enforcer records the claim it timed out"
+    );
 
     // The hung attempt now returns a success, after its claim is gone.
     GATE.notify_one();
@@ -1269,6 +1295,23 @@ async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
         Duration::from_secs(5),
         || async {
             std::sync::atomic::AtomicBool::load(&GATED_DONE, std::sync::atomic::Ordering::SeqCst)
+        },
+    )
+    .await;
+    // The owner takes its own record, so the cap cannot evict the record of
+    // a slower owner.
+    wait_until(
+        "the owner takes its timeout record",
+        Duration::from_secs(5),
+        || {
+            let url = url.clone();
+            async move {
+                let mut conn = connect(&url).await;
+                task_row(&mut conn, task_id)
+                    .await
+                    .timed_out_claims
+                    .is_some_and(|claims| claims.is_empty())
+            }
         },
     )
     .await;

@@ -15285,10 +15285,14 @@ impl Drop for CircuitProbeGuard<'_> {
 
 /// Whether the claim of `task` was lost to the timeout enforcer (issue
 /// #1809). The enforcer records the `started_at` of the claim it timed out.
-/// Any other loss, or a failed read, is not a timeout.
+/// Any other loss, or a failed write, is not a timeout.
+///
+/// The read also removes the record, so call it once per lost claim. Call it
+/// even when the activity has no breaker policy. Otherwise the record stays
+/// and takes a slot that a slow owner needs.
 async fn claim_lost_to_timeout(conn: &mut AsyncPgConnection, task: &TaskQueueItem) -> bool {
     match task.started_at {
-        Some(started_at) => queue::claim_timed_out(conn, task.id, started_at).await,
+        Some(started_at) => queue::take_timed_out_claim(conn, task.id, started_at).await,
         None => false,
     }
 }
@@ -16433,8 +16437,8 @@ async fn process_activity_task(
             // timeout counts against the downstream. `on_claim_lost` counts
             // one that another process enforced, and releases the slot of any
             // other loss.
-            let lost_to_timeout = circuit_breakers.has_policy(activity_name)
-                && claim_lost_to_timeout(&mut conn, task).await;
+            let lost_to_timeout = claim_lost_to_timeout(&mut conn, task).await
+                && circuit_breakers.has_policy(activity_name);
             if circuit_breakers.on_claim_lost(
                 activity_name,
                 token,
@@ -16561,8 +16565,8 @@ async fn process_activity_task(
     // lost claim counts only when a timeout took it (see `on_claim_lost`).
     let applied = finalized.as_ref().ok().copied();
     let lost_to_timeout = applied == Some(false)
-        && circuit_breakers.has_policy(activity_name)
-        && claim_lost_to_timeout(&mut conn, task).await;
+        && claim_lost_to_timeout(&mut conn, task).await
+        && circuit_breakers.has_policy(activity_name);
     report_outcome(applied, lost_to_timeout);
     finalized.map(|_| ())
 }
