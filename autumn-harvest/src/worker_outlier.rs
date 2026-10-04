@@ -83,6 +83,9 @@ struct Sample {
 /// The window drops a sample when it is older than `max_age`, or when the
 /// window holds `capacity` newer samples. So a worker that heals stops being
 /// an outlier after `max_age` at most.
+///
+/// The samples stay in time order. Two threads can record out of order, so
+/// each insert finds its place by timestamp.
 #[derive(Debug)]
 pub struct TaskOutcomeWindow {
     samples: Mutex<VecDeque<Sample>>,
@@ -113,16 +116,23 @@ impl TaskOutcomeWindow {
     }
 
     /// Record one task outcome that ends at `at`.
+    ///
+    /// A full window evicts its oldest sample, which can be this one.
     pub fn record_at(&self, at: Instant, failed: bool, latency: Duration) {
         let mut samples = self.lock();
-        if samples.len() == self.capacity {
+        // A late sample lands near the back, so the insert moves few samples.
+        let index = samples.partition_point(|s| s.at <= at);
+        samples.insert(
+            index,
+            Sample {
+                at,
+                failed,
+                latency,
+            },
+        );
+        if samples.len() > self.capacity {
             samples.pop_front();
         }
-        samples.push_back(Sample {
-            at,
-            failed,
-            latency,
-        });
     }
 
     /// Snapshot the window as it is now.
@@ -135,9 +145,13 @@ impl TaskOutcomeWindow {
     #[must_use]
     pub fn snapshot_at(&self, now: Instant) -> WorkerTaskStats {
         let mut samples = self.lock();
-        // Two threads can insert out of time order, so an expired sample is
-        // not always at the front. Drop every expired sample.
-        samples.retain(|s| now.saturating_duration_since(s.at) <= self.max_age);
+        // The samples are in time order, so the expired ones are at the front.
+        while samples
+            .front()
+            .is_some_and(|s| now.saturating_duration_since(s.at) > self.max_age)
+        {
+            samples.pop_front();
+        }
         let mut latencies: Vec<Duration> = samples.iter().map(|s| s.latency).collect();
         let failures = samples.iter().filter(|s| s.failed).count();
         drop(samples);
@@ -559,6 +573,18 @@ mod tests {
         let snap = window.snapshot_at(start + Duration::from_secs(75));
         assert_eq!((snap.tasks, snap.failures), (1, 0));
         assert_eq!(snap.p99_latency_ms, Some(10));
+    }
+
+    #[test]
+    fn full_window_keeps_the_newest_samples_when_an_older_one_lands_late() {
+        let window = TaskOutcomeWindow::new(2, Duration::from_secs(60));
+        let start = Instant::now();
+        window.record_at(start + Duration::from_secs(2), false, Duration::ZERO);
+        window.record_at(start + Duration::from_secs(3), false, Duration::ZERO);
+        // An older failure lands late. It is the oldest, so it is evicted.
+        window.record_at(start + Duration::from_secs(1), true, Duration::ZERO);
+        let snap = window.snapshot_at(start + Duration::from_secs(3));
+        assert_eq!((snap.tasks, snap.failures), (2, 0));
     }
 
     #[test]
