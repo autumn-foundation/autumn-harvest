@@ -1280,6 +1280,18 @@ pub fn claim_task_query_fenced() -> &'static str {
 /// waiting in `PENDING` state.  This bounds the maximum starvation time for
 /// `Low` priority tasks even under sustained high-priority load.
 ///
+/// # Continuations before new starts
+///
+/// Within one priority level, continuations of running workflows go first
+/// (issue #1824). A new start sorts as if it were due
+/// [`NEW_START_HANDICAP_SECS`] later, so it cannot starve. See
+/// [`CLAIM_ORDER_DUE_SQL`].
+///
+/// # Run deadline
+///
+/// A task whose run is past its deadline is not returned. The claim fails
+/// it with [`DEADLINE_EXCEEDED_ERROR`] and claims again (issue #1824).
+///
 /// # Sticky routing
 ///
 /// When a row has `sticky_worker_id` set and `sticky_until > NOW()`, only that
