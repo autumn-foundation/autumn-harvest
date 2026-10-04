@@ -1548,6 +1548,38 @@ async fn a_repeated_ramp_write_keeps_its_ramp_id() {
     assert_eq!(policy_step(&mut conn).await, step, "the step stays");
 }
 
+/// A policy update gives an id-less ramp the caller's `ramp_id`. Such a ramp
+/// comes from a writer from before the migration. With an id, a later guard
+/// can finish a partial abort of it after a restart.
+#[tokio::test]
+async fn a_policy_update_gives_an_id_less_ramp_an_id() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // An old writer sets the ramp with no id.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+    .execute(&mut conn)
+    .await
+    .expect("old writer ramp");
+    assert_eq!(policy_ramp_id(&mut conn).await, None);
+
+    let ramp_id = uuid::Uuid::new_v4();
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, ramp_id)
+        .await
+        .expect("set new base");
+    assert!(ramp_is_active(&mut conn).await);
+    assert_eq!(policy_ramp_id(&mut conn).await, Some(ramp_id));
+}
+
 /// A split ramp with no abort marker is not cleared.
 #[tokio::test]
 async fn a_split_ramp_without_an_abort_marker_stays() {

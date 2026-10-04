@@ -345,7 +345,9 @@ pub async fn set_build_policy(
 /// (issue #1814).
 ///
 /// A fan-out passes one `ramp_id` to every pool, so a retained ramp keeps one
-/// identity across pools. A row with no ramp keeps `ramp_id` NULL.
+/// identity across pools. A retained ramp gets the id even when it had none,
+/// for example from a writer from before the `ramp_id` column. A row with no
+/// ramp keeps `ramp_id` NULL.
 ///
 /// The write is idempotent. A row that already holds this `ramp_id`, build
 /// and deployment is left as is, and its step stays. So a retried fan-out, or
@@ -368,7 +370,7 @@ pub async fn set_build_policy_with_ramp_id(
          ON CONFLICT (queue_name) DO UPDATE \
              SET build_id = EXCLUDED.build_id, \
                  deployment_name = EXCLUDED.deployment_name, \
-                 ramp_id = CASE WHEN harvest_build_policies.ramp_id IS NULL THEN NULL \
+                 ramp_id = CASE WHEN harvest_build_policies.target_build_id IS NULL THEN NULL \
                                 ELSE $5 END, \
                  updated_at = NOW() \
              WHERE harvest_build_policies.ramp_id IS DISTINCT FROM $5 \
