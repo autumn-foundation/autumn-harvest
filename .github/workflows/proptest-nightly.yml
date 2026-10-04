@@ -1,0 +1,61 @@
+# Deep property-test pass (issue #1829).
+#
+# CI runs the property suites on each change with the default 128 cases. This
+# workflow runs them deep every night, with `PROPTEST_CASES` raised:
+#
+# - `property`: the pure suites of the `property` target, 100000 cases each.
+# - `lifecycle`: the stateful lifecycle model (`lifecycle_model_props`), which
+#   runs each case against a real Postgres. One case costs about 150 ms, so
+#   eight shards run 12500 cases each, 100000 in total. Each shard draws its
+#   own random seed.
+#
+# A failure prints the shrunk operation sequence. Replay it locally as
+# `docs/testing/property-and-fuzz.md` describes.
+name: Proptest deep
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 03:29 UTC, off the hour and away from the chaos run.
+    - cron: "29 3 * * *"
+
+concurrency:
+  group: proptest-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  property:
+    name: Property suites (deep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PROPTEST_CASES: "100000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the property suites
+        run: cargo test -p autumn-harvest --features db --test property
+
+  lifecycle:
+    name: Lifecycle model (deep, shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      PROPTEST_CASES: "12500"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the lifecycle model
+        # Each test owns a Postgres container (testcontainers), so the
+        # runner needs only Docker.
+        run: 'cargo test -p autumn-harvest --test integration lifecycle_model_props:: -- --test-threads=1'

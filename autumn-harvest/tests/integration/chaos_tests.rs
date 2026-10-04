@@ -54,6 +54,10 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 
+use crate::history_checker::{
+    ExactlyOnceFire, FireInput, FireOutput, Recorder, assert_linearizable,
+};
+
 // ── Test workflows (macro-generated companions are field-growth-resilient) ──
 
 /// Suspends on a signal — the simplest workflow that reaches the suspension
@@ -324,6 +328,32 @@ async fn exec_count(conn: &mut AsyncPgConnection, wf_name: &str) -> i64 {
         .get_result(conn)
         .await
         .expect("count executions")
+}
+
+/// The sorted ids of every execution of a workflow type, for a history read.
+async fn run_ids(conn: &mut AsyncPgConnection, wf_name: &str) -> Vec<uuid::Uuid> {
+    use autumn_harvest::schema::harvest_workflow_executions::dsl;
+    let mut ids: Vec<uuid::Uuid> = dsl::harvest_workflow_executions
+        .filter(dsl::workflow_name.eq(wf_name))
+        .select(dsl::id)
+        .load(conn)
+        .await
+        .expect("load execution ids");
+    ids.sort();
+    ids
+}
+
+/// Record a read of the slot `key` into `history`.
+async fn record_read(
+    history: &Recorder<FireInput, FireOutput>,
+    url: &str,
+    key: &str,
+    wf_name: &str,
+    input: FireInput,
+) {
+    let op = history.invoke(1, key, input);
+    let ids = run_ids(&mut connect(url).await, wf_name).await;
+    history.ok(op, FireOutput::Read(ids));
 }
 
 /// Read a schedule's `(fire_claim_token, live)` where `live` is true iff the
@@ -944,10 +974,14 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
         insert_due_schedule(&mut conn, wf).await
     };
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
+    // Issue #1829: the history of ticks and reads must be exactly-once.
+    let history = Recorder::<FireInput, FireOutput>::new();
+    let key = sched_id.to_string();
 
     // Crash mid-fire: KILL after the claim commits, before the fire. The tick is
     // spawned so the panic surfaces as a JoinError instead of aborting the test.
     let guard = arm(ChaosPlan::scripted().kill_at(SCHED_AFTER_CLAIM)).await;
+    let crashed_fire = history.invoke(0, &*key, FireInput::Fire);
     let crash = tokio::spawn(tick_once(
         make_pool(&url),
         Arc::clone(&registry),
@@ -968,6 +1002,8 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     );
     let diag = guard.diagnostics();
     drop(guard);
+    history.info(crashed_fire);
+    record_read(&history, &url, &key, wf, FireInput::Read).await;
 
     // The crash left the claim held (committed in autocommit) with no fire.
     {
@@ -989,6 +1025,7 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     }
 
     // A healthy peer tick while the claim is live must NOT double-fire.
+    let peer = history.invoke(1, &*key, FireInput::Fire);
     tick_once(
         make_pool(&url),
         Arc::clone(&registry),
@@ -998,6 +1035,8 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     )
     .await
     .expect("peer tick (live claim)");
+    history.ok(peer, FireOutput::Ticked);
+    record_read(&history, &url, &key, wf, FireInput::Read).await;
     {
         let mut conn = connect(&url).await;
         assert_eq!(
@@ -1019,6 +1058,7 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
         .await
         .expect("expire claim");
     }
+    let peer = history.invoke(1, &*key, FireInput::Fire);
     tick_once(
         make_pool(&url),
         registry,
@@ -1028,6 +1068,9 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     )
     .await
     .expect("peer tick (expired claim)");
+    history.ok(peer, FireOutput::Ticked);
+    record_read(&history, &url, &key, wf, FireInput::FinalRead).await;
+    assert_linearizable(&ExactlyOnceFire, &history.snapshot(), &diag);
 
     let mut conn = connect(&url).await;
     assert_eq!(
@@ -1071,11 +1114,15 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
         insert_due_schedule(&mut conn, wf).await
     };
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
+    // Issue #1829: the history of ticks and reads must be exactly-once.
+    let history = Recorder::<FireInput, FireOutput>::new();
+    let key = sched_id.to_string();
 
     // Crash AFTER the start commits, BEFORE next_run_at advances. Only reachable
     // because a start committed this tick (the `dispatched > 0` gate); the tick is
     // spawned so the panic surfaces as a JoinError instead of aborting the test.
     let guard = arm(ChaosPlan::scripted().kill_at(SCHED_AFTER_START_BEFORE_ADVANCE)).await;
+    let crashed_fire = history.invoke(0, &*key, FireInput::Fire);
     let crash = tokio::spawn(tick_once(
         make_pool(&url),
         Arc::clone(&registry),
@@ -1096,6 +1143,8 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     );
     let diag = guard.diagnostics();
     drop(guard);
+    history.info(crashed_fire);
+    record_read(&history, &url, &key, wf, FireInput::Read).await;
 
     // The crash committed exactly one start (the point fires AFTER the start), but
     // did NOT advance the schedule — so the claim is still held and the slot is
@@ -1115,6 +1164,7 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     }
 
     // A healthy peer tick while the claim is live must NOT fire again.
+    let peer = history.invoke(1, &*key, FireInput::Fire);
     tick_once(
         make_pool(&url),
         Arc::clone(&registry),
@@ -1124,6 +1174,8 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     )
     .await
     .expect("peer tick (live claim)");
+    history.ok(peer, FireOutput::Ticked);
+    record_read(&history, &url, &key, wf, FireInput::Read).await;
     {
         let mut conn = connect(&url).await;
         assert_eq!(
@@ -1146,6 +1198,7 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
         .await
         .expect("expire claim");
     }
+    let peer = history.invoke(1, &*key, FireInput::Fire);
     tick_once(
         make_pool(&url),
         registry,
@@ -1155,6 +1208,9 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     )
     .await
     .expect("peer tick (expired claim)");
+    history.ok(peer, FireOutput::Ticked);
+    record_read(&history, &url, &key, wf, FireInput::FinalRead).await;
+    assert_linearizable(&ExactlyOnceFire, &history.snapshot(), &diag);
 
     let mut conn = connect(&url).await;
     assert_eq!(

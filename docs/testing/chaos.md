@@ -370,6 +370,27 @@ cargo test -p autumn-harvest --features chaos --test integration \
   chaos_tests::infra_faults::toxiproxy_partition_longer_than_lease_ttl -- --nocapture
 ```
 
+## History checks (issue #1829)
+
+The crash tests also record client histories and check them for
+linearizability. `tests/integration/history_checker.rs` holds the checker.
+It follows Porcupine: a search for one real-time order that a sequential
+model accepts, done per key. An operation with no clear outcome after a
+crash is an `info` operation, as in Jepsen. It may or may not have taken
+effect.
+
+- `chaos_repro_350_crashed_fire_claim_is_refired_exactly_once` and
+  `chaos_repro_350_post_start_crash_dedupes_to_exactly_one` record their
+  ticks and reads. The history must satisfy the `ExactlyOnceFire` model.
+- `tests/integration/history_crash_tests.rs` runs concurrent clients while
+  it drops request futures and calls `pg_terminate_backend` at random.
+  Idempotent starts must satisfy `StartIdempotency`. Scheduler replicas
+  must satisfy `ExactlyOnceFire`. The suite needs only the `db` feature, so
+  CI runs it on each change. Set `HISTORY_SEED` to replay a printed seed.
+
+The checker self-tests feed it forged violations: two creators, a read of
+two runs, a real-time inversion, a lost fire and a replaced run.
+
 ## Out of scope
 
 Production/runtime chaos (#796), Jepsen / Antithesis-style model checking, DAG
