@@ -114,6 +114,54 @@ pub trait PayloadStore: Send + Sync + 'static {
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()>;
 }
 
+/// The number of blob uploads that one counting offloader starts.
+///
+/// See [`PayloadOffloader::counting_uploads`]. Only the worker's result write
+/// uses it, so it exists with the `db` feature only.
+#[cfg(feature = "db")]
+#[derive(Clone, Default)]
+pub(crate) struct UploadCount(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(feature = "db")]
+impl UploadCount {
+    /// Whether the offloader started at least one upload.
+    pub(crate) fn any(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+}
+
+/// A store that counts each `put` before it passes it to the inner store.
+///
+/// A `put` counts when it starts. A `put` that fails can still leave a blob
+/// in the store, so it counts too.
+#[cfg(feature = "db")]
+struct CountingStore {
+    inner: Arc<dyn PayloadStore>,
+    uploads: UploadCount,
+}
+
+#[cfg(feature = "db")]
+impl PayloadStore for CountingStore {
+    fn store_id(&self) -> &str {
+        self.inner.store_id()
+    }
+
+    fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
+        self.uploads
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.put(bytes)
+    }
+
+    fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
+        self.inner.get(key)
+    }
+
+    fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
+        self.inner.delete(key)
+    }
+}
+
 /// A reference to an offloaded blob, recorded per execution so the retention
 /// sweep can garbage-collect blobs no longer referenced by any execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +291,25 @@ impl PayloadOffloader {
             });
         }
         Ok(refs)
+    }
+
+    /// A copy of this offloader that counts the blobs it uploads.
+    ///
+    /// The copy writes to the same store under the same store id. Only its
+    /// own uploads are counted. A caller makes one copy per write and so
+    /// learns if that write uploaded a blob (issue #1788).
+    #[cfg(feature = "db")]
+    pub(crate) fn counting_uploads(&self) -> (Self, UploadCount) {
+        let uploads = UploadCount::default();
+        let store = CountingStore {
+            inner: Arc::clone(&self.store),
+            uploads: uploads.clone(),
+        };
+        let copy = Self {
+            store: Arc::new(store),
+            ..self.clone()
+        };
+        (copy, uploads)
     }
 
     /// Reconstruct any offloaded payload field inside a serialized event's
@@ -446,6 +513,35 @@ mod tests {
     #[allow(clippy::needless_pass_by_value)]
     fn event_with_output(output: Value) -> Value {
         serde_json::json!({ "type": "WorkflowCompleted", "data": { "output": output } })
+    }
+
+    /// A counting copy counts the blobs it uploads and nothing else.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_counting_copy_counts_its_own_uploads() {
+        let store = MemStore::new();
+        let off = offloader(store.clone(), 16);
+        let (counting, uploads) = off.counting_uploads();
+
+        let mut small = event_with_output(serde_json::json!("x"));
+        counting
+            .offload_event_value(&mut small)
+            .await
+            .expect("offload");
+        assert!(!uploads.any(), "an inline field uploads nothing");
+
+        let mut other = event_with_output(serde_json::json!("y".repeat(64)));
+        off.offload_event_value(&mut other).await.expect("offload");
+        assert!(!uploads.any(), "the original handle is not counted");
+
+        let mut large = event_with_output(serde_json::json!("x".repeat(64)));
+        let refs = counting
+            .offload_event_value(&mut large)
+            .await
+            .expect("offload");
+        assert!(uploads.any(), "a blob upload is counted");
+        assert_eq!(refs[0].store_id, "mem", "the store id is unchanged");
+        assert_eq!(store.puts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
