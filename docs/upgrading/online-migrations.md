@@ -84,7 +84,9 @@ The lint reads the history of earlier migrations. It finds the table of a
 schema of its table, and a name without a schema means `public`. A
 `DROP INDEX` or `DROP TABLE` that surely runs makes the lint forget the index.
 After a `search_path` change, an unqualified name has no known schema, so the
-lint neither learns nor places it.
+lint neither learns nor places it. A call of a routine whose body may change
+`search_path` counts as a change when the call returns. That holds for a
+routine from an earlier migration too.
 It finds the foreign keys of a table from the migrations that added them. An
 index that no migration creates counts as hot. So does a `REINDEX` of a schema,
 a database or the system catalogs.

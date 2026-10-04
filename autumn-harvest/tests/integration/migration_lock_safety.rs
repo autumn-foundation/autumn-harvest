@@ -262,6 +262,9 @@ struct History {
     /// may leave with an unbounded lock. No identity of such a name counts as
     /// self-bounded, because a later call may reach that version.
     unbounded_routines: BTreeSet<String>,
+    /// Each routine whose body may change `search_path`, without its schema.
+    /// A call of such a routine in a later migration changes the path too.
+    path_routines: BTreeSet<String>,
 }
 
 impl History {
@@ -2230,6 +2233,7 @@ fn alter_routine_history(s: &Stmts, k: usize, clears: bool, history: &mut Histor
             &mut history.clearing_routines,
             &mut history.foreign_routines,
             &mut history.locking_routines,
+            &mut history.path_routines,
         ] {
             if set.contains(&old) {
                 set.insert(new.to_string());
@@ -2836,7 +2840,7 @@ fn path_change(s: &Stmts, opaque: &[usize], history: &mut History) -> Option<usi
     let text = (0..s.toks.len())
         .find(|&k| s.starts[k] == k && running_path_change(s, k, true))
         .into_iter()
-        .chain(path_routine_call(s))
+        .chain(path_routine_call(s, history))
         .min();
     let hidden = opaque.first().map(|&k| s.end(k));
     // Only a session change that runs now carries into history. A local
@@ -2904,22 +2908,29 @@ fn running_path_change(s: &Stmts, k: usize, local: bool) -> bool {
     (k..s.end(k)).any(|j| path_call(s, j) && s.toks[j].runs && (local || !is_local(j)))
 }
 
-/// The end of the first running call of a routine in this file whose body may
-/// change `search_path`. The change takes effect when that call returns.
+/// The end of the first running call of a routine whose body may change
+/// `search_path`. The change takes effect when that call returns.
 ///
 /// A routine that calls such a routine may change the path too. The set grows
-/// until no routine joins it, as for clearing and locking routines.
-fn path_routine_call(s: &Stmts) -> Option<usize> {
+/// until no routine joins it, as for clearing and locking routines. The
+/// history keeps the set for later migrations.
+fn path_routine_call(s: &Stmts, history: &mut History) -> Option<usize> {
     let routines = file_routines(s);
     let bodies = routine_bodies(s);
     let own = |r: &Routine, j: usize| owns(s, &bodies, r.at, j);
-    let all: BTreeSet<&str> = routines.iter().map(|r| base(&r.name)).collect();
+    let inherited = history.path_routines.clone();
+    let all: BTreeSet<&str> = routines
+        .iter()
+        .map(|r| base(&r.name))
+        .chain(inherited.iter().map(String::as_str))
+        .collect();
     let mut names: BTreeSet<&str> = routines
         .iter()
         .filter(|r| {
             (r.at..s.toks.len()).any(|j| own(r, j) && s.starts[j] == j && changes_search_path(s, j))
         })
         .map(|r| base(&r.name))
+        .chain(inherited.iter().map(String::as_str))
         .collect();
     loop {
         let before = names.len();
@@ -2935,6 +2946,9 @@ fn path_routine_call(s: &Stmts) -> Option<usize> {
             break;
         }
     }
+    history
+        .path_routines
+        .extend(names.iter().map(ToString::to_string));
     (0..s.toks.len())
         .filter(|&k| s.toks[k].runs)
         .find(|&k| call_target(s, k, &names).is_some())
@@ -7468,6 +7482,32 @@ fn an_uncalled_body_does_not_change_the_path_of_its_file() {
         let history = format!("{routine}{outer}{call}{index}");
         let findings = lint_with_history(&[&history], drop, true);
         assert!(!findings.is_empty(), "{history}\n{findings:?}");
+    }
+}
+
+#[test]
+fn a_path_routine_from_an_earlier_migration_changes_the_path() {
+    let routine = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                   PERFORM set_config('search_path', 'scratch, public', false);\nEND $$;";
+    let outer = "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 PERFORM f();\nEND $$;";
+    let rename = "ALTER FUNCTION f() RENAME TO h;";
+    let index = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX public.idx;";
+    // The call runs the change, so the index may not be in `public`.
+    for (earlier, call) in [
+        (vec![routine], "SELECT f();"),
+        (vec![routine, outer], "SELECT g();"),
+        (vec![routine, rename], "SELECT h();"),
+    ] {
+        let migration = format!("{call}\n{index}");
+        let history: Vec<&str> = earlier
+            .iter()
+            .copied()
+            .chain([migration.as_str()])
+            .collect();
+        let findings = lint_with_history(&history, drop, true);
+        assert!(!findings.is_empty(), "{history:?}\n{findings:?}");
     }
 }
 
