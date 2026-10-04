@@ -583,11 +583,12 @@ pub struct TaskQueueItem {
     /// claim started its handler. `NULL` when no attempt started.
     #[serde(default)]
     pub handler_started_attempt: Option<i32>,
-    /// The `started_at` of the last claim that the timeout enforcer timed
-    /// out (issue #1809). The worker that held that claim matches it against
-    /// its own `started_at`. `NULL` until a claim times out.
+    /// The `started_at` of each recent claim that the timeout enforcer timed
+    /// out, newest last, at most 32 (issue #1809). The worker that held a
+    /// claim looks for its own `started_at` here. `NULL` until a claim times
+    /// out.
     #[serde(default)]
-    pub timed_out_started_at: Option<DateTime<Utc>>,
+    pub timed_out_claims: Option<Vec<Option<DateTime<Utc>>>>,
 }
 
 /// Insert struct for enqueuing a new task.

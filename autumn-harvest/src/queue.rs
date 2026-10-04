@@ -2808,12 +2808,16 @@ pub(crate) async fn later_claim_shares_strikes(
         .map_err(crate::error::database_error)
 }
 
+/// How many timed-out claims a row remembers (issue #1809).
+const TIMED_OUT_CLAIMS_KEPT: i32 = 32;
+
 /// Record that the timeout enforcer timed out the claim that started at
 /// `started_at` (issue #1809).
 ///
 /// The enforcer calls this inside its transaction, after its write applied.
-/// The worker that held the claim reads it back with
-/// [`claim_timed_out`]. A later timeout overwrites the value.
+/// The row keeps the newest [`TIMED_OUT_CLAIMS_KEPT`] epochs. A worker whose
+/// handler outlives several retries can then still find its own claim with
+/// [`claim_timed_out`].
 ///
 /// # Errors
 ///
@@ -2823,13 +2827,19 @@ pub(crate) async fn record_timed_out_claim(
     task_id: Uuid,
     started_at: DateTime<Utc>,
 ) -> HarvestResult<()> {
-    use crate::schema::harvest_task_queue::dsl;
-
-    diesel::update(dsl::harvest_task_queue.find(task_id))
-        .set(dsl::timed_out_started_at.eq(Some(started_at)))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET timed_out_claims = \
+             (array_append(COALESCE(timed_out_claims, '{}'::timestamptz[]), $2)) \
+             [GREATEST(1, COALESCE(cardinality(timed_out_claims), 0) + 2 - $3):] \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+    .bind::<diesel::sql_types::Integer, _>(TIMED_OUT_CLAIMS_KEPT)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -2841,14 +2851,23 @@ pub(crate) async fn claim_timed_out(
     task_id: Uuid,
     started_at: DateTime<Utc>,
 ) -> bool {
-    use crate::schema::harvest_task_queue::dsl;
+    #[derive(diesel::QueryableByName)]
+    struct Hit {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        hit: bool,
+    }
 
-    dsl::harvest_task_queue
-        .find(task_id)
-        .select(dsl::timed_out_started_at)
-        .first::<Option<DateTime<Utc>>>(conn)
-        .await
-        .is_ok_and(|marker| marker == Some(started_at))
+    diesel::sql_query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM harvest_task_queue \
+             WHERE id = $1 AND $2 = ANY(timed_out_claims) \
+         ) AS hit",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+    .get_result::<Hit>(conn)
+    .await
+    .is_ok_and(|row| row.hit)
 }
 
 /// Record that the handler of `claim` started (issue #1809).

@@ -16,13 +16,13 @@
 SELECT set_config('lock_timeout', '5s', true);
 
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS handler_started_attempt INT4;
-ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS timed_out_started_at TIMESTAMPTZ;
+ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS timed_out_claims TIMESTAMPTZ[];
 
 COMMENT ON COLUMN harvest_task_queue.handler_started_attempt IS
     'The attempt whose activity handler started (issue #1809). Written with '
     'ActivityStarted. Equal to attempt only after the current claim started '
     'its handler. NULL when no attempt started.';
-COMMENT ON COLUMN harvest_task_queue.timed_out_started_at IS
-    'The started_at of the last claim that the timeout enforcer timed out '
-    '(issue #1809). The worker that held that claim matches it against its '
-    'own started_at to tell a timeout from any other lost claim.';
+COMMENT ON COLUMN harvest_task_queue.timed_out_claims IS
+    'The started_at of each recent claim that the timeout enforcer timed out, '
+    'newest last, at most 32 (issue #1809). The worker that held a claim looks '
+    'for its own started_at here to tell a timeout from any other lost claim.';

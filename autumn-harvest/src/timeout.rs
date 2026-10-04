@@ -1624,31 +1624,22 @@ async fn enforce_activity_timeout(
     let Some(enforced) = enforced? else {
         return Ok(());
     };
-    provisional.confirm(enforced.handler_started);
-    if enforced.retried {
-        metrics.record_activity_retried(activity_name, &task.queue_name);
-    }
-
     // Circuit breaker (issues #369, #1809). A timeout against a protected
     // downstream is a retryable, downstream-style failure. The handler-result
-    // path never sees it, because the worker may be gone. Record it out of
-    // band, so a hanging downstream trips the breaker as an explicit error does.
+    // path never sees it, because the worker may be gone. The confirm counts
+    // it out of band, so a hanging downstream trips the breaker as an
+    // explicit error does.
     //
     // Only an attempt whose handler started can say anything about the
     // downstream. A task that waited after its claim made no call, and
     // neither did a `PENDING` task that timed out in the queue. Counting
     // them would let a backlog open the circuit and turn overload into
-    // failure (#1785).
-    //
-    // The claim mark is confirmed above, so a late result of this attempt
-    // leaves the breaker alone. This path counts the attempt.
-    if enforced.handler_started
-        && let Some(breakers) = circuit_breakers
-        && breakers.on_external_failure(activity_name, std::time::Instant::now())
-            == Some(crate::circuit_breaker::CircuitTransition::Tripped)
-    {
-        metrics.record_circuit_tripped(activity_name);
+    // failure (#1785). The confirm also fences a late result of this attempt.
+    provisional.confirm(enforced.handler_started);
+    if enforced.retried {
+        metrics.record_activity_retried(activity_name, &task.queue_name);
     }
+
     Ok(())
 }
 
@@ -1702,9 +1693,11 @@ impl<'a> ProvisionalTimeoutMark<'a> {
     /// timeout is local congestion, not a failed probe.
     fn confirm(&mut self, handler_started: bool) {
         if let Some(breakers) = self.breakers.take() {
+            // Only a started handler counts against the downstream.
             let transition = breakers.confirm_claim_timed_out(
                 self.activity_name,
                 self.claim,
+                handler_started,
                 std::time::Instant::now(),
             );
             if handler_started {

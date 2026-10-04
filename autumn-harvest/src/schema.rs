@@ -324,7 +324,7 @@ diesel::table! {
         /// the current claim started its handler. `NULL` when no attempt
         /// started.
         handler_started_attempt -> Nullable<Int4>,
-        timed_out_started_at -> Nullable<Timestamptz>,
+        timed_out_claims -> Nullable<Array<Nullable<Timestamptz>>>,
     }
 }
 

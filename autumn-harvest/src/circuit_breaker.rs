@@ -630,30 +630,44 @@ impl CircuitBreakerRegistry {
     /// breaker half-open. A held result is dropped. A later result does not
     /// count. A timed-out probe is a failed probe, so this returns
     /// [`CircuitTransition::Tripped`] when it re-opens the breaker.
+    ///
+    /// With `count_failure`, the timeout also counts as a failure, under the
+    /// same lock. A claim of this process counts through its dispatch token,
+    /// so a token from before a trip or a reset counts nothing. A claim of
+    /// another process has no token here and counts as an external failure.
     pub fn confirm_claim_timed_out(
         &self,
         activity_name: &str,
         claim: ClaimKey,
+        count_failure: bool,
         now: Instant,
     ) -> Option<CircuitTransition> {
-        if !self.policies.contains_key(activity_name) {
+        let &policy = self.policies.get(activity_name)?;
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+        let token = match st.in_flight_claims.get(&claim).copied() {
+            Some(entry) => match entry.state {
+                ClaimState::Held(..) | ClaimState::LostPending(_) => {
+                    st.in_flight_claims.remove(&claim);
+                    Some(entry.token)
+                }
+                ClaimState::Running | ClaimState::Provisional(_) => {
+                    if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                        entry.state = ClaimState::TimedOut;
+                    }
+                    Some(entry.token)
+                }
+                ClaimState::TimedOut => return None,
+            },
+            None => None,
+        };
+        if token.is_some_and(|token| apply_cancelled(st, token, now)) {
+            return Some(CircuitTransition::Tripped);
+        }
+        if !count_failure || token.is_some_and(|token| token.generation != st.generation) {
             return None;
         }
-        let mut states = self.lock();
-        let st = states.get_mut(activity_name)?;
-        let entry = st.in_flight_claims.get(&claim).copied()?;
-        match entry.state {
-            ClaimState::Held(..) | ClaimState::LostPending(_) => {
-                st.in_flight_claims.remove(&claim);
-            }
-            ClaimState::Provisional(_) => {
-                if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
-                    entry.state = ClaimState::TimedOut;
-                }
-            }
-            ClaimState::Running | ClaimState::TimedOut => return None,
-        }
-        apply_cancelled(st, entry.token, now).then_some(CircuitTransition::Tripped)
+        apply_external_failure(st, policy, now)
     }
 
     /// The enforcer did not time `claim` out after all (issue #1809). A held
@@ -958,6 +972,11 @@ fn count_remote_timeout(
     if apply_cancelled(st, token, now) {
         return Some(CircuitTransition::Tripped);
     }
+    // Generation fence: a claim dispatched before a trip or a reset counts
+    // nothing, as a stale handler result does.
+    if token.generation != st.generation {
+        return None;
+    }
     apply_external_failure(st, policy, now)
 }
 
@@ -1097,7 +1116,7 @@ mod tests {
         let token = dispatch(&reg, t0);
         reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
-        let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
         let _ = reg.on_external_failure("send_email", t0);
         assert_eq!(rolling(&reg, t0), 1);
 
@@ -1121,7 +1140,7 @@ mod tests {
         reg.begin_claim("send_email", claim(1), TOKEN);
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
         reg.mark_claim_timed_out("send_email", claim(1));
-        let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
         let _ = reg.on_external_failure("send_email", t0);
         assert_eq!(rolling(&reg, t0), 1);
     }
@@ -1140,7 +1159,7 @@ mod tests {
         reg.begin_claim("send_email", claim(1), probe);
         reg.mark_claim_timed_out("send_email", claim(1));
         assert_eq!(
-            reg.confirm_claim_timed_out("send_email", claim(1), t1),
+            reg.confirm_claim_timed_out("send_email", claim(1), false, t1),
             Some(CircuitTransition::Tripped),
             "a timed-out probe re-trips the breaker"
         );
@@ -1205,7 +1224,7 @@ mod tests {
         reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
-        let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
         assert_eq!(
             rolling(&reg, t0),
             1,
@@ -1228,9 +1247,9 @@ mod tests {
             reg.mark_claim_timed_out("send_email", claim(1));
             if rollback_first {
                 let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
-                let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
+                let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
             } else {
-                let _ = reg.confirm_claim_timed_out("send_email", claim(1), t0);
+                let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
                 let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
             }
             let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
@@ -1277,7 +1296,7 @@ mod tests {
         let token = dispatch(&reg, t0);
         reg.begin_claim("send_email", claim(2), token);
         reg.mark_claim_timed_out("send_email", claim(2));
-        let _ = reg.confirm_claim_timed_out("send_email", claim(2), t0);
+        let _ = reg.confirm_claim_timed_out("send_email", claim(2), false, t0);
         assert_eq!(
             reg.on_claim_lost("send_email", token, claim(2), true, t0),
             None
@@ -1308,6 +1327,39 @@ mod tests {
             Some(CircuitTransition::Tripped)
         );
         assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// A timeout of a claim dispatched before a reset counts nothing, in the
+    /// enforcer and in the owner (issue #1809).
+    #[test]
+    fn a_timeout_from_before_a_reset_counts_nothing() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let stale = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), stale);
+        reg.begin_claim("send_email", claim(2), stale);
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        reg.force_close("send_email");
+
+        reg.mark_claim_timed_out("send_email", claim(1));
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), true, t0),
+            None
+        );
+        assert_eq!(
+            reg.on_claim_lost("send_email", stale, claim(2), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0, "the reset fences both counts");
+
+        // A fresh claim's timeout counts.
+        let fresh = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(3), fresh);
+        reg.mark_claim_timed_out("send_email", claim(3));
+        let _ = reg.confirm_claim_timed_out("send_email", claim(3), true, t0);
+        assert_eq!(rolling(&reg, t0), 1);
     }
 
     #[test]
