@@ -1827,14 +1827,27 @@ fn unreadable_settings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
 /// `E'...'` does. The lint then misreads every later `DO`, routine and
 /// `EXECUTE` body, so the statement counts as a lock that no bound covers.
 ///
-/// A session value outlives its file. When an earlier file leaves the setting
-/// off, a file with any backslash counts as unreadable too. Without a
-/// backslash, the setting changes nothing.
+/// While the setting is off, each top-level statement with a backslash on its
+/// lines counts as unreadable too. The lock sits on that statement, so an
+/// annotation on the setter cannot cover it. A session value outlives its
+/// file, so the state carries into later files. Without a backslash, the
+/// setting changes nothing.
 fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut Vec<Raw>) {
-    if history.nonstandard_strings && sql.contains('\\') && !s.toks.is_empty() {
-        raws.push(Raw::lock(0, NONSTANDARD_STRINGS, None));
-    }
+    let backslash_lines: BTreeSet<usize> = sql
+        .lines()
+        .enumerate()
+        .filter(|(_, text)| text.contains('\\'))
+        .map(|(n, _)| n + 1)
+        .collect();
     for k in 0..s.toks.len() {
+        let top_start = s.starts[k] == k && s.toks[k].depth == 0 && !s.is_punct(k, ';');
+        if top_start && history.nonstandard_strings {
+            let last = s.end(k).saturating_sub(1).max(k);
+            let lines = s.toks[k].line..=s.toks[last].line;
+            if backslash_lines.range(lines).next().is_some() {
+                raws.push(Raw::lock(k, NONSTANDARD_STRINGS, None));
+            }
+        }
         match conforming_change(s, k) {
             Some(false) => {
                 raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
@@ -5719,6 +5732,21 @@ fn a_quoted_object_name_is_not_its_target_keyword() {
             "{findings:?}"
         );
     }
+}
+
+#[test]
+fn an_annotated_nonstandard_setter_cannot_hide_a_later_body() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               -- lock-safety: allow lock-timeout #1810 test fixture\n\
+               SET standard_conforming_strings = off;\n\
+               DO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert_eq!(findings[0].line, 4, "{findings:?}");
+    assert!(
+        findings[0].detail.contains("standard_conforming_strings"),
+        "{findings:?}"
+    );
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

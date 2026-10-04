@@ -272,8 +272,9 @@ that no longer matches a finding also fails the build.
   as code, in any quote form. Any other string is data.
 - The lint reads string literals as `standard_conforming_strings = on` does.
   A statement that may turn the setting off counts as a lock on an unknown
-  table that no bound covers. The setting outlives its file, so each later
-  migration with a backslash counts the same way until a reset.
+  table that no bound covers. While it is off, each statement with a
+  backslash counts the same way, later in the file and in later migrations,
+  until a reset.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
   call of a routine in another language, counts as a lock on an unknown table.
   No bound covers that lock, because the code may clear the bound first. It
