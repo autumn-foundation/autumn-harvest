@@ -39,8 +39,8 @@ it. The exemption ends at a later `DROP TABLE`, `RENAME TO`, `SET SCHEMA`,
 `DROP SCHEMA`, `DROP OWNED` or `ROLLBACK`, because the name can mean the hot
 table again.
 A drop or rename ends it with or without a schema in the name. A `search_path`
-change ends it for a name without a schema. So does a `COMMIT` after such a
-change, because the commit restores a local value.
+change ends it for a name without a schema. A `COMMIT` ends every exemption,
+because other sessions can then see the new table and lock it.
 The lock must name the table exactly as the create does, schema included.
 
 A partition of a hot table is hot too, because it takes the live writes of its
@@ -116,7 +116,8 @@ A clear in a routine body can outlive the call. So a call ends the bound
 when the routine may clear it. A call reaches a body in the same file only
 when an earlier `CREATE` has the same name, schema included, and the same
 number of parameters. Any other `CALL` also ends the bound, because the lint
-cannot read the body it reaches. Set the bound again after the call. A change
+cannot read the body it reaches. The lint does not compare parameter types, so
+a call also ends the bound when any such `CREATE` may clear it. Set the bound again after the call. A change
 in the expression of an `EXECUTE` takes effect before the SQL runs. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
 `EXIT` or `CONTINUE`, does not count either, because it may not run. Nothing in a block with an
 `EXCEPTION` handler counts, because the handler rolls the block back. A clear inside a

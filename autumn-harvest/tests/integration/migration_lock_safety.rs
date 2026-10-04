@@ -1709,7 +1709,8 @@ struct Routine {
 ///
 /// A call reaches a body in this file only when an earlier `CREATE` has the
 /// same name as written and the same number of parameters. Any other `CALL`
-/// clears, because it may reach a routine from another file.
+/// clears, because it may reach a routine from another file. A call also
+/// clears when any such `CREATE` clears.
 fn call_clears(
     s: &Stmts,
     timeouts: &mut Vec<(usize, Timeout)>,
@@ -1726,11 +1727,20 @@ fn call_clears(
     let calls: Vec<Routine> = (0..s.toks.len())
         .filter_map(|k| call_target(s, k, &bases))
         .collect();
-    // The latest earlier `CREATE` that matches the call, if any.
-    let target = |call: &Routine| {
-        routines.iter().rposition(|r| {
+    // Whether every earlier `CREATE` that may match the call keeps the bound.
+    // The lint does not compare parameter types, so any overload with the
+    // same name and arity may be the one that runs.
+    let keeps = |call: &Routine, clearing: &BTreeSet<usize>| {
+        let mut matches = (0..routines.len()).filter(|&i| {
+            let r = &routines[i];
             r.at < call.at && r.name == call.name && r.arity.is_some() && r.arity == call.arity
-        })
+        });
+        let first = matches.next();
+        first.is_some()
+            && first
+                .into_iter()
+                .chain(matches)
+                .all(|i| !clearing.contains(&i))
     };
     let changes = |r: &Routine| {
         let range = r.at..s.end(r.at);
@@ -1746,9 +1756,9 @@ fn call_clears(
         let before = clearing.len();
         for (i, r) in routines.iter().enumerate() {
             let range = r.at..s.end(r.at);
-            let calls_a_clearer = calls.iter().any(|call| {
-                range.contains(&call.at) && target(call).is_none_or(|t| clearing.contains(&t))
-            });
+            let calls_a_clearer = calls
+                .iter()
+                .any(|call| range.contains(&call.at) && !keeps(call, &clearing));
             if calls_a_clearer {
                 clearing.insert(i);
             }
@@ -1762,7 +1772,7 @@ fn call_clears(
         local: false,
     };
     for call in &calls {
-        if target(call).is_some_and(|t| !clearing.contains(&t)) {
+        if keeps(call, &clearing) {
             continue;
         }
         if s.toks[call.at].runs {
@@ -1833,27 +1843,26 @@ fn arity(s: &Stmts, open: usize) -> Option<usize> {
 /// The range starts at the `CREATE TABLE`. It ends at the first later
 /// `DROP TABLE`, `ALTER TABLE ... RENAME TO` or `SET SCHEMA` of that name,
 /// with or without a schema. It also ends at any later `DROP SCHEMA` or
-/// `DROP OWNED`, or at any later `ROLLBACK`, which may undo the create. A `search_path` change
-/// ends the range of an unqualified name. So does a `COMMIT` after such a
-/// change, because it restores a local value. After that the name can mean
-/// the hot table again.
+/// `DROP OWNED`, or at any later `ROLLBACK`, which may undo the create. After
+/// that the name can mean the hot table again. A `search_path` change ends
+/// the range of an unqualified name for the same reason.
+///
+/// Any later `COMMIT` ends every range. After it, other sessions can see the
+/// new table and lock it.
 fn new_table_spans(
     s: &Stmts,
     created: &BTreeMap<String, usize>,
 ) -> BTreeMap<String, (usize, usize)> {
     let toks = s.toks;
     let mut ends: Vec<(SpanEnd, usize)> = Vec::new();
-    let mut path_changed = false;
     for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
         let commit = s.is(k, "commit") || (s.is(k, "end") && toks[k].depth == 0);
         // `DROP SCHEMA` or `DROP OWNED` may drop any new table. The lint does
         // not track schemas or owners, so it ends every range.
         let drops_any = s.is(k, "drop") && (s.is(k + 1, "schema") || s.is(k + 1, "owned"));
-        if s.is(k, "rollback") || s.is(k, "abort") || drops_any {
+        // After a commit, other sessions can see and lock the new table.
+        if s.is(k, "rollback") || s.is(k, "abort") || drops_any || commit {
             ends.push((SpanEnd::All, k));
-        } else if commit && path_changed {
-            // A `COMMIT` restores a local `search_path` value.
-            ends.push((SpanEnd::Unqualified, k));
         } else if s.is(k, "drop") && s.is(k + 1, "table") {
             for name in s.name_list(s.skip_if_exists(k + 2)) {
                 ends.push((SpanEnd::Name(name), k));
@@ -1868,7 +1877,6 @@ fn new_table_spans(
             let end = s.statement_table(k).map_or(SpanEnd::All, SpanEnd::Name);
             ends.push((end, k));
         } else if changes_search_path(s, k) {
-            path_changed = true;
             ends.push((SpanEnd::Unqualified, k));
         }
     }
@@ -4914,7 +4922,7 @@ fn a_call_may_clear_the_bound() {
 }
 
 #[test]
-fn a_commit_ends_a_new_table_after_a_search_path_change() {
+fn a_commit_ends_a_new_table() {
     for path in [
         "SET LOCAL search_path = scratch, public;",
         "SELECT set_config('search_path', 'scratch, public', true);",
@@ -4928,10 +4936,16 @@ fn a_commit_ends_a_new_table_after_a_search_path_change() {
             assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
         }
     }
-    // Without a `search_path` change, the new table stays exempt.
-    let sql = "CREATE TABLE harvest_events (id BIGINT);\nCOMMIT;\n\
-               ALTER TABLE harvest_events ADD COLUMN x INT;";
-    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+    // Other sessions can lock a committed table, so a commit ends the
+    // exemption without a `search_path` change too.
+    for end in ["COMMIT;", "END;"] {
+        let sql = format!(
+            "CREATE TABLE harvest_events (id BIGINT);\n{end}\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    }
 }
 
 #[test]
@@ -5042,6 +5056,18 @@ fn a_text_placeholder_in_quoted_template_text_is_unreadable() {
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
         assert!(findings[0].detail.contains("cannot read"), "{findings:?}");
     }
+}
+
+#[test]
+fn a_call_keeps_the_bound_only_when_no_overload_clears() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let clears = "CREATE PROCEDURE p(a TEXT) LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                  PERFORM set_config('lock_timeout', '0', true);\nEND $$;\n";
+    let keeps = "CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$\nBEGIN\n    RAISE NOTICE 'hi';\nEND $$;\n";
+    let sql = format!("{set}{clears}{keeps}CALL p('x'::text);\n{lock}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
