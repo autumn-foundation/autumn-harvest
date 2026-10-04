@@ -705,7 +705,8 @@ fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
 /// `CREATE FUNCTION` stores the body and runs nothing in it, as with a
 /// quoted body. The body ends at the `END` that no SQL `CASE` claims.
 fn mark_atomic_bodies(toks: &mut [Token]) {
-    let word = |t: &Token, w: &str| t.tok == Tok::Word(w.to_string());
+    // A quoted name such as `"end"` is never a keyword.
+    let word = |t: &Token, w: &str| t.tok == Tok::Word(w.to_string()) && !t.quoted;
     let mut k = 0;
     while k + 1 < toks.len() {
         let depth = toks[k].depth;
@@ -1866,8 +1867,12 @@ fn nonstandard_strings(s: &Stmts, sql: &str, history: &mut History, raws: &mut V
 
 /// The new `standard_conforming_strings` value that the token at `k` sets, if
 /// any. A value the lint cannot read counts as `false`, which fails closed.
+///
+/// Only a session value counts as `true`. A transaction-local `on` ends at
+/// the commit and restores the session value, so it changes nothing.
 fn conforming_change(s: &Stmts, k: usize) -> Option<bool> {
-    let on = |j: usize| s.word(j).or_else(|| s.string(j)).is_some_and(pg_true);
+    let literal = |j: usize| s.word(j).or_else(|| s.string(j));
+    let on = |j: usize| literal(j).is_some_and(pg_true);
     let start = s.starts[k] == k;
     if start && s.keyword(k, "reset") {
         return (s.is(k + 1, "standard_conforming_strings") || s.is(k + 1, "all")).then_some(true);
@@ -1883,13 +1888,20 @@ fn conforming_change(s: &Stmts, k: usize) -> Option<bool> {
         } else {
             name + 1
         };
-        return s.is(name, "standard_conforming_strings").then(|| on(value));
+        let local = s.is(k + 1, "local");
+        return s
+            .is(name, "standard_conforming_strings")
+            .then(|| on(value))
+            .filter(|&on| !(on && local));
     }
     let named = s.is(k, "set_config")
         && s.is_punct(k + 1, '(')
         && s.string(k + 2)
             .is_some_and(|n| n.trim().eq_ignore_ascii_case("standard_conforming_strings"));
-    named.then(|| s.is_punct(k + 3, ',') && on(k + 4))
+    let session = s.is_punct(k + 5, ',') && literal(k + 6).is_some_and(pg_false);
+    named
+        .then(|| s.is_punct(k + 3, ',') && on(k + 4))
+        .filter(|&on| !on || session)
 }
 
 /// The verb of a lock that an `ALTER` of a routine may expose.
@@ -5870,6 +5882,42 @@ fn a_call_of_an_unread_or_locking_routine_is_a_lock() {
         let sql = format!("SET LOCAL lock_timeout = '5s';\n{call}");
         assert_eq!(lint_with_history(&history, &sql, true), [], "{sql}");
     }
+}
+
+#[test]
+fn a_local_conforming_strings_value_keeps_the_session_taint() {
+    let off = "-- lock-safety: allow lock-timeout #1810 test fixture\nSET standard_conforming_strings = off;\n";
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    for local in [
+        "SET LOCAL standard_conforming_strings = on;",
+        "SELECT set_config('standard_conforming_strings', 'on', true);",
+    ] {
+        let earlier = format!("{off}{local}");
+        let findings = lint_with_history(&[&earlier], hidden, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.contains("standard_conforming_strings")),
+            "{local}"
+        );
+    }
+    let earlier = format!("{off}SELECT set_config('standard_conforming_strings', 'on', false);");
+    let findings = lint_with_history(&[&earlier], hidden, true);
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_quoted_end_does_not_close_an_atomic_body() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               CREATE FUNCTION f() RETURNS void LANGUAGE sql BEGIN ATOMIC\n    \
+               SELECT \"end\" FROM t;\n    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
