@@ -7151,8 +7151,8 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "histogram_quantile(0.99, sum by (le, instance, op) (rate(harvest_db_query_duration_bucket[$__rate_interval])))",
-              "legendFormat": "p99 {{op}} @ {{instance}}",
+              "expr": "histogram_quantile(0.99, sum by (le, instance, op, shard) (rate(harvest_db_query_duration_bucket[$__rate_interval])))",
+              "legendFormat": "p99 {{op}} shard {{shard}} @ {{instance}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -7160,8 +7160,8 @@
             },
             {
               "refId": "B",
-              "expr": "sum by (instance, op) (rate(harvest_db_query_duration_sum[$__rate_interval])) / sum by (instance, op) (rate(harvest_db_query_duration_count[$__rate_interval]))",
-              "legendFormat": "avg {{op}} @ {{instance}} (bucket-less fallback)",
+              "expr": "sum by (instance, op, shard) (rate(harvest_db_query_duration_sum[$__rate_interval])) / sum by (instance, op, shard) (rate(harvest_db_query_duration_count[$__rate_interval]))",
+              "legendFormat": "avg {{op}} shard {{shard}} @ {{instance}} (bucket-less fallback)",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

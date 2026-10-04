@@ -206,6 +206,7 @@ impl HeartbeatSink for PgHeartbeatSink {
                 let written = crate::queue::record_heartbeat(&mut conn, &self.claim, payload).await;
                 self.metrics.record_db_query_duration(
                     crate::telemetry::DbOp::Heartbeat,
+                    self.shard,
                     write_started.elapsed().as_secs_f64(),
                 );
                 match written {

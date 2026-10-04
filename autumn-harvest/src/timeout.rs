@@ -4796,6 +4796,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
     .await;
     metrics.record_db_query_duration(
         crate::telemetry::DbOp::Scan,
+        conn_shard.map_or(0, crate::worker::shard_metric_label),
         started.elapsed().as_secs_f64(),
     );
     result

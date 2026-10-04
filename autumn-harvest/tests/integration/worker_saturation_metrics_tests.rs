@@ -97,7 +97,7 @@ impl MetricsRecorder for Recording {
         self.push(Sample::PoolWait { shard });
     }
 
-    fn record_db_query_duration(&self, op: DbOp, _seconds: f64) {
+    fn record_db_query_duration(&self, op: DbOp, _shard: u16, _seconds: f64) {
         self.push(Sample::Query(op.as_str()));
     }
 

@@ -3069,9 +3069,10 @@ pub trait MetricsRecorder: Send + Sync {
 
     /// The duration of one database operation (issue #1815).
     ///
-    /// Maps to the histogram `harvest_db_query_duration{op}`.
-    fn record_db_query_duration(&self, op: DbOp, seconds: f64) {
-        let _ = (op, seconds);
+    /// Maps to the histogram `harvest_db_query_duration{op, shard}`. The
+    /// shard keeps a slow shard of a multi-shard worker visible.
+    fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
+        let _ = (op, shard, seconds);
     }
 
     /// The poll loops on this worker that claim from `queue` (issue #1815).
@@ -4400,7 +4401,7 @@ mod tests {
         let rec = NoOpMetrics;
         rec.record_db_pool(0, 3, 7);
         rec.record_db_pool_wait(0, 0.01);
-        rec.record_db_query_duration(DbOp::Claim, 0.002);
+        rec.record_db_query_duration(DbOp::Claim, 0, 0.002);
         rec.record_worker_pollers("default", 1);
         rec.record_worker_outlier(crate::worker_outlier::OutlierDimension::FailureRatio, true);
     }

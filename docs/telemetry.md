@@ -443,7 +443,7 @@ metric is emitted in the source code.
 | `harvest.db.pool.in_use` | `shard` |
 | `harvest.db.pool.idle` | `shard` |
 | `harvest.db.pool.wait_duration` | `shard` |
-| `harvest.db.query.duration` | `op` (`claim\|persist\|scan\|heartbeat`) |
+| `harvest.db.query.duration` | `op` (`claim\|persist\|scan\|heartbeat`), `shard` |
 | `harvest.worker.pollers` | `queue` |
 | `harvest.worker.outlier` | `dimension` (`failure_ratio\|latency_p99`) |
 | `harvest.workflow.active` | `workflow`, `state` (`running\|paused`) |

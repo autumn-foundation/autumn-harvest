@@ -13,7 +13,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - `harvest.db.pool.wait_duration{shard}`: histogram of the wait for a pooled
   connection. The claim path, the timeout scanner and the activity heartbeat
   flush record it. A failed or timed-out wait counts too.
-- `harvest.db.query.duration{op}`: histogram per op.
+- `harvest.db.query.duration{op, shard}`: histogram per op and shard, so a
+  slow shard of a multi-shard worker stays visible.
   - `claim` times one claim query.
   - `persist` times the workflow-task persist transaction, COMMIT included.
     A drop guard records a transaction that a timeout cancels.

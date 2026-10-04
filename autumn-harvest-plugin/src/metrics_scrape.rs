@@ -464,10 +464,10 @@ impl MetricsRecorder for HarvestMetricsRecorder {
             .observe(vec![shard.to_string()], seconds);
     }
 
-    fn record_db_query_duration(&self, op: DbOp, seconds: f64) {
+    fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
         self.0
             .db_query_duration
-            .observe(vec![op.as_str().to_owned()], seconds);
+            .observe(vec![op.as_str().to_owned(), shard.to_string()], seconds);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -813,7 +813,7 @@ fn push_saturation_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
         families,
         "harvest_db_query_duration",
         "Seconds one database operation takes",
-        &[METRIC_LABEL_OP],
+        &[METRIC_LABEL_OP, METRIC_LABEL_SHARD],
         inner.db_query_duration.snapshot(),
     );
     push_gauge(
@@ -1084,7 +1084,7 @@ mod tests {
         recorder.record_db_pool(2, 3, 5);
         recorder.record_db_pool_wait(2, 0.5);
         recorder.record_db_pool_wait(2, 0.25);
-        recorder.record_db_query_duration(DbOp::Claim, 0.125);
+        recorder.record_db_query_duration(DbOp::Claim, 2, 0.125);
         recorder.record_worker_pollers("email", 1);
         recorder.record_worker_outlier(OutlierDimension::FailureRatio, true);
         recorder.record_worker_outlier(OutlierDimension::LatencyP99, false);
@@ -1100,7 +1100,7 @@ mod tests {
         let wait_sum = family(&families, "harvest_db_pool_wait_duration_sum");
         assert_eq!(sample_value(wait_sum, &[("shard", "2")]), 0.75);
         let query = family(&families, "harvest_db_query_duration_count");
-        assert_eq!(sample_value(query, &[("op", "claim")]), 1.0);
+        assert_eq!(sample_value(query, &[("op", "claim"), ("shard", "2")]), 1.0);
         let pollers = family(&families, "harvest_worker_pollers");
         assert_eq!(pollers.kind, MetricKind::Gauge);
         assert_eq!(sample_value(pollers, &[("queue", "email")]), 1.0);

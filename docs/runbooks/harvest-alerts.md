@@ -3510,12 +3510,12 @@ are fast.
 ## harvest_db_query_latency_high
 
 **What to do when hot-path database operations are slow:** the histogram
-`harvest.db.query.duration{op}` times four ops (issue #1815). They are one
-claim, one workflow-task persist transaction, one timeout-scanner pass and
-one activity heartbeat write. Each op is a unit of work, not one SQL
+`harvest.db.query.duration{op, shard}` times four ops (issue #1815). They
+are one claim, one workflow-task persist transaction, one timeout-scanner
+pass and one activity heartbeat write. Each op is a unit of work, not one SQL
 statement. The rule watches `claim` and `persist`, because they set
-throughput. It keeps the `instance` label, so one slow replica fires it
-alone.
+throughput. It keeps the `instance` and `shard` labels, so one slow replica,
+or one slow shard of a multi-shard worker, fires it alone.
 
 ### Triage steps
 

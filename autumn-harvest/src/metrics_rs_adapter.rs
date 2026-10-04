@@ -401,8 +401,13 @@ impl MetricsRecorder for MetricsRsRecorder {
         histogram!(METRIC_DB_POOL_WAIT, METRIC_LABEL_SHARD => shard.to_string()).record(seconds);
     }
 
-    fn record_db_query_duration(&self, op: DbOp, seconds: f64) {
-        histogram!(METRIC_DB_QUERY_DURATION, METRIC_LABEL_OP => op.as_str()).record(seconds);
+    fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
+        histogram!(
+            METRIC_DB_QUERY_DURATION,
+            METRIC_LABEL_OP => op.as_str(),
+            METRIC_LABEL_SHARD => shard.to_string()
+        )
+        .record(seconds);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1444,7 +1449,7 @@ mod tests {
         rec.record_workflow_completed("wf", "q", 1.0, WorkflowStatus::Completed);
         rec.record_db_pool(0, 1, 2);
         rec.record_db_pool_wait(0, 0.01);
-        rec.record_db_query_duration(DbOp::Persist, 0.02);
+        rec.record_db_query_duration(DbOp::Persist, 0, 0.02);
         rec.record_worker_pollers("q", 1);
         rec.record_worker_outlier(OutlierDimension::LatencyP99, false);
         rec.record_workflow_history_size("wf", 2);
@@ -2468,7 +2473,7 @@ mod tests {
             let rec = MetricsRsRecorder;
             rec.record_db_pool(3, 4, 6);
             rec.record_db_pool_wait(3, 0.25);
-            rec.record_db_query_duration(DbOp::Claim, 0.5);
+            rec.record_db_query_duration(DbOp::Claim, 3, 0.5);
             rec.record_worker_pollers("email", 1);
             rec.record_worker_outlier(OutlierDimension::FailureRatio, true);
             rec.record_worker_outlier(OutlierDimension::LatencyP99, false);
@@ -2496,7 +2501,10 @@ mod tests {
                 ),
                 (
                     METRIC_DB_QUERY_DURATION.to_owned(),
-                    label(METRIC_LABEL_OP, "claim"),
+                    vec![
+                        (METRIC_LABEL_OP.to_owned(), "claim".to_owned()),
+                        (METRIC_LABEL_SHARD.to_owned(), "3".to_owned()),
+                    ],
                     0.5
                 ),
                 (

@@ -23318,7 +23318,11 @@ async fn process_workflow_task(
 
     // Issue #1815: the `persist` op spans the whole transaction, COMMIT
     // included. The guard also records a transaction that a timeout cancels.
-    let persist_timer = DbOpTimer::start(&registry.telemetry().metrics, DbOp::Persist);
+    let persist_timer = DbOpTimer::start(
+        &registry.telemetry().metrics,
+        DbOp::Persist,
+        shard_metric_label(crate::types::ShardId::new(prepared.execution.shard_id)),
+    );
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
             if check_paused_and_park(
@@ -26296,14 +26300,16 @@ impl Drop for PollerGuard {
 struct DbOpTimer {
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
     op: DbOp,
+    shard: u16,
     started: std::time::Instant,
 }
 
 impl DbOpTimer {
-    fn start(metrics: &Arc<dyn crate::telemetry::MetricsRecorder>, op: DbOp) -> Self {
+    fn start(metrics: &Arc<dyn crate::telemetry::MetricsRecorder>, op: DbOp, shard: u16) -> Self {
         Self {
             metrics: Arc::clone(metrics),
             op,
+            shard,
             started: std::time::Instant::now(),
         }
     }
@@ -26311,8 +26317,11 @@ impl DbOpTimer {
 
 impl Drop for DbOpTimer {
     fn drop(&mut self) {
-        self.metrics
-            .record_db_query_duration(self.op, self.started.elapsed().as_secs_f64());
+        self.metrics.record_db_query_duration(
+            self.op,
+            self.shard,
+            self.started.elapsed().as_secs_f64(),
+        );
     }
 }
 
@@ -31127,7 +31136,7 @@ impl Worker {
             shard,
         )
         .await;
-        self.record_db_op(DbOp::Claim, claim_started);
+        self.record_db_op(DbOp::Claim, shard, claim_started);
 
         match claimed {
             Ok(Some(task)) => {
@@ -32112,13 +32121,19 @@ impl Worker {
         PollerGuard::new(&self.config.queues, &self.registry.telemetry().metrics)
     }
 
-    /// Record the duration of one database op that began at `started`
-    /// (issue #1815).
-    fn record_db_op(&self, op: DbOp, started: std::time::Instant) {
-        self.registry
-            .telemetry()
-            .metrics
-            .record_db_query_duration(op, started.elapsed().as_secs_f64());
+    /// Record the duration of one database op on `shard` that began at
+    /// `started` (issue #1815). The shard label matches the pool-wait one.
+    fn record_db_op(
+        &self,
+        op: DbOp,
+        shard: Option<crate::types::ShardId>,
+        started: std::time::Instant,
+    ) {
+        self.registry.telemetry().metrics.record_db_query_duration(
+            op,
+            shard.map_or(0, shard_metric_label),
+            started.elapsed().as_secs_f64(),
+        );
     }
 
     /// Execute a single poll iteration.
@@ -32218,7 +32233,7 @@ impl Worker {
                     kind,
                 )
                 .await;
-                self.record_db_op(DbOp::Claim, claim_started);
+                self.record_db_op(DbOp::Claim, shard, claim_started);
                 match claimed {
                     Ok(Some(task)) => {
                         tracing::debug!(
@@ -32264,7 +32279,7 @@ impl Worker {
             kind,
         )
         .await;
-        self.record_db_op(DbOp::Claim, claim_started);
+        self.record_db_op(DbOp::Claim, shard, claim_started);
         match claimed {
             Ok(Some(task)) => {
                 tracing::debug!(
