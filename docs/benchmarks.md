@@ -382,6 +382,10 @@ happened.
   scenario here reports throughput over the *same* history, from the same
   builder — `build_history` lives in the shared harness and both benches call
   it — so the two can never drift into describing different workloads.
+* [`benchmarks/notify-commit.md`](benchmarks/notify-commit.md) (issue #1796)
+  measures commit throughput with and without a `pg_notify` inside the write
+  transaction. Read it to see why history appends and enqueues send NOTIFY
+  after commit.
 
 ## Scope
 
