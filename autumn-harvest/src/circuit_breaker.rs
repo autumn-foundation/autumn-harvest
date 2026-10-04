@@ -127,11 +127,12 @@ pub struct ClaimKey {
 enum ClaimState {
     /// No enforcement touches the claim.
     Running,
-    /// The enforcer is deciding. A result that arrives now waits for that
-    /// decision.
-    Provisional,
-    /// The result that arrived while the enforcer was deciding.
-    Held(AttemptOutcome, DispatchToken),
+    /// Enforcers are deciding, this many of them. Two scanners can race on
+    /// one claim. A result that arrives now waits for their decision.
+    Provisional(u32),
+    /// The result that arrived while enforcers were deciding, and how many
+    /// still decide.
+    Held(AttemptOutcome, DispatchToken, u32),
     /// The enforcer timed the claim out. A later result does not count.
     TimedOut,
 }
@@ -472,9 +473,9 @@ impl CircuitBreakerRegistry {
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
         match st.in_flight_claims.get(&claim).copied() {
-            Some(ClaimState::Provisional) => {
+            Some(ClaimState::Provisional(deciding)) => {
                 st.in_flight_claims
-                    .insert(claim, ClaimState::Held(outcome, token));
+                    .insert(claim, ClaimState::Held(outcome, token, deciding));
                 None
             }
             Some(ClaimState::TimedOut) => {
@@ -520,9 +521,10 @@ impl CircuitBreakerRegistry {
     /// Mark `claim` provisionally, before the enforcer decides on it (issue
     /// #1809).
     ///
-    /// A result that arrives now is held. The enforcer then calls
+    /// A result that arrives now is held. Each enforcer that marks then calls
     /// [`confirm_claim_timed_out`](Self::confirm_claim_timed_out) or
-    /// [`unmark_claim_timed_out`](Self::unmark_claim_timed_out). A claim that
+    /// [`unmark_claim_timed_out`](Self::unmark_claim_timed_out) once. One
+    /// confirm wins over any number of rollbacks, in any order. A claim that
     /// this process does not hold has no local result to fence, so the mark
     /// then does nothing.
     pub fn mark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
@@ -533,9 +535,17 @@ impl CircuitBreakerRegistry {
         if let Some(state) = states
             .get_mut(activity_name)
             .and_then(|st| st.in_flight_claims.get_mut(&claim))
-            && *state == ClaimState::Running
         {
-            *state = ClaimState::Provisional;
+            *state = match *state {
+                ClaimState::Running => ClaimState::Provisional(1),
+                ClaimState::Provisional(deciding) => {
+                    ClaimState::Provisional(deciding.saturating_add(1))
+                }
+                ClaimState::Held(outcome, token, deciding) => {
+                    ClaimState::Held(outcome, token, deciding.saturating_add(1))
+                }
+                ClaimState::TimedOut => ClaimState::TimedOut,
+            };
         }
     }
 
@@ -550,11 +560,11 @@ impl CircuitBreakerRegistry {
             return;
         };
         match st.in_flight_claims.get(&claim).copied() {
-            Some(ClaimState::Held(_, token)) => {
+            Some(ClaimState::Held(_, token, _)) => {
                 st.in_flight_claims.remove(&claim);
                 apply_cancelled(st, token, now);
             }
-            Some(ClaimState::Provisional) => {
+            Some(ClaimState::Provisional(_)) => {
                 st.in_flight_claims.insert(claim, ClaimState::TimedOut);
             }
             _ => {}
@@ -573,11 +583,21 @@ impl CircuitBreakerRegistry {
         let mut states = self.lock();
         let st = states.get_mut(activity_name)?;
         match st.in_flight_claims.get(&claim).copied() {
-            Some(ClaimState::Held(outcome, token)) => {
+            Some(ClaimState::Held(outcome, token, deciding)) if deciding > 1 => {
+                st.in_flight_claims
+                    .insert(claim, ClaimState::Held(outcome, token, deciding - 1));
+                None
+            }
+            Some(ClaimState::Held(outcome, token, _)) => {
                 st.in_flight_claims.remove(&claim);
                 apply_result(st, policy, outcome, token, now)
             }
-            Some(ClaimState::Provisional) => {
+            Some(ClaimState::Provisional(deciding)) if deciding > 1 => {
+                st.in_flight_claims
+                    .insert(claim, ClaimState::Provisional(deciding - 1));
+                None
+            }
+            Some(ClaimState::Provisional(_)) => {
                 st.in_flight_claims.insert(claim, ClaimState::Running);
                 None
             }
@@ -1060,6 +1080,47 @@ mod tests {
             "the late success does not clear the window"
         );
         assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// Two enforcers race on one claim. One times it out and the other does
+    /// nothing. In either order, the late result stays fenced.
+    #[test]
+    fn racing_enforcers_keep_the_fence_in_either_order() {
+        for rollback_first in [true, false] {
+            let reg = registry();
+            let t0 = Instant::now();
+            fail(&reg, t0);
+            let token = dispatch(&reg, t0);
+            reg.begin_claim("send_email", claim(1));
+            reg.mark_claim_timed_out("send_email", claim(1));
+            reg.mark_claim_timed_out("send_email", claim(1));
+            if rollback_first {
+                let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+                reg.confirm_claim_timed_out("send_email", claim(1), t0);
+            } else {
+                reg.confirm_claim_timed_out("send_email", claim(1), t0);
+                let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+            }
+            let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+            assert_eq!(rolling(&reg, t0), 1, "rollback first: {rollback_first}");
+        }
+    }
+
+    /// A result held during two rollbacks counts once, after the last one.
+    #[test]
+    fn held_result_waits_for_every_racing_enforcer() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+        assert_eq!(rolling(&reg, t0), 1, "one enforcer still decides");
+        let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+        assert_eq!(rolling(&reg, t0), 0, "the held success counts now");
     }
 
     /// A claim that this process does not hold cannot be marked, and an
