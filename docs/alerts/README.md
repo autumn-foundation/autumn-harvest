@@ -8,6 +8,9 @@ deployments:
 - `../runbooks/synthetic-incident-drills.md` contains the incident drills that
   prove the first five common failure modes route to the expected alert.
 
+For SLO-based paging, use the optional burn-rate pack in [`slo.md`](slo.md).
+It defines reference SLIs and targets, and pages on error-budget burn.
+
 The thresholds are starter defaults, not universal SLOs. Tune them to workload
 volume, downstream SLAs, deployment topology, queue count, shard count, and the
 cadence of your scheduled workflows. A queue that normally drains 10 tasks per

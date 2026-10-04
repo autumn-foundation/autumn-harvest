@@ -3364,3 +3364,128 @@ Escalate when the queue usage keeps rising after the long transactions
 end, or when it reaches `1` and `harvest.notify.send_failures` climbs.
 Escalate to the database owner first, because the queue is a
 database-wide resource that other applications can also fill.
+
+## harvest_slo_workflow_task
+
+This section covers the three workflow-task SLO alerts in the optional
+burn-rate pack (`docs/alerts/slo-pack-v0.1.0.rules.yml`, issue #1816):
+`harvest_slo_workflow_task_burn_1h`, `_burn_6h`, and `_burn_3d`. The SLI
+and its 99.9% objective are in [`docs/alerts/slo.md`](../alerts/slo.md).
+
+A workflow task is one executor cycle. A task fails when its cycle ends the
+run as `failed`, or when it times out and the worker abandons it
+(`harvest.workflow.task_timeout`). A `burn_1h` or `burn_6h` alert is a page.
+A `burn_3d` alert is a ticket.
+
+### Triage steps
+
+1. Read the `window` label. It tells you how fast the budget burns:
+   `1h` is 14.4x, `6h` is 6x, and `3d` is 1x.
+2. Find the source of the errors. Compare
+   `sum by (workflow) (rate(harvest_workflow_duration_count{status="failed"}[1h]))`
+   with `sum by (workflow) (rate(harvest_workflow_task_timeout_total[1h]))`.
+3. If failed cycles lead, follow
+   [`harvest_workflow_failure_rate`](#harvest_workflow_failure_rate).
+4. If timeouts lead, run `harvest worker health --output json`. Then
+   follow [`harvest_worker_saturation`](#harvest_worker_saturation).
+
+### Likely causes
+
+- A deploy that makes a workflow fail.
+- A downstream outage that exhausts activity retries.
+- Workers that are too slow or too few, so workflow tasks time out.
+
+### False positives
+
+The `failed` status includes failures that the workflow returns on purpose.
+If a workflow type fails by design, remove it from the SLI with a
+`workflow!~"..."` matcher. A deliberate load test can also burn budget.
+
+### Safe actions
+
+Roll back the release that caused the errors. Pause the schedules that feed
+a failing workflow type. Add worker capacity if timeouts lead.
+
+### Escalation criteria
+
+Escalate to the workflow owner when a page stays active for 30 minutes.
+Escalate to the release owner when the onset matches a deploy.
+
+## harvest_slo_schedule_to_start
+
+This section covers the three schedule-to-start SLO alerts in the optional
+burn-rate pack: `harvest_slo_schedule_to_start_burn_1h`, `_burn_6h`, and
+`_burn_3d`. The SLI is the share of tasks that wait more than 5 s from
+eligibility to start. The objective is 99% within 5 s. See
+[`docs/alerts/slo.md`](../alerts/slo.md).
+
+### Triage steps
+
+1. Read the `window` label. It tells you how fast the budget burns.
+2. Find the slow queues with
+   `histogram_quantile(0.99, sum by (le, queue) (rate(harvest_queue_schedule_to_start_bucket[1h])))`.
+3. Follow
+   [`harvest_queue_schedule_to_start_high`](#harvest_queue_schedule_to_start_high)
+   for the queues that you find.
+
+### Likely causes
+
+- Not enough worker slots for the load.
+- No live worker polls a queue.
+- A paused queue, a concurrency limit, or a rate limit holds tasks back.
+
+### False positives
+
+A large planned backfill can burn budget. A paused queue burns budget when
+it resumes, because its held tasks start late. Mute the alert for a planned
+backfill, or move the backfill to its own queue.
+
+### Safe actions
+
+Add worker capacity. Move a hot workflow type to its own queue. Do not
+remove a concurrency limit or a rate limit until you know why it is there.
+
+### Escalation criteria
+
+Escalate to the platform owner when added capacity does not reduce the
+burn within 30 minutes.
+
+## harvest_slo_canary
+
+This section covers the three canary SLO alerts in the optional burn-rate
+pack: `harvest_slo_canary_burn_1h`, `_burn_6h`, and `_burn_3d`. The SLI is
+the share of synthetic liveness probes (issue #796) that fail. The
+objective is 99%. See [`docs/alerts/slo.md`](../alerts/slo.md).
+
+A canary probe runs the full start, dispatch, activity, timer, and complete
+path. A failed probe means that this path is broken for real workflows too.
+
+### Triage steps
+
+1. Run `GET /api/harvest/admin/canary`. Find the probes with
+   `stale: true` or a rising `failure_count`.
+2. If one queue fails, run `harvest worker list --queue <queue> --output json`.
+3. If one shard fails, run `harvest shard health --output json`.
+4. If all probes fail, run `harvest preflight --output json`.
+
+### Likely causes
+
+- No live worker polls a probe queue.
+- A shard is unready, fenced, or not writable.
+- The scheduler does not fire, so timers do not complete.
+
+### False positives
+
+A probe queue with no worker fails every probe. That is a configuration
+error, not a false positive. Remove the queue from the canary configuration
+or add a worker for it.
+
+### Safe actions
+
+Restart a stuck worker. Drain and restart a shard only through the steps in
+[`harvest_shard_unready`](#harvest_shard_unready).
+
+### Escalation criteria
+
+Escalate to the platform owner at once when every probe fails. That
+pattern means the execution path is down for all workflows.
