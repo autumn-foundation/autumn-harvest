@@ -555,21 +555,36 @@ impl ShardPeerViews {
     }
 }
 
-/// The outlier verdicts of every worker in this process (issue #1815).
+/// The outlier verdicts of the local workers that share one recorder (issue
+/// #1815).
 ///
-/// The gauge has no worker label, and two `Worker`s in one process share one
-/// recorder. The gauge therefore reports the OR of all local verdicts. A
+/// The gauge has no worker label, and two `Worker`s in one process can share
+/// one recorder. The gauge therefore reports the OR of their verdicts. A
 /// healthy worker's tick then cannot clear a sick worker's flag.
 #[derive(Debug, Default)]
 pub struct ProcessOutlierFlags(Mutex<std::collections::HashMap<String, Vec<OutlierDimension>>>);
 
 impl ProcessOutlierFlags {
-    /// The instance that every worker in this process shares.
+    /// The instance that every worker using `metrics` shares.
+    ///
+    /// Workers that share a recorder share one gauge, so they share one set of
+    /// verdicts. A runtime with its own recorder gets its own set, so one
+    /// runtime's sick worker cannot raise another runtime's gauge.
     #[must_use]
-    pub fn global() -> Arc<Self> {
-        static GLOBAL: std::sync::LazyLock<Arc<ProcessOutlierFlags>> =
-            std::sync::LazyLock::new(Arc::default);
-        Arc::clone(&GLOBAL)
+    pub fn for_recorder(metrics: &Arc<dyn MetricsRecorder>) -> Arc<Self> {
+        type Entry = (Arc<dyn MetricsRecorder>, Arc<ProcessOutlierFlags>);
+        static BY_RECORDER: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Entry>>> =
+            std::sync::LazyLock::new(Mutex::default);
+        let mut by_recorder = BY_RECORDER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The entry holds the recorder, so its address stays unique.
+        let (_, flags) = by_recorder
+            .entry(crate::telemetry::recorder_key(metrics))
+            .or_insert_with(|| (Arc::clone(metrics), Arc::default()));
+        let flags = Arc::clone(flags);
+        drop(by_recorder);
+        flags
     }
 
     /// Record `worker_id`'s verdict and return the dimensions on which any
@@ -629,8 +644,8 @@ pub struct OutlierProbe {
     pub slot: usize,
     /// The peer rows of all this worker's shard heartbeats.
     pub shard_peers: Arc<ShardPeerViews>,
-    /// The verdicts of every worker in the process. Use
-    /// [`ProcessOutlierFlags::global`] outside tests.
+    /// The verdicts of every local worker that shares `metrics`. Use
+    /// [`ProcessOutlierFlags::for_recorder`] outside tests.
     pub process_flags: Arc<ProcessOutlierFlags>,
 }
 
@@ -2351,6 +2366,22 @@ mod tests {
         assert_eq!(flags.set("sick", &[]), vec![LatencyP99]);
         // A stopped worker leaves the map, so its flag cannot linger.
         assert_eq!(flags.remove("slow"), Vec::new());
+    }
+
+    /// Issue #1815: workers that share a recorder share verdicts, and a
+    /// runtime with its own recorder does not.
+    #[test]
+    fn process_outlier_flags_are_kept_per_recorder() {
+        use std::sync::Arc;
+        let a: Arc<dyn crate::telemetry::MetricsRecorder> = Arc::new(crate::telemetry::NoOpMetrics);
+        let b: Arc<dyn crate::telemetry::MetricsRecorder> = Arc::new(crate::telemetry::NoOpMetrics);
+        let a_flags = super::ProcessOutlierFlags::for_recorder(&a);
+        let a_again = super::ProcessOutlierFlags::for_recorder(&Arc::clone(&a));
+        assert!(Arc::ptr_eq(&a_flags, &a_again));
+        assert!(!Arc::ptr_eq(
+            &a_flags,
+            &super::ProcessOutlierFlags::for_recorder(&b)
+        ));
     }
 
     /// The fleet lookup that gates the capability-miss redelivery budget

@@ -25869,13 +25869,22 @@ fn pool_occupancy(status: &deadpool::Status) -> (u64, u64) {
     (in_use as u64, idle as u64)
 }
 
-/// Running poll loops per queue in this process (issue #1815).
+/// One recorder's running poll loops per queue (issue #1815). The entry holds
+/// the recorder, so its address stays unique while the entry lives.
+type RecorderPollers = (
+    Arc<dyn crate::telemetry::MetricsRecorder>,
+    std::collections::HashMap<String, u64>,
+);
+
+/// Running poll loops per queue, per metrics recorder (issue #1815).
 ///
-/// The gauge has no worker label, and two `Worker`s in one process share one
-/// recorder. A per-worker count would let one worker's drain write 0 over a
-/// peer that still polls. So the count is process-wide.
-static POLLERS_BY_QUEUE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+/// The gauge has no worker label, and two `Worker`s in one process can share
+/// one recorder. A per-worker count would let one worker's drain write 0 over
+/// a peer that still polls. So workers that share a recorder share a count. A
+/// runtime with its own recorder gets its own count, keyed by
+/// [`crate::telemetry::recorder_key`].
+static POLLERS_BY_RECORDER: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, RecorderPollers>>,
 > = std::sync::LazyLock::new(std::sync::Mutex::default);
 
 /// Counts one running poll loop and keeps `harvest.worker.pollers` current
@@ -25907,9 +25916,12 @@ impl PollerGuard {
     /// stop together then emit in count order, so the last write is current.
     #[allow(clippy::significant_drop_tightening)]
     fn adjust(&self, start: bool) {
-        let mut counts = POLLERS_BY_QUEUE
+        let mut by_recorder = POLLERS_BY_RECORDER
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_, counts) = by_recorder
+            .entry(crate::telemetry::recorder_key(&self.metrics))
+            .or_insert_with(|| (Arc::clone(&self.metrics), std::collections::HashMap::new()));
         for queue in &self.queues {
             let count = counts.entry(queue.clone()).or_insert(0);
             *count = if start {
@@ -30252,7 +30264,9 @@ impl Worker {
                 compare: compare_outliers,
                 slot: shard_slot,
                 shard_peers: Arc::clone(&self.outlier_peers),
-                process_flags: crate::workers::ProcessOutlierFlags::global(),
+                process_flags: crate::workers::ProcessOutlierFlags::for_recorder(
+                    &self.registry.telemetry().metrics,
+                ),
             },
         )
     }
@@ -39896,6 +39910,18 @@ mod tests {
             vec![1, 2, 1, 0],
             "a duplicate queue counts once per loop"
         );
+
+        // A runtime with its own recorder keeps its own count on the same queue.
+        let other = Arc::new(Pollers::default());
+        let other_metrics: Arc<dyn crate::telemetry::MetricsRecorder> = other.clone();
+        let first = PollerGuard::new(std::slice::from_ref(&queue), &metrics);
+        let second = PollerGuard::new(std::slice::from_ref(&queue), &other_metrics);
+        drop(first);
+        drop(second);
+        let mine: Vec<u64> = recorder.0.lock().unwrap().iter().map(|(_, n)| *n).collect();
+        let theirs: Vec<u64> = other.0.lock().unwrap().iter().map(|(_, n)| *n).collect();
+        assert_eq!(mine[4..], [1, 0]);
+        assert_eq!(theirs, vec![1, 0]);
     }
 
     #[test]

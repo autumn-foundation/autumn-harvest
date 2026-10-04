@@ -328,8 +328,8 @@ pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
 /// Gauge: poll loops that claim work from a queue on this worker (issue #1815).
 ///
 /// Labelled `{queue}`. One poll loop claims from all the worker's queues, so
-/// each queue reports the same count. The count covers every worker in the
-/// process. It drops when a worker drains. This is the Harvest form of
+/// each queue reports the same count. The count covers every worker that
+/// shares the metrics recorder. It drops when a worker drains. This is the Harvest form of
 /// `temporal_num_pollers`.
 pub const METRIC_WORKER_POLLERS: &str = "harvest.worker.pollers";
 
@@ -2340,6 +2340,20 @@ impl TunerDecision {
             Self::Hold => "hold",
         }
     }
+}
+
+/// A key for one metrics recorder (issue #1815): the address of its shared
+/// allocation.
+///
+/// Two clones of one `Arc` give the same key, and two recorders give two keys.
+/// An aggregate that feeds an unlabelled gauge, such as the poller count, is
+/// kept per key. Workers that share a recorder then share the aggregate, and
+/// a second runtime with its own recorder stays apart. A holder of a key must
+/// also hold a clone of the `Arc`, so the address is not reused.
+#[cfg(feature = "db")]
+#[must_use]
+pub(crate) fn recorder_key(metrics: &Arc<dyn MetricsRecorder>) -> usize {
+    Arc::as_ptr(metrics).cast::<()>() as usize
 }
 
 /// A timed database operation (issue #1815), used as the bounded `op` label on

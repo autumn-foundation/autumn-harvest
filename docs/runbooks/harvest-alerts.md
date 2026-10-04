@@ -3385,8 +3385,8 @@ last 5 minutes and at most 1024 tasks. A busy worker therefore covers less
 than 5 minutes. The liveness heartbeat writes a snapshot to
 `harvest_worker_task_stats` on every shard. One heartbeat per worker then
 compares it with its peers. That heartbeat merges the peers from all the
-worker's shards. With two workers in one process, the gauge reads `1` when
-either worker is an outlier.
+worker's shards. When two workers in one process share a metrics recorder,
+the gauge reads `1` when either worker is an outlier.
 
 The peers are the live, `Active` workers that poll the same queues. A worker
 on a slow queue is not compared with workers on a fast queue.
