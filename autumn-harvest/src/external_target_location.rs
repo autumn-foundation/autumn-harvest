@@ -75,11 +75,11 @@
 //!
 //! **Connections are the scarce resource, not queries.** The outbox calls this
 //! from inside a transaction on a connection it already holds from its own
-//! shard's pool, and Harvest configures no deadpool `Timeouts`, so a bare
-//! `pool.get().await` is an *unbounded* wait — a sweep that reached back into
-//! its own pool for a second connection parks forever on a one-connection pool
-//! and wedges every later resident of that scanner tick (the hazard
-//! `codec_rotation.rs` and `audit_export.rs` were both fixed for). Three rules
+//! shard's pool. A pool may have no deadpool `Timeouts`. Then a bare
+//! `pool.get().await` is an *unbounded* wait. A sweep that reached back into
+//! its own pool for a second connection parks forever on a one-connection
+//! pool. It then wedges every later resident of that scanner tick. That is the
+//! hazard `codec_rotation.rs` and `audit_export.rs` were both fixed for. Three rules
 //! keep that from happening here:
 //!
 //! * The caller's own shard is probed on the **connection the caller already

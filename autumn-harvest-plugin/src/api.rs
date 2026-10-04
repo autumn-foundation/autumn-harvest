@@ -365,6 +365,13 @@ pub struct HarvestApiState {
     admin_auth_session_key: Arc<Mutex<String>>,
     /// When enabled, `/health` returns 503 until writable shards are ready.
     health_requires_shard_readiness: Arc<Mutex<bool>>,
+    /// Set at shutdown. `/health/ready` then returns 503 (issue #1812).
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// The autumn-web probe state, linked on the plugin path (issue #1812).
+    /// autumn-web marks it at SIGTERM, before its shutdown hooks run.
+    host_probes: Arc<Mutex<Option<autumn_web::probe::ProbeState>>>,
+    /// The last readiness database result and its time (issue #1812).
+    ready_cache: Arc<tokio::sync::Mutex<Option<(tokio::time::Instant, ReadyDatabaseVerdict)>>>,
     /// Default drain deadline offset used when `POST /workers/{id}/drain` omits `deadline_at`.
     /// Set from `WorkerConfig::shutdown_timeout` at startup; defaults to 30 s.
     worker_shutdown_timeout: Arc<Mutex<std::time::Duration>>,
@@ -467,6 +474,9 @@ impl Default for HarvestApiState {
             allow_unauthenticated_mutations: Arc::new(Mutex::new(false)),
             admin_auth_session_key: Arc::new(Mutex::new("user_id".to_string())),
             health_requires_shard_readiness: Arc::new(Mutex::new(false)),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            host_probes: Arc::new(Mutex::new(None)),
+            ready_cache: Arc::new(tokio::sync::Mutex::new(None)),
             worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
             workflow_result_notification_urls: Arc::default(),
             workflow_result_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
@@ -1220,6 +1230,52 @@ impl HarvestApiState {
             .health_requires_shard_readiness
             .lock()
             .expect("harvest api state lock poisoned") = required;
+    }
+
+    /// Mark this replica as draining (issue #1812).
+    ///
+    /// `GET /health/ready` then returns 503. `GET /health/live` stays 200.
+    /// Both stop paths call this first. An embedder can call it earlier, when
+    /// SIGTERM arrives. The next runtime start ends the drain.
+    pub fn begin_draining(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Report whether this replica is draining (issue #1812).
+    ///
+    /// A linked autumn-web probe state that is shutting down also counts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        // The full path is necessary. Diesel `RunQueryDsl::load` shadows the method.
+        std::sync::atomic::AtomicBool::load(&self.draining, std::sync::atomic::Ordering::SeqCst)
+            || self
+                .host_probes
+                .lock()
+                .expect("harvest api state lock poisoned")
+                .as_ref()
+                .is_some_and(autumn_web::probe::ProbeState::is_shutting_down)
+    }
+
+    /// End a drain. Each runtime start calls this before its first await.
+    pub(crate) fn end_draining(&self) {
+        self.draining
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Link the autumn-web probe state (issue #1812).
+    ///
+    /// autumn-web marks it at SIGTERM. It closes the listener before it runs
+    /// the `HarvestPlugin` shutdown hook, so the hook alone is too late.
+    pub(crate) fn link_host_probes(&self, probes: autumn_web::probe::ProbeState) {
+        *self
+            .host_probes
+            .lock()
+            .expect("harvest api state lock poisoned") = Some(probes);
     }
 
     /// Returns `Some(days)` only when explicitly set via [`HarvestApiState::set_audit_retention_days`];
@@ -5128,6 +5184,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
         )
         .route("/health", get(health))
+        // Kubernetes probes (issue #1812). PublicSafe, like `/health`.
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         // No admin gate: a client generator fetches this before it holds any
         // credential. An embedder's own auth middleware still gates it.
         .route("/openapi.json", get(crate::openapi::get_openapi_document))
@@ -6908,6 +6967,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("PATCH", "/tasks/{id}"),
         // ── health & admin ────────────────────────────────────────────────────
         ("GET", "/health"),
+        ("GET", "/health/live"),
+        ("GET", "/health/ready"),
         // The published OpenAPI 3.1 document for this router.
         ("GET", "/openapi.json"),
         ("GET", "/admin/preflight"),
@@ -7545,6 +7606,7 @@ pub const fn management_api_response_fields()
                 "scheduled_time",
                 "history_truncated",
                 "history_endpoint",
+                "legal_hold",
             ]),
         ),
         (
@@ -7716,24 +7778,18 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/{workflow_name}/start",
-            // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
-            // A debounced workflow (issue #499) instead returns 202 Accepted with the
-            // debounce fields below (no execution_id exists until the scanner fires).
-            // With an idempotency_key (issue #808) the response also carries the
-            // started_fresh/deduplicated flags (200 on a dedup replay).
+            // The 201 body: a normal start, or a batch that flushed at once. With
+            // an idempotency_key (issue #808) it also carries started_fresh and
+            // deduplicated. A deferred start (debounce, batch or throttle) is a
+            // 202 with its own fields. The contract lists those under
+            // `additional_responses` (issue #1616).
             Some(&[
                 "execution_id",
                 "workflow_name",
                 "workflow_id",
                 "state",
-                "debounced",
-                "debounce_key",
-                "fire_at",
-                "pending_count",
                 "batched",
                 "flushed",
-                "batch_key",
-                "max_size",
                 "started_fresh",
                 "deduplicated",
                 "shard_id",
@@ -8247,6 +8303,20 @@ pub const fn management_api_response_fields()
                 "scheduler",
                 "shard_readiness_enforced",
                 "shard_readiness",
+            ]),
+        ),
+        ("GET", "/health/live", Some(&["alive", "draining"])),
+        (
+            "GET",
+            "/health/ready",
+            Some(&[
+                "ready",
+                "runtime_ready",
+                "draining",
+                "database_reachable",
+                "shard_readiness_enforced",
+                "shard_readiness",
+                "reasons",
             ]),
         ),
         // The OpenAPI document itself, a free-form JSON object.
@@ -40791,6 +40861,178 @@ async fn health(Extension(api_state): Extension<HarvestApiState>) -> axum::respo
         .into_response()
 }
 
+/// Total budget for the readiness database checks (issue #1812).
+///
+/// One deadline covers `SELECT 1` and the shard report together. It is below
+/// the probe `timeoutSeconds` in `docs/operations/kubernetes-probes.md`, so the
+/// replica answers 503 before the kubelet stops waiting.
+const READY_DATABASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Lifetime of a cached readiness database result (issue #1812).
+///
+/// The probe is public. The cache limits its database work to one check per
+/// interval, whatever the request rate.
+const READY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+const READY_REASON_RUNTIME_NOT_STARTED: &str = "runtime_not_started";
+const READY_REASON_DRAINING: &str = "draining";
+const READY_REASON_DATABASE_UNREACHABLE: &str = "database_unreachable";
+const READY_REASON_SHARD_NOT_READY: &str = "shard_not_ready";
+const READY_REASON_SHARD_REPORT_TIMEOUT: &str = "shard_report_timeout";
+
+#[derive(Debug, Serialize)]
+struct HarvestLiveness {
+    alive: bool,
+    draining: bool,
+}
+
+// Each bool is a wire field of the documented contract. An enum would change it.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Serialize)]
+struct HarvestReadiness {
+    ready: bool,
+    runtime_ready: bool,
+    draining: bool,
+    /// `None` when an earlier check failed and this check did not run.
+    database_reachable: Option<bool>,
+    shard_readiness_enforced: bool,
+    /// The overall verdict only. `GET /admin/shards/health` has the detail.
+    shard_readiness: Option<ShardReadiness>,
+    reasons: Vec<&'static str>,
+}
+
+/// The database part of a readiness answer. It is cached for [`READY_CACHE_TTL`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadyDatabaseVerdict {
+    shard_readiness_enforced: bool,
+    database_reachable: bool,
+    shard_readiness: Option<ShardReadiness>,
+    reason: Option<&'static str>,
+}
+
+/// `GET /health/live` (issue #1812). It does no I/O and always returns 200.
+async fn health_live(Extension(api_state): Extension<HarvestApiState>) -> Json<HarvestLiveness> {
+    Json(HarvestLiveness {
+        alive: true,
+        draining: api_state.is_draining(),
+    })
+}
+
+/// `GET /health/ready` (issue #1812).
+///
+/// The checks run in order. A failed runtime or drain check skips the
+/// database checks, so a stopping replica does no extra I/O.
+async fn health_ready(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> axum::response::Response {
+    let shard_readiness_enforced = api_state.health_requires_shard_readiness();
+    let verdict = if api_state.runtime().is_ok() && !api_state.is_draining() {
+        Some(ready_database_verdict(&api_state, shard_readiness_enforced).await)
+    } else {
+        None
+    };
+
+    // Read the state again. A drain or a stop can start during the database await.
+    let runtime_ready = api_state.runtime().is_ok();
+    let draining = api_state.is_draining();
+    let mut reasons = Vec::new();
+    if !runtime_ready {
+        reasons.push(READY_REASON_RUNTIME_NOT_STARTED);
+    }
+    if draining {
+        reasons.push(READY_REASON_DRAINING);
+    }
+    reasons.extend(verdict.and_then(|verdict| verdict.reason));
+
+    let ready = reasons.is_empty();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(HarvestReadiness {
+            ready,
+            runtime_ready,
+            draining,
+            database_reachable: verdict.map(|verdict| verdict.database_reachable),
+            shard_readiness_enforced,
+            shard_readiness: verdict.and_then(|verdict| verdict.shard_readiness),
+            reasons,
+        }),
+    )
+        .into_response()
+}
+
+/// Return a fresh cached verdict, or compute one.
+///
+/// The lock is held across the check. Concurrent callers wait, then read the
+/// new result, so at most one check runs at a time.
+async fn ready_database_verdict(
+    api_state: &HarvestApiState,
+    shard_readiness_enforced: bool,
+) -> ReadyDatabaseVerdict {
+    let mut cache = api_state.ready_cache.lock().await;
+    if let Some((at, verdict)) = *cache
+        && at.elapsed() < READY_CACHE_TTL
+        && verdict.shard_readiness_enforced == shard_readiness_enforced
+    {
+        return verdict;
+    }
+    let verdict = check_ready_database(api_state, shard_readiness_enforced).await;
+    *cache = Some((tokio::time::Instant::now(), verdict));
+    verdict
+}
+
+/// Run the database checks within one [`READY_DATABASE_BUDGET`].
+///
+/// The deadline covers the pool checkout too. An exhausted pool otherwise
+/// blocks the probe with no limit. Without `require_shard_readiness`, only the
+/// default shard is read. One bad non-default shard therefore does not
+/// remove every replica from the load balancer.
+async fn check_ready_database(
+    api_state: &HarvestApiState,
+    shard_readiness_enforced: bool,
+) -> ReadyDatabaseVerdict {
+    let deadline = tokio::time::Instant::now() + READY_DATABASE_BUDGET;
+    let mut verdict = ReadyDatabaseVerdict {
+        shard_readiness_enforced,
+        database_reachable: false,
+        shard_readiness: None,
+        reason: Some(READY_REASON_DATABASE_UNREACHABLE),
+    };
+    let Ok(pool) = api_state.storage_pool() else {
+        return verdict;
+    };
+    let select_one = async {
+        let mut conn = pool.default_pool().get().await.ok()?;
+        diesel::sql_query("SELECT 1").execute(&mut conn).await.ok()
+    };
+    if !matches!(
+        tokio::time::timeout_at(deadline, select_one).await,
+        Ok(Some(_))
+    ) {
+        return verdict;
+    }
+    verdict.database_reachable = true;
+    verdict.reason = None;
+    if shard_readiness_enforced {
+        let report =
+            tokio::time::timeout_at(deadline, build_shard_health_report(api_state, None)).await;
+        match report {
+            Ok(report) => {
+                verdict.shard_readiness = Some(report.overall_readiness);
+                if report.overall_readiness != ShardReadiness::Ready {
+                    verdict.reason = Some(READY_REASON_SHARD_NOT_READY);
+                }
+            }
+            Err(_) => verdict.reason = Some(READY_REASON_SHARD_REPORT_TIMEOUT),
+        }
+    }
+    verdict
+}
+
 pub(crate) async fn load_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -59457,5 +59699,291 @@ mod mutation_gate_tests {
         let status = start_status(true).await;
         assert_ne!(status, StatusCode::UNAUTHORIZED);
         assert_ne!(status, StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use tower::ServiceExt as _;
+
+    /// A runtime with no handlers. It needs no database.
+    fn empty_runtime() -> HarvestApiRuntime {
+        HarvestApiRuntime::new(
+            Arc::new(HandlerRegistry::new(vec![], vec![])),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            None,
+            vec!["default".to_string()],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+            ShardRouter::single(),
+        )
+    }
+
+    /// A pool that cannot connect. Port 1 refuses at once.
+    fn unreachable_pool() -> HarvestDbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            AsyncPgConnection,
+        >::new("postgres://postgres:postgres@127.0.0.1:1/nope");
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("build pool");
+        HarvestDbPool::single(pool)
+    }
+
+    async fn probe(api_state: &HarvestApiState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = harvest_api_router(api_state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    fn reasons(body: &serde_json::Value) -> Vec<String> {
+        body["reasons"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Issue #1812 AC1: readiness fails before the runtime starts.
+    #[tokio::test]
+    async fn ready_is_503_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["runtime_ready"], false);
+        assert_eq!(body["database_reachable"], serde_json::Value::Null);
+        assert_eq!(reasons(&body), vec!["runtime_not_started"]);
+    }
+
+    /// Issue #1812: `/health` keeps its old status for compatibility.
+    #[tokio::test]
+    async fn legacy_health_is_unchanged_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["runtime_ready"], false);
+    }
+
+    #[tokio::test]
+    async fn live_is_200_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["alive"], true);
+        assert_eq!(body["draining"], false);
+    }
+
+    /// Issue #1812 AC2: drain fails readiness and keeps liveness.
+    #[tokio::test]
+    async fn draining_drops_ready_but_not_live() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+        api_state.begin_draining();
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["runtime_ready"], true);
+        assert_eq!(body["draining"], true);
+        assert_eq!(body["database_reachable"], serde_json::Value::Null);
+        assert_eq!(reasons(&body), vec!["draining"]);
+
+        let (status, body) = probe(&api_state, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["draining"], true);
+    }
+
+    /// A drain that starts during startup survives `install()`.
+    #[test]
+    fn install_keeps_an_early_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.begin_draining();
+        api_state.install(empty_runtime());
+        assert!(api_state.is_draining());
+    }
+
+    /// A restart must not inherit the drain of the stopped runtime.
+    #[test]
+    fn end_draining_ends_the_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.begin_draining();
+        api_state.end_draining();
+        assert!(!api_state.is_draining());
+    }
+
+    /// autumn-web marks its probe state at SIGTERM. It closes the listener
+    /// before the plugin shutdown hook runs, so readiness must read that state.
+    #[tokio::test]
+    async fn host_probe_shutdown_drops_ready_but_not_live() {
+        let api_state = HarvestApiState::new();
+        let probes = autumn_web::probe::ProbeState::default();
+        api_state.link_host_probes(probes.clone());
+        api_state.install(empty_runtime());
+        assert!(!api_state.is_draining());
+
+        probes.begin_shutdown();
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reasons(&body), vec!["draining"]);
+        let (status, body) = probe(&api_state, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["draining"], true);
+    }
+
+    /// `/health` keeps its old answer during a drain.
+    #[tokio::test]
+    async fn legacy_health_is_unchanged_during_a_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+        api_state.begin_draining();
+        let (status, body) = probe(&api_state, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["runtime_ready"], true);
+        assert!(body.get("draining").is_none());
+    }
+
+    /// A pool whose server accepts TCP and never answers.
+    fn black_hole_pool(listener: &std::net::TcpListener) -> HarvestDbPool {
+        let port = listener.local_addr().unwrap().port();
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            AsyncPgConnection,
+        >::new(format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/nope"
+        ));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("build pool");
+        HarvestDbPool::single(pool)
+    }
+
+    /// The database check is bounded, and its result is cached.
+    #[tokio::test]
+    async fn ready_is_bounded_and_cached_when_the_database_hangs() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(black_hole_pool(&listener));
+        api_state.install(empty_runtime());
+
+        let started = std::time::Instant::now();
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        let first = started.elapsed();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["database_reachable"], false);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+        assert!(first >= READY_DATABASE_BUDGET, "{first:?}");
+        assert!(first < std::time::Duration::from_millis(2500), "{first:?}");
+
+        let started = std::time::Instant::now();
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    /// A drain that starts during the database check still fails the answer.
+    #[tokio::test]
+    async fn a_drain_during_the_database_check_fails_ready() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(black_hole_pool(&listener));
+        api_state.install(empty_runtime());
+
+        let request = tokio::spawn({
+            let api_state = api_state.clone();
+            async move { probe(&api_state, "/health/ready").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        api_state.begin_draining();
+
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["draining"], true, "{body}");
+        assert!(reasons(&body).contains(&"draining".to_string()), "{body}");
+    }
+
+    /// Liveness does no database I/O, so a hung database cannot slow it.
+    #[tokio::test]
+    async fn live_does_no_database_io() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(black_hole_pool(&listener));
+        api_state.install(empty_runtime());
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            probe(&api_state, "/health/live"),
+        )
+        .await
+        .expect("live must not wait on the database");
+        assert_eq!(answer.0, StatusCode::OK);
+    }
+
+    /// The stopped state keeps reporting the drain.
+    #[test]
+    fn clear_keeps_the_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+        api_state.begin_draining();
+        api_state.clear();
+        assert!(api_state.is_draining());
+    }
+
+    #[tokio::test]
+    async fn ready_is_503_when_the_database_is_unreachable() {
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(unreachable_pool());
+        api_state.install(empty_runtime());
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["runtime_ready"], true);
+        assert_eq!(body["draining"], false);
+        assert_eq!(body["database_reachable"], false);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    #[tokio::test]
+    async fn ready_is_503_when_no_storage_pool_is_installed() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["database_reachable"], false);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    /// The probes are public, like `/health`.
+    #[test]
+    fn probes_are_public_safe() {
+        for method in [axum::http::Method::GET, axum::http::Method::HEAD] {
+            for path in ["/health/live", "/health/ready"] {
+                assert_eq!(
+                    classify_route(&method, path),
+                    RouteClass::PublicSafe,
+                    "{method} {path}"
+                );
+            }
+        }
     }
 }

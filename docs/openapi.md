@@ -32,6 +32,21 @@ pins that.
 Mounting the management router at the application root is the one case that
 collides. Axum then rejects the duplicate `GET /openapi.json` at startup.
 
+## Use the published TypeScript client
+
+Each GitHub release after 0.6.0 attaches `autumn-harvest-client`, a client
+built from [`docs/openapi.json`](openapi.json). You do not need a running
+Harvest to install it or to write code against it (issue #1616). Replace
+`<version>` with your server's version:
+
+```sh
+npm install https://github.com/autumn-foundation/autumn-harvest/releases/download/v<version>/autumn-harvest-client-<version>.tgz
+```
+
+The package version is the crate version. See
+[`clients/typescript`](../clients/typescript/README.md) for the API and for
+the routes whose responses have full types.
+
 ## Generate a typed client in under ten minutes
 
 The worked example lives in
@@ -92,8 +107,9 @@ compiles the workspace, which is the slow part; the client steps take seconds.
   `HarvestBearerToken` (scoped API tokens, issue #942) and
   `HarvestSessionCookie` (the embedding application session). The top-level
   `security` list also carries an empty requirement, because enforcement is
-  the embedder's choice (issue #174). The two `public_safe` routes
-  (`GET /health`, `GET /openapi.json`) override it with `security: []`, which
+  the embedder's choice (issue #174). The `public_safe` routes are
+  `GET /health`, `GET /health/live`, `GET /health/ready` and
+  `GET /openapi.json`. They override it with `security: []`, which
   says positively that Harvest itself asks for no credential there. An embedder
   that wraps the router with `HarvestPlugin::api_with_auth` gates every route,
   the document included, so a generator then needs a credential to read it. See
@@ -101,10 +117,15 @@ compiles the workspace, which is the slow part; the client steps take seconds.
 
 ### Limits worth knowing
 
-- **Response properties are open.** The contract records field names, and
+- **Most response properties are open.** The contract records field names, and
   sometimes a type, not full JSON Schemas. A generator therefore types most
-  response properties as `unknown` / `any`. Per-workflow message schemas are a
-  different contract; see `GET /workflows/registered/{name}/schema`.
+  response properties as `unknown` / `any`. The core lifecycle routes are the
+  exception: every field declares a type. The list is
+  `autumn_harvest_plugin::openapi::CORE_CLIENT_ROUTES`. On those routes, a
+  field that holds any JSON value, such as workflow input, carries
+  `x-harvest-any`. A client sees it as `unknown`. Per-workflow
+  message schemas are a different contract; see
+  `GET /workflows/registered/{name}/schema`.
 - **Streaming routes** declare `text/event-stream` with a string body. The
   frame grammar is in the response description.
 - **Conditional shapes** (the partial-availability envelopes of issue #756)
@@ -132,7 +153,7 @@ Run it whenever `docs/api-contract.json` changes. CI fails otherwise.
 
 ## Guarantees
 
-Five checks hold the chain together:
+Six checks hold the chain together:
 
 1. `contract_regression::management_routes_match_contract` fails when
    `management_api_routes()` and the contract disagree. That function is the
@@ -154,6 +175,12 @@ Five checks hold the chain together:
    field must be documented with its type and required flag. The audit also
    reads a body parsed from raw `Bytes`. A type the audit cannot resolve
    fails the check.
+6. `openapi_response_conformance` drives each core lifecycle route against
+   Postgres. It asserts the status of each response shape, and checks every
+   body against the published schema. An undeclared key, a wrong type, an
+   undeclared `null`, an array with no element type or a missing required key
+   fails it. `openapi_spec::core_client_routes_type_every_response_field`
+   fails when a core route loses a type.
 
 ## Why the document is derived, not annotated
 
