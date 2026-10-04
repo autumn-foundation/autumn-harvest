@@ -1085,3 +1085,73 @@ async fn timeout_scanner_pass_records_the_scan_op() {
     .expect("scan pass");
     assert!(recorder.has(&Sample::Query(DbOp::Scan.as_str())));
 }
+
+/// Records the shard label of each pool wait and each scan op.
+#[derive(Default)]
+struct ScanShards {
+    waits: Mutex<Vec<u16>>,
+    scans: Mutex<Vec<u16>>,
+}
+
+impl MetricsRecorder for ScanShards {
+    fn record_db_pool_wait(&self, shard: u16, _seconds: f64) {
+        self.waits.lock().expect("lock").push(shard);
+    }
+
+    fn record_db_query_duration(&self, op: DbOp, shard: u16, _seconds: f64) {
+        if op == DbOp::Scan {
+            self.scans.lock().expect("lock").push(shard);
+        }
+    }
+}
+
+/// Issue #1815: a checker for a nonzero shard has no pool shard of its own.
+/// It records its pool wait and its scan under the same shard, so the
+/// per-shard alert and panels see one shard.
+#[tokio::test]
+async fn a_shard_checker_records_its_scan_under_its_shard() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let recorder = Arc::new(ScanShards::default());
+    let telemetry = Arc::new(TelemetryConfig {
+        metrics: Arc::clone(&recorder) as Arc<dyn MetricsRecorder>,
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = timeout::spawn_timeout_checker_for_shard(
+        pool,
+        cancel.clone(),
+        // Long enough to open a connection: a slower acquire skips the pass.
+        Duration::from_millis(500),
+        telemetry,
+        Duration::from_secs(5),
+        None,
+        vec![ShardId::new(3)],
+        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        Some(ShardId::new(3)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while recorder.scans.lock().expect("lock").is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "no scan pass recorded; pool waits: {:?}",
+            recorder.waits.lock().expect("lock")
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cancel.cancel();
+    let _ = handle.await;
+
+    let waits = recorder.waits.lock().expect("lock").clone();
+    let scans = recorder.scans.lock().expect("lock").clone();
+    assert!(
+        waits.iter().all(|shard| *shard == 3),
+        "pool waits: {waits:?}"
+    );
+    assert!(scans.iter().all(|shard| *shard == 3), "scans: {scans:?}");
+}
