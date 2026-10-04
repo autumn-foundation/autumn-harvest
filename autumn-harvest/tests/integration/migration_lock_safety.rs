@@ -2648,8 +2648,7 @@ fn path_change(s: &Stmts, opaque: &[usize], history: &mut History) -> Option<usi
     // Only a session change that runs now carries into history. A local
     // change ends with its transaction. A routine body runs only when called,
     // and that call counts as code the lint cannot read in its own file.
-    let session =
-        (0..s.toks.len()).any(|k| changes(k) && s.toks[k].runs && !local_path_change(s, k));
+    let session = (0..s.toks.len()).any(|k| s.starts[k] == k && session_path_change(s, k));
     history.search_path_changed |= session;
     let local = text.into_iter().chain(hidden).min();
     local.or_else(|| history.search_path_changed.then_some(0))
@@ -2692,23 +2691,38 @@ fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
         .collect()
 }
 
-/// Whether the `search_path` change at `k` is surely local to its transaction:
-/// `SET LOCAL`, or only plain `set_config` calls with a literal `true` scope.
-fn local_path_change(s: &Stmts, k: usize) -> bool {
-    if s.keyword(k, "set") || s.keyword(k, "reset") {
-        return s.keyword(k, "set") && s.keyword(k + 1, "local");
+/// Whether the statement at `k` holds a session `search_path` change that
+/// runs now.
+///
+/// The test reads each setter token, not the statement around it. So a
+/// setter in an uncalled routine body does not count, and nor does a
+/// `SET LOCAL` or a plain `set_config` with a literal `true` scope.
+fn session_path_change(s: &Stmts, k: usize) -> bool {
+    let scope = usize::from(s.keyword(k + 1, "local") || s.keyword(k + 1, "session"));
+    let set = s.keyword(k, "set")
+        && (s.is(k + 1 + scope, "search_path") || s.keyword(k + 1 + scope, "schema"));
+    let reset = s.keyword(k, "reset") && (s.is(k + 1, "search_path") || s.keyword(k + 1, "all"));
+    if set || reset {
+        return s.toks[k].runs && !(set && s.keyword(k + 1, "local"));
     }
     let literal = |j: usize| s.word(j).or_else(|| s.string(j));
-    let calls: Vec<usize> = (k..s.end(k))
-        .filter(|&j| s.is(j, "set_config") && s.is_punct(j + 1, '('))
-        .collect();
-    !calls.is_empty()
-        && calls.iter().all(|&j| {
-            s.string(j + 2).is_some()
-                && s.is_punct(j + 3, ',')
-                && s.is_punct(j + 5, ',')
-                && literal(j + 6).is_some_and(pg_true)
-        })
+    let local = |j: usize| {
+        s.string(j + 2).is_some()
+            && s.is_punct(j + 3, ',')
+            && s.is_punct(j + 5, ',')
+            && literal(j + 6).is_some_and(pg_true)
+    };
+    (k..s.end(k)).any(|j| path_call(s, j) && s.toks[j].runs && !local(j))
+}
+
+/// Whether the token at `k` is a `set_config` call that may name
+/// `search_path`: it names it, or its name is not one plain literal.
+fn path_call(s: &Stmts, k: usize) -> bool {
+    s.is(k, "set_config")
+        && s.is_punct(k + 1, '(')
+        && (!(s.string(k + 2).is_some() && s.is_punct(k + 3, ','))
+            || s.string(k + 2)
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("search_path")))
 }
 
 /// Whether the statement at `k` may change `search_path`.
@@ -2722,13 +2736,7 @@ fn changes_search_path(s: &Stmts, k: usize) -> bool {
     let reset = s.keyword(k, "reset") && (s.is(k + 1, "search_path") || s.keyword(k + 1, "all"));
     // A call counts when it names `search_path`, or when its name is not one
     // plain literal, which may be `search_path` too.
-    let call = (k..s.end(k)).any(|j| {
-        s.is(j, "set_config")
-            && s.is_punct(j + 1, '(')
-            && (!(s.string(j + 2).is_some() && s.is_punct(j + 3, ','))
-                || s.string(j + 2)
-                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("search_path")))
-    });
+    let call = (k..s.end(k)).any(|j| path_call(s, j));
     set || reset || call
 }
 
@@ -7021,6 +7029,8 @@ fn a_path_change_in_an_uncalled_body_does_not_carry() {
     for change in [
         "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
          SET search_path = scratch, public;\nEND $$;",
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+         PERFORM set_config('search_path', 'scratch, public', false);\nEND $$;",
         "DO $$\nBEGIN\n    PERFORM set_config('search_path', 'scratch, public', true);\nEND $$;",
     ] {
         assert_eq!(
