@@ -16418,7 +16418,26 @@ async fn process_activity_task(
     probe_guard.disarm();
     let circuit_outcome = if was_cancelled {
         if let Some(token) = circuit_token {
-            circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+            // The claim watcher cancels on any lost claim (issue #1809). A
+            // cancelled task says nothing about the downstream. Any other loss
+            // of a probe's claim is a timeout, perhaps enforced by another
+            // process: a failed probe, so it reports its trip. Only a probe
+            // pays for the read.
+            let probe_timed_out = token.is_probe()
+                && !matches!(
+                    queue::task_status_for_claim(&mut conn, &activity_claim).await,
+                    Ok(Some((state, _, _))) if state == "CANCELLED"
+                );
+            let now = std::time::Instant::now();
+            if probe_timed_out {
+                if circuit_breakers.on_claim_lost(activity_name, token, claim_key, now)
+                    == Some(crate::circuit_breaker::CircuitTransition::Tripped)
+                {
+                    telemetry.metrics.record_circuit_tripped(activity_name);
+                }
+            } else {
+                circuit_breakers.on_cancelled(activity_name, token, now);
+            }
         }
         None
     } else if committed_transactionally {

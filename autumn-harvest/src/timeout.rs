@@ -1338,9 +1338,11 @@ async fn enforce_activity_timeout(
         task_id: task.id,
         attempt: task.attempt,
     };
-    if let Some(breakers) = circuit_breakers {
-        breakers.mark_claim_timed_out(activity_name, claim_key);
-    }
+    // The guard rolls the mark back on every exit that does not confirm it,
+    // including a dropped future. A mark left provisional would hold a late
+    // result, and with it a probe slot, for good.
+    let mut provisional =
+        ProvisionalTimeoutMark::new(circuit_breakers, activity_name, claim_key, metrics);
     // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
     // scope ties its publish to this transaction's commit.
     //
@@ -1612,36 +1614,12 @@ async fn enforce_activity_timeout(
         }),
     ))
     .await;
-    let enforced = match enforced {
-        Ok(Some(enforced)) => enforced,
-        other => {
-            // No timeout after all. A result held meanwhile counts now.
-            if let Some(breakers) = circuit_breakers {
-                match breakers.unmark_claim_timed_out(
-                    activity_name,
-                    claim_key,
-                    std::time::Instant::now(),
-                ) {
-                    Some(crate::circuit_breaker::CircuitTransition::Tripped) => {
-                        metrics.record_circuit_tripped(activity_name);
-                    }
-                    Some(crate::circuit_breaker::CircuitTransition::Closed) => {
-                        metrics.record_circuit_closed(activity_name);
-                    }
-                    None => {}
-                }
-            }
-            return other.map(|_| ());
-        }
+    // No timeout after all: the guard rolls the mark back as it drops, and a
+    // result held meanwhile counts now.
+    let Some(enforced) = enforced? else {
+        return Ok(());
     };
-    // A timed-out probe re-opens the breaker here. Record that trip, since
-    // `on_external_failure` below skips a breaker that is already open.
-    if let Some(breakers) = circuit_breakers
-        && breakers.confirm_claim_timed_out(activity_name, claim_key, std::time::Instant::now())
-            == Some(crate::circuit_breaker::CircuitTransition::Tripped)
-    {
-        metrics.record_circuit_tripped(activity_name);
-    }
+    provisional.confirm();
     if enforced.retried {
         metrics.record_activity_retried(activity_name, &task.queue_name);
     }
@@ -1667,6 +1645,76 @@ async fn enforce_activity_timeout(
         metrics.record_circuit_tripped(activity_name);
     }
     Ok(())
+}
+
+/// A provisional timeout mark on one claim (issue #1809).
+///
+/// [`confirm`](Self::confirm) settles it as a timeout. Any other exit,
+/// including a dropped enforcement future, rolls it back. A held result then
+/// counts as usual. Each settle records the breaker transition it causes.
+struct ProvisionalTimeoutMark<'a> {
+    breakers: Option<&'a crate::circuit_breaker::CircuitBreakerRegistry>,
+    activity_name: &'a str,
+    claim: crate::circuit_breaker::ClaimKey,
+    metrics: &'a (dyn MetricsRecorder + Send + Sync),
+}
+
+impl<'a> ProvisionalTimeoutMark<'a> {
+    fn new(
+        breakers: Option<&'a crate::circuit_breaker::CircuitBreakerRegistry>,
+        activity_name: &'a str,
+        claim: crate::circuit_breaker::ClaimKey,
+        metrics: &'a (dyn MetricsRecorder + Send + Sync),
+    ) -> Self {
+        if let Some(breakers) = breakers {
+            breakers.mark_claim_timed_out(activity_name, claim);
+        }
+        Self {
+            breakers,
+            activity_name,
+            claim,
+            metrics,
+        }
+    }
+
+    /// The enforcer timed the claim out. A timed-out probe re-opens the
+    /// breaker here. The trip is recorded, since `on_external_failure` skips
+    /// a breaker that is already open.
+    fn confirm(&mut self) {
+        if let Some(breakers) = self.breakers.take() {
+            let transition = breakers.confirm_claim_timed_out(
+                self.activity_name,
+                self.claim,
+                std::time::Instant::now(),
+            );
+            self.record(transition);
+        }
+    }
+
+    fn record(&self, transition: Option<crate::circuit_breaker::CircuitTransition>) {
+        match transition {
+            Some(crate::circuit_breaker::CircuitTransition::Tripped) => {
+                self.metrics.record_circuit_tripped(self.activity_name);
+            }
+            Some(crate::circuit_breaker::CircuitTransition::Closed) => {
+                self.metrics.record_circuit_closed(self.activity_name);
+            }
+            None => {}
+        }
+    }
+}
+
+impl Drop for ProvisionalTimeoutMark<'_> {
+    fn drop(&mut self) {
+        if let Some(breakers) = self.breakers.take() {
+            let transition = breakers.unmark_claim_timed_out(
+                self.activity_name,
+                self.claim,
+                std::time::Instant::now(),
+            );
+            self.record(transition);
+        }
+    }
 }
 
 /// Test seam for the activity timeout enforcer (issue #1809).
@@ -5747,6 +5795,49 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 #[cfg(test)]
 mod tests {
     // ── Timeout retry rule (issue #1809, ADR 0004) ───────────────────────
+
+    /// A dropped enforcement rolls its provisional mark back (issue #1809). A
+    /// result held meanwhile then counts, so a successful probe closes the
+    /// breaker instead of holding its slot for good.
+    #[test]
+    fn a_dropped_enforcement_rolls_its_mark_back() {
+        use crate::circuit_breaker::{
+            AttemptOutcome, CircuitBreakerRegistry, ClaimKey, DispatchDecision,
+        };
+        use crate::policy::CircuitBreakerPolicy;
+        use std::time::{Duration, Instant};
+
+        let mut policies = std::collections::HashMap::new();
+        policies.insert(
+            "send".to_string(),
+            CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(60)),
+        );
+        let reg = CircuitBreakerRegistry::new(policies);
+        let t0 = Instant::now();
+        let DispatchDecision::Allow { token } = reg.on_dispatch("send", t0) else {
+            panic!("a closed breaker admits");
+        };
+        let _ = reg.on_result("send", AttemptOutcome::RetryableFailure, token, t0);
+        let t1 = t0 + Duration::from_secs(61);
+        let DispatchDecision::Allow { token: probe } = reg.on_dispatch("send", t1) else {
+            panic!("the cooldown admits a probe");
+        };
+        let claim = ClaimKey {
+            task_id: uuid::Uuid::from_u128(1809),
+            attempt: 1,
+        };
+        reg.begin_claim("send", claim, probe);
+        let metrics = crate::telemetry::NoOpMetrics;
+        let mark = super::ProvisionalTimeoutMark::new(Some(&reg), "send", claim, &metrics);
+        let held = reg.on_claim_result("send", AttemptOutcome::Success, probe, claim, t1);
+        assert_eq!(held, None, "the result waits for the enforcer");
+        drop(mark);
+        assert_eq!(
+            reg.snapshot("send", t1).expect("tracked").state,
+            "closed",
+            "the rollback applies the held probe success"
+        );
+    }
 
     #[test]
     fn only_start_to_close_and_heartbeat_timeouts_retry() {
