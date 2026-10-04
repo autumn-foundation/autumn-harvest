@@ -15219,6 +15219,15 @@ impl Drop for CircuitProbeGuard<'_> {
     }
 }
 
+/// Whether an attempt ran past its start-to-close budget (issue #1809).
+/// `elapsed` is measured from after the claim, so it never exceeds the
+/// enforcer's elapsed time. A missing or negative budget never overruns.
+fn attempt_overran(start_to_close: Option<chrono::Duration>, elapsed: Duration) -> bool {
+    start_to_close
+        .and_then(|budget| budget.to_std().ok())
+        .is_some_and(|budget| elapsed > budget)
+}
+
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
 /// cannot spin the claim loop hot (issue #1809).
 const CIRCUIT_DEFER_MIN: Duration = Duration::from_millis(100);
@@ -16349,7 +16358,15 @@ async fn process_activity_task(
     // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
     // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
     probe_guard.disarm();
-    let circuit_outcome = if was_cancelled {
+    // An attempt that ran past its start-to-close budget timed out, whichever
+    // process enforces that (issue #1809). Breaker state is per process, so a
+    // timeout enforced elsewhere sets no mark here. Its late outcome must not
+    // move this breaker either. The clock starts after the claim, so the
+    // check never fires before the enforcer's deadline. A self-committed
+    // activity sealed its own success and keeps it.
+    let overran = !committed_transactionally
+        && attempt_overran(task.start_to_close, attempt_clock_start.elapsed());
+    let circuit_outcome = if was_cancelled || overran {
         if let Some(token) = circuit_token {
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
         }
@@ -42187,6 +42204,19 @@ mod tests {
             timeout_retry_delay(&task, "timeout: StartToClose for call_api"),
             None
         );
+    }
+
+    /// Issue #1809: only a run past a known budget overruns.
+    #[test]
+    fn attempt_overran_needs_a_known_budget_and_a_longer_run() {
+        let budget = Some(chrono::Duration::milliseconds(300));
+        assert!(!attempt_overran(budget, Duration::from_millis(300)));
+        assert!(attempt_overran(budget, Duration::from_millis(301)));
+        assert!(!attempt_overran(None, Duration::from_secs(3600)));
+        assert!(!attempt_overran(
+            Some(chrono::Duration::milliseconds(-5)),
+            Duration::from_secs(1)
+        ));
     }
 
     #[test]
