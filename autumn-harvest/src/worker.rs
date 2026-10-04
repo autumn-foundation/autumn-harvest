@@ -16490,15 +16490,23 @@ async fn process_activity_task(
     // process, so this write is the one signal every process shares. A
     // finalization that wins leaves the enforcer nothing to do, so the
     // attempt counts once.
-    let report_outcome = |applied: bool| {
+    //
+    // `applied` is `Some(true)` when this claim wrote the outcome, and
+    // `Some(false)` when another path settled the attempt first. `None` means
+    // the write failed before ownership was known: a probe slot is released,
+    // and nothing counts as an outcome or a trip.
+    let report_outcome = |applied: Option<bool>| {
         let now = std::time::Instant::now();
         if let Some(transition) = circuit_token
             .zip(circuit_outcome)
-            .and_then(|(token, outcome)| {
-                if applied {
+            .and_then(|(token, outcome)| match applied {
+                Some(true) => {
                     circuit_breakers.on_claim_result(activity_name, outcome, token, claim_key, now)
-                } else {
-                    circuit_breakers.on_claim_lost(activity_name, token, claim_key, now)
+                }
+                Some(false) => circuit_breakers.on_claim_lost(activity_name, token, claim_key, now),
+                None => {
+                    circuit_breakers.on_cancelled(activity_name, token, now);
+                    None
                 }
             })
         {
@@ -16534,7 +16542,7 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
-        report_outcome(true);
+        report_outcome(Some(true));
         return Ok(());
     }
 
@@ -16556,8 +16564,8 @@ async fn process_activity_task(
         registry.payload_codecs(),
     )
     .await;
-    // A failed write reports as lost, so an admitted probe is still released.
-    report_outcome(matches!(finalized, Ok(true)));
+    // A failed write still releases an admitted probe, without a trip.
+    report_outcome(finalized.as_ref().ok().copied());
     finalized.map(|_| ())
 }
 

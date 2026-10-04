@@ -1619,7 +1619,7 @@ async fn enforce_activity_timeout(
     let Some(enforced) = enforced? else {
         return Ok(());
     };
-    provisional.confirm();
+    provisional.confirm(enforced.handler_started);
     if enforced.retried {
         metrics.record_activity_retried(activity_name, &task.queue_name);
     }
@@ -1678,16 +1678,20 @@ impl<'a> ProvisionalTimeoutMark<'a> {
     }
 
     /// The enforcer timed the claim out. A timed-out probe re-opens the
-    /// breaker here. The trip is recorded, since `on_external_failure` skips
-    /// a breaker that is already open.
-    fn confirm(&mut self) {
+    /// breaker here, which releases its slot. The trip is recorded only when
+    /// the handler started, since `on_external_failure` skips a breaker that
+    /// is already open. An unstarted probe made no downstream call, so its
+    /// timeout is local congestion, not a failed probe.
+    fn confirm(&mut self, handler_started: bool) {
         if let Some(breakers) = self.breakers.take() {
             let transition = breakers.confirm_claim_timed_out(
                 self.activity_name,
                 self.claim,
                 std::time::Instant::now(),
             );
-            self.record(transition);
+            if handler_started {
+                self.record(transition);
+            }
         }
     }
 
@@ -5795,6 +5799,60 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 #[cfg(test)]
 mod tests {
     // ── Timeout retry rule (issue #1809, ADR 0004) ───────────────────────
+
+    /// A confirmed timeout releases a probe slot either way. Only a probe whose
+    /// handler started records the trip (issue #1809). An unstarted probe
+    /// made no downstream call.
+    #[test]
+    fn only_a_started_probe_timeout_records_a_trip() {
+        use crate::circuit_breaker::{
+            AttemptOutcome, CircuitBreakerRegistry, ClaimKey, DispatchDecision,
+        };
+        use crate::policy::CircuitBreakerPolicy;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        struct Trips(AtomicUsize);
+        impl crate::telemetry::MetricsRecorder for Trips {
+            fn record_circuit_tripped(&self, _activity_name: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for handler_started in [false, true] {
+            let mut policies = std::collections::HashMap::new();
+            policies.insert(
+                "send".to_string(),
+                CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(60)),
+            );
+            let reg = CircuitBreakerRegistry::new(policies);
+            let t0 = Instant::now();
+            let DispatchDecision::Allow { token } = reg.on_dispatch("send", t0) else {
+                panic!("a closed breaker admits");
+            };
+            let _ = reg.on_result("send", AttemptOutcome::RetryableFailure, token, t0);
+            let t1 = t0 + Duration::from_secs(61);
+            let DispatchDecision::Allow { token: probe } = reg.on_dispatch("send", t1) else {
+                panic!("the cooldown admits a probe");
+            };
+            let claim = ClaimKey {
+                task_id: uuid::Uuid::from_u128(1809),
+                attempt: 1,
+            };
+            reg.begin_claim("send", claim, probe);
+            let trips = Trips::default();
+            let mut mark = super::ProvisionalTimeoutMark::new(Some(&reg), "send", claim, &trips);
+            mark.confirm(handler_started);
+            let state = reg.snapshot("send", t1).expect("tracked").state;
+            assert_eq!(state, "open", "the probe slot is released");
+            assert_eq!(
+                AtomicUsize::load(&trips.0, Ordering::SeqCst),
+                usize::from(handler_started),
+                "handler started: {handler_started}"
+            );
+        }
+    }
 
     /// A dropped enforcement rolls its provisional mark back (issue #1809). A
     /// result held meanwhile then counts, so a successful probe closes the
