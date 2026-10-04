@@ -3039,7 +3039,8 @@ pub async fn release_unstarted_claim(
     Ok(ClaimWrite::Applied)
 }
 
-/// The claims of the `RUNNING` rows that `worker_id` holds (issue #1813).
+/// The claims of the `RUNNING` rows that `worker_id` holds, each with its
+/// `started_at` (issue #1813).
 ///
 /// # Errors
 ///
@@ -3047,19 +3048,21 @@ pub async fn release_unstarted_claim(
 pub async fn running_claims_of_worker(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
-) -> HarvestResult<Vec<TaskClaim>> {
+) -> HarvestResult<Vec<(TaskClaim, Option<DateTime<Utc>>)>> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let rows: Vec<(Uuid, i32)> = dsl::harvest_task_queue
+    let rows: Vec<(Uuid, i32, Option<DateTime<Utc>>)> = dsl::harvest_task_queue
         .filter(dsl::state.eq("RUNNING"))
         .filter(dsl::worker_id.eq(worker_id))
-        .select((dsl::id, dsl::attempt))
+        .select((dsl::id, dsl::attempt, dsl::started_at))
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
     Ok(rows
         .into_iter()
-        .map(|(task_id, attempt)| TaskClaim::new(task_id, worker_id, attempt))
+        .map(|(task_id, attempt, started_at)| {
+            (TaskClaim::new(task_id, worker_id, attempt), started_at)
+        })
         .collect())
 }
 
@@ -3075,19 +3078,25 @@ pub async fn running_claims_of_worker(
 /// because a handler can have run. It keeps `crash_strikes`, because a
 /// failed write says nothing about the task.
 ///
+/// The fence also matches `started_at`. [`release_unstarted_claim`]
+/// restores `attempt`, so a later claim can reuse the same epoch. Each claim
+/// writes a new `started_at`, so that later claim never matches.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn release_abandoned_claim(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
+    started_at: DateTime<Utc>,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
 
     let update = diesel::update(
         dsl::harvest_task_queue
             .find(claim.task_id)
-            .filter(dsl::state.eq("RUNNING")),
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::started_at.eq(started_at)),
     )
     .set((
         dsl::state.eq("PENDING"),

@@ -45,8 +45,10 @@ the drain. Now:
   each lease refresh also gives back, through the new fenced
   `queue::release_abandoned_claim`, each `RUNNING` claim whose dispatch
   body ended after shutdown began. A failed release or result write leaves
-  such a claim. A replacement worker with the same id has other claim
-  epochs, so the keeper never touches its claims.
+  such a claim. The match uses the task id, `attempt` and `started_at`, and
+  the write is fenced on all three. A replacement worker with the same id
+  writes a new `started_at` on each claim, so the keeper never touches its
+  claims.
 
 **Safety.** A claim is released only when no handler for it can still run:
 the handler never started, or it returned. The release is fenced on the

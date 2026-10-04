@@ -430,7 +430,9 @@ async fn release_unstarted_claim_restores_the_claim_and_is_fenced() {
 }
 
 /// `release_abandoned_claim` gives back only the current claim, as orphan
-/// reclaim would. It keeps `attempt`, because a handler can have run.
+/// reclaim would. It keeps `attempt`, because a handler can have run. The
+/// fence includes `started_at`, because a release of an unstarted claim
+/// restores `attempt`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_abandoned_claim_requeues_the_claim_and_is_fenced() {
     let (url, _container) = setup_test_database_url_or_env().await;
@@ -451,19 +453,33 @@ async fn release_abandoned_claim_requeues_the_claim_and_is_fenced() {
     .expect("claim")
     .expect("the workflow task is claimable");
 
-    for stale in [
-        queue::TaskClaim::new(task.id, "another-worker", task.attempt),
-        queue::TaskClaim::new(task.id, &worker, task.attempt + 1),
+    let started_at = task.started_at.expect("a claimed row has started_at");
+    // A re-claim after a release that restored `attempt` has the same epoch
+    // but a new `started_at`.
+    let reclaimed = started_at - chrono::Duration::milliseconds(1);
+    for (stale, stamp) in [
+        (
+            queue::TaskClaim::new(task.id, "another-worker", task.attempt),
+            started_at,
+        ),
+        (
+            queue::TaskClaim::new(task.id, &worker, task.attempt + 1),
+            started_at,
+        ),
+        (
+            queue::TaskClaim::new(task.id, &worker, task.attempt),
+            reclaimed,
+        ),
     ] {
-        let write = queue::release_abandoned_claim(&mut conn, &stale)
+        let write = queue::release_abandoned_claim(&mut conn, &stale, stamp)
             .await
             .expect("release");
-        assert_eq!(write, queue::ClaimWrite::LeaseLost, "{stale:?}");
+        assert_eq!(write, queue::ClaimWrite::LeaseLost, "{stale:?} {stamp}");
         assert_eq!(task_state(&url, task.id).await.0, "RUNNING", "{stale:?}");
     }
 
     let claim = queue::TaskClaim::of(&task).expect("a claimed row has a claim");
-    let write = queue::release_abandoned_claim(&mut conn, &claim)
+    let write = queue::release_abandoned_claim(&mut conn, &claim, started_at)
         .await
         .expect("release");
     assert_eq!(write, queue::ClaimWrite::Applied);

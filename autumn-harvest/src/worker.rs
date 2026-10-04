@@ -28871,15 +28871,22 @@ impl Drop for DispatchReservation {
     }
 }
 
-/// The `(task_id, attempt)` claims of this worker instance (issue #1813).
+/// One claim of this worker instance: task id, `attempt` and `started_at`.
+///
+/// `attempt` alone does not identify a claim. A release of an unstarted
+/// claim restores it, so a later claim can reuse it. Each claim writes a new
+/// `started_at` (issue #1813).
+type ClaimKey = (uuid::Uuid, i32, chrono::DateTime<chrono::Utc>);
+
+/// The claims of this worker instance (issue #1813).
 #[derive(Debug, Default)]
 struct ClaimSets {
     /// The claim of each dispatch body that still runs.
-    live: std::collections::HashSet<(uuid::Uuid, i32)>,
+    live: std::collections::HashSet<ClaimKey>,
     /// The claim of each body that ended after shutdown began. Only these
     /// can be abandoned claims of this instance. A replacement worker with
     /// the same id never has a claim here.
-    ended: std::collections::HashSet<(uuid::Uuid, i32)>,
+    ended: std::collections::HashSet<ClaimKey>,
 }
 
 /// The claims of this worker instance, shared with its dispatch bodies.
@@ -28902,23 +28909,21 @@ struct Dispatched {
 /// The set then holds only the claims of the drain, so it stays small.
 struct LiveClaim {
     claims: LiveClaims,
-    key: (uuid::Uuid, i32),
+    /// `None` for a claim with no `started_at`. The keeper never releases
+    /// such a claim.
+    key: Option<ClaimKey>,
     shutdown: CancellationToken,
 }
 
 impl LiveClaim {
-    fn new(
-        claims: &LiveClaims,
-        task_id: uuid::Uuid,
-        attempt: i32,
-        shutdown: &CancellationToken,
-    ) -> Self {
-        let key = (task_id, attempt);
-        claims
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .live
-            .insert(key);
+    fn new(claims: &LiveClaims, key: Option<ClaimKey>, shutdown: &CancellationToken) -> Self {
+        if let Some(key) = key {
+            claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .live
+                .insert(key);
+        }
         Self {
             claims: Arc::clone(claims),
             key,
@@ -28929,13 +28934,16 @@ impl LiveClaim {
 
 impl Drop for LiveClaim {
     fn drop(&mut self) {
+        let Some(key) = self.key else {
+            return;
+        };
         let mut claims = self
             .claims
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        claims.live.remove(&self.key);
+        claims.live.remove(&key);
         if self.shutdown.is_cancelled() {
-            claims.ended.insert(self.key);
+            claims.ended.insert(key);
         }
     }
 }
@@ -33197,6 +33205,9 @@ impl Worker {
         // untouched, since being stuck is not a crash, so it needs its own
         // discriminator. See `reset_timed_out_workflow_task`'s doc comment.
         let claim_attempt = task.attempt;
+        // With `attempt`, it names this claim for the lease keeper (issue
+        // #1813). See `ClaimKey`.
+        let claim_started_at = task.started_at;
         let worker_id = self.config.worker_id.clone();
         let build_id = self.config.build_id.clone();
         let cancellation_grace_period = self.config.cancellation_grace_period;
@@ -33643,8 +33654,7 @@ impl Worker {
         let bound_channel = self.bound_channel();
         let live = LiveClaim::new(
             &self.dispatched.live,
-            task_id,
-            claim_attempt,
+            claim_started_at.map(|started_at| (task_id, claim_attempt, started_at)),
             &self.shutdown,
         );
         // The tracker keeps the body's handle for the drain (issue #1813).
@@ -33936,16 +33946,19 @@ fn next_lease_refresh(heartbeat_interval: Duration, refreshed: bool) -> Duration
 /// holds the lease, so it gives these claims back itself.
 ///
 /// Only a claim in the ended set qualifies. Its body ended, so no handler
-/// runs it. A replacement worker with the same id has other claim epochs,
-/// so this never touches its claims.
+/// runs it. A replacement worker with the same id has another `started_at`
+/// on each claim, so this never touches its claims.
 async fn release_abandoned_claims(
     conn: &mut diesel_async::AsyncPgConnection,
     worker_id: &str,
     claims: &LiveClaims,
 ) -> HarvestResult<usize> {
     let mut released = 0;
-    for claim in queue::running_claims_of_worker(conn, worker_id).await? {
-        let key = (claim.task_id, claim.attempt);
+    for (claim, started_at) in queue::running_claims_of_worker(conn, worker_id).await? {
+        let Some(started_at) = started_at else {
+            continue;
+        };
+        let key = (claim.task_id, claim.attempt, started_at);
         let abandoned = claims
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -33954,7 +33967,9 @@ async fn release_abandoned_claims(
         if !abandoned {
             continue;
         }
-        if queue::release_abandoned_claim(conn, &claim).await? == queue::ClaimWrite::Applied {
+        if queue::release_abandoned_claim(conn, &claim, started_at).await?
+            == queue::ClaimWrite::Applied
+        {
             tracing::warn!(
                 task_id = %claim.task_id,
                 worker_id = %worker_id,
@@ -38422,20 +38437,21 @@ mod tests {
         let claims = LiveClaims::default();
         let shutdown = CancellationToken::new();
         let task = uuid::Uuid::new_v4();
-        drop(LiveClaim::new(&claims, task, 1, &shutdown));
-        let held = LiveClaim::new(&claims, task, 2, &shutdown);
+        let at = chrono::Utc::now();
+        drop(LiveClaim::new(&claims, Some((task, 1, at)), &shutdown));
+        let held = LiveClaim::new(&claims, Some((task, 2, at)), &shutdown);
         let snapshot = || {
             let sets = claims.lock().expect("lock");
             (sets.live.clone(), sets.ended.clone())
         };
         let (live, ended) = snapshot();
-        assert!(live.contains(&(task, 2)));
+        assert!(live.contains(&(task, 2, at)));
         assert!(ended.is_empty(), "a body before shutdown is not abandoned");
         shutdown.cancel();
         drop(held);
         let (live, ended) = snapshot();
         assert!(live.is_empty());
-        assert_eq!(ended.into_iter().collect::<Vec<_>>(), vec![(task, 2)]);
+        assert_eq!(ended.into_iter().collect::<Vec<_>>(), vec![(task, 2, at)]);
     }
 
     /// A failed lease refresh retries well before the lease goes stale
