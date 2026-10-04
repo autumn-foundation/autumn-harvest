@@ -1273,7 +1273,12 @@ impl<'a> Stmts<'a> {
     /// `PERFORM f(...)`, with nothing after the closing parenthesis.
     fn is_bare_call(&self, k: usize) -> bool {
         let start = self.starts[k];
-        if k != start + 1 || !(self.is(start, "select") || self.is(start, "perform")) {
+        // Only `pg_catalog` surely holds the built-in function.
+        let named = k == start + 1
+            || (k == start + 3
+                && self.is(start + 1, "pg_catalog")
+                && self.is_punct(start + 2, '.'));
+        if !named || !(self.is(start, "select") || self.is(start, "perform")) {
             return false;
         }
         let mut parens = 0_usize;
@@ -1799,7 +1804,7 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
     let toks = s.toks;
     let handler = |j: usize| s.is(j, "exception") && !(j > 0 && s.is(j - 1, "raise"));
     // A block with an exception handler runs as a subtransaction. An error
-    // rolls the whole block back, so nothing in the body surely happens.
+    // rolls the whole block back, so nothing in that block surely happens.
     let mut rolled_back = vec![false; toks.len()];
     let mut from = 0;
     while from < toks.len() {
@@ -1811,7 +1816,15 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
             .find(|&j| toks[j].depth == 0)
             .unwrap_or(toks.len());
         if (from..to).any(handler) {
-            rolled_back[from..to].fill(true);
+            // When the blocks do not pair up, the whole body fails closed.
+            match handled_blocks(s, from, to) {
+                Some(blocks) => {
+                    for (begin, end) in blocks {
+                        rolled_back[begin..=end].fill(true);
+                    }
+                }
+                None => rolled_back[from..to].fill(true),
+            }
         }
         from = to;
     }
@@ -1849,6 +1862,36 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
         out.push(depth == 0 || (*branches == 0 && !*skippable && !rolled_back[k]));
     }
     out
+}
+
+/// Each `BEGIN ... END` block in tokens `from..to` that has an exception
+/// handler, as a token range.
+///
+/// `END IF`, `END LOOP` and `END CASE` close no block, and nor does the `END`
+/// of a SQL `CASE` expression. `None` means the blocks do not pair up.
+fn handled_blocks(s: &Stmts, from: usize, to: usize) -> Option<Vec<(usize, usize)>> {
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    let mut expression_cases = 0_usize;
+    let mut blocks = Vec::new();
+    for j in from..to {
+        match s.word(j) {
+            Some("begin") => open.push((j, false)),
+            Some("exception") if !(j > 0 && s.is(j - 1, "raise")) => {
+                open.last_mut()?.1 = true;
+            }
+            Some("case") if s.starts[j] != j => expression_cases += 1,
+            Some("end") if ["if", "loop", "case"].iter().any(|w| s.is(j + 1, w)) => {}
+            Some("end") if expression_cases > 0 => expression_cases -= 1,
+            Some("end") => {
+                let (begin, handled) = open.pop()?;
+                if handled {
+                    blocks.push((begin, j));
+                }
+            }
+            _ => {}
+        }
+    }
+    open.is_empty().then_some(blocks)
 }
 
 /// The `lock_timeout` change at token `k`, if any: whether it sets a bound.
@@ -4500,6 +4543,33 @@ fn a_schema_move_ends_a_new_table_exemption() {
             .any(|f| f.rule == Rule::LockTimeout && f.line == 3),
         "{findings:?}"
     );
+}
+
+#[test]
+fn a_nested_handler_rolls_back_only_its_block() {
+    // The handler undoes its own block. The outer setter and lock stay.
+    let sql = "DO $$\nBEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\n    BEGIN\n        \
+               PERFORM 1 / 0;\n    EXCEPTION WHEN others THEN\n        NULL;\n    END;\n    \
+               ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
+    assert_eq!(lint_with_history(&[], sql, true), []);
+    // A setter inside the handled block may still be undone.
+    let sql = "DO $$\nBEGIN\n    BEGIN\n        PERFORM set_config('lock_timeout', '5s', true);\n    \
+               EXCEPTION WHEN others THEN\n        NULL;\n    END;\n    \
+               ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_pg_catalog_setter_is_a_bare_call() {
+    let sql = "SELECT pg_catalog.set_config('lock_timeout', '5s', true);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], sql, true), []);
+    // Another schema may hold a different function.
+    let sql = "SELECT app.set_config('lock_timeout', '5s', true);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
