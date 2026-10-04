@@ -556,6 +556,13 @@ pub const METRIC_SUMMARY_DELETED: &str = "harvest.retention.summary_deleted";
 /// (issue #948).
 pub const METRIC_RATE_LIMIT_BUCKETS_DELETED: &str = "harvest.retention.rate_limit_buckets_deleted";
 
+/// Counter: terminal `harvest_task_queue` rows deleted by the terminal-task
+/// janitor (issue #1811).
+///
+/// Labeled by [`METRIC_LABEL_STATE`]: `COMPLETED`, `FAILED` or `CANCELLED`.
+/// Real deletes only, never a `dry_run` preview.
+pub const METRIC_TERMINAL_TASKS_DELETED: &str = "harvest.retention.terminal_tasks_deleted";
+
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -1451,6 +1458,20 @@ pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
 /// `GET /admin/preflight` for deployments without a metrics pipeline.
 pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 
+/// Counter: a pool acquire hit its bound (issue #1788).
+///
+/// Labelled `{site}`: `claim` or `heartbeat_flush`. A steady rate means the
+/// pool is too small or a connection is stuck. See
+/// `docs/operations/postgres-timeouts.md`.
+pub const METRIC_DB_POOL_ACQUIRE_TIMEOUT: &str = "harvest.db.pool_acquire_timeout";
+
+/// Counter: an activity heartbeat flush failed (issue #1788).
+///
+/// Labelled `{reason}`: `acquire_timeout`, `acquire_error` or `write_error`.
+/// The flusher keeps the payload and tries again on the next tick. A run of
+/// failures can let `heartbeat_timeout` fire on a healthy activity.
+pub const METRIC_HEARTBEAT_FLUSH_FAILED: &str = "harvest.heartbeat.flush_failed";
+
 /// Counter: a `SignalReceived` event was durably delivered into a workflow's
 /// history and promoted to a live workflow-task wake (issue #684).
 ///
@@ -1837,8 +1858,11 @@ pub const METRIC_LABEL_QUEUE: &str = "queue";
 pub const METRIC_LABEL_TASK_TYPE: &str = "task_type";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
 pub const METRIC_LABEL_STATUS: &str = "status";
-/// Metric label: active workflow lifecycle state (issue #770) — one of the
-/// bounded values `"running"` / `"paused"`.
+/// Metric label: lifecycle state.
+///
+/// `harvest.workflow.active` uses `"running"` / `"paused"` (issue #770).
+/// `harvest.retention.terminal_tasks_deleted` uses the task states
+/// `COMPLETED` / `FAILED` / `CANCELLED` (issue #1811).
 pub const METRIC_LABEL_STATE: &str = "state";
 /// Metric label: low-cardinality error class on failed activity records.
 pub const METRIC_LABEL_ERROR_TYPE: &str = "error.type";
@@ -1920,6 +1944,11 @@ pub const METRIC_LABEL_ACTION: &str = "action";
 /// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
 /// variants — a call site passes the enum's `as_str()`, never a free string.
 pub const METRIC_LABEL_SCANNER: &str = "scanner";
+
+/// Metric label: the code path that hit a pool acquire bound (issue #1788).
+///
+/// Bounded: `claim` or `heartbeat_flush`.
+pub const METRIC_LABEL_SITE: &str = "site";
 /// `shard` label value for a control loop that is **not** per-shard (issue #797).
 ///
 /// The `retention` and `schedule` loops run once per process rather than once
@@ -2928,6 +2957,21 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (scanner, shard);
     }
 
+    /// A pool acquire hit its bound (issue #1788).
+    ///
+    /// `site` is `claim` or `heartbeat_flush`. Additive with a no-op default.
+    fn record_db_pool_acquire_timeout(&self, site: &str) {
+        let _ = site;
+    }
+
+    /// An activity heartbeat flush failed (issue #1788).
+    ///
+    /// `reason` is `acquire_timeout`, `acquire_error` or `write_error`.
+    /// Additive with a no-op default.
+    fn record_heartbeat_flush_failed(&self, reason: &str) {
+        let _ = reason;
+    }
+
     /// Results of one retention-janitor tick on a shard.
     fn record_retention_tick(
         &self,
@@ -2974,6 +3018,14 @@ pub trait MetricsRecorder: Send + Sync {
     /// unbounded bucket key. Emitted for real deletes only (never dry-run).
     fn record_rate_limit_buckets_deleted(&self, family: &str, count: u64) {
         let _ = (family, count);
+    }
+
+    /// Number of terminal task rows the terminal-task janitor deleted on one
+    /// shard in one tick, per task state (issue #1811).
+    ///
+    /// Maps to [`METRIC_TERMINAL_TASKS_DELETED`]. Real deletes only.
+    fn record_terminal_tasks_deleted(&self, state: &str, count: u64) {
+        let _ = (state, count);
     }
 
     /// Current number of RUNNING tasks for a concurrency group key.
@@ -4420,6 +4472,10 @@ mod tests {
             METRIC_RATE_LIMIT_BUCKETS_DELETED,
             "harvest.retention.rate_limit_buckets_deleted"
         );
+        assert_eq!(
+            METRIC_TERMINAL_TASKS_DELETED,
+            "harvest.retention.terminal_tasks_deleted"
+        );
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
@@ -5227,6 +5283,7 @@ mod tests {
         rec.record_retention_deleted("onboarding", 50);
         rec.record_summary_deleted("onboarding", 50);
         rec.record_rate_limit_buckets_deleted("dyn-rate", 12);
+        rec.record_terminal_tasks_deleted("COMPLETED", 12);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_workflow_nondeterministic_block("onboarding", "default");
         rec.record_workflow_history_bloat("onboarding");

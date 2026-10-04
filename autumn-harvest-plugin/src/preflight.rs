@@ -408,7 +408,12 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("harvest_events", &["SELECT", "INSERT"]),
-    ("harvest_task_queue", &["SELECT", "INSERT", "UPDATE"]),
+    // The terminal-task janitor deletes finished rows (issue #1811). Without
+    // `DELETE`, every sweep fails and the table grows without limit.
+    (
+        "harvest_task_queue",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     ("harvest_schedules", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),

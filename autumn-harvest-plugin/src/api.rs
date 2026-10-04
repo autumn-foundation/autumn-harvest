@@ -7640,6 +7640,7 @@ pub const fn management_api_response_fields()
                 "scheduled_time",
                 "history_truncated",
                 "history_endpoint",
+                "legal_hold",
             ]),
         ),
         (
@@ -7811,24 +7812,18 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/{workflow_name}/start",
-            // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
-            // A debounced workflow (issue #499) instead returns 202 Accepted with the
-            // debounce fields below (no execution_id exists until the scanner fires).
-            // With an idempotency_key (issue #808) the response also carries the
-            // started_fresh/deduplicated flags (200 on a dedup replay).
+            // The 201 body: a normal start, or a batch that flushed at once. With
+            // an idempotency_key (issue #808) it also carries started_fresh and
+            // deduplicated. A deferred start (debounce, batch or throttle) is a
+            // 202 with its own fields. The contract lists those under
+            // `additional_responses` (issue #1616).
             Some(&[
                 "execution_id",
                 "workflow_name",
                 "workflow_id",
                 "state",
-                "debounced",
-                "debounce_key",
-                "fire_at",
-                "pending_count",
                 "batched",
                 "flushed",
-                "batch_key",
-                "max_size",
                 "started_fresh",
                 "deduplicated",
                 "shard_id",

@@ -785,6 +785,28 @@ pub enum HarvestError {
         reason: String,
     },
 
+    /// A pool did not hand out a connection within the bound (issue #1788).
+    ///
+    /// The pool is full, or the database does not answer. Nothing was
+    /// written, so the caller can retry. Classify it with
+    /// [`HarvestError::is_pool_acquire_timeout`].
+    #[error("database pool acquire timed out after {waited:?}")]
+    PoolAcquireTimeout {
+        /// How long the acquire waited before it failed.
+        waited: std::time::Duration,
+    },
+
+    /// A pool could not open or hand out a connection (issue #1788).
+    ///
+    /// For example, Postgres refuses the connect, or the connection setup
+    /// hook fails. Nothing was written, so the caller can retry. Classify it
+    /// with [`HarvestError::is_pool_acquire_failure`].
+    #[error("database pool acquire failed: {reason}")]
+    PoolAcquireFailed {
+        /// The pool error.
+        reason: String,
+    },
+
     /// A shard checkout named a shard outside the request's shard fence
     /// (issue #1803).
     ///
@@ -1404,6 +1426,23 @@ impl HarvestError {
     #[must_use]
     pub const fn is_shard_unavailable(&self) -> bool {
         matches!(self, Self::ShardUnavailable { .. })
+    }
+
+    /// Is this a [`HarvestError::PoolAcquireTimeout`]?
+    #[must_use]
+    pub const fn is_pool_acquire_timeout(&self) -> bool {
+        matches!(self, Self::PoolAcquireTimeout { .. })
+    }
+
+    /// Did a pool fail to hand out a connection? True for
+    /// [`HarvestError::PoolAcquireTimeout`] and
+    /// [`HarvestError::PoolAcquireFailed`].
+    #[must_use]
+    pub const fn is_pool_acquire_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::PoolAcquireTimeout { .. } | Self::PoolAcquireFailed { .. }
+        )
     }
 
     /// Returns `true` if this is a

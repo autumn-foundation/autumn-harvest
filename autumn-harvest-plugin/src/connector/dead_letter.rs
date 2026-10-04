@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use diesel_async::AsyncPgConnection;
 use uuid::Uuid;
 
-use super::source::ConnectorError;
+use super::source::{ConnectorError, ConnectorFuture};
 
 /// One poison message, captured with everything needed to diagnose and replay
 /// it by hand.
@@ -77,9 +77,11 @@ pub enum DeadLetterOutcome {
 }
 
 /// Where a binding's poison messages are written.
-// `async_trait` adds its own `#[must_use]` to each method.
-#[allow(clippy::double_must_use)]
-#[async_trait]
+///
+/// Implement it with `#[async_trait]` on the `impl` block and an `async fn
+/// write`. The signature here is the one that `#[async_trait]` generates. It
+/// is written out because `#[async_trait]` on the trait adds a `#[must_use]`
+/// that clippy rejects as `double_must_use`.
 pub trait DeadLetterSink: Send + Sync {
     /// Durably record a poison message.
     ///
@@ -97,8 +99,14 @@ pub trait DeadLetterSink: Send + Sync {
     ///
     /// Returns [`ConnectorError::Broker`] (or [`ConnectorError::Config`]) when
     /// the record could not be written.
-    async fn write(&self, entry: &ConnectorDeadLetter)
-    -> Result<DeadLetterOutcome, ConnectorError>;
+    fn write<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        entry: &'life1 ConnectorDeadLetter,
+    ) -> ConnectorFuture<'async_trait, Result<DeadLetterOutcome, ConnectorError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 }
 
 /// A sink that writes to `harvest_connector_dead_letters`.

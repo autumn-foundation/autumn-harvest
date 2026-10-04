@@ -372,6 +372,14 @@ name = "notify_commit_bench"
 required-features = ["db"]
 harness = false
 
+# Claim latency after 1M terminal task rows, before and after the task-queue
+# hygiene fix (issue #1811). `harness = false` for the same reason as
+# `claim_bench`: claims and the janitor sweep are destructive.
+[[bench]]
+name = "task_queue_hygiene_bench"
+required-features = ["db"]
+harness = false
+
 # Retention-reclamation benchmark for the opt-in partitioned `harvest_events`
 # layout (issue #958). `harness = false` for the same reason as `claim_bench`:
 # the measured operation is destructive and enormous (it collects half the

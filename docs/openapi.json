@@ -3913,6 +3913,7 @@
                       "type": "integer"
                     },
                     "skipped_reasons": {
+                      "additionalProperties": true,
                       "description": "Machine-readable breakdown of skip causes. Keys: already_exists, max_active_runs.",
                       "type": "object"
                     },
@@ -4652,6 +4653,7 @@
                       "type": "array"
                     },
                     "shards": {
+                      "additionalProperties": true,
                       "description": "The per-shard view behind the disagreement, keyed by shard id.",
                       "type": "object"
                     }
@@ -5361,6 +5363,7 @@
                     "replay_succeeded": {},
                     "sampled": {},
                     "summary_by_type": {
+                      "additionalProperties": true,
                       "description": "A map from workflow type name to CanaryTypeSummary objects. Each summary object has: sampled (integer), replay_succeeded (integer), and replay_failed (integer).",
                       "type": "object"
                     },
@@ -6905,14 +6908,72 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "dag_count": {},
-                    "queues": {},
-                    "runtime_ready": {},
-                    "scheduler": {},
-                    "shard_readiness": {},
-                    "shard_readiness_enforced": {},
-                    "worker_id": {}
+                    "dag_count": {
+                      "type": "integer"
+                    },
+                    "queues": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "runtime_ready": {
+                      "type": "boolean"
+                    },
+                    "scheduler": {
+                      "properties": {
+                        "dag_count": {
+                          "type": "integer"
+                        },
+                        "last_tick_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "running": {
+                          "type": "boolean"
+                        },
+                        "tick_interval_ms": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "running",
+                        "dag_count",
+                        "tick_interval_ms",
+                        "last_tick_at"
+                      ],
+                      "type": "object"
+                    },
+                    "shard_readiness": {
+                      "additionalProperties": true,
+                      "description": "Null when shard readiness is not enforced.",
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "shard_readiness_enforced": {
+                      "type": "boolean"
+                    },
+                    "worker_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
                   },
+                  "required": [
+                    "runtime_ready",
+                    "worker_id",
+                    "queues",
+                    "dag_count",
+                    "scheduler",
+                    "shard_readiness_enforced",
+                    "shard_readiness"
+                  ],
                   "type": "object"
                 }
               }
@@ -6924,14 +6985,72 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "dag_count": {},
-                    "queues": {},
-                    "runtime_ready": {},
-                    "scheduler": {},
-                    "shard_readiness": {},
-                    "shard_readiness_enforced": {},
-                    "worker_id": {}
+                    "dag_count": {
+                      "type": "integer"
+                    },
+                    "queues": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "runtime_ready": {
+                      "type": "boolean"
+                    },
+                    "scheduler": {
+                      "properties": {
+                        "dag_count": {
+                          "type": "integer"
+                        },
+                        "last_tick_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "running": {
+                          "type": "boolean"
+                        },
+                        "tick_interval_ms": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "running",
+                        "dag_count",
+                        "tick_interval_ms",
+                        "last_tick_at"
+                      ],
+                      "type": "object"
+                    },
+                    "shard_readiness": {
+                      "additionalProperties": true,
+                      "description": "Null when shard readiness is not enforced.",
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "shard_readiness_enforced": {
+                      "type": "boolean"
+                    },
+                    "worker_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
                   },
+                  "required": [
+                    "runtime_ready",
+                    "worker_id",
+                    "queues",
+                    "dag_count",
+                    "scheduler",
+                    "shard_readiness_enforced",
+                    "shard_readiness"
+                  ],
                   "type": "object"
                 }
               }
@@ -9634,16 +9753,453 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "execution": {},
-                    "external_handoffs": {},
-                    "history": {},
-                    "history_endpoint": {},
-                    "history_truncated": {},
-                    "last_completion_result": {},
-                    "last_error": {},
-                    "parent_id": {},
-                    "scheduled_time": {}
+                    "execution": {
+                      "description": "The execution row.",
+                      "properties": {
+                        "assigned_build_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "chain_deadline_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "chain_execution_timeout": {
+                          "description": "A duration as [seconds, nanoseconds].",
+                          "items": {
+                            "type": "integer"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "completed_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "completion_callbacks": {
+                          "x-harvest-any": true
+                        },
+                        "continued_from_exec_id": {
+                          "description": "A UUID.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "created_at": {
+                          "description": "RFC 3339 time.",
+                          "type": "string"
+                        },
+                        "current_details": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "deadline_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "execution_timeout": {
+                          "description": "A duration as [seconds, nanoseconds].",
+                          "items": {
+                            "type": "integer"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "first_exec_id": {
+                          "description": "A UUID.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "history_bloat_warned_at": {
+                          "description": "RFC 3339 time.",
+                          "type": "string"
+                        },
+                        "id": {
+                          "description": "A UUID.",
+                          "type": "string"
+                        },
+                        "input": {
+                          "x-harvest-any": true
+                        },
+                        "legal_hold_actor": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "legal_hold_reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "legal_hold_set_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "legal_hold_until": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "memo": {
+                          "x-harvest-any": true
+                        },
+                        "migrated_at": {
+                          "description": "RFC 3339 time.",
+                          "type": "string"
+                        },
+                        "migrated_from_shards": {
+                          "x-harvest-any": true
+                        },
+                        "migrated_run_terminal_at": {
+                          "description": "RFC 3339 time.",
+                          "type": "string"
+                        },
+                        "migrated_run_terminal_state": {
+                          "type": "string"
+                        },
+                        "migrated_to_shard": {
+                          "type": "integer"
+                        },
+                        "nd_block_count": {
+                          "type": "integer"
+                        },
+                        "nd_block_reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "nd_blocked_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "origin": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "output": {
+                          "x-harvest-any": true
+                        },
+                        "owner": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "parent_close_policy": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "parent_id": {
+                          "description": "A UUID.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "pause_actor": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "pause_reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "paused_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "queue_name": {
+                          "type": "string"
+                        },
+                        "quota_key": {
+                          "type": "string"
+                        },
+                        "retry_of_exec_id": {
+                          "description": "A UUID.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "run_id": {
+                          "description": "A UUID.",
+                          "type": "string"
+                        },
+                        "runbook_url": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "schedule_id": {
+                          "description": "A UUID.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "scheduled_for": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "search_attrs": {
+                          "x-harvest-any": true
+                        },
+                        "severity": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "shard_id": {
+                          "type": "integer"
+                        },
+                        "sla": {
+                          "description": "A duration as [seconds, nanoseconds].",
+                          "items": {
+                            "type": "integer"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "sla_breached": {
+                          "type": "boolean"
+                        },
+                        "sla_breached_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "sla_deadline_at": {
+                          "description": "RFC 3339 time.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "staging_vacated_by": {
+                          "description": "A UUID.",
+                          "type": "string"
+                        },
+                        "staging_vacated_state": {
+                          "type": "string"
+                        },
+                        "start_source": {
+                          "description": "How the run started, such as `api` or `schedule`. `unknown` when not recorded.",
+                          "type": "string"
+                        },
+                        "start_source_ref": {
+                          "type": "string"
+                        },
+                        "started_at": {
+                          "description": "RFC 3339 time.",
+                          "type": "string"
+                        },
+                        "started_by": {
+                          "type": "string"
+                        },
+                        "state": {
+                          "description": "Upper-case state, such as `RUNNING` or `COMPLETED`.",
+                          "type": "string"
+                        },
+                        "sticky_worker_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "triage_note": {
+                          "type": "string"
+                        },
+                        "workflow_attempt": {
+                          "type": "integer"
+                        },
+                        "workflow_id": {
+                          "type": "string"
+                        },
+                        "workflow_name": {
+                          "type": "string"
+                        },
+                        "workflow_retry_policy": {
+                          "x-harvest-any": true
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "workflow_name",
+                        "workflow_id",
+                        "run_id",
+                        "shard_id",
+                        "state",
+                        "input",
+                        "output",
+                        "error",
+                        "parent_id",
+                        "sticky_worker_id",
+                        "queue_name",
+                        "started_at",
+                        "completed_at",
+                        "execution_timeout",
+                        "deadline_at",
+                        "chain_execution_timeout",
+                        "chain_deadline_at",
+                        "memo",
+                        "search_attrs",
+                        "created_at",
+                        "assigned_build_id",
+                        "parent_close_policy",
+                        "owner",
+                        "runbook_url",
+                        "severity",
+                        "paused_at",
+                        "pause_reason",
+                        "pause_actor",
+                        "current_details",
+                        "sla",
+                        "sla_deadline_at",
+                        "sla_breached",
+                        "sla_breached_at",
+                        "schedule_id",
+                        "scheduled_for",
+                        "workflow_attempt",
+                        "workflow_retry_policy",
+                        "retry_of_exec_id",
+                        "origin",
+                        "nd_blocked_at",
+                        "nd_block_reason",
+                        "nd_block_count",
+                        "completion_callbacks",
+                        "continued_from_exec_id",
+                        "first_exec_id",
+                        "legal_hold_set_at",
+                        "legal_hold_until",
+                        "legal_hold_reason",
+                        "legal_hold_actor",
+                        "start_source"
+                      ],
+                      "type": "object"
+                    },
+                    "external_handoffs": {
+                      "description": "Pending external activity hand-offs.",
+                      "items": {
+                        "description": "One pending hand-off. No live test creates one yet, so the shape stays open.",
+                        "x-harvest-any": true
+                      },
+                      "type": "array"
+                    },
+                    "history": {
+                      "description": "The first page of events, at most 100. Each event is `{type, data}`.",
+                      "items": {
+                        "properties": {
+                          "data": {
+                            "additionalProperties": true,
+                            "type": "object"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "data"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "history_endpoint": {
+                      "description": "The path that pages through the full history.",
+                      "type": "string"
+                    },
+                    "history_truncated": {
+                      "type": "boolean"
+                    },
+                    "last_completion_result": {
+                      "x-harvest-any": true
+                    },
+                    "last_error": {
+                      "type": "string"
+                    },
+                    "legal_hold": {
+                      "description": "True when a legal hold blocks erasure and retention.",
+                      "type": "boolean"
+                    },
+                    "parent_id": {
+                      "description": "A UUID.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "scheduled_time": {
+                      "description": "RFC 3339 time.",
+                      "type": "string"
+                    }
                   },
+                  "required": [
+                    "parent_id",
+                    "execution",
+                    "history",
+                    "external_handoffs",
+                    "history_truncated",
+                    "history_endpoint",
+                    "legal_hold"
+                  ],
                   "type": "object"
                 }
               }
@@ -9925,13 +10481,34 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "execution_id": {},
-                    "failed_task_count": {},
-                    "newly_cancelled": {},
-                    "ok": {},
-                    "reason": {},
-                    "state": {}
+                    "execution_id": {
+                      "description": "The attempt that was stopped. A UUID.",
+                      "type": "string"
+                    },
+                    "failed_task_count": {
+                      "type": "integer"
+                    },
+                    "newly_cancelled": {
+                      "type": "boolean"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string"
+                    }
                   },
+                  "required": [
+                    "ok",
+                    "execution_id",
+                    "state",
+                    "reason",
+                    "newly_cancelled",
+                    "failed_task_count"
+                  ],
                   "type": "object"
                 }
               }
@@ -9943,13 +10520,34 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "execution_id": {},
-                    "failed_task_count": {},
-                    "newly_cancelled": {},
-                    "ok": {},
-                    "reason": {},
-                    "state": {}
+                    "execution_id": {
+                      "description": "The attempt that was stopped. A UUID.",
+                      "type": "string"
+                    },
+                    "failed_task_count": {
+                      "type": "integer"
+                    },
+                    "newly_cancelled": {
+                      "type": "boolean"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string"
+                    }
                   },
+                  "required": [
+                    "ok",
+                    "execution_id",
+                    "state",
+                    "reason",
+                    "newly_cancelled",
+                    "failed_task_count"
+                  ],
                   "type": "object"
                 }
               }
@@ -11332,11 +11930,26 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "completed_at": {},
-                    "error": {},
-                    "output": {},
-                    "state": {}
+                    "completed_at": {
+                      "description": "RFC 3339 time.",
+                      "type": "string"
+                    },
+                    "error": {
+                      "description": "Present for a failed outcome that recorded an error.",
+                      "type": "string"
+                    },
+                    "output": {
+                      "description": "Present for `completed` and `continued_as_new`.",
+                      "x-harvest-any": true
+                    },
+                    "state": {
+                      "description": "Lower-case terminal state, such as `completed` or `failed`.",
+                      "type": "string"
+                    }
                   },
+                  "required": [
+                    "state"
+                  ],
                   "type": "object"
                 }
               }
@@ -11536,10 +12149,22 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "ok": {},
-                    "routed_execution_id": {},
-                    "signal_delivered": {}
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "routed_execution_id": {
+                      "description": "Present when the signal landed on another retry attempt. A UUID.",
+                      "type": "string"
+                    },
+                    "signal_delivered": {
+                      "description": "False for a deduplicated retry.",
+                      "type": "boolean"
+                    }
                   },
+                  "required": [
+                    "ok",
+                    "signal_delivered"
+                  ],
                   "type": "object"
                 }
               }
@@ -11711,13 +12336,34 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "execution_id": {},
-                    "failed_task_count": {},
-                    "newly_terminated": {},
-                    "ok": {},
-                    "reason": {},
-                    "state": {}
+                    "execution_id": {
+                      "description": "The attempt that was stopped. A UUID.",
+                      "type": "string"
+                    },
+                    "failed_task_count": {
+                      "type": "integer"
+                    },
+                    "newly_terminated": {
+                      "type": "boolean"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string"
+                    }
                   },
+                  "required": [
+                    "ok",
+                    "execution_id",
+                    "state",
+                    "reason",
+                    "newly_terminated",
+                    "failed_task_count"
+                  ],
                   "type": "object"
                 }
               }
@@ -12428,6 +13074,7 @@
                     "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not — except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400. A prior sealed MIGRATED/MIGRATING by a shard rebalance (issue #964) counts as ACTIVE -- the run is live, just on another shard -- and terminate_existing against one is REFUSED with a retryable 503 naming the live residence rather than replaced: the terminate could not reach the live copy from the prior's shard, and replacing would release the business key while the real run kept executing, producing two live runs for one workflow_id. Cancel or terminate the execution by id (which routes to its live residence), then retry the start."
                   },
                   "context_headers": {
+                    "additionalProperties": true,
                     "description": "Caller-supplied trace or correlation headers, threaded onto the execution row and carried through the run.",
                     "type": "object"
                   },
@@ -12487,22 +13134,39 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "batch_key": {},
-                    "batched": {},
-                    "debounce_key": {},
-                    "debounced": {},
-                    "deduplicated": {},
-                    "execution_id": {},
-                    "fire_at": {},
-                    "flushed": {},
-                    "max_size": {},
-                    "pending_count": {},
-                    "shard_id": {},
-                    "started_fresh": {},
-                    "state": {},
-                    "workflow_id": {},
-                    "workflow_name": {}
+                    "deduplicated": {
+                      "description": "Present on an idempotency-key start. True when an earlier start matched the key.",
+                      "type": "boolean"
+                    },
+                    "execution_id": {
+                      "description": "The execution id, a UUID.",
+                      "type": "string"
+                    },
+                    "shard_id": {
+                      "description": "Present when the request pins `shard_id` or `residency_key`.",
+                      "type": "integer"
+                    },
+                    "started_fresh": {
+                      "description": "Present when the request sends `conflict_policy` or an idempotency key.",
+                      "type": "boolean"
+                    },
+                    "state": {
+                      "description": "The execution state, such as `RUNNING`. Attach and dedup return the state of the existing run.",
+                      "type": "string"
+                    },
+                    "workflow_id": {
+                      "type": "string"
+                    },
+                    "workflow_name": {
+                      "type": "string"
+                    }
                   },
+                  "required": [
+                    "execution_id",
+                    "workflow_name",
+                    "workflow_id",
+                    "state"
+                  ],
                   "type": "object"
                 }
               }
@@ -12514,22 +13178,47 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "batch_key": {},
-                    "batched": {},
-                    "debounce_key": {},
-                    "debounced": {},
-                    "deduplicated": {},
-                    "execution_id": {},
-                    "fire_at": {},
-                    "flushed": {},
-                    "max_size": {},
-                    "pending_count": {},
-                    "shard_id": {},
-                    "started_fresh": {},
-                    "state": {},
-                    "workflow_id": {},
-                    "workflow_name": {}
+                    "batched": {
+                      "description": "Present and true when an event batch flushed at once.",
+                      "type": "boolean"
+                    },
+                    "deduplicated": {
+                      "description": "Present on an idempotency-key start. True when an earlier start matched the key.",
+                      "type": "boolean"
+                    },
+                    "execution_id": {
+                      "description": "The execution id, a UUID.",
+                      "type": "string"
+                    },
+                    "flushed": {
+                      "description": "Present and true when an event batch flushed at once.",
+                      "type": "boolean"
+                    },
+                    "shard_id": {
+                      "description": "Present when the request pins `shard_id` or `residency_key`.",
+                      "type": "integer"
+                    },
+                    "started_fresh": {
+                      "description": "Present when the request sends `conflict_policy` or an idempotency key.",
+                      "type": "boolean"
+                    },
+                    "state": {
+                      "description": "The execution state, such as `RUNNING`. Attach and dedup return the state of the existing run.",
+                      "type": "string"
+                    },
+                    "workflow_id": {
+                      "type": "string"
+                    },
+                    "workflow_name": {
+                      "type": "string"
+                    }
                   },
+                  "required": [
+                    "execution_id",
+                    "workflow_name",
+                    "workflow_id",
+                    "state"
+                  ],
                   "type": "object"
                 }
               }
@@ -12598,6 +13287,10 @@
                       "type": "string"
                     }
                   },
+                  "required": [
+                    "workflow_name",
+                    "workflow_id"
+                  ],
                   "type": "object"
                 }
               }

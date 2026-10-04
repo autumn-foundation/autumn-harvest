@@ -177,6 +177,8 @@ mod payload_offload_db_tests;
 mod payload_offload_replay_tests;
 mod performance_docs;
 #[cfg(feature = "db")]
+mod pg_timeouts_tests;
+#[cfg(feature = "db")]
 mod poison_pill_reclaim_perf;
 mod poison_pill_tests;
 #[cfg(feature = "db")]
@@ -268,6 +270,8 @@ mod start_source_tests;
 mod sticky_default_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
+#[cfg(feature = "db")]
+mod terminal_task_gc_tests;
 #[cfg(feature = "db")]
 mod terminal_write_ownership_tests;
 #[cfg(feature = "db")]
