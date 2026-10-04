@@ -2425,6 +2425,43 @@ async fn a_logical_standby_refuses_to_start_and_provisions_nothing() {
     assert!(!FenceRegistry::is_enabled());
 }
 
+/// A subscription may have any local name. Its slot name carries the DR
+/// prefix, so the slot name marks the standby too.
+#[tokio::test]
+async fn a_standby_whose_subscription_slot_has_the_dr_prefix_refuses_to_start() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("standbyslotname");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("the replicated row");
+    let sub = format!("regional_replica_{db}");
+    diesel::sql_query(format!(
+        "CREATE SUBSCRIPTION {sub} CONNECTION 'dbname=unused' PUBLICATION harvest_dr \
+         WITH (connect = false, slot_name = '{DR_PREFIX}_{db}')"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("create a disconnected subscription");
+
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool).await;
+    let enabled = FenceRegistry::is_enabled();
+    let _ = diesel::sql_query(format!("ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)"))
+        .execute(&mut conn)
+        .await;
+    let _ = diesel::sql_query(format!("DROP SUBSCRIPTION {sub}"))
+        .execute(&mut conn)
+        .await;
+
+    let Err(error) = refused else {
+        panic!("a standby must refuse to start, whatever its subscription is named");
+    };
+    assert!(error.to_string().contains("standby"), "{error}");
+    assert!(!enabled, "a refused start pins nothing");
+}
+
 /// A database without the fence table probes as plain. Before issue #1823 an
 /// unfenced process issued no DR query, so it must not fail now.
 #[tokio::test]

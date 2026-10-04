@@ -181,7 +181,8 @@ marker**. A marker is any one of these:
 - a `harvest_shard_generation` row, which a fenced process or
   `harvest dr fence` writes;
 - a replication slot whose name starts with the DR prefix (`harvest_dr`);
-- a subscription in this database whose name starts with the DR prefix.
+- a subscription in this database whose name or slot name starts with the
+  DR prefix.
 
 The slot test uses the same scope as the RPO metric. A logical slot counts
 for its own database only. A physical slot counts for every database on the

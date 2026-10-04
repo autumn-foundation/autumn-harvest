@@ -546,7 +546,9 @@ pub struct DrMarkers {
     pub generation_shards: Vec<ShardId>,
     /// Replication slots with the DR prefix, scoped like the RPO metric.
     pub dr_slots: i64,
-    /// Subscriptions in this database with the DR prefix.
+    /// Subscriptions in this database whose name or slot name has the DR
+    /// prefix. A subscription may have any local name, but its slot is the
+    /// one the DR setup names.
     pub dr_subscriptions: i64,
     /// Every subscription in this database, whatever its name.
     ///
@@ -1369,7 +1371,9 @@ mod db {
                  (SELECT COUNT(*) FROM pg_subscription s \
                   JOIN pg_database d ON d.oid = s.subdbid \
                   WHERE d.datname = current_database() \
-                    AND starts_with(s.subname::text, $1)) AS dr_subscriptions, \
+                    AND (starts_with(s.subname::text, $1) \
+                         OR starts_with(COALESCE(s.subslotname::text, ''), $1))) \
+                     AS dr_subscriptions, \
                  (SELECT COUNT(*) FROM pg_subscription s \
                   JOIN pg_database d ON d.oid = s.subdbid \
                   WHERE d.datname = current_database()) AS subscriptions, \
