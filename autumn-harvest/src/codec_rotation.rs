@@ -1038,12 +1038,13 @@ mod db {
     /// assertion's `FOR SHARE` stays a commit-order barrier against a
     /// concurrent promotion.
     ///
-    /// The fence read is skipped when fencing is off.
+    /// With fencing off, the swap skips the fence read.
     ///
-    /// The swap always runs in its own transaction (issue #1817). The
-    /// append-only guard trigger rejects an `event_data` rewrite unless the
-    /// transaction carries the [`EventRewrite::CodecRotation`] sanction.
-    /// A transaction-local setting needs a transaction to live in.
+    /// The swap always runs in a transaction, or in a savepoint when the
+    /// caller already holds one (issue #1817). The append-only guard trigger
+    /// rejects an `event_data` rewrite unless the transaction carries the
+    /// [`EventRewrite::CodecRotation`] sanction. A transaction-local setting
+    /// needs a transaction to live in.
     ///
     /// [`EventRewrite::CodecRotation`]: crate::append_only::EventRewrite::CodecRotation
     ///

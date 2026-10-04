@@ -2346,13 +2346,29 @@ async fn refuse_if_operator_triggers(
          ({}). An operator trigger stays on the renamed table, where it stops firing for \
          every new row from cutover onward while still existing — silent for an audit or \
          validation trigger, since nothing reports the loss. Drop the trigger first (and \
-         recreate it against harvest_events afterward) to proceed.",
+         recreate it against harvest_events afterward) to proceed.{}",
         if triggers.len() == 1 {
             "a trigger is"
         } else {
             "triggers are"
         },
-        triggers.join(", ")
+        triggers.join(", "),
+        // Issue #1817: the conversion reinstalls harvest's own guard, so
+        // recreating it by hand afterward fails with "already exists".
+        if triggers
+            .iter()
+            .any(|t| t == crate::append_only::GUARD_TRIGGER)
+        {
+            format!(
+                " {} is harvest's append-only guard in a changed state. Re-enable it \
+                 (`ALTER TABLE harvest_events ENABLE TRIGGER {}`) or drop it. The \
+                 conversion reinstalls it, so do not recreate it.",
+                crate::append_only::GUARD_TRIGGER,
+                crate::append_only::GUARD_TRIGGER
+            )
+        } else {
+            String::new()
+        }
     )))
 }
 
@@ -3921,8 +3937,8 @@ pub async fn disable_partitioning(
             )
             .await?;
             // Issue #1817: `LIKE` copies no triggers, so reinstall the
-            // append-only guard on the flat table. The `cohort` reset above
-            // passes the guard either way: `cohort` is not history.
+            // append-only guard on the flat table. Keep it after the `cohort`
+            // reset above: the guard rejects a `cohort` change.
             exec(conn, &crate::append_only::create_guard_trigger_sql()).await?;
             exec(
                 conn,

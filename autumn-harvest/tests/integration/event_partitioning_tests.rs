@@ -10143,9 +10143,12 @@ async fn a_session_statement_timeout_does_not_stop_the_drain_census() {
 // ══ Issue #1817: the append-only guard survives every layout change ══════════
 
 /// Try a plain `event_data` rewrite on every row of `exec`.
+///
+/// Each call writes a new value, so a repeat call is never a no-op.
 async fn plain_rewrite_error(conn: &mut AsyncPgConnection, exec: uuid::Uuid) -> Option<String> {
     diesel::sql_query(
-        "UPDATE harvest_events SET event_data = jsonb_set(event_data, '{forged}', 'true') \
+        "UPDATE harvest_events \
+         SET event_data = jsonb_set(event_data, '{forged}', to_jsonb(clock_timestamp()::text)) \
          WHERE workflow_exec_id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec)
@@ -10263,4 +10266,114 @@ async fn an_operator_trigger_sharing_the_append_only_guard_name_still_refuses() 
         err.to_string().contains("harvest_events_append_only_trg"),
         "the refusal must name the impostor; got {err}"
     );
+}
+
+/// Partitions of `harvest_events` that lack the append-only guard.
+async fn partitions_without_the_guard(conn: &mut AsyncPgConnection) -> Vec<String> {
+    diesel::sql_query(
+        "SELECT i.inhrelid::regclass::text AS v FROM pg_inherits i
+          WHERE i.inhparent = 'harvest_events'::regclass
+            AND NOT EXISTS (SELECT 1 FROM pg_trigger tg
+                             WHERE tg.tgrelid = i.inhrelid
+                               AND tg.tgname = 'harvest_events_append_only_trg'
+                               AND tg.tgenabled = 'O')
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .expect("list unguarded partitions")
+    .into_iter()
+    .map(|r| r.v)
+    .collect()
+}
+
+#[tokio::test]
+async fn the_append_only_guard_survives_a_default_partition_drain() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Park rows in DEFAULT, then drain them. The drain detaches and
+    // re-attaches DEFAULT, which drops and re-clones its triggers.
+    let today = partition::partition_name(partition::cohort_start(
+        Utc::now(),
+        partition::DEFAULT_COHORT_WIDTH_SECS,
+    ));
+    diesel::sql_query(format!("DROP TABLE {today}"))
+        .execute(&mut conn)
+        .await
+        .expect("open a maintenance gap");
+    let exec = seed_with_history(&mut conn, "guard-drain").await;
+    let moved = partition::drain_default(&mut conn).await.expect("drain");
+    assert_eq!(moved, 3, "the drain moves every parked row");
+
+    assert_eq!(
+        partitions_without_the_guard(&mut conn).await,
+        Vec::<String>::new(),
+        "every partition keeps the guard after a drain"
+    );
+    assert_guarded(&mut conn, exec, "a row moved out of DEFAULT").await;
+    reset_to_unpartitioned(&mut conn).await;
+}
+
+#[tokio::test]
+async fn the_guard_migration_installs_on_an_already_partitioned_shard() {
+    // An operator can enable partitioning before this migration runs.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    let legacy = seed_with_history(&mut conn, "guard-premigrated").await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Return to the pre-migration schema, then apply the migration.
+    conn.batch_execute(include_str!(
+        "../../migrations/20261004160009_harvest_events_append_only_guard/down.sql"
+    ))
+    .await
+    .expect("down migration");
+    assert!(
+        plain_rewrite_error(&mut conn, legacy).await.is_none(),
+        "the down migration removes the guard from every partition"
+    );
+    conn.batch_execute(include_str!(
+        "../../migrations/20261004160009_harvest_events_append_only_guard/up.sql"
+    ))
+    .await
+    .expect("up migration on a partitioned shard");
+
+    assert_eq!(
+        partitions_without_the_guard(&mut conn).await,
+        Vec::<String>::new(),
+        "the migration clones the guard onto every existing partition"
+    );
+    assert_guarded(&mut conn, legacy, "legacy partition after the migration").await;
+    reset_to_unpartitioned(&mut conn).await;
+}
+
+#[tokio::test]
+async fn a_disabled_append_only_guard_refuses_the_conversion() {
+    // The most likely change an operator makes to the guard.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    conn.batch_execute("ALTER TABLE harvest_events DISABLE TRIGGER harvest_events_append_only_trg")
+        .await
+        .expect("disable the guard");
+    let refused = partition::enable_partitioning(&mut conn, &EnableOptions::default()).await;
+    conn.batch_execute("ALTER TABLE harvest_events ENABLE TRIGGER harvest_events_append_only_trg")
+        .await
+        .expect("re-enable the guard");
+
+    let err = refused.expect_err("a disabled guard must refuse the conversion");
+    assert!(
+        err.to_string().contains("Re-enable it"),
+        "the refusal must say how to restore harvest's own guard; got {err}"
+    );
+    reset_to_unpartitioned(&mut conn).await;
 }

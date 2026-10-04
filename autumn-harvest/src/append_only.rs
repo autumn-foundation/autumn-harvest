@@ -5,12 +5,18 @@
 //!
 //! - `event_data` can change only under a sanction. See [`EventRewrite`].
 //! - The `type` key inside `event_data` never changes.
-//! - `cohort` can change. It is storage placement, and replay does not read it.
-//! - No other column can change.
+//! - No other column can change, `cohort` included.
+//!
+//! `cohort` is guarded because retention relies on it. The sweeper's fast drop
+//! gate assumes that no row's cohort predates its execution. A row moved into
+//! an older cohort can be dropped while its run is still live.
 //!
 //! A sanction is a transaction-local setting. Set it in a transaction with
 //! [`sanction`], write, then clear it with [`revoke`]. A sanction set outside a
 //! transaction ends with its own statement, so the next `UPDATE` fails.
+//!
+//! The guard checks who rewrites `event_data`. It does not check what the
+//! writer changes under `data`. Each writer's own tests prove its scope.
 //!
 //! The guard stops mistakes. It is not a security boundary. Any role can set
 //! a custom setting, and a superuser can disable triggers.
@@ -111,37 +117,66 @@ async fn set(conn: &mut AsyncPgConnection, value: &str) -> HarvestResult<()> {
     Ok(())
 }
 
-/// Run `body` with the guard off on this connection. Test fixtures only.
+/// Run `body` in a transaction with the guard off. Test fixtures only.
 ///
 /// Not part of the semver-stable surface. It stays `pub` so the plugin
 /// crate's integration tests can call it.
 ///
 /// Some fixtures need a row the guard rejects: a backdated `timestamp`, or a
-/// tampered payload. This helper sets `session_replication_role = replica`,
-/// which turns off ordinary triggers for this session. Only a superuser can
-/// set it, so no production path can use this route.
+/// tampered payload. This helper runs `SET LOCAL session_replication_role =
+/// replica`, which turns off every ordinary trigger, foreign-key checks
+/// included. It needs a superuser, or a role with `SET` on that parameter.
+/// Production code must not call it.
 ///
-/// Call it outside a transaction. It restores the role after `body` returns.
+/// The setting ends with the transaction. A commit, a rollback and an error
+/// all end it. A panic leaves the transaction open, so a pool sees a broken
+/// connection and discards it.
+///
+/// # Errors
+///
+/// The first database error from the setting or from `body`. The transaction
+/// then rolls back.
 ///
 /// # Panics
 ///
-/// Panics if the role cannot be set or restored. A connection left in
-/// replica mode would skip every trigger, so a loud failure is safer.
+/// Panics when `conn` is already in a transaction.
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub async fn with_guard_off<R>(
     conn: &mut AsyncPgConnection,
-    body: impl AsyncFnOnce(&mut AsyncPgConnection) -> R,
-) -> R {
-    use diesel_async::SimpleAsyncConnection as _;
-    conn.batch_execute("SET session_replication_role = replica")
+    body: impl AsyncFnOnce(&mut AsyncPgConnection) -> diesel::QueryResult<R>,
+) -> diesel::QueryResult<R> {
+    use diesel_async::{AnsiTransactionManager, SimpleAsyncConnection as _, TransactionManager};
+    // Inside a transaction, BEGIN becomes a savepoint, and the setting would
+    // then last until the outer transaction ends.
+    assert!(
+        matches!(
+            AnsiTransactionManager::transaction_manager_status_mut(conn).transaction_depth(),
+            Ok(None)
+        ),
+        "call with_guard_off outside a transaction"
+    );
+    AnsiTransactionManager::begin_transaction(conn).await?;
+    let out = match conn
+        .batch_execute("SET LOCAL session_replication_role = replica")
         .await
-        .expect("turn the append-only guard off (needs a superuser)");
-    let out = body(conn).await;
-    conn.batch_execute("RESET session_replication_role")
-        .await
-        .expect("turn the append-only guard back on");
-    out
+    {
+        Ok(()) => body(conn).await,
+        Err(e) => Err(e),
+    };
+    match out {
+        Ok(value) => {
+            AnsiTransactionManager::commit_transaction(conn).await?;
+            Ok(value)
+        }
+        Err(e) => {
+            // The original error matters more than a failed rollback.
+            AnsiTransactionManager::rollback_transaction(conn)
+                .await
+                .ok();
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

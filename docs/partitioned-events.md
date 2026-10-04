@@ -235,9 +235,12 @@ layouts. `LIKE` copies no triggers, so each conversion reinstalls it. On the
 partitioned layout it sits on the parent, and Postgres clones it onto each
 partition. The legacy table drops its own copy before `ATTACH`, because
 `ATTACH` fails on a trigger name that the partition already has. The
-operator-trigger refusal exempts the guard by its exact shape. The guard lets
-`cohort` change, so a `cohort` update is not refused. See CLAUDE.md, Engine
-Invariants, for the rules.
+operator-trigger refusal exempts the guard by its exact shape.
+
+The guard also rejects a `cohort` change. The fast drop gate assumes that no
+row's cohort predates its execution, so a moved row could be dropped while its
+run is live. `disable` resets `cohort` before it reinstalls the guard. See
+CLAUDE.md, Engine Invariants, for the rules.
 
 ### Reads do not prune
 

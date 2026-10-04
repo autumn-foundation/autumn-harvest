@@ -6161,13 +6161,16 @@ async fn reset_event_field(
         .await
         .expect("load event row");
     event_data["data"][field] = encoded_value;
-    diesel::update(
-        harvest_events::table
-            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-            .filter(harvest_events::event_id.eq(event_id)),
-    )
-    .set(harvest_events::event_data.eq(event_data))
-    .execute(&mut *conn)
+    autumn_harvest::append_only::with_guard_off(&mut *conn, async |c| {
+        diesel::update(
+            harvest_events::table
+                .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+                .filter(harvest_events::event_id.eq(event_id)),
+        )
+        .set(harvest_events::event_data.eq(event_data))
+        .execute(c)
+        .await
+    })
     .await
     .expect("restore event field");
 }

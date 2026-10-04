@@ -297,13 +297,16 @@ async fn reset_workflow_started_input(
         .await
         .expect("load WorkflowStarted row");
     event_data["data"]["input"] = encoded_input;
-    diesel::update(
-        harvest_events::table
-            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-            .filter(harvest_events::event_id.eq(0)),
-    )
-    .set(harvest_events::event_data.eq(event_data))
-    .execute(conn)
+    autumn_harvest::append_only::with_guard_off(conn, async |c| {
+        diesel::update(
+            harvest_events::table
+                .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+                .filter(harvest_events::event_id.eq(0)),
+        )
+        .set(harvest_events::event_data.eq(event_data))
+        .execute(c)
+        .await
+    })
     .await
     .expect("restore WorkflowStarted input");
 }

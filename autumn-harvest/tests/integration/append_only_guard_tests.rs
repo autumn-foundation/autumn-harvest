@@ -4,7 +4,7 @@
 //! A `BEFORE UPDATE` trigger rejects history rewrites. Only `event_data`
 //! can change, and only when a sanctioned writer sets the
 //! `harvest.sanctioned_event_rewrite` setting in its transaction.
-//! The `cohort` column stays writable. Every other column is immutable.
+//! Every other column is immutable, `cohort` included.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres.
 //! Otherwise each test starts its own container.
@@ -83,8 +83,12 @@ async fn seed(conn: &mut AsyncPgConnection) -> uuid::Uuid {
     id
 }
 
-/// Run `stmt` against event 0 of `exec` and return the error text, if any.
-async fn try_update(conn: &mut AsyncPgConnection, exec: uuid::Uuid, set: &str) -> Option<String> {
+/// Run `set` against event 0 of `exec` and return the error, if any.
+async fn try_update(
+    conn: &mut AsyncPgConnection,
+    exec: uuid::Uuid,
+    set: &str,
+) -> Option<diesel::result::Error> {
     diesel::sql_query(format!(
         "UPDATE harvest_events SET {set} WHERE workflow_exec_id = $1 AND event_id = 0"
     ))
@@ -92,7 +96,6 @@ async fn try_update(conn: &mut AsyncPgConnection, exec: uuid::Uuid, set: &str) -
     .execute(conn)
     .await
     .err()
-    .map(|e| e.to_string())
 }
 
 /// Run `set` inside a transaction that first sets the sanction to `value`.
@@ -101,14 +104,25 @@ async fn try_sanctioned_update(
     exec: uuid::Uuid,
     value: &str,
     set: &str,
-) -> Option<String> {
+) -> Option<diesel::result::Error> {
+    let setup = format!("SELECT set_config('harvest.sanctioned_event_rewrite', '{value}', true);");
+    try_in_transaction(conn, exec, &setup, set).await
+}
+
+/// Run `setup`, then `set` against event 0 of `exec`, in one transaction.
+async fn try_in_transaction(
+    conn: &mut AsyncPgConnection,
+    exec: uuid::Uuid,
+    setup: &str,
+    set: &str,
+) -> Option<diesel::result::Error> {
     let sql = format!(
         "BEGIN;
-         SELECT set_config('harvest.sanctioned_event_rewrite', '{value}', true);
+         {setup}
          UPDATE harvest_events SET {set} WHERE workflow_exec_id = '{exec}' AND event_id = 0;
          COMMIT;"
     );
-    let out = conn.batch_execute(&sql).await.err().map(|e| e.to_string());
+    let out = conn.batch_execute(&sql).await.err();
     if out.is_some() {
         conn.batch_execute("ROLLBACK").await.ok();
     }
@@ -129,11 +143,24 @@ async fn event_data(conn: &mut AsyncPgConnection, exec: uuid::Uuid) -> String {
 
 const REWRITE: &str = "event_data = jsonb_set(event_data, '{data,details}', '\"rewritten\"')";
 
-fn assert_rejected(err: Option<String>, what: &str) {
-    let msg = err.unwrap_or_else(|| panic!("{what}: the guard must reject this UPDATE"));
+/// A second rewrite. It differs from [`REWRITE`], so it is never a no-op.
+const REWRITE_AGAIN: &str =
+    "event_data = jsonb_set(event_data, '{data,details}', '\"rewritten again\"')";
+
+/// Assert the guard rejected the UPDATE, with SQLSTATE `23001`.
+fn assert_rejected(err: Option<diesel::result::Error>, what: &str) {
+    use diesel::result::{DatabaseErrorKind, Error};
+    let err = err.unwrap_or_else(|| panic!("{what}: the guard must reject this UPDATE"));
     assert!(
-        msg.contains("append-only"),
-        "{what}: the refusal must come from the append-only guard; got {msg}"
+        matches!(
+            err,
+            Error::DatabaseError(DatabaseErrorKind::RestrictViolation, _)
+        ),
+        "{what}: the refusal must be a restrict_violation; got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("harvest_events is append-only:"),
+        "{what}: the refusal must come from the append-only guard; got {err}"
     );
 }
 
@@ -219,16 +246,55 @@ async fn identity_columns_stay_immutable_under_a_sanction() {
 }
 
 #[tokio::test]
-async fn the_cohort_column_stays_writable() {
-    // `disable_partitioning` resets `cohort` on the flat layout. The
-    // column is storage placement, not history, so it is sanctioned.
+async fn the_cohort_column_is_guarded() {
+    // The sweeper's fast drop gate assumes that no row's cohort predates its
+    // execution. A row moved into an older cohort can be dropped early.
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     let exec = seed(&mut conn).await;
-    let err = try_update(&mut conn, exec, "cohort = '-infinity'::timestamptz").await;
+    for set in [
+        "cohort = '2000-01-01'::timestamptz",
+        "cohort = 'infinity'::timestamptz",
+    ] {
+        assert_rejected(try_update(&mut conn, exec, set).await, set);
+        assert_rejected(
+            try_sanctioned_update(&mut conn, exec, "erase", set).await,
+            &format!("{set} under a sanction"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_no_op_update_passes() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let exec = seed(&mut conn).await;
+    let err = try_update(&mut conn, exec, "event_type = event_type").await;
     assert!(
         err.is_none(),
-        "a cohort update must pass the guard: {err:?}"
+        "an UPDATE that changes nothing must pass: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_fixture_helper_turns_the_guard_off_for_one_transaction() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let exec = seed(&mut conn).await;
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::sql_query(
+            "UPDATE harvest_events SET timestamp = timestamp - INTERVAL '1 day' \
+             WHERE workflow_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec)
+        .execute(c)
+        .await
+    })
+    .await
+    .expect("the fixture helper allows a backdate");
+    assert_rejected(
+        try_update(&mut conn, exec, "timestamp = timestamp - INTERVAL '1 day'").await,
+        "the guard after the helper's transaction ends",
     );
 }
 
@@ -247,5 +313,48 @@ async fn the_guard_trigger_is_installed() {
     assert_eq!(
         n, 1,
         "the migration must install the guard on harvest_events"
+    );
+}
+
+#[tokio::test]
+async fn a_sanction_ends_with_its_transaction() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let exec = seed(&mut conn).await;
+    let err = try_sanctioned_update(&mut conn, exec, "erase", REWRITE).await;
+    assert!(err.is_none(), "the sanctioned rewrite must pass: {err:?}");
+    assert_rejected(
+        try_update(&mut conn, exec, REWRITE_AGAIN).await,
+        "a plain UPDATE after the sanctioned transaction commits",
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_sanction_no_longer_applies() {
+    // `append_only::revoke` sets the value to the empty string.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let exec = seed(&mut conn).await;
+    let setup = "SELECT set_config('harvest.sanctioned_event_rewrite', 'erase', true);
+                 SELECT set_config('harvest.sanctioned_event_rewrite', '', true);";
+    assert_rejected(
+        try_in_transaction(&mut conn, exec, setup, REWRITE).await,
+        "an UPDATE after the sanction is revoked",
+    );
+}
+
+#[tokio::test]
+async fn a_sanction_outlives_a_released_savepoint() {
+    // This is why each writer revokes its sanction after the write.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let exec = seed(&mut conn).await;
+    let setup = "SAVEPOINT s;
+                 SELECT set_config('harvest.sanctioned_event_rewrite', 'erase', true);
+                 RELEASE SAVEPOINT s;";
+    let err = try_in_transaction(&mut conn, exec, setup, REWRITE).await;
+    assert!(
+        err.is_none(),
+        "a released savepoint keeps the sanction until the outer transaction ends: {err:?}"
     );
 }

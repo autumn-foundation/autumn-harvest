@@ -1410,7 +1410,7 @@ jobs:
       # assertions, `HARVEST_TEST_PARTITIONED=1` -- so "per-execution event
       # semantics are byte-identical between layouts" is asserted by the
       # existing tests rather than by a separate set that could drift from
-      # them. Only 9 rows (~6 minutes unsharded) -- not worth splitting, so it
+      # them. Only 10 rows (~6 minutes unsharded) -- not worth splitting, so it
       # runs whole, once, on shard 0 only.
       - name: Integration suites (partitioned harvest_events layout)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
