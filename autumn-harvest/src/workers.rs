@@ -778,8 +778,11 @@ pub struct LiveWorkerTaskStats {
     pub cohort: String,
     /// The published snapshot.
     pub stats: WorkerTaskStats,
-    /// When the worker published the snapshot, on the database clock.
-    pub updated_at: DateTime<Utc>,
+    /// The worker's own snapshot sequence, from [`next_snapshot_seq`].
+    ///
+    /// Only the worker writes it. So two rows of one worker on two shards
+    /// compare correctly, even when the shard database clocks differ.
+    pub snapshot_seq: i64,
 }
 
 impl LiveWorkerTaskStats {
@@ -787,9 +790,26 @@ impl LiveWorkerTaskStats {
     /// one wins. A window shrinks as old samples expire, so the newer snapshot
     /// can hold fewer tasks and still be the correct one.
     #[must_use]
-    pub fn is_fresher_than(&self, kept: &Self) -> bool {
-        self.updated_at > kept.updated_at
+    pub const fn is_fresher_than(&self, kept: &Self) -> bool {
+        self.snapshot_seq > kept.snapshot_seq
     }
+}
+
+/// The next task-stats snapshot sequence of this process (issue #1815).
+///
+/// The sequence starts at the host clock in microseconds and then counts up
+/// by one. So it rises within a process, even if the host clock steps back. A
+/// restarted worker on the same host starts above its last value. Only one
+/// worker's rows are compared with each other, so hosts need not agree.
+pub fn next_snapshot_seq() -> i64 {
+    static SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
+        std::sync::LazyLock::new(|| {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_micros());
+            std::sync::atomic::AtomicI64::new(i64::try_from(micros).unwrap_or(0))
+        });
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The cohort key for a worker's `queues` JSON: the sorted, deduplicated
@@ -820,12 +840,14 @@ pub async fn upsert_worker_task_stats(
     let to_i32 = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
     diesel::sql_query(
         "INSERT INTO harvest_worker_task_stats \
-             (worker_id, window_tasks, window_failures, p99_latency_ms, updated_at) \
-         VALUES ($1, $2, $3, $4, NOW()) \
+             (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, \
+              updated_at) \
+         VALUES ($1, $2, $3, $4, $5, NOW()) \
          ON CONFLICT (worker_id) DO UPDATE SET \
              window_tasks = EXCLUDED.window_tasks, \
              window_failures = EXCLUDED.window_failures, \
              p99_latency_ms = EXCLUDED.p99_latency_ms, \
+             snapshot_seq = EXCLUDED.snapshot_seq, \
              updated_at = EXCLUDED.updated_at",
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
@@ -836,6 +858,7 @@ pub async fn upsert_worker_task_stats(
             .p99_latency_ms
             .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
     )
+    .bind::<diesel::sql_types::BigInt, _>(next_snapshot_seq())
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -872,8 +895,8 @@ struct TaskStatsRow {
     window_failures: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     p99_latency_ms: Option<i64>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    snapshot_seq: i64,
 }
 
 /// The task stats of every `Active` worker with a fresh heartbeat and fresh
@@ -893,7 +916,7 @@ pub async fn load_live_worker_task_stats(
     let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
     let rows: Vec<TaskStatsRow> = diesel::sql_query(
         "SELECT s.worker_id, w.queues, s.window_tasks, s.window_failures, s.p99_latency_ms, \
-                s.updated_at \
+                s.snapshot_seq \
          FROM harvest_worker_task_stats s \
          JOIN harvest_workers w ON w.worker_id = s.worker_id \
          WHERE w.status = $1 \
@@ -916,7 +939,7 @@ pub async fn load_live_worker_task_stats(
                 failures: u32::try_from(r.window_failures).unwrap_or(0),
                 p99_latency_ms: r.p99_latency_ms.and_then(|ms| u64::try_from(ms).ok()),
             },
-            updated_at: r.updated_at,
+            snapshot_seq: r.snapshot_seq,
         })
         .collect())
 }
@@ -2384,12 +2407,28 @@ mod tests {
                 failures: 0,
                 p99_latency_ms: Some(1),
             },
-            updated_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs),
+            // A newer row has a higher sequence, as `next_snapshot_seq` gives.
+            snapshot_seq: 1_000_000 - age_secs,
         }
     }
 
     fn live(worker_id: &str, tasks: u32) -> super::LiveWorkerTaskStats {
         live_aged(worker_id, tasks, 0)
+    }
+
+    /// Issue #1815: shard clocks can differ, so the worker's own sequence
+    /// decides which of its snapshots is newer.
+    #[test]
+    fn the_worker_sequence_orders_snapshots_across_skewed_shards() {
+        let first = super::next_snapshot_seq();
+        let second = super::next_snapshot_seq();
+        assert!(second > first, "the sequence rises");
+        let mut older = live("w", 90);
+        older.snapshot_seq = first;
+        let mut newer = live("w", 10);
+        newer.snapshot_seq = second;
+        assert!(newer.is_fresher_than(&older));
+        assert!(!older.is_fresher_than(&newer));
     }
 
     /// Issue #1815: the comparing heartbeat sees peers from every shard, once

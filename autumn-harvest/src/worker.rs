@@ -25911,33 +25911,64 @@ fn spawn_worker_slot_sampler(
 /// Each tick reads `Pool::status()` for every `(shard, pool)` pair. That read
 /// takes no connection and runs no query. A pool that two colocated shards
 /// share reports under both shard labels.
+///
+/// Dropping the returned guard aborts the task. The task leaves the gauge
+/// registry on every exit, an abort or a panic included.
 fn spawn_db_pool_sampler(
     pools: Vec<(u16, DbPool)>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let metrics = &telemetry.metrics;
-        for (shard, pool) in &pools {
-            pool_gauge_update(metrics, *shard, pool_identity(pool), PoolGaugeChange::Join);
-        }
+) -> AbortOnDrop {
+    AbortOnDrop::new(tokio::spawn(async move {
+        let sampled = SampledPoolsGuard::join(Arc::clone(&telemetry.metrics), pools);
         loop {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            for (shard, pool) in &pools {
-                let (in_use, idle) = pool_occupancy(&pool.status());
-                let change = PoolGaugeChange::Sample { in_use, idle };
-                pool_gauge_update(metrics, *shard, pool_identity(pool), change);
-            }
+            sampled.sample();
         }
+    }))
+}
+
+/// The pools one sampler reads, joined to the gauge registry (issue #1815).
+///
+/// The drop leaves the registry. So a sampler that is aborted, or that
+/// panics, cannot leave its last values in the shard's sum.
+struct SampledPoolsGuard {
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+    pools: Vec<(u16, DbPool)>,
+}
+
+impl SampledPoolsGuard {
+    fn join(
+        metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+        pools: Vec<(u16, DbPool)>,
+    ) -> Self {
         for (shard, pool) in &pools {
-            pool_gauge_update(metrics, *shard, pool_identity(pool), PoolGaugeChange::Leave);
+            pool_gauge_update(&metrics, *shard, pool_identity(pool), PoolGaugeChange::Join);
         }
-    })
+        Self { metrics, pools }
+    }
+
+    fn sample(&self) {
+        for (shard, pool) in &self.pools {
+            let (in_use, idle) = pool_occupancy(&pool.status());
+            let change = PoolGaugeChange::Sample { in_use, idle };
+            pool_gauge_update(&self.metrics, *shard, pool_identity(pool), change);
+        }
+    }
+}
+
+impl Drop for SampledPoolsGuard {
+    fn drop(&mut self) {
+        for (shard, pool) in &self.pools {
+            let change = PoolGaugeChange::Leave;
+            pool_gauge_update(&self.metrics, *shard, pool_identity(pool), change);
+        }
+    }
 }
 
 /// A stable identity for one pool across all its clones (issue #1815): the
@@ -26823,7 +26854,8 @@ struct WorkerMonitoringHandles {
     workflow_active_sampler: tokio::task::JoinHandle<()>,
     worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
     /// DB-pool gauge sampler (issue #1815). Started only with metrics on.
-    db_pool_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Dropping the handles aborts it, so an owner abort cannot detach it.
+    db_pool_sampler: Option<AbortOnDrop>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Cross-region DR sampler (issue #954): replication watermark beat,
     /// measured-RPO gauges, and this worker's periodic self-fence check.
@@ -29332,7 +29364,7 @@ impl Worker {
             tracing::warn!(error = %error, "worker slot sampler failed during shutdown");
         }
         if let Some(handle) = monitors.db_pool_sampler
-            && let Err(error) = handle.await
+            && let Err(error) = handle.join().await
         {
             tracing::warn!(error = %error, "db pool sampler failed during shutdown");
         }
@@ -31439,7 +31471,7 @@ impl Worker {
             );
         }
         if let Some(handle) = monitors.db_pool_sampler
-            && let Err(error) = handle.await
+            && let Err(error) = handle.join().await
         {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
@@ -40155,6 +40187,45 @@ mod tests {
                 (7, 0, 0)
             ]
         );
+    }
+
+    /// Issue #1815: dropping a running pool sampler, as an owner abort does,
+    /// stops it and removes its pools from the gauge registry.
+    #[tokio::test]
+    async fn a_dropped_pool_sampler_leaves_the_gauge_registry() {
+        let metrics: Arc<dyn crate::telemetry::MetricsRecorder> =
+            Arc::new(crate::telemetry::NoOpMetrics);
+        let telemetry = Arc::new(
+            crate::telemetry::TelemetryConfig::builder()
+                .metrics(Arc::clone(&metrics))
+                .build(),
+        );
+        let key = (crate::telemetry::recorder_key(&metrics), 4242u16);
+        let registered = || {
+            POOL_GAUGES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&key)
+        };
+        let sampler = spawn_db_pool_sampler(
+            vec![(key.1, unreachable_pool("postgres://127.0.0.1:1/none"))],
+            CancellationToken::new(),
+            telemetry,
+            Duration::from_millis(5),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !registered() {
+            assert!(std::time::Instant::now() < deadline, "the sampler joins");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(sampler);
+        while registered() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a dropped sampler leaves the registry"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Issue #1815: the pool gauges split open connections into lent and idle.

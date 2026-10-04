@@ -39,6 +39,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   shards. They all see the same peer set, so the gauge does not flap. A
   healthy shard keeps the verdict live when another shard fails.
 - A stopped or aborted heartbeat retires the worker's verdict.
+- Each stats row carries a `snapshot_seq` that the worker writes. When two
+  shards hold a row for one worker, the higher sequence wins. Shard clocks
+  can differ, so `updated_at` is not used to order them.
 - Two workers in one process share the gauge, so it reports the OR of their
   verdicts.
 - The peers are the live `Active` workers that poll the same queues, with

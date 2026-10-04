@@ -1115,7 +1115,8 @@ mod tests {
             worker_id: worker_id.to_string(),
             cohort: cohort.to_string(),
             stats,
-            updated_at: Utc::now() - chrono::Duration::seconds(age_secs),
+            // A newer row has a higher sequence, as `next_snapshot_seq` gives.
+            snapshot_seq: 1_000_000 - age_secs,
         }
     }
 

@@ -7093,8 +7093,8 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "histogram_quantile(0.99, sum by (le, shard) (rate(harvest_db_pool_wait_duration_bucket{shard=~\"$shard\"}[$__rate_interval])))",
-              "legendFormat": "p99 shard {{shard}}",
+              "expr": "histogram_quantile(0.99, sum by (le, instance, shard) (rate(harvest_db_pool_wait_duration_bucket{shard=~\"$shard\"}[$__rate_interval])))",
+              "legendFormat": "p99 shard {{shard}} @ {{instance}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -7102,15 +7102,15 @@
             },
             {
               "refId": "B",
-              "expr": "sum by (shard) (rate(harvest_db_pool_wait_duration_sum{shard=~\"$shard\"}[$__rate_interval])) / sum by (shard) (rate(harvest_db_pool_wait_duration_count{shard=~\"$shard\"}[$__rate_interval]))",
-              "legendFormat": "avg shard {{shard}} (bucket-less fallback)",
+              "expr": "sum by (instance, shard) (rate(harvest_db_pool_wait_duration_sum{shard=~\"$shard\"}[$__rate_interval])) / sum by (instance, shard) (rate(harvest_db_pool_wait_duration_count{shard=~\"$shard\"}[$__rate_interval]))",
+              "legendFormat": "avg shard {{shard}} @ {{instance}} (bucket-less fallback)",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
             }
           ],
-          "description": "Seconds a caller waits for a pooled connection on the claim path, the timeout scanner and the activity heartbeat flush (issue #1815). Alert: harvest_db_pool_wait_high (docs/runbooks/harvest-alerts.md#harvest_db_pool_wait_high). p99 needs set_buckets_for_metric; the avg fallback works on any install."
+          "description": "Seconds a caller waits for a pooled connection on the claim path, the timeout scanner and the activity heartbeat flush (issue #1815). Alert: harvest_db_pool_wait_high (docs/runbooks/harvest-alerts.md#harvest_db_pool_wait_high). p99 needs set_buckets_for_metric; the avg fallback works on any install. Charted per replica, as the alert is, so one starved replica cannot hide behind healthy ones."
         },
         {
           "id": 716897,
@@ -7151,8 +7151,8 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "histogram_quantile(0.99, sum by (le, op) (rate(harvest_db_query_duration_bucket[$__rate_interval])))",
-              "legendFormat": "p99 {{op}}",
+              "expr": "histogram_quantile(0.99, sum by (le, instance, op) (rate(harvest_db_query_duration_bucket[$__rate_interval])))",
+              "legendFormat": "p99 {{op}} @ {{instance}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -7160,15 +7160,15 @@
             },
             {
               "refId": "B",
-              "expr": "sum by (op) (rate(harvest_db_query_duration_sum[$__rate_interval])) / sum by (op) (rate(harvest_db_query_duration_count[$__rate_interval]))",
-              "legendFormat": "avg {{op}} (bucket-less fallback)",
+              "expr": "sum by (instance, op) (rate(harvest_db_query_duration_sum[$__rate_interval])) / sum by (instance, op) (rate(harvest_db_query_duration_count[$__rate_interval]))",
+              "legendFormat": "avg {{op}} @ {{instance}} (bucket-less fallback)",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
             }
           ],
-          "description": "Seconds one database operation takes, by op: claim, persist, scan, heartbeat (issue #1815). Each op is one unit of work, not one SQL statement. Alert: harvest_db_query_latency_high (docs/runbooks/harvest-alerts.md#harvest_db_query_latency_high). Not the same as harvest_query_duration, which times workflow query handlers."
+          "description": "Seconds one database operation takes, by op: claim, persist, scan, heartbeat (issue #1815). Each op is one unit of work, not one SQL statement. Alert: harvest_db_query_latency_high (docs/runbooks/harvest-alerts.md#harvest_db_query_latency_high). Not the same as harvest_query_duration, which times workflow query handlers. Charted per replica, as the alert is."
         },
         {
           "id": 270529,
