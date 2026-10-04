@@ -33812,6 +33812,13 @@ impl Worker {
     /// refresh gives such claims back through [`release_abandoned_claims`].
     /// Each keeper stops when the last dispatch body ends. It also stops when
     /// the process exits, and orphan reclaim then recovers the task.
+    ///
+    /// The lease therefore lasts only while a claim of this instance is
+    /// current. A body whose claim is lost, for example to `start_to_close`,
+    /// drops its handler after the grace period, see
+    /// [`observe_task_cancellation`]. Two live instances with the same worker
+    /// id share one lease row, so each hides the other while both run. That
+    /// is true of the normal heartbeat too.
     fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
         if self.dispatched.tracker.is_empty() {
             return;

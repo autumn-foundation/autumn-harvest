@@ -59,7 +59,11 @@ epoch never matches a later claim.
 **Invariants.** No migration. No new `WorkflowEvent` variant. No write to
 `harvest_events`.
 
-**Scope.** Running workflow tasks are not cancelled. `workflow_task_timeout`
+**Scope.** The kept lease lasts only while a claim of the drained worker is
+current. A handler whose claim is lost is dropped after the grace period, as
+before. Two live workers with the same id share one lease row, so each hides
+the other while both run, as with the normal heartbeat. Running workflow
+tasks are not cancelled. `workflow_task_timeout`
 bounds them, and #1184 fences their writes. A drained attempt still counts as
 a failed attempt in `harvest.activity.attempts` and `harvest.activity.failed`.
 Its release counts as one retry in `harvest.activity.retries`.

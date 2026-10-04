@@ -98,6 +98,22 @@ async fn drain_stubborn(
     Ok(serde_json::json!("done"))
 }
 
+static LOST_STARTS: AtomicU32 = AtomicU32::new(0);
+static LOST_GO: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Ignores cancellation, as `drain_stubborn` does, for a claim that the
+/// test then takes away.
+#[activity(start_to_close = "600s")]
+async fn drain_lost(
+    _ctx: &ActivityContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let _ = input;
+    LOST_STARTS.fetch_add(1, Ordering::SeqCst);
+    LOST_GO.notified().await;
+    Ok(serde_json::json!("done"))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
@@ -124,7 +140,7 @@ fn registry() -> Arc<HandlerRegistry> {
     });
     Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![drain_wf_info()],
-        activities![drain_cooperative, drain_stubborn],
+        activities![drain_cooperative, drain_stubborn, drain_lost],
         autumn_harvest::context::empty_shared_state(),
         telemetry,
     ))
@@ -493,6 +509,51 @@ async fn release_abandoned_claim_requeues_the_claim_and_is_fenced() {
     assert!(row.worker_id.is_none());
     assert!(row.started_at.is_none());
     assert_eq!(row.attempt, task.attempt, "the attempt counts");
+}
+
+/// The drained worker keeps its lease only while one of its claims is still
+/// current. Once a timeout scanner takes the claim of a handler that ignores
+/// the cancel, the keeper stops. The lease then lapses as usual, so it does
+/// not hide the claims of a replacement worker with the same id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_stops_keeping_the_lease_once_the_claim_is_lost() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("lost");
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, &queue, "drain_lost").await;
+    let pool = build_test_pool(&url);
+
+    let worker_a = format!("{queue}-a");
+    let a = Running::start_with_heartbeat(&worker_a, &queue, &pool, Duration::from_secs(1));
+    wait_for_start(&url, exec_id, &worker_a, &LOST_STARTS).await;
+    a.stop().await;
+
+    // A timeout scanner fails the attempt while its handler still runs.
+    diesel::update(
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(harvest_task_queue::task_type.eq("activity")),
+    )
+    .set(harvest_task_queue::state.eq("FAILED"))
+    .execute(&mut conn)
+    .await
+    .expect("fail the attempt");
+
+    // Give the keeper a few refresh periods (0.5 s) to see the lost claim.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let beat = async |conn: &mut AsyncPgConnection| {
+        harvest_workers::table
+            .find(&worker_a)
+            .select(harvest_workers::last_heartbeat_at)
+            .first::<chrono::DateTime<Utc>>(conn)
+            .await
+            .expect("load the worker row")
+    };
+    let before = beat(&mut conn).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = beat(&mut conn).await;
+    LOST_GO.notify_one();
+    assert_eq!(before, after, "the keeper stops once no claim is current");
 }
 
 /// A running activity that honours the cancel is joined and released. A peer
