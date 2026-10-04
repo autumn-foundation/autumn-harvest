@@ -991,6 +991,49 @@ async fn an_abort_marker_for_another_ramp_id_does_not_clear_a_ramp() {
     );
 }
 
+/// A pool can hold the marker of an old ramp and a newer operator ramp with
+/// the same builds. The guard finishes the old ramp on the other pool. It
+/// keeps the newer ramp, because its `ramp_id` matches no marker.
+#[tokio::test]
+async fn a_marker_beside_a_newer_ramp_finishes_only_the_marked_ramp() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+
+    // The old guard cleared pool 1 only. Pool 1 now holds the marker.
+    let step_1 = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+    );
+    // A new operator ramp with the same builds reaches pool 1 only.
+    let new_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, new_id).await;
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the marked old ramp on pool 2 is cleared"
+    );
+    assert!(
+        ramp_is_active(&mut conn_1).await,
+        "the newer ramp on pool 1 stays"
+    );
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no audit row");
+}
+
 /// A split ramp with no abort marker is not cleared.
 #[tokio::test]
 async fn a_split_ramp_without_an_abort_marker_stays() {

@@ -181,6 +181,10 @@ The guard fails safe: when it cannot read, it does not abort.
   matter. An operator ramp set after the abort has a new `ramp_id`, so the
   guard does not clear it. A ramp set before the migration has no id, and the
   guard cannot finish its partial abort after a restart.
+- A pool can hold an abort marker and a newer operator ramp at the same time.
+  The guard reads the marker anyway. It clears only the pools whose `ramp_id`
+  matches a marker. The newer ramp stays, and the next pass judges it on its
+  own counts.
 - After a cancel, a pass lets the clear in flight finish and starts no new
   clear. Shutdown therefore waits for one bounded clear at most, plus the
   audit write of a clear that the pass made.

@@ -464,11 +464,10 @@ struct ObservedRamp {
     /// The pool index and the step of each pool that holds the ramp, in
     /// pool order.
     steps: Vec<(usize, chrono::DateTime<chrono::Utc>)>,
-    /// The identities of the ramp on its pools.
-    ramp_ids: Vec<uuid::Uuid>,
-    /// `true` when another pool holds a guard abort marker for one of
-    /// `ramp_ids`. That is the trace of a partial clear.
-    abort_marked: bool,
+    /// The steps whose `ramp_id` matches a guard abort marker. They are the
+    /// trace of a partial clear. A step with another `ramp_id` is not in this
+    /// list, even when the builds are the same.
+    marked_steps: Vec<(usize, chrono::DateTime<chrono::Utc>)>,
 }
 
 /// A guard abort marker on one pool: the queue and the `ramp_id` it cleared.
@@ -584,14 +583,14 @@ async fn read_pool_ramps(
             let mut ramps = Vec::new();
             let mut markers = Vec::new();
             for policy in policies {
+                // A marker stays valid when a newer ramp is active on the
+                // same row, so read it first.
+                if let Some(aborted) = policy.ramp_aborted_id {
+                    markers.push((policy.queue_name.clone(), aborted));
+                }
                 let (Some(target), Some(percent)) =
                     (policy.target_build_id.clone(), policy.ramp_percent)
                 else {
-                    if policy.target_build_id.is_none()
-                        && let Some(aborted) = policy.ramp_aborted_id
-                    {
-                        markers.push((policy.queue_name.clone(), aborted));
-                    }
                     continue;
                 };
                 if percent <= 0 || target == policy.build_id {
@@ -617,10 +616,10 @@ async fn read_pool_ramps(
 /// The pools are read at the same time. Returns `None` when any read fails,
 /// so a pass never decides on part of the fleet.
 ///
-/// A ramp is `abort_marked` when another pool holds a guard abort marker for
-/// one of its `ramp_id`s on the same queue. The match is by id, so clock skew
-/// between pools does not matter. An operator ramp set after the abort has a
-/// new id, so it is not marked.
+/// A pool step is marked when a guard abort marker on the same queue holds
+/// its `ramp_id`. The match is by id, so clock skew between pools does not
+/// matter. An operator ramp set after the abort has a new id, so it is not
+/// marked.
 #[cfg(feature = "db")]
 async fn read_ramps(
     pools: &[crate::worker::DbPool],
@@ -630,6 +629,7 @@ async fn read_ramps(
     let mut merged: std::collections::BTreeMap<RampKey, ObservedRamp> =
         std::collections::BTreeMap::new();
     let mut markers: std::collections::BTreeSet<AbortMarker> = std::collections::BTreeSet::new();
+    let mut identified = Vec::new();
     for (index, result) in futures::future::join_all(reads)
         .await
         .into_iter()
@@ -643,20 +643,23 @@ async fn read_ramps(
             }
         };
         for ramp in ramps {
-            let slot = merged.entry(ramp.key).or_default();
+            let slot = merged.entry(ramp.key.clone()).or_default();
             slot.ramp_percent = slot.ramp_percent.max(ramp.ramp_percent);
             slot.base = slot.base.plus(ramp.base);
             slot.target = slot.target.plus(ramp.target);
             slot.steps.push((index, ramp.step));
-            slot.ramp_ids.extend(ramp.ramp_id);
+            if let Some(ramp_id) = ramp.ramp_id {
+                identified.push((ramp.key, index, ramp.step, ramp_id));
+            }
         }
         markers.extend(pool_markers);
     }
-    for ((queue, _, _), ramp) in &mut merged {
-        ramp.abort_marked = ramp
-            .ramp_ids
-            .iter()
-            .any(|id| markers.contains(&(queue.clone(), *id)));
+    for (key, index, step, ramp_id) in identified {
+        if markers.contains(&(key.0.clone(), ramp_id))
+            && let Some(ramp) = merged.get_mut(&key)
+        {
+            ramp.marked_steps.push((index, step));
+        }
     }
     Some(merged)
 }
@@ -953,8 +956,11 @@ impl RampGuard {
             if self.pending.contains_key(&key) {
                 continue;
             }
-            if ramp.abort_marked {
-                self.finish_marked_abort(pools, &key, &ramp, bound, cancel)
+            if !ramp.marked_steps.is_empty() {
+                // The merged counts mix the marked ramp with any newer ramp
+                // of the same builds. So the pass gives no verdict now. The
+                // next pass judges the newer ramp on its own counts.
+                self.finish_marked_abort(pools, &key, &ramp.marked_steps, bound, cancel)
                     .await;
                 continue;
             }
@@ -1057,16 +1063,19 @@ impl RampGuard {
     /// its abort marker in the same UPDATE, so the marker is durable. The
     /// guard clears the other pools too. It writes no new audit row, because
     /// the guard that cleared the first pool reported the abort.
+    ///
+    /// `steps` holds only the marked steps. A newer ramp with the same builds
+    /// on another pool is not in it, so this call does not clear that ramp.
     async fn finish_marked_abort(
         &mut self,
         pools: &[crate::worker::DbPool],
         key: &RampKey,
-        ramp: &ObservedRamp,
+        steps: &[(usize, chrono::DateTime<chrono::Utc>)],
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) {
         let mut failed: Vec<PendingStep> = Vec::new();
-        for &(index, step) in &ramp.steps {
+        for &(index, step) in steps {
             if cancel.is_cancelled() {
                 failed.push((index, step, false));
                 continue;
