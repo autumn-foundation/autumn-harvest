@@ -157,6 +157,10 @@ enum ClaimState {
     /// timeout. When the last one rolls back, another process enforced it,
     /// and it counts here then.
     LostPending(u32),
+    /// The worker ended the claim with no result while enforcers here were
+    /// still deciding, this many of them. The entry keeps the dispatch
+    /// token, so a confirm still counts through the generation fence.
+    Ended(u32),
 }
 
 /// Outcome of consulting the breaker before dispatching an activity attempt.
@@ -585,18 +589,29 @@ impl CircuitBreakerRegistry {
     /// Remove `claim` from the in-flight set without a result (issue #1809).
     /// A claim that already reported is not there, so this is then a no-op.
     /// A held result stays, because the enforcer still settles it.
+    ///
+    /// While an enforcer here still decides, the entry stays as
+    /// [`ClaimState::Ended`]. Its token then still fences a confirm by
+    /// generation. The last rollback removes it.
     pub fn end_claim(&self, activity_name: &str, claim: ClaimKey) {
         if !self.policies.contains_key(activity_name) {
             return;
         }
         let mut states = self.lock();
-        if let Some(st) = states.get_mut(activity_name)
-            && !matches!(
-                st.in_flight_claims.get(&claim).map(|entry| entry.state),
-                Some(ClaimState::Held(..) | ClaimState::LostPending(_))
-            )
-        {
-            st.in_flight_claims.remove(&claim);
+        let Some(st) = states.get_mut(activity_name) else {
+            return;
+        };
+        match st.in_flight_claims.get(&claim).map(|entry| entry.state) {
+            Some(ClaimState::Held(..) | ClaimState::LostPending(_) | ClaimState::Ended(_))
+            | None => {}
+            Some(ClaimState::Provisional(deciding)) => {
+                if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                    entry.state = ClaimState::Ended(deciding);
+                }
+            }
+            Some(ClaimState::Running | ClaimState::TimedOut) => {
+                st.in_flight_claims.remove(&claim);
+            }
         }
     }
 
@@ -634,6 +649,7 @@ impl CircuitBreakerRegistry {
             ClaimState::LostPending(deciding) => {
                 ClaimState::LostPending(deciding.saturating_add(1))
             }
+            ClaimState::Ended(deciding) => ClaimState::Ended(deciding.saturating_add(1)),
         };
     }
 
@@ -669,7 +685,10 @@ impl CircuitBreakerRegistry {
                     st.in_flight_claims.remove(&claim);
                     None
                 }
-                (ClaimState::Held(..) | ClaimState::LostPending(_), token) => {
+                (
+                    ClaimState::Held(..) | ClaimState::LostPending(_) | ClaimState::Ended(_),
+                    token,
+                ) => {
                     st.in_flight_claims.remove(&claim);
                     token
                 }
@@ -734,6 +753,15 @@ impl CircuitBreakerRegistry {
                 let token = entry.token;
                 st.in_flight_claims.remove(&claim);
                 token.and_then(|token| count_remote_timeout(st, policy, token, now))
+            }
+            ClaimState::Ended(deciding) if deciding > 1 => {
+                entry.state = ClaimState::Ended(deciding - 1);
+                None
+            }
+            ClaimState::Ended(_) => {
+                // The worker reported nothing, and no timeout counts.
+                st.in_flight_claims.remove(&claim);
+                None
             }
             ClaimState::Running | ClaimState::TimedOut => None,
         }
@@ -1388,6 +1416,43 @@ mod tests {
         assert_eq!(rolling(&reg, t0), 1);
     }
 
+    /// A worker can end its claim with no result while an enforcer decides.
+    /// The entry keeps the token, so the generation fence still holds
+    /// (issue #1809).
+    #[test]
+    fn an_ended_claim_keeps_its_fence_until_the_enforcer_decides() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let stale = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), stale);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        reg.end_claim("send_email", claim(1));
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        reg.force_close("send_email");
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0, "the reset fences the ended claim");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // A current claim still counts, and a rollback leaves nothing.
+        let fresh = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(2), fresh);
+        reg.mark_claim_timed_out("send_email", claim(2));
+        reg.end_claim("send_email", claim(2));
+        let _ = reg.confirm_claim_timed_out("send_email", claim(2), true, t0);
+        assert_eq!(rolling(&reg, t0), 1);
+        reg.begin_claim("send_email", claim(3), fresh);
+        reg.mark_claim_timed_out("send_email", claim(3));
+        reg.end_claim("send_email", claim(3));
+        assert_eq!(reg.unmark_claim_timed_out("send_email", claim(3), t0), None);
+        assert_eq!(rolling(&reg, t0), 1);
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+    }
+
     /// A mark on a claim that no worker here registered leaves nothing behind
     /// once its enforcer decides (issue #1809).
     #[test]
@@ -1407,9 +1472,12 @@ mod tests {
         assert_eq!(rolling(&reg, t0), 1);
         assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
 
+        // An ended claim waits for its enforcer, then leaves nothing.
         reg.begin_claim("send_email", claim(1), TOKEN);
         reg.mark_claim_timed_out("send_email", claim(1));
         reg.end_claim("send_email", claim(1));
+        assert!(!reg.lock()["send_email"].in_flight_claims.is_empty());
+        assert_eq!(reg.unmark_claim_timed_out("send_email", claim(1), t0), None);
         let states = reg.lock();
         assert!(states["send_email"].in_flight_claims.is_empty());
     }
