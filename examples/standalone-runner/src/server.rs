@@ -141,9 +141,13 @@ pub async fn run() -> Result<(), BoxError> {
     tracing::info!(%address, "standalone Harvest runner listening");
     let signalled = Arc::new(tokio::sync::Notify::new());
     let notify = Arc::clone(&signalled);
+    let drain_state = harvest.api_state().clone();
     let serve = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+            // Mark the drain before the listener closes. A probe in flight
+            // then sees 503. The pod `preStop` sleep covers new traffic.
+            drain_state.begin_draining();
             notify.notify_one();
         })
         .into_future();
