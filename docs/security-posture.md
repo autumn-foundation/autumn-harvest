@@ -756,6 +756,16 @@ fleet, do the rollout in two steps:
    checks that every live worker can read the key, records it, and then
    switches new writes to it.
 
+Activation encrypts new writes only. Payloads that an existing deployment
+already stored stay in clear. The rotation sweep re-keys ciphertext only, so
+it never encrypts them, and its census does not count them. A sweep can
+therefore report completion while old plaintext remains. To remove old
+plaintext, let retention delete it, or erase it with
+`POST /workflows/{id}/erase-payloads` (terminal executions only). Harvest has
+no plaintext-to-ciphertext migration. That migration would be a third
+in-place mutation of `harvest_events`, and the engine invariants in
+`CLAUDE.md` allow two.
+
 ```rust,ignore
 use autumn_harvest::payload_codec::{CODEC_LEGACY_KEY_ID, IdentityCodec};
 
@@ -779,7 +789,7 @@ key well before the limit, and at once after a key leak.
 
 To rotate, load a codec for the new key id and register it. Activate it with
 `codec_rotation::activate_codec_key`. The issue #948 sweep then re-encrypts
-stored history under the new key.
+stored ciphertext under the new key. It does not touch stored plaintext.
 
 The sweep does not re-encrypt offloaded blobs (issue #524). Retirement
 removes the old codec from the registry, so the read path can no longer
