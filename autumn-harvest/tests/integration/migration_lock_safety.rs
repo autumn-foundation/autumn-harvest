@@ -1742,8 +1742,9 @@ fn call_target<'a>(s: &Stmts<'a>, k: usize, known: &BTreeSet<&str>) -> Option<&'
 /// The token range in which each new table is exempt.
 ///
 /// The range starts at the `CREATE TABLE`. It ends at the first later
-/// `DROP TABLE`, `ALTER TABLE ... RENAME TO` or `SET SCHEMA` of that name, or
-/// at any later `ROLLBACK`, which may undo the create. A `search_path` change
+/// `DROP TABLE`, `ALTER TABLE ... RENAME TO` or `SET SCHEMA` of that name,
+/// with or without a schema. It also ends at any later `DROP SCHEMA`, or at
+/// any later `ROLLBACK`, which may undo the create. A `search_path` change
 /// ends the range of an unqualified name. So does a `COMMIT` after such a
 /// change, because it restores a local value. After that the name can mean
 /// the hot table again.
@@ -1756,7 +1757,10 @@ fn new_table_spans(
     let mut path_changed = false;
     for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
         let commit = s.is(k, "commit") || (s.is(k, "end") && toks[k].depth == 0);
-        if s.is(k, "rollback") || s.is(k, "abort") {
+        // A schema drop may drop any new table. The lint does not track
+        // the schema of an unqualified name, so it ends every range.
+        let schema_drop = s.is(k, "drop") && s.is(k + 1, "schema");
+        if s.is(k, "rollback") || s.is(k, "abort") || schema_drop {
             ends.push((SpanEnd::All, k));
         } else if commit && path_changed {
             // A `COMMIT` restores a local `search_path` value.
@@ -1797,7 +1801,7 @@ fn new_table_spans(
 enum SpanEnd {
     /// Every new table, as after a `ROLLBACK`.
     All,
-    /// The new table of this exact name.
+    /// Each new table with this name, whatever its schema.
     Name(String),
     /// Every new table without a schema in its name.
     Unqualified,
@@ -1807,7 +1811,8 @@ impl SpanEnd {
     fn ends(&self, name: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Name(n) => n == name,
+            // `scratch.t` and `t` may name the same table.
+            Self::Name(n) => base(n) == base(name),
             Self::Unqualified => !name.contains('.'),
         }
     }
@@ -4840,6 +4845,28 @@ fn an_index_tablespace_clause_still_builds_an_index() {
     // `USING INDEX` with an index name adopts that index.
     let sql = format!("{set}ALTER TABLE harvest_events ADD CONSTRAINT k UNIQUE USING INDEX k_idx;");
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_schema_or_qualified_drop_ends_a_new_table() {
+    let create = "CREATE TABLE harvest_events (id BIGINT);\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    for drop in [
+        "DROP SCHEMA scratch CASCADE;",
+        "DROP SCHEMA IF EXISTS scratch;",
+        "DROP TABLE scratch.harvest_events;",
+    ] {
+        let sql =
+            format!("{create}SET LOCAL lock_timeout = '5s';\n{drop}\nRESET lock_timeout;\n{lock}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
+    }
+    // A qualified create ends at an unqualified drop too.
+    let sql = "CREATE TABLE public.harvest_events (id BIGINT);\n\
+               SET LOCAL lock_timeout = '5s';\nDROP TABLE harvest_events;\nRESET lock_timeout;\n\
+               ALTER TABLE public.harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

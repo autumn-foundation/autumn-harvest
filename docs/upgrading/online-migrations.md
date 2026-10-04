@@ -35,8 +35,9 @@ A table that the same migration creates is not hot after its `CREATE TABLE`.
 No session can hold a lock on it yet. The exemption needs a create that surely
 runs: not `IF NOT EXISTS`, not inside a branch, and not in a function body.
 A temporary table never counts, because a commit or the session end can drop
-it. The exemption ends at a later `DROP TABLE`, `RENAME TO`, `SET SCHEMA` or
-`ROLLBACK`, because the name can mean the hot table again. A `search_path`
+it. The exemption ends at a later `DROP TABLE`, `RENAME TO`, `SET SCHEMA`,
+`DROP SCHEMA` or `ROLLBACK`, because the name can mean the hot table again.
+A drop or rename ends it with or without a schema in the name. A `search_path`
 change ends it for a name without a schema. So does a `COMMIT` after such a
 change, because the commit restores a local value.
 The lock must name the table exactly as the create does, schema included.
