@@ -849,9 +849,24 @@ fn lex(
             // `U&"..."` and `U&'...'` take Unicode escapes.
             let quote = chars[i + 2];
             let start_line = line;
-            let (raw, end) = quoted(chars, i + 3, quote);
+            let (mut raw, end) = quoted(chars, i + 3, quote);
             line += raw.matches('\n').count();
             i = end;
+            // A string continues across whitespace with a newline, before
+            // its escapes are decoded.
+            if quote == '\'' {
+                loop {
+                    let gap = chars[i..].iter().take_while(|c| c.is_whitespace()).count();
+                    let newlines = chars[i..i + gap].iter().filter(|c| **c == '\n').count();
+                    if newlines == 0 || at(i + gap) != Some('\'') {
+                        break;
+                    }
+                    let (more, end) = quoted(chars, i + gap + 1, quote);
+                    line += newlines + more.matches('\n').count();
+                    raw.push_str(&more);
+                    i = end;
+                }
+            }
             let escape = uescape(chars, &mut i, &mut line).unwrap_or('\\');
             let value = decode_unicode(&raw, escape);
             if quote == '\'' && in_do_statement(toks, depth) {
@@ -1573,10 +1588,10 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 /// The token range in which each new table is exempt.
 ///
 /// The range starts at the `CREATE TABLE`. It ends at the first later
-/// `DROP TABLE` or `ALTER TABLE ... RENAME TO` of that name, or at any later
-/// `ROLLBACK`, which may undo the create. A `search_path` change ends the
-/// range of an unqualified name. After that the name can mean the hot table
-/// again.
+/// `DROP TABLE`, `ALTER TABLE ... RENAME TO` or `SET SCHEMA` of that name, or
+/// at any later `ROLLBACK`, which may undo the create. A `search_path` change
+/// ends the range of an unqualified name. After that the name can mean the hot
+/// table again.
 fn new_table_spans(
     s: &Stmts,
     created: &BTreeMap<String, usize>,
@@ -1590,6 +1605,10 @@ fn new_table_spans(
             for name in s.name_list(s.skip_if_exists(k + 2)) {
                 ends.push((SpanEnd::Name(name), k));
             }
+        } else if s.is(k, "alter") && s.has_pair(k, "set", "schema") {
+            // The new table moves away, so the name can mean the hot table.
+            let end = s.statement_table(k).map_or(SpanEnd::All, SpanEnd::Name);
+            ends.push((end, k));
         } else if s.is(k, "alter") && s.has_pair(k, "rename", "to") {
             // A rename of anything but a table, such as a schema, may move
             // every new table.
@@ -4455,6 +4474,32 @@ fn a_commit_in_a_procedure_body_ends_its_bound() {
                ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;\nCALL p();";
     let findings = lint_with_history(&[], sql, false);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_continued_unicode_literal_joins() {
+    let sql = "DO U&'BEGIN ALTER TABLE harvest_'\n    'events ADD COLUMN x INT; END';";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert!(
+        findings[0].detail.contains("harvest_events"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_schema_move_ends_a_new_table_exemption() {
+    // The unqualified name can mean the hot table once the new one moves.
+    let sql = "CREATE TABLE harvest_events (id INT);\n\
+               ALTER TABLE harvest_events SET SCHEMA archive;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule == Rule::LockTimeout && f.line == 3),
+        "{findings:?}"
+    );
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
