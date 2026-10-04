@@ -5664,6 +5664,10 @@ async fn reconcile_lost_start(
 /// must still be `RUNNING` under this claim's `attempt` and `worker_id`. The
 /// row is read after the history. A newer start in that history needs a newer
 /// claim first, and a newer claim has a larger `attempt`.
+///
+/// The read first waits for any transaction that holds the task row lock. A
+/// start whose connection dropped can still be committing, and a plain read
+/// would miss it.
 async fn read_lost_start(
     pool: &DbPool,
     task: &TaskQueueItem,
@@ -5675,6 +5679,20 @@ async fn read_lost_start(
         return Ok(None);
     };
     let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+    // The lost start can still be committing. Its transaction holds the task
+    // row lock until it ends. A key-share lock waits for that, so the history
+    // read below sees the outcome. The lock goes at the end of the statement.
+    {
+        use crate::schema::harvest_task_queue::dsl;
+        dsl::harvest_task_queue
+            .find(task.id)
+            .select(dsl::id)
+            .for_key_share()
+            .first::<uuid::Uuid>(&mut conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+    }
     let history = store::load_history_with_timestamps(&mut conn, exec_id).await?;
     let events: Vec<WorkflowEvent> = history.iter().map(|(_, event)| event.clone()).collect();
     let Some(activity_id) = pending_activity_id_for_task(&events, task, activity_name)? else {
@@ -5780,6 +5798,25 @@ pub async fn append_start_for_test(
     )
     .await;
     started.map(|started| started.is_some())
+}
+
+/// Whether [`reconcile_lost_start`] finds this claim's start. Tests use it
+/// (issue #1788).
+///
+/// # Errors
+///
+/// The reconcile error.
+#[doc(hidden)]
+pub async fn reconcile_lost_start_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    reconcile_lost_start(pool, task, exec_id, activity_name, worker_id)
+        .await
+        .map(|started| started.is_some())
 }
 
 async fn append_activity_started_if_pending(

@@ -2155,6 +2155,60 @@ async fn a_lost_start_on_a_one_slot_pool_is_still_found() {
     assert!(found, "this claim's committed start must be found");
 }
 
+/// A lost connection can leave the start transaction still committing
+/// (issue #1788). The reconcile read must wait for it. A plain read sees no
+/// start, the claim goes back, and the start then commits. The retry would
+/// append a second `ActivityStarted` for a handler that never ran.
+#[tokio::test]
+async fn a_lost_start_read_waits_for_a_start_in_progress() {
+    let (url, _container) = setup_db().await;
+    let mut admin = connect(&url).await;
+    // The seeded start is older than the claim, so it is not this claim's.
+    let (exec_id, _activity_id, task) = seed_claimed_activity(&mut admin, "q-lw").await;
+
+    // The start transaction of this claim: it holds its locks while it
+    // commits.
+    let mut starter = connect(&url).await;
+    let start_task = task.clone();
+    let start = tokio::spawn(async move {
+        Box::pin(
+            starter.transaction::<_, autumn_harvest::error::HarvestError, _>(async |conn| {
+                autumn_harvest::worker::append_activity_started_for_test(
+                    conn,
+                    &start_task,
+                    exec_id,
+                    "act",
+                    "w-1",
+                    &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                )
+                .await?;
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                Ok(())
+            }),
+        )
+        .await
+        .expect("the start commits");
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let pool = engine_pool(
+        url,
+        2,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let found =
+        autumn_harvest::worker::reconcile_lost_start_for_test(&pool, &task, exec_id, "act", "w-1")
+            .await
+            .expect("the reconcile reads");
+    start.await.expect("the start joins");
+    assert!(
+        found,
+        "the reconcile must wait for the start that is committing"
+    );
+}
+
 /// A session-release write that a session timeout cancels must not fail the
 /// workflow. The handler wrote nothing, so the claim goes back for a retry.
 /// Another session locks `harvest_sessions` for 600 ms, and the pool gives up
