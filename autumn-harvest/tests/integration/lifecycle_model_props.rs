@@ -15,11 +15,13 @@
 //!    `autumn_harvest::lifecycle::TRANSITIONS`. The model asserts this on
 //!    every step it takes, so the model is an executable copy of that table.
 //!
-//! The model comes from the documented contracts: the reuse-policy matrix
-//! on `start_or_load_workflow_execution`, the claim fence
-//! `(worker_id, attempt)` from `docs/architecture.md` section 9, the
-//! lost-wake rule of `park_workflow_task`, and the orphan reclaim rules of
-//! `poison_pill`. The claim order is the exception. No contract states it,
+//! The model comes from four documented contracts:
+//!
+//! - the reuse-policy matrix on `start_or_load_workflow_execution`;
+//! - the claim fence `(worker_id, attempt)`, `docs/architecture.md` section 9;
+//! - the lost-wake rule of `park_workflow_task`;
+//! - the orphan reclaim rules of `poison_pill`.
+//! The claim order is the exception. No contract states it,
 //! so the model follows the `scheduled_at` stamps that the SQL writes.
 //!
 //! # Case count
