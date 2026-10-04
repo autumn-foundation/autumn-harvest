@@ -1180,11 +1180,22 @@ fn is_keyword(t: &Token, w: &str) -> bool {
     !t.quoted && t.tok == Tok::Word(w.to_string())
 }
 
-/// Whether the open statement at `depth` is a PL/pgSQL `EXECUTE`.
+/// Whether the open statement at `depth` holds a PL/pgSQL `EXECUTE`.
 ///
-/// A top-level `EXECUTE` runs a prepared statement. Its arguments are data.
+/// `FOR ... IN EXECUTE`, `RETURN QUERY EXECUTE` and `OPEN ... FOR EXECUTE`
+/// run dynamic SQL too. The `EXECUTE FUNCTION` of a trigger does not. A
+/// top-level `EXECUTE` runs a prepared statement, so its arguments are data.
 fn in_execute_statement(toks: &[Token], depth: usize) -> bool {
-    depth > 0 && statement_head(toks, depth).is_some_and(|t| is_keyword(t, "execute"))
+    // The open statement, last token first.
+    let open = open_statement(toks, depth);
+    let routine = |i: usize| {
+        i > 0 && (is_keyword(open[i - 1], "function") || is_keyword(open[i - 1], "procedure"))
+    };
+    depth > 0
+        && open
+            .iter()
+            .enumerate()
+            .any(|(i, t)| is_keyword(t, "execute") && !routine(i))
 }
 
 /// Whether the next token at `depth` is the body of a `CREATE FUNCTION` or
@@ -1203,6 +1214,11 @@ fn function_body_follows(toks: &[Token], depth: usize) -> bool {
 /// Inside a PL/pgSQL body, `BEGIN`, `THEN`, `ELSE` and `LOOP` also end the
 /// statement before, as in `Stmts::new`.
 fn statement_head(toks: &[Token], depth: usize) -> Option<&Token> {
+    open_statement(toks, depth).last().copied()
+}
+
+/// The tokens of the open statement at `depth`, last token first.
+fn open_statement(toks: &[Token], depth: usize) -> Vec<&Token> {
     let opens = |t: &Token| match &t.tok {
         Tok::Punct(';') => true,
         Tok::Word(w) => {
@@ -1214,7 +1230,7 @@ fn statement_head(toks: &[Token], depth: usize) -> Option<&Token> {
         .rev()
         .filter(|t| t.depth == depth)
         .take_while(|t| !opens(t))
-        .last()
+        .collect()
 }
 
 /// Lex the SQL that a PL/pgSQL `EXECUTE` at `depth` runs.
@@ -1722,7 +1738,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             Some("vacuum") if start => raws.extend(vacuum_full(&s, k)),
             // SQL the lint cannot read may lock anything, and may also clear
             // the bound for what comes after it.
-            Some("execute") if start && tok.depth > 0 => {
+            Some("execute") if dynamic_execute(&s, k) => {
                 if let Some(raw) = unreadable_execute(&s, k) {
                     raws.push(raw);
                     let list = if tok.runs {
@@ -2569,7 +2585,7 @@ fn new_table_spans(
 fn calls_or_hides(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> bool {
     let calls = (k..s.end(k)).any(|j| call_target(s, j, bases).is_some());
     let execute =
-        s.keyword(k, "execute") && s.toks[k].depth > 0 && unreadable_execute(s, k).is_some();
+        (k..s.end(k)).any(|j| dynamic_execute(s, j) && unreadable_execute(s, j).is_some());
     let foreign_do = s.keyword(k, "do") && language(s, k).is_some_and(|l| l != "plpgsql");
     calls || execute || foreign_do
 }
@@ -2645,10 +2661,7 @@ fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
         .filter(|&k| s.toks[k].runs)
         .filter(|&k| {
             let start = s.starts[k] == k;
-            let execute = start
-                && s.keyword(k, "execute")
-                && s.toks[k].depth > 0
-                && unreadable_execute(s, k).is_some();
+            let execute = dynamic_execute(s, k) && unreadable_execute(s, k).is_some();
             let call = call_target(s, k, &bases).is_some_and(|c| !resolved(&c));
             (start && foreign_do(s, k)) || execute || call
         })
@@ -3332,7 +3345,10 @@ fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     } else {
         after_literal.or(Some(end))
     };
-    let tail_ok = rest.is_some_and(|j| j >= end || s.keyword(j, "into") || s.keyword(j, "using"));
+    // `FOR ... IN EXECUTE` ends with the `LOOP` of its body.
+    let tail_ok = rest.is_some_and(|j| {
+        j >= end || s.keyword(j, "into") || s.keyword(j, "using") || s.keyword(j, "loop")
+    });
     let text_placeholder = (k + 1..end).any(|j| toks[j].depth > depth && s.is(j, "%s"));
     (!constant || !tail_ok || text_placeholder).then(|| Raw::lock(k, UNREADABLE_EXECUTE, None))
 }
@@ -3370,12 +3386,20 @@ fn recorded_change(
 /// So a change in the expression takes effect at the `EXECUTE` token, before
 /// the locks of the SQL.
 fn execute_at(s: &Stmts, k: usize) -> usize {
-    let start = s.starts[k];
-    if s.toks[k].depth > 0 && s.keyword(start, "execute") {
-        start
-    } else {
-        k
-    }
+    (s.starts[k]..k)
+        .find(|&j| dynamic_execute(s, j))
+        .unwrap_or(k)
+}
+
+/// Whether the token at `k` is a PL/pgSQL `EXECUTE` of dynamic SQL.
+///
+/// It may open a statement or follow `FOR ... IN`, `RETURN QUERY` or
+/// `OPEN ... FOR`. The `EXECUTE FUNCTION` of a trigger runs no dynamic SQL.
+fn dynamic_execute(s: &Stmts, k: usize) -> bool {
+    s.keyword(k, "execute")
+        && s.toks[k].depth > 0
+        && !s.keyword(k + 1, "function")
+        && !s.keyword(k + 1, "procedure")
 }
 
 /// The verb of a lock that unreadable `EXECUTE` SQL may take.
@@ -6891,6 +6915,33 @@ fn a_foreign_do_body_takes_no_lock_of_its_own() {
     let sql = "-- lock-safety: allow lock-timeout #1810 test fixture\n\
                DO $$\n# ; ALTER TABLE harvest_events ADD COLUMN x INT\npass\n$$ LANGUAGE plpython3u;";
     assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+}
+
+#[test]
+fn an_execute_inside_a_control_form_is_dynamic_sql() {
+    let history = [
+        "CREATE FUNCTION legacy_f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                    ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;",
+    ];
+    for body in [
+        "DO $$\nDECLARE r record;\nBEGIN\n    FOR r IN EXECUTE 'SELECT legacy_f()' LOOP\n        NULL;\n    \
+         END LOOP;\nEND $$;",
+        "DO $$\nDECLARE r record;\nDECLARE q text := 'x';\nBEGIN\n    FOR r IN EXECUTE q LOOP\n        \
+         NULL;\n    END LOOP;\nEND $$;",
+        "CREATE FUNCTION g() RETURNS SETOF record LANGUAGE plpgsql AS $$\nBEGIN\n    \
+         RETURN QUERY EXECUTE 'SELECT legacy_f()';\nEND $$;",
+    ] {
+        let findings = lint_with_history(&history, body, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{body}\n{findings:?}"
+        );
+    }
+    // A constant query that locks nothing stays readable.
+    let sql = "DO $$\nDECLARE r record;\nBEGIN\n    FOR r IN EXECUTE 'SELECT 1' LOOP\n        NULL;\n    \
+               END LOOP;\nEND $$;";
+    assert_eq!(lint_with_history(&history, sql, true), [], "{sql}");
 }
 
 #[test]

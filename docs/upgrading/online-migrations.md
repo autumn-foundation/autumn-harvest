@@ -290,7 +290,8 @@ that no longer matches a finding also fails the build.
   with `%s` anywhere in its text, even in a comment or a quoted name. So does
   a `%L` value that a `DO`, `EXECUTE` or function body runs as code.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
-  as code, in any quote form. Any other string is data.
+  as code, in any quote form. That includes `FOR ... IN EXECUTE`,
+  `RETURN QUERY EXECUTE` and `OPEN ... FOR EXECUTE`. Any other string is data.
 - The lint reads string literals as `standard_conforming_strings = on` does.
   A statement that may turn the setting off counts as a lock on an unknown
   table that no bound covers. That includes a `set_config` call whose name is
