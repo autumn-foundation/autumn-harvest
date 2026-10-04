@@ -152,8 +152,10 @@ After the clear, the guard does these steps once per abort:
 Many replicas can run the guard. A replica reports an abort only after it
 cleared a pool itself, so a failed clear never reports a change that did not
 happen. A replica that lost the clear on the first pool that holds the ramp
-does not report, because another replica owns that report. Normally one
-replica audits each abort.
+to another guard does not report, because that guard owns the report. The
+abort marker tells a guard clear from an operator change. An operator change
+on the first pool does not decide who reports. Normally one replica audits
+each abort.
 
 ## Failure behaviour
 
@@ -181,8 +183,10 @@ The guard fails safe: when it cannot read, it does not abort.
   `ramp_id`, which the API fan-out writes to every shard pool. Each finished
   clear copies it to the abort marker `harvest_build_policies.ramp_aborted_id`
   in the same `UPDATE`, so the marker cannot be lost. After a restart, a pool
-  can still hold a ramp whose `ramp_id` matches a marker on another pool. The
-  guard then clears that ramp with no new verdict and no new audit row. The
+  can still hold a ramp whose `ramp_id` and base build match a marker on
+  another pool. The guard then clears that ramp with no new verdict and no
+  new audit row. A base-build change keeps the `ramp_id`, but the base no
+  longer matches, so the marker does not clear the new step. The
   match uses ids, not database clocks, so clock skew between pools does not
   matter. An operator ramp set after the abort has a new `ramp_id`, so the
   guard does not clear it. A ramp set before the migration has no id, and the

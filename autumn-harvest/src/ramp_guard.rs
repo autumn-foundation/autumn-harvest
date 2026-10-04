@@ -477,9 +477,13 @@ struct ObservedRamp {
     abort_marked: bool,
 }
 
-/// A guard abort marker on one pool: the queue and the `ramp_id` it cleared.
+/// A guard abort marker on one pool: the queue, the base build and the
+/// `ramp_id` that the guard cleared.
+///
+/// A base-build change keeps the `ramp_id` but starts a new step. The base
+/// build is part of the marker, so an old marker does not match the new step.
 #[cfg(feature = "db")]
-type AbortMarker = (String, uuid::Uuid);
+type AbortMarker = (String, String, uuid::Uuid);
 
 /// What one pool holds: its active ramps and its guard abort markers.
 #[cfg(feature = "db")]
@@ -593,7 +597,7 @@ async fn read_pool_ramps(
                 // A marker stays valid when a newer ramp is active on the
                 // same row, so read it first.
                 if let Some(aborted) = policy.ramp_aborted_id {
-                    markers.push((policy.queue_name.clone(), aborted));
+                    markers.push((policy.queue_name.clone(), policy.build_id.clone(), aborted));
                 }
                 let (Some(target), Some(percent)) =
                     (policy.target_build_id.clone(), policy.ramp_percent)
@@ -626,8 +630,8 @@ async fn read_pool_ramps(
 /// The counts merge per generation, not per ramp key. So the evidence of one
 /// `ramp_id` never counts for another.
 ///
-/// A generation is marked when a guard abort marker on the same queue holds
-/// its `ramp_id`. The match is by id, so clock skew between pools does not
+/// A generation is marked when a guard abort marker on the same queue and
+/// base build holds its `ramp_id`. The match is by id, so clock skew between pools does not
 /// matter. An operator ramp set after the abort has a new id, so it is not
 /// marked.
 #[cfg(feature = "db")]
@@ -660,9 +664,9 @@ async fn read_ramps(
         }
         markers.extend(pool_markers);
     }
-    for (((queue, _, _), ramp_id), ramp) in &mut merged {
-        ramp.abort_marked =
-            ramp_id.is_some_and(|ramp_id| markers.contains(&(queue.clone(), ramp_id)));
+    for (((queue, base, _), ramp_id), ramp) in &mut merged {
+        ramp.abort_marked = ramp_id
+            .is_some_and(|ramp_id| markers.contains(&(queue.clone(), base.clone(), ramp_id)));
     }
     Some(merged)
 }
@@ -673,8 +677,13 @@ async fn read_ramps(
 enum ClearOutcome {
     /// This call cleared the ramp.
     Cleared,
-    /// The row changed first, so nothing was cleared.
+    /// Another guard cleared the ramp first, so it owns the report. A ramp
+    /// with no `ramp_id` also gives this outcome, because the guard cannot
+    /// tell who changed it.
     Lost,
+    /// An operator changed the row first, and no guard cleared this ramp.
+    /// Nothing was cleared, and the change says nothing about who reports.
+    Moved,
     /// The server failed or stopped the clear, so nothing changed. The guard
     /// retries it.
     Failed,
@@ -684,28 +693,81 @@ enum ClearOutcome {
     Ambiguous,
 }
 
+/// Return `true` when a guard abort marker on this pool holds `ramp_id`.
+///
+/// A lost clear calls this to learn who changed the row. A guard clear sets
+/// the marker in the same UPDATE, and an operator change does not.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
+pub async fn ramp_aborted_by_guard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    queue: &str,
+    ramp_id: uuid::Uuid,
+) -> crate::error::HarvestResult<bool> {
+    use diesel::sql_types::{Bool, Text};
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Bool)]
+        marked: bool,
+    }
+
+    let row: Row = diesel::sql_query(
+        "SELECT EXISTS (SELECT 1 FROM harvest_build_policies \
+                        WHERE queue_name = $1 AND ramp_aborted_id = $2) AS marked",
+    )
+    .bind::<Text, _>(queue)
+    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(row.marked)
+}
+
 /// Clear one ramp step on one pool.
 ///
 /// The server stops the clear at `bound`. The client waits twice as long, so
 /// a client timeout means that the server did not answer at all.
+///
+/// When the row changed first, the marker tells a guard clear (`Lost`) from
+/// an operator change (`Moved`). A failed marker read gives `Lost`, so the
+/// guard does not report an abort that another guard can own.
 #[cfg(feature = "db")]
 async fn clear_on_pool(
     pool: &crate::worker::DbPool,
     index: usize,
     key: &RampKey,
+    ramp_id: Option<uuid::Uuid>,
     step: chrono::DateTime<chrono::Utc>,
     bound: Duration,
 ) -> ClearOutcome {
     let (queue, base, target) = key;
     let clear = async {
         let mut conn = pool.get().await.map_err(|e| e.to_string())?;
-        abort_ramp(&mut conn, queue, base, target, step, bound)
+        if abort_ramp(&mut conn, queue, base, target, step, bound)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?
+        {
+            return Ok::<_, String>(ClearOutcome::Cleared);
+        }
+        let Some(ramp_id) = ramp_id else {
+            return Ok(ClearOutcome::Lost);
+        };
+        let by_guard = ramp_aborted_by_guard(&mut conn, queue, ramp_id)
+            .await
+            .unwrap_or(true);
+        Ok(if by_guard {
+            ClearOutcome::Lost
+        } else {
+            ClearOutcome::Moved
+        })
     };
     match tokio::time::timeout(bound.saturating_mul(2), clear).await {
-        Ok(Ok(true)) => ClearOutcome::Cleared,
-        Ok(Ok(false)) => ClearOutcome::Lost,
+        Ok(Ok(outcome)) => outcome,
         Ok(Err(error)) => {
             tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard clear failed");
             ClearOutcome::Failed
@@ -807,7 +869,8 @@ enum Disposition {
 /// Decide what to do with an abort from the outcomes of its clears.
 ///
 /// `outcomes` is in pool order. On a first attempt, a lost clear on the
-/// first pool means that another replica owns the report. A guard reports
+/// first pool means that another guard owns the report. A moved clear is an
+/// operator change, so it does not decide the owner. A guard reports
 /// an abort only when it cleared a pool itself. A failed clear therefore
 /// never reports a change that did not happen.
 #[cfg(feature = "db")]
@@ -875,6 +938,8 @@ const fn retry_outcome(outcome: ClearOutcome, was_ambiguous: bool) -> ClearOutco
 #[cfg(feature = "db")]
 #[derive(Debug)]
 struct PendingAbort {
+    /// The `ramp_id` of the aborted generation.
+    ramp_id: Option<uuid::Uuid>,
     /// The pools that did not clear.
     steps: Vec<PendingStep>,
     /// The abort, while no clear of this guard has succeeded yet. The guard
@@ -955,14 +1020,15 @@ impl RampGuard {
             return aborts;
         };
 
-        for ((key, _), ramp) in ramps {
+        for (generation, ramp) in ramps {
+            let key = &generation.0;
             // A pending clear blocks every generation of its key until the
             // retry ends, so one key never has two pending entries.
-            if self.pending.contains_key(&key) {
+            if self.pending.contains_key(key) {
                 continue;
             }
             if ramp.abort_marked {
-                self.finish_marked_abort(pools, &key, &ramp.steps, bound, cancel)
+                self.finish_marked_abort(pools, &generation, &ramp.steps, bound, cancel)
                     .await;
                 continue;
             }
@@ -994,7 +1060,7 @@ impl RampGuard {
                     pools,
                     audit_pool,
                     metrics,
-                    key,
+                    generation,
                     &ramp.steps,
                     abort,
                     bound,
@@ -1015,7 +1081,7 @@ impl RampGuard {
         pools: &[crate::worker::DbPool],
         audit_pool: &crate::worker::DbPool,
         metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
-        key: RampKey,
+        (key, ramp_id): GenerationKey,
         steps: &[(usize, chrono::DateTime<chrono::Utc>)],
         mut abort: RampAbort,
         bound: Duration,
@@ -1029,7 +1095,7 @@ impl RampGuard {
             let outcome = if cancel.is_cancelled() {
                 ClearOutcome::Failed
             } else {
-                clear_on_pool(&pools[index], index, &key, step, bound).await
+                clear_on_pool(&pools[index], index, &key, ramp_id, step, bound).await
             };
             if matches!(outcome, ClearOutcome::Failed | ClearOutcome::Ambiguous) {
                 failed.push((index, step, outcome == ClearOutcome::Ambiguous));
@@ -1043,6 +1109,7 @@ impl RampGuard {
             self.pending.insert(
                 key,
                 PendingAbort {
+                    ramp_id,
                     steps: failed.clone(),
                     unreported,
                 },
@@ -1072,7 +1139,7 @@ impl RampGuard {
     async fn finish_marked_abort(
         &mut self,
         pools: &[crate::worker::DbPool],
-        key: &RampKey,
+        (key, ramp_id): &GenerationKey,
         steps: &[(usize, chrono::DateTime<chrono::Utc>)],
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
@@ -1083,12 +1150,12 @@ impl RampGuard {
                 failed.push((index, step, false));
                 continue;
             }
-            let outcome = clear_on_pool(&pools[index], index, key, step, bound).await;
+            let outcome = clear_on_pool(&pools[index], index, key, *ramp_id, step, bound).await;
             match outcome {
                 ClearOutcome::Cleared => {
                     tracing::info!(queue = %key.0, pool = index, "ramp guard finished a marked abort");
                 }
-                ClearOutcome::Lost => {}
+                ClearOutcome::Lost | ClearOutcome::Moved => {}
                 ClearOutcome::Failed | ClearOutcome::Ambiguous => {
                     failed.push((index, step, outcome == ClearOutcome::Ambiguous));
                 }
@@ -1098,6 +1165,7 @@ impl RampGuard {
             self.pending.insert(
                 key.clone(),
                 PendingAbort {
+                    ramp_id: *ramp_id,
                     steps: failed,
                     unreported: None,
                 },
@@ -1135,13 +1203,13 @@ impl RampGuard {
                     outcomes.push(ClearOutcome::Failed);
                     continue;
                 }
-                let raw = clear_on_pool(pool, index, &key, step, bound).await;
+                let raw = clear_on_pool(pool, index, &key, entry.ramp_id, step, bound).await;
                 let outcome = retry_outcome(raw, was_ambiguous);
                 match outcome {
                     ClearOutcome::Cleared => {
                         tracing::info!(queue = %key.0, pool = index, "ramp guard finished a pending clear");
                     }
-                    ClearOutcome::Lost => {}
+                    ClearOutcome::Lost | ClearOutcome::Moved => {}
                     ClearOutcome::Failed | ClearOutcome::Ambiguous => still_failed.push((
                         index,
                         step,
@@ -1168,6 +1236,7 @@ impl RampGuard {
                 self.pending.insert(
                     key,
                     PendingAbort {
+                        ramp_id: entry.ramp_id,
                         steps: still_failed,
                         unreported,
                     },
@@ -1487,11 +1556,28 @@ mod tests {
 
     #[cfg(feature = "db")]
     #[test]
+    fn an_operator_change_on_the_first_pool_does_not_decide_the_reporter() {
+        use ClearOutcome::{Cleared, Failed, Lost, Moved};
+        // An operator moved the first pool, and this guard cleared another.
+        assert_eq!(disposition(&[Moved, Cleared], true), Disposition::Report);
+        assert_eq!(disposition(&[Moved, Failed], true), Disposition::Defer);
+        assert_eq!(disposition(&[Moved, Moved], true), Disposition::Drop);
+        // Another guard cleared the first pool: it still owns the report.
+        assert_eq!(
+            disposition(&[Lost, Moved, Cleared], true),
+            Disposition::Drop
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
     fn a_lost_retry_after_an_ambiguous_clear_counts_as_this_guards_clear() {
         use ClearOutcome::{Ambiguous, Cleared, Failed, Lost};
         assert_eq!(retry_outcome(Lost, true), Cleared);
         assert_eq!(retry_outcome(Lost, false), Lost);
-        for outcome in [Cleared, Failed, Ambiguous] {
+        // A moved row has no guard marker, so the ambiguous clear did not
+        // commit.
+        for outcome in [Cleared, Failed, Ambiguous, ClearOutcome::Moved] {
             assert_eq!(retry_outcome(outcome, true), outcome);
         }
         // So an unreported abort is reported, not dropped.

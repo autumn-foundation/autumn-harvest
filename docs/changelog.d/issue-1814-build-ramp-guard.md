@@ -30,11 +30,12 @@ Design decisions:
   pool clear stays pending, and the next pass retries it with no new verdict.
   Each operator ramp has a `ramp_id`, the same on every pool. The clear
   copies it to the durable marker `ramp_aborted_id` in the same UPDATE. After
-  a restart, the guard matches markers to ramps by id, not by clocks, to
-  finish a partial clear. A clear has a server-side timeout, so it cannot commit late. After a
+  a restart, the guard matches markers to ramps by id and base build, not by
+  clocks, to finish a partial clear. A clear has a server-side timeout, so it cannot commit late. After a
   cancel, a pass starts no new clear.
 - A replica reports an abort only after it cleared a pool itself, and not
-  when it lost the first pool's clear to another replica.
+  when it lost the first pool's clear to another guard. The marker tells a
+  guard clear from an operator change.
 - The guard fails safe. A failed or slow read aborts nothing. Every read and
   write has a bound, and each read has a server-side `statement_timeout`.
 

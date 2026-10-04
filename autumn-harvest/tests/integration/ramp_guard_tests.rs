@@ -13,12 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::build_routing::{
-    get_build_policy, ramp_bucket, set_build_policy, set_build_ramp, set_build_ramp_with_id,
+    clear_build_ramp, get_build_policy, ramp_bucket, set_build_policy, set_build_ramp,
+    set_build_ramp_with_id,
 };
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::ramp_guard::{
-    RampAbortReason, RampGuardConfig, abort_ramp, guard_once, run_ramp_guard,
+    RampAbortReason, RampGuardConfig, abort_ramp, guard_once, ramp_aborted_by_guard, run_ramp_guard,
 };
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::{
@@ -44,6 +45,7 @@ const WF: &str = "ramp_guard_wf";
 const QUEUE: &str = "default";
 const BUILD_A: &str = "ramp-a";
 const BUILD_B: &str = "ramp-b";
+const BUILD_C: &str = "ramp-c";
 const RAMP_PERCENT: i32 = 10;
 const RUNS_A: usize = 30;
 const RUNS_B: usize = 10;
@@ -1065,6 +1067,81 @@ async fn a_marker_beside_a_newer_ramp_finishes_only_the_marked_ramp() {
         "the newer ramp on pool 1 stays"
     );
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no audit row");
+}
+
+/// A base-build change keeps the `ramp_id`, but it starts a new step. An old
+/// marker for the old base therefore does not finish the ramp.
+#[tokio::test]
+async fn a_marker_does_not_finish_a_ramp_whose_base_changed() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    set_ramp_with_id(&mut conn_2, ramp_id).await;
+    let step_1 = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+    );
+    // The operator moves pool 2 to a new base build. The ramp stays.
+    set_build_policy(&mut conn_2, QUEUE, BUILD_C, None)
+        .await
+        .expect("set new base");
+    assert!(ramp_is_active(&mut conn_2).await);
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "the ramp from the new base stays"
+    );
+}
+
+/// A lost clear tells a guard clear from an operator change by the abort
+/// marker. Only a guard clear sets the marker of the ramp's `ramp_id`.
+#[tokio::test]
+async fn the_marker_tells_a_guard_clear_from_an_operator_clear() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    // An operator clears the ramp: no guard marker.
+    let operator_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, operator_id).await;
+    clear_build_ramp(&mut conn, QUEUE).await.expect("clear");
+    assert!(
+        !ramp_aborted_by_guard(&mut conn, QUEUE, operator_id)
+            .await
+            .expect("read marker")
+    );
+
+    // A guard clears the next ramp: the marker holds its id.
+    let guard_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, guard_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("guard clear")
+    );
+    assert!(
+        ramp_aborted_by_guard(&mut conn, QUEUE, guard_id)
+            .await
+            .expect("read marker")
+    );
+    assert!(
+        !ramp_aborted_by_guard(&mut conn, QUEUE, operator_id)
+            .await
+            .expect("read marker")
+    );
 }
 
 /// A split ramp with no abort marker is not cleared.
