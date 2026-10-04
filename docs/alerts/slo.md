@@ -163,14 +163,25 @@ update the alerts.
 
 The `workflow_task` and `canary` records also need a change to each
 `or vector(0)`. `vector(0)` has no labels, so it cannot fill a gap for one
-queue. Use the other series times zero instead. For the `workflow_task`
-numerator, with `F` for the `failed` selector and `T` for the timeout
-selector:
+queue. Use a series that the queue always has, times zero. Then a healthy
+queue gets a ratio of 0, not a gap. For `workflow_task`, with `D` for the
+all-status duration selector, `F` for the `failed` selector, and `T` for
+the timeout selector:
 
 ```promql
-(sum by (queue) (rate(F[5m])) or sum by (queue) (rate(T[5m])) * 0)
-+ (sum by (queue) (rate(T[5m])) or sum by (queue) (rate(F[5m])) * 0)
+(
+  (sum by (queue) (rate(F[5m])) or sum by (queue) (rate(D[5m])) * 0 or sum by (queue) (rate(T[5m])) * 0)
+  + (sum by (queue) (rate(T[5m])) or sum by (queue) (rate(D[5m])) * 0)
+)
+/
+(
+  (sum by (queue) (rate(D[5m])) or sum by (queue) (rate(T[5m])) * 0)
+  + (sum by (queue) (rate(T[5m])) or sum by (queue) (rate(D[5m])) * 0)
+)
 ```
+
+For `canary`, use the success series times zero as the fallback for the
+failure series, and the reverse.
 
 The `schedule_to_start` records need `by (queue)` only.
 

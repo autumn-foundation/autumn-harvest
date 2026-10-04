@@ -482,6 +482,47 @@ async fn quarantine_of_a_canary_probe_records_a_canary_failure() {
     );
 }
 
+/// The caller's workflow name can be the `unknown` fallback label.
+/// The quarantine reads the execution row, so it must use that name.
+#[tokio::test]
+async fn quarantine_finds_a_canary_probe_behind_an_unknown_label() {
+    let (mut conn, pool, _container) = setup().await;
+
+    let probe = format!(
+        "{}__default",
+        autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX
+    );
+    let exec_id = insert_running_workflow_named(&mut conn, &probe, 1).await;
+    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
+
+    let metrics = RecordingMetrics::default();
+    let quarantined = quarantine_workflow_task_timeout(
+        &pool,
+        task_id,
+        Some(exec_id),
+        "worker-1",
+        1,
+        3,
+        1,
+        "unknown",
+        "default",
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+
+    assert!(quarantined, "the quarantine must commit");
+    assert_eq!(
+        *metrics.canary_failures.lock().unwrap(),
+        vec![("default".to_owned(), 1)],
+        "the execution row names the probe, so it is a canary failure"
+    );
+    assert!(
+        metrics.terminal.lock().unwrap().is_empty(),
+        "a probe never records a business terminal"
+    );
+}
+
 /// A late quarantine does not touch a peer's claim (issue #1788).
 ///
 /// The quarantine retries its acquire. In that time the stuck-running backstop

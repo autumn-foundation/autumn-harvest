@@ -33581,8 +33581,10 @@ pub async fn quarantine_workflow_task_timeout(
     let mut workflow_id_str = String::new();
     let mut schedule_id_opt: Option<uuid::Uuid> = None;
     let mut origin_opt: Option<String> = None;
-    // The canary failure metric needs the probe's shard (issue #1816).
+    // The canary failure metric needs the probe's shard and its real name
+    // (issue #1816). The caller's name can be the `unknown` fallback label.
     let mut shard_id: i32 = 0;
+    let mut row_workflow_name: Option<String> = None;
     let (owner, severity) = match exec_id_opt {
         Some(exec_uuid) => {
             let res = exec_dsl::harvest_workflow_executions
@@ -33596,6 +33598,7 @@ pub async fn quarantine_workflow_task_timeout(
                     exec_dsl::schedule_id,
                     exec_dsl::origin,
                     exec_dsl::shard_id,
+                    exec_dsl::workflow_name,
                 ))
                 .first::<(
                     Option<String>,
@@ -33606,6 +33609,7 @@ pub async fn quarantine_workflow_task_timeout(
                     Option<uuid::Uuid>,
                     Option<String>,
                     i32,
+                    String,
                 )>(&mut conn)
                 .await
                 .optional();
@@ -33617,9 +33621,10 @@ pub async fn quarantine_workflow_task_timeout(
                 }
             };
             match res {
-                Some((o, s, p, pcp, wid, sched_id, orig, shard)) => {
+                Some((o, s, p, pcp, wid, sched_id, orig, shard, name)) => {
                     exec_exists = true;
                     shard_id = shard;
+                    row_workflow_name = Some(name);
                     parent_id_opt = p;
                     parent_close_policy_opt = pcp;
                     workflow_id_str = wid;
@@ -33832,6 +33837,7 @@ pub async fn quarantine_workflow_task_timeout(
             // actually committed.
             crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
             if let Some(q) = queue_used {
+                let workflow_name = row_workflow_name.as_deref().unwrap_or(workflow_name);
                 crate::telemetry::emit_workflow_terminal(
                     metrics,
                     workflow_name,
