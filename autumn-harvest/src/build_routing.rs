@@ -324,10 +324,9 @@ impl From<BuildPolicyRow> for BuildPolicy {
 /// affected.
 ///
 /// A policy update keeps an active ramp, but it starts a new ramp step. So
-/// it gives the ramp a new `ramp_id` (issue #1814). The new id derives from
-/// the old id and the new base build. Every shard pool that held the same
-/// ramp derives the same new id, so the fan-out keeps one ramp identity. An
-/// old ramp guard abort marker does not match the new id.
+/// it gives the ramp a fresh `ramp_id` (issue #1814). A fan-out over shard
+/// pools uses [`set_build_policy_with_ramp_id`] to write one id to every
+/// pool. An old ramp guard abort marker does not match the new id.
 ///
 /// # Errors
 ///
@@ -339,6 +338,30 @@ pub async fn set_build_policy(
     build_id: &str,
     deployment_name: Option<&str>,
 ) -> HarvestResult<BuildPolicy> {
+    set_build_policy_with_ramp_id(conn, queue_name, build_id, deployment_name, Uuid::new_v4()).await
+}
+
+/// [`set_build_policy`] with a caller-chosen `ramp_id` for a retained ramp
+/// (issue #1814).
+///
+/// A fan-out passes one `ramp_id` to every pool, so a retained ramp keeps one
+/// identity across pools. A row with no ramp keeps `ramp_id` NULL.
+///
+/// The write is idempotent. A row that already holds this `ramp_id`, build
+/// and deployment is left as is, and its step stays. So a retried fan-out, or
+/// two logical shards on one pool, cannot split the ramp identity.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
+pub async fn set_build_policy_with_ramp_id(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    build_id: &str,
+    deployment_name: Option<&str>,
+    ramp_id: Uuid,
+) -> HarvestResult<BuildPolicy> {
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "INSERT INTO harvest_build_policies (id, queue_name, build_id, deployment_name) \
          VALUES ($1, $2, $3, $4) \
@@ -346,22 +369,29 @@ pub async fn set_build_policy(
              SET build_id = EXCLUDED.build_id, \
                  deployment_name = EXCLUDED.deployment_name, \
                  ramp_id = CASE WHEN harvest_build_policies.ramp_id IS NULL THEN NULL \
-                     ELSE md5(harvest_build_policies.ramp_id::text || ':' \
-                              || EXCLUDED.build_id)::uuid END, \
+                                ELSE $5 END, \
                  updated_at = NOW() \
+             WHERE harvest_build_policies.ramp_id IS DISTINCT FROM $5 \
+                OR harvest_build_policies.build_id IS DISTINCT FROM EXCLUDED.build_id \
+                OR harvest_build_policies.deployment_name \
+                   IS DISTINCT FROM EXCLUDED.deployment_name \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))
     .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
     .bind::<diesel::sql_types::Text, _>(queue_name)
     .bind::<diesel::sql_types::Text, _>(build_id)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(deployment_name)
+    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
     .load(conn)
     .await
     .map_err(database_error)?;
 
-    rows.into_iter()
-        .next()
-        .map(BuildPolicy::from)
+    if let Some(row) = rows.into_iter().next() {
+        return Ok(BuildPolicy::from(row));
+    }
+    // The row already held this write, so the UPDATE changed nothing.
+    get_build_policy(conn, queue_name)
+        .await?
         .ok_or_else(|| database_error("set_build_policy: no row returned"))
 }
 
@@ -438,6 +468,10 @@ pub async fn set_build_ramp(
 /// matches the marker to the ramp by this id, not by database clocks, so it
 /// can finish a partial abort safely.
 ///
+/// The write is idempotent. A row that already holds this ramp is left as
+/// is, and its step stays. So a retried fan-out, or two logical shards on
+/// one pool, cannot split the ramp identity.
+///
 /// # Errors
 ///
 /// The same as [`set_build_ramp`].
@@ -455,6 +489,9 @@ pub async fn set_build_ramp_with_id(
         "UPDATE harvest_build_policies \
          SET target_build_id = $2, ramp_percent = $3, ramp_id = $4, updated_at = NOW() \
          WHERE queue_name = $1 \
+           AND (ramp_id IS DISTINCT FROM $4 \
+                OR target_build_id IS DISTINCT FROM $2 \
+                OR ramp_percent IS DISTINCT FROM $3) \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
@@ -465,15 +502,17 @@ pub async fn set_build_ramp_with_id(
     .await
     .map_err(database_error)?;
 
-    rows.into_iter()
-        .next()
-        .map(BuildPolicy::from)
-        .ok_or_else(|| {
-            HarvestError::Config(format!(
-                "cannot set a build ramp for queue '{queue_name}': no base build policy is \
+    if let Some(row) = rows.into_iter().next() {
+        return Ok(BuildPolicy::from(row));
+    }
+    // Either the row already held this ramp, so the write is a repeat, or
+    // the queue has no base policy yet.
+    get_build_policy(conn, queue_name).await?.ok_or_else(|| {
+        HarvestError::Config(format!(
+            "cannot set a build ramp for queue '{queue_name}': no base build policy is \
              registered for this queue yet — call set_build_policy first"
-            ))
-        })
+        ))
+    })
 }
 
 /// Clear a queue's percentage ramp, immediately stopping new starts from

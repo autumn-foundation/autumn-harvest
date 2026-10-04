@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::build_routing::{
-    clear_build_ramp, get_build_policy, ramp_bucket, set_build_policy, set_build_ramp,
-    set_build_ramp_with_id,
+    clear_build_ramp, get_build_policy, ramp_bucket, set_build_policy,
+    set_build_policy_with_ramp_id, set_build_ramp, set_build_ramp_with_id,
 };
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
@@ -1471,11 +1471,12 @@ async fn a_recovery_claim_that_did_not_report_is_retried_after_its_lease() {
     assert_eq!(marker_reported(&mut conn, ramp_id).await, Some(true));
 }
 
-/// A base-build change keeps an active ramp. It gives the ramp a new
-/// `ramp_id`, and every pool derives the same one. So the ramp keeps one
+/// A base-build change keeps an active ramp. The fan-out gives the ramp one
+/// new `ramp_id` on every pool. A repeated write on one pool, from a retry
+/// or from two shards on one pool, keeps that id. So the ramp keeps one
 /// identity across pools, and no old marker matches it.
 #[tokio::test]
-async fn a_base_change_gives_the_ramp_a_new_shared_id() {
+async fn a_base_change_fan_out_gives_the_ramp_one_new_id() {
     let (url_1, _c1) = setup().await;
     let (url_2, _c2) = setup().await;
     let mut conn_1 = AsyncPgConnection::establish(&url_1)
@@ -1487,20 +1488,20 @@ async fn a_base_change_gives_the_ramp_a_new_shared_id() {
     let old_id = uuid::Uuid::new_v4();
     set_ramp_with_id(&mut conn_1, old_id).await;
     set_ramp_with_id(&mut conn_2, old_id).await;
+    let new_id = uuid::Uuid::new_v4();
+    // Pool 1 takes the write twice, as from two shards on one pool.
     for conn in [&mut conn_1, &mut conn_2] {
-        set_build_policy(conn, QUEUE, BUILD_C, None)
+        set_build_policy_with_ramp_id(conn, QUEUE, BUILD_C, None, new_id)
             .await
             .expect("set new base");
         assert!(ramp_is_active(conn).await, "the ramp stays");
     }
-    let new_1 = policy_ramp_id(&mut conn_1)
+    set_build_policy_with_ramp_id(&mut conn_1, QUEUE, BUILD_C, None, new_id)
         .await
-        .expect("pool 1 keeps an id");
-    let new_2 = policy_ramp_id(&mut conn_2)
-        .await
-        .expect("pool 2 keeps an id");
-    assert_eq!(new_1, new_2, "both pools derive the same id");
-    assert_ne!(new_1, old_id, "the new step has a new id");
+        .expect("repeat on pool 1");
+    assert_eq!(policy_ramp_id(&mut conn_1).await, Some(new_id));
+    assert_eq!(policy_ramp_id(&mut conn_2).await, Some(new_id));
+    assert_ne!(new_id, old_id);
 }
 
 /// A recovery claim stays leased while its guard reports, even with a zero
@@ -1529,6 +1530,22 @@ async fn a_zero_grace_still_leases_a_recovery_claim() {
     let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
     assert!(aborts.is_empty(), "the fresh claim holds: {aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+}
+
+/// A repeated ramp write with the same `ramp_id`, from a retry or from two
+/// shards on one pool, keeps the id. It does not start a new step either.
+#[tokio::test]
+async fn a_repeated_ramp_write_keeps_its_ramp_id() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id)
+        .await
+        .expect("repeat the ramp write");
+    assert_eq!(policy_ramp_id(&mut conn).await, Some(ramp_id));
+    assert_eq!(policy_step(&mut conn).await, step, "the step stays");
 }
 
 /// A split ramp with no abort marker is not cleared.

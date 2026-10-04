@@ -44,7 +44,8 @@ use autumn_harvest::audit::{
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
-    list_build_compat, list_build_policies, merge_reachability, revoke_compat, set_build_policy,
+    list_build_compat, list_build_policies, merge_reachability, revoke_compat,
+    set_build_policy_with_ramp_id,
 };
 use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::execution::StartWorkflowParams;
@@ -8225,14 +8226,23 @@ async fn build_routing_set_policy_ui(
     let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
     // Fan out to all shards so every shard's get_build_policy() sees the new policy
     // when evaluating assigned_build_id at workflow start time.
+    // One ramp id for every shard, so a retained ramp keeps one identity
+    // (issue #1814).
+    let ramp_id = uuid::Uuid::new_v4();
     let mut last_policy = None;
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => {
-                match set_build_policy(&mut conn, &queue_name, &build_id, deployment_name)
-                    .await
-                    .map_err(map_error)
+                match set_build_policy_with_ramp_id(
+                    &mut conn,
+                    &queue_name,
+                    &build_id,
+                    deployment_name,
+                    ramp_id,
+                )
+                .await
+                .map_err(map_error)
                 {
                     Ok(p) => last_policy = Some(p),
                     Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),

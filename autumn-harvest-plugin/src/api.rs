@@ -48108,7 +48108,7 @@ async fn set_build_policy_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildPolicyBody>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::set_build_policy;
+    use autumn_harvest::build_routing::set_build_policy_with_ramp_id;
 
     let queue_name = body.queue_name.trim();
     let build_id = body.build_id.trim();
@@ -48124,6 +48124,9 @@ async fn set_build_policy_handler(
     let deployment = body.deployment_name.as_deref().filter(|s| !s.is_empty());
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
+    // One ramp id for every shard, so a retained ramp keeps one identity
+    // (issue #1814).
+    let ramp_id = uuid::Uuid::new_v4();
     let mut last_policy = None;
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
@@ -48134,7 +48137,7 @@ async fn set_build_policy_handler(
                 continue;
             }
         };
-        match set_build_policy(&mut conn, queue_name, build_id, deployment)
+        match set_build_policy_with_ramp_id(&mut conn, queue_name, build_id, deployment, ramp_id)
             .await
             .map_err(map_error)
         {
