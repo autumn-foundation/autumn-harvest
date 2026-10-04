@@ -99,7 +99,9 @@ ALTER TABLE harvest_workflow_executions
 ```
 
 Every lock on a hot table needs a bound in force when it runs. A timeout set
-after the lock does not count. A later `RESET lock_timeout`, `RESET ALL` or
+after the lock does not count. Each migration sets its own bound. A session
+value from an earlier migration does not count, because a migration may run
+alone on a new connection. A later `RESET lock_timeout`, `RESET ALL` or
 zero value ends the bound for the locks after it, and so does a
 `ROLLBACK TO SAVEPOINT`. `0` turns the timeout off, and so does a value under
 1 ms, because Postgres rounds it to 0.

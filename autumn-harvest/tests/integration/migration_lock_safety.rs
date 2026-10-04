@@ -529,7 +529,9 @@ fn bound_in_force(analysis: &Analysis, hit: &Hit) -> bool {
         .filter(|(k, _)| *k >= from)
         .copied()
         .collect();
-    timeout_in_force(&local, hit.at)
+    // A routine setting sits at the first body token and applies before the
+    // body runs. So it covers a lock at that token too.
+    timeout_in_force(&local, hit.at.max(from + 1))
 }
 
 /// One change to the session's `lock_timeout`.
@@ -5253,6 +5255,27 @@ fn a_quoted_label_does_not_end_a_branch() {
                NULL;\n        END \"if\";\n        SET LOCAL lock_timeout = '5s';\n    END IF;\n\
                END $$;\nALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_routine_setting_covers_a_lock_at_the_body_start() {
+    // A SQL body may start with the lock itself.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE sql SET lock_timeout = '5s' \
+               AS 'ALTER TABLE harvest_events ADD COLUMN x INT';";
+    assert_eq!(lint_with_history(&[], sql, true), [], "{sql}");
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE sql \
+               AS 'ALTER TABLE harvest_events ADD COLUMN x INT';";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_bound_from_an_earlier_migration_does_not_count() {
+    // A migration may run alone on a new connection, without the earlier SET.
+    let earlier = "SET lock_timeout = '5s';";
+    let sql = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[earlier], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
