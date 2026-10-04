@@ -550,10 +550,10 @@ diesel::table! {
         /// One operator ramp's identity, the same on every shard pool (issue
         /// #1814). NULL = no ramp, or a ramp set before the column existed.
         ramp_id -> Nullable<Uuid>,
-        /// The `ramp_id` that the ramp guard last aborted on this pool (issue
-        /// #1814). A later guard uses it to finish a partial abort. NULL = no
-        /// guard abort.
-        ramp_aborted_id -> Nullable<Uuid>,
+        /// The ramp guard's abort markers on this pool, newest first (issue
+        /// #1814). Each is `{"id": ramp_id, "base": build_id}`. A later guard
+        /// uses them to finish a partial abort.
+        ramp_aborted -> Jsonb,
     }
 }
 

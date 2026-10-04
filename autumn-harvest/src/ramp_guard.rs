@@ -371,18 +371,30 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
      GROUP BY assigned_build_id"
 }
 
+/// The number of abort markers that one policy row keeps (issue #1814).
+///
+/// A marker is needed only until its partial abort finishes. A newer abort on
+/// the same row keeps the older markers, up to this number.
+pub const MAX_ABORT_MARKERS: usize = 8;
+
 /// SQL for the compare-and-swap clear of one ramp step.
 ///
 /// The binds are the queue, the base build, the target build and the step
 /// start. The row must still hold the same step, so a verdict about an old
-/// step cannot clear a new one. The same UPDATE copies `ramp_id` to the
-/// durable abort marker `ramp_aborted_id`, so the marker commits with the
-/// clear.
+/// step cannot clear a new one. The same UPDATE adds the abort marker
+/// `{"id": ramp_id, "base": build_id}` to the front of `ramp_aborted`, so
+/// the marker commits with the clear. The list keeps the
+/// [`MAX_ABORT_MARKERS`] newest markers. A ramp with no `ramp_id` adds no
+/// marker.
 #[must_use]
 pub const fn abort_ramp_query() -> &'static str {
     "UPDATE harvest_build_policies \
-     SET ramp_aborted_id = ramp_id, ramp_id = NULL, \
-         target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
+     SET ramp_aborted = CASE WHEN ramp_id IS NULL THEN ramp_aborted ELSE \
+             jsonb_path_query_array( \
+                 jsonb_build_array(jsonb_build_object('id', ramp_id, 'base', build_id)) \
+                     || ramp_aborted, \
+                 '$[0 to 7]') END, \
+         ramp_id = NULL, target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
      WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
        AND updated_at = $4"
 }
@@ -559,7 +571,25 @@ struct PolicyRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     ramp_id: Option<uuid::Uuid>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
-    ramp_aborted_id: Option<uuid::Uuid>,
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    ramp_aborted: serde_json::Value,
+}
+
+/// Parse the abort markers of one policy row into `(base build, ramp_id)`
+/// pairs. An entry with a missing or bad field is skipped.
+#[cfg(feature = "db")]
+fn abort_markers(
+    ramp_aborted: &serde_json::Value,
+) -> impl Iterator<Item = (String, uuid::Uuid)> + '_ {
+    ramp_aborted
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let base = entry.get("base")?.as_str()?;
+            let id = entry.get("id")?.as_str()?.parse().ok()?;
+            Some((base.to_owned(), id))
+        })
 }
 
 /// Read every active ramp, its step counts and every abort marker on one pool.
@@ -585,7 +615,7 @@ async fn read_pool_ramps(
                 .map_err(crate::error::database_error)?;
             let policies: Vec<PolicyRow> = diesel::sql_query(
                 "SELECT queue_name, build_id, updated_at, target_build_id, ramp_percent, \
-                        ramp_id, ramp_aborted_id \
+                        ramp_id, ramp_aborted \
                  FROM harvest_build_policies ORDER BY queue_name",
             )
             .load(conn)
@@ -596,9 +626,10 @@ async fn read_pool_ramps(
             for policy in policies {
                 // A marker stays valid when a newer ramp is active on the
                 // same row, so read it first.
-                if let Some(aborted) = policy.ramp_aborted_id {
-                    markers.push((policy.queue_name.clone(), policy.build_id.clone(), aborted));
-                }
+                markers.extend(
+                    abort_markers(&policy.ramp_aborted)
+                        .map(|(base, id)| (policy.queue_name.clone(), base, id)),
+                );
                 let (Some(target), Some(percent)) =
                     (policy.target_build_id.clone(), policy.ramp_percent)
                 else {
@@ -718,7 +749,9 @@ pub async fn ramp_aborted_by_guard(
 
     let row: Row = diesel::sql_query(
         "SELECT EXISTS (SELECT 1 FROM harvest_build_policies \
-                        WHERE queue_name = $1 AND ramp_aborted_id = $2) AS marked",
+                        WHERE queue_name = $1 \
+                          AND ramp_aborted @> jsonb_build_array( \
+                                  jsonb_build_object('id', $2::text))) AS marked",
     )
     .bind::<Text, _>(queue)
     .bind::<diesel::sql_types::Uuid, _>(ramp_id)
@@ -746,8 +779,20 @@ async fn clear_on_pool(
     bound: Duration,
 ) -> ClearOutcome {
     let (queue, base, target) = key;
+    // A checkout that fails or times out sent nothing to the server, so it
+    // is a plain failure. Only the clear itself can be ambiguous.
+    let mut conn = match tokio::time::timeout(bound, pool.get()).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(error)) => {
+            tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard clear checkout failed");
+            return ClearOutcome::Failed;
+        }
+        Err(_) => {
+            tracing::warn!(queue = %queue, pool = index, "ramp guard clear checkout timed out");
+            return ClearOutcome::Failed;
+        }
+    };
     let clear = async {
-        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
         if abort_ramp(&mut conn, queue, base, target, step, bound)
             .await
             .map_err(|e| e.to_string())?
@@ -1525,6 +1570,24 @@ mod tests {
             "the clear pins the step"
         );
         assert!(abort_sql.contains("target_build_id = $3"));
+        // The marker list keeps exactly MAX_ABORT_MARKERS entries.
+        let slice = format!("'$[0 to {}]'", MAX_ABORT_MARKERS - 1);
+        assert!(abort_sql.contains(&slice), "the clear caps the markers");
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn abort_markers_parse_each_valid_entry() {
+        let id = uuid::Uuid::new_v4();
+        let list = serde_json::json!([
+            {"id": id.to_string(), "base": "a"},
+            {"id": "not-a-uuid", "base": "a"},
+            {"base": "a"},
+            {"id": id.to_string()},
+        ]);
+        let markers: Vec<_> = abort_markers(&list).collect();
+        assert_eq!(markers, vec![("a".to_owned(), id)]);
+        assert_eq!(abort_markers(&serde_json::json!({})).count(), 0);
     }
 
     #[cfg(feature = "db")]

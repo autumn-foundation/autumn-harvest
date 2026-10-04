@@ -29,7 +29,8 @@ Design decisions:
   every shard pool. It cannot clear a newer ramp or a newer step. A failed
   pool clear stays pending, and the next pass retries it with no new verdict.
   Each operator ramp has a `ramp_id`, the same on every pool. The clear
-  copies it to the durable marker `ramp_aborted_id` in the same UPDATE. After
+  adds it to the durable marker list `ramp_aborted` in the same UPDATE. A
+  newer abort keeps the older markers. After
   a restart, the guard matches markers to ramps by id and base build, not by
   clocks, to finish a partial clear. A clear has a server-side timeout, so it cannot commit late. After a
   cancel, a pass starts no new clear.
@@ -42,8 +43,8 @@ Design decisions:
 Migration `20261003212318_harvest_ramp_guard_outcome_index` adds the partial
 index `idx_harvest_we_ramp_guard_outcome` on `harvest_workflow_executions
 (queue_name, assigned_build_id, created_at)`. Migration
-`20261003235300_harvest_build_policy_ramp_id` adds the nullable columns
-`harvest_build_policies.ramp_id` and `ramp_aborted_id`. Neither migrates data,
+`20261003235300_harvest_build_policy_ramp_id` adds the columns
+`harvest_build_policies.ramp_id` and `ramp_aborted`. Neither migrates data,
 adds a `WorkflowEvent` variant or affects replay.
 
 `build_id` label: five families now carry the build of the worker that ran

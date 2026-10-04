@@ -1,4 +1,4 @@
--- Ramp identity and durable abort marker for the build ramp guard
+-- Ramp identity and durable abort markers for the build ramp guard
 -- (issue #1814).
 --
 -- The ramp guard clears an aborted ramp on every shard pool. A guard can stop
@@ -7,14 +7,18 @@
 -- routing stays split across pools.
 --
 -- `ramp_id` names one operator ramp. The fan-out that sets a ramp writes the
--- same id to every pool. The guard's compare-and-swap clear copies it to
--- `ramp_aborted_id` in the same UPDATE, so the marker commits with the clear.
--- A later guard finishes a ramp whose `ramp_id` matches a marker on another
--- pool. The match uses the id, not database clocks, so clock skew between
--- pools cannot clear a newer ramp or strand an old one.
+-- same id to every pool. The guard's compare-and-swap clear adds the marker
+-- `{"id": ramp_id, "base": build_id}` to `ramp_aborted` in the same UPDATE, so
+-- the marker commits with the clear. A later guard finishes a ramp whose
+-- `ramp_id` and base build match a marker on another pool. The match uses the
+-- id, not database clocks, so clock skew between pools cannot clear a newer
+-- ramp or strand an old one.
 --
--- Additive and nullable. A ramp set before this migration has no id, so the
--- guard cannot finish its partial abort after a restart.
+-- `ramp_aborted` is a list, newest first, so a newer abort on a pool keeps the
+-- older markers. The guard keeps the 8 newest.
+--
+-- Additive. A ramp set before this migration has no id, so the guard cannot
+-- finish its partial abort after a restart.
 ALTER TABLE harvest_build_policies
     ADD COLUMN IF NOT EXISTS ramp_id UUID NULL,
-    ADD COLUMN IF NOT EXISTS ramp_aborted_id UUID NULL;
+    ADD COLUMN IF NOT EXISTS ramp_aborted JSONB NOT NULL DEFAULT '[]'::jsonb;

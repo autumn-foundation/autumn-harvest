@@ -167,6 +167,8 @@ The guard fails safe: when it cannot read, it does not abort.
 - Each clear and each audit write has the same bound. A clear runs with a
   server-side `lock_timeout` and `statement_timeout`, so a slow clear fails
   and rolls back on the server. It cannot commit after the guard gave up.
+- A clear first takes a pool connection within the bound. A checkout that
+  fails sent nothing to the server, so it is a plain failed clear.
 - The client waits twice the bound for a clear. When the client still gives
   up, the outcome is unknown. A retry that then finds the row changed counts
   the change as the guard's own clear and reports it. An extra audit row is
@@ -181,8 +183,10 @@ The guard fails safe: when it cannot read, it does not abort.
 - A failed audit write logs a warning and does not undo the clear.
 - A guard keeps its pending clears in memory. Each operator ramp also has a
   `ramp_id`, which the API fan-out writes to every shard pool. Each finished
-  clear copies it to the abort marker `harvest_build_policies.ramp_aborted_id`
-  in the same `UPDATE`, so the marker cannot be lost. After a restart, a pool
+  clear adds the abort marker `{"id": ramp_id, "base": build_id}` to the
+  list `harvest_build_policies.ramp_aborted` in the same `UPDATE`, so the
+  marker cannot be lost. A newer abort on the same row keeps the older
+  markers. The list keeps the 8 newest (`MAX_ABORT_MARKERS`). After a restart, a pool
   can still hold a ramp whose `ramp_id` and base build match a marker on
   another pool. The guard then clears that ramp with no new verdict and no
   new audit row. A base-build change keeps the `ramp_id`, but the base no

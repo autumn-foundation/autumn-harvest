@@ -1195,9 +1195,9 @@ pub struct HarvestBuildPolicy {
     /// One operator ramp's identity, the same on every shard pool (issue
     /// #1814). `None` = no ramp, or a ramp set before the column existed.
     pub ramp_id: Option<Uuid>,
-    /// The `ramp_id` that the ramp guard last aborted on this pool (issue
-    /// #1814). `None` = no guard abort.
-    pub ramp_aborted_id: Option<Uuid>,
+    /// The ramp guard's abort markers on this pool, newest first (issue
+    /// #1814). Each is `{"id": ramp_id, "base": build_id}`.
+    pub ramp_aborted: serde_json::Value,
 }
 
 /// Insert struct for a new build policy.

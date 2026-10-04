@@ -1144,6 +1144,53 @@ async fn the_marker_tells_a_guard_clear_from_an_operator_clear() {
     );
 }
 
+/// A guard abort on a pool keeps the older markers of that pool. An old
+/// partial abort can therefore still finish after a newer abort there.
+#[tokio::test]
+async fn a_newer_abort_keeps_an_older_marker() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+    // The old ramp clears on pool 1 only.
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear old ramp")
+    );
+    // A newer ramp on pool 1 is aborted there too.
+    set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear new ramp")
+    );
+    assert!(
+        ramp_aborted_by_guard(&mut conn_1, QUEUE, old_id)
+            .await
+            .expect("read marker"),
+        "the old marker stays"
+    );
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the old ramp on pool 2 is finished"
+    );
+}
+
 /// A split ramp with no abort marker is not cleared.
 #[tokio::test]
 async fn a_split_ramp_without_an_abort_marker_stays() {
