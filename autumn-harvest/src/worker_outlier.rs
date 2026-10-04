@@ -258,8 +258,8 @@ pub fn outlier_dimensions(
     let peer_ratios: Vec<f64> = peers.iter().filter_map(|p| p.failure_ratio()).collect();
     if peer_ratios.len() >= min_peers {
         let median = median_f64(peer_ratios);
-        if own_ratio - median >= config.failure_ratio_margin
-            && own_ratio >= config.failure_ratio_factor * median
+        if own_ratio - median + RATIO_TOLERANCE >= config.failure_ratio_margin
+            && own_ratio + RATIO_TOLERANCE >= config.failure_ratio_factor * median
         {
             dimensions.push(OutlierDimension::FailureRatio);
         }
@@ -356,6 +356,15 @@ fn non_empty<T>(values: Vec<T>) -> Option<Vec<T>> {
     (!values.is_empty()).then_some(values)
 }
 
+/// The slack that the failure-ratio checks allow for floating-point rounding.
+///
+/// Ratios come from task counts, so a worker can sit exactly on a boundary. In
+/// floating point, 0.3 - 0.1 is just below 0.2, and the check would miss it.
+/// A window holds a few thousand tasks at most. Two distinct ratios of such
+/// windows differ by far more than this tolerance, so it never changes a real
+/// verdict.
+const RATIO_TOLERANCE: f64 = 1e-9;
+
 /// The median of a non-empty list. An even list gives the mean of the two
 /// middle values.
 fn median_f64(mut values: Vec<f64>) -> f64 {
@@ -444,6 +453,23 @@ mod tests {
         assert_eq!(outliers[0].dimensions, vec![OutlierDimension::FailureRatio]);
         assert_eq!(outliers[0].peer_median_failure_ratio, Some(0.0));
         assert_eq!(outliers[0].peer_median_p99_latency_ms, Some(40));
+    }
+
+    /// Issue #1815: a worker exactly on the failure-ratio boundary is
+    /// flagged. In floating point, 0.3 - 0.1 falls just short of 0.2.
+    #[test]
+    fn a_worker_exactly_on_the_failure_margin_is_flagged() {
+        let config = OutlierConfig::default();
+        let peers = [stats(100, 10, 40), stats(100, 10, 40)];
+        assert_eq!(
+            outlier_dimensions(&stats(100, 30, 40), &peers, &config),
+            vec![OutlierDimension::FailureRatio]
+        );
+        // Just under the boundary is not flagged.
+        assert_eq!(
+            outlier_dimensions(&stats(100, 29, 40), &peers, &config),
+            Vec::new()
+        );
     }
 
     #[test]
