@@ -842,6 +842,11 @@ fn lex(
                 lex(&body, start_line, depth + 1, runs, toks, comments);
                 continue;
             }
+            if quote == '\'' && function_body_follows(toks, depth) {
+                let body: Vec<char> = value.chars().collect();
+                lex(&body, start_line, depth + 1, false, toks, comments);
+                continue;
+            }
             toks.push(Token {
                 tok: if quote == '"' {
                     Tok::Word(value.replace('.', &QUOTED_DOT.to_string()))
@@ -1615,10 +1620,15 @@ fn changes_search_path(s: &Stmts, k: usize) -> bool {
     let set =
         s.is(k, "set") && (s.is(k + 1 + scope, "search_path") || s.is(k + 1 + scope, "schema"));
     let reset = s.is(k, "reset") && (s.is(k + 1, "search_path") || s.is(k + 1, "all"));
-    let call = (k..s.end(k)).any(|j| s.is(j, "set_config"))
-        && (k..s.end(k)).any(|j| {
-            matches!(&s.toks[j].tok, Tok::Str(v) if v.trim().eq_ignore_ascii_case("search_path"))
-        });
+    // A call counts when it names `search_path`, or when its name is not one
+    // plain literal, which may be `search_path` too.
+    let call = (k..s.end(k)).any(|j| {
+        s.is(j, "set_config")
+            && s.is_punct(j + 1, '(')
+            && (!(s.string(j + 2).is_some() && s.is_punct(j + 3, ','))
+                || s.string(j + 2)
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("search_path")))
+    });
     set || reset || call
 }
 
@@ -3778,6 +3788,8 @@ fn a_search_path_change_ends_an_unqualified_exemption() {
         "RESET search_path;",
         "RESET ALL;",
         "SELECT set_config('search_path', 'public', false);",
+        // A computed name may be `search_path`.
+        "SELECT set_config('search_' || 'path', 'public', false);",
         // `SET SCHEMA` is an alias of `SET search_path`.
         "SET SCHEMA 'public';",
     ] {
@@ -4242,10 +4254,18 @@ fn a_computed_set_config_name_may_clear() {
 #[test]
 fn a_single_quoted_function_body_is_scanned() {
     // Its locks count, as in a dollar-quoted body.
-    let sql = "CREATE FUNCTION f() RETURNS void AS \
-               'BEGIN ALTER TABLE harvest_events ADD COLUMN x INT; END' LANGUAGE plpgsql;";
-    let findings = lint_with_history(&[], sql, true);
-    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    for quote in ["", "E", "U&"] {
+        let sql = format!(
+            "CREATE FUNCTION f() RETURNS void AS \
+             {quote}'BEGIN ALTER TABLE harvest_events ADD COLUMN x INT; END' LANGUAGE plpgsql;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{quote}: {findings:?}"
+        );
+    }
 }
 
 #[test]
