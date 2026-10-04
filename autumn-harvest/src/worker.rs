@@ -33696,8 +33696,9 @@ impl Worker {
     ///
     /// One keeper task for each pool refreshes `last_heartbeat_at` at the
     /// heartbeat interval. A stalled shard pool therefore cannot stop the
-    /// refresh of another shard. Each keeper stops when the last dispatch body
-    /// ends. It also stops when the process exits, and orphan reclaim then
+    /// refresh of another shard. Each refresh has its own limit, from
+    /// [`lease_refresh_bound`], so a slow pool cannot let the lease expire.
+    /// Each keeper stops when the last dispatch body ends. It also stops when the process exits, and orphan reclaim then
     /// recovers the task.
     fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
         if self.dispatched.is_empty() {
@@ -33709,6 +33710,7 @@ impl Worker {
             "drain ended with handlers still running; the worker keeps its lease until they return"
         );
         let interval = self.config.worker_heartbeat_interval;
+        let bound = lease_refresh_bound(interval);
         // One task for each pool, so a stalled shard pool cannot stop the
         // refresh of another shard. Detached on purpose: the handlers they
         // guard are detached too.
@@ -33724,20 +33726,21 @@ impl Worker {
                         biased;
                         () = &mut done => return,
                         _ = tick.tick() => {
-                            let touched = match crate::pool::acquire_within_pool_bound(&pool).await {
-                                Ok(mut conn) => {
-                                    crate::workers::touch_worker_liveness(&mut conn, &worker_id)
-                                        .await
-                                }
-                                Err(error) => Err(error),
+                            let touched = tokio::time::timeout(bound, async {
+                                let mut conn = crate::pool::acquire(&pool, bound).await?;
+                                crate::workers::touch_worker_liveness(&mut conn, &worker_id).await
+                            })
+                            .await;
+                            let error = match touched {
+                                Ok(Ok(_)) => continue,
+                                Ok(Err(error)) => error.to_string(),
+                                Err(_elapsed) => format!("timed out after {bound:?}"),
                             };
-                            if let Err(error) = touched {
-                                tracing::warn!(
-                                    worker_id = %worker_id,
-                                    %error,
-                                    "failed to keep the worker lease for a drained handler"
-                                );
-                            }
+                            tracing::warn!(
+                                worker_id = %worker_id,
+                                %error,
+                                "failed to keep the worker lease for a drained handler"
+                            );
                         }
                     }
                 }
@@ -33775,6 +33778,16 @@ fn drain_cancel_at(
     deadline
         .checked_sub(join_window.min(drain / 2))
         .map_or(started, |at| at.max(started))
+}
+
+/// The time limit for one lease refresh after a drain (issue #1813).
+///
+/// Orphan reclaim sees a worker as dead after two heartbeat intervals. A
+/// refresh starts one interval after the last one. It must therefore end
+/// within the next interval, with a margin. The pool acquire bound can be 30
+/// seconds, so it cannot serve as this limit.
+fn lease_refresh_bound(heartbeat_interval: Duration) -> Duration {
+    heartbeat_interval / 2
 }
 
 // ---------------------------------------------------------------------------
@@ -38208,6 +38221,17 @@ mod tests {
             drain_cancel_at(start, deadline, Duration::from_secs(5)),
             start
         );
+    }
+
+    /// A lease refresh ends well inside the stale window, also on a stalled
+    /// pool (issue #1813).
+    #[test]
+    fn lease_refresh_bound_ends_inside_the_stale_window() {
+        for interval in [Duration::from_secs(1), Duration::from_secs(5)] {
+            let bound = lease_refresh_bound(interval);
+            assert!(bound < interval);
+            assert!(interval + bound < interval * 2);
+        }
     }
 
     #[test]
