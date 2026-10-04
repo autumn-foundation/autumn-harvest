@@ -1,8 +1,8 @@
 //! Guards for the optional SLO burn-rate pack (issue #1816).
 //!
-//! `promtool` proves the rules load and fire. These tests pin the shape that
-//! `promtool` cannot see: the Workbook burn-rate pairs, a fixture for each
-//! alert, catalogued metrics, live runbook links, the CI step, and the docs.
+//! `promtool` proves the rules load and fire. These tests pin what
+//! `promtool` cannot see. That is the Workbook burn-rate pairs, a fixture
+//! for each alert, the metric names, the runbook links, CI, and the docs.
 
 use serde_yaml::Value;
 use std::collections::BTreeSet;
