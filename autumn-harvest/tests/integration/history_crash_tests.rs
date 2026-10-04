@@ -11,7 +11,7 @@
 //!
 //! The test records each request as a Jepsen operation. A request with no
 //! clear outcome is an `info` operation, which may or may not have taken
-//! effect. After the crashes stop and every client connection is closed,
+//! effect. After the crashes stop and every client closes its connection,
 //! the test reads the final state. [`crate::history_checker`] then checks
 //! that one real-time order of the history satisfies the guarantee.
 //!
@@ -20,7 +20,9 @@
 //! - Exactly-once schedule fires (issue #350): a schedule slot gets exactly
 //!   one run through crashes and recovery.
 //!
-//! Set `HISTORY_SEED` to replay one seed. Each failure prints its seed.
+//! Set `HISTORY_SEED` to replay the random choices of a run. Each failure
+//! prints its seed. The thread timing can still differ, so a replay is not
+//! exact.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,12 +60,30 @@ async fn history_noop(
     Ok(serde_json::json!("ok"))
 }
 
-/// A fresh migrated Postgres 16 container, or `HARVEST_TEST_DATABASE_URL`.
-/// Each test uses unique names, so a shared database is safe.
+/// A database that this test alone uses. A scheduler tick fires every due
+/// schedule in its database, so a shared database is not safe. With
+/// `HARVEST_TEST_DATABASE_URL` set, the test creates a throwaway database on
+/// that server. Otherwise it starts a Postgres 16 container.
 async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
     use testcontainers::ImageExt;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+    if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        let name = format!("harvest_history_{}", Uuid::new_v4().simple());
+        let mut admin = AsyncPgConnection::establish(&admin_url)
+            .await
+            .expect("HARVEST_TEST_DATABASE_URL must be reachable");
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .await
+            .expect("create a throwaway database");
+        let prefix = admin_url
+            .rsplit_once('/')
+            .map_or(admin_url.as_str(), |(p, _)| p);
+        let url = format!("{prefix}/{name}");
+        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        conn.batch_execute(&autumn_harvest::test_init_sql())
+            .await
+            .expect("migration");
         return (url, None);
     }
     let container = Postgres::default()
@@ -95,12 +115,15 @@ fn tagged(url: &str, app: &str) -> String {
     format!("{url}{sep}application_name={app}")
 }
 
-/// Terminate the backends of `app` at random moments until `stop` is set.
+/// Terminate one busy backend of `app` at random moments until `stop` is
+/// set. A pause before each strike is a random value in `pause_ms`. Only a
+/// busy backend is a target, so each kill lands in the middle of a request.
 /// Returns how many backends it terminated.
 fn spawn_killer(
     url: String,
     app: &'static str,
     seed: u64,
+    pause_ms: std::ops::Range<u64>,
     stop: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<i64> {
     tokio::spawn(async move {
@@ -113,10 +136,12 @@ fn spawn_killer(
         let mut conn = AsyncPgConnection::establish(&url).await.expect("killer");
         let mut total = 0;
         while !AtomicBool::load(&stop, Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(rng.gen_range(30..120))).await;
+            tokio::time::sleep(Duration::from_millis(rng.gen_range(pause_ms.clone()))).await;
             total += diesel::sql_query(
-                "SELECT COUNT(pg_terminate_backend(pid))::bigint AS n \
-                 FROM pg_stat_activity WHERE application_name = $1",
+                "SELECT COUNT(pg_terminate_backend(pid))::bigint AS n FROM ( \
+                   SELECT pid FROM pg_stat_activity \
+                   WHERE application_name = $1 AND state IS DISTINCT FROM 'idle' \
+                   ORDER BY random() LIMIT 1) busy",
             )
             .bind::<Text, _>(app)
             .get_result::<Killed>(&mut conn)
@@ -128,32 +153,43 @@ fn spawn_killer(
     })
 }
 
-/// Wait until no backend of `app` has work in flight. A request that a
-/// client dropped can still run on the server, so a read must wait for it.
-/// An idle pooled connection has no open transaction, so it does not count.
+/// Wait until no backend of `app` is left. A request that a client dropped
+/// can still run on the server, so a read must wait for it.
+///
+/// First the busy backends must finish. Then the test terminates the idle
+/// ones, because a pooled session can still hold an unread statement in its
+/// socket. A terminated backend never runs that statement.
 async fn wait_for_quiescence(url: &str, app: &str) {
     #[derive(diesel::QueryableByName)]
-    struct Open {
+    struct Count {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         n: i64,
     }
     let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
-    for _ in 0..500 {
-        let open = diesel::sql_query(
-            "SELECT COUNT(*)::bigint AS n FROM pg_stat_activity \
-             WHERE application_name = $1 AND state IS DISTINCT FROM 'idle'",
-        )
-        .bind::<Text, _>(app)
-        .get_result::<Open>(&mut conn)
-        .await
-        .expect("count backends")
-        .n;
-        if open == 0 {
-            return;
+    let busy = "SELECT COUNT(*)::bigint AS n FROM pg_stat_activity \
+                WHERE application_name = $1 AND state IS DISTINCT FROM 'idle'";
+    let close_idle = "SELECT COUNT(pg_terminate_backend(pid))::bigint AS n \
+                      FROM pg_stat_activity WHERE application_name = $1";
+    let left = "SELECT COUNT(*)::bigint AS n FROM pg_stat_activity \
+                WHERE application_name = $1";
+    for sql in [busy, close_idle, left] {
+        for attempt in 0.. {
+            let n = diesel::sql_query(sql)
+                .bind::<Text, _>(app)
+                .get_result::<Count>(&mut conn)
+                .await
+                .expect("query backends")
+                .n;
+            if sql == close_idle || n == 0 {
+                break;
+            }
+            assert!(
+                attempt < 500,
+                "backends of {app} are still open after 10 seconds"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("backends of {app} are still busy after 10 seconds");
 }
 
 /// The ids of every run that `sql` selects for `key`.
@@ -252,7 +288,7 @@ async fn start_idempotency_history_is_linearizable_under_crashes() {
     let run = Uuid::new_v4().simple().to_string();
     let history = Arc::new(Recorder::<StartInput, StartOutput>::new());
     let stop = Arc::new(AtomicBool::new(false));
-    let killer_task = spawn_killer(url.clone(), APP, seed, Arc::clone(&stop));
+    let killer_task = spawn_killer(url.clone(), APP, seed, 3..15, Arc::clone(&stop));
 
     let mut clients = Vec::new();
     for process in 0..KEYS * CLIENTS {
@@ -263,8 +299,15 @@ async fn start_idempotency_history_is_linearizable_under_crashes() {
             let name = format!("hist_{run}_{}", process % KEYS);
             let mut conn = None;
             for request in 0..REQUESTS {
-                while conn.is_none() {
+                for attempt in 0.. {
+                    if conn.is_some() {
+                        break;
+                    }
+                    assert!(attempt < 400, "client {process} cannot connect");
                     conn = AsyncPgConnection::establish(&url).await.ok();
+                    if conn.is_none() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
                 }
                 let Some(c) = conn.as_mut() else { continue };
                 let exec = ExecutionId::new_for_shard(ShardId::new(0));
@@ -276,7 +319,7 @@ async fn start_idempotency_history_is_linearizable_under_crashes() {
                         candidate: exec.as_uuid(),
                     },
                 );
-                let budget = Duration::from_millis(rng.gen_range(1..400));
+                let budget = Duration::from_millis(rng.gen_range(1..250));
                 let out = tokio::time::timeout(
                     budget,
                     start_or_load_workflow_execution_idempotent(
@@ -312,6 +355,8 @@ async fn start_idempotency_history_is_linearizable_under_crashes() {
     stop.store(true, Ordering::SeqCst);
     let terminated = killer_task.await.expect("killer task");
     wait_for_quiescence(&url, APP).await;
+    // Nothing a crashed request started can still run, so bound them.
+    history.bound_open_infos();
 
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     for k in 0..KEYS {
@@ -334,6 +379,10 @@ async fn start_idempotency_history_is_linearizable_under_crashes() {
     assert!(
         info > 0,
         "no request crashed, so the run proves nothing; {context}"
+    );
+    assert!(
+        terminated > 0,
+        "no backend was terminated mid-request; {context}"
     );
     let dedups = history
         .iter()
@@ -437,7 +486,14 @@ async fn schedule_fire_history_is_exactly_once_under_crashes() {
         }
         let keys: Arc<Vec<String>> = Arc::new(schedules.iter().map(Uuid::to_string).collect());
         let stop = Arc::new(AtomicBool::new(false));
-        let killer = spawn_killer(url.clone(), APP, seed ^ round as u64, Arc::clone(&stop));
+        // Ticks are short, so this killer strikes more often.
+        let killer = spawn_killer(
+            url.clone(),
+            APP,
+            seed ^ round as u64,
+            10..40,
+            Arc::clone(&stop),
+        );
         let mut replicas = Vec::new();
         for replica in 0..REPLICAS {
             let pool = make_pool(&tagged(&url, APP));
@@ -446,28 +502,38 @@ async fn schedule_fire_history_is_exactly_once_under_crashes() {
                 Arc::clone(&history),
                 Arc::clone(&keys),
             );
-            // Replica 0 always crashes early. `tick_once` logs some errors
-            // and returns `Ok`, so a terminated backend alone may not show.
-            let limit = if replica == 0 { 20 } else { 1500 };
-            let budget = Duration::from_millis(rng.gen_range(1..limit));
+            // Replica 0 always crashes early. The others tick again and again
+            // until the budget ends, so a tick after a kill can still fire.
+            // The tick that the budget cuts off is a crash.
+            let budget = if replica == 0 {
+                rng.gen_range(1..20)
+            } else {
+                rng.gen_range(300..1500)
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
             replicas.push(tokio::spawn(async move {
-                let ops: Vec<_> = keys
-                    .iter()
-                    .map(|k| history.invoke(replica, k.clone(), FireInput::Fire))
-                    .collect();
-                let tick = tick_once(
-                    pool,
-                    registry,
-                    Arc::new(DagCatalog::default()),
-                    Arc::new(vec![]),
-                    SchedulerMonitor::offline(),
-                );
-                let ok = matches!(tokio::time::timeout(budget, tick).await, Ok(Ok(())));
-                for op in ops {
-                    if ok {
-                        history.ok(op, FireOutput::Ticked);
-                    } else {
-                        history.info(op);
+                loop {
+                    let ops: Vec<_> = keys
+                        .iter()
+                        .map(|k| history.invoke(replica, k.clone(), FireInput::Fire))
+                        .collect();
+                    let tick = tick_once(
+                        pool.clone(),
+                        Arc::clone(&registry),
+                        Arc::new(DagCatalog::default()),
+                        Arc::new(vec![]),
+                        SchedulerMonitor::offline(),
+                    );
+                    let ok = matches!(tokio::time::timeout_at(deadline, tick).await, Ok(Ok(())));
+                    for op in ops {
+                        if ok {
+                            history.ok(op, FireOutput::Ticked);
+                        } else {
+                            history.info(op);
+                        }
+                    }
+                    if !ok || tokio::time::Instant::now() >= deadline {
+                        break;
                     }
                 }
             }));
@@ -478,6 +544,8 @@ async fn schedule_fire_history_is_exactly_once_under_crashes() {
         stop.store(true, Ordering::SeqCst);
         terminated += killer.await.expect("killer task");
         wait_for_quiescence(&url, APP).await;
+        // Nothing a crashed tick started can still run, so bound them.
+        history.bound_open_infos();
 
         for (n, key) in keys.iter().enumerate() {
             let op = history.invoke(usize::MAX, key.clone(), FireInput::Read);
@@ -527,6 +595,10 @@ async fn schedule_fire_history_is_exactly_once_under_crashes() {
     assert!(
         info > 0,
         "no tick crashed, so the run proves nothing; {context}"
+    );
+    assert!(
+        terminated > 0,
+        "no backend was terminated mid-tick; {context}"
     );
     eprintln!("schedule fire history: {context}");
 }

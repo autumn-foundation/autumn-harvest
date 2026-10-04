@@ -372,8 +372,8 @@ cargo test -p autumn-harvest --features chaos --test integration \
 
 ## History checks (issue #1829)
 
-The crash tests also record client histories and check them for
-linearizability. `tests/integration/history_checker.rs` holds the checker.
+Two chaos reproducers and a crash suite record client histories and check
+them for linearizability. `tests/integration/history_checker.rs` holds the checker.
 It follows Porcupine: a search for one real-time order that a sequential
 model accepts, done per key. An operation with no clear outcome after a
 crash is an `info` operation, as in Jepsen. It may or may not have taken
@@ -386,13 +386,25 @@ effect.
   it drops request futures and calls `pg_terminate_backend` at random.
   Idempotent starts must satisfy `StartIdempotency`. Scheduler replicas
   must satisfy `ExactlyOnceFire`. The suite needs only the `db` feature, so
-  CI runs it on each change. Set `HISTORY_SEED` to replay a printed seed.
+  the `test-db-linux` job runs it on each change. That job is not a required
+  check yet. Set `HISTORY_SEED` to replay the random choices of a printed
+  seed. The thread timing can still differ.
+
+A crashed operation has no known outcome, so it may take effect at any
+later time. When the test knows that nothing a crash started can still run,
+it calls `Recorder::bound_open_infos`. A later read then constrains the
+crashed operations. Each suite calls it after the server has no session of
+the test left. The chaos reproducers call it after the killed task joins.
+
+The convergence sweep does not record a history. It drives workflow tasks,
+not starts or schedule fires.
 
 The checker self-tests feed it forged violations: two creators, a read of
-two runs, a real-time inversion, a lost fire and a replaced run.
+two runs, a real-time inversion, a lost fire, a replaced run, and a crashed
+fire that takes effect after its bound.
 
 ## Out of scope
 
-Production/runtime chaos (#796), Jepsen / Antithesis-style model checking, DAG
+Production/runtime chaos (#796), Antithesis-style deterministic simulation, DAG
 what-if simulation, and *fixing* any new bug the harness surfaces — new bugs
 are filed and fixed separately.

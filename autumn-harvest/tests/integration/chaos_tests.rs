@@ -966,6 +966,8 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
 // `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
 // end-of-scope; see `DB_BODY_SERIAL`.
 #[allow(clippy::significant_drop_tightening)]
+// Issue #1829: the history check pushed this test one line over the limit.
+#[allow(clippy::too_many_lines)]
 async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     let (_body, url, _c) = chaos_db().await;
     let wf = "chaos_sched_350";
@@ -1003,6 +1005,8 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     let diag = guard.diagnostics();
     drop(guard);
     history.info(crashed_fire);
+    // The killed tick has joined, so it can no longer take effect.
+    history.bound_open_infos();
     record_read(&history, &url, &key, wf, FireInput::Read).await;
 
     // The crash left the claim held (committed in autocommit) with no fire.
@@ -1144,6 +1148,8 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     let diag = guard.diagnostics();
     drop(guard);
     history.info(crashed_fire);
+    // The killed tick has joined, so it can no longer take effect.
+    history.bound_open_infos();
     record_read(&history, &url, &key, wf, FireInput::Read).await;
 
     // The crash committed exactly one start (the point fires AFTER the start), but

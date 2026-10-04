@@ -45,6 +45,10 @@ pub trait Model {
     /// model rejects the step. The checker already treats an `info`
     /// operation as one that may never have happened, so a model need not
     /// return the unchanged state for it.
+    ///
+    /// The checker places an `ok` step that leaves the state unchanged at
+    /// once, with no search. That is valid only if the same step, in a later
+    /// state, is also unchanged or is rejected. Both models here obey it.
     fn step(
         &self,
         state: &Self::State,
@@ -75,8 +79,9 @@ pub struct Operation<I, O> {
     pub input: I,
     /// The logical time of the invocation.
     pub invoked: u64,
-    /// The logical time of the completion. `None` until it completes, and
-    /// for an `info` operation.
+    /// The logical time of the completion. `None` until it completes. For
+    /// an `info` operation it is a bound: after this time the operation can
+    /// no longer take effect. `None` means no bound is known.
     pub completed: Option<u64>,
     /// The completion. `None` until it completes.
     pub outcome: Option<Outcome<O>>,
@@ -161,6 +166,22 @@ impl<I: Clone + Debug, O: Clone + Debug> Recorder<I, O> {
         self.complete(pending, Outcome::Info);
     }
 
+    /// Bound every open `info` operation at the current time.
+    ///
+    /// Call it only when nothing those operations started can still run,
+    /// for example after the test waits until the server has no busy
+    /// session. A later read then constrains them.
+    pub fn bound_open_infos(&self) {
+        let mut ops = self.ops.lock().unwrap();
+        let now = self.tick();
+        for op in ops.iter_mut() {
+            if matches!(op.outcome, Some(Outcome::Info)) && op.completed.is_none() {
+                op.completed = Some(now);
+            }
+        }
+        drop(ops);
+    }
+
     /// A copy of the history. An operation still in flight counts as `info`.
     #[must_use]
     pub fn snapshot(&self) -> Vec<Operation<I, O>> {
@@ -239,7 +260,8 @@ pub fn check<M: Model>(
 struct Search<'a, M: Model> {
     model: &'a M,
     ops: &'a [Operation<M::Input, M::Output>],
-    /// The number of operations that are not `info`. Each must be placed.
+    /// The number of operations that are not `info`. The search must place
+    /// each one.
     required: usize,
     seen: HashSet<(Vec<u64>, M::State)>,
 }
@@ -254,25 +276,42 @@ impl<M: Model> Search<'_, M> {
             return false;
         }
         let is_done = |i: usize| done[i / 64] & (1 << (i % 64)) != 0;
+        let is_info = |i: usize| matches!(self.ops[i].outcome, Some(Outcome::Info));
         // An operation can go next only if no open operation completed
-        // before it was invoked. An `info` operation never completes.
+        // before its invocation. An `info` operation may never happen, so
+        // its bound does not hold back other operations.
         let deadline = (0..self.ops.len())
-            .filter(|&i| !is_done(i))
+            .filter(|&i| !is_done(i) && !is_info(i))
             .filter_map(|i| self.ops[i].completed)
             .min()
             .unwrap_or(u64::MAX);
+        // The latest invocation already placed. A bounded `info` operation
+        // cannot take effect after an operation invoked past its bound.
+        let latest = (0..self.ops.len())
+            .filter(|&i| is_done(i))
+            .map(|i| self.ops[i].invoked)
+            .max();
         for i in 0..self.ops.len() {
-            if is_done(i) || self.ops[i].invoked > deadline {
+            let op = &self.ops[i];
+            if is_done(i) || op.invoked > deadline {
                 continue;
             }
-            let op = &self.ops[i];
             let (output, info) = match &op.outcome {
                 Some(Outcome::Ok(output)) => (Some(output), false),
                 _ => (None, true),
             };
+            if info && op.completed.is_some_and(|bound| latest > Some(bound)) {
+                continue;
+            }
             let mut next_done = done.to_vec();
             next_done[i / 64] |= 1 << (i % 64);
-            for next in self.model.step(state, &op.input, output) {
+            let nexts = self.model.step(state, &op.input, output);
+            // A minimal `ok` step that changes nothing can go first in any
+            // valid order (see `Model::step`), so it needs no branch.
+            if !info && nexts.len() == 1 && nexts[0] == *state {
+                return self.linearize(&next_done, state, count + 1);
+            }
+            for next in nexts {
                 if info && next == *state {
                     continue;
                 }
@@ -323,7 +362,8 @@ pub enum StartOutput {
 }
 
 /// Start idempotency: one key creates at most one run, and every response
-/// names that run.
+/// names that run. A fresh run must carry the candidate id of its request.
+/// A read must return the run ids sorted and without duplicates.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StartIdempotency;
 
@@ -399,7 +439,8 @@ pub enum SlotState {
 }
 
 /// Exactly-once schedule fires: a slot gets at most one run, the run never
-/// changes, and after recovery the slot has fired.
+/// changes, and after recovery the slot has fired. A read must return the
+/// run ids without duplicates.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExactlyOnceFire;
 
@@ -499,7 +540,7 @@ mod tests {
         assert!(check(&StartIdempotency, &h.snapshot()).is_err());
     }
 
-    /// A dedup completes before the creator is invoked. No order puts the
+    /// A dedup completes before the invocation of the creator. No order puts the
     /// creator first, so the history is not linearizable.
     #[test]
     fn a_real_time_inversion_is_rejected() {
@@ -585,6 +626,48 @@ mod tests {
         assert!(check(&ExactlyOnceFire, &h.snapshot()).is_ok());
     }
 
+    /// A crashed fire that has stopped cannot take effect later. Once the
+    /// test bounds it, a run that appears after an empty read is a
+    /// violation.
+    #[test]
+    fn a_bounded_info_operation_cannot_take_effect_after_a_later_read() {
+        let h = Recorder::new();
+        let crash = h.invoke(0, "s", FireInput::Fire);
+        h.info(crash);
+        h.bound_open_infos();
+        let r = h.invoke(1, "s", FireInput::Read);
+        h.ok(r, FireOutput::Read(vec![]));
+        let f = h.invoke(1, "s", FireInput::FinalRead);
+        h.ok(f, FireOutput::Read(vec![id(1)]));
+        assert!(check(&ExactlyOnceFire, &h.snapshot()).is_err());
+    }
+
+    /// Without the bound the crashed fire may still be running, so the same
+    /// history is valid.
+    #[test]
+    fn an_unbounded_info_operation_may_take_effect_after_a_later_read() {
+        let h = Recorder::new();
+        let crash = h.invoke(0, "s", FireInput::Fire);
+        h.info(crash);
+        let r = h.invoke(1, "s", FireInput::Read);
+        h.ok(r, FireOutput::Read(vec![]));
+        let f = h.invoke(1, "s", FireInput::FinalRead);
+        h.ok(f, FireOutput::Read(vec![id(1)]));
+        assert!(check(&ExactlyOnceFire, &h.snapshot()).is_ok());
+    }
+
+    /// A bounded crash may still have taken effect before its bound.
+    #[test]
+    fn a_bounded_info_operation_may_take_effect_before_its_bound() {
+        let h = Recorder::new();
+        let crash = h.invoke(0, "s", FireInput::Fire);
+        h.info(crash);
+        h.bound_open_infos();
+        let f = h.invoke(1, "s", FireInput::FinalRead);
+        h.ok(f, FireOutput::Read(vec![id(1)]));
+        assert!(check(&ExactlyOnceFire, &h.snapshot()).is_ok());
+    }
+
     #[test]
     fn a_double_fire_is_rejected() {
         let h = Recorder::new();
@@ -629,6 +712,26 @@ mod tests {
 
     /// The search must stay fast on a crash-heavy history. Forty concurrent
     /// `info` starts give a large search space without memoization.
+    /// Many concurrent dedups change nothing. On a violation the search
+    /// must not try each subset of them.
+    #[test]
+    fn a_violation_among_many_concurrent_dedups_checks_quickly() {
+        let h = Recorder::new();
+        let a = h.invoke(0, "k", start(1));
+        h.ok(a, StartOutput::Started(id(1)));
+        let pending: Vec<_> = (0..24)
+            .map(|n| h.invoke(n + 1, "k", start(n as u128 + 10)))
+            .collect();
+        let r = h.invoke(99, "k", StartInput::Read);
+        for p in pending {
+            h.ok(p, StartOutput::Deduplicated(id(1)));
+        }
+        h.ok(r, StartOutput::Read(vec![id(2)]));
+        let begin = std::time::Instant::now();
+        assert!(check(&StartIdempotency, &h.snapshot()).is_err());
+        assert!(begin.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[test]
     fn many_concurrent_info_operations_check_quickly() {
         let h = Recorder::new();

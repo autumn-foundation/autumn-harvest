@@ -34,9 +34,8 @@
 //! # Isolation
 //!
 //! The orphan scan is global, so each case starts on empty engine tables.
-//! The test owns its database, as every container-backed suite does. With
-//! `HARVEST_TEST_DATABASE_URL` set, point it at a database that nothing else
-//! uses, because each case truncates the tables.
+//! The test therefore owns its database: a container, or a throwaway
+//! database on the `HARVEST_TEST_DATABASE_URL` server.
 
 #[path = "../property/prop_config.rs"]
 mod prop_config;
@@ -166,17 +165,22 @@ fn motif() -> impl Strategy<Value = Vec<Op>> {
             Op::Reclaim,
             Op::ReviveWorker { worker },
         ]),
-        // A held claim heartbeats and completes. The run is then terminal.
+        // A held claim heartbeats and completes. The run is then terminal,
+        // and the claim is stale.
         (0..SLOTS, 0..WORKERS).prop_map(move |(slot, worker)| vec![
             start(slot),
             Op::Claim { worker },
             Op::Heartbeat { worker, claim: 0 },
             Op::Complete { worker, claim: 0 },
             Op::Signal { slot, pick: 0 },
+            Op::Cancel { slot, pick: 0 },
+            Op::Heartbeat { worker, claim: 0 },
         ]),
-        // A cancelled run rejects a signal. A failed-only start replaces it.
+        // A cancel of a cancelled run is a no-op, and the run rejects a
+        // signal. A failed-only start replaces it.
         (0..SLOTS).prop_map(move |slot| vec![
             start(slot),
+            Op::Cancel { slot, pick: 0 },
             Op::Cancel { slot, pick: 0 },
             Op::Signal { slot, pick: 0 },
             Op::Start {
@@ -291,6 +295,8 @@ struct Run {
     state: WorkflowState,
     task: Task,
     signals: i64,
+    /// The lifecycle event types of the run, in history order.
+    events: Vec<&'static str>,
 }
 
 /// What a worker client believes it holds. It can be stale.
@@ -309,6 +315,8 @@ struct Model {
     held: [Vec<Held>; WORKERS],
     /// The case clock in milliseconds. The runner sets it before each step.
     now: i64,
+    /// Tasks that the orphan reclaim sent to the dead-letter queue.
+    dead_letters: i64,
 }
 
 impl Model {
@@ -362,6 +370,7 @@ impl Model {
                 due,
             },
             signals: 0,
+            events: vec!["WorkflowStarted"],
         });
         self.runs.len() - 1
     }
@@ -369,6 +378,7 @@ impl Model {
     /// Cancel moves the run to `CANCELLED` and fails its open task.
     fn cancel(&mut self, run: usize) {
         self.transition(run, WorkflowState::Cancelled);
+        self.runs[run].events.push("WorkflowCancelled");
         self.fail_open_task(run);
     }
 
@@ -479,13 +489,14 @@ impl Model {
     /// A worker parks only a task it holds. A wake that raced the park makes
     /// the engine re-wake the task at once.
     fn park(&mut self, worker: usize, claim: usize) -> Res {
-        let Some((index, held)) = self.claim_of(worker, claim) else {
+        let Some((_, held)) = self.claim_of(worker, claim) else {
             return Res::Skipped;
         };
+        // The engine parks only inside the persist transaction, after it
+        // locks and checks the claim. A stale claim never reaches a park.
         if !self.holds(worker, held, false) {
             return Res::Skipped;
         }
-        self.held[worker].remove(index);
         let task = &mut self.runs[held.run].task;
         let had_wake = task.wake_requested;
         task.worker = None;
@@ -513,14 +524,15 @@ impl Model {
     }
 
     fn complete(&mut self, worker: usize, claim: usize) -> Res {
-        let Some((index, held)) = self.claim_of(worker, claim) else {
+        let Some((_, held)) = self.claim_of(worker, claim) else {
             return Res::Skipped;
         };
         if !self.holds(worker, held, true) {
             return Res::ClaimAmbiguous;
         }
-        self.held[worker].remove(index);
+        // The worker keeps the claim, so a later use of it is stale.
         self.transition(held.run, WorkflowState::Completed);
+        self.runs[held.run].events.push("WorkflowCompleted");
         self.runs[held.run].task.state = TaskState::Completed;
         Res::Ok
     }
@@ -573,9 +585,11 @@ impl Model {
             self.runs[run].task.strikes = strikes;
             if strikes >= STRIKE_THRESHOLD {
                 quarantined += 1;
+                self.dead_letters += 1;
                 self.runs[run].task.state = TaskState::Failed;
                 if self.runs[run].state == WorkflowState::Running {
                     self.transition(run, WorkflowState::Failed);
+                    self.runs[run].events.push("WorkflowFailed");
                 }
             } else {
                 requeued += 1;
@@ -719,6 +733,7 @@ async fn apply_db(
             }
         }
         Op::Claim { worker } => {
+            let due = due_tasks(conn, &case.queue).await?;
             let task = autumn_harvest::queue::claim_task(
                 conn,
                 std::slice::from_ref(&case.queue),
@@ -730,6 +745,15 @@ async fn apply_db(
             )
             .await
             .map_err(fail)?;
+            if let Some(task) = &task {
+                let earliest = due.iter().map(|(_, at)| *at).min();
+                let claimed = due.iter().find(|(id, _)| *id == task.id).map(|(_, at)| *at);
+                if claimed.is_none() || claimed != earliest {
+                    return Err(format!(
+                        "the claim took a task due at {claimed:?}, but the earliest is {earliest:?}"
+                    ));
+                }
+            }
             let run = match task {
                 None => None,
                 Some(task) => {
@@ -917,6 +941,29 @@ fn apply_model(model: &mut Model, op: Op, db: &Res) -> Res {
     }
 }
 
+/// The pending tasks of `queue` that are due, with their `scheduled_at`.
+async fn due_tasks(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+) -> Result<Vec<(Uuid, chrono::DateTime<chrono::Utc>)>, String> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = SqlUuid)]
+        id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        scheduled_at: chrono::DateTime<chrono::Utc>,
+    }
+    diesel::sql_query(
+        "SELECT id, scheduled_at FROM harvest_task_queue \
+         WHERE queue_name = $1 AND state = 'PENDING' AND scheduled_at <= NOW()",
+    )
+    .bind::<Text, _>(queue)
+    .load::<Row>(conn)
+    .await
+    .map(|rows| rows.into_iter().map(|r| (r.id, r.scheduled_at)).collect())
+    .map_err(|e| format!("load due tasks: {e}"))
+}
+
 async fn task_id(conn: &mut AsyncPgConnection, exec: ExecutionId) -> Result<Uuid, String> {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -936,7 +983,7 @@ async fn task_id(conn: &mut AsyncPgConnection, exec: ExecutionId) -> Result<Uuid
 struct Observed {
     state: String,
     task_state: String,
-    /// The claiming worker of a `RUNNING` task. Other states keep a stale
+    /// The claiming worker of an open task. A closed task keeps a stale
     /// `worker_id` for bookkeeping, so the test ignores it there.
     worker: Option<usize>,
     attempt: i32,
@@ -944,6 +991,18 @@ struct Observed {
     wake_requested: bool,
     signals: i64,
     tasks: i64,
+    /// The lifecycle event types, comma-separated, in history order.
+    events: String,
+}
+
+/// The event types that change the lifecycle of a run.
+const LIFECYCLE_EVENTS: &str = "'WorkflowStarted', 'WorkflowCompleted', 'WorkflowFailed', \
+     'WorkflowCancelled', 'WorkflowContinuedAsNew', 'WorkflowResetTerminated', \
+     'WorkflowExecutionTimedOut'";
+
+/// A task state that can still change.
+fn is_open(task_state: &str) -> bool {
+    task_state == "PENDING" || task_state == "RUNNING"
 }
 
 impl Observed {
@@ -951,7 +1010,7 @@ impl Observed {
         Self {
             state: run.state.as_str().to_string(),
             task_state: run.task.state.as_str().to_string(),
-            worker: (run.task.state == TaskState::Running)
+            worker: is_open(run.task.state.as_str())
                 .then_some(run.task.worker)
                 .flatten(),
             attempt: run.task.attempt,
@@ -959,6 +1018,7 @@ impl Observed {
             wake_requested: run.task.wake_requested,
             signals: run.signals,
             tasks: 1,
+            events: run.events.join(","),
         }
     }
 }
@@ -986,33 +1046,40 @@ async fn observe(conn: &mut AsyncPgConnection, case: &Case) -> Result<Vec<Observ
         signals: i64,
         #[diesel(sql_type = BigInt)]
         tasks: i64,
+        #[diesel(sql_type = Nullable<Text>)]
+        events: Option<String>,
     }
-    let rows: Vec<Row> = diesel::sql_query(
+    let sql = format!(
         "SELECT e.id, e.state, t.state AS task_state, t.worker_id, t.attempt, \
                 t.crash_strikes, t.wake_requested, \
                 (SELECT COUNT(*) FROM harvest_signals s \
-                  WHERE s.workflow_exec_id = e.id AND NOT s.consumed) AS signals, \
+                  WHERE s.workflow_exec_id = e.id) AS signals, \
                 (SELECT COUNT(*) FROM harvest_task_queue q \
-                  WHERE q.workflow_exec_id = e.id) AS tasks \
+                  WHERE q.workflow_exec_id = e.id) AS tasks, \
+                (SELECT string_agg(v.event_type, ',' ORDER BY v.event_id) \
+                   FROM harvest_events v \
+                  WHERE v.workflow_exec_id = e.id \
+                    AND v.event_type IN ({LIFECYCLE_EVENTS})) AS events \
          FROM harvest_workflow_executions e \
          LEFT JOIN harvest_task_queue t ON t.workflow_exec_id = e.id \
-         WHERE e.workflow_name = $1",
-    )
-    .bind::<Text, _>(&case.name)
-    .load(conn)
-    .await
-    .map_err(|e| format!("observe: {e}"))?;
+         WHERE e.workflow_name = $1"
+    );
+    let rows: Vec<Row> = diesel::sql_query(sql)
+        .bind::<Text, _>(&case.name)
+        .load(conn)
+        .await
+        .map_err(|e| format!("observe: {e}"))?;
     let mut by_id: HashMap<Uuid, Row> = rows.into_iter().map(|r| (r.id, r)).collect();
     let mut observed = Vec::with_capacity(case.execs.len());
     for exec in &case.execs {
         let row = by_id
             .remove(&exec.as_uuid())
             .ok_or_else(|| format!("run {exec} is missing"))?;
-        let running = row.task_state.as_deref() == Some("RUNNING");
+        let open = row.task_state.as_deref().is_some_and(is_open);
         observed.push(Observed {
             state: row.state,
             task_state: row.task_state.unwrap_or_default(),
-            worker: if running {
+            worker: if open {
                 row.worker_id
                     .and_then(|w| case.workers.iter().position(|x| *x == w))
             } else {
@@ -1023,6 +1090,7 @@ async fn observe(conn: &mut AsyncPgConnection, case: &Case) -> Result<Vec<Observ
             wake_requested: row.wake_requested.unwrap_or(false),
             signals: row.signals,
             tasks: row.tasks,
+            events: row.events.unwrap_or_default(),
         });
     }
     if !by_id.is_empty() {
@@ -1032,7 +1100,14 @@ async fn observe(conn: &mut AsyncPgConnection, case: &Case) -> Result<Vec<Observ
 }
 
 /// Check that each observed state change is a sanctioned transition.
-fn check_transitions(before: &[Observed], after: &[Observed]) -> Result<(), String> {
+fn check_transitions(op: Op, before: &[Observed], after: &[Observed]) -> Result<(), String> {
+    let terminate = matches!(
+        op,
+        Op::Start {
+            policy: Policy::TerminateIfRunning,
+            ..
+        }
+    );
     for (i, now) in after.iter().enumerate() {
         let to = WorkflowState::from_db(&now.state)
             .ok_or_else(|| format!("run {i} has an unknown state {}", now.state))?;
@@ -1045,7 +1120,8 @@ fn check_transitions(before: &[Observed], after: &[Observed]) -> Result<(), Stri
                 // A start with `TerminateIfRunning` cancels and seals in one
                 // call, so one operation can take two sanctioned steps.
                 let direct = is_sanctioned(from, to);
-                let via_cancel = is_sanctioned(from, WorkflowState::Cancelled)
+                let via_cancel = terminate
+                    && is_sanctioned(from, WorkflowState::Cancelled)
                     && is_sanctioned(WorkflowState::Cancelled, to);
                 if !direct && !via_cancel {
                     return Err(format!(
@@ -1061,6 +1137,20 @@ fn check_transitions(before: &[Observed], after: &[Observed]) -> Result<(), Stri
 
 // ── Case runner ─────────────────────────────────────────────────────────────
 
+/// The dead-letter count. Each case starts on an empty table.
+async fn dead_letter_count(conn: &mut AsyncPgConnection) -> Result<i64, String> {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_dead_letters")
+        .get_result::<Count>(conn)
+        .await
+        .map(|c| c.n)
+        .map_err(|e| format!("count dead letters: {e}"))
+}
+
 /// Remove the rows of all earlier cases. The orphan scan is global, so a
 /// failed case that leaves a claimed task would change the next result.
 async fn scrub(conn: &mut AsyncPgConnection) -> Result<(), TestCaseError> {
@@ -1074,47 +1164,70 @@ async fn scrub(conn: &mut AsyncPgConnection) -> Result<(), TestCaseError> {
 
 /// A coverage label for a result. The runner collects the labels of all
 /// cases, so a pass that never reaches a branch fails instead.
-const fn label(res: &Res) -> &'static str {
-    match res {
-        Res::Skipped => "skipped",
-        Res::Ok => "ok",
-        Res::Started { created: true, .. } => "start created",
-        Res::Started { created: false, .. } => "start attached",
-        Res::Claimed(Some(_)) => "claim",
-        Res::Claimed(None) => "claim empty",
-        Res::Heartbeat(ClaimWrite::Applied) => "heartbeat applied",
-        Res::Heartbeat(ClaimWrite::LeaseLost) => "heartbeat lease lost",
-        Res::Parked { had_wake: true } => "park with raced wake",
-        Res::Parked { had_wake: false } => "park",
-        Res::Reclaimed {
-            quarantined: 1.., ..
-        } => "reclaim quarantine",
-        Res::Reclaimed { requeued: 1.., .. } => "reclaim requeue",
-        Res::Reclaimed { .. } => "reclaim empty",
-        Res::AlreadyExists => "already exists",
-        Res::Cancelled => "signal cancelled",
-        Res::AlreadyTerminal => "already terminal",
-        Res::ClaimAmbiguous => "complete stale claim",
+fn label(model: &Model, op: Op, res: &Res) -> &'static str {
+    match (op, res) {
+        (Op::Start { slot, .. }, Res::Started { created: true, .. }) => {
+            if model.live_run(slot).is_some() {
+                "start replaced"
+            } else {
+                "start created"
+            }
+        }
+        (Op::Start { .. }, Res::Started { created: false, .. }) => "start attached",
+        (Op::Start { .. }, Res::AlreadyExists) => "start rejected",
+        (Op::Claim { .. }, Res::Claimed(Some(run))) if model.runs[*run].task.strikes > 0 => {
+            "claim requeued orphan"
+        }
+        (Op::Claim { .. }, Res::Claimed(Some(_))) => "claim",
+        (Op::Claim { .. }, Res::Claimed(None)) => "claim empty",
+        (_, Res::Heartbeat(ClaimWrite::Applied)) => "heartbeat applied",
+        (_, Res::Heartbeat(ClaimWrite::LeaseLost)) => "heartbeat lease lost",
+        (_, Res::Parked { had_wake: true }) => "park with raced wake",
+        (_, Res::Parked { had_wake: false }) => "park",
+        (Op::Complete { .. }, Res::Ok) => "complete",
+        (Op::Complete { .. }, Res::ClaimAmbiguous) => "complete stale claim",
+        (Op::Signal { .. }, Res::Ok) => "signal",
+        (Op::Signal { .. }, Res::Cancelled) => "signal cancelled run",
+        (Op::Signal { .. }, Res::AlreadyTerminal) => "signal terminal run",
+        (Op::Cancel { slot, pick }, Res::Ok) => match model.pick(slot, pick) {
+            Some(run) if model.runs[run].state == WorkflowState::Cancelled => "cancel again",
+            _ => "cancel",
+        },
+        (Op::Cancel { .. }, Res::AlreadyTerminal) => "cancel terminal run",
+        (
+            _,
+            Res::Reclaimed {
+                quarantined: 1.., ..
+            },
+        ) => "reclaim quarantine",
+        (_, Res::Reclaimed { requeued: 1.., .. }) => "reclaim requeue",
+        _ => "other",
     }
 }
 
 /// Every label a sound run reaches with the default case count.
 const REQUIRED: &[&str] = &[
-    "ok",
     "start created",
+    "start replaced",
     "start attached",
+    "start rejected",
     "claim",
+    "claim requeued orphan",
     "claim empty",
     "heartbeat applied",
     "heartbeat lease lost",
     "park with raced wake",
     "park",
+    "complete",
+    "complete stale claim",
+    "signal",
+    "signal cancelled run",
+    "signal terminal run",
+    "cancel",
+    "cancel again",
+    "cancel terminal run",
     "reclaim quarantine",
     "reclaim requeue",
-    "already exists",
-    "signal cancelled",
-    "already terminal",
-    "complete stale claim",
 ];
 
 async fn run_case(
@@ -1151,6 +1264,7 @@ async fn run_case(
         let db = apply_db(conn, &mut case, &model, op)
             .await
             .map_err(|e| TestCaseError::fail(format!("step {step}: {e}")))?;
+        let tag = label(&model, op, &db);
         let expected = apply_model(&mut model, op, &db);
         prop_assert_eq!(
             &db,
@@ -1159,13 +1273,23 @@ async fn run_case(
             step,
             op
         );
-        seen.insert(label(&db));
+        seen.insert(tag);
         let after = observe(conn, &case)
             .await
             .map_err(|e| TestCaseError::fail(format!("step {step}: {e}")))?;
         let wanted: Vec<Observed> = model.runs.iter().map(Observed::of).collect();
         prop_assert_eq!(&after, &wanted, "step {}: rows differ after {:?}", step, op);
-        check_transitions(&before, &after)
+        let dead_letters = dead_letter_count(conn)
+            .await
+            .map_err(|e| TestCaseError::fail(format!("step {step}: {e}")))?;
+        prop_assert_eq!(
+            dead_letters,
+            model.dead_letters,
+            "step {}: dead letters differ after {:?}",
+            step,
+            op
+        );
+        check_transitions(op, &before, &after)
             .map_err(|e| TestCaseError::fail(format!("step {step}: {e}")))?;
         before = after;
     }
@@ -1173,10 +1297,30 @@ async fn run_case(
     Ok(())
 }
 
+/// A database that this test alone uses. Each case truncates the engine
+/// tables, so the test never runs on a shared database. With
+/// `HARVEST_TEST_DATABASE_URL` set, it creates a throwaway database on that
+/// server. Otherwise it starts a Postgres 16 container.
 async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
     use testcontainers::ImageExt;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+    if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        let name = format!("harvest_lifecycle_model_{}", Uuid::new_v4().simple());
+        let mut admin = AsyncPgConnection::establish(&admin_url)
+            .await
+            .expect("HARVEST_TEST_DATABASE_URL must be reachable");
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .await
+            .expect("create a throwaway database");
+        let prefix = admin_url
+            .rsplit_once('/')
+            .map_or(admin_url.as_str(), |(p, _)| p);
+        let url = format!("{prefix}/{name}");
+        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        conn.batch_execute(&autumn_harvest::test_init_sql())
+            .await
+            .expect("migration");
         return (url, None);
     }
     let container = Postgres::default()
@@ -1210,7 +1354,12 @@ fn lifecycle_matches_the_reference_model() {
         rt.block_on(AsyncPgConnection::establish(&url))
             .expect("connect"),
     );
-    let mut runner = TestRunner::new(prop_config::config());
+    // A database-backed shrink step costs about 150 ms. Cap the shrink so a
+    // late failure still prints its sequence before the job times out.
+    let mut runner = TestRunner::new(proptest::test_runner::Config {
+        max_shrink_time: 20 * 60 * 1000,
+        ..prop_config::config()
+    });
     let ops = ops();
     let seen = RefCell::new(BTreeSet::new());
     let result = runner.run(&ops, |ops| {
@@ -1327,8 +1476,9 @@ fn a_wake_during_a_claim_is_not_lost() {
     assert_eq!(m.runs[0].task.state, TaskState::Pending);
 }
 
-/// A fresh enqueue is backdated by the skew allowance, but an orphan
-/// requeue is not. A start made just after a reclaim is claimed first.
+/// A fresh enqueue backdates `scheduled_at` by the skew allowance. An orphan
+/// requeue does not. A claim therefore takes a start made just after a
+/// reclaim first.
 #[test]
 fn a_requeued_orphan_sorts_behind_a_fresh_start() {
     let mut m = Model::new();
