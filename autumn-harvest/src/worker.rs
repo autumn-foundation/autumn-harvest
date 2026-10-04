@@ -40033,8 +40033,8 @@ mod tests {
         assert_ne!(pool_shard_label(ShardId::UNENCODED), u16::MAX);
     }
 
-    /// Issue #1815: two pools on one shard and sink sum, a pool that two
-    /// samplers read counts once, and the gauges fall to 0 when the last pool
+    /// Issue #1815: two pools on one shard and sink sum. A pool that two
+    /// samplers read counts once. The gauges fall to 0 when the last pool
     /// leaves.
     #[test]
     fn pool_gauges_sum_distinct_pools_per_sink_and_shard() {
