@@ -12,7 +12,7 @@
 //!      ends. A plain drop needs `ACCESS EXCLUSIVE`, which queues all access.
 //!
 //! An in-file annotation is the reviewed escape hatch. Shipped migrations
-//! cannot change, so they are grandfathered by name in `GRANDFATHERED`.
+//! cannot change, so `GRANDFATHERED` names each one by tree and name.
 //! `docs/upgrading/online-migrations.md` is the author guide.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,10 +77,13 @@ const PARTITIONED_TABLES: &[&str] = &["harvest_events"];
 /// The plugin `harvest` tree runs against the same database as the core tree.
 /// The `app` tree runs against the application database.
 const MIGRATION_TREES: &[&str] = &[
-    "autumn-harvest/migrations",
+    CORE_TREE,
     "autumn-harvest-plugin/migrations/harvest",
     APP_TREE,
 ];
+
+/// The core migration tree.
+const CORE_TREE: &str = "autumn-harvest/migrations";
 
 /// The one tree that targets the application database, not the Harvest one.
 const APP_TREE: &str = "autumn-harvest-plugin/migrations/app";
@@ -92,69 +95,81 @@ const ANNOTATION_PREFIX: &str = "lock-safety:";
 ///
 /// Each entry is a migration directory name and the rule it breaks. A test
 /// fails when an entry no longer matches a finding, so the list cannot rot.
-const GRANDFATHERED: &[(&str, Rule, &str)] = &[
+const GRANDFATHERED: &[(&str, &str, Rule, &str)] = &[
     (
+        CORE_TREE,
         "20260915231809_harvest_migrated_seal_terminal_at",
         Rule::BlockingIndex,
         "Drops and rebuilds the active-uniqueness index in the migration \
          transaction. Shipped before this lint.",
     ),
     (
+        CORE_TREE,
         "20260915231809_harvest_migrated_seal_terminal_at",
         Rule::LockTimeout,
         "Adds two columns with no lock bound. Shipped before this lint.",
     ),
     (
+        CORE_TREE,
         "20260916151612_harvest_staging_vacated_state",
         Rule::LockTimeout,
         "Adds a nullable column with no lock bound. Shipped before this lint.",
     ),
     (
+        CORE_TREE,
         "20260919144514_harvest_events_recent_by_timestamp_index",
         Rule::BlockingIndex,
         "Guarded plain build. The upgrade guide tells operators to prebuild \
          the index with CONCURRENTLY, and the guard accepts it.",
     ),
     (
+        CORE_TREE,
         "20260919144514_harvest_events_recent_by_timestamp_index",
         Rule::LockTimeout,
         "The guarded plain build has no lock bound. Shipped before this lint.",
     ),
     (
+        CORE_TREE,
         "20260920014641_harvest_staging_vacated_by",
         Rule::LockTimeout,
         "Adds a nullable column with no lock bound. Shipped before this lint.",
     ),
     (
+        CORE_TREE,
         "20260921011505_harvest_task_queue_timer_fires_at",
         Rule::LockTimeout,
         "Adds a column and backfills it with no lock bound. Shipped before \
          this lint.",
     ),
     (
+        CORE_TREE,
         "20261001190405_harvest_audit_unexported_idx_lazy",
         Rule::BlockingIndex,
         "Drops the audit claim-scan index through EXECUTE, only on a database \
          with no export cursor. Shipped before this lint.",
     ),
     (
+        CORE_TREE,
         "20261001190405_harvest_audit_unexported_idx_lazy",
         Rule::LockTimeout,
         "The 5 s bound and the drop sit in one IF branch, so the bound is in \
          force. The lint does not count a setter inside a branch.",
     ),
     (
+        CORE_TREE,
         "20261001192155_harvest_quota_reconcile_name_id_index",
         Rule::BlockingIndex,
         "Guarded plain build. The upgrade guide tells operators to prebuild \
          the index with CONCURRENTLY, and the guard accepts it.",
     ),
     (
+        CORE_TREE,
         "20261001192155_harvest_quota_reconcile_name_id_index",
         Rule::LockTimeout,
         "The guarded plain build has no lock bound. Shipped before this lint.",
     ),
     (
+        CORE_TREE,
         "20261003201739_harvest_task_queue_hygiene",
         Rule::BlockingIndex,
         "Drops three redundant task-queue indexes without CONCURRENTLY, after \
@@ -162,6 +177,7 @@ const GRANDFATHERED: &[(&str, Rule, &str)] = &[
          this lint.",
     ),
     (
+        CORE_TREE,
         "20261003201739_harvest_task_queue_hygiene",
         Rule::LockTimeout,
         "The index drops and the guarded EXECUTE build have no lock bound. \
@@ -4296,10 +4312,12 @@ fn lint_all(migrations: &[OnDisk]) -> Vec<Vec<Finding>> {
     out
 }
 
-fn grandfathered(name: &str, rule: Rule) -> bool {
+fn grandfathered(tree: &str, name: &str, rule: Rule) -> bool {
     GRANDFATHERED
         .iter()
-        .any(|(entry, entry_rule, _)| *entry == name && *entry_rule == rule)
+        .any(|(entry_tree, entry, entry_rule, _)| {
+            *entry_tree == tree && *entry == name && *entry_rule == rule
+        })
 }
 
 /// Lint a synthetic migration after the synthetic migrations in `history`.
@@ -8113,7 +8131,7 @@ fn the_20260915231809_index_rebuild_is_flagged_and_grandfathered() {
 
     for rule in [Rule::BlockingIndex, Rule::LockTimeout] {
         assert!(
-            grandfathered(NAME, rule),
+            grandfathered(CORE_TREE, NAME, rule),
             "{NAME} must be grandfathered for {}",
             rule.id()
         );
@@ -8129,7 +8147,7 @@ fn migrations_after_the_cutoff_are_lock_safe() {
     let mut failures = Vec::new();
     for (m, findings) in migrations.iter().zip(all).filter(|(m, _)| m.in_scope()) {
         for f in findings {
-            if !grandfathered(&m.name, f.rule) {
+            if !grandfathered(m.tree, &m.name, f.rule) {
                 failures.push(format!(
                     "{}/{}/up.sql:{}: [{}] {}",
                     m.tree,
@@ -8204,13 +8222,27 @@ fn a_new_backdated_migration_is_in_scope() {
 }
 
 #[test]
+fn a_grandfather_entry_binds_to_its_tree() {
+    // The app tree targets another database, so it may reuse a core name.
+    const NAME: &str = "20260915231809_harvest_migrated_seal_terminal_at";
+    assert!(grandfathered(CORE_TREE, NAME, Rule::LockTimeout));
+    assert!(!grandfathered(APP_TREE, NAME, Rule::LockTimeout));
+}
+
+#[test]
 fn grandfather_entries_are_shipped_in_scope_and_unique() {
     let migrations = load_migrations();
-    let names: BTreeSet<&str> = migrations.iter().map(|m| m.name.as_str()).collect();
+    let names: BTreeSet<(&str, &str)> = migrations
+        .iter()
+        .map(|m| (m.tree, m.name.as_str()))
+        .collect();
     let mut seen = BTreeSet::new();
-    for (name, rule, reason) in GRANDFATHERED {
+    for (tree, name, rule, reason) in GRANDFATHERED {
         let version = name.split('_').next().unwrap_or(name);
-        assert!(names.contains(name), "{name} is not on disk");
+        assert!(
+            names.contains(&(*tree, *name)),
+            "{tree}/{name} is not on disk"
+        );
         assert!(
             version > LOCK_SAFETY_CUTOFF,
             "{name} is out of scope, so its entry is dead"
@@ -8225,7 +8257,10 @@ fn grandfather_entries_are_shipped_in_scope_and_unique() {
             rule.id()
         );
         assert!(!reason.trim().is_empty(), "{name}: give a reason");
-        assert!(seen.insert((*name, *rule)), "{name}: duplicate entry");
+        assert!(
+            seen.insert((*tree, *name, *rule)),
+            "{name}: duplicate entry"
+        );
     }
 }
 
@@ -8233,10 +8268,10 @@ fn grandfather_entries_are_shipped_in_scope_and_unique() {
 fn grandfather_entries_are_not_stale() {
     let migrations = load_migrations();
     let all = lint_all(&migrations);
-    for (name, rule, _) in GRANDFATHERED {
+    for (tree, name, rule, _) in GRANDFATHERED {
         let at = migrations
             .iter()
-            .position(|m| m.name == *name)
+            .position(|m| m.tree == *tree && m.name == *name)
             .unwrap_or_else(|| panic!("{name} is not on disk"));
         assert!(
             rules(&all[at]).contains(rule),

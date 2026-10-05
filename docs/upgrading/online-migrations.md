@@ -155,6 +155,8 @@ routine must also call only routines of its file that bound their own locks.
 An annotation does not make a lock bounded. Any other definition of the same
 name, or any `ALTER` of it, removes the exemption for good. Code that the lint
 cannot read removes it too, because that code may replace the routine.
+The lint knows only the routines that migrations create. A routine of the same
+name and arity that something else created may be the one that a call reaches.
 A routine created in an uncalled body or in a branch may not exist. A later
 `ROLLBACK` in the file may undo its `CREATE`. A call that runs now never
 reaches such a routine, and later calls gain nothing from it.
