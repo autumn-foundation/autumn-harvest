@@ -8,6 +8,9 @@ deployments:
 - `../runbooks/synthetic-incident-drills.md` contains the incident drills that
   prove the first five common failure modes route to the expected alert.
 
+For SLO-based paging, use the optional burn-rate pack in [`slo.md`](slo.md).
+It defines reference SLIs and targets, and pages on error-budget burn.
+
 The thresholds are starter defaults, not universal SLOs. Tune them to workload
 volume, downstream SLAs, deployment topology, queue count, shard count, and the
 cadence of your scheduled workflows. A queue that normally drains 10 tasks per
@@ -51,11 +54,18 @@ Harvest metric names that are expected after Prometheus normalization:
 | `harvest.schedule.runs` | `harvest_schedule_runs_total` |
 | `harvest.schedule.skipped` | `harvest_schedule_skipped_total` |
 | `harvest.retention.deleted` | `harvest_retention_deleted_total` |
+| `harvest.workflow.task_timeout` | `harvest_workflow_task_timeout_total` |
+| `harvest.canary.success` | `harvest_canary_success_total` |
+| `harvest.canary.failure` | `harvest_canary_failure_total` |
 
 Use only bounded labels from ADR-0001/#138: `workflow`, `activity`, `queue`,
 `status`, `shard`, `kind`, `name`, and `reason`. Never use `execution.id`,
 `harvest.execution.id`, raw workflow IDs, task IDs, payload values, tenant IDs,
 or user IDs as metric labels. Those belong in traces, logs, or API payloads.
+
+Rule labels are a different case. The SLO pack adds `severity`, `slo`, and
+`window` to its alerts. Each has a small, fixed set of values, so the rule
+above does not apply to them.
 
 Readiness-style alerts do not have native ADR metrics. Either run the CLI/API
 checks directly or export the management API result through your own probe with

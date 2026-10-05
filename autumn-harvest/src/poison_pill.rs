@@ -450,12 +450,14 @@ mod scanner {
     /// `WorkflowFailed` event path (issue #367 AC4 — no new event variant).
     ///
     /// Only transitions executions still in `RUNNING`; a workflow that already
-    /// reached a terminal state is left untouched. Returns the
-    /// `(workflow_id, workflow_name, schedule_id, origin)` of the execution when
-    /// (and only when) it actually transitioned `RUNNING` → `FAILED`, so the
-    /// caller can count the failure toward schedule auto-pause once the
-    /// transaction commits (with the correct origin so backfill quarantines are
-    /// not mis-attributed to the cadence counter).
+    /// reached a terminal state is left untouched.
+    ///
+    /// Returns `(workflow_id, workflow_name, schedule_id, origin, shard_id)`
+    /// only when the execution moved from `RUNNING` to `FAILED`. After the
+    /// transaction commits, the caller counts the failure toward schedule
+    /// auto-pause. The origin keeps a backfill quarantine out of the cadence
+    /// counter. The shard labels the canary failure for a quarantined probe
+    /// (#1816).
     #[allow(clippy::too_many_lines)]
     async fn fail_owning_workflow(
         conn: &mut AsyncPgConnection,
@@ -466,7 +468,7 @@ mod scanner {
         // field, so this write encodes through the configured registry.
         codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<(
-        Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
+        Option<(String, String, Option<uuid::Uuid>, Option<String>, i32)>,
         Vec<DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
         Vec<crate::execution::StartCancelledRun>,
@@ -481,6 +483,7 @@ mod scanner {
             String,
             Option<uuid::Uuid>,
             Option<String>,
+            i32,
         );
         let current: Option<ExecRow> = exec_dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
@@ -493,6 +496,7 @@ mod scanner {
                 exec_dsl::workflow_name,
                 exec_dsl::schedule_id,
                 exec_dsl::origin,
+                exec_dsl::shard_id,
             ))
             .first(conn)
             .await
@@ -506,6 +510,7 @@ mod scanner {
             workflow_name,
             schedule_id,
             origin,
+            shard_id,
         )) = current
         else {
             return Ok((None, Vec::new(), Vec::new(), Vec::new()));
@@ -623,7 +628,7 @@ mod scanner {
             }
         }
         Ok((
-            Some((workflow_id, workflow_name, schedule_id, origin)),
+            Some((workflow_id, workflow_name, schedule_id, origin, shard_id)),
             deferred,
             closed_children,
             pending_cancel_metrics,
@@ -717,7 +722,7 @@ mod scanner {
         let (acted, failed_workflow, deferred_starts, closed_children, pending_cancel_metrics) =
             crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
                 bool,
-                Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
+                Option<(String, String, Option<uuid::Uuid>, Option<String>, i32)>,
                 Vec<DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
                 Vec<crate::execution::StartCancelledRun>,
@@ -801,13 +806,23 @@ mod scanner {
             // schedule auto-pause threshold (issue #360), mirroring the normal
             // failure and timeout paths. Runs after the transaction commits so
             // a counter error can never abort the quarantine.
-            if let Some((workflow_id, workflow_name, schedule_id, origin)) = failed_workflow {
+            if let Some((workflow_id, workflow_name, schedule_id, origin, shard_id)) =
+                failed_workflow
+            {
                 crate::telemetry::emit_workflow_terminal(
                     metrics,
                     &workflow_name,
                     &task.queue_name,
                     crate::telemetry::WorkflowStatus::Failed,
                 );
+                // The terminal above skips a canary probe. A quarantined probe
+                // is a failed probe, so the canary SLI must count it (#1816).
+                if crate::canary::is_canary_workflow(&workflow_name) {
+                    metrics.record_canary_failure(
+                        &task.queue_name,
+                        u16::try_from(shard_id).unwrap_or(0),
+                    );
+                }
 
                 if let Some(exec_uuid) = task.workflow_exec_id {
                     let exec_id = execution_id_from_uuid(exec_uuid);
