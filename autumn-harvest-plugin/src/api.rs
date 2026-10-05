@@ -905,31 +905,23 @@ impl HarvestApiState {
     }
 
     /// The build ramp guard settings (issue #1814).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn ramp_guard_config(&self) -> autumn_harvest::ramp_guard::RampGuardConfig {
         *self
             .ramp_guard_config
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the build ramp guard settings (issue #1814).
     ///
     /// The boot path reads them when it spawns the guard loop, so set them
     /// first.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_ramp_guard_config(&self, config: autumn_harvest::ramp_guard::RampGuardConfig) {
         *self
             .ramp_guard_config
             .lock()
-            .expect("harvest api state lock poisoned") = config;
+            .unwrap_or_else(PoisonError::into_inner) = config;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
