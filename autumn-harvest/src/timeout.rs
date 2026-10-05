@@ -751,9 +751,10 @@ struct LockedTask {
     /// its handler started (issue #1809). A schedule-to-close timeout ends
     /// this claim, which can be later than the scanned one.
     current_started_claim: Option<chrono::DateTime<Utc>>,
-    /// The handler start time of the claim that holds the row now, when its
-    /// handler started (issue #1809). The attempt duration counts from it.
-    current_handler_started_at: Option<chrono::DateTime<Utc>>,
+    /// How long the handler of the claim that holds the row now has run, when
+    /// it started (issue #1809). The database clock measures it, because that
+    /// clock also wrote the start.
+    current_handler_elapsed_secs: Option<f64>,
     /// The row-current `attempt`. With `current_started_claim`, it names the
     /// claim that holds the row now.
     attempt: i32,
@@ -766,7 +767,9 @@ struct LockedTask {
 /// `clock_timestamp()`, not `NOW()`: this transaction can wait on row locks,
 /// and `NOW()` is frozen at its start.
 const LOCK_TASK_FOR_TIMEOUT_SQL: &str = "SELECT state, schedule_to_close_at, crash_strikes, \
-         worker_id, attempt, started_at, handler_started_attempt, handler_started_at, \
+         worker_id, attempt, started_at, handler_started_attempt, \
+         EXTRACT(EPOCH FROM clock_timestamp() - handler_started_at)::float8 \
+             AS handler_elapsed_secs, \
          COALESCE(heartbeat_timeout IS NOT NULL \
              AND COALESCE(last_heartbeat_at, started_at) + heartbeat_timeout \
                  < clock_timestamp(), false) AS heartbeat_expired \
@@ -788,8 +791,8 @@ struct LockedTaskRow {
     started_at: Option<chrono::DateTime<Utc>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     handler_started_attempt: Option<i32>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    handler_started_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    handler_elapsed_secs: Option<f64>,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     heartbeat_expired: bool,
 }
@@ -821,7 +824,9 @@ async fn lock_task_for_timeout(
             handler_started: scanned_claim && current_handler_started,
             scanned_claim,
             current_started_claim: row.started_at.filter(|_| current_handler_started),
-            current_handler_started_at: row.handler_started_at.filter(|_| current_handler_started),
+            current_handler_elapsed_secs: row
+                .handler_elapsed_secs
+                .filter(|_| current_handler_started),
             attempt: row.attempt,
             heartbeat_expired: row.heartbeat_expired,
             crash_strikes: row.crash_strikes,
@@ -847,9 +852,9 @@ struct ActivityTimeoutOutcome {
     /// The `started_at` of the timed-out claim, when its handler started.
     /// The enforcer then counts that attempt as a failed one.
     started_attempt: Option<chrono::DateTime<Utc>>,
-    /// When the handler of the timed-out attempt started. The attempt
-    /// duration counts from it, as on the worker path.
-    handler_started_at: Option<chrono::DateTime<Utc>>,
+    /// How long the handler of the timed-out attempt ran. The attempt
+    /// duration counts from its start, as on the worker path.
+    handler_elapsed_secs: Option<f64>,
 }
 
 /// SQL for [`schedule_to_start_still_expired`], exposed for shape tests.
@@ -1595,7 +1600,7 @@ async fn enforce_activity_timeout(
                     handler_started: locked.handler_started,
                     scanned_claim: locked.scanned_claim,
                     started_attempt,
-                    handler_started_at: locked.current_handler_started_at,
+                    handler_elapsed_secs: locked.current_handler_elapsed_secs,
                 })
             };
             // Timeout retry (issue #1809, ADR 0004). A start-to-close or
@@ -1738,15 +1743,20 @@ async fn enforce_activity_timeout(
     // later reports this attempt finds its record and does not count it.
     //
     // The duration counts from the handler start, as on the worker path. The
-    // wait between the claim and the handler start is local setup. A marker
-    // written without a start time falls back to the claim time.
+    // wait between the claim and the handler start is local setup. The
+    // database clock wrote the start, so the same clock measures the run. A
+    // marker written without a start time falls back to the claim time.
     if let Some(started_at) = enforced.started_attempt {
         let (error_type, non_retryable, _) = crate::failure::parse_error_payload(&error);
-        let handler_started_at = enforced.handler_started_at.unwrap_or(started_at);
-        let duration_secs = (Utc::now() - handler_started_at)
-            .to_std()
-            .unwrap_or_default()
-            .as_secs_f64();
+        let duration_secs = enforced.handler_elapsed_secs.map_or_else(
+            || {
+                (Utc::now() - started_at)
+                    .to_std()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+            },
+            |elapsed| elapsed.max(0.0),
+        );
         metrics.record_activity_completed_with_error_type(
             activity_name,
             &task.queue_name,

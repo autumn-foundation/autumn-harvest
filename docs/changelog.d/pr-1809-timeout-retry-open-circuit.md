@@ -23,7 +23,9 @@ decision.
 - A timeout of an attempt whose handler never started refunds the claim's
   rate-limit token, on a retry or a final failure. That attempt made no
   downstream call. An activity that a circuit breaker tracks debits at
-  dispatch, not at the claim, so its timeout refunds nothing.
+  dispatch, not at the claim, so the enforcer refunds nothing for it. A
+  tracked WASM activity whose claim is lost before its guest starts gets its
+  dispatch debit back from the worker instead.
 - A fleet that mixes 0.6 and 0.7 workers must keep timeouts terminal until
   the upgrade ends. See the 0.7.0 upgrade guide, §1.7.
 

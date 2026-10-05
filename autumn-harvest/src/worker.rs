@@ -17547,6 +17547,9 @@ async fn process_activity_task(
                             Ok(queue::ClaimWrite::LeaseLost) => {
                                 use crate::failure::IntoActivityErrorString as _;
                                 log_lease_lost(task, "wasm handler start marker");
+                                // The guest never runs, so the dispatch debit
+                                // goes back. The enforcer cannot see that debit.
+                                refund_debited_token(&mut conn, debited_key).await;
                                 cancel.cancel();
                                 crate::wasm_store::WasmDispatch::Fail(
                                     crate::failure::ActivityFailure::retryable(
@@ -17563,6 +17566,8 @@ async fn process_activity_task(
                                     error = %error,
                                     "could not record the wasm handler start; the guest does not start"
                                 );
+                                refund_after_start_error(pool, Some(conn), debited_key, &error)
+                                    .await;
                                 cancel.cancel();
                                 crate::wasm_store::WasmDispatch::Fail(
                                     crate::failure::ActivityFailure::retryable(

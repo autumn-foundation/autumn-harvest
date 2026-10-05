@@ -26,7 +26,7 @@ use autumn_harvest::failure::{
 };
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
-use autumn_harvest::policy::RetryPolicy;
+use autumn_harvest::policy::{CircuitBreakerPolicy, RetryPolicy};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::shard::ShardedDbPool;
@@ -864,17 +864,29 @@ fn build_wasm_registry(
     wasm: Vec<WasmActivitySpec>,
     metrics: Arc<dyn MetricsRecorder>,
 ) -> Arc<HandlerRegistry> {
+    build_wasm_registry_with(workflows, wasm, metrics, |_| {})
+}
+
+/// [`build_wasm_registry`], with `tweak` applied to each activity.
+fn build_wasm_registry_with(
+    workflows: Vec<WorkflowInfo>,
+    wasm: Vec<WasmActivitySpec>,
+    metrics: Arc<dyn MetricsRecorder>,
+    tweak: impl Fn(&mut ActivityInfo),
+) -> Arc<HandlerRegistry> {
     let mut activities = Vec::new();
     let mut bindings = HashMap::new();
     let mut registrations = Vec::new();
     for spec in wasm {
-        activities.push(ActivityInfo::wasm(
+        let mut activity = ActivityInfo::wasm(
             spec.name,
             None,
             spec.retry.clone(),
             Some(Duration::from_secs(5)),
             spec.schedule_to_close,
-        ));
+        );
+        tweak(&mut activity);
+        activities.push(activity);
         bindings.insert(
             spec.name.to_string(),
             WasmBinding {
@@ -1212,6 +1224,21 @@ async fn run_echo_with_start_marker_trigger(
     worker_id: &str,
     action: &str,
 ) -> Vec<WorkflowEvent> {
+    run_echo_with_start_marker_trigger_and_bucket(queue, worker_id, action, None)
+        .await
+        .0
+}
+
+/// [`run_echo_with_start_marker_trigger`]. With `bucket`, the activity is
+/// rate-limited on that key and tracked by a circuit breaker, so it debits
+/// at dispatch. The bucket holds one token, has room for two, and never
+/// refills. Returns the history and the tokens left at the end.
+async fn run_echo_with_start_marker_trigger_and_bucket(
+    queue: &str,
+    worker_id: &str,
+    action: &str,
+    bucket: Option<&'static str>,
+) -> (Vec<WorkflowEvent>, Option<f64>) {
     use diesel_async::SimpleAsyncConnection as _;
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -1231,6 +1258,15 @@ async fn run_echo_with_start_marker_trigger(
     ))
     .await
     .expect("install the trigger");
+    if let Some(key) = bucket {
+        conn.batch_execute(&format!(
+            "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
+             VALUES ('{key}', 0.0, 2.0, 1.0, NOW()) \
+             ON CONFLICT (key) DO UPDATE SET refill_rate = 0.0, burst = 2.0, tokens = 1.0"
+        ))
+        .await
+        .expect("seed the rate-limit bucket");
+    }
 
     let exec_id = seed_workflow(
         &mut conn,
@@ -1239,17 +1275,30 @@ async fn run_echo_with_start_marker_trigger(
         queue,
     )
     .await;
-    let registry = build_wasm_registry(
+    let registry = build_wasm_registry_with(
         vec![wf_info("wf_run_wasm", wf_run_wasm)],
         vec![WasmActivitySpec {
             name: "echo_wasm",
             bytes: assemble(ECHO_WAT),
             caps: WasmCapabilities::default(),
             limits: WasmLimits::default(),
-            retry: None,
+            // One attempt, so no retry debits again.
+            retry: bucket.map(|_| RetryPolicy::fixed(1, Duration::from_millis(1))),
             schedule_to_close: None,
         }],
         Arc::new(RecordingMetrics::default()),
+        |activity| {
+            if let Some(key) = bucket {
+                activity.rate_limit_rps = Some(1.0);
+                activity.rate_limit_burst = Some(2.0);
+                activity.rate_limit_key = Some(key);
+                activity.circuit_breaker = Some(CircuitBreakerPolicy::new(
+                    100,
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                ));
+            }
+        },
     );
     let worker = build_worker(worker_id, queue, Arc::clone(&registry));
     let pool = build_pool(&url);
@@ -1278,7 +1327,26 @@ async fn run_echo_with_start_marker_trigger(
     conn.batch_execute("DROP TRIGGER IF EXISTS t1809_start_marker ON harvest_task_queue")
         .await
         .expect("drop the trigger");
-    load_history(&url, exec_id).await
+    let tokens = match bucket {
+        Some(key) => Some(bucket_tokens(&mut conn, key).await),
+        None => None,
+    };
+    (load_history(&url, exec_id).await, tokens)
+}
+
+/// The tokens left in the rate-limit bucket `key`.
+async fn bucket_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+        .bind::<diesel::sql_types::Text, _>(key)
+        .get_result::<Tokens>(conn)
+        .await
+        .expect("read the rate-limit bucket")
+        .tokens
 }
 
 /// A WASM guest must not start after its claim is lost (issue #1809). The
@@ -1294,6 +1362,30 @@ async fn wasm_guest_does_not_start_after_a_lost_claim() {
         find_activity_completed(&history),
         None,
         "a guest whose claim was lost must not run: {history:?}"
+    );
+}
+
+/// A tracked WASM activity debits its token at dispatch, before its module
+/// resolves (issue #1809). When the claim is lost before the guest starts,
+/// the worker gives that token back. The enforcer cannot see this debit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_dispatch_debit_comes_back_when_the_guest_never_starts() {
+    let (history, tokens) = run_echo_with_start_marker_trigger_and_bucket(
+        "q-wasm-lost-debit",
+        "w-wasm-lost-debit",
+        "RETURN NULL",
+        Some("t1809-wasm-dispatch-bucket"),
+    )
+    .await;
+    assert_eq!(
+        find_activity_completed(&history),
+        None,
+        "the guest must not run: {history:?}"
+    );
+    let tokens = tokens.expect("a bucket");
+    assert!(
+        (tokens - 1.0).abs() < 0.01,
+        "the dispatch debit comes back, so the bucket holds its one token: {tokens}"
     );
 }
 
