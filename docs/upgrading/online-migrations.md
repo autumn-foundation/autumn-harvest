@@ -63,7 +63,7 @@ run time, so the lint treats those names as hot.
 |---|---|---|
 | `lock-timeout` | A statement takes a blocking lock on a hot table, and no non-zero `lock_timeout` is in force. | Put `SET LOCAL lock_timeout = '5s';` first. |
 | `blocking-index` | A plain `CREATE INDEX`, `DROP INDEX` or `REINDEX` touches a hot table. So does `ALTER TABLE ... ADD` of a `UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraint without `USING INDEX` and an index name. `USING INDEX TABLESPACE` still builds an index. | Use `CONCURRENTLY` (section 4), or the guarded build (section 5). On `harvest_events`, `CONCURRENTLY` also counts, because the partitioned layout cannot run it. |
-| `concurrently-in-transaction` | `CONCURRENTLY` runs in a transaction, shares its file with another statement, or sits in a `DO` block. | Put it alone in a file with `run_in_transaction = false` (section 4). |
+| `concurrently-in-transaction` | `CONCURRENTLY` or `VACUUM` runs in a transaction, shares its file with another statement, or sits in a `DO` block. Postgres rejects both there. | Put it alone in a file with `run_in_transaction = false` (section 4). |
 | `bad-annotation` | A `-- lock-safety:` comment does not parse. | Fix the annotation (section 6). |
 | `unused-annotation` | An annotation allows a rule that the statement below it does not break. | Remove the annotation. |
 
@@ -347,9 +347,9 @@ rule in its file, so a digest pins the SQL of each listed migration as well.
   such an `EXECUTE` counts as a lock on an unknown table. So does a template
   with `%s` anywhere in its text, even in a comment or a quoted name. So does
   a `%L` value that a `DO`, `EXECUTE` or function body runs as code.
-  After a `search_path` change, or in a routine with its own `search_path`,
-  an unqualified `format` may be another schema's function. It counts the same
-  way. Write `pg_catalog.format` there.
+  The connection may list `pg_catalog` last in its `search_path`. An
+  unqualified `format` may then be another schema's function, so it counts the
+  same way. Write `pg_catalog.format`.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
   as code, in any quote form. That includes `FOR ... IN EXECUTE`,
   `RETURN QUERY EXECUTE` and `OPEN ... FOR EXECUTE`. Any other string is data.

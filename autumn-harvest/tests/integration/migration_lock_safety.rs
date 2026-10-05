@@ -434,25 +434,22 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
             });
             continue;
         }
+        if hit.kind == Kind::NoTransaction {
+            if let Some(reason) = placement_problem(hit, run_in_transaction, &analysis) {
+                findings.push(Finding {
+                    rule: Rule::ConcurrentlyInTransaction,
+                    line: hit.line,
+                    stmt: hit.at,
+                    detail: format!("{} {reason}.", hit.verb),
+                });
+            }
+            continue;
+        }
         let Kind::Index { concurrent } = hit.kind else {
             continue;
         };
         if concurrent {
-            let reason = if hit.in_body {
-                Some("cannot run inside a DO block or a function")
-            } else if run_in_transaction {
-                Some(
-                    "cannot run in a transaction. Set `run_in_transaction = false` in metadata.toml",
-                )
-            } else if analysis.statement_count > 1 {
-                Some(
-                    "must be the only statement in its file. Diesel sends the file as one \
-                     batch, and Postgres runs a batch as one transaction",
-                )
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
+            if let Some(reason) = placement_problem(hit, run_in_transaction, &analysis) {
                 findings.push(Finding {
                     rule: Rule::ConcurrentlyInTransaction,
                     line: hit.line,
@@ -518,6 +515,27 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
     }
 
     apply_annotations(sql, &analysis.comments, findings)
+}
+
+/// Why a statement that must run outside a transaction block cannot run where
+/// it sits, if it cannot.
+const fn placement_problem(
+    hit: &Hit,
+    run_in_transaction: bool,
+    analysis: &Analysis,
+) -> Option<&'static str> {
+    if hit.in_body {
+        Some("cannot run inside a DO block or a function")
+    } else if run_in_transaction {
+        Some("cannot run in a transaction. Set `run_in_transaction = false` in metadata.toml")
+    } else if analysis.statement_count > 1 {
+        Some(
+            "must be the only statement in its file. Diesel sends the file as one \
+             batch, and Postgres runs a batch as one transaction",
+        )
+    } else {
+        None
+    }
 }
 
 /// What a plain form of an index statement costs a hot table.
@@ -622,7 +640,7 @@ fn needs_bound(analysis: &Analysis, hit: &Hit) -> bool {
     hit.hot
         && !matches!(
             hit.kind,
-            Kind::Index { concurrent: true } | Kind::RejectedConcurrent
+            Kind::Index { concurrent: true } | Kind::RejectedConcurrent | Kind::NoTransaction
         )
         && !bound_in_force(analysis, hit)
 }
@@ -1456,6 +1474,9 @@ enum Kind {
     /// A `CONCURRENTLY` form that Postgres rejects outright: a `DROP INDEX` of
     /// more than one index or with `CASCADE`, or `REINDEX SYSTEM`.
     RejectedConcurrent,
+    /// A statement that Postgres runs only outside a transaction block, such
+    /// as `VACUUM`. It places like a `CONCURRENTLY` build.
+    NoTransaction,
 }
 
 /// One statement that can lock a table.
@@ -1875,14 +1896,11 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             Some("rename") if s.keyword(k + 1, "to") => rename(&s, k, history),
             Some("lock" | "truncate") if start => raws.extend(lock_or_truncate(&s, k)),
             Some("cluster") if start => raws.push(cluster(&s, k)),
-            Some("vacuum") if start => raws.extend(vacuum_full(&s, k)),
+            Some("vacuum") if start => raws.extend(vacuum(&s, k)),
             // SQL the lint cannot read may lock anything, and may also clear
             // the bound for what comes after it.
             Some("execute") if dynamic_execute(&s, k) => {
-                let shadowed = shadowed_format(&s, k, path_change, &path_bodies);
-                let raw = unreadable_execute(&s, k)
-                    .or_else(|| shadowed.then(|| Raw::lock(k, UNREADABLE_EXECUTE, None)));
-                if let Some(raw) = raw {
+                if let Some(raw) = unreadable_execute(&s, k) {
                     raws.push(raw);
                     let list = if tok.runs {
                         &mut timeouts
@@ -4072,8 +4090,8 @@ fn drops_dependents(s: &Stmts, k: usize) -> bool {
 /// A lock on an unknown table for the PL/pgSQL `EXECUTE` at `k`, when the
 /// lint cannot read the SQL it runs.
 ///
-/// The lint reads only constant SQL: one literal, or `format()` of one
-/// literal. Only `INTO` or `USING` may follow. A variable, a composed
+/// The lint reads only constant SQL: one literal, or `pg_catalog.format()` of
+/// one literal. Only `INTO` or `USING` may follow. A variable, a composed
 /// expression, or a `format()` `%s` placeholder may hold any statement.
 fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     let toks = s.toks;
@@ -4103,30 +4121,15 @@ fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     (!constant || !tail_ok || text_placeholder).then(|| Raw::lock(k, UNREADABLE_EXECUTE, None))
 }
 
-/// The opening parenthesis of a `format(` or `pg_catalog.format(` call that
-/// follows the `EXECUTE` at `k`.
+/// The opening parenthesis of a `pg_catalog.format(` call that follows the
+/// `EXECUTE` at `k`.
+///
+/// The connection may start with a path that lists `pg_catalog` last. An
+/// unqualified `format` may then be another schema's function, and its
+/// template tells nothing about the SQL. So only the qualified name counts.
 fn format_paren(s: &Stmts, k: usize) -> Option<usize> {
     let qualified = s.is(k + 1, "pg_catalog") && s.is_punct(k + 2, '.');
-    let name = if qualified { k + 3 } else { k + 1 };
-    (s.is(name, "format") && s.is_punct(name + 1, '(')).then_some(name + 1)
-}
-
-/// Whether the `EXECUTE` at `k` calls an unqualified `format` that may not be
-/// the built-in.
-///
-/// Postgres searches `pg_catalog` first unless the path names it later. So
-/// only a path change, or a routine with its own `search_path`, may put
-/// another `format` first. The template then tells nothing about the SQL.
-fn shadowed_format(
-    s: &Stmts,
-    k: usize,
-    path_change: Option<usize>,
-    path_bodies: &[(usize, usize)],
-) -> bool {
-    let unqualified = s.is(k + 1, "format") && s.is_punct(k + 2, '(');
-    let changed = path_change.is_some_and(|c| c <= k)
-        || path_bodies.iter().any(|&(from, to)| from <= k && k < to);
-    unqualified && changed
+    (qualified && s.is(k + 3, "format") && s.is_punct(k + 4, '(')).then_some(k + 4)
 }
 
 /// The `lock_timeout` change at `k`, as `analyse` records it.
@@ -4410,6 +4413,20 @@ fn referenced<'h>(history: &'h History, table: &str) -> impl Iterator<Item = Str
         .iter()
         .filter(move |(owner, _)| **owner == name || owner.contains('%'))
         .flat_map(|(_, targets)| targets.iter().cloned())
+}
+
+/// The hits of the `VACUUM` at `k`. Postgres rejects any `VACUUM` in a
+/// transaction block, so each one must sit alone outside a transaction.
+fn vacuum(s: &Stmts, k: usize) -> Vec<Raw> {
+    let mut raws = vacuum_full(s, k);
+    raws.push(Raw {
+        at: k,
+        verb: "VACUUM",
+        index: None,
+        table: None,
+        kind: Kind::NoTransaction,
+    });
+    raws
 }
 
 /// `VACUUM FULL [name, ...]` or `VACUUM (FULL, ...) [name, ...]`.
@@ -6353,7 +6370,7 @@ fn execute_runs_its_constant_sql() {
     for body in [
         "EXECUTE 'ALTER TABLE harvest_events ADD COLUMN x INT';",
         "EXECUTE $q$ALTER TABLE harvest_events ADD COLUMN x INT$q$;",
-        "EXECUTE format('ALTER TABLE %I ADD COLUMN x INT', 'harvest_events');",
+        "EXECUTE pg_catalog.format('ALTER TABLE %I ADD COLUMN x INT', 'harvest_events');",
     ] {
         let sql = format!("DO $$\nBEGIN\n    {body}\nEND $$;");
         let findings = lint_with_history(&[], &sql, true);
@@ -6365,7 +6382,7 @@ fn execute_runs_its_constant_sql() {
     }
     // A placeholder is an unknown name, and an unknown index counts as hot.
     let sql = "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    \
-               EXECUTE format('DROP INDEX %I.idx_x', 'staging');\nEND $$;";
+               EXECUTE pg_catalog.format('DROP INDEX %I.idx_x', 'staging');\nEND $$;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
     // SQL with no lock passes.
@@ -6436,7 +6453,9 @@ fn a_format_literal_placeholder_in_code_makes_execute_unreadable() {
         "'DO $x$ BEGIN EXECUTE %L; END $x$'",
         "'CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS %L'",
     ] {
-        let sql = format!("{set}DO $$\nBEGIN\n    EXECUTE format({template}, {ddl});\nEND $$;");
+        let sql = format!(
+            "{set}DO $$\nBEGIN\n    EXECUTE pg_catalog.format({template}, {ddl});\nEND $$;"
+        );
         let findings = lint_with_history(&[], &sql, true);
         assert!(
             findings
@@ -6447,8 +6466,8 @@ fn a_format_literal_placeholder_in_code_makes_execute_unreadable() {
     }
     // A `%L` value in a query is data.
     let sql = format!(
-        "{set}DO $$\nBEGIN\n    EXECUTE format('SELECT %L', 'x');\nEND $$;\n\
-         DO $$\nBEGIN\n    EXECUTE format('DO $x$ BEGIN PERFORM %L; END $x$', 'x');\nEND $$;"
+        "{set}DO $$\nBEGIN\n    EXECUTE pg_catalog.format('SELECT %L', 'x');\nEND $$;\n\
+         DO $$\nBEGIN\n    EXECUTE pg_catalog.format('DO $x$ BEGIN PERFORM %L; END $x$', 'x');\nEND $$;"
     );
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
@@ -7396,16 +7415,49 @@ fn an_unqualified_format_after_a_path_change_is_unreadable() {
     // The built-in, named by its schema, stays readable.
     let sql = format!("{path}{}", execute("pg_catalog.format"));
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
-    // Without a path change, `pg_catalog` comes first.
+    // The connection itself may start with `pg_catalog` last, so even with no
+    // path change in the file, only the qualified name is the built-in.
     let sql = format!("SET LOCAL lock_timeout = '5s';\n{}", execute("format"));
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(
+        findings.iter().any(|f| f.detail.contains("cannot read")),
+        "{sql}\n{findings:?}"
+    );
+    let sql = format!(
+        "SET LOCAL lock_timeout = '5s';\n{}",
+        execute("pg_catalog.format")
+    );
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn vacuum_cannot_run_in_a_transaction() {
+    let vacuum = "VACUUM FULL harvest_events;";
+    let bounded = format!("SET LOCAL lock_timeout = '5s';\n{vacuum}");
+    let in_do = "DO $$\nBEGIN\n    VACUUM harvest_timers;\nEND $$;";
+    // Postgres rejects VACUUM in a transaction block, a batch or a body.
+    for (sql, in_transaction) in [
+        (bounded.as_str(), true),
+        ("VACUUM ANALYZE harvest_events;", true),
+        (bounded.as_str(), false),
+        (in_do, false),
+    ] {
+        let findings = lint_with_history(&[], sql, in_transaction);
+        assert!(
+            rules(&findings).contains(&Rule::ConcurrentlyInTransaction),
+            "{sql}\n{findings:?}"
+        );
+    }
+    // Alone in a file without a transaction, it runs.
+    let findings = lint_with_history(&[], "VACUUM ANALYZE harvest_events;", false);
+    assert_eq!(findings, [], "{findings:?}");
 }
 
 #[test]
 fn a_composed_format_template_is_unreadable() {
     for template in [
-        "format('ALTER TABLE harvest_' || 'events ADD COLUMN x INT')",
-        "format('ALTER TABLE harvest_' || 'events ADD COLUMN %I INT', 'x')",
+        "pg_catalog.format('ALTER TABLE harvest_' || 'events ADD COLUMN x INT')",
+        "pg_catalog.format('ALTER TABLE harvest_' || 'events ADD COLUMN %I INT', 'x')",
     ] {
         let sql = format!(
             "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    EXECUTE {template};\nEND $$;"
@@ -7416,8 +7468,8 @@ fn a_composed_format_template_is_unreadable() {
     }
     // One literal, with or without arguments, stays readable.
     for template in [
-        "format('ALTER TABLE t ADD COLUMN x INT')",
-        "format('ALTER TABLE t ADD COLUMN %I INT', 'x')",
+        "pg_catalog.format('ALTER TABLE t ADD COLUMN x INT')",
+        "pg_catalog.format('ALTER TABLE t ADD COLUMN %I INT', 'x')",
     ] {
         let sql = format!(
             "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    EXECUTE {template};\nEND $$;"
