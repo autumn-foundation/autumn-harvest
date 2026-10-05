@@ -2895,20 +2895,22 @@ fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
         .map(|r| base(&r.name))
         .chain(inherited.into_iter().flatten().map(String::as_str))
         .collect();
-    let resolved = |call: &Routine| {
-        routines.iter().any(|r| {
-            !r.foreign && r.sure && r.at < call.at && r.name == call.name && r.accepts(call)
-        })
-    };
     (0..s.toks.len())
-        .filter(|&k| s.toks[k].runs)
-        .filter(|&k| {
-            let start = s.starts[k] == k;
-            let execute = dynamic_execute(s, k) && unreadable_execute(s, k).is_some();
-            let call = call_target(s, k, &bases).is_some_and(|c| !resolved(&c));
-            (start && foreign_do(s, k)) || execute || call
-        })
+        .filter(|&k| s.toks[k].runs && opaque_at(s, k, &routines, &bases))
         .collect()
+}
+
+/// Whether the token at `k` runs code that the lint cannot read.
+///
+/// That is a `DO` in another language, an unreadable `EXECUTE`, or a call that
+/// no earlier routine of this file reaches. `bases` names the routines whose
+/// calls the lint looks for.
+fn opaque_at(s: &Stmts, k: usize, routines: &[Routine], bases: &BTreeSet<&str>) -> bool {
+    let start = s.starts[k] == k;
+    let execute = dynamic_execute(s, k) && unreadable_execute(s, k).is_some();
+    let resolved = |call: &Routine| routines.iter().any(|r| !r.foreign && reaches(s, r, call));
+    let call = call_target(s, k, bases).is_some_and(|c| !resolved(&c));
+    (start && foreign_do(s, k)) || execute || call
 }
 
 /// Whether the statement at `k` holds a `search_path` change that runs now.
@@ -2918,9 +2920,8 @@ fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
 /// a `SET LOCAL` or a plain `set_config` with a literal `true` scope.
 fn running_path_change(s: &Stmts, k: usize, local: bool) -> bool {
     let scope = usize::from(s.keyword(k + 1, "local") || s.keyword(k + 1, "session"));
-    let set = s.keyword(k, "set")
-        && (s.is(k + 1 + scope, "search_path") || s.keyword(k + 1 + scope, "schema"));
-    let reset = s.keyword(k, "reset") && (s.is(k + 1, "search_path") || s.keyword(k + 1, "all"));
+    let set = s.keyword(k, "set") && path_setting(s, k + 1 + scope);
+    let reset = s.keyword(k, "reset") && (path_setting(s, k + 1) || s.keyword(k + 1, "all"));
     if set || reset {
         return s.toks[k].runs && (local || !(set && s.keyword(k + 1, "local")));
     }
@@ -2950,11 +2951,23 @@ fn path_routine_call(s: &Stmts, history: &mut History) -> Option<usize> {
         .map(|r| base(&r.name))
         .chain(inherited.iter().map(String::as_str))
         .collect();
+    // A body that runs code the lint cannot read may change the path too.
+    let watched: BTreeSet<&str> = [
+        &history.clearing_routines,
+        &history.foreign_routines,
+        &history.locking_routines,
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::as_str)
+    .chain(routines.iter().map(|r| base(&r.name)))
+    .collect();
+    let changes = |j: usize| {
+        (s.starts[j] == j && changes_search_path(s, j)) || opaque_at(s, j, &routines, &watched)
+    };
     let mut names: BTreeSet<&str> = routines
         .iter()
-        .filter(|r| {
-            (r.at..s.toks.len()).any(|j| own(r, j) && s.starts[j] == j && changes_search_path(s, j))
-        })
+        .filter(|r| (r.at..s.toks.len()).any(|j| own(r, j) && changes(j)))
         .map(|r| base(&r.name))
         .chain(inherited.iter().map(String::as_str))
         .collect();
@@ -2987,19 +3000,34 @@ fn path_call(s: &Stmts, k: usize) -> bool {
     s.is(k, "set_config")
         && s.is_punct(k + 1, '(')
         && (!(s.string(k + 2).is_some() && s.is_punct(k + 3, ','))
-            || s.string(k + 2)
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("search_path")))
+            || s.string(k + 2).is_some_and(|v| {
+                ["search_path", "role", "session_authorization"]
+                    .iter()
+                    .any(|name| v.trim().eq_ignore_ascii_case(name))
+            }))
+}
+
+/// Whether the setting that a `SET` or `RESET` names at `j` may change where
+/// an unqualified name goes.
+///
+/// `SET SCHEMA` is an alias of `SET search_path`. The `"$user"` entry of the
+/// path follows the current role, so a role change counts too.
+fn path_setting(s: &Stmts, j: usize) -> bool {
+    s.is(j, "search_path")
+        || s.keyword(j, "schema")
+        || s.keyword(j, "role")
+        || s.keyword(j, "authorization")
+        || s.is(j, "session_authorization")
+        || (s.keyword(j, "session") && s.keyword(j + 1, "authorization"))
 }
 
 /// Whether the statement at `k` may change `search_path`.
 ///
 /// `SET`, `RESET` and a `set_config` call count, wherever they sit.
 fn changes_search_path(s: &Stmts, k: usize) -> bool {
-    // `SET SCHEMA` is an alias of `SET search_path`.
     let scope = usize::from(s.keyword(k + 1, "local") || s.keyword(k + 1, "session"));
-    let set = s.keyword(k, "set")
-        && (s.is(k + 1 + scope, "search_path") || s.keyword(k + 1 + scope, "schema"));
-    let reset = s.keyword(k, "reset") && (s.is(k + 1, "search_path") || s.keyword(k + 1, "all"));
+    let set = s.keyword(k, "set") && path_setting(s, k + 1 + scope);
+    let reset = s.keyword(k, "reset") && (path_setting(s, k + 1) || s.keyword(k + 1, "all"));
     // A call counts when it names `search_path`, or when its name is not one
     // plain literal, which may be `search_path` too.
     let call = (k..s.end(k)).any(|j| path_call(s, j));
@@ -7649,6 +7677,48 @@ fn a_path_routine_from_an_earlier_migration_changes_the_path() {
             .collect();
         let findings = lint_with_history(&history, drop, true);
         assert!(!findings.is_empty(), "{history:?}\n{findings:?}");
+    }
+}
+
+#[test]
+fn a_role_change_may_change_the_path() {
+    let index = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX public.idx;";
+    // The `"$user"` entry of `search_path` follows the current role.
+    for change in [
+        "SET ROLE app_owner;",
+        "SET LOCAL ROLE app_owner;",
+        "SET role = app_owner;",
+        "SET SESSION AUTHORIZATION app_owner;",
+        "RESET ROLE;",
+        "RESET SESSION AUTHORIZATION;",
+        "SELECT set_config('role', 'app_owner', false);",
+    ] {
+        let history = format!("{change}\n{index}");
+        let findings = lint_with_history(&[&history], drop, true);
+        assert!(!findings.is_empty(), "{history}\n{findings:?}");
+    }
+    // A session role change carries into a later migration.
+    let findings = lint_with_history(&["SET ROLE app_owner;", index], drop, true);
+    assert!(!findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn a_routine_that_runs_opaque_code_may_change_the_path() {
+    let index = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX public.idx;";
+    for body in ["CALL mystery();", "EXECUTE v;"] {
+        let routine = format!(
+            "CREATE FUNCTION outer_f(v text) RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+             {body}\nEND $$;\n"
+        );
+        assert_eq!(
+            lint_with_history(&[&format!("{routine}{index}")], drop, true),
+            []
+        );
+        let history = format!("{routine}SELECT outer_f('x');\n{index}");
+        let findings = lint_with_history(&[&history], drop, true);
+        assert!(!findings.is_empty(), "{history}\n{findings:?}");
     }
 }
 

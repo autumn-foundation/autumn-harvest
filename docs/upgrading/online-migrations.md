@@ -86,7 +86,9 @@ schema of its table, and a name without a schema means `public`. A
 After a `search_path` change, an unqualified name has no known schema, so the
 lint neither learns nor places it. A call of a routine whose body may change
 `search_path` counts as a change when the call returns. That holds for a
-routine from an earlier migration too.
+routine from an earlier migration too. So does a body that runs code the lint
+cannot read. The `"$user"` entry of the path follows the current role, so
+`SET ROLE`, `SET SESSION AUTHORIZATION` and their resets count as a change.
 It finds the foreign keys of a table from the migrations that added them. An
 index that no migration creates counts as hot. So does a `REINDEX` of a schema,
 a database or the system catalogs.
