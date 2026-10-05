@@ -102,7 +102,9 @@ lint neither learns nor places it. A call of a routine whose body may change
 routine from an earlier migration too. So does a body that runs code the lint
 cannot read. The `"$user"` entry of the path follows the current role, so
 `SET ROLE`, `SET SESSION AUTHORIZATION` and their resets count as a change.
-It finds the foreign keys of a table from the migrations that added them. An
+It finds the foreign keys of a table from the migrations that added them. A
+key added under a `format()` placeholder may belong to any table, so it counts
+for every table. An
 index that no migration creates counts as hot. So does a `REINDEX` of a schema,
 a database or the system catalogs.
 

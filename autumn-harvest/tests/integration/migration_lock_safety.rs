@@ -4241,14 +4241,17 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
     }
 }
 
-/// The tables that `table`'s foreign keys reference.
+/// The tables that `table`'s foreign keys may reference.
+///
+/// A key whose owner is a `format()` placeholder may belong to any table, so
+/// it counts for every table.
 fn referenced<'h>(history: &'h History, table: &str) -> impl Iterator<Item = String> + 'h {
+    let name = base(table).to_string();
     history
         .references
-        .get(base(table))
-        .into_iter()
-        .flatten()
-        .cloned()
+        .iter()
+        .filter(move |(owner, _)| **owner == name || owner.contains('%'))
+        .flat_map(|(_, targets)| targets.iter().cloned())
 }
 
 /// `VACUUM FULL [name, ...]` or `VACUUM (FULL, ...) [name, ...]`.
@@ -8041,6 +8044,17 @@ fn conforming_strings_start_unknown_in_each_migration() {
     let sql = format!("{on}\n{hidden}");
     let findings = lint_with_history(&[], &sql, true);
     assert!(!flagged(&findings), "{findings:?}");
+}
+
+#[test]
+fn a_placeholder_owner_may_be_any_table() {
+    // `%I` may name any table, so each table may own this hot foreign key.
+    let earlier = "SET LOCAL lock_timeout = '5s';\nDO $$\nBEGIN\n    EXECUTE format(\
+                   'ALTER TABLE %I ADD FOREIGN KEY (e) REFERENCES harvest_events (id)', 'cold');\nEND $$;";
+    let drop = "ALTER TABLE cold DROP CONSTRAINT cold_e_fkey;";
+    assert_eq!(lint_with_history(&[], drop, true), []);
+    let findings = lint_with_history(&[earlier], drop, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 #[test]
