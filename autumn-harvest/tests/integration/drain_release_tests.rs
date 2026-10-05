@@ -665,6 +665,28 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         serde_json::json!([]),
         "the kept lease advertises no queue"
     );
+    // A replacement with the same id registers as Active with its own
+    // queues. The keeper must not clear them.
+    diesel::update(harvest_workers::table.find(&worker_a))
+        .set((
+            harvest_workers::status.eq("Active"),
+            harvest_workers::queues.eq(serde_json::json!(["replacement-q"])),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("register a replacement");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let queues: serde_json::Value = harvest_workers::table
+        .find(&worker_a)
+        .select(harvest_workers::queues)
+        .first(&mut conn)
+        .await
+        .expect("load the replacement row");
+    assert_eq!(
+        queues,
+        serde_json::json!(["replacement-q"]),
+        "the keeper leaves a replacement's queues alone"
+    );
 
     // A shutdown heartbeat does not re-register a missing row. The keeper
     // must restore it, or orphan reclaim sees no worker. A missing row is an

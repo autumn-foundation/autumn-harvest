@@ -446,6 +446,10 @@ pub async fn register_worker_and_clear_stale_miss_evidence(
 /// [`live_workers_on_queue_query`] would count it as a capable peer, and a
 /// capability miss would keep releasing a task instead of escalating it.
 ///
+/// The queues are cleared only while the row is not `Active`. A replacement
+/// worker with the same id registers as `Active` with its own queues, and
+/// this write must not remove them.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError`] on database failure.
@@ -456,7 +460,9 @@ pub async fn touch_worker_liveness(
     diesel::update(harvest_workers::table.find(worker_id))
         .set((
             harvest_workers::last_heartbeat_at.eq(diesel::dsl::now),
-            harvest_workers::queues.eq(serde_json::json!([])),
+            harvest_workers::queues.eq(diesel::dsl::sql::<diesel::sql_types::Jsonb>(
+                "CASE WHEN status = 'Active' THEN queues ELSE '[]'::jsonb END",
+            )),
         ))
         .execute(conn)
         .await
