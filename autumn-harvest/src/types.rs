@@ -1357,9 +1357,10 @@ impl fmt::Display for DeploymentName {
 
 /// Task priority for within-queue ordering (issue #249).
 ///
-/// Workers claim tasks in `priority DESC, available_at ASC` order, so
-/// higher-priority tasks are claimed before lower-priority ones that arrived
-/// earlier.  Same-priority tasks are FIFO by `available_at`.
+/// Workers claim tasks in `priority DESC` order, then by due time
+/// (`scheduled_at`). So a higher-priority task goes before a lower-priority
+/// task that arrived earlier. Within one priority, a continuation goes
+/// before a new start. See *Continuations* below.
 ///
 /// The numeric values are chosen so that `Normal = 0` preserves backward
 /// compatibility: pre-upgrade rows written with `priority = 0` continue to
@@ -1375,6 +1376,13 @@ impl fmt::Display for DeploymentName {
 /// priority is boosted by `+1` for every `aging_secs` it has waited in
 /// `PENDING` state.  This bounds the maximum starvation time for `Low`
 /// priority tasks even under sustained high-priority load.
+///
+/// ## Continuations
+///
+/// Within one priority level, continuations of running workflows are claimed
+/// before the first task of a new run (issue #1824). The new start yields
+/// for at most [`crate::queue::NEW_START_HANDICAP_SECS`]. A higher priority
+/// always wins over this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {

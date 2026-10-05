@@ -8106,3 +8106,61 @@ async fn cancel_live_attempt_does_not_deadlock_a_capacity_one_target_pool() {
         "expected the terminal-state refusal, got {error:?}"
     );
 }
+
+/// A task row staged before migration `20261004162927` has no `new_start`
+/// key (issue #1824). So does a row staged by a source shard that is not yet
+/// migrated. `jsonb_populate_record` over a NULL base turns a missing key
+/// into NULL, and `new_start` is NOT NULL. Activation must still restore the
+/// row, as a continuation.
+#[tokio::test]
+async fn activation_restores_a_task_staged_without_the_new_start_key() {
+    #[derive(diesel::QueryableByName)]
+    struct Restored {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        new_start: bool,
+    }
+
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "pre-new-start-stage").await;
+
+    let mut source = shards.source().await;
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    let mut target = shards.target().await;
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    diesel::sql_query(
+        "UPDATE harvest_shard_migrations SET staged_task = staged_task - 'new_start' \
+         WHERE execution_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("strip the new_start key");
+
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover")
+    );
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activation restores the row");
+
+    let mut target2 = shards.target().await;
+    let row: Restored = diesel::sql_query(
+        "SELECT new_start FROM harvest_task_queue \
+          WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut target2)
+    .await
+    .expect("the restored task row");
+    assert!(!row.new_start, "a restored row is a continuation");
+}

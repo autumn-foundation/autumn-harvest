@@ -68,7 +68,7 @@ Design decisions:
 
 ### Upgrade note
 
-This changes default behaviour. `docs/upgrading/0.7.0.md` §1.5 carries the
+This changes default behaviour. `docs/upgrading/0.7.0.md` §1.6 carries the
 note: who is affected, how to raise a cap or restore `unlimited`, and a SQL
 query that finds the runs a cap would fail.
 
