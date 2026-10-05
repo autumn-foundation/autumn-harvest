@@ -188,6 +188,9 @@ outlives its file, so the rule holds for every later migration too. A
 top-level `SET LOCAL` change ends with its transaction, so it does not.
 A call of a routine whose body makes a session change counts as a session
 change too.
+An `ALTER ROLE`, `ALTER USER` or `ALTER DATABASE` that sets or resets
+`search_path` changes the default of each later connection. So it counts for
+every later migration.
 
 A change in the expression of an `EXECUTE` takes effect before the SQL runs.
 A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`, `EXIT` or

@@ -3125,7 +3125,10 @@ fn path_change(s: &Stmts, opaque: &[usize], history: &mut History) -> Option<usi
     // Only a session change that runs now carries into history. A local
     // change ends with its transaction. A routine body runs only when called.
     // `path_routine_call` carries a running call of a session-changing routine.
-    let session = (0..s.toks.len()).any(|k| s.starts[k] == k && running_path_change(s, k, false));
+    let session = (0..s.toks.len()).any(|k| {
+        s.starts[k] == k
+            && (running_path_change(s, k, false) || s.toks[k].runs && role_default_change(s, k))
+    });
     history.search_path_changed |= session;
     let local = text.into_iter().chain(hidden).min();
     local.or_else(|| history.search_path_changed.then_some(0))
@@ -3258,7 +3261,9 @@ fn path_routine_call(s: &Stmts, history: &mut History) -> Option<usize> {
     let names = changed_by(&changes, &inherited);
     // Only a readable session change outlives the migration. Code that the
     // lint cannot read keeps its doubt in its own file.
-    let session_change = |j: usize| s.starts[j] == j && path_change_at(s, j, false, false);
+    let session_change = |j: usize| {
+        s.starts[j] == j && (path_change_at(s, j, false, false) || role_default_change(s, j))
+    };
     let session = changed_by(&session_change, &inherited_session);
     let names_view: BTreeSet<&str> = names.iter().map(String::as_str).collect();
     let end = (0..s.toks.len())
@@ -3301,6 +3306,23 @@ fn path_setting(s: &Stmts, j: usize) -> bool {
         || s.keyword(j, "authorization")
         || s.is(j, "session_authorization")
         || (s.keyword(j, "session") && s.keyword(j + 1, "authorization"))
+}
+
+/// Whether the statement at `k` changes the default `search_path` of a role
+/// or a database.
+///
+/// The current connection keeps its value. Each later connection starts with
+/// the new default, so the change counts for later migrations.
+fn role_default_change(s: &Stmts, k: usize) -> bool {
+    let owner = ["role", "user", "database"]
+        .iter()
+        .any(|word| s.keyword(k + 1, word));
+    s.keyword(k, "alter")
+        && owner
+        && (k..s.end(k)).any(|j| {
+            (s.keyword(j, "set") && path_setting(s, j + 1))
+                || (s.keyword(j, "reset") && (path_setting(s, j + 1) || s.keyword(j + 1, "all")))
+        })
 }
 
 /// Whether the statement at `k` may change `search_path`.
@@ -8474,6 +8496,26 @@ fn a_session_path_change_in_a_routine_carries_into_later_migrations() {
     // A local value ends with the transaction of the call.
     let history = [index, local, "SELECT f();"];
     assert_eq!(lint_with_history(&history, drop, true), [], "{history:?}");
+}
+
+#[test]
+fn a_role_default_path_carries_into_later_migrations() {
+    let index = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX idx;";
+    // The default applies to each later connection, so later migrations
+    // may resolve `idx` in another schema.
+    for change in [
+        "ALTER ROLE app SET search_path = tenant, public;",
+        "ALTER USER app SET search_path TO tenant;",
+        "ALTER ROLE app IN DATABASE harvest SET search_path = tenant;",
+        "ALTER DATABASE harvest SET search_path = tenant;",
+        "ALTER ROLE app RESET ALL;",
+    ] {
+        let findings = lint_with_history(&[index, change], drop, true);
+        assert!(!findings.is_empty(), "{change}\n{findings:?}");
+    }
+    let other = "ALTER ROLE app SET work_mem = '64MB';";
+    assert_eq!(lint_with_history(&[index, other], drop, true), []);
 }
 
 #[test]
