@@ -1567,12 +1567,14 @@ async fn backdate_events(database_url: &str, exec_id: ExecutionId, minutes: i64)
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect to backdate events");
-    diesel::sql_query(format!(
+    let sql = format!(
         "UPDATE harvest_events SET timestamp = NOW() - INTERVAL '{minutes} minutes' \
          WHERE workflow_exec_id = '{}'",
         exec_id.as_uuid()
-    ))
-    .execute(&mut conn)
+    );
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::sql_query(sql).execute(c).await
+    })
     .await
     .expect("backdate update should succeed");
 }

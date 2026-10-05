@@ -76,6 +76,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
+use autumn_harvest::append_only::with_guard_off;
 use autumn_harvest::codec_rotation::{
     FleetWriteFence, activate_codec_key, load_shard_rotation_progress,
     load_shard_rotation_progress_against, refresh_active_codec_key, retire_codec_key,
@@ -103,6 +104,23 @@ use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
+
+/// Commit `data` over row `row_id` as PII erasure does: under the `erase`
+/// sanction, which the append-only guard requires (issue #1817).
+async fn commit_as_erasure(conn: &mut AsyncPgConnection, row_id: i64, data: &Value) {
+    use autumn_harvest::schema::harvest_events;
+    conn.transaction::<_, diesel::result::Error, _>(async |c| {
+        diesel::sql_query("SELECT set_config('harvest.sanctioned_event_rewrite', 'erase', true)")
+            .execute(c)
+            .await?;
+        diesel::update(harvest_events::table.find(row_id))
+            .set(harvest_events::event_data.eq(data))
+            .execute(c)
+            .await
+    })
+    .await
+    .expect("an erasure commits under its sanction");
+}
 
 // ── codecs ───────────────────────────────────────────────────────────────────
 
@@ -1119,11 +1137,7 @@ async fn an_erasure_tombstone_committed_before_the_sweep_is_never_overwritten() 
         .await
         .expect("row");
     tombstoned["data"]["input"] = erasure_tombstone();
-    diesel::update(harvest_events::table.find(row_id))
-        .set(harvest_events::event_data.eq(&tombstoned))
-        .execute(&mut conn)
-        .await
-        .expect("tombstone");
+    commit_as_erasure(&mut conn, row_id, &tombstoned).await;
 
     let swept = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
         .await
@@ -1185,11 +1199,7 @@ async fn a_stale_read_can_never_overwrite_a_committed_erasure() {
     // 2. An erasure tombstones the row and commits, under the sweep.
     let mut tombstoned = stale.clone();
     tombstoned["data"]["input"] = erasure_tombstone();
-    diesel::update(harvest_events::table.find(row_id))
-        .set(harvest_events::event_data.eq(&tombstoned))
-        .execute(&mut conn)
-        .await
-        .expect("erasure commits");
+    commit_as_erasure(&mut conn, row_id, &tombstoned).await;
 
     // 3. The sweep's write must lose.
     let swapped = compare_and_swap_event(
@@ -1259,11 +1269,14 @@ async fn offload_envelopes_and_tombstones_survive_a_sweep_untouched() {
             .await
             .expect("row");
         data["data"][field] = replacement;
-        diesel::update(harvest_events::table.find(row_id))
-            .set(harvest_events::event_data.eq(&data))
-            .execute(&mut conn)
-            .await
-            .expect("update");
+        with_guard_off(&mut conn, async |c| {
+            diesel::update(harvest_events::table.find(row_id))
+                .set(harvest_events::event_data.eq(&data))
+                .execute(c)
+                .await
+        })
+        .await
+        .expect("update");
     }
 
     codecs.set_active_key("k2").expect("flip");
@@ -2184,11 +2197,14 @@ async fn a_near_envelope_is_neither_counted_nor_swept() {
         "data": "AAAA",
         "something_else": true,
     });
-    diesel::update(harvest_events::table.find(row_id))
-        .set(harvest_events::event_data.eq(&data))
-        .execute(&mut conn)
-        .await
-        .expect("update");
+    with_guard_off(&mut conn, async |c| {
+        diesel::update(harvest_events::table.find(row_id))
+            .set(harvest_events::event_data.eq(&data))
+            .execute(c)
+            .await
+    })
+    .await
+    .expect("update");
 
     codecs.set_active_key("k2").expect("flip");
     let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
@@ -2249,11 +2265,14 @@ async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
         "data": "AAAA",
         "kid": "k1",
     });
-    diesel::update(harvest_events::table.find(row_id))
-        .set(harvest_events::event_data.eq(&data))
-        .execute(&mut conn)
-        .await
-        .expect("update");
+    with_guard_off(&mut conn, async |c| {
+        diesel::update(harvest_events::table.find(row_id))
+            .set(harvest_events::event_data.eq(&data))
+            .execute(c)
+            .await
+    })
+    .await
+    .expect("update");
 
     codecs.set_active_key("k2").expect("flip");
     let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
@@ -2405,11 +2424,14 @@ async fn a_nested_near_envelope_is_neither_counted_nor_swept() {
         "_harvest_codec_envelope": {"codec_id": "xor", "data": "AAAA"},
         "something_else": true,
     });
-    diesel::update(harvest_events::table.find(row_id))
-        .set(harvest_events::event_data.eq(&data))
-        .execute(&mut conn)
-        .await
-        .expect("update");
+    with_guard_off(&mut conn, async |c| {
+        diesel::update(harvest_events::table.find(row_id))
+            .set(harvest_events::event_data.eq(&data))
+            .execute(c)
+            .await
+    })
+    .await
+    .expect("update");
 
     codecs.set_active_key("k2").expect("flip");
     let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
@@ -2840,11 +2862,14 @@ async fn a_crafted_key_id_in_stored_input_is_not_counted() {
         "data": "AAAA",
         "kid": "A".repeat(4096),
     });
-    diesel::update(harvest_events::table.find(row_id))
-        .set(harvest_events::event_data.eq(&data))
-        .execute(&mut conn)
-        .await
-        .expect("update");
+    with_guard_off(&mut conn, async |c| {
+        diesel::update(harvest_events::table.find(row_id))
+            .set(harvest_events::event_data.eq(&data))
+            .execute(c)
+            .await
+    })
+    .await
+    .expect("update");
 
     codecs.set_active_key("k2").expect("flip");
     let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)

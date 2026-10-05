@@ -156,17 +156,21 @@ fn request_response_workflow_id() -> AutumnResult<String> {
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .routes(routes![greet])
-        .plugin(
-            HarvestPlugin::new()
-                .workflows(workflows![greeting, instant_greeting])
-                .activities(activities![send_greeting])
-                .worker(WorkerConfig::default())
-                .api("/api/harvest"),
-        )
-        .run()
-        .await;
+    // The `run` future is large in autumn-web 0.8, so it is boxed.
+    // That keeps it off the stack and satisfies `clippy::large_futures`.
+    Box::pin(
+        autumn_web::app()
+            .routes(routes![greet])
+            .plugin(
+                HarvestPlugin::new()
+                    .workflows(workflows![greeting, instant_greeting])
+                    .activities(activities![send_greeting])
+                    .worker(WorkerConfig::default())
+                    .api("/api/harvest"),
+            )
+            .run(),
+    )
+    .await;
 }
 
 #[cfg(test)]

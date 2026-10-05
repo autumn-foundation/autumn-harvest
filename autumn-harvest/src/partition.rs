@@ -237,6 +237,27 @@ const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 /// harvest's.
 const EXEC_FK_TRIGGER_TGTYPE: i16 = 7;
 
+/// A SQL predicate that is true unless `tg` is harvest's own append-only
+/// guard (issue #1817). Expects the aliases `tg` (`pg_trigger`), `p`
+/// (`pg_proc`) and `c` (`pg_class`).
+///
+/// Each conversion reinstalls the guard, so it is not an operator trigger.
+/// The exemption checks the whole identity, as for [`EXEC_FK_TRIGGER`]:
+/// name, function, schema, shape, no arguments, no `WHEN` clause, and the
+/// plain enabled state.
+fn not_the_append_only_guard_sql() -> String {
+    use crate::append_only::{GUARD_FUNCTION, GUARD_TRIGGER, GUARD_TRIGGER_TGTYPE};
+    format!(
+        "NOT (tg.tgname = '{GUARD_TRIGGER}' \
+         AND p.proname = '{GUARD_FUNCTION}' \
+         AND p.pronamespace = c.relnamespace \
+         AND tg.tgtype = {GUARD_TRIGGER_TGTYPE} \
+         AND tg.tgnargs = 0 \
+         AND tg.tgqual IS NULL \
+         AND tg.tgenabled = 'O')"
+    )
+}
+
 /// The `COMMENT` `enable` stamps on `idx_harvest_we_created_at`.
 ///
 /// Stamped the moment `enable` actually creates that index. Never stamped
@@ -2267,11 +2288,15 @@ async fn refuse_if_unreplayable_constraints(
 /// silently changed its enable mode. The exemption now requires that
 /// too.
 ///
+/// The append-only guard (issue #1817) is exempt the same way, by its whole
+/// identity. See [`not_the_append_only_guard_sql`].
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] if the catalog query fails.
 #[cfg(feature = "db")]
 pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    let not_the_guard = not_the_append_only_guard_sql();
     let rows = diesel::sql_query(format!(
         "SELECT tg.tgname AS v
            FROM pg_trigger tg
@@ -2297,6 +2322,7 @@ pub async fn operator_triggers(conn: &mut AsyncPgConnection) -> HarvestResult<Ve
                      AND tg.tgnargs = 0
                      AND tg.tgqual IS NULL
                      AND tg.tgenabled = 'O')
+            AND {not_the_guard}
           ORDER BY 1"
     ))
     .load::<TextRow>(conn)
@@ -2320,13 +2346,29 @@ async fn refuse_if_operator_triggers(
          ({}). An operator trigger stays on the renamed table, where it stops firing for \
          every new row from cutover onward while still existing — silent for an audit or \
          validation trigger, since nothing reports the loss. Drop the trigger first (and \
-         recreate it against harvest_events afterward) to proceed.",
+         recreate it against harvest_events afterward) to proceed.{}",
         if triggers.len() == 1 {
             "a trigger is"
         } else {
             "triggers are"
         },
-        triggers.join(", ")
+        triggers.join(", "),
+        // Issue #1817: the conversion reinstalls harvest's own guard, so
+        // recreating it by hand afterward fails with "already exists".
+        if triggers
+            .iter()
+            .any(|t| t == crate::append_only::GUARD_TRIGGER)
+        {
+            format!(
+                " {} is harvest's append-only guard in a changed state. Re-enable it \
+                 (`ALTER TABLE harvest_events ENABLE TRIGGER {}`) or drop it. The \
+                 conversion reinstalls it, so do not recreate it.",
+                crate::append_only::GUARD_TRIGGER,
+                crate::append_only::GUARD_TRIGGER
+            )
+        } else {
+            String::new()
+        }
     )))
 }
 
@@ -2513,6 +2555,9 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     let copy_acl = copy_acl_body(LEGACY_PARTITION, "harvest_events");
     let bounded_rename_fn = bounded_rename_fn_sql();
     let expected_cohort_ck_stmt = expected_cohort_ck_def_sql("cutover");
+    let not_the_guard = not_the_append_only_guard_sql();
+    let create_guard = crate::append_only::create_guard_trigger_sql();
+    let guard = crate::append_only::GUARD_TRIGGER;
     // Review finding: the view, trigger and unique-index rechecks below
     // all close the same preflight-to-lock gap for a publication too.
     // See `incompatible_publications` for why a leaf-publishing
@@ -2701,7 +2746,8 @@ the preflight check ran but before this transaction''s ACCESS EXCLUSIVE lock. Dr
                 AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}
                 AND tg.tgnargs = 0
                 AND tg.tgqual IS NULL
-                AND tg.tgenabled = 'O');
+                AND tg.tgenabled = 'O')
+       AND {not_the_guard};
     IF bad_trg IS NOT NULL THEN
         RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by CREATE \
 TABLE ... (LIKE ...) (%), installed after the preflight check ran but before this \
@@ -2920,6 +2966,10 @@ harvest_events afterward, if it is still needed), then re-run.', bad_con;
     EXECUTE 'CREATE TRIGGER {EXEC_FK_TRIGGER} BEFORE INSERT ON harvest_events '
          || 'FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()';
 
+    -- Issue #1817: `LIKE` copies no triggers, so install the append-only
+    -- guard on the new parent. Postgres clones it onto each partition.
+    EXECUTE '{create_guard}';
+
     -- The sweeper's tier-1 drop gate reads
     -- `harvest_workflow_executions (created_at)`; without this index that probe
     -- is a sequential scan of the executions table, per cohort, per tick.
@@ -2999,6 +3049,10 @@ harvest_events afterward, if it is still needed), then re-run.', bad_con;
             || 'CHECK (cohort < %L) NOT VALID', cutover);
         EXECUTE 'ALTER TABLE {LEGACY_PARTITION} '
              || 'VALIDATE CONSTRAINT {LEGACY_PARTITION}_cohort_ck';
+        -- ATTACH clones the parent's append-only guard. It fails if the
+        -- partition already has a trigger of that name, so drop the old copy
+        -- first. The lock this block holds closes the gap between the two.
+        EXECUTE 'DROP TRIGGER IF EXISTS {guard} ON {LEGACY_PARTITION}';
         EXECUTE format(
             'ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION} '
             || 'FOR VALUES FROM (MINVALUE) TO (%L)', cutover);
@@ -3882,6 +3936,10 @@ pub async fn disable_partitioning(
                  WHERE cohort <> '-infinity'::timestamptz",
             )
             .await?;
+            // Issue #1817: `LIKE` copies no triggers, so reinstall the
+            // append-only guard on the flat table. Keep it after the `cohort`
+            // reset above: the guard rejects a `cohort` change.
+            exec(conn, &crate::append_only::create_guard_trigger_sql()).await?;
             exec(
                 conn,
                 "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id)",
@@ -5624,6 +5682,7 @@ fn dependent_views_guard_sql(tag: &str) -> String {
 /// [`operator_triggers`]'s identical enabled-state fix too.
 #[must_use]
 fn operator_triggers_guard_sql(tag: &str) -> String {
+    let not_the_guard = not_the_append_only_guard_sql();
     format!(
         "DO ${tag}$\nDECLARE bad text;\nBEGIN\n    \
          SELECT string_agg(tg.tgname, ', ' ORDER BY 1) INTO bad\n      \
@@ -5639,7 +5698,8 @@ fn operator_triggers_guard_sql(tag: &str) -> String {
          AND tg.tgtype = {EXEC_FK_TRIGGER_TGTYPE}\n                      \
          AND tg.tgnargs = 0\n                      \
          AND tg.tgqual IS NULL\n                      \
-         AND tg.tgenabled = 'O');\n    \
+         AND tg.tgenabled = 'O')\n       \
+         AND {not_the_guard};\n    \
          IF bad IS NOT NULL THEN\n        \
          RAISE EXCEPTION 'harvest #958: trigger(s) on harvest_events not carried by \
          CREATE TABLE ... (LIKE ...) (%). An operator trigger would stay on the \
@@ -6471,9 +6531,21 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
                  FOR EACH ROW EXECUTE FUNCTION harvest_events_require_execution()"
             ),
         ),
+        // Issue #1817: `LIKE` copies no triggers. Install the append-only
+        // guard on the new parent. Postgres clones it onto each partition.
+        step(4, crate::append_only::create_guard_trigger_sql()),
         step(
             4,
             format!("CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT"),
+        ),
+        // ATTACH clones the parent's guard, and fails if the legacy table
+        // still has its own copy under the same name.
+        step(
+            4,
+            format!(
+                "DROP TRIGGER IF EXISTS {} ON {LEGACY_PARTITION}",
+                crate::append_only::GUARD_TRIGGER
+            ),
         ),
         step(
             4,

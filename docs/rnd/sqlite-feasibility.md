@@ -37,7 +37,7 @@ current for the audited revision, not as prose.
 | Is harvest's determinism core backend-portable? | **Yes, already.** It consumes plain values (`ExecutionId`, `Vec<WorkflowEvent>`, a handler `fn`, JSON) — no connection, no trait object. |
 | Is harvest's *coordination* layer backend-portable? | **No.** Multi-worker claim, push notification, and cross-connection locking are the three load-bearing Postgres features, and SQLite substitutes them only by dropping capability. |
 | Did the prototype work? | **Yes — 4/4 durability scenarios**, plus cross-backend replay. Now productized. |
-| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 26 of 63 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
+| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 26 of 64 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
 | What shipped instead? | `autumn-harvest-sqlite` — reuses the determinism core wholesale, reimplements persistence only. |
 
 The one-sentence version: **the valuable half of harvest is already portable
@@ -54,23 +54,23 @@ module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
 |---|---|---|
-| `diesel` query layer | 63 modules | Query construction is mechanical; the *type* layer is not. |
+| `diesel` query layer | 64 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 15 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 43 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 44 modules | Case by case — the SQL must be read, not inferred from the ORM. |
 | `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 31 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 14 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 10 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
 | `gen_random_uuid` server-side ids | 1 module | Yes — mint application-side. |
 
-Plus **121 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
+Plus **122 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 `INTERVAL`, `UUID`, partial indexes, `gen_random_uuid()` defaults), none of
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**63 of the 124 core modules** exhibit at least one mechanism — just over
+**64 of the 125 core modules** exhibit at least one mechanism — a shade over
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
@@ -107,7 +107,7 @@ have grown past that round's 18 as new Postgres-only syntax lands; each module
 the open rule newly catches has so far already been (b) or (c). The counts move;
 the classifications do not.
 
-That 43 of the 63 coupled modules hand-write SQL is therefore the more
+That 44 of the 64 coupled modules hand-write SQL is therefore the more
 decision-relevant number than any dialect tally. It is the volume of query text
 a second backend must re-author by hand, and it is knowable exactly.
 
@@ -160,6 +160,7 @@ Classification rule:
 |---|---|---|---|
 | `activity_pause` | diesel, raw-sql | (b) | Claim-time gate on one activity type. The snapshot-window re-check and the two-pass resume credit exist only for READ COMMITTED; a single writer subsumes both. |
 | `admission_gate` | diesel, advisory-lock, raw-sql | (b) | Advisory lock subsumed by the single write lock. |
+| `append_only` | diesel, raw-sql | (b) | The database guard on append-only `harvest_events` (issue #1817). The guard itself is a `BEFORE UPDATE` trigger in a migration. This module only sets and clears a transaction-local setting with `set_config`, which SQLite does not have. SQLite has `BEFORE UPDATE` triggers and `RAISE(ABORT)`, so the guard ports. The sanction would need another per-connection flag, such as a row in a `TEMP` table. That is a rewrite of one mechanism, not a lost capability, hence (b). The test-only `with_guard_off` uses `session_replication_role`, which has no SQLite equivalent and would not need one. |
 | `audit` | diesel, raw-sql | (b) | Append-only row writes, plus one hand-written statement: the retention purge carries a `NOT EXISTS` guard against `harvest_audit_export_cursor` so a sweep can never delete an audit record the exporter has not yet shipped (#953). Written as one statement deliberately -- a read-then-delete pair would widen the window in which a concurrent redrive lowers the cursor between the two. Plain DML with nothing Postgres-specific in it, so the substitute is a direct transcription; it is (b) rather than (a) only because the SQL is hand-written and must be read rather than inferred from the ORM. |
 | `audit_export` | advisory-lock, diesel, raw-pg-sql, raw-sql, row-lock, to_regclass | (b) | Off-box audit export (#953). `SELECT ... FOR UPDATE` on the per-shard cursor row serializes exporters (`row-lock`); a single writer subsumes it. The lazy claim-scan index build (#1667) takes a session advisory lock so two exporters never drop each other's build (`advisory-lock`), subsumed by the single write lock. It also probes `to_regclass` for the audit table and its index, a `sqlite_master` lookup. SQLite has no concurrent index build, so the build becomes a plain `CREATE INDEX`. The sequence-assignment statement uses a `row_number() OVER (ORDER BY ...)` window in an `UPDATE ... FROM` CTE -- SQLite has window functions (3.25+) but not `UPDATE ... FROM` before 3.33, so it needs a correlated-subquery rewrite. |
 | `backup_verify` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Read-only post-restore probes (issue #943). Every statement is a `SELECT`, but the reused scanner predicates carry `NOW() - ($1 * INTERVAL '1 second')` interval arithmetic — rewrite against integer epoch ms, as `build_routing` does. `COUNT(*) OVER ()` already works (SQLite window functions, 3.25+). |
@@ -222,7 +223,7 @@ Classification rule:
 | `worker` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
-**Totals: (a) 8 · (b) 29 · (c) 26.**
+**Totals: (a) 8 · (b) 30 · (c) 26.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
@@ -327,7 +328,7 @@ absence of demand for what it would buy.
 
 | Component | Scope |
 |---|---|
-| Trait definition + Postgres impl | ~63 modules touched |
+| Trait definition + Postgres impl | ~64 modules touched |
 | Rewriting scanners against the trait | ~13 modules, each with a concurrency contract to re-specify |
 | Type-layer abstraction | `models.rs` + `schema.rs` wholesale |
 | Test matrix | Every DB-gated suite runs twice, with per-backend expectations where semantics diverge |
@@ -372,13 +373,13 @@ disputed:
 
 - **26 modules are class (c)** — portable only by dropping a capability or
   reimplementing wholesale — against 8 that are trivially trait-able.
-- **43 modules reach for raw SQL**, so their portability cannot be read off
+- **44 modules reach for raw SQL**, so their portability cannot be read off
   their Diesel usage at all.
 - The **capability losses are documented and unavoidable** on the single-writer
   side (*Known capability losses*, below), so the second backend is not the same
   product with a different file on disk.
 - The companion crate delivered that capability at **structurally zero cost** to
-  the Postgres path, against a seam sized above at ~63 modules touched.
+  the Postgres path, against a seam sized above at ~64 modules touched.
 
 Each subsection below is a cost, weighed against that. None is offered as a
 proof that the trait is impossible; the previous section establishes that it is

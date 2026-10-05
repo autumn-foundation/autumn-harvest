@@ -273,13 +273,16 @@ async fn backdate_all_events(database_url: &str, exec_id: ExecutionId, hours_ago
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect");
-    diesel::sql_query(
-        "UPDATE harvest_events SET timestamp = NOW() - ($1 * INTERVAL '1 hour') \
-         WHERE workflow_exec_id = $2",
-    )
-    .bind::<diesel::sql_types::BigInt, _>(hours_ago)
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::sql_query(
+            "UPDATE harvest_events SET timestamp = NOW() - ($1 * INTERVAL '1 hour') \
+             WHERE workflow_exec_id = $2",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(hours_ago)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(c)
+        .await
+    })
     .await
     .expect("backdate events");
 }
