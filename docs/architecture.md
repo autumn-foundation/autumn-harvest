@@ -56,7 +56,7 @@ autumn-harvest/          <- workspace root
       replay_tests.rs    <- replay engine integration tests
       build_routing_tests.rs <- build-id routing unit + integration tests
       sticky_routing_tests.rs <- sticky routing unit + integration tests (issue #235)
-      scheduler_ha_tests.rs <- HA scheduler claim exclusivity tests (issue #350)
+      scheduler_ha_tests.rs <- HA scheduler claim exclusivity tests (issues #350, #1820)
       macros_*.rs        <- proc-macro integration tests
   autumn-harvest-macros/ <- proc-macro crate
     src/
