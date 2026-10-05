@@ -130,7 +130,9 @@ A clear in a routine body can outlive the call. So a call ends the bound
 when the routine may clear it. A call reaches a body in the same file only
 when an earlier `CREATE` has the same name, schema included, and the same
 number of parameters. The lint does not compare parameter types, so a call
-also ends the bound when any such `CREATE` may clear it. Any other `CALL` also
+also ends the bound when any such `CREATE` may clear it. For the same reason,
+a call never reaches a body in this file when an earlier migration created a
+locking routine of that name. Any other `CALL` also
 ends the bound, because the lint cannot read the body it reaches. Such a
 `CALL`, and any call of a locking routine from an earlier migration, also
 counts as a lock on an unknown table. A bound covers that lock only when the

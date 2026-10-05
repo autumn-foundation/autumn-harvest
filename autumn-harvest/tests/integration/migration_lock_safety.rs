@@ -2403,7 +2403,11 @@ fn call_clears(
         // A `CALL` that no earlier `CREATE` here matches, or a call of a
         // locking routine from an earlier migration, may take any lock.
         let unplaced = unplaced_call(call, path_change, &path_bodies);
-        let resolved = !unplaced && routines.iter().any(|r| reaches(s, r, call));
+        // The lint does not compare types. So an earlier locking overload of
+        // the same name and arity may be the one that runs.
+        let resolved = !unplaced
+            && !inherited_locking.contains(callee)
+            && routines.iter().any(|r| reaches(s, r, call));
         let unread = s.keyword(call.at, "call") || inherited_locking.contains(callee);
         let self_bounded = !unplaced && reaches_self_bounded(call, raws, history);
         if !foreign && !resolved && unread && !self_bounded {
@@ -2714,6 +2718,7 @@ fn param_range(s: &Stmts, open: usize, procedure: bool) -> Option<(usize, usize)
     // The flags of the open parameter: seen, `OUT`, and with a default.
     let (mut seen, mut out, mut default) = (false, false, false);
     let mut parens = 0_usize;
+    let mut brackets = 0_usize;
     let mut count = |seen: bool, out: bool, default: bool| {
         if seen && (procedure || !out) {
             most += 1;
@@ -2733,7 +2738,12 @@ fn param_range(s: &Stmts, open: usize, procedure: bool) -> Option<(usize, usize)
                 continue;
             }
         }
-        if parens == 1 && s.is_punct(j, ',') {
+        if s.is_punct(j, '[') {
+            brackets += 1;
+        } else if s.is_punct(j, ']') {
+            brackets = brackets.saturating_sub(1);
+        }
+        if parens == 1 && brackets == 0 && s.is_punct(j, ',') {
             count(seen, out, default);
             (seen, out, default) = (false, false, false);
             continue;
@@ -2758,13 +2768,19 @@ fn arity(s: &Stmts, open: usize) -> Option<usize> {
     }
     let depth = s.toks[open].depth;
     let mut parens = 0_usize;
+    // A comma inside an `ARRAY[...]` constructor separates elements, not arguments.
+    let mut brackets = 0_usize;
     let mut commas = 0;
     for j in (open..close).filter(|&j| s.toks[j].depth == depth) {
         if s.is_punct(j, '(') {
             parens += 1;
         } else if s.is_punct(j, ')') {
             parens -= 1;
-        } else if s.is_punct(j, ',') && parens == 1 {
+        } else if s.is_punct(j, '[') {
+            brackets += 1;
+        } else if s.is_punct(j, ']') {
+            brackets = brackets.saturating_sub(1);
+        } else if s.is_punct(j, ',') && parens == 1 && brackets == 0 {
             commas += 1;
         }
     }
@@ -7489,6 +7505,37 @@ fn a_routine_search_path_unplaces_its_unqualified_calls() {
     let qualified = defs("public.");
     assert_eq!(lint_with_history(&[], &qualified, true), []);
     assert_eq!(lint_with_history(&[&qualified], "CALL w();", true), []);
+}
+
+#[test]
+fn an_in_file_overload_does_not_hide_an_inherited_locking_one() {
+    let earlier = "CREATE FUNCTION f(a int) RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                   ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;";
+    // The lint does not compare types, so `f(1)` may reach the locking `f(int)`.
+    let sql = "CREATE FUNCTION f(a text) RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+               NULL;\nEND $$;\nSELECT f(1);";
+    let findings = lint_with_history(&[earlier], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn an_array_comma_is_not_an_argument_separator() {
+    let routine = |params: &str| {
+        format!(
+            "CREATE FUNCTION f({params}) RETURNS void LANGUAGE plpgsql SET lock_timeout = '5s' \
+             AS $$\nBEGIN\n    ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;"
+        )
+    };
+    // Each call reaches the self-bounded `f`, so it needs no outside bound.
+    for (params, call) in [
+        ("a int[]", "SELECT f(ARRAY[1,2]);"),
+        ("a int[] DEFAULT ARRAY[1,2]", "SELECT f();"),
+        ("a int[] DEFAULT ARRAY[1,2]", "SELECT f(ARRAY[3,4]);"),
+    ] {
+        let earlier = routine(params);
+        let findings = lint_with_history(&[&earlier], call, true);
+        assert_eq!(findings, [], "{earlier}\n{call}");
+    }
 }
 
 #[test]
