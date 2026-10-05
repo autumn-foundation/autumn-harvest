@@ -229,7 +229,9 @@ shard is plain:
 - A worker **holds** the shard. It starts, registers and serves its other
   shards, as before (issue #961). The held shard is pinned to a sentinel
   generation that no row holds, so the worker claims nothing there and every
-  append there fails closed. A background task probes again with backoff. A
+  append there fails closed. It also writes no fleet row, heartbeat or
+  rate-limit bucket there, because the database may be an unpromoted
+  standby. A background task probes again with backoff. A
   shard with no marker is released and runs unfenced. A shard with a marker
   stops the worker, because a pin is fixed for the life of a process. The
   restarted worker pins it.

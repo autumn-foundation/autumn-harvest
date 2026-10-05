@@ -2567,6 +2567,66 @@ async fn an_unprobeable_shard_reuses_the_process_pin() {
     assert!(fenced.is_some() && held.is_empty());
 }
 
+/// A worker writes nothing to a held shard (issue #1823). The shard may be
+/// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
+/// the release, and the heartbeat then registers the worker.
+#[tokio::test]
+async fn a_worker_defers_its_startup_writes_on_a_held_shard() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holdwrites");
+    FenceRegistry::hold(&[ShardId::new(0)], ShardId::new(0)).expect("hold");
+
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(0)]),
+    );
+    config.worker_heartbeat_interval = std::time::Duration::from_millis(200);
+    let worker_id = config.worker_id.clone();
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(config, registry).expect("worker builds"),
+    );
+    let runner = std::sync::Arc::clone(&worker);
+    let pool = dr_pool(&url);
+    let run = tokio::spawn(async move { runner.run(&pool).await });
+
+    let registered = |url: String, worker_id: String| async move {
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let mut conn = connect(&url).await;
+        diesel::sql_query("SELECT count(*) AS n FROM harvest_workers WHERE worker_id = $1")
+            .bind::<diesel::sql_types::Text, _>(worker_id)
+            .get_result::<Count>(&mut conn)
+            .await
+            .expect("count workers")
+            .n
+            == 1
+    };
+    // Several heartbeat intervals pass while the shard is held.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let while_held = registered(url.clone(), worker_id.clone()).await;
+
+    FenceRegistry::release_held(ShardId::new(0));
+    eventually(
+        "the worker to register after the release",
+        std::time::Duration::from_secs(20),
+        || registered(url.clone(), worker_id.clone()),
+    )
+    .await;
+    worker.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("worker stops")
+        .expect("worker task joins");
+
+    assert!(!while_held, "a held shard must not get a fleet row");
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

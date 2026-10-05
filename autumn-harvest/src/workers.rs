@@ -1707,6 +1707,9 @@ pub fn spawn_worker_heartbeat(
     // task has already started. A heartbeat must advertise the current
     // registry, not the one at spawn time.
     codecs: crate::payload_codec::PayloadCodecs,
+    // The shard this pool serves (issue #1823). While the process holds it,
+    // the tick writes nothing: the database may be an unpromoted standby.
+    held_gate: Option<crate::types::ShardId>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
@@ -1714,6 +1717,9 @@ pub fn spawn_worker_heartbeat(
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
+            }
+            if held_gate.is_some_and(crate::replication::FenceRegistry::is_held) {
+                continue;
             }
             // Loaded fresh each tick (issue #548 review): a tuned worker's
             // dispatch target can change between heartbeats, so a value
