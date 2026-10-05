@@ -1257,7 +1257,27 @@ impl HandlerRegistry {
             #[cfg(not(feature = "hot-code-swap"))]
             module_host: serde_json::Value::Null,
             workflows: self.workflow_policies(),
+            declarative_handlers: self.declarative_handler_policies(),
         }
+    }
+
+    /// Each declarative query and update handler, sorted, for the worker's
+    /// cohort key (issue #1815).
+    ///
+    /// The worker puts the handlers of a workflow into its task context. An
+    /// entry names the handler and its code, and whether an update validates.
+    fn declarative_handler_policies(&self) -> Vec<serde_json::Value> {
+        let queries = self
+            .query_handlers
+            .iter()
+            .map(|h| serde_json::json!(["query", h.workflow, h.name, h.module, false]));
+        let updates = self
+            .update_handlers
+            .iter()
+            .map(|h| serde_json::json!(["update", h.workflow, h.name, h.module, h.has_validator]));
+        let mut policies: Vec<serde_json::Value> = queries.chain(updates).collect();
+        policies.sort_by_key(std::string::ToString::to_string);
+        policies
     }
 
     /// The policy of each registered workflow, sorted by name, for the
@@ -38495,6 +38515,63 @@ mod tests {
         );
         // worker_id should be a valid UUID
         assert!(uuid::Uuid::parse_str(&runtime_cfg.worker_id).is_ok());
+    }
+
+    /// Issue #1815: the task context carries the declarative query and update
+    /// handlers of its workflow. A worker without a handler fails a request
+    /// that a peer runs, so the handlers are part of the cohort.
+    #[test]
+    fn payload_policy_holds_the_declarative_handlers() {
+        fn update(has_validator: bool) -> crate::info::UpdateHandlerInfo {
+            crate::info::UpdateHandlerInfo {
+                name: "approve",
+                workflow: "order",
+                module: "tests",
+                input_type_hint: "ApproveRequest",
+                output_type_hint: "bool",
+                has_validator,
+                handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
+                validator: None,
+                mcp: false,
+                description: None,
+                arg_schema: None,
+                response_schema: None,
+            }
+        }
+        fn query() -> crate::info::QueryHandlerInfo {
+            crate::info::QueryHandlerInfo {
+                name: "status",
+                workflow: "order",
+                module: "tests",
+                input_type_hint: "StatusRequest",
+                output_type_hint: "StatusResponse",
+                handler: |_ctx, args| Ok(args),
+                description: None,
+                arg_schema: None,
+                response_schema: None,
+            }
+        }
+        let policy = |queries, updates| {
+            HandlerRegistry::new(vec![], vec![])
+                .with_handler_infos(queries, updates, vec![])
+                .payload_policy()
+        };
+        let plain = policy(vec![], vec![]);
+        assert_ne!(
+            plain,
+            policy(vec![], vec![update(false)]),
+            "an update handler"
+        );
+        assert_ne!(
+            policy(vec![], vec![update(false)]),
+            policy(vec![], vec![update(true)]),
+            "an update validator"
+        );
+        assert_ne!(plain, policy(vec![query()], vec![]), "a query handler");
+        assert_eq!(
+            policy(vec![query()], vec![update(false)]),
+            policy(vec![query()], vec![update(false)])
+        );
     }
 
     /// Issue #1815: the worker applies each workflow's input cap, and it

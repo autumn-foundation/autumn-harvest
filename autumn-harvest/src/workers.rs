@@ -1237,6 +1237,10 @@ pub struct PayloadPolicy {
     /// input cap and whether it is a unified DAG. The worker enforces the cap,
     /// and a continue-as-new into a DAG is refused.
     pub workflows: Vec<(String, serde_json::Value)>,
+    /// Each declarative query and update handler, sorted. The task context
+    /// carries the handlers of its workflow, and a worker without a handler
+    /// fails a request that a peer runs.
+    pub declarative_handlers: Vec<serde_json::Value>,
 }
 
 impl PayloadPolicy {
@@ -1257,6 +1261,7 @@ impl PayloadPolicy {
             "local_activity_defaults": self.local_activity_defaults,
             "module_host": self.module_host,
             "workflows": self.workflows,
+            "declarative_handlers": self.declarative_handlers,
         })
     }
 }
@@ -3882,6 +3887,10 @@ mod tests {
             },
             PayloadPolicy {
                 workflows: vec![("order".to_owned(), serde_json::json!({"dag": true}))],
+                ..base.clone()
+            },
+            PayloadPolicy {
+                declarative_handlers: vec![serde_json::json!(["update", "order", "approve"])],
                 ..base
             },
         ]

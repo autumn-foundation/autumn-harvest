@@ -81,8 +81,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   caps, local flag, rate limit, concurrency limit and WASM binding, a local
   activity's own retry and start-to-close defaults, the registry's
   local-activity defaults and retry-after ceiling, the hot-code-swap
-  module-host policy, and each workflow's effective input cap and DAG
-  classification), the registered payload codec ids and default codec, and
+  module-host policy, each workflow's effective input cap and DAG
+  classification, and the declarative query and update handlers), the registered payload codec ids and default codec, and
   the registered codec key ids, which the
   heartbeat reads on every tick because a reload can change them, with
   fresh stats. The cohort is
