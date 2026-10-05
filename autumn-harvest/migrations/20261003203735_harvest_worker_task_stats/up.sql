@@ -18,6 +18,12 @@
 -- its cohort. The heartbeat reads only its own cohort, so the second index
 -- keeps that read small. The key has no length bound, so the index is a hash
 -- index: it stores a fixed-size hash, and it serves the equality read.
+--
+-- The foreign key locks `harvest_workers` while it is added. The timeout
+-- bounds that wait, so a busy worker table fails the migration fast instead
+-- of stalling every heartbeat behind it (issue #1810).
+SET LOCAL lock_timeout = '5s';
+
 CREATE TABLE IF NOT EXISTS harvest_worker_task_stats (
     worker_id       TEXT        PRIMARY KEY
                                 REFERENCES harvest_workers (worker_id) ON DELETE CASCADE,
