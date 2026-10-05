@@ -2456,6 +2456,7 @@ mod tests {
         assert_eq!(sum, stats(11, 22, 33, 44));
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn only_a_clear_with_no_answer_is_ambiguous() {
         use super::Step::{Done, Failed, TimedOut};
