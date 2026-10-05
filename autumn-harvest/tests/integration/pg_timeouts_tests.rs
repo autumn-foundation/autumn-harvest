@@ -1646,9 +1646,10 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
         let (exec_id, _activity_id, mut stale) = seed_claimed_activity(&mut conn, "q-sr").await;
         let task_id = stale.id;
         if case == "deadline" {
-            // The 1 s retry delay crosses this deadline, so the write takes
-            // the schedule-to-close timeout branch.
-            let deadline = Utc::now() + chrono::Duration::milliseconds(500);
+            // Any retry delay crosses a deadline in the past, so the write
+            // takes the schedule-to-close timeout branch. The retry delay is
+            // jittered, so a future deadline could miss it.
+            let deadline = Utc::now() - chrono::Duration::seconds(1);
             stale.schedule_to_close_at = Some(deadline);
             diesel::sql_query(
                 "UPDATE harvest_task_queue SET schedule_to_close_at = $2 WHERE id = $1",
@@ -1670,7 +1671,7 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
         .expect("model the newer claim");
 
         let policy = autumn_harvest::policy::RetryPolicy::fixed(3, Duration::from_secs(1));
-        let _ = autumn_harvest::worker::write_activity_result_for_task(
+        let write = autumn_harvest::worker::write_activity_result_for_task(
             &mut conn,
             &stale,
             "w-1",
@@ -1679,6 +1680,12 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
             &autumn_harvest::payload_codec::PayloadCodecs::default(),
         )
         .await;
+        // Issue #1815: the outcome window skips a lost lease, so the stale
+        // write must report one on every branch.
+        assert!(
+            matches!(write, Ok(autumn_harvest::queue::ClaimWrite::LeaseLost)),
+            "{case}: the stale write must report a lost lease, got {write:?}"
+        );
 
         let claim =
             diesel::sql_query("SELECT state, worker_id FROM harvest_task_queue WHERE id = $1")

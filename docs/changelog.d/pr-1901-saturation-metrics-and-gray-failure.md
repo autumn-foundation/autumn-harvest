@@ -44,6 +44,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   latency taken then. It is left out when that write finds a peer owns the
   claim. A release is not counted.
   `worker::reset_timed_out_workflow_task` now returns a `ClaimRecovery`.
+  The panic re-pend is now fenced by the claim, like the deadlock re-pend,
+  through the new `queue::requeue_claimed_workflow_task_after_panic`. A stale
+  dispatcher no longer re-pends a peer's newer claim.
 - Every liveness heartbeat writes a snapshot to the new table
   `harvest_worker_task_stats` and reads the live peers of its shard. Each
   heartbeat then compares the worker with the merged peers of all its

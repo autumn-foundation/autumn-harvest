@@ -15343,6 +15343,9 @@ enum ScheduleToCloseTimeoutOutcome {
     /// `PENDING` row is frozen by the claim gate and its deadline is shifted
     /// forward by the pause span on resume.
     ExecutionPaused,
+    /// A peer holds the claim (issues #1789, #1815). Nothing was written, so
+    /// the caller reports a lost lease and does not requeue.
+    ClaimLost,
 }
 
 /// Pure decision rule for the re-check
@@ -15453,7 +15456,7 @@ async fn record_schedule_to_close_activity_timeout(
                 lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
             // A stale owner must not time out a later claim (issue #1789).
             if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
-                return Ok(ScheduleToCloseTimeoutOutcome::Handled);
+                return Ok(ScheduleToCloseTimeoutOutcome::ClaimLost);
             }
             let task_row = task_state_and_deadline_for_update(conn, task.id).await?;
             // Authoritative re-check under the execution row lock: bail
@@ -15587,6 +15590,12 @@ async fn handle_activity_result(
                         ScheduleToCloseTimeoutOutcome::Handled => {
                             return Ok(queue::ClaimWrite::Applied);
                         }
+                        // Issue #1815: the outcome window skips a lost lease,
+                        // so a stale attempt is not counted as this worker's.
+                        ScheduleToCloseTimeoutOutcome::ClaimLost => {
+                            log_lease_lost(task, "activity schedule-to-close timeout");
+                            return Ok(queue::ClaimWrite::LeaseLost);
+                        }
                         // Stale claim-time snapshot: a concurrent pause/resume
                         // cycle shifted the row's deadline forward (issue #609
                         // post-review hardening) — the attempt still has
@@ -15632,7 +15641,8 @@ async fn handle_activity_result(
 ///
 /// Tests use it to check the claim fence (issue #1788). It applies no result
 /// size cap, no offloader and no metrics. The execution and activity ids come
-/// from `task`.
+/// from `task`. It returns [`queue::ClaimWrite::LeaseLost`] when a peer holds
+/// the claim.
 ///
 /// # Errors
 ///
@@ -15646,7 +15656,7 @@ pub async fn write_activity_result_for_task(
     retry_policy: Option<&RetryPolicy>,
     result: Result<serde_json::Value, String>,
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
+) -> HarvestResult<queue::ClaimWrite> {
     let (Some(exec_uuid), Some(activity_uuid)) = (task.workflow_exec_id, task.activity_id) else {
         return Err(HarvestError::Config(format!(
             "task {} has no execution or activity id",
@@ -15671,7 +15681,6 @@ pub async fn write_activity_result_for_task(
         codecs,
     )
     .await
-    .map(|_| ())
 }
 
 /// Outcome of the retry budget gate in `process_activity_task` (issue #1793).
@@ -22650,10 +22659,10 @@ async fn process_workflow_task(
     // reset commits, so a later capability miss can decide on the counters the
     // row actually holds without re-reading them. See `frontier_miss_state`.
     frontier_reset_committed: &std::sync::atomic::AtomicBool,
-    // Issue #1815: set when this dispatch failed the workflow task and re-pended
-    // it, after a deadlock or a contained panic. The run stays RUNNING, but the
-    // task failed, so the worker's outcome window counts it as a failure.
-    requeued_after_failure: &std::sync::atomic::AtomicBool,
+    // Issue #1815: set when this dispatch failed the workflow task after a
+    // deadlock or a contained panic. The run stays RUNNING, but the task
+    // failed, so the worker's outcome window counts it unless the claim is lost.
+    cycle_failure: &CycleFailure,
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -24082,8 +24091,9 @@ async fn process_workflow_task(
         };
         if queue::requeue_claimed_workflow_task_after_deadlock(conn, &claim, backoff, error).await?
         {
-            requeued_after_failure.store(true, std::sync::atomic::Ordering::Relaxed);
+            cycle_failure.requeued();
         } else {
+            cycle_failure.claim_lost();
             tracing::debug!(
                 execution_id = %prepared.exec_id,
                 task_id = %task.id,
@@ -24139,12 +24149,26 @@ async fn process_workflow_task(
                 drop(execute_span);
                 // Discard the panicked cycle's pending commands (R5) and re-pend
                 // the task with backoff. State stays RUNNING; no event appended.
-                let requeued =
-                    queue::requeue_workflow_task_after_panic(conn, task.id, backoff, error).await;
-                if requeued.is_ok() {
-                    requeued_after_failure.store(true, std::sync::atomic::Ordering::Relaxed);
+                //
+                // The requeue is fenced by the claim, as on the deadlock path.
+                // A reclaim can move the row while the cycle runs. Without a
+                // claim, no write can be fenced, so the timeout sweeper owns it.
+                let Some(claim) = queue::TaskClaim::of(task) else {
+                    return Ok(());
+                };
+                if queue::requeue_claimed_workflow_task_after_panic(conn, &claim, backoff, error)
+                    .await?
+                {
+                    cycle_failure.requeued();
+                } else {
+                    cycle_failure.claim_lost();
+                    tracing::debug!(
+                        execution_id = %prepared.exec_id,
+                        task_id = %task.id,
+                        "harvest: panicked workflow task lost its claim; the new owner keeps the row"
+                    );
                 }
-                return requeued;
+                return Ok(());
             }
             PanicRetryDecision::Terminal => {
                 // Budget exhausted (or disabled): clear the strike entry and
@@ -25062,22 +25086,44 @@ enum TaskDispatchOutcome {
     /// or a contained handler panic (issue #1815). The run stays `RUNNING`.
     /// The re-pend already ran, so the dispatch site only counts the failure.
     RequeuedAfterFailure,
+    /// The cycle failed the workflow task, but its claim-fenced re-pend found
+    /// that a peer owns the claim (issue #1815). The stale attempt wrote
+    /// nothing, so the dispatch site does not count it.
+    ClaimLostAfterFailure,
 }
 
-/// The outcome of a dispatch whose cycle returned `Ok` (issue #1815).
+/// How a workflow cycle that returned `Ok` ended its task (issue #1815).
 ///
-/// A cycle that re-pended a failed task still returns `Ok`, because the run
-/// stays `RUNNING`. The flag tells that case apart from a normal conclusion.
-fn completed_outcome(
-    requeued_after_failure: &std::sync::atomic::AtomicBool,
-) -> TaskDispatchOutcome {
-    if std::sync::atomic::AtomicBool::load(
-        requeued_after_failure,
-        std::sync::atomic::Ordering::Relaxed,
-    ) {
-        TaskDispatchOutcome::RequeuedAfterFailure
-    } else {
-        TaskDispatchOutcome::Completed
+/// A cycle that failed its task and re-pended it still returns `Ok`, because
+/// the run stays `RUNNING`. The cycle records that case here, so the dispatch
+/// site can tell it apart from a normal conclusion.
+#[derive(Debug, Default)]
+struct CycleFailure(std::sync::atomic::AtomicU8);
+
+impl CycleFailure {
+    const REQUEUED: u8 = 1;
+    const CLAIM_LOST: u8 = 2;
+
+    /// The cycle failed the task and re-pended it under its claim.
+    fn requeued(&self) {
+        self.0
+            .store(Self::REQUEUED, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The cycle failed the task, but a peer owns the claim.
+    fn claim_lost(&self) {
+        self.0
+            .store(Self::CLAIM_LOST, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The dispatch outcome of the cycle.
+    fn outcome(&self) -> TaskDispatchOutcome {
+        // Fully qualified, because diesel's `RunQueryDsl::load` is in scope.
+        match std::sync::atomic::AtomicU8::load(&self.0, std::sync::atomic::Ordering::Relaxed) {
+            Self::REQUEUED => TaskDispatchOutcome::RequeuedAfterFailure,
+            Self::CLAIM_LOST => TaskDispatchOutcome::ClaimLostAfterFailure,
+            _ => TaskDispatchOutcome::Completed,
+        }
     }
 }
 
@@ -25259,8 +25305,9 @@ async fn process_task(
     // resolve a frontier inline, so it stays clear on that path and their
     // claim-time snapshot is trivially current.
     let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
-    // Issue #1815: the workflow path sets this when it re-pends a failed task.
-    let requeued_after_failure = std::sync::atomic::AtomicBool::new(false);
+    // Issue #1815: the workflow path sets this when a deadlock or a contained
+    // panic fails its task.
+    let cycle_failure = CycleFailure::default();
 
     let (mut conn, outcome) = match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
@@ -25290,7 +25337,7 @@ async fn process_task(
                     &workflow_deadlock_strikes,
                     workflow_task_deadline,
                     &frontier_reset_committed,
-                    &requeued_after_failure,
+                    &cycle_failure,
                 ))
                 .await;
                 Ok::<_, HarvestError>((conn, outcome))
@@ -25351,7 +25398,7 @@ async fn process_task(
     // schedule-activity enqueue). `fail_execution_on_error` passes the typed
     // variant through un-failed precisely so it lands here.
     let Err(error) = &outcome else {
-        return Ok(completed_outcome(&requeued_after_failure));
+        return Ok(cycle_failure.outcome());
     };
     // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
     // claim is intercepted HERE -- after `run_under_workflow_body_budget`
@@ -27703,13 +27750,16 @@ pub enum ClaimRecovery {
 /// (issue #1815).
 ///
 /// A completion is a success. An error or a body timeout is a failure. A
-/// release is neither, because the task did not run to a decision here.
+/// release is neither, because the task did not run to a decision here. A
+/// failure whose claim a peer took is neither too, because a peer owns it.
 const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> Option<bool> {
     match outcome {
         Ok(TaskDispatchOutcome::Completed) => Some(false),
         Ok(TaskDispatchOutcome::BodyTimedOut | TaskDispatchOutcome::RequeuedAfterFailure)
         | Err(_) => Some(true),
-        Ok(TaskDispatchOutcome::Released { .. }) => None,
+        Ok(TaskDispatchOutcome::Released { .. } | TaskDispatchOutcome::ClaimLostAfterFailure) => {
+            None
+        }
     }
 }
 
@@ -34009,6 +34059,17 @@ impl Worker {
                             dispatched_at.elapsed(),
                         );
                     }
+                    Ok(TaskDispatchOutcome::ClaimLostAfterFailure) => {
+                        // Issue #1815: the failed task's re-pend found a peer
+                        // owns the claim, so the window skips it. It is not a
+                        // timeout, so the timeout strike still clears.
+                        if let Some(exec_id) = exec_id_for_timeout {
+                            timeout_strikes
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&exec_id);
+                        }
+                    }
                     Ok(TaskDispatchOutcome::Released {
                         clears_timeout_strike,
                     }) => {
@@ -35185,7 +35246,7 @@ pub async fn chaos_drive_one_workflow_task(
         >::new()));
         let workflow_deadlock_strikes = Arc::new(DeadlockStrikes::default());
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
-        let requeued_after_failure = std::sync::atomic::AtomicBool::new(false);
+        let cycle_failure = CycleFailure::default();
         // Boxed for the same reason as the production call site
         // (clippy::large_futures).
         Box::pin(process_workflow_task(
@@ -35203,7 +35264,7 @@ pub async fn chaos_drive_one_workflow_task(
             &workflow_deadlock_strikes,
             None,
             &frontier_reset_committed,
-            &requeued_after_failure,
+            &cycle_failure,
         ))
         .await
     })
@@ -35253,7 +35314,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
         >::new()));
         let workflow_deadlock_strikes = Arc::new(DeadlockStrikes::default());
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
-        let requeued_after_failure = std::sync::atomic::AtomicBool::new(false);
+        let cycle_failure = CycleFailure::default();
         // Boxed for the same reason as `chaos_drive_one_workflow_task`
         // (clippy::large_futures).
         let mut cycle = Box::pin(process_workflow_task(
@@ -35271,7 +35332,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             &workflow_deadlock_strikes,
             None,
             &frontier_reset_committed,
-            &requeued_after_failure,
+            &cycle_failure,
         ));
         let cancelled_at_hold = tokio::select! {
             () = hold.reached() => true,
@@ -42543,6 +42604,13 @@ mod tests {
     /// out. A recovery that never reached the database still counts.
     #[test]
     fn a_failed_workflow_task_counts_unless_its_claim_was_lost() {
+        let cycle = CycleFailure::default();
+        assert_eq!(cycle.outcome(), TaskDispatchOutcome::Completed);
+        cycle.requeued();
+        assert_eq!(cycle.outcome(), TaskDispatchOutcome::RequeuedAfterFailure);
+        cycle.claim_lost();
+        assert_eq!(cycle.outcome(), TaskDispatchOutcome::ClaimLostAfterFailure);
+
         let window = crate::worker_outlier::TaskOutcomeWindow::new(16, Duration::from_secs(300));
         let latency = Duration::from_millis(40);
         record_failed_workflow_task(&window, ClaimRecovery::ClaimLost, latency);
@@ -42564,6 +42632,11 @@ mod tests {
             workflow_task_failed(&Ok(TaskDispatchOutcome::RequeuedAfterFailure)),
             Some(true),
             "a deadlock or a contained panic that re-pends the task is a failure"
+        );
+        assert_eq!(
+            workflow_task_failed(&Ok(TaskDispatchOutcome::ClaimLostAfterFailure)),
+            None,
+            "a failure whose claim a peer took is not counted"
         );
         assert_eq!(
             workflow_task_failed(&Ok(TaskDispatchOutcome::Released {
