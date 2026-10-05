@@ -587,8 +587,10 @@ impl Model {
     /// strike. At the threshold the task goes to the dead-letter queue and
     /// its run fails. Below it the task is pending again.
     fn reclaim(&mut self) -> Res {
-        // The requeue stamps `clock_timestamp()` with no backdate. A requeued
-        // orphan therefore sorts behind a fresh start of the next 5 seconds.
+        // The requeue stamps `clock_timestamp()` with no backdate. The orphan
+        // keeps its `attempt`, so it is a continuation with no handicap. It
+        // sorts ahead of a fresh start made up to 25 seconds before the
+        // reclaim (issue #1923).
         let due = self.now;
         let (mut requeued, mut quarantined) = (0, 0);
         for run in 0..self.runs.len() {
@@ -1399,15 +1401,25 @@ fn lifecycle_matches_the_reference_model() {
 
 // ── Pinned counterexamples ──────────────────────────────────────────────────
 
-/// Shrunk counterexamples from the deep nightly pass. Each one replays
-/// against the database on every CI run, so a model drift fails a pull
-/// request and not only the nightly.
-const PINNED: &[(&str, &[Op])] = &[
+/// A shrunk counterexample that replays against the database.
+struct Pinned {
+    name: &'static str,
+    /// The coverage labels the replay must reach. Without them, a pin can
+    /// stop reaching its branch after a change and still pass.
+    reaches: &'static [&'static str],
+    ops: &'static [Op],
+}
+
+/// Shrunk counterexamples from the deep nightly pass. The `test-db-linux`
+/// job replays each one against the database. So a model drift shows on a
+/// pull request, and not only in the nightly.
+const PINNED: &[Pinned] = &[
     // Issue #1923: a worker re-claims its own requeued orphan. The orphan
     // is a continuation, so it sorts ahead of the fresh start of slot 1.
-    (
-        "#1923 re-claim of an own orphan",
-        &[
+    Pinned {
+        name: "#1923 re-claim of an own orphan",
+        reaches: &["claim requeued orphan", "complete stale claim"],
+        ops: &[
             Op::Start {
                 slot: 0,
                 policy: Policy::AllowDuplicate,
@@ -1434,11 +1446,12 @@ const PINNED: &[(&str, &[Op])] = &[
                 claim: 0,
             },
         ],
-    ),
+    },
     // Issue #1923: an orphan is requeued, claimed again and quarantined.
-    (
-        "#1923 orphan to the dead-letter queue",
-        &[
+    Pinned {
+        name: "#1923 orphan to the dead-letter queue",
+        reaches: &["claim requeued orphan", "reclaim quarantine"],
+        ops: &[
             Op::Start {
                 slot: 0,
                 policy: Policy::AllowDuplicate,
@@ -1454,12 +1467,17 @@ const PINNED: &[(&str, &[Op])] = &[
             Op::Reclaim,
             Op::ReviveWorker { worker: 0 },
         ],
-    ),
+    },
     // Issue #1923: another worker claims the requeued orphan. The old
     // claim is then stale.
-    (
-        "#1923 claim lost to a reclaim",
-        &[
+    Pinned {
+        name: "#1923 claim lost to a reclaim",
+        reaches: &[
+            "claim requeued orphan",
+            "heartbeat lease lost",
+            "complete stale claim",
+        ],
+        ops: &[
             Op::Start {
                 slot: 2,
                 policy: Policy::AllowDuplicate,
@@ -1482,21 +1500,23 @@ const PINNED: &[(&str, &[Op])] = &[
                 claim: 0,
             },
         ],
-    ),
+    },
 ];
 
-/// Each pinned counterexample replays clean against the database. The test
-/// replays all of them and reports every failure.
+/// Each pinned counterexample replays clean against the database and reaches
+/// its labels. The test replays all of them and reports every failure.
 #[test]
 fn pinned_counterexamples_replay() {
     let failures = on_own_database(|rt, conn| {
-        let mut seen = BTreeSet::new();
         PINNED
             .iter()
-            .filter_map(|(name, ops)| {
-                rt.block_on(run_case(conn, ops, &mut seen))
-                    .err()
-                    .map(|e| format!("{name}: {e}"))
+            .filter_map(|pin| {
+                let mut seen = BTreeSet::new();
+                if let Err(e) = rt.block_on(run_case(conn, pin.ops, &mut seen)) {
+                    return Some(format!("{}: {e}", pin.name));
+                }
+                let missed: Vec<_> = pin.reaches.iter().filter(|l| !seen.contains(*l)).collect();
+                (!missed.is_empty()).then(|| format!("{}: never reached {missed:?}", pin.name))
             })
             .collect::<Vec<_>>()
     });

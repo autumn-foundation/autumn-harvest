@@ -80,7 +80,7 @@ jobs:
       - name: Open or update the alert issue
         run: |
           title="Proptest nightly: a scheduled run failed"
-          body="The deep property run failed: ${RUN_URL}"
+          body="The deep property run failed: ${RUN_URL}. Add each shrunk lifecycle sequence to PINNED in lifecycle_model_props.rs (docs/testing/property-and-fuzz.md)."
           issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title \"$title\"" --json number,title \
             --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
