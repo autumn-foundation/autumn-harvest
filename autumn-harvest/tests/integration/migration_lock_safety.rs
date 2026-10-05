@@ -1527,11 +1527,10 @@ impl<'a> Stmts<'a> {
     /// `PERFORM f(...)`, with nothing after the closing parenthesis.
     fn is_bare_call(&self, k: usize) -> bool {
         let start = self.starts[k];
-        // Only `pg_catalog` surely holds the built-in function.
-        let named = k == start + 1
-            || (k == start + 3
-                && self.is(start + 1, "pg_catalog")
-                && self.is_punct(start + 2, '.'));
+        // Only `pg_catalog` surely holds the built-in function. The connection
+        // may start with a path that lists another schema first.
+        let named =
+            k == start + 3 && self.is(start + 1, "pg_catalog") && self.is_punct(start + 2, '.');
         if !named || !(self.keyword(start, "select") || self.keyword(start, "perform")) {
             return false;
         }
@@ -2309,6 +2308,9 @@ struct Routine {
     at: usize,
     /// Whether the body is in a language other than PL/pgSQL or SQL.
     foreign: bool,
+    /// Whether the last parameter is `VARIADIC`. A call may then pass any
+    /// number of arguments from `min_arity` up.
+    variadic: bool,
     /// Whether the `CREATE` surely runs and stays. A routine created in an
     /// uncalled body or a branch may not exist. A later `ROLLBACK` may undo
     /// the `CREATE`. A call is always sure.
@@ -2319,9 +2321,21 @@ impl Routine {
     /// Whether `call` passes a number of arguments this routine accepts.
     const fn accepts(&self, call: &Self) -> bool {
         match (self.min_arity, self.arity, call.arity) {
-            (Some(fewest), Some(most), Some(n)) => fewest <= n && n <= most,
+            (Some(fewest), Some(most), Some(n)) => fewest <= n && (n <= most || self.variadic),
             _ => false,
         }
+    }
+
+    /// Each identity a call of this routine may name, from `identity`. A
+    /// variadic routine also gets an open-ended `name/N+` identity.
+    fn identities(&self) -> Vec<String> {
+        let (Some(fewest), Some(most)) = (self.min_arity, self.arity) else {
+            return Vec::new();
+        };
+        (fewest..=most)
+            .map(|n| identity(&self.name, n))
+            .chain(self.variadic.then(|| format!("{}/{most}+", self.name)))
+            .collect()
     }
 }
 
@@ -2429,10 +2443,7 @@ fn call_clears(
         if !foreign && !resolved && unread && !self_bounded {
             // A routine that may clear the bound before it locks makes the
             // outside bound worthless. An unknown routine may do that too.
-            let known = call
-                .arity
-                .map(|n| identity(&call.name, n))
-                .is_some_and(|id| inherited_bounded.contains(&id));
+            let known = knows(&inherited_bounded, call);
             let may_clear = inherited.contains(callee) || unplaced || !known;
             let verb = if may_clear {
                 UNREAD_CLEARING_CALL
@@ -2496,8 +2507,9 @@ fn file_routines(s: &Stmts) -> Vec<Routine> {
             let foreign = language(s, k).is_some_and(|l| l != "plpgsql" && l != "sql");
             Some(Routine {
                 name,
-                arity: range.map(|(_, most)| most),
-                min_arity: range.map(|(fewest, _)| fewest),
+                arity: range.map(|(_, most, _)| most),
+                min_arity: range.map(|(fewest, _, _)| fewest),
+                variadic: range.is_some_and(|(_, _, variadic)| variadic),
                 at: k,
                 foreign,
                 sure: s.toks[k].runs && unconditional[k] && last_rollback.is_none_or(|r| r < k),
@@ -2568,16 +2580,20 @@ fn record_routines(
         let name = base(&r.name);
         // A call may pass any number of arguments from the required ones up
         // to all of them.
-        if locking.contains(name)
-            && !history.clearing_routines.contains(name)
-            && let (Some(fewest), Some(most)) = (r.min_arity, r.arity)
-        {
-            for n in fewest..=most {
-                history.bounded_routines.insert(identity(&r.name, n));
-            }
+        if locking.contains(name) && !history.clearing_routines.contains(name) {
+            history.bounded_routines.extend(r.identities());
         }
     }
     history.locking_routines = locking;
+}
+
+/// Whether `ids` holds the identity that `call` names: its exact arity, or an
+/// open-ended `name/N+` identity of a variadic routine with `N` up to it.
+fn knows(ids: &BTreeSet<String>, call: &Routine) -> bool {
+    call.arity.is_some_and(|n| {
+        ids.contains(&identity(&call.name, n))
+            || (0..=n).any(|k| ids.contains(&format!("{}/{k}+", call.name)))
+    })
 }
 
 /// The full identity of a routine: its name as written, schema included, and
@@ -2594,11 +2610,7 @@ fn reaches_self_bounded(call: &Routine, raws: &[Raw], history: &History) -> bool
         .any(|raw| raw.at < call.at && [UNREADABLE_EXECUTE, FOREIGN_CODE].contains(&raw.verb));
     !opaque_before
         && !history.unbounded_routines.contains(base(&call.name))
-        && call.arity.is_some_and(|n| {
-            history
-                .self_bounded_routines
-                .contains(&identity(&call.name, n))
-        })
+        && knows(&history.self_bounded_routines, call)
 }
 
 /// Record which routines of this file bound every lock they take.
@@ -2656,11 +2668,7 @@ fn record_self_bounded(s: &Stmts, analysis: &Analysis, history: &mut History) {
         if !r.sure || unbounded.contains(base(&r.name)) {
             continue;
         }
-        if let (Some(fewest), Some(most)) = (r.min_arity, r.arity) {
-            for n in fewest..=most {
-                history.self_bounded_routines.insert(identity(&r.name, n));
-            }
-        }
+        history.self_bounded_routines.extend(r.identities());
     }
     let opaque = analysis.hits.iter().any(|hit| {
         hit.body_start.is_none() && [UNREADABLE_EXECUTE, FOREIGN_CODE].contains(&hit.verb)
@@ -2692,6 +2700,7 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
             min_arity: arity,
             at: k,
             foreign: false,
+            variadic: false,
             sure: true,
         });
     }
@@ -2717,6 +2726,7 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
         min_arity: arity,
         at: k,
         foreign: false,
+        variadic: false,
         sure: true,
     })
 }
@@ -2727,12 +2737,14 @@ fn call_target(s: &Stmts, k: usize, bases: &BTreeSet<&str>) -> Option<Routine> {
 /// A parameter with a default may be left out. Postgres requires the defaults
 /// to come last. A function never takes its `OUT` parameters as arguments,
 /// but a `CALL` of a procedure passes them.
-fn param_range(s: &Stmts, open: usize, procedure: bool) -> Option<(usize, usize)> {
+fn param_range(s: &Stmts, open: usize, procedure: bool) -> Option<(usize, usize, bool)> {
     let close = closing_paren(s, open)?;
     let depth = s.toks[open].depth;
     let (mut fewest, mut most) = (0, 0);
     // The flags of the open parameter: seen, `OUT`, and with a default.
     let (mut seen, mut out, mut default) = (false, false, false);
+    // Whether the open parameter, and so the last one seen, is `VARIADIC`.
+    let mut variadic = false;
     let mut parens = 0_usize;
     let mut brackets = 0_usize;
     let mut count = |seen: bool, out: bool, default: bool| {
@@ -2762,15 +2774,17 @@ fn param_range(s: &Stmts, open: usize, procedure: bool) -> Option<(usize, usize)
         if parens == 1 && brackets == 0 && s.is_punct(j, ',') {
             count(seen, out, default);
             (seen, out, default) = (false, false, false);
+            variadic = false;
             continue;
         }
         if parens == 1 {
+            variadic |= !seen && s.keyword(j, "variadic");
             out |= !seen && s.keyword(j, "out");
             default |= s.keyword(j, "default") || s.is_punct(j, '=');
         }
         seen = true;
     }
-    Some((fewest, most))
+    Some((fewest, most, variadic))
 }
 
 /// The number of comma-separated items in the parentheses that open at `open`.
@@ -4439,7 +4453,7 @@ fn alter_table_on_a_hot_table_needs_a_lock_timeout() {
         "SET LOCAL lock_timeout = '5s';",
         "SET lock_timeout TO '2s';",
         "SET LOCAL lock_timeout = 5000;",
-        "SELECT set_config('lock_timeout', '5s', true);",
+        "SELECT pg_catalog.set_config('lock_timeout', '5s', true);",
     ] {
         let sql = format!("{set}\n{bare}");
         assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
@@ -4864,12 +4878,12 @@ fn a_partition_of_a_hot_table_locks_the_parent() {
 fn a_timeout_set_inside_a_function_body_does_not_count() {
     // A function body runs only when someone calls the function.
     let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\n\
-               BEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\nEND $$;\n\
+               BEGIN\n    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);\nEND $$;\n\
                ALTER TABLE harvest_events ADD COLUMN x INT;\n";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 
-    let in_do = "DO $$\nBEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\nEND $$;\n\
+    let in_do = "DO $$\nBEGIN\n    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);\nEND $$;\n\
                  ALTER TABLE harvest_events ADD COLUMN x INT;\n";
     assert_eq!(lint_with_history(&[], in_do, true), []);
 }
@@ -4918,9 +4932,9 @@ fn drop_rule_locks_its_table() {
 fn a_timeout_set_on_a_conditional_path_does_not_count() {
     let lock = "\nALTER TABLE harvest_events ADD COLUMN x INT;\n";
     for body in [
-        "IF false THEN\n    PERFORM set_config('lock_timeout', '5s', true);\nEND IF;",
-        "FOR i IN 1..0 LOOP\n    PERFORM set_config('lock_timeout', '5s', true);\nEND LOOP;",
-        "NULL;\nEXCEPTION WHEN others THEN\n    PERFORM set_config('lock_timeout', '5s', true);",
+        "IF false THEN\n    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);\nEND IF;",
+        "FOR i IN 1..0 LOOP\n    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);\nEND LOOP;",
+        "NULL;\nEXCEPTION WHEN others THEN\n    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);",
     ] {
         let sql = format!("DO $$\nBEGIN\n{body}\nEND $$;{lock}");
         let findings = lint_with_history(&[], &sql, true);
@@ -4933,7 +4947,7 @@ fn a_timeout_set_on_a_conditional_path_does_not_count() {
     // A setter after a closed branch runs on every path.
     let after = format!(
         "DO $$\nBEGIN\nIF false THEN\n    NULL;\nEND IF;\n\
-         PERFORM set_config('lock_timeout', '5s', true);\nEND $$;{lock}"
+         PERFORM pg_catalog.set_config('lock_timeout', '5s', true);\nEND $$;{lock}"
     );
     assert_eq!(lint_with_history(&[], &after, true), []);
 }
@@ -5284,12 +5298,12 @@ fn code_after_an_exit_does_not_surely_run() {
 
 #[test]
 fn a_set_config_with_an_unknown_scope_counts_as_local() {
-    let sql = "BEGIN;\nSELECT set_config('lock_timeout', '5s', NOT false);\nCOMMIT;\n\
+    let sql = "BEGIN;\nSELECT pg_catalog.set_config('lock_timeout', '5s', NOT false);\nCOMMIT;\n\
                ALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, false);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
     // A literal false is a session-level setting, which outlives the commit.
-    let session = "BEGIN;\nSELECT set_config('lock_timeout', '5s', false);\nCOMMIT;\n\
+    let session = "BEGIN;\nSELECT pg_catalog.set_config('lock_timeout', '5s', false);\nCOMMIT;\n\
                    ALTER TABLE harvest_events ADD COLUMN x INT;";
     assert_eq!(lint_with_history(&[], session, false), []);
 }
@@ -5941,7 +5955,7 @@ fn a_dollar_literal_argument_is_a_string() {
                ALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
-    let sql = "SELECT set_config($$lock_timeout$$, $$5s$$, true);\n\
+    let sql = "SELECT pg_catalog.set_config($$lock_timeout$$, $$5s$$, true);\n\
                ALTER TABLE harvest_events ADD COLUMN x INT;";
     assert_eq!(lint_with_history(&[], sql, true), []);
 }
@@ -6386,7 +6400,7 @@ fn a_lock_in_a_function_body_needs_a_bound_in_the_body() {
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
     }
     // A bound set in the body holds for the lock after it.
-    let sql = body("    PERFORM set_config('lock_timeout', '5s', true);");
+    let sql = body("    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);");
     assert_eq!(lint_with_history(&[], &sql, true), []);
 }
 
@@ -6478,12 +6492,12 @@ fn a_schema_move_ends_a_new_table_exemption() {
 #[test]
 fn a_nested_handler_rolls_back_only_its_block() {
     // The handler undoes its own block. The outer setter and lock stay.
-    let sql = "DO $$\nBEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\n    BEGIN\n        \
+    let sql = "DO $$\nBEGIN\n    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);\n    BEGIN\n        \
                PERFORM 1 / 0;\n    EXCEPTION WHEN others THEN\n        NULL;\n    END;\n    \
                ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
     assert_eq!(lint_with_history(&[], sql, true), []);
     // A setter inside the handled block may still be undone.
-    let sql = "DO $$\nBEGIN\n    BEGIN\n        PERFORM set_config('lock_timeout', '5s', true);\n    \
+    let sql = "DO $$\nBEGIN\n    BEGIN\n        PERFORM pg_catalog.set_config('lock_timeout', '5s', true);\n    \
                EXCEPTION WHEN others THEN\n        NULL;\n    END;\n    \
                ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
     let findings = lint_with_history(&[], sql, true);
@@ -7591,15 +7605,53 @@ fn a_set_config_in_another_schema_sets_no_bound() {
         let expected = if setter.starts_with("DO") { 2 } else { 1 };
         assert_eq!(n, expected, "{sql}\n{findings:?}");
     }
-    for call in ["pg_catalog.set_config", "set_config"] {
-        let sql = format!("SELECT {call}('lock_timeout', '5s', true);\n{lock}");
-        assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
-    }
+    let sql = format!("SELECT pg_catalog.set_config('lock_timeout', '5s', true);\n{lock}");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
     // The user function may also change the real value, so it ends a bound.
     let sql = format!(
         "SET LOCAL lock_timeout = '5s';\nSELECT public.set_config('lock_timeout', '5s', true);\n{lock}"
     );
     let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn only_the_catalog_set_config_sets_a_bound() {
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    // The connection may start with a path such as `tenant, pg_catalog`, so an
+    // unqualified `set_config` may be a user function.
+    for setter in [
+        "SELECT set_config('lock_timeout', '5s', true);".to_string(),
+        format!(
+            "DO $$\nBEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\n    {lock}\nEND $$;"
+        ),
+    ] {
+        let sql = format!("{setter}\n{lock}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            rules(&findings).contains(&Rule::LockTimeout),
+            "{sql}\n{findings:?}"
+        );
+    }
+    let sql = format!("SELECT pg_catalog.set_config('lock_timeout', '5s', true);\n{lock}");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn a_variadic_routine_accepts_any_number_of_trailing_arguments() {
+    let earlier = "CREATE FUNCTION f(a int, VARIADIC xs int[]) RETURNS void LANGUAGE plpgsql \
+                   SET lock_timeout = '5s' AS $$\nBEGIN\n    \
+                   ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;";
+    // Each call reaches the self-bounded `f`, so it needs no outside bound.
+    for call in [
+        "SELECT f(0, 1);",
+        "SELECT f(0, 1, 2, 3);",
+        "SELECT f(0, VARIADIC ARRAY[1,2]);",
+    ] {
+        assert_eq!(lint_with_history(&[earlier], call, true), [], "{call}");
+    }
+    // A call with too few arguments reaches another routine.
+    let findings = lint_with_history(&[earlier], "SELECT f(0);", true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
@@ -7916,7 +7968,7 @@ fn an_atomic_body_setter_covers_a_later_call() {
                     ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;",
     ];
     let sql = "CREATE FUNCTION g() RETURNS void LANGUAGE sql\nBEGIN ATOMIC\n    \
-               SELECT set_config('lock_timeout', '5s', true);\n    SELECT legacy_f();\nEND;";
+               SELECT pg_catalog.set_config('lock_timeout', '5s', true);\n    SELECT legacy_f();\nEND;";
     assert_eq!(lint_with_history(&history, sql, true), [], "{sql}");
     let sql = "CREATE FUNCTION g() RETURNS void LANGUAGE sql\nBEGIN ATOMIC\n    \
                SELECT 1;\n    SELECT legacy_f();\nEND;";

@@ -114,8 +114,10 @@ zero value ends the bound for the locks after it, and so does a
 `DEFAULT` restores the server default, which is usually `0`, so the lint does
 not accept it. `SET lock_timeout` must be its own statement. `ALTER ROLE ...
 SET lock_timeout` does not change the current session. Inside a `DO` block,
-`PERFORM set_config('lock_timeout', '5s', true)` also counts. It must be a
-bare `SELECT` or `PERFORM` of the call. A query with a filter may never call
+`PERFORM pg_catalog.set_config('lock_timeout', '5s', true)` also counts. It
+must be a bare `SELECT` or `PERFORM` of the call, with the `pg_catalog`
+schema. The connection may start with a `search_path` that lists another
+schema before `pg_catalog`, so an unqualified call may reach a user function. A query with a filter may never call
 the function, so it does not count. A `set_config` in a schema other than
 `pg_catalog` is a user function, so it ends the bound. The same call in a
 function body does not count for the migration, because the body runs only
@@ -150,7 +152,8 @@ too. Set the bound again after the call.
 A routine can bound its own locks with a `SET lock_timeout` clause, or with a
 setter that surely runs before each lock in its body. Postgres applies that
 bound on each call. So a later call of that routine needs no outside bound.
-The call must use the same schema and an accepted number of arguments. The
+The call must use the same schema and an accepted number of arguments. A
+`VARIADIC` routine accepts any number of trailing arguments. The
 routine must also call only routines of its file that bound their own locks.
 An annotation does not make a lock bounded. Any other definition of the same
 name, or any `ALTER` of it, removes the exemption for good. Code that the lint
@@ -161,10 +164,8 @@ A routine created in an uncalled body or in a branch may not exist. A later
 `ROLLBACK` in the file may undo its `CREATE`. A call that runs now never
 reaches such a routine, and later calls gain nothing from it.
 
-After a `search_path` change, only `pg_catalog.set_config` sets a bound,
-because another schema may hold a `set_config` that shadows the built-in. The
-same holds in the body of a routine with a `SET search_path` clause. An
-unqualified call after such a change, or in such a body, also ends the bound.
+An unqualified call after a `search_path` change, or in the body of a routine
+with a `SET search_path` clause, ends the bound.
 It may reach a routine in another schema. A session change
 outlives its file, so the rule holds for every later migration too. A
 top-level `SET LOCAL` change ends with its transaction, so it does not.
