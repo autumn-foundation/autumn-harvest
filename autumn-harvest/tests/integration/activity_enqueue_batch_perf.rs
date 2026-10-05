@@ -490,9 +490,9 @@ async fn enqueue_batch_returns_ids_in_input_order() {
 
 /// A batch past Postgres's bind-parameter ceiling must still succeed.
 ///
-/// `NewTaskQueueItem` carries 27 columns, so one unchunked multi-row
-/// `INSERT` hits Postgres's 65,535-bind-parameter ceiling at 2,428 rows
-/// (`65_535 / 27 = 2427`, floor). 3,000 rows spans that boundary: two
+/// `NewTaskQueueItem` carries 28 columns, so one unchunked multi-row
+/// `INSERT` hits Postgres's 65,535-bind-parameter ceiling at 2,341 rows
+/// (`65_535 / 28 = 2340`, floor). 3,000 rows spans that boundary: two
 /// chunks, not one. This is a direct regression test for the
 /// pre-chunking bug. `execute_activity_fan_out_raw` accepts an uncapped
 /// `Vec`, and a large-enough fan-out returned a DB error before
