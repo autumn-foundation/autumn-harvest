@@ -85,12 +85,17 @@ These statements take a blocking lock for `lock-timeout`:
 - a plain `CREATE INDEX` (`SHARE`), `DROP INDEX` (`ACCESS EXCLUSIVE`) or
   `REINDEX`.
 
-The lint reads the history of earlier migrations. It finds the table of a
+The lint reads the history of earlier migrations. `harvest migrate` runs the
+core set and then the plugin set, while the combined path runs both in version
+order. The lint checks each migration in both orders, and a finding in either
+one counts. It finds the table of a
 `DROP INDEX` from the migration that created the index. The index sits in the
 schema of its table. A name without a schema goes to the first schema of the
 connection's `search_path`, which may not be `public`. So it matches only a
 name without a schema, never `public.<name>`. A
 `DROP INDEX` or `DROP TABLE` that surely runs makes the lint forget the index.
+A later `ROLLBACK` in the file may undo any of these changes, so after one the
+lint learns and forgets nothing from them.
 After a `search_path` change, an unqualified name has no known schema, so the
 lint neither learns nor places it. A call of a routine whose body may change
 `search_path` counts as a change when the call returns. That holds for a

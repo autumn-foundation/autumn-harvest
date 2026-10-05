@@ -2531,14 +2531,20 @@ fn reaches(s: &Stmts, r: &Routine, call: &Routine) -> bool {
     r.at < call.at && (r.sure || !s.toks[call.at].runs) && r.name == call.name && r.accepts(call)
 }
 
+/// The last `ROLLBACK` or `ABORT` statement of the file.
+///
+/// The lint does not track which transaction a `ROLLBACK` ends. So it may undo
+/// any earlier statement, which fails closed.
+fn last_rollback(s: &Stmts) -> Option<usize> {
+    (0..s.toks.len())
+        .rev()
+        .find(|&k| s.starts[k] == k && (s.keyword(k, "rollback") || s.keyword(k, "abort")))
+}
+
 /// Each routine that the file creates.
 fn file_routines(s: &Stmts) -> Vec<Routine> {
     let unconditional = unconditional(s);
-    // The lint does not track which transaction a `ROLLBACK` ends. So it may
-    // undo any earlier `CREATE`, which fails closed.
-    let last_rollback = (0..s.toks.len())
-        .rev()
-        .find(|&k| s.starts[k] == k && (s.keyword(k, "rollback") || s.keyword(k, "abort")));
+    let last_rollback = last_rollback(s);
     (0..s.toks.len())
         .filter_map(|k| {
             let keyword = routine_keyword(s, k)?;
@@ -3161,6 +3167,11 @@ fn resolve(
     let unplaced =
         |name: &str, at: usize| !name.contains('.') && path_change.is_some_and(|c| c <= at);
     let bodies = routine_bodies(s);
+    // A change to the index history must surely run and stay. A later
+    // `ROLLBACK` may undo it.
+    let last_rollback = last_rollback(s);
+    let stays =
+        |at: usize| toks[at].runs && unconditional[at] && last_rollback.is_none_or(|r| r < at);
     let mut hits = Vec::with_capacity(raws.len());
     for raw in raws {
         // A `format()` placeholder makes a name unknown, which fails closed.
@@ -3177,8 +3188,7 @@ fn resolve(
         // surely runs: not conditional, and not `IF NOT EXISTS`, which may do
         // nothing. A hot table is always learnt, because it can only make a
         // later drop stricter.
-        let sure = toks[raw.at].runs
-            && unconditional[raw.at]
+        let sure = stays(raw.at)
             && !s.has_pair(raw.at, "not", "exists")
             && !table.as_deref().is_some_and(|t| unplaced(t, raw.at));
         let learn = sure || table.as_deref().is_some_and(|t| history.is_hot(t));
@@ -3199,7 +3209,7 @@ fn resolve(
         {
             let old_key = index_key(index, index);
             let tables = history.indexes.get(&old_key).cloned();
-            if toks[raw.at].runs && unconditional[raw.at] {
+            if stays(raw.at) {
                 history.indexes.remove(&old_key);
             }
             if let Some(tables) = tables {
@@ -3209,7 +3219,7 @@ fn resolve(
         // A drop that surely runs removes the name. A later index of that name
         // is then unknown, which fails closed. A table drop takes every index
         // on the table with it.
-        if toks[raw.at].runs && unconditional[raw.at] {
+        if stays(raw.at) {
             if let (Some(index), "DROP INDEX") = (&raw.index, raw.verb)
                 && !unplaced(index, raw.at)
             {
@@ -4403,16 +4413,36 @@ fn read_migration(tree: &'static str, dir: &Path) -> OnDisk {
 /// Harvest database, every core migration runs before any plugin one. The
 /// app tree targets its own database, so it keeps its own history.
 fn lint_all(migrations: &[OnDisk]) -> Vec<Vec<Finding>> {
+    // `harvest migrate` runs the core set and then the plugin set. The combined
+    // path runs both in version order. A finding in either order counts.
     let rank = |m: &OnDisk| match m.tree {
-        "autumn-harvest/migrations" => 0,
+        CORE_TREE => 0,
         APP_TREE => 2,
         _ => 1,
     };
-    let mut order: Vec<usize> = (0..migrations.len()).collect();
-    order.sort_by(|&a, &b| {
-        let (a, b) = (&migrations[a], &migrations[b]);
-        (rank(a), &a.name).cmp(&(rank(b), &b.name))
+    let by_set = lint_in_order(migrations, |m| (rank(m), m.name.clone()));
+    let by_version = lint_in_order(migrations, |m| {
+        (usize::from(m.tree == APP_TREE), m.name.clone())
     });
+    by_set
+        .into_iter()
+        .zip(by_version)
+        .map(|(mut findings, more)| {
+            for f in more {
+                if !findings.contains(&f) {
+                    findings.push(f);
+                }
+            }
+            findings
+        })
+        .collect()
+}
+
+/// Lint each migration against the history of those before it in `key` order.
+/// The app tree keeps its own history, because it targets another database.
+fn lint_in_order<K: Ord>(migrations: &[OnDisk], key: impl Fn(&OnDisk) -> K) -> Vec<Vec<Finding>> {
+    let mut order: Vec<usize> = (0..migrations.len()).collect();
+    order.sort_by_key(|&i| key(&migrations[i]));
     let mut harvest = History::default();
     let mut app = History::default();
     let mut out = vec![Vec::new(); migrations.len()];
@@ -7868,6 +7898,46 @@ fn a_new_table_exempts_only_locks_that_run_now() {
     );
     let findings = lint_with_history(&[], &sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_rolled_back_index_change_is_not_learnt() {
+    let hot = "CREATE INDEX CONCURRENTLY idx ON harvest_events (x);";
+    // The `ROLLBACK` undoes the rename and the cold build, so `idx` is still
+    // the hot index.
+    let undone =
+        "ALTER INDEX idx RENAME TO idx_old;\nCREATE INDEX idx ON scratch_t (x);\nROLLBACK;";
+    let findings = lint_with_history(&[hot, undone], "DROP INDEX idx;", false);
+    assert!(!findings.is_empty(), "{findings:?}");
+    // Without the `ROLLBACK`, `idx` is the cold index.
+    let kept = "ALTER INDEX idx RENAME TO idx_old;\nCREATE INDEX idx ON scratch_t (x);";
+    assert_eq!(
+        lint_with_history(&[hot, kept], "DROP INDEX idx;", false),
+        []
+    );
+}
+
+#[test]
+fn the_lint_checks_the_version_ordered_history_too() {
+    let plugin = "autumn-harvest-plugin/migrations/harvest";
+    let migration = |tree: &'static str, name: &str, sql: &str| OnDisk {
+        tree,
+        name: name.to_string(),
+        sql: sql.to_string(),
+        run_in_transaction: true,
+    };
+    // In version order, the plugin drop runs before the core build, so `idx`
+    // is still unknown there.
+    let migrations = [
+        migration(
+            CORE_TREE,
+            "20261010000001_core_build",
+            "CREATE INDEX idx ON scratch_t (x);",
+        ),
+        migration(plugin, "20261010000000_plugin_drop", "DROP INDEX idx;"),
+    ];
+    let all = lint_all(&migrations);
+    assert!(!all[1].is_empty(), "{all:?}");
 }
 
 #[test]
