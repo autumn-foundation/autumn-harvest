@@ -68,7 +68,7 @@ fails in these cases:
 | Spec | Protocol | Configs |
 |---|---|---|
 | `ActivityClaim` | Activity claim epoch (issue #1789) | fixed, pre-fix, reachability |
-| `WorkflowTaskClaim` | Workflow-task terminal-write ownership (issues #1184, #1806) | fixed, pre-fix, reachability, capability-miss gap and fix |
+| `WorkflowTaskClaim` | Workflow-task terminal-write ownership (issues #1184, #1806, #1917) | fixed, pre-fix, reachability, capability-miss pre-fix |
 | `CodecRotation` | Codec re-encryption against PII erasure (issues #948, #495) | CAS, blind write, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
@@ -102,10 +102,9 @@ one task row and these actions:
 `Fenced = FALSE` gives it only `state = 'RUNNING'`, as before #1789.
 
 `SelfRelease` uses the full `claim_held` guard, which is stronger than the
-pause and capability-miss guards in the code. Two facts make it equivalent
-here. The pause releases run in the claim's own transaction. The
-capability-miss release runs only on a worker without the handler, which
-never starts the activity.
+pause guards in the code. The pause releases run in the claim's own
+transaction, so the stronger guard is equivalent here. The capability-miss
+release checks `claim_held` and `crash_strikes` (issue #1917).
 
 Invariants:
 
@@ -161,20 +160,19 @@ the issue:
 `OwnerWritesByCurrentClaim` covers the suspension release too. Remove the
 `attempt` term from that release alone, and the fixed config fails.
 
-**Open gap: the capability-miss release.** A cycle that started its
+**The capability-miss release (issue #1917).** A cycle that started its
 handler can release its claim through
 `release_task_for_capability_miss_query` (phases `DuringHandler` and
-`AfterHandler`). That guard checks `worker_id` and `crash_strikes`, but
-not `attempt`. `CapMissGuard` selects the guard:
+`AfterHandler`). `CapMissGuard` selects the guard of that release:
 
-- `WorkflowTaskClaimCapMissGap.cfg` uses the current guard. TLC violates
+- `WorkflowTaskClaim.cfg` uses `"epoch"`, the guard after #1917. It checks
+  `attempt` too. The fixed config passes.
+- `WorkflowTaskClaimCapMissPreFix.cfg` uses `"strikes"`, the guard before
+  #1917. It checks `worker_id` and `crash_strikes` only. TLC violates
   `OwnerWritesByCurrentClaim`: after a stuck requeue and a re-claim by the
-  same worker, the stale cycle re-pends the live claim. The terminal write
-  stays safe, because its own guard checks `attempt`.
-- `WorkflowTaskClaimCapMissFix.cfg` adds the `attempt` term. It passes.
+  same worker, the stale cycle re-pends the live claim.
 
-The fixed config keeps this action off, so it checks the guards that #1806
-fixed.
+This model found the #1917 gap before any test did.
 
 #### `CodecRotation` — model (c)
 
