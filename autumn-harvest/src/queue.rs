@@ -8639,7 +8639,8 @@ mod tests {
     /// new claim variant without the fence fails here, not during a failover.
     #[test]
     fn every_claim_variant_applies_the_dr_fence() {
-        let full = include_str!("queue.rs");
+        // A Windows checkout can use CRLF line ends. The scan matches LF.
+        let full = include_str!("queue.rs").replace("\r\n", "\n");
         let source = &full[..full
             .find("\n#[cfg(test)]\nmod tests")
             .expect("queue.rs has a test module")];
