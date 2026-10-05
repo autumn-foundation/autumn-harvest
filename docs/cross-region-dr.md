@@ -326,10 +326,12 @@ Admin writes go through the same check as worker writes (issue #1823).
   while it writes `harvest_schedules` and fires. A fenced or held shard gets
   no write, and the log names it.
 
-The barrier is a transaction on its own connection. It takes an advisory
-lock in shared mode and checks the generation. `harvest dr fence` takes that
-lock in exclusive mode before it bumps, so the bump waits for a pass in
-flight. A pass that starts after the bump sees the new generation and stops.
+The barrier is a transaction on its own connection. It takes the shard's
+advisory lock in shared mode and checks the generation. `harvest dr fence`
+takes that shard's lock in exclusive mode before it bumps, so the bump waits
+for a pass in flight on that shard. A pass that starts after the bump sees
+the new generation and stops. Each shard has its own lock. A pass on one
+shard does not delay a bump of another shard on the same database.
 The bump waits at most 5 seconds. A pass that runs longer makes the bump
 fail with a lock timeout. Run `harvest dr fence` again.
 
@@ -353,8 +355,9 @@ Three limits, stated plainly:
 - A barrier opens one extra connection per shard. On a DR node every admin
   write, scheduler pass and partition pass pays that cost. The barrier pings
   that connection each second. If the session ends, the server frees the
-  lock. A scheduler pass then stops before it fires. A write already in
-  flight can still race a bump for up to one second.
+  lock. The pass then stops: a scheduler pass before it fires, a partition
+  pass or a rebalance at once, with an error. A write already in flight can
+  still race a bump for up to one second.
 - The check reads every pinned shard on each admin write. If one shard
   cannot be read, every admin write on the node answers `503`. That fails
   closed. A node that has lost authority on one shard has lost it on the

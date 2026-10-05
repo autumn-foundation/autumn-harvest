@@ -515,9 +515,9 @@ impl DrFencing {
             (Self::Disabled, true) => Err(
                 "DR fencing is Disabled, but a shard database carries a DR marker (a \
                  harvest_shard_generation row, a DR replication slot or a DR subscription). An \
-                 unfenced process could write to a demoted primary after a failover. Remove \
-                 with_dr_fencing(false) or with_dr_fencing_mode(Disabled) to use the default \
-                 Auto mode."
+                 unfenced process could write to a demoted primary after a failover. Delete \
+                 the with_dr_fencing(false) or with_dr_fencing_mode(DrFencing::Disabled) call, \
+                 or replace it with with_dr_fencing_mode(DrFencing::Auto)."
                     .to_string(),
             ),
         }
@@ -1337,11 +1337,12 @@ mod db {
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
-                // Wait for every fenced pass in flight (issue #1823). A pass
-                // holds this lock shared, so its writes commit before the
-                // bump. The wait comes before the table lock, so a pass's
-                // own `FOR SHARE` checks never queue behind this bump.
+                // Wait for every fenced pass in flight on this shard (issue
+                // #1823). A pass holds this lock shared, so its writes commit
+                // before the bump. The wait comes before the table lock, so a
+                // pass's own `FOR SHARE` checks never queue behind this bump.
                 diesel::sql_query(FENCE_PASS_LOCK_EXCLUSIVE)
+                    .bind::<Integer, _>(shard_id)
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
@@ -1377,12 +1378,17 @@ mod db {
             })
     }
 
-    /// Take the pass lock shared, for a fenced pass (issue #1823).
+    /// Take one shard's pass lock shared, for a fenced pass (issue #1823).
+    /// `$1` is the shard id. Shards on one database have separate locks, so
+    /// a pass on one shard does not block a bump of another.
     const FENCE_PASS_LOCK_SHARED: &str =
-        "SELECT pg_advisory_xact_lock_shared(hashtext('harvest:dr_fence_pass:v1'))";
-    /// Take the pass lock exclusive, for a bump (issue #1823).
+        "SELECT pg_advisory_xact_lock_shared(hashtext('harvest:dr_fence_pass:v1'), $1)";
+    /// Take one shard's pass lock exclusive, for a bump (issue #1823).
     const FENCE_PASS_LOCK_EXCLUSIVE: &str =
-        "SELECT pg_advisory_xact_lock(hashtext('harvest:dr_fence_pass:v1'))";
+        "SELECT pg_advisory_xact_lock(hashtext('harvest:dr_fence_pass:v1'), $1)";
+    /// The error a pass gets when its fence guard loses its session.
+    const FENCE_PASS_LOST: &str = "the DR fence session ended, so the pass stopped. A fence \
+                                   bump can commit after that point. Run the pass again.";
     /// How often a fence guard pings its session (issue #1823). The ping
     /// keeps an idle proxy from closing it, and finds a lost session.
     const FENCE_PASS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1394,17 +1400,21 @@ mod db {
     /// A scheduler pass or a partition-maintenance pass writes in many
     /// statements and transactions. A check before the pass is not a
     /// barrier: a bump can commit between the check and a write. This guard
-    /// holds a transaction open on its own connection, with the pass lock
-    /// shared and the generation checked. [`bump_generation`] takes the
-    /// pass lock exclusive, so it cannot commit while the pass runs. A pass
-    /// that starts after the bump sees the new generation and stops.
+    /// holds a transaction open on its own connection, with the shard's
+    /// pass lock shared and the generation checked. [`bump_generation`]
+    /// takes that lock exclusive, so it cannot commit while the pass runs. A
+    /// pass that starts after the bump sees the new generation and stops.
+    ///
+    /// The guard holds no lock on `harvest_shard_generation`. A bump takes
+    /// that table exclusive, so a table lock would block a bump of every
+    /// shard on the database.
     ///
     /// The connection is not from the pool, so the guard never starves the
     /// pass of a connection. Dropping the guard closes the connection. The
     /// server then ends the transaction and frees the lock, even when the
     /// pass is cancelled.
     pub struct FencePassGuard {
-        lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        lost: tokio_util::sync::CancellationToken,
         keepalive: tokio::task::JoinHandle<()>,
     }
 
@@ -1412,13 +1422,13 @@ mod db {
         /// Whether the guard's session has ended (issue #1823).
         ///
         /// The server then frees the pass lock, so a bump can commit. A pass
-        /// checks this before it writes, and stops when it is set. A pass
-        /// already mid-write when the session ends can still race a bump,
-        /// for at most one keepalive interval.
+        /// checks this before it writes, and stops when it is set. A long
+        /// pass uses [`run_fenced_pass`] instead. A pass already mid-write
+        /// when the session ends can still race a bump, for at most one
+        /// keepalive interval.
         #[must_use]
         pub fn is_lost(&self) -> bool {
-            // UFCS: diesel's blanket `RunQueryDsl::load` shadows this method.
-            std::sync::atomic::AtomicBool::load(&self.lost, std::sync::atomic::Ordering::Acquire)
+            self.lost.is_cancelled()
         }
     }
 
@@ -1427,6 +1437,39 @@ mod db {
             // The task owns the connection. Aborting it closes the
             // connection, and the server then frees the pass lock.
             self.keepalive.abort();
+        }
+    }
+
+    /// Run `pass` until it ends or a guard loses its session (issue #1823).
+    ///
+    /// A lost session frees the pass lock, so a bump can commit. This then
+    /// drops `pass`, and the pass stops before its next write. With no
+    /// guard, the pass runs to its end.
+    ///
+    /// A dropped pass can leave a transaction open. Close its connection,
+    /// so that the server rolls the transaction back. Do not reuse it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Database`] when a guard loses its
+    /// session before `pass` ends.
+    pub async fn run_fenced_pass<'a, T>(
+        guards: impl IntoIterator<Item = &'a FencePassGuard>,
+        pass: impl std::future::Future<Output = T>,
+    ) -> HarvestResult<T> {
+        let lost: Vec<_> = guards
+            .into_iter()
+            .map(|guard| Box::pin(guard.lost.cancelled()))
+            .collect();
+        if lost.is_empty() {
+            return Ok(pass.await);
+        }
+        tokio::select! {
+            biased;
+            _ = futures::future::select_all(lost) => Err(
+                crate::error::HarvestError::Database(FENCE_PASS_LOST.to_string()),
+            ),
+            output = pass => Ok(output),
         }
     }
 
@@ -1503,12 +1546,22 @@ mod db {
         .await
         .map_err(database_error)?;
         diesel::sql_query(FENCE_PASS_LOCK_SHARED)
+            .bind::<Integer, _>(shard.as_i32())
             .execute(&mut conn)
             .await
             .map_err(database_error)?;
+        // The check reads the generation row, which locks the table. The
+        // rollback to the savepoint frees that lock and keeps the pass lock.
+        // A bump of another shard then does not wait for this pass.
+        conn.batch_execute("SAVEPOINT harvest_fence_check")
+            .await
+            .map_err(database_error)?;
         assert_generation(&mut conn, shard, expected).await?;
-        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = std::sync::Arc::clone(&lost);
+        conn.batch_execute("ROLLBACK TO SAVEPOINT harvest_fence_check")
+            .await
+            .map_err(database_error)?;
+        let lost = tokio_util::sync::CancellationToken::new();
+        let flag = lost.clone();
         let keepalive = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(FENCE_PASS_KEEPALIVE).await;
@@ -1517,7 +1570,7 @@ mod db {
                     .await
                     .is_err()
                 {
-                    flag.store(true, std::sync::atomic::Ordering::Release);
+                    flag.cancel();
                     tracing::error!(
                         shard_id = shard.as_i32(),
                         "the DR fence guard lost its session; its pass stops writing"
@@ -2880,6 +2933,7 @@ pub use db::{
     begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on, bump_generation,
     current_generation, ensure_generation_row, measure_rpo, pin_process_fence, pin_worker_fence,
     probe_dr_markers, query_replication_status, record_replication_heartbeat, resolve_held,
+    run_fenced_pass,
 };
 
 #[cfg(test)]
@@ -3380,6 +3434,11 @@ mod tests {
             .expect_err("a disagreeing config must refuse to start");
         assert!(refusal.contains("Disabled"), "{refusal}");
         assert!(refusal.contains("DR"), "{refusal}");
+        // The fix must not select Disabled again.
+        assert!(
+            refusal.contains("with_dr_fencing_mode(DrFencing::Auto)"),
+            "{refusal}"
+        );
     }
 
     #[test]

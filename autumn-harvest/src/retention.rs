@@ -1527,7 +1527,7 @@ async fn run_partition_maintenance_pass(
         };
         // Held until this shard's pass ends, so a bump cannot commit while
         // the pass writes. See `crate::replication::FencePassGuard`.
-        let Some(_fence) = partition_pass_fence(pool, shard, monitor_task).await else {
+        let Some(fence) = partition_pass_fence(pool, shard, monitor_task).await else {
             continue;
         };
         // Review finding: a standalone probe used to run here, before
@@ -1580,17 +1580,28 @@ async fn run_partition_maintenance_pass(
         // until the next tick. Read the clock fresh, right before this
         // shard's own call.
         let now = Utc::now();
-        match crate::partition::maintain_with_progress(
-            &mut conn,
-            now,
-            config.partitions.lookahead_cohorts,
-            &sweep_opts,
-            cursor.resume_after,
-            cursor.catch_up_target,
-            &mut tick_partition,
+        // A lost fence session stops the pass. See
+        // `crate::replication::run_fenced_pass`.
+        let maintained = crate::replication::run_fenced_pass(
+            fence.as_ref(),
+            crate::partition::maintain_with_progress(
+                &mut conn,
+                now,
+                config.partitions.lookahead_cohorts,
+                &sweep_opts,
+                cursor.resume_after,
+                cursor.catch_up_target,
+                &mut tick_partition,
+            ),
         )
-        .await
-        {
+        .await;
+        // A stopped pass can leave a transaction open. Closing the
+        // connection makes the server roll it back.
+        let maintained = maintained.unwrap_or_else(|lost| {
+            drop(deadpool::managed::Object::take(conn));
+            Err(lost)
+        });
+        match maintained {
             Ok(outcome) if outcome.partitioned == Some(false) => {
                 // `outcome.partitioned` comes from `maintain`'s own
                 // probe, the same one that gated its (empty) pass below

@@ -3003,6 +3003,74 @@ async fn a_fence_guard_reports_a_lost_session() {
     .await;
 }
 
+/// A pass stops when its fence guard loses its session (issue #1823). The
+/// server then frees the pass lock, so a bump can commit mid-pass.
+#[tokio::test]
+async fn a_pass_stops_when_its_fence_guard_is_lost() {
+    let (url, db) = require_db!("passlost");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(
+        Some(&guard),
+        tokio::time::sleep(std::time::Duration::from_secs(60)),
+    );
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+
+    let Ok(outcome) = stopped else {
+        panic!("a pass must stop when its guard is lost");
+    };
+    assert!(outcome.is_err(), "a stopped pass reports an error");
+}
+
+/// A pass on one shard does not block a bump of another shard on the same
+/// database (issue #1823). Generations are per shard, so the barrier is too.
+#[tokio::test]
+async fn a_fenced_pass_does_not_block_another_shards_bump() {
+    let (url, _db) = require_db!("passscope");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .unwrap();
+    let other = ensure_generation_row(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(2), other)
+        .await
+        .expect("open the pass on shard 2");
+
+    let bump = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        bump_generation(&mut conn, ShardId::new(1), "failover", "test"),
+    )
+    .await;
+    drop(guard);
+
+    assert!(
+        matches!(bump, Ok(Ok(_))),
+        "a pass on shard 2 must not block a bump of shard 1: {bump:?}"
+    );
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

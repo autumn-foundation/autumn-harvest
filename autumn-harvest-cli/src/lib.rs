@@ -6518,7 +6518,7 @@ async fn run_partition_enable(
             continue;
         }
         // Held until this shard's mutation ends (issue #1823).
-        let _fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+        let fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
             Ok(guard) => guard,
             Err(error) => {
                 row.error = Some(error);
@@ -6530,7 +6530,14 @@ async fn run_partition_enable(
         // half-converted cluster is a supported state (each shard's layout is
         // detected at runtime), so one shard's lock timeout must not abort the
         // conversion of the rest.
-        match autumn_harvest::partition::enable_partitioning(&mut conn, opts).await {
+        // A lost fence session stops the mutation. See `run_fenced_pass`.
+        let enabled = autumn_harvest::replication::run_fenced_pass(
+            fence.as_ref(),
+            autumn_harvest::partition::enable_partitioning(&mut conn, opts),
+        )
+        .await
+        .and_then(|done| done);
+        match enabled {
             Ok(report) => row.enable = Some(report),
             Err(e) => row.error = Some(e.to_string()),
         }
@@ -6579,7 +6586,7 @@ async fn run_partition_maintain(
             continue;
         }
         // Held until this shard's mutation ends (issue #1823).
-        let _fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+        let fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
             Ok(guard) => guard,
             Err(error) => {
                 row.error = Some(error);
@@ -6587,16 +6594,21 @@ async fn run_partition_maintain(
                 continue;
             }
         };
-        match autumn_harvest::partition::maintain(
-            &mut conn,
-            autumn_harvest::chrono::Utc::now(),
-            lookahead_cohorts,
-            &sweep,
-            None,
-            None,
+        // A lost fence session stops the pass. See `run_fenced_pass`.
+        let maintained = autumn_harvest::replication::run_fenced_pass(
+            fence.as_ref(),
+            autumn_harvest::partition::maintain(
+                &mut conn,
+                autumn_harvest::chrono::Utc::now(),
+                lookahead_cohorts,
+                &sweep,
+                None,
+                None,
+            ),
         )
         .await
-        {
+        .and_then(|done| done);
+        match maintained {
             Ok(outcome) => {
                 // A pass that ran but did not COMPLETE — a `drain_default` that
                 // lost its bounded lock attempt, say — comes back as `Ok` with
@@ -6650,7 +6662,7 @@ async fn run_partition_disable(
             continue;
         }
         // Held until this shard's mutation ends (issue #1823).
-        let _fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+        let fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
             Ok(guard) => guard,
             Err(error) => {
                 row.error = Some(error);
@@ -6658,7 +6670,14 @@ async fn run_partition_disable(
                 continue;
             }
         };
-        match autumn_harvest::partition::disable_partitioning(&mut conn).await {
+        // A lost fence session stops the mutation. See `run_fenced_pass`.
+        let disabled = autumn_harvest::replication::run_fenced_pass(
+            fence.as_ref(),
+            autumn_harvest::partition::disable_partitioning(&mut conn),
+        )
+        .await
+        .and_then(|done| done);
+        match disabled {
             Ok(report) => {
                 row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);
                 // `None` = already unpartitioned. That is a successful no-op,
@@ -10475,7 +10494,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             }
             let pool = build_pool(&targets)?;
             // Held until the command ends. See `shard_pool_write_authority`.
-            let _fence = if *dry_run {
+            let fence = if *dry_run {
                 Vec::new()
             } else {
                 shard_pool_write_authority(&pool, expect_generation).await?
@@ -10483,17 +10502,22 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let after = after_created_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
-            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
-                &pool,
-                ShardId::new(*from),
-                ShardId::new(*to),
-                *limit,
-                *dry_run,
-                actor.unwrap_or("anonymous"),
-                &PayloadCodecs::default(),
-                after,
+            // A lost fence session stops the command. See `run_fenced_pass`.
+            let report = autumn_harvest::replication::run_fenced_pass(
+                &fence,
+                autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
+                    &pool,
+                    ShardId::new(*from),
+                    ShardId::new(*to),
+                    *limit,
+                    *dry_run,
+                    actor.unwrap_or("anonymous"),
+                    &PayloadCodecs::default(),
+                    after,
+                ),
             )
             .await
+            .and_then(|done| done)
             .map_err(|e| CliError::InvalidInput(e.to_string()))?;
 
             if *json {
@@ -10517,15 +10541,20 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            let _fence = shard_pool_write_authority(&pool, expect_generation).await?;
-            let outcomes = autumn_harvest::shard_rebalance::resume_incomplete_migrations(
-                &pool,
-                ShardId::new(*from),
-                *limit,
-                actor.unwrap_or("anonymous"),
-                &PayloadCodecs::default(),
+            let fence = shard_pool_write_authority(&pool, expect_generation).await?;
+            // A lost fence session stops the command. See `run_fenced_pass`.
+            let outcomes = autumn_harvest::replication::run_fenced_pass(
+                &fence,
+                autumn_harvest::shard_rebalance::resume_incomplete_migrations(
+                    &pool,
+                    ShardId::new(*from),
+                    *limit,
+                    actor.unwrap_or("anonymous"),
+                    &PayloadCodecs::default(),
+                ),
             )
             .await
+            .and_then(|done| done)
             .map_err(|e| CliError::InvalidInput(e.to_string()))?;
 
             if *json {
@@ -10555,19 +10584,23 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            let _fence = shard_pool_write_authority(&pool, expect_generation).await?;
+            let fence = shard_pool_write_authority(&pool, expect_generation).await?;
             let after = after_migrated_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
-            let (reconciled, failures, next_cursor) =
+            // A lost fence session stops the command. See `run_fenced_pass`.
+            let (reconciled, failures, next_cursor) = autumn_harvest::replication::run_fenced_pass(
+                &fence,
                 autumn_harvest::shard_rebalance::reconcile_migrated_seals_after(
                     &pool,
                     ShardId::new(*from),
                     *limit,
                     after,
-                )
-                .await
-                .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+                ),
+            )
+            .await
+            .and_then(|done| done)
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
 
             if *json {
                 println!(
