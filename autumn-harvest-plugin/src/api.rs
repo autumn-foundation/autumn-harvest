@@ -5698,9 +5698,12 @@ async fn admit_mutation(
     if !mutation_admitted(api_state, has_token, session).await {
         return AutumnError::unauthorized_msg("authentication required").into_response();
     }
-    if let Err(refusal) = enforce_dr_fence(api_state).await {
-        return refusal.into_response();
-    }
+    // Held until the handler returns, so a bump cannot commit while the
+    // handler writes. See `FencePassGuard`.
+    let _fence = match enforce_dr_fence(api_state).await {
+        Ok(guards) => guards,
+        Err(refusal) => return refusal.into_response(),
+    };
     next.run(request).await
 }
 
@@ -5720,26 +5723,27 @@ async fn admit_mutation(
 /// `pool_for` falls back to the default pool on purpose. On a single-database
 /// node, that pool is the database of whichever shard the node pinned.
 ///
-/// The check runs before the handler, not inside its transaction. A handler
-/// that appends history is also checked inside the append transaction.
-pub(crate) async fn enforce_dr_fence(api_state: &HarvestApiState) -> Result<(), AutumnError> {
-    use autumn_harvest::replication::{FenceRegistry, assert_fence};
+/// The caller holds the returned guards until its handler returns. Each is
+/// a commit-order barrier: a bump cannot commit while the handler writes.
+/// See [`autumn_harvest::replication::FencePassGuard`].
+pub(crate) async fn enforce_dr_fence(
+    api_state: &HarvestApiState,
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, AutumnError> {
+    use autumn_harvest::replication::{FenceRegistry, begin_fenced_pass};
 
     if !FenceRegistry::is_enabled() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let checks = FenceRegistry::snapshot().into_iter().map(|(shard, _)| {
         let shard_pool = pool.pool_for(shard).clone();
-        async move {
-            let mut conn = autumn_harvest::pool::acquire_within_pool_bound(&shard_pool).await?;
-            assert_fence(&mut conn, shard).await
-        }
+        async move { begin_fenced_pass(&shard_pool, shard).await }
     });
+    let mut guards = Vec::new();
     for checked in futures::future::join_all(checks).await {
-        checked.map_err(map_error)?;
+        guards.extend(checked.map_err(map_error)?);
     }
-    Ok(())
+    Ok(guards)
 }
 
 /// Whether the mutation gate admits a caller (issue #1802).

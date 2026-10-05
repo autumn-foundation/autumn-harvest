@@ -6142,11 +6142,13 @@ async fn direct_write_authority(
 
 /// [`direct_write_authority`] for every shard of a rebalance pool, before any
 /// write. A rebalance moves history between two shards, so both must hold
-/// authority.
+/// authority. The returned guards hold each stated epoch until the caller
+/// drops them, so a bump cannot commit while the rebalance writes.
 async fn shard_pool_write_authority(
     pool: &autumn_harvest::shard::ShardedDbPool,
     expect_generation: &[ExpectGeneration],
-) -> Result<(), CliError> {
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, CliError> {
+    let mut guards = Vec::new();
     for (shard, shard_pool) in pool.iter_shards() {
         let mut conn = shard_pool
             .get()
@@ -6160,8 +6162,20 @@ async fn shard_pool_write_authority(
         )
         .await
         .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
+        // Hold a barrier at the stated epoch for the whole command, so a bump
+        // cannot commit while the rebalance writes (issue #1823).
+        if let Some(expected) = expected_generation_for(expect_generation, shard.as_i32())? {
+            let guard = autumn_harvest::replication::begin_fenced_pass_at(
+                shard_pool,
+                shard,
+                autumn_harvest::replication::ShardGeneration::new(expected),
+            )
+            .await
+            .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
+            guards.push(guard);
+        }
     }
-    Ok(())
+    Ok(guards)
 }
 
 /// What `harvest partition disable` did on one shard.
@@ -10406,9 +10420,12 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 ));
             }
             let pool = build_pool(&targets)?;
-            if !*dry_run {
-                shard_pool_write_authority(&pool, expect_generation).await?;
-            }
+            // Held until the command ends. See `shard_pool_write_authority`.
+            let _fence = if *dry_run {
+                Vec::new()
+            } else {
+                shard_pool_write_authority(&pool, expect_generation).await?
+            };
             let after = after_created_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
@@ -10446,7 +10463,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            shard_pool_write_authority(&pool, expect_generation).await?;
+            let _fence = shard_pool_write_authority(&pool, expect_generation).await?;
             let outcomes = autumn_harvest::shard_rebalance::resume_incomplete_migrations(
                 &pool,
                 ShardId::new(*from),
@@ -10484,7 +10501,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            shard_pool_write_authority(&pool, expect_generation).await?;
+            let _fence = shard_pool_write_authority(&pool, expect_generation).await?;
             let after = after_migrated_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));

@@ -342,12 +342,15 @@ These direct-database commands are exempt, by design:
 | `harvest migrate run` | Logical replication carries no DDL. You must migrate both regions. |
 | `harvest backup verify`, `harvest dr status`, `harvest partition status`, `harvest migrate status` | They read only. |
 
+An admin write holds the same fence barrier as a scheduler pass. The
+management API holds one per pinned shard until the handler returns. A
+rebalance holds one per shard, at the stated epoch, until the command ends.
+A bump therefore cannot commit while either one writes.
+
 Three limits, stated plainly:
 
-- The management API check runs before the handler, not inside its
-  transaction. The persist assert also checks each admin write that appends
-  history, inside the append transaction. A write that appends no history,
-  such as a queue pause, has only the check before the handler.
+- A barrier opens one extra connection per shard. On a DR node every admin
+  write, scheduler pass and partition pass pays that cost.
 - The check reads every pinned shard on each admin write. If one shard
   cannot be read, every admin write on the node answers `503`. That fails
   closed. A node that has lost authority on one shard has lost it on the

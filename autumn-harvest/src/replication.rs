@@ -1416,12 +1416,26 @@ mod db {
         pool: &crate::worker::DbPool,
         shard: ShardId,
     ) -> HarvestResult<Option<FencePassGuard>> {
-        use deadpool::managed::Manager as _;
-        use diesel_async::SimpleAsyncConnection as _;
         let Some(pinned) = FenceRegistry::expected(shard) else {
             return Ok(None);
         };
         let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+        begin_fenced_pass_at(pool, resolved, pinned).await.map(Some)
+    }
+
+    /// [`begin_fenced_pass`] at an explicit generation, for a process that
+    /// pins nothing (issue #1823). The CLI states the epoch an operator gave.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_pass`].
+    pub async fn begin_fenced_pass_at(
+        pool: &crate::worker::DbPool,
+        shard: ShardId,
+        expected: ShardGeneration,
+    ) -> HarvestResult<FencePassGuard> {
+        use deadpool::managed::Manager as _;
+        use diesel_async::SimpleAsyncConnection as _;
         let mut conn = tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
             .await
             .map_err(|_| {
@@ -1435,8 +1449,8 @@ mod db {
             .execute(&mut conn)
             .await
             .map_err(database_error)?;
-        assert_generation(&mut conn, resolved, pinned).await?;
-        Ok(Some(FencePassGuard { _conn: conn }))
+        assert_generation(&mut conn, shard, expected).await?;
+        Ok(FencePassGuard { _conn: conn })
     }
 
     /// Assert that this process still holds write authority for `shard`.
@@ -2787,9 +2801,9 @@ mod db {
 #[cfg(feature = "db")]
 pub use db::{
     FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority, assert_fence,
-    begin_fenced_pass, bump_generation, current_generation, ensure_generation_row, measure_rpo,
-    pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
-    record_replication_heartbeat, resolve_held,
+    begin_fenced_pass, begin_fenced_pass_at, bump_generation, current_generation,
+    ensure_generation_row, measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers,
+    query_replication_status, record_replication_heartbeat, resolve_held,
 };
 
 #[cfg(test)]
