@@ -1094,6 +1094,7 @@ mod tests {
     type FailureRow = (&'static str, &'static str, WorkflowEvent, bool);
 
     /// One event per variant that the security doc lists as uncovered.
+    #[allow(clippy::too_many_lines)]
     fn failure_rows() -> Vec<FailureRow> {
         use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId};
         let msg = || MSG_SECRET.to_string();
