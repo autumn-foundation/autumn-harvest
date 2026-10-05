@@ -4118,6 +4118,7 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_released_by_the_stale_disp
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         task.crash_strikes,
+        task.attempt,
         TEST_FRONTIER,
     )
     .await
@@ -4214,6 +4215,7 @@ async fn the_release_reports_the_cardinality_it_actually_committed() {
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         0,
+        load_task(&url, task_id).await.attempt,
         TEST_FRONTIER,
     )
     .await
@@ -4276,6 +4278,7 @@ async fn release_never_writes_the_error_column() {
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         0,
+        load_task(&url, task_id).await.attempt,
         TEST_FRONTIER,
     )
     .await
@@ -4321,6 +4324,7 @@ async fn release_never_writes_the_error_column() {
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         0,
+        load_task(&url, task2).await.attempt,
         TEST_FRONTIER,
     )
     .await
@@ -4370,6 +4374,7 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         0,
+        load_task(&url, task_id).await.attempt,
         TEST_FRONTIER,
     )
     .await
@@ -4783,6 +4788,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         2,
+        load_task(&url, task_id).await.attempt,
         TEST_FRONTIER,
     )
     .await
@@ -4832,6 +4838,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         CapabilityMissPhase::AfterHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         2,
+        load_task(&url, task2).await.attempt,
         TEST_FRONTIER,
     )
     .await

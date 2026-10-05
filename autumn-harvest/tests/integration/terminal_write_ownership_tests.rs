@@ -1227,3 +1227,70 @@ async fn a_release_from_a_stale_attempt_does_not_free_the_current_claim_1806() {
     .expect("release runs");
     assert!(released, "the current claim must still release");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1917: the capability-miss release must key on `attempt`
+// ---------------------------------------------------------------------------
+
+/// A capability-miss release from an earlier attempt must not re-pend a later
+/// claim of the same worker that has the same `crash_strikes` (issue #1917).
+///
+/// A workflow cycle reaches this release after its handler starts
+/// (`DuringHandler`, `AfterHandler`), so a stuck-running requeue can leave a
+/// stale cycle in flight. Each phase selects its own statement, so each one is
+/// checked.
+#[tokio::test]
+async fn a_capability_miss_release_from_a_stale_attempt_does_not_free_the_current_claim_1917() {
+    use autumn_harvest::error::CapabilityMissPhase;
+
+    let (url, _container) = setup_db().await;
+    for phase in [
+        CapabilityMissPhase::BeforeHandler,
+        CapabilityMissPhase::DuringHandler,
+        CapabilityMissPhase::AfterHandler,
+    ] {
+        let fx = reclaim_after_stuck_requeue(&url, "q1917-capmiss").await;
+        let mut conn = connect(&url).await;
+
+        let released = queue::release_task_for_capability_miss(
+            &mut conn,
+            fx.stale.id,
+            &fx.worker_id,
+            Duration::from_secs(1),
+            phase,
+            fx.stale.crash_strikes,
+            fx.stale.attempt,
+            "q1917-frontier",
+        )
+        .await
+        .expect("release runs");
+
+        assert_eq!(
+            released, None,
+            "{phase:?}: a stale release must not free the later claim"
+        );
+        let row = load_tasks(&url, fx.exec_id).await.remove(0);
+        assert_eq!(
+            (row.state.as_str(), row.worker_id.as_deref(), row.attempt),
+            ("RUNNING", Some(fx.worker_id.as_str()), fx.current.attempt),
+            "{phase:?}: the current claim must stay untouched"
+        );
+
+        let released = queue::release_task_for_capability_miss(
+            &mut conn,
+            fx.current.id,
+            &fx.worker_id,
+            Duration::from_secs(1),
+            phase,
+            fx.current.crash_strikes,
+            fx.current.attempt,
+            "q1917-frontier",
+        )
+        .await
+        .expect("release runs");
+        assert!(
+            released.is_some(),
+            "{phase:?}: the current claim must still release"
+        );
+    }
+}

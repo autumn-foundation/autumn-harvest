@@ -4526,6 +4526,7 @@ pub async fn release_task_for_capability_miss(
     backoff: StdDuration,
     phase: crate::error::CapabilityMissPhase,
     claim_crash_strikes: i32,
+    _claim_attempt: i32,
     frontier: &str,
 ) -> HarvestResult<Option<i32>> {
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
@@ -10866,6 +10867,25 @@ mod tests {
     /// this race is the thing that bumps it. The terminal escalation guard
     /// ([`claim_still_held_for_update`]) already keys on it for exactly
     /// this reason; the release is the far more common path and must match.
+    /// A stuck-running requeue keeps `crash_strikes`, and the same worker can
+    /// claim the row again. Only `attempt` tells the two claims apart
+    /// (issue #1917).
+    #[test]
+    fn capability_miss_release_is_guarded_on_the_claim_attempt() {
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            let sql = release_task_for_capability_miss_query(phase);
+            assert!(
+                sql.contains("AND attempt = $6"),
+                "{phase:?}: a stale release must not match a later claim of the \
+                 same worker with the same crash_strikes: {sql}",
+            );
+        }
+    }
+
     #[test]
     fn capability_miss_release_is_guarded_on_the_claim_epoch() {
         for phase in [
