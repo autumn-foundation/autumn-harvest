@@ -15705,6 +15705,109 @@ async fn defer_retry_for_budget(
     Ok(write == queue::ClaimWrite::Applied)
 }
 
+/// The prefix of the error a drain-released activity carries into its next
+/// attempt (issue #1813). `ActivityContext::previous_failure` reports it.
+const WORKER_SHUTDOWN_ERROR: &str = "worker shutdown";
+
+/// The handler error of an attempt that the drain cancelled before its
+/// first poll (issue #1813).
+const DRAIN_BEFORE_START_ERROR: &str = "the handler never started";
+
+/// Requeue an activity whose handler the drain cancelled and joined (issue
+/// #1813).
+///
+/// The retry is due at once. The attempt counts, so an old claim epoch never
+/// matches a later claim. The release skips the retry delay and the attempt
+/// cap, as orphan reclaim does. A deploy must not fail an activity. A lost
+/// claim is a no-op. An applied release counts one enqueued retry in the
+/// metrics, as the normal retry path does. When the handler was never
+/// polled, the release also refunds the attempt's rate-limit debit.
+async fn release_drained_activity(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    payload: &str,
+    activity_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    handler_started: bool,
+) -> HarvestResult<()> {
+    let claim = claim_of_task(task)?;
+    let message = crate::failure::parse_error_payload_full(payload).message;
+    let error = format!("{WORKER_SHUTDOWN_ERROR}: {message}");
+    let write =
+        queue::requeue_claimed_task_for_retry(conn, &claim, chrono::Duration::zero(), &error)
+            .await?;
+    if write == queue::ClaimWrite::Applied {
+        // The release enqueues a retry, as the normal retry path does.
+        metrics.record_activity_retried(activity_name, &task.queue_name);
+        tracing::info!(
+            task_id = %task.id,
+            worker_id = %claim.worker_id,
+            "drain released a cancelled activity for an immediate retry"
+        );
+    } else {
+        log_lease_lost(task, "drain release");
+    }
+    // No handler call used the rate-limit token, so give it back. As for an
+    // unstarted claim, the refund does not depend on the release.
+    if !handler_started
+        && let Some(key) = task.rate_limit_key.as_deref()
+        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
+    {
+        tracing::warn!(
+            task_id = %task.id,
+            rate_limit_key = %key,
+            %error,
+            "failed to refund the rate-limit token of an attempt that never started"
+        );
+    }
+    Ok(())
+}
+
+/// How a running activity's handler ended (issue #1813).
+struct ActivityRun {
+    result: Result<serde_json::Value, String>,
+    /// The drain cancelled the handler, and the handler then returned.
+    drained: bool,
+    /// The handler was polled. It is `false` when the drain cancel came
+    /// before the first poll, so the handler never ran.
+    started: bool,
+}
+
+/// Give a handler whose claim is no longer current its grace period to
+/// return, then drop it.
+async fn unwind_cancelled_activity(
+    activity_name: &str,
+    task_id: uuid::Uuid,
+    cancellation_grace_period: Duration,
+    activity_future: &mut (
+             dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + Unpin
+         ),
+    cancel: &CancellationToken,
+) -> Result<serde_json::Value, String> {
+    cancel.cancel();
+    tracing::info!(
+        task_id = %task_id,
+        activity = %activity_name,
+        grace_period_ms = %cancellation_grace_period.as_millis(),
+        "cancellation or lost lease detected for running activity; \
+         awaiting cooperative unwind"
+    );
+    tokio::time::timeout(cancellation_grace_period, activity_future)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                task_id = %task_id,
+                activity = %activity_name,
+                grace_period_ms = %cancellation_grace_period.as_millis(),
+                "activity ignored cancellation; hard-aborting handler"
+            );
+            Err(format!(
+                "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
+                cancellation_grace_period.as_millis()
+            ))
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_activity_future_with_cancellation(
     activity_name: &str,
@@ -15715,37 +15818,68 @@ async fn execute_activity_future_with_cancellation(
          ),
     mut cancellation_observer: impl std::future::Future<Output = ()> + Send + Unpin,
     cancel: tokio_util::sync::CancellationToken,
+    drain_cancel: &CancellationToken,
+    keep_alive: impl std::future::Future<Output = std::convert::Infallible> + Send,
     span: tracing::Span,
-) -> Result<serde_json::Value, String> {
+) -> ActivityRun {
     use tracing::Instrument;
+    let unwind = |activity_future| {
+        unwind_cancelled_activity(
+            activity_name,
+            task_id,
+            cancellation_grace_period,
+            activity_future,
+            &cancel,
+        )
+    };
+    // The setup can outlast the join window. The drain arm comes first, so
+    // a cancel that is already set wins before the handler's first poll. A
+    // handler that was never polled never starts. It then cannot begin a new
+    // side effect after the cancel point (issue #1813).
+    let polled = std::sync::atomic::AtomicBool::new(false);
+    let mut handler = std::future::poll_fn(|cx| {
+        polled.store(true, Ordering::Relaxed);
+        std::pin::Pin::new(&mut *activity_future).poll(cx)
+    });
     async {
         tokio::select! {
             biased;
-            result = &mut *activity_future => result,
-            () = &mut cancellation_observer => {
+            () = drain_cancel.cancelled() => {
                 cancel.cancel();
+                if !std::sync::atomic::AtomicBool::load(&polled, Ordering::Relaxed) {
+                    return ActivityRun {
+                        result: Err(DRAIN_BEFORE_START_ERROR.to_string()),
+                        drained: true,
+                        started: false,
+                    };
+                }
                 tracing::info!(
                     task_id = %task_id,
                     activity = %activity_name,
-                    grace_period_ms = %cancellation_grace_period.as_millis(),
-                    "cancellation or lost lease detected for running activity; \
-                     awaiting cooperative unwind"
+                    "drain deadline near; cancelling running activity"
                 );
-                tokio::time::timeout(cancellation_grace_period, activity_future)
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            activity = %activity_name,
-                            grace_period_ms = %cancellation_grace_period.as_millis(),
-                            "activity ignored cancellation; hard-aborting handler"
-                        );
-                        Err(format!(
-                            "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
-                            cancellation_grace_period.as_millis()
-                        ))
-                    })
+                // The drain never drops the handler. A handler that ignores
+                // the cancel keeps its claim and its task heartbeat (issue
+                // #1813).
+                let keep_alive = keep_alive;
+                tokio::pin!(keep_alive);
+                tokio::select! {
+                    biased;
+                    result = &mut handler => ActivityRun { result, drained: true, started: true },
+                    never = &mut keep_alive => match never {},
+                    () = &mut cancellation_observer => ActivityRun {
+                        result: unwind(&mut handler).await,
+                        drained: false,
+                        started: true,
+                    },
+                }
             }
+            result = &mut handler => ActivityRun { result, drained: false, started: true },
+            () = &mut cancellation_observer => ActivityRun {
+                result: unwind(&mut handler).await,
+                drained: false,
+                started: true,
+            },
         }
     }
     .instrument(span)
@@ -16482,6 +16616,7 @@ async fn process_activity_task(
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
     shutdown: &CancellationToken,
+    drain_cancel: &CancellationToken,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
@@ -16836,12 +16971,16 @@ async fn process_activity_task(
         .await;
     }
 
-    let cancel = CancellationToken::new();
+    // The context token is a child of the flusher token. A lost lease
+    // cancels both. A drain cancels the context alone, so a handler that
+    // ignores it keeps its heartbeat and its claim (issue #1813).
+    let heartbeat_stop = CancellationToken::new();
+    let cancel = heartbeat_stop.child_token();
     let activity_claim = claim_of_task(task)?;
     let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with(
         activity_claim.clone(),
         pool.clone(),
-        cancel.clone(),
+        heartbeat_stop.clone(),
         crate::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: crate::pool::acquire_bound(pool),
             metrics: Arc::clone(&registry.telemetry().metrics),
@@ -17056,7 +17195,7 @@ async fn process_activity_task(
     // inside a closure argument, which is markedly harder to read than the match.
     #[cfg(feature = "wasm-activities")]
     #[allow(clippy::option_if_let_else)]
-    let constructed = match wasm_dispatch {
+    let construct = || match wasm_dispatch {
         Some(dispatch) => crate::error::catch_construct(|| {
             crate::interceptor::dispatch_with_interceptors(
                 activity_interceptors,
@@ -17109,43 +17248,52 @@ async fn process_activity_task(
     };
 
     #[cfg(not(feature = "wasm-activities"))]
-    let constructed = crate::error::catch_construct(|| {
-        crate::interceptor::dispatch_with_interceptors(
-            activity_interceptors,
-            &invocation,
-            &ctx,
-            task.input.clone(),
-            |input| (activity_handler)(&ctx, input),
-        )
-    });
+    let construct = || {
+        crate::error::catch_construct(|| {
+            crate::interceptor::dispatch_with_interceptors(
+                activity_interceptors,
+                &invocation,
+                &ctx,
+                task.input.clone(),
+                |input| (activity_handler)(&ctx, input),
+            )
+        })
+    };
 
-    let mut activity_future = {
+    // The handler is built at the first poll, after the drain check in
+    // `execute_activity_future_with_cancellation` (issue #1813). A
+    // hand-written handler can do synchronous work while it builds its
+    // future. That work must not run after the drain cancel either.
+    let mut activity_future = Box::pin(async {
         use futures::FutureExt as _;
-        match constructed {
+        match construct() {
             Ok(fut) => std::panic::AssertUnwindSafe(fut)
                 .catch_unwind()
-                .map(|caught| match caught {
-                    Ok(inner) => inner,
-                    Err(panic_payload) => Err(handler_panic_activity_envelope(
+                .await
+                .unwrap_or_else(|panic_payload| {
+                    Err(handler_panic_activity_envelope(
                         crate::error::panic_message(panic_payload),
-                    )),
-                })
-                .left_future(),
-            Err(message) => {
-                futures::future::ready(Err(handler_panic_activity_envelope(message))).right_future()
-            }
+                    ))
+                }),
+            Err(message) => Err(handler_panic_activity_envelope(message)),
         }
-    };
+    });
     let cancellation_observer = observe_task_cancellation(pool, &activity_claim);
     tokio::pin!(cancellation_observer);
 
-    let activity_result = execute_activity_future_with_cancellation(
+    let ActivityRun {
+        result: activity_result,
+        drained,
+        started,
+    } = execute_activity_future_with_cancellation(
         activity_name,
         task.id,
         cancellation_grace_period,
         &mut activity_future,
         cancellation_observer,
         cancel.clone(),
+        drain_cancel,
+        ctx.keep_alive_after_drain(),
         span,
     )
     .await;
@@ -17153,7 +17301,7 @@ async fn process_activity_task(
     // token when the workflow/task is cancelled mid-flight. A cancellation is
     // not evidence the downstream is unhealthy, so it must not count toward the
     // circuit breaker (issue #369 review). Captured before the unconditional
-    // `cancel.cancel()` below.
+    // `heartbeat_stop.cancel()` below.
     let was_cancelled = cancel.is_cancelled();
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
@@ -17241,7 +17389,7 @@ async fn process_activity_task(
             .metrics
             .record_activity_failed(activity_name, "", error_type, *non_retryable);
     }
-    cancel.cancel();
+    heartbeat_stop.cancel();
     drop(activity_future);
 
     // Finalization phase. The handler already ran, so a short pool incident
@@ -17348,6 +17496,26 @@ async fn process_activity_task(
         &task.queue_name,
         &activity_result,
     );
+    // The drain cancelled the handler, and it returned a retryable error.
+    // The handler is gone, so no peer can run beside it. Give the claim back
+    // for an immediate retry (issue #1813). A non-retryable error takes the
+    // normal path below. A handler that never started always goes back: a
+    // retry policy must not fail an activity that never ran.
+    if drained
+        && let Err(payload) = &activity_result
+        && (!started || !failure_is_non_retryable(payload, retry_policy.as_ref()))
+    {
+        let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
+        return release_drained_activity(
+            &mut conn,
+            task,
+            payload,
+            activity_name,
+            registry.telemetry().metrics.as_ref(),
+            started,
+        )
+        .await;
+    }
     let attempt = ActivityAttempt {
         task,
         exec_id,
@@ -25082,6 +25250,8 @@ async fn process_task(
     // capability-miss cleanup below. `None` on the activity path (never bounded
     // by it) and when `workflow_task_timeout` is zero.
     workflow_body_timeout: Option<Duration>,
+    // Issue #1813: the drain's cancel for running activities.
+    drain_cancel: &CancellationToken,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Issue #804 (Codex round-22 P2): the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
@@ -25147,6 +25317,7 @@ async fn process_task(
                 max_concurrent_sessions,
                 session_slots_in_use,
                 shutdown,
+                drain_cancel,
             )
             .await;
             // Acquire only if we actually need to act on a capability miss or
@@ -25467,16 +25638,27 @@ async fn read_live_fleet_or_degrade(
 /// on ownership would stop at `T-2` — a permanent leak on a `refill_rate = 0`
 /// bucket, and the direction that starves the capable peer.
 ///
-/// The refund is safe to make unconditional because it is exactly one refund
-/// per claim-time debit: `claim_task` debits every rate-limited claim it grants
-/// (bar the breaker-tracked ones, unreachable here — see above), this is the
-/// only site that returns a claim-time debit, and it runs once per dispatch. No
-/// other path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
+/// The refund is safe to make unconditional because each claim-time debit
+/// gets at most one refund. `claim_task` debits every rate-limited claim it
+/// grants (bar the breaker-tracked ones, unreachable here — see above). Four
+/// sites return a claim-time debit: this one and the three named below. Each
+/// runs at most once per dispatch, and no two share a dispatch. No other
+/// path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
 /// second credit for one debit cannot arise.
 ///
 /// A retry-budget deferral (issue #1793) also refunds a claim-time debit. It
 /// runs only after the handler lookup succeeds, so it never shares a dispatch
 /// with a capability miss.
+///
+/// A drain release of a task that never started (issue #1813) also refunds.
+/// It ends the dispatch before the handler lookup, so it never shares a
+/// dispatch with a capability miss either.
+///
+/// A drain release of an attempt whose handler was never polled (issue
+/// #1813) also refunds. That debit is a claim-time one, or the dispatch-time
+/// one of a breaker-tracked activity. The release ends the dispatch before
+/// the result path, so it never shares a dispatch with a retry-budget
+/// deferral or with the sites above.
 ///
 /// Pinned by `stale_dispatcher_refund_leaves_one_debit_for_the_live_claim` in
 /// `capability_miss_tests`, which drives the exact interleaving above and
@@ -27759,6 +27941,11 @@ pub struct Worker {
     monitoring_started: std::sync::atomic::AtomicBool,
     /// Cancellation token for graceful shutdown.
     shutdown: CancellationToken,
+    /// Fired by the drain one join window before its deadline (issue
+    /// #1813). Each running activity then sees its context cancelled.
+    drain_cancel: CancellationToken,
+    /// Every dispatch body and its claim (issue #1813).
+    dispatched: Dispatched,
     /// Set (and refreshed on every heartbeat) by the heartbeat task while the
     /// worker is draining.  Holds the absolute deadline from the operator's
     /// `drain_deadline_at` so that `drain_in_flight` can honour an extended
@@ -28945,6 +29132,187 @@ impl Drop for DispatchReservation {
     }
 }
 
+/// One claim of this worker instance: task id, `attempt` and `started_at`.
+///
+/// `attempt` alone does not identify a claim. A release of an unstarted
+/// claim restores it, so a later claim can reuse it. Each claim writes a new
+/// `started_at` (issue #1813).
+type ClaimKey = (uuid::Uuid, i32, chrono::DateTime<chrono::Utc>);
+
+/// The claims of this worker instance (issue #1813).
+#[derive(Debug, Default)]
+struct ClaimSets {
+    /// The claim of each dispatch body that still runs.
+    live: std::collections::HashSet<ClaimKey>,
+    /// The claim of each body that ended after shutdown began. Only these
+    /// can be abandoned claims of this instance. A replacement worker with
+    /// the same id never has a claim here.
+    ended: std::collections::HashSet<ClaimKey>,
+    /// The claim of each live body that the drain already gave back. Such a
+    /// claim never joins `ended`. Its release can restore `attempt`, so a
+    /// later claim may reuse the epoch.
+    settled: std::collections::HashSet<ClaimKey>,
+}
+
+/// Mark the claim `key` as given back by its own body (issue #1813).
+fn settle_claim(claims: &LiveClaims, key: Option<ClaimKey>) {
+    if let Some(key) = key {
+        claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .settled
+            .insert(key);
+    }
+}
+
+/// The claims of this worker instance, shared with its dispatch bodies.
+type LiveClaims = Arc<std::sync::Mutex<ClaimSets>>;
+
+/// The dispatch bodies of a worker (issue #1813).
+#[derive(Debug, Default)]
+struct Dispatched {
+    /// Every dispatch body. The drain waits for it, so a body that releases
+    /// a claim with no permit still counts as in flight.
+    tracker: tokio_util::task::TaskTracker,
+    /// The claims of this instance. The lease keeper gives back each claim
+    /// whose body ended but whose row is still `RUNNING`.
+    live: LiveClaims,
+}
+
+/// Marks one claim live until its dispatch body ends (issue #1813).
+///
+/// A body that ends after shutdown began moves its claim to the ended set.
+/// The set then holds only the claims of the drain, so it stays small.
+struct LiveClaim {
+    claims: LiveClaims,
+    /// `None` for a claim with no `started_at`. The keeper never releases
+    /// such a claim.
+    key: Option<ClaimKey>,
+    shutdown: CancellationToken,
+}
+
+impl LiveClaim {
+    fn new(claims: &LiveClaims, key: Option<ClaimKey>, shutdown: &CancellationToken) -> Self {
+        if let Some(key) = key {
+            claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .live
+                .insert(key);
+        }
+        Self {
+            claims: Arc::clone(claims),
+            key,
+            shutdown: shutdown.clone(),
+        }
+    }
+}
+
+impl Drop for LiveClaim {
+    fn drop(&mut self) {
+        let Some(key) = self.key else {
+            return;
+        };
+        let mut claims = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claims.live.remove(&key);
+        let settled = claims.settled.remove(&key);
+        if self.shutdown.is_cancelled() && !settled {
+            claims.ended.insert(key);
+        }
+    }
+}
+
+/// What a dispatch needs to give back a claim it never started (issue #1813).
+struct UnstartedClaim {
+    claim: Option<queue::TaskClaim>,
+    /// The bucket the claim debited a rate-limit token from, if any.
+    refund_key: Option<String>,
+    /// The worker's claim sets and this claim's key. A release marks the
+    /// claim settled, so the lease keeper never counts it as abandoned.
+    claims: LiveClaims,
+    key: Option<ClaimKey>,
+}
+
+impl UnstartedClaim {
+    fn of(task: &TaskQueueItem, registry: &HandlerRegistry, claims: &LiveClaims) -> Self {
+        // A breaker-tracked activity takes no claim-time debit (issue #369).
+        let debited = !task
+            .activity_name
+            .as_deref()
+            .is_some_and(|name| registry.circuit_breakers().has_policy(name));
+        Self {
+            claim: queue::TaskClaim::of(task),
+            refund_key: task.rate_limit_key.clone().filter(|_| debited),
+            claims: Arc::clone(claims),
+            key: task
+                .started_at
+                .map(|started_at| (task.id, task.attempt, started_at)),
+        }
+    }
+
+    /// Release the claim and refund its rate-limit debit.
+    ///
+    /// The refund does not depend on the release. A lost claim still leaves
+    /// this dispatch's debit stranded. See
+    /// [`refund_capability_miss_rate_limit_token`].
+    ///
+    /// The acquire retries as a result write does, so a short pool incident
+    /// does not drop the release or the refund. The body stays live
+    /// meanwhile, so the lease keeper does not release this claim too.
+    async fn release(self, pool: &DbPool) {
+        let Some(claim) = self.claim else {
+            return;
+        };
+        let mut conn =
+            match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = %claim.task_id,
+                        %error,
+                        "no connection to release a claim that never started; the lease recovers it"
+                    );
+                    return;
+                }
+            };
+        match queue::release_unstarted_claim(&mut conn, &claim).await {
+            Ok(queue::ClaimWrite::Applied) => {
+                settle_claim(&self.claims, self.key);
+                tracing::info!(
+                    task_id = %claim.task_id,
+                    worker_id = %claim.worker_id,
+                    "shutdown released a claimed task that never started"
+                );
+            }
+            Ok(queue::ClaimWrite::LeaseLost) => {
+                settle_claim(&self.claims, self.key);
+                tracing::debug!(
+                    task_id = %claim.task_id,
+                    "a claim that never started was already lost"
+                );
+            }
+            Err(error) => tracing::warn!(
+                task_id = %claim.task_id,
+                %error,
+                "failed to release a claim that never started; the lease recovers it"
+            ),
+        }
+        if let Some(key) = self.refund_key.as_deref()
+            && let Err(error) = queue::refund_rate_limit_token(&mut conn, key).await
+        {
+            tracing::warn!(
+                task_id = %claim.task_id,
+                rate_limit_key = %key,
+                %error,
+                "failed to refund the rate-limit token of a claim that never started"
+            );
+        }
+    }
+}
+
 /// Owns a task handle and aborts the task when dropped (issue #1552).
 ///
 /// A bare `JoinHandle` detaches its task on drop. Cancelling the future that
@@ -29464,12 +29832,12 @@ impl Worker {
             gate_refused: Arc::new(GateRefused::default()),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
+            drain_cancel: CancellationToken::new(),
+            dispatched: Dispatched::default(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
-            workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            workflow_task_timeout_strikes: Arc::default(),
             workflow_panic_strikes: Arc::default(),
             workflow_deadlock_strikes: Arc::default(),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
@@ -30109,18 +30477,9 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
-        // Draining: transition status on every shard pool. Bounded (issue
-        // #1209): sequential visits mean one exhausted shard pool would
-        // otherwise park this loop and never reach its peers.
+        // Bounded (issue #1209): the shutdown writes visit the shards one by
+        // one, so one exhausted shard pool must not park the others' writes.
         let shutdown_acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
-        for (_, shard_pool) in &shard_targets {
-            self.transition_fleet_status(
-                shard_pool,
-                crate::workers::WorkerStatus::Draining,
-                shutdown_acquire_bound,
-            )
-            .await;
-        }
         self.drain_releasing_sticky_pins(&shard_targets, shutdown_acquire_bound)
             .await;
 
@@ -30576,18 +30935,22 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
-        // Transition to Draining before waiting for in-flight tasks. `None`:
-        // the single-shard path has no peer to strand, so it uses the pool's
-        // own bound (issue #1788).
-        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
-            .await;
-
-        // This worker claims no new task now. Release its pins before the
-        // drain, so a wake during the drain does not re-arm them.
-        self.release_sticky_pins(pool, None).await;
-
+        // Mark the worker Draining and release its pins while the drain
+        // runs. `None`: the single-shard path has no peer to strand, so it
+        // uses the pool's own bound (issue #1788). This worker claims no new
+        // task now, so a wake during the drain does not re-arm a pin.
+        //
+        // The drain starts at once, so its deadline and cancel point count
+        // from the signal. A slow pool cannot spend the grace period on
+        // this bookkeeping first (issue #1813).
+        let bookkeeping = async {
+            self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
+                .await;
+            self.release_sticky_pins(pool, None).await;
+        };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
-        self.drain_in_flight().await;
+        tokio::join!(bookkeeping, self.drain_in_flight());
+        self.keep_lease_while_handlers_run(vec![pool.clone()]);
 
         // A decision that parked during the drain pinned its task again.
         // Release once more. A task that outlived the drain keeps its pin.
@@ -32744,22 +33107,40 @@ impl Worker {
     }
 
     /// Drain in-flight tasks of a multi-shard worker, with a sticky-pin
-    /// release on every shard pool before and after the drain (issue #1798).
+    /// release on every shard pool at drain start and after the drain (issue
+    /// #1798).
     ///
     /// The first release stops a wake during the drain from re-arming a pin.
     /// A decision that parks during the drain pins its task again, so the
     /// second release clears that pin. A task that outlives the drain keeps
     /// its pin.
+    ///
+    /// The Draining writes and the first release run while the drain runs.
+    /// The drain deadline and cancel point then count from the signal, and
+    /// slow shard pools cannot spend the grace period first (issue #1813).
     async fn drain_releasing_sticky_pins(
         &self,
         shard_targets: &[(crate::types::ShardId, DbPool)],
         acquire_bound: Option<Duration>,
     ) {
-        for (_, shard_pool) in shard_targets {
-            self.release_sticky_pins(shard_pool, acquire_bound).await;
-        }
+        let bookkeeping = async {
+            for (_, shard_pool) in shard_targets {
+                self.transition_fleet_status(
+                    shard_pool,
+                    crate::workers::WorkerStatus::Draining,
+                    acquire_bound,
+                )
+                .await;
+            }
+            for (_, shard_pool) in shard_targets {
+                self.release_sticky_pins(shard_pool, acquire_bound).await;
+            }
+        };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
-        self.drain_in_flight().await;
+        tokio::join!(bookkeeping, self.drain_in_flight());
+        self.keep_lease_while_handlers_run(
+            shard_targets.iter().map(|(_, pool)| pool.clone()).collect(),
+        );
         for (_, shard_pool) in shard_targets {
             self.release_sticky_pins(shard_pool, acquire_bound).await;
         }
@@ -33132,6 +33513,9 @@ impl Worker {
         // untouched, since being stuck is not a crash, so it needs its own
         // discriminator. See `reset_timed_out_workflow_task`'s doc comment.
         let claim_attempt = task.attempt;
+        // With `attempt`, it names this claim for the lease keeper (issue
+        // #1813). See `ClaimKey`.
+        let claim_started_at = task.started_at;
         let worker_id = self.config.worker_id.clone();
         let build_id = self.config.build_id.clone();
         let cancellation_grace_period = self.config.cancellation_grace_period;
@@ -33185,7 +33569,10 @@ impl Worker {
         // inside a dispatch buffering scope (issue #1312). Binding keeps the
         // body at the same nesting, so this change adds no reindentation to
         // the hottest file in the repo.
+        let drain_cancel = self.drain_cancel.clone();
+        let unstarted = UnstartedClaim::of(&task, &self.registry, &self.dispatched.live);
         let task_body = async move {
+            chaos_point!(WORKER_DISPATCH_BEFORE_START);
             // Acquire semaphore permit — blocks if at concurrency limit. A
             // poll-path claim already holds one (issue #1787).
             // The release wakes a saturated poll loop (issue #1787).
@@ -33193,11 +33580,23 @@ impl Worker {
                 if let Some(permit) = held_permit {
                     permit
                 } else {
-                    let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
-                        tracing::error!(task_id = %task_id, "semaphore closed");
-                        return;
+                    // Shutdown ends the wait (issue #1813).
+                    let acquired = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => None,
+                        acquired = Arc::clone(&semaphore).acquire_owned() => Some(acquired),
                     };
-                    permit
+                    match acquired {
+                        Some(Ok(permit)) => permit,
+                        Some(Err(_)) => {
+                            tracing::error!(task_id = %task_id, "semaphore closed");
+                            return;
+                        }
+                        None => {
+                            unstarted.release(&pool).await;
+                            return;
+                        }
+                    }
                 },
                 &capacity_freed,
             );
@@ -33205,6 +33604,12 @@ impl Worker {
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
             drop(reservation);
+            // A task that has not started when shutdown begins gives its
+            // claim back, so a peer runs it at once (issue #1813).
+            if shutdown.is_cancelled() {
+                unstarted.release(&pool).await;
+                return;
+            }
 
             // Feed the adaptive slot tuner's permit-wait signal (issue #548).
             // A lock-free fetch_max so concurrent dispatches never contend;
@@ -33271,6 +33676,7 @@ impl Worker {
                     workflow_task_deadline,
                     capability_miss_policy,
                     Some(workflow_task_timeout),
+                    &drain_cancel,
                 )
                 .await
                 {
@@ -33509,6 +33915,7 @@ impl Worker {
                     // Same reason: this arm is the "no timeout configured, or
                     // not a workflow task" path, which was never wrapped.
                     None,
+                    &drain_cancel,
                 )
                 .await
                 {
@@ -33553,7 +33960,14 @@ impl Worker {
         // not the live slot (issue #1431). Another runtime can replace the
         // slot after this worker starts.
         let bound_channel = self.bound_channel();
-        tokio::spawn(async move {
+        let live = LiveClaim::new(
+            &self.dispatched.live,
+            claim_started_at.map(|started_at| (task_id, claim_attempt, started_at)),
+            &self.shutdown,
+        );
+        // The tracker keeps the body's handle for the drain (issue #1813).
+        self.dispatched.tracker.spawn(async move {
+            let _live = live;
             // Every hint this task raises waits in the scope until the
             // transaction that raised it commits and a flush point publishes
             // it. This is the catch-all for a hint no flush point reached.
@@ -33579,14 +33993,20 @@ impl Worker {
 
     /// Wait for all in-flight tasks to finish (or the drain deadline expires).
     ///
-    /// We wait until all semaphore permits are available again, meaning all
-    /// spawned tasks have completed and dropped their permits.
+    /// The drain waits until every dispatch body ends and every semaphore
+    /// permit is free again.
     ///
     /// The deadline is read from `remote_drain_deadline` (set by the heartbeat
     /// task) rather than being snapshotted once.  The heartbeat task refreshes
     /// that cell on every tick while draining, so an operator-extended deadline
     /// (via a second POST .../drain with a later `deadline_at`) is picked up
     /// here without restarting the worker.
+    ///
+    /// One join window before the deadline, the drain cancels running
+    /// activities (issue #1813). See [`drain_cancel_at`]. A handler that
+    /// returns a retryable error gives its claim back. A handler that ignores
+    /// the cancel keeps its claim past the deadline. See
+    /// [`Self::keep_lease_while_handlers_run`].
     async fn drain_in_flight(&self) {
         // Uses the actual permit count behind each semaphore (issue #548):
         // equal to `config.max_concurrent_*` when no slot tuner is
@@ -33598,7 +34018,8 @@ impl Worker {
 
         // Fixed fallback for local (non-remote) shutdowns: computed once so that
         // the 1-second tick in the loop cannot keep sliding it forward.
-        let local_deadline = tokio::time::Instant::now() + self.config.shutdown_timeout;
+        let started = tokio::time::Instant::now();
+        let local_deadline = started + self.config.shutdown_timeout;
 
         // Returns the current deadline: remote (refreshable) when set, otherwise
         // the fixed local_deadline computed above.
@@ -33609,11 +34030,21 @@ impl Worker {
                 .and_then(|g| *g)
                 .map_or(local_deadline, tokio::time::Instant::from_std)
         };
+        let cancel_at =
+            |deadline| drain_cancel_at(started, deadline, self.config.cancellation_grace_period);
 
-        let sleep = tokio::time::sleep_until(snapshot_deadline());
+        let deadline = snapshot_deadline();
+        let sleep = tokio::time::sleep_until(deadline);
         tokio::pin!(sleep);
+        let cancel_sleep = tokio::time::sleep_until(cancel_at(deadline));
+        tokio::pin!(cancel_sleep);
 
+        // No body starts after this point, so the tracker can close.
+        self.dispatched.tracker.close();
         let drain = async {
+            // Every dispatch body has ended, including one that gives back a
+            // claim with no permit (issue #1813).
+            self.dispatched.tracker.wait().await;
             // Try to acquire ALL permits — when we can, all in-flight tasks are done.
             let _wf = self
                 .workflow_semaphore
@@ -33645,18 +34076,142 @@ impl Worker {
             tokio::select! {
                 biased;
                 () = &mut drain => return,
+                // Before the deadline arm, so a past deadline still cancels.
+                () = &mut cancel_sleep, if !self.drain_cancel.is_cancelled() => {
+                    tracing::info!(
+                        worker_id = %self.config.worker_id,
+                        "drain deadline near; cancelling running activities"
+                    );
+                    self.drain_cancel.cancel();
+                }
                 () = &mut sleep => {
                     tracing::warn!(
                         worker_id = %self.config.worker_id,
                         total_permits,
-                        "shutdown timeout elapsed — some tasks may still be running"
+                        "shutdown timeout elapsed — some tasks may still be running; \
+                         their claims stay held until each handler returns"
                     );
                     return;
                 }
                 _ = check.tick() => {
-                    sleep.as_mut().reset(snapshot_deadline());
+                    let deadline = snapshot_deadline();
+                    sleep.as_mut().reset(deadline);
+                    cancel_sleep.as_mut().reset(cancel_at(deadline));
                 }
             }
+        }
+    }
+
+    /// Keep this worker's lease alive while a drained handler still runs
+    /// (issue #1813).
+    ///
+    /// The drain keeps the claim of a handler that ignores the cancel. Orphan
+    /// reclaim judges that claim by the worker heartbeat alone. A host process
+    /// can outlive `run`, as an embedded runtime does. Without this keeper, a
+    /// peer would then start a second copy while the first one still runs.
+    ///
+    /// One keeper task for each pool refreshes `last_heartbeat_at`. A stalled
+    /// shard pool therefore cannot stop the refresh of another shard. Each
+    /// refresh has its own limit, from [`lease_refresh_bound`]. A failed
+    /// refresh retries at once, see [`next_lease_refresh`]. A slow pool
+    /// therefore cannot let the lease expire.
+    ///
+    /// The kept lease would also hide a claim that no body holds. So each
+    /// refresh gives such claims back through [`release_abandoned_claims`].
+    /// Each keeper stops when the last dispatch body ends. It also stops when
+    /// the process exits, and orphan reclaim then recovers the task.
+    ///
+    /// The lease therefore lasts only while a claim of this instance is
+    /// current. A body whose claim is lost, for example to `start_to_close`,
+    /// drops its handler after the grace period, see
+    /// [`observe_task_cancellation`]. Two live instances with the same worker
+    /// id share one lease row, so each hides the other while both run. That
+    /// is true of the normal heartbeat too.
+    fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
+        let interval = keeper_interval(self.config.worker_heartbeat_interval);
+        if self.dispatched.tracker.is_empty() {
+            // Every body ended in the drain. One of them can still have left
+            // its claim `RUNNING` after a failed write, so sweep anyway.
+            for pool in pools {
+                let worker_id = self.config.worker_id.clone();
+                let live_claims = Arc::clone(&self.dispatched.live);
+                tokio::spawn(async move {
+                    final_abandoned_claim_sweep(&pool, &worker_id, &live_claims, interval).await;
+                });
+            }
+            return;
+        }
+        tracing::warn!(
+            worker_id = %self.config.worker_id,
+            running = self.dispatched.tracker.len(),
+            "drain ended with handlers still running; the worker keeps its lease until they return"
+        );
+        let bound = lease_refresh_bound(interval);
+        // One task for each pool, so a stalled shard pool cannot stop the
+        // refresh of another shard. Detached on purpose: the handlers they
+        // guard are detached too.
+        for pool in pools {
+            let dispatched = self.dispatched.tracker.clone();
+            let worker_id = self.config.worker_id.clone();
+            let live_claims = Arc::clone(&self.dispatched.live);
+            let host = crate::workers::local_hostname();
+            tokio::spawn(async move {
+                let done = dispatched.wait();
+                tokio::pin!(done);
+                let mut next = tokio::time::Instant::now();
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = &mut done => {
+                            // The last body can end with a failed write. Its
+                            // claim joins the ended set as the tracker empties.
+                            // A replacement worker with the same id can keep
+                            // the row fresh, so orphan reclaim may never take
+                            // that claim. Sweep until it succeeds.
+                            final_abandoned_claim_sweep(&pool, &worker_id, &live_claims, interval)
+                                .await;
+                            return;
+                        }
+                        () = tokio::time::sleep_until(next) => {
+                            let touched = tokio::time::timeout(bound, async {
+                                let mut conn = crate::pool::acquire(&pool, bound).await?;
+                                let touched =
+                                    crate::workers::touch_worker_liveness(&mut conn, &worker_id)
+                                        .await?;
+                                // A shutdown heartbeat does not re-register a
+                                // missing row. Without one, orphan reclaim
+                                // sees no worker.
+                                if touched == 0 {
+                                    crate::workers::restore_stopped_worker_row(
+                                        &mut conn, &worker_id, &host,
+                                    )
+                                    .await?;
+                                }
+                                // The kept lease hides every claim of this
+                                // worker from orphan reclaim. So give back
+                                // each claim that no body holds.
+                                release_abandoned_claims(&mut conn, &worker_id, &live_claims)
+                                    .await
+                            })
+                            .await;
+                            let error = match touched {
+                                Ok(Ok(_)) => None,
+                                Ok(Err(error)) => Some(error.to_string()),
+                                Err(_elapsed) => Some(format!("timed out after {bound:?}")),
+                            };
+                            next = tokio::time::Instant::now()
+                                + next_lease_refresh(interval, error.is_none());
+                            if let Some(error) = error {
+                                tracing::warn!(
+                                    worker_id = %worker_id,
+                                    %error,
+                                    "failed to keep the worker lease for a drained handler"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -33674,6 +34229,147 @@ impl Worker {
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+}
+
+/// The instant at which a drain cancels its running activities (issue #1813).
+///
+/// It is `join_window` before `deadline`, capped at half the drain. At least
+/// half the drain then lets tasks finish on their own. The result is never
+/// before `started`.
+fn drain_cancel_at(
+    started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    join_window: Duration,
+) -> tokio::time::Instant {
+    let drain = deadline.saturating_duration_since(started);
+    deadline
+        .checked_sub(join_window.min(drain / 2))
+        .map_or(started, |at| at.max(started))
+}
+
+/// The interval the lease keeper works to (issue #1813).
+///
+/// It is half the stale window that orphan reclaim applies, see
+/// [`worker_stale_secs`]. That window is at least one second, so the result
+/// is at least 500 ms, even for a tiny configured heartbeat interval. A zero
+/// interval would give a zero refresh bound and a hot retry loop.
+fn keeper_interval(heartbeat_interval: Duration) -> Duration {
+    let stale_secs = u64::try_from(worker_stale_secs(heartbeat_interval)).unwrap_or(1);
+    Duration::from_secs(stale_secs) / 2
+}
+
+/// The time limit for one lease refresh after a drain (issue #1813).
+///
+/// Orphan reclaim sees a worker as dead after two heartbeat intervals. A
+/// refresh starts one interval after the last one. It must therefore end
+/// within the next interval, with a margin. The pool acquire bound can be 30
+/// seconds, so it cannot serve as this limit.
+fn lease_refresh_bound(heartbeat_interval: Duration) -> Duration {
+    heartbeat_interval / 2
+}
+
+/// The wait before the next lease refresh after a drain (issue #1813).
+///
+/// A success waits half a heartbeat interval. A failure retries after
+/// [`crate::pool::ZERO_WAIT_RETRY_SPACING`]. Several tries then fit inside
+/// the stale window after the last success, even when each try runs to its
+/// [`lease_refresh_bound`].
+fn next_lease_refresh(heartbeat_interval: Duration, refreshed: bool) -> Duration {
+    if refreshed {
+        heartbeat_interval / 2
+    } else {
+        crate::pool::ZERO_WAIT_RETRY_SPACING.min(heartbeat_interval / 2)
+    }
+}
+
+/// Run the abandoned-claim sweep after the last body ends, until it succeeds
+/// (issue #1813).
+///
+/// It skips the database when no claim is in the ended set, which is the
+/// usual case. A failed try retries after half a heartbeat interval. Only
+/// the first failure is logged.
+async fn final_abandoned_claim_sweep(
+    pool: &DbPool,
+    worker_id: &str,
+    claims: &LiveClaims,
+    heartbeat_interval: Duration,
+) {
+    let bound = lease_refresh_bound(heartbeat_interval);
+    let mut warned = false;
+    loop {
+        let pending = !claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ended
+            .is_empty();
+        if !pending {
+            return;
+        }
+        let swept = tokio::time::timeout(bound, async {
+            let mut conn = crate::pool::acquire(pool, bound).await?;
+            release_abandoned_claims(&mut conn, worker_id, claims).await
+        })
+        .await;
+        if matches!(swept, Ok(Ok(_))) {
+            return;
+        }
+        if !warned {
+            warned = true;
+            tracing::warn!(
+                worker_id = %worker_id,
+                "the final sweep of abandoned claims failed; retrying"
+            );
+        }
+        tokio::time::sleep(next_lease_refresh(heartbeat_interval, true)).await;
+    }
+}
+
+/// Give back each claim that this instance abandoned in the drain (issue
+/// #1813).
+///
+/// A failed release or result write leaves such a claim `RUNNING`. Orphan
+/// reclaim recovers it only when the worker lease lapses. The lease keeper
+/// holds the lease, so it gives these claims back itself.
+///
+/// Only a claim in the ended set qualifies. Its body ended, so no handler
+/// runs it. A replacement worker with the same id has another `started_at`
+/// on each claim, so this never touches its claims.
+async fn release_abandoned_claims(
+    conn: &mut diesel_async::AsyncPgConnection,
+    worker_id: &str,
+    claims: &LiveClaims,
+) -> HarvestResult<usize> {
+    let mut released = 0;
+    for (claim, started_at) in queue::running_claims_of_worker(conn, worker_id).await? {
+        let Some(started_at) = started_at else {
+            continue;
+        };
+        let key = (claim.task_id, claim.attempt, started_at);
+        let abandoned = claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ended
+            .contains(&key);
+        if !abandoned {
+            continue;
+        }
+        if queue::release_abandoned_claim(conn, &claim, started_at).await?
+            == queue::ClaimWrite::Applied
+        {
+            tracing::warn!(
+                task_id = %claim.task_id,
+                worker_id = %worker_id,
+                "the lease keeper gave back a claim that no handler holds"
+            );
+            released += 1;
+        }
+        claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ended
+            .remove(&key);
+    }
+    Ok(released)
 }
 
 // ---------------------------------------------------------------------------
@@ -38178,6 +38874,166 @@ mod tests {
         worker.shutdown();
         assert!(worker.shutdown.is_cancelled());
         Ok(())
+    }
+
+    /// The drain cancels running activities one join window before its
+    /// deadline (issue #1813).
+    #[test]
+    fn drain_cancel_at_leaves_the_join_window_before_the_deadline() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(25);
+        assert_eq!(
+            drain_cancel_at(start, deadline, Duration::from_secs(5)),
+            start + Duration::from_secs(20),
+        );
+    }
+
+    /// A short drain keeps at least half of its budget for tasks to finish.
+    #[test]
+    fn drain_cancel_at_caps_the_join_window_at_half_the_drain() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(2);
+        assert_eq!(
+            drain_cancel_at(start, deadline, Duration::from_secs(5)),
+            start + Duration::from_secs(1),
+        );
+    }
+
+    /// A remote deadline in the past cancels at once.
+    #[test]
+    fn drain_cancel_at_is_never_before_the_drain_started() {
+        let start = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = start - Duration::from_secs(3);
+        assert_eq!(
+            drain_cancel_at(start, deadline, Duration::from_secs(5)),
+            start
+        );
+    }
+
+    /// A lease refresh ends well inside the stale window, also on a stalled
+    /// pool (issue #1813).
+    #[test]
+    fn lease_refresh_bound_ends_inside_the_stale_window() {
+        for interval in [Duration::from_secs(1), Duration::from_secs(5)] {
+            let bound = lease_refresh_bound(interval);
+            assert!(bound < interval);
+            assert!(interval + bound < interval * 2);
+        }
+    }
+
+    /// A claim joins the ended set only when its body ends after shutdown
+    /// began (issue #1813).
+    #[test]
+    fn live_claim_marks_a_claim_ended_only_after_shutdown() {
+        let claims = LiveClaims::default();
+        let shutdown = CancellationToken::new();
+        let task = uuid::Uuid::new_v4();
+        let at = chrono::Utc::now();
+        drop(LiveClaim::new(&claims, Some((task, 1, at)), &shutdown));
+        let held = LiveClaim::new(&claims, Some((task, 2, at)), &shutdown);
+        let snapshot = || {
+            let sets = claims.lock().expect("lock");
+            (sets.live.clone(), sets.ended.clone())
+        };
+        let (live, ended) = snapshot();
+        assert!(live.contains(&(task, 2, at)));
+        assert!(ended.is_empty(), "a body before shutdown is not abandoned");
+        shutdown.cancel();
+        drop(held);
+        let (live, ended) = snapshot();
+        assert!(live.is_empty());
+        assert_eq!(ended.into_iter().collect::<Vec<_>>(), vec![(task, 2, at)]);
+    }
+
+    /// A handler that reaches dispatch after the drain cancel never starts
+    /// (issue #1813). It cannot begin a new side effect after the cancel
+    /// point.
+    #[tokio::test]
+    async fn an_activity_after_the_drain_cancel_never_starts() {
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&polled);
+        let mut handler = Box::pin(async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok(serde_json::Value::Null)
+        });
+        let cancel = CancellationToken::new();
+        let drain_cancel = CancellationToken::new();
+        drain_cancel.cancel();
+        let run = execute_activity_future_with_cancellation(
+            "act",
+            uuid::Uuid::new_v4(),
+            Duration::from_secs(1),
+            &mut handler,
+            std::future::pending::<()>(),
+            cancel.clone(),
+            &drain_cancel,
+            std::future::pending::<std::convert::Infallible>(),
+            tracing::Span::none(),
+        )
+        .await;
+        assert!(
+            !std::sync::atomic::AtomicBool::load(&polled, Ordering::SeqCst),
+            "the handler is never polled"
+        );
+        assert!(cancel.is_cancelled(), "the context reads as cancelled");
+        assert!(
+            run.drained && !run.started,
+            "the run is drained, not started"
+        );
+        assert!(run.result.is_err(), "the attempt ends with an error");
+    }
+
+    /// A claim that the drain released never joins the ended set (issue
+    /// #1813). The release can restore `attempt`, so a later claim may reuse
+    /// the same epoch.
+    #[test]
+    fn a_settled_claim_never_joins_the_ended_set() {
+        let claims = LiveClaims::default();
+        let shutdown = CancellationToken::new();
+        let key = (uuid::Uuid::new_v4(), 1, chrono::Utc::now());
+        let held = LiveClaim::new(&claims, Some(key), &shutdown);
+        shutdown.cancel();
+        settle_claim(&claims, Some(key));
+        drop(held);
+        let sets = std::mem::take(&mut *claims.lock().expect("lock"));
+        assert!(sets.live.is_empty());
+        assert!(sets.ended.is_empty(), "a released claim is not abandoned");
+        assert!(sets.settled.is_empty(), "the drop clears the settled mark");
+    }
+
+    /// The keeper interval follows the stale window that orphan reclaim
+    /// applies, so it is never zero (issue #1813).
+    #[test]
+    fn keeper_interval_is_half_the_floored_stale_window() {
+        assert_eq!(
+            keeper_interval(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            keeper_interval(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        for tiny in [Duration::from_nanos(1), Duration::from_millis(10)] {
+            let interval = keeper_interval(tiny);
+            assert_eq!(interval, Duration::from_millis(500), "{tiny:?}");
+            assert!(lease_refresh_bound(interval) > Duration::ZERO);
+            assert!(next_lease_refresh(interval, false) > Duration::ZERO);
+        }
+    }
+
+    /// A failed lease refresh retries well before the lease goes stale
+    /// (issue #1813).
+    #[test]
+    fn next_lease_refresh_retries_a_failure_at_once() {
+        for interval in [Duration::from_secs(1), Duration::from_secs(5)] {
+            let success = next_lease_refresh(interval, true);
+            let retry = next_lease_refresh(interval, false);
+            assert!(retry <= crate::pool::ZERO_WAIT_RETRY_SPACING);
+            // After a success, a failed try, the retry spacing and a second
+            // try all end inside the stale window.
+            let bound = lease_refresh_bound(interval);
+            assert!(success + bound + retry + bound < interval * 2);
+        }
     }
 
     #[test]

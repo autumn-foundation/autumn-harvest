@@ -15561,6 +15561,38 @@ impl ActivityContext {
         self.start_auto_heartbeat(interval)
     }
 
+    /// Keep this activity alive after a drain cancel (issue #1813).
+    ///
+    /// The drain cancel stops the auto-heartbeat ticker and fails each manual
+    /// heartbeat. A handler that ignores the cancel keeps its claim. Without
+    /// pings, the heartbeat-timeout scanner fails the task, and a retry then
+    /// runs next to the live handler.
+    ///
+    /// This future re-sends the last payload at `heartbeat_timeout / 3`, as
+    /// [`Self::start_auto_heartbeat_default`] does. The checkpoint therefore
+    /// does not change. It never completes. Without a heartbeat timeout or a
+    /// flusher, it only pends. The `start_to_close` ceiling still applies.
+    #[cfg(feature = "db")]
+    pub(crate) async fn keep_alive_after_drain(&self) -> std::convert::Infallible {
+        let (Some(timeout), Some(tx)) = (self.heartbeat_timeout, self.heartbeat_tx.as_ref()) else {
+            return std::future::pending().await;
+        };
+        let mut ticker =
+            tokio::time::interval((timeout / 3).max(std::time::Duration::from_millis(1)));
+        loop {
+            ticker.tick().await;
+            let payload = self
+                .last_heartbeat_payload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or(serde_json::Value::Null);
+            if !tx.send(payload).await {
+                return std::future::pending().await;
+            }
+        }
+    }
+
     /// Check whether the owning workflow has been cancelled.
     ///
     /// This is a lightweight convenience that works for both regular and local

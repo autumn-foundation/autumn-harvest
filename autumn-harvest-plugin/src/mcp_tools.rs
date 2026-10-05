@@ -984,7 +984,7 @@ fn build_tool_route(
         idempotency: autumn_web::RouteIdempotency::Direct,
         // Inherit the global request-timeout deadline (autumn-web 0.6).
         timeout: autumn_web::RouteTimeout::Inherit,
-        // Generated API routes carry no SEO meta (autumn-web 0.7): EMPTY is
+        // Generated API routes carry no SEO meta (since autumn-web 0.7): EMPTY is
         // what a route attribute without `seo(...)` produces.
         seo: autumn_web::SeoRouteDefaults::EMPTY,
     }

@@ -18,7 +18,7 @@
     "description": "Generated from `docs/api-contract.json` (contract version 2). Do not edit by hand. Regenerate with `scripts/regenerate-openapi.sh`.\n\nEvery path is relative to the prefix the embedder passes to `HarvestPlugin::api`, `/api/harvest` by convention.\n\nAuth: Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
     "summary": "Control-plane HTTP API for autumn-harvest durable workflows.",
     "title": "Harvest management API",
-    "version": "0.6.0",
+    "version": "0.7.0",
     "x-harvest-contract-version": "2"
   },
   "openapi": "3.1.0",

@@ -26,7 +26,7 @@ plugin wiring in [step 3](#3-wire-the-plugin) below is different:
 [chapter 13](13-broker-connectors.md)'s `connectors` feature:
 
 ```toml
-autumn-harvest-plugin = { version = "0.6", features = ["webhooks"] }
+autumn-harvest-plugin = { version = "0.7", features = ["webhooks"] }
 ```
 
 Skipping this fails at the `.webhooks(webhooks![...])` call in step 3, not at

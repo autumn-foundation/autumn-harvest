@@ -1980,13 +1980,16 @@ async fn stamp_type_agnostic_carryover(
         headers: serde_json::json!({"traceparent": "00-abc-def-01"}),
         callbacks: serde_json::json!([{"url": "https://example.test/hook"}]),
     };
-    diesel::sql_query(
-        "UPDATE harvest_events \
-         SET event_data = jsonb_set(event_data, '{data,last_completion_result}', '{\"rows\": 41}') \
-         WHERE workflow_exec_id = $1 AND event_id = 0",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(predecessor.as_uuid())
-    .execute(&mut *conn)
+    autumn_harvest::append_only::with_guard_off(&mut *conn, async |c| {
+        diesel::sql_query(
+            "UPDATE harvest_events \
+             SET event_data = jsonb_set(event_data, '{data,last_completion_result}', '{\"rows\": 41}') \
+             WHERE workflow_exec_id = $1 AND event_id = 0",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(predecessor.as_uuid())
+        .execute(c)
+        .await
+    })
     .await
     .expect("stamp carryover");
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))

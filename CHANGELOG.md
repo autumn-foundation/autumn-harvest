@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-05
+
+### Upgraded
+
+- **Upgrade to autumn-web 0.8.** Harvest 0.7.0 depends on `autumn-web` 0.8, so an app that mounts `HarvestPlugin` bumps `autumn-web` in the same change: Cargo treats 0.7 and 0.8 as distinct crates, and a leftover `autumn-web = "0.7"` compiles a second copy whose `Plugin` trait `HarvestPlugin` does not implement. Harvest itself needed no source change — `Route` and `AppBuilder::plugin_migrations` are unchanged — and MSRV stays 1.88.0. `HarvestPlugin` now implements 0.8's new `Plugin::contract`, declaring `autumn-web = "0.8"` (exposed as `autumn_harvest_plugin::plugin::harvest_plugin_contract()` and `AUTUMN_WEB_REQUIREMENT`, pinned to the crate's `Cargo.toml` requirement by a unit test), so `autumn plugin-check` passes its new `plugin-contract` check and `AppBuilder::plugin` rejects a mismatched framework at registration. The workspace `tokio-postgres-rustls` pin moves 0.13 → 0.14 to match autumn-web 0.8, keeping one copy in the graph; `autumn_harvest::pg_tls::Connector` is now the 0.14 `MakeRustlsConnect` (constructor unchanged). autumn-web 0.8 adds framework migrations, none sharing a version with a Harvest migration; the six pre-existing shared versions with Autumn's job-queue set are still resolved by 0.6.0's name-keyed substitution, so the upgrade moves no tracking record. The `harvest new` scaffold now writes `autumn-harvest = "0.7"`, `autumn-harvest-plugin = "0.7"` and `autumn-web = "0.8"`. See [`docs/upgrading/0.7.0.md`](docs/upgrading/0.7.0.md) §2.
+
+### Changed
+
+- **Breaking defaults and behavior changes.** Mutating management routes fail closed with `401` outside the `dev` profile when no auth layer is declared (issue #1802); activities with no timeout of their own stop after a 10-minute `default_activity_start_to_close` (issue #1808); a worker with an empty `build_id` no longer claims a run pinned to a build (issue #1805); the retention janitor deletes finished `harvest_task_queue` rows after 7 days (issue #1811, migration `20261003201739_harvest_task_queue_hygiene`); and continuations are claimed before new starts while a claim skips a task whose run is past its deadline (issue #1824, migration `20261004162927_harvest_task_queue_new_start`). Each has its own section, opt-out and check in [`docs/upgrading/0.7.0.md`](docs/upgrading/0.7.0.md) §1.
+
+The per-PR entries for this release are the fragments in [`docs/changelog.d/`](docs/changelog.d/README.md). The collation sweep folds them into this section and into `docs/shipped-work.md`.
+
 ## [0.6.0] - 2026-08-26
 
 ### Upgraded

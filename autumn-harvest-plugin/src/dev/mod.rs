@@ -1003,27 +1003,31 @@ async fn run_app(
     postgres: Arc<Mutex<Option<EphemeralPostgres>>>,
 ) {
     let dashboard_path = sample::DevDashboardPath(format!("{api_path}/ui"));
-    autumn_web::app()
-        .with_config_loader(loader)
-        // `AppBuilder::run` asserts at least one route is registered, and the
-        // plugin's management API mounts through `nest`, which does not count.
-        // This is a landing redirect to the dashboard AND the thing that makes
-        // the app boot at all.
-        .routes(sample::routes())
-        .with_extension(dashboard_path)
-        .plugin(
-            crate::HarvestPlugin::new()
-                .workflows(sample::workflows())
-                .activities(sample::activities())
-                .worker(autumn_harvest::WorkerConfig::default())
-                .api(api_path)
-                // Issue #1291: a backstop against ambient Harvest config
-                // changing between the checks in `DevRuntime::start` and
-                // this plugin actually building and starting.
-                .require_embedded_harvest_mode(),
-        )
-        .run()
-        .await;
+    // The `run` future is large in autumn-web 0.8, so it is boxed.
+    // That keeps it off the stack and satisfies `clippy::large_futures`.
+    Box::pin(
+        autumn_web::app()
+            .with_config_loader(loader)
+            // `AppBuilder::run` asserts at least one route is registered, and the
+            // plugin's management API mounts through `nest`, which does not count.
+            // This is a landing redirect to the dashboard AND the thing that makes
+            // the app boot at all.
+            .routes(sample::routes())
+            .with_extension(dashboard_path)
+            .plugin(
+                crate::HarvestPlugin::new()
+                    .workflows(sample::workflows())
+                    .activities(sample::activities())
+                    .worker(autumn_harvest::WorkerConfig::default())
+                    .api(api_path)
+                    // Issue #1291: a backstop against ambient Harvest config
+                    // changing between the checks in `DevRuntime::start` and
+                    // this plugin actually building and starting.
+                    .require_embedded_harvest_mode(),
+            )
+            .run(),
+    )
+    .await;
     // Deliberately NO `on_shutdown` teardown hook. It looked like belt and
     // braces and was actually a race: on Ctrl-C both this thread's hook and
     // `DevRuntime::shutdown` reach for the same `Option`, and whichever loses
