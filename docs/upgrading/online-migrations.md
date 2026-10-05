@@ -313,9 +313,9 @@ An annotation allows one rule at one statement:
   between the annotation and the statement. A blank line ends the search.
 - Allow one rule per annotation. A statement that breaks two rules needs two
   annotations.
-- `<rule>` is `lock-timeout`, `blocking-index` or
-  `concurrently-in-transaction`. Nothing allows `bad-annotation` or
-  `unused-annotation`.
+- `<rule>` is `lock-timeout` or `blocking-index`. Nothing allows
+  `concurrently-in-transaction`, because Postgres rejects each statement that
+  breaks it. Nothing allows `bad-annotation` or `unused-annotation` either.
 - Cite the issue that approves the exception, and give the reason.
 
 A reviewer approves each annotation. It is the record that the lock is a

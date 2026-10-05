@@ -238,12 +238,10 @@ impl Rule {
     /// Whether an annotation or a grandfather entry can suppress this rule.
     ///
     /// The annotation rules guard the escape hatch itself, so nothing
-    /// suppresses them.
+    /// suppresses them. Postgres rejects each `concurrently-in-transaction`
+    /// statement, so an annotation would only hide a migration that fails.
     const fn allowable(self) -> bool {
-        matches!(
-            self,
-            Self::LockTimeout | Self::BlockingIndex | Self::ConcurrentlyInTransaction
-        )
+        matches!(self, Self::LockTimeout | Self::BlockingIndex)
     }
 }
 
@@ -7428,6 +7426,28 @@ fn an_unqualified_format_after_a_path_change_is_unreadable() {
         execute("pg_catalog.format")
     );
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn an_annotation_cannot_allow_a_statement_postgres_rejects() {
+    let allow = "-- lock-safety: allow concurrently-in-transaction #1810 test fixture\n";
+    // Postgres rejects each of these, so no annotation may hide it.
+    for (sql, in_transaction) in [
+        ("DROP INDEX CONCURRENTLY a_idx, b_idx;", false),
+        ("REINDEX SYSTEM CONCURRENTLY app;", false),
+        (
+            "CREATE INDEX CONCURRENTLY x_idx ON harvest_timers (x);",
+            true,
+        ),
+        ("VACUUM ANALYZE harvest_events;", true),
+    ] {
+        let sql = format!("{allow}{sql}");
+        let findings = lint_with_history(&[], &sql, in_transaction);
+        assert!(
+            rules(&findings).contains(&Rule::ConcurrentlyInTransaction),
+            "{sql}\n{findings:?}"
+        );
+    }
 }
 
 #[test]

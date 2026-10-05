@@ -22,10 +22,11 @@ is hot too, including the `harvest_events` partitions made at run time.
   `CONCURRENTLY`. An `ADD UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraint
   without `USING INDEX` builds an index, so it counts too.
 
-`concurrently-in-transaction` catches `CONCURRENTLY` that cannot run. That is
-a transactional migration, a `DO` block, or a file with a second statement.
-Diesel sends each file as one batch, and Postgres runs a batch as one
-implicit transaction.
+`concurrently-in-transaction` catches `CONCURRENTLY` or `VACUUM` that cannot
+run. That is a transactional migration, a `DO` block, or a file with a second
+statement. Diesel sends each file as one batch, and Postgres runs a batch as
+one implicit transaction. Postgres rejects each such statement, so no
+annotation can allow this rule.
 
 The lexer skips comments and string literals. It lexes each `DO` body on its
 own and scans it as code, in dollar quotes or in single quotes. The lint reads index and foreign-key history
