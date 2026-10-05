@@ -411,6 +411,19 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
     let mut findings = Vec::new();
 
     for hit in &analysis.hits {
+        if hit.kind == Kind::RejectedConcurrent {
+            findings.push(Finding {
+                rule: Rule::ConcurrentlyInTransaction,
+                line: hit.line,
+                stmt: hit.at,
+                detail: format!(
+                    "{} CONCURRENTLY takes exactly one index and no CASCADE, so Postgres \
+                     rejects the statement.",
+                    hit.verb
+                ),
+            });
+            continue;
+        }
         let Kind::Index { concurrent } = hit.kind else {
             continue;
         };
@@ -596,7 +609,12 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
 
 /// Whether `hit` locks a hot table with no bound in force.
 fn needs_bound(analysis: &Analysis, hit: &Hit) -> bool {
-    hit.hot && hit.kind != (Kind::Index { concurrent: true }) && !bound_in_force(analysis, hit)
+    hit.hot
+        && !matches!(
+            hit.kind,
+            Kind::Index { concurrent: true } | Kind::RejectedConcurrent
+        )
+        && !bound_in_force(analysis, hit)
 }
 
 /// Whether a bound is in force for `hit`.
@@ -1425,6 +1443,8 @@ enum Kind {
     Index { concurrent: bool },
     /// Any other statement that takes a blocking lock.
     Lock,
+    /// A `CONCURRENTLY` form that Postgres rejects outright.
+    RejectedConcurrent,
 }
 
 /// One statement that can lock a table.
@@ -2569,7 +2589,15 @@ fn call_clears(
             // A routine that may clear the bound before it locks makes the
             // outside bound worthless. An unknown routine may do that too.
             let known = knows(&inherited_bounded, call);
-            let may_clear = inherited.contains(callee) || unplaced || !known;
+            // Postgres may evaluate the calls of one statement in any order,
+            // so a sibling call that may clear may run first.
+            let sibling_clears = calls.iter().any(|other| {
+                other.at != call.at
+                    && s.starts[other.at] == s.starts[call.at]
+                    && !keeps(other, &clearing)
+                    && (inherited.contains(base(&other.name)) || !knows(&inherited_bounded, other))
+            });
+            let may_clear = inherited.contains(callee) || unplaced || !known || sibling_clears;
             let verb = if may_clear {
                 UNREAD_CLEARING_CALL
             } else {
@@ -3827,7 +3855,19 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
         Some("index") => {
             let concurrent = s.keyword(k + 2, "concurrently");
             let j = s.skip_if_exists(k + 2 + usize::from(concurrent));
-            raws.extend(s.name_list(j).into_iter().map(|index| Raw {
+            let names = s.name_list(j);
+            // Postgres drops one index at a time this way, and rejects CASCADE.
+            let cascade = (k..s.end(k)).any(|i| s.keyword(i, "cascade"));
+            if concurrent && (names.len() > 1 || cascade) {
+                raws.push(Raw {
+                    at: k,
+                    verb: "DROP INDEX",
+                    index: None,
+                    table: None,
+                    kind: Kind::RejectedConcurrent,
+                });
+            }
+            raws.extend(names.into_iter().map(|index| Raw {
                 at: k,
                 verb: "DROP INDEX",
                 index: Some(index),
@@ -8055,6 +8095,42 @@ fn a_placeholder_owner_may_be_any_table() {
     assert_eq!(lint_with_history(&[], drop, true), []);
     let findings = lint_with_history(&[earlier], drop, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_concurrent_drop_takes_one_index_and_no_cascade() {
+    let history = ["CREATE INDEX CONCURRENTLY a_idx ON harvest_timers (x);\n\
+                    CREATE INDEX CONCURRENTLY b_idx ON harvest_timers (y);"];
+    assert_eq!(
+        lint_with_history(&history, "DROP INDEX CONCURRENTLY a_idx;", false),
+        []
+    );
+    // Postgres rejects both forms, so the migration fails when it runs.
+    for drop in [
+        "DROP INDEX CONCURRENTLY a_idx, b_idx;",
+        "DROP INDEX CONCURRENTLY a_idx CASCADE;",
+    ] {
+        let findings = lint_with_history(&history, drop, false);
+        assert!(
+            rules(&findings).contains(&Rule::ConcurrentlyInTransaction),
+            "{drop}\n{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_clear_in_a_statement_may_run_before_its_siblings() {
+    let earlier = "CREATE FUNCTION legacy_f() RETURNS int LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                   ALTER TABLE harvest_events ADD COLUMN y INT;\n    RETURN 1;\nEND $$;\n\
+                   CREATE FUNCTION clear_f() RETURNS int LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                   PERFORM set_config('lock_timeout', '0', false);\n    RETURN 1;\nEND $$;";
+    // Postgres may evaluate the arguments in any order.
+    let sql = "SET LOCAL lock_timeout = '5s';\nSELECT coalesce(legacy_f(), clear_f());";
+    let findings = lint_with_history(&[earlier], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // In a later statement, the clear runs after the lock.
+    let sql = "SET LOCAL lock_timeout = '5s';\nSELECT legacy_f();\nSELECT clear_f();";
+    assert_eq!(lint_with_history(&[earlier], sql, true), [], "{sql}");
 }
 
 #[test]

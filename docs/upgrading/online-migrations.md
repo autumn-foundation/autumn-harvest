@@ -163,6 +163,8 @@ A rename or a schema move carries what the lint knows to the new name, and no
 outside bound covers a call by either name.
 A call of a clearing routine that an earlier migration created ends the bound
 too. Set the bound again after the call.
+Postgres may evaluate the calls in one statement in any order. So no bound
+covers a call when another call in the same statement may clear it.
 
 A routine can bound its own locks with a `SET lock_timeout` clause, or with a
 setter that surely runs before each lock in its body. Postgres applies that
@@ -230,6 +232,8 @@ and `harvest migrate` send the file as one batch, and a batch of two or more
 statements runs as one implicit transaction. A `SET lock_timeout` beside it
 therefore breaks the migration. The lint flags it. `SHARE UPDATE EXCLUSIVE`
 does not block reads or writes, so this statement needs no `lock_timeout`.
+`DROP INDEX CONCURRENTLY` takes exactly one index and no `CASCADE`. Postgres
+rejects any other form, so the lint flags it.
 
 **`harvest_events` is different.** The opt-in partitioned layout turns it
 into a partitioned parent. Postgres does not build or drop an index
