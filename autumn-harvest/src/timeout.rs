@@ -1243,6 +1243,10 @@ async fn commit_workflow_execution_timeout(
             store::append_single_event(conn, exec_id, timeout_event).await?;
             update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
 
+            // Each open task did not finish before the run deadline. The claim
+            // skips such a task (issue #1824), so this write is its recorded
+            // outcome. The prefix lets an operator find it.
+            let task_error = format!("{}: {error_msg}", crate::queue::DEADLINE_EXCEEDED_ERROR);
             let _rows = diesel::update(
                 harvest_task_queue::table
                     .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
@@ -1254,7 +1258,7 @@ async fn commit_workflow_execution_timeout(
             )
             .set((
                 harvest_task_queue::state.eq("FAILED"),
-                harvest_task_queue::error.eq(Some(&error_msg)),
+                harvest_task_queue::error.eq(Some(&task_error)),
                 harvest_task_queue::completed_at.eq(Some(Utc::now())),
             ))
             .execute(conn)

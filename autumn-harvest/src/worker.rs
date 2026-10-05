@@ -44228,6 +44228,7 @@ mod tests {
             timer_fires_at: None,
             handler_started_attempt: None,
             timed_out_claims: None,
+            new_start: false,
         }
     }
 
