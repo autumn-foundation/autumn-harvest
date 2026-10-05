@@ -976,19 +976,14 @@ async fn byte_cap_rechecks_a_stale_warm_mark_before_failing() {
     // The warm mark now counts about 40 KiB for this signal.
     send_grow(&mut conn, exec_id, incompressible_payload(40 * 1024), 1).await;
 
-    // Shrink that row in place, as a rotation sweep could. The append-only
-    // guard (issue #1817) needs the `codec_rotation` sanction for the write.
+    // Shrink that row in place, as a rotation sweep could. A fixture rewrite
+    // turns the append-only guard off for one transaction (issue #1817).
     let small = serde_json::to_value(WorkflowEvent::SignalReceived {
         signal_name: "grow".into(),
         payload: serde_json::json!({}),
     })
     .expect("serialize small signal");
-    conn.transaction::<_, diesel::result::Error, _>(async |c| {
-        diesel::sql_query(
-            "SELECT set_config('harvest.sanctioned_event_rewrite', 'codec_rotation', true)",
-        )
-        .execute(c)
-        .await?;
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
         diesel::sql_query(
             "UPDATE harvest_events SET event_data = $2 \
              WHERE workflow_exec_id = $1 AND event_type = 'SignalReceived'",
