@@ -631,6 +631,20 @@ fn timeout_batch_query(predicate: &str) -> String {
     format!("SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q ORDER BY q.id")
 }
 
+/// The ids among `$1` that match `predicate` now (issue #1795).
+///
+/// It selects ids only. A probe of a large batch then loads no payloads.
+fn timeout_probe_query(predicate: &str) -> String {
+    format!("SELECT q.id FROM ({predicate} AND id = ANY($1) OFFSET 0) q")
+}
+
+/// One id from [`timeout_probe_query`].
+#[derive(diesel::QueryableByName)]
+struct ProbedId {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+}
+
 /// What an earlier lane can still claim in its current sweep (issue #1795).
 ///
 /// A later lane leaves a row to this lane only if this lane can still claim
@@ -705,7 +719,8 @@ struct TimeoutScanLane {
     /// The retried ids of the last loaded batch, with their tries.
     loaded_retries: std::collections::HashMap<uuid::Uuid, u32>,
     /// Ids that moved here from another reason. They stay out of `queued`,
-    /// so moves never hold back a refill. At most one batch of them waits.
+    /// so moves never hold back a refill. At most one refill page of them
+    /// waits.
     moved: std::collections::VecDeque<uuid::Uuid>,
     /// Which of moved and queued ids gets the odd slot of the next batch.
     /// It flips each pass that has both, so neither can starve the other.
@@ -953,14 +968,14 @@ async fn lapsed_moves(
         if other == index || lapsed.is_empty() {
             continue;
         }
-        let matched: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate))
+        let matched: Vec<ProbedId> = diesel::sql_query(timeout_probe_query(predicate))
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&lapsed)
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
-        let matched_ids: HashSet<uuid::Uuid> = matched.iter().map(|task| task.id).collect();
+        let matched_ids: HashSet<uuid::Uuid> = matched.iter().map(|row| row.id).collect();
         lapsed.retain(|id| !matched_ids.contains(id));
-        moves.extend(matched.iter().map(|task| (other, task.id)));
+        moves.extend(matched.iter().map(|row| (other, row.id)));
     }
     Ok(moves)
 }
@@ -1043,14 +1058,20 @@ pub async fn find_timed_out_tasks_batch(
 
 /// Hands each moved row to the lane of its new reason.
 ///
-/// Moved rows wait in their own list, first in, first out. A lane holds at
-/// most `limit` of them, so steady moves cannot grow it. A row past that,
-/// or one the lane already holds, is left out. That lane's next sweep finds
-/// a row that still matches.
+/// Moved rows wait in their own list, first in, first out. The list keeps
+/// the row reserved for its new reason across passes. A later lane never
+/// takes a held row, so it cannot record the wrong reason.
+///
+/// A lane holds at most one refill page of moved ids, as for its queue. So
+/// steady moves cannot grow it without bound. A row past that, or one the
+/// lane already holds, is left out. That lane's next sweep finds a row that
+/// still matches, unless a later lane takes it first.
 fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>, limit: usize) {
     if moves.is_empty() {
         return;
     }
+    let (_, page_rows) = timeout_scan_bounds(i64::try_from(limit).unwrap_or(MAX_PAGE_ROWS));
+    let cap = usize::try_from(page_rows).unwrap_or(usize::MAX);
     let mut held: Vec<HashSet<uuid::Uuid>> = lanes
         .iter()
         .map(|lane| {
@@ -1063,7 +1084,7 @@ fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>
         })
         .collect();
     for (other, id) in moves {
-        if lanes[other].moved.len() < limit && held[other].insert(id) {
+        if lanes[other].moved.len() < cap && held[other].insert(id) {
             lanes[other].moved.push_back(id);
         }
     }
@@ -6983,9 +7004,11 @@ mod tests {
         // that queue, or steady moves would stop the lane's sweep.
         assert!(lanes[3].queued.is_empty());
         assert_eq!(lanes[3].moved.len(), 1);
-        // A lane holds at most one batch of moved rows.
-        admit_moves(&mut lanes, vec![(3, uuid::Uuid::new_v4())], 1);
-        assert_eq!(lanes[3].moved.len(), 1);
+        // A lane holds at most one refill page of moved rows.
+        let page = usize::try_from(REFILL_BATCHES).expect("fits");
+        let more = (0..page).map(|_| (3, uuid::Uuid::new_v4())).collect();
+        admit_moves(&mut lanes, more, 1);
+        assert_eq!(lanes[3].moved.len(), page);
     }
 
     #[test]
@@ -7012,6 +7035,26 @@ mod tests {
             ..TimeoutScanLane::default()
         };
         assert_eq!(lane.batch_split(4), (0, 4, 0));
+    }
+
+    /// A move past one batch stays reserved for its new reason. Dropping it
+    /// would let a later lane take the row under that lane's reason.
+    #[test]
+    fn moves_past_one_batch_stay_reserved() {
+        let mut lanes: [TimeoutScanLane; 4] = Default::default();
+        let moved: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+        admit_moves(&mut lanes, moved.iter().map(|id| (3, *id)).collect(), 1);
+        assert_eq!(lanes[3].moved, moved);
+    }
+
+    /// The probe for lapsed rows needs their ids only. It must not load task
+    /// payloads, which a batch of 100,000 rows makes large.
+    #[test]
+    fn the_lapsed_row_probe_selects_ids_only() {
+        for (_, predicate) in task_timeout_scans() {
+            let sql = timeout_probe_query(predicate);
+            assert!(sql.starts_with("SELECT q.id FROM ("), "{sql}");
+        }
     }
 
     #[test]

@@ -54,8 +54,9 @@ size, so adding workers to clear a backlog added database load in proportion.
   clock until its last queue drains. A queued row keeps its reason when an
   earlier one starts to match. If its reason stops matching, it moves to the
   first other reason that still matches. It waits there in a moved list of
-  at most one batch, which shares each batch with the queue. No
-  later lane hands it out under its own reason in the same pass. The
+  at most one refill page of ids, which shares each batch with the queue.
+  No later lane hands it out under its own reason while it waits. The
+  probe for such rows loads ids only, not payloads. The
   lanes give up their batch ids only after every load of the pass succeeds. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.
   The public `enforce_timeouts_once` keeps its full scan.
