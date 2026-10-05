@@ -390,6 +390,10 @@ pub struct EnqueueParams {
     /// since the session's local state only exists on that one worker.
     /// `None` for an ordinary (non-session) activity.
     pub session_id: Option<Uuid>,
+    /// `true` only for the first workflow task of a freshly admitted run
+    /// (issue #1824). The workflow start path sets it. Every other path
+    /// keeps `false`, so its row is a continuation in the claim order.
+    pub new_start: bool,
 }
 
 impl EnqueueParams {
@@ -428,14 +432,16 @@ impl EnqueueParams {
             required_capabilities: None,
             context_headers: None,
             session_id: None,
+            new_start: false,
         }
     }
 
     /// Set the task priority, overriding the `Normal` default.
     ///
-    /// The claim query orders candidates by `priority DESC, available_at ASC`
-    /// so tasks with higher priority are always claimed before lower-priority
-    /// tasks that arrived earlier on the same queue.
+    /// The claim query orders candidates by `priority DESC`, then by the
+    /// claim-order due time ([`CLAIM_ORDER_DUE_SQL`]). So a task with higher
+    /// priority is claimed before a lower-priority task that arrived earlier on
+    /// the same queue.
     #[must_use]
     pub const fn with_priority(mut self, priority: Priority) -> Self {
         self.priority = priority.as_i32();
@@ -536,6 +542,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         required_capabilities: params.required_capabilities.clone(),
         context_headers: params.context_headers.clone(),
         session_id: params.session_id,
+        new_start: params.new_start,
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -587,7 +594,7 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 /// number by exhaustive field destructure. Adding or removing a
 /// `NewTaskQueueItem` field breaks that test at compile time until this
 /// constant is updated too, so it cannot silently drift.
-const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 27;
+const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 28;
 
 /// Largest row count one `enqueue_batch` `INSERT` may carry.
 ///
@@ -797,6 +804,7 @@ pub async fn enqueue_batch(
                     required_capabilities: p.required_capabilities.clone(),
                     context_headers: p.context_headers.clone(),
                     session_id: p.session_id,
+                    new_start: p.new_start,
                 }
             })
             .collect();
@@ -850,6 +858,137 @@ pub async fn enqueue_batch(
 
     Ok(task_ids)
 }
+
+/// How long a new start yields to continuations at equal priority (issue #1824).
+///
+/// [`CLAIM_ORDER_DUE_SQL`] spells the same value as an SQL interval.
+pub const NEW_START_HANDICAP_SECS: u32 = 30;
+
+/// The claim-order due time of a `harvest_task_queue` row (issue #1824).
+///
+/// A new start is the first workflow task of a freshly admitted run. The
+/// workflow start path sets `new_start` on that row. A claim increments
+/// `attempt`, so the row stops being a new start. A claim that is given back
+/// restores `attempt` to 0, and the row is a new start again. A wake reuses
+/// the same row.
+///
+/// Every other task is a continuation. That includes an activity task and a
+/// woken workflow task. It also includes the first task of a child, a
+/// continue-as-new, a reset fork, a workflow retry or a DLQ redrive. Each of
+/// these extends admitted work. The admission gate uses a similar split.
+///
+/// A new start sorts as if it were due [`NEW_START_HANDICAP_SECS`] later. So
+/// at equal priority, a continuation goes first under a backlog. The
+/// handicap is fixed, so a new start that waits longer competes FIFO again.
+/// That bounds starvation without a separate ageing term.
+///
+/// The term sorts after the effective priority, so an explicit priority still
+/// wins. Priority ageing (`priority_aging_secs`) reads `scheduled_at`, not
+/// this term. An ageing interval below the handicap can lift an aged new
+/// start above a fresh continuation.
+/// The claim already sorts on a `CASE` key, so this adds no sort that
+/// an index could have saved. See `docs/performance.md`, issue #1177.
+macro_rules! claim_order_due_sql {
+    () => {
+        "(scheduled_at + CASE WHEN new_start AND attempt = 0 \
+         THEN INTERVAL '30 seconds' ELSE INTERVAL '0 seconds' END)"
+    };
+}
+
+/// The `claim_order_due_sql!` text as a value, for shape tests.
+pub const CLAIM_ORDER_DUE_SQL: &str = claim_order_due_sql!();
+
+/// The error prefix on a task that the timeout scanner fails (issue #1824).
+///
+/// The claim never hands out a task of an expired run. See
+/// [`EXPIRED_RUN_GATE_SQL`]. The scanner then times out the run and fails
+/// each open task with this prefix on its error.
+pub const DEADLINE_EXCEEDED_ERROR: &str = "deadline_exceeded";
+
+/// The runs that are past a deadline, for the claim gate (issue #1824).
+///
+/// The predicate is the timeout scanner's own: a `RUNNING` run with a past
+/// `deadline_at` or `chain_deadline_at`. A `PAUSED` run is not in the set,
+/// because a resume moves its deadline forward. The two partial deadline
+/// indexes serve the read. The set is small, because the scanner clears it
+/// once per poll interval.
+///
+/// The CTE is `MATERIALIZED`, so it runs once per claim, not once per row. It
+/// only reads the run rows and takes no lock. A lock here would invert the
+/// scanner's order, which locks the run before its task rows.
+macro_rules! expired_runs_cte_sql {
+    () => {
+        "expired_runs AS MATERIALIZED ( \
+             SELECT id FROM harvest_workflow_executions \
+             WHERE state = 'RUNNING' \
+               AND (deadline_at < NOW() OR chain_deadline_at < NOW()) \
+         )"
+    };
+}
+
+/// The `candidate` predicate that skips a task of an expired run (issue #1824).
+///
+/// The task stays `PENDING`. No worker runs it, and the claim spends no
+/// attempt, rate-limit token or concurrency slot on it. The claim takes the
+/// next eligible row instead. Without this gate, a task of an expired run can
+/// run in the gap before the scanner tick.
+macro_rules! expired_run_gate_sql {
+    () => {
+        "AND ( \
+                   workflow_exec_id IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM expired_runs x \
+                       WHERE x.id = harvest_task_queue.workflow_exec_id \
+                   ) \
+               ) "
+    };
+}
+
+/// The run-deadline re-check after the bucket lock, for the single-row
+/// claim (issue #1824).
+///
+/// `rate_limit_debit` can wait on its bucket row lock. The run deadline can
+/// pass during that wait, and `NOW()` stays at the statement start. So
+/// `fresh_now` takes the bucket lock first and only then reads
+/// `clock_timestamp()`. The batched attempt uses the same order in its
+/// `now_ts` CTE. A task with no rate-limit debit takes no lock here.
+///
+/// `run_expired_now` checks the run of the candidate against that time. It
+/// reads the run row and takes no lock. Both `rate_limit_debit` and
+/// `claimed` require it to be false. So a run that expires during the wait
+/// gets no token and no claim.
+macro_rules! fresh_run_deadline_ctes_sql {
+    () => {
+        "fresh_now AS MATERIALIZED ( \
+             SELECT clock_timestamp() AS ts \
+             FROM (SELECT 1 AS one) base \
+             LEFT JOIN ( \
+                 SELECT 1 AS x FROM harvest_rate_limit_buckets b \
+                 JOIN candidate c ON b.key = c.rate_limit_key \
+                 WHERE NOT (c.activity_name = ANY($5)) \
+                 FOR UPDATE OF b \
+             ) locked ON TRUE \
+         ), \
+         run_expired_now AS MATERIALIZED ( \
+             SELECT EXISTS ( \
+                 SELECT 1 FROM candidate c \
+                 JOIN harvest_workflow_executions e ON e.id = c.workflow_exec_id \
+                 WHERE e.state = 'RUNNING' \
+                   AND (e.deadline_at < (SELECT ts FROM fresh_now) \
+                        OR e.chain_deadline_at < (SELECT ts FROM fresh_now)) \
+             ) AS expired \
+         )"
+    };
+}
+
+/// The `fresh_run_deadline_ctes_sql!` text as a value, for shape tests.
+pub const FRESH_RUN_DEADLINE_CTES_SQL: &str = fresh_run_deadline_ctes_sql!();
+
+/// The `expired_runs_cte_sql!` text as a value, for shape tests.
+pub const EXPIRED_RUNS_CTE_SQL: &str = expired_runs_cte_sql!();
+
+/// The `expired_run_gate_sql!` text as a value, for shape tests.
+pub const EXPIRED_RUN_GATE_SQL: &str = expired_run_gate_sql!();
 
 // NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): the queue-pause
 // exclusion used to be a per-row correlated `NOT EXISTS`, embedded verbatim
@@ -963,13 +1102,14 @@ pub async fn enqueue_batch(
 /// values with RUNNING work than this queue set's current PENDING backlog
 /// touches, and the aggregate must not pay for keys this claim attempt cannot
 /// possibly select.
-// The body is one SQL string literal; the line count is the query's, not
-// control flow's. `claim_task` carried the same allow before this query was
-// extracted for shape-testing.
+// The body is one SQL statement, built with `concat!`. The line count is the
+// query's, not control flow's. `claim_task` carried the same allow before this
+// query was extracted for shape-testing.
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub const fn claim_task_query() -> &'static str {
-    "WITH worker_info AS ( \
+    concat!(
+        "WITH worker_info AS ( \
              SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
          ), \
          paused_queues AS MATERIALIZED ( \
@@ -997,9 +1137,12 @@ pub const fn claim_task_query() -> &'static str {
                AND t.worker_id IS NOT NULL \
                AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys) \
              GROUP BY t.concurrency_key, t.task_type \
-         ), \
+         ), ",
+        expired_runs_cte_sql!(),
+        ", \
          candidate AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
+             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
+                    workflow_exec_id \
              FROM harvest_task_queue \
              CROSS JOIN worker_info \
              CROSS JOIN paused_queues \
@@ -1050,8 +1193,9 @@ pub const fn claim_task_query() -> &'static str {
                        WHERE e.id = harvest_task_queue.workflow_exec_id \
                          AND e.state = 'PAUSED' \
                    ) \
-               ) \
-               AND ( \
+               ) ",
+        expired_run_gate_sql!(),
+        "               AND ( \
                    task_type != 'activity' \
                    OR activity_name IS NULL \
                    OR required_capabilities IS NOT NULL \
@@ -1100,10 +1244,13 @@ pub const fn claim_task_query() -> &'static str {
                      WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
                      THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
                      ELSE priority \
-                 END DESC, \
-                 scheduled_at ASC \
+                 END DESC, ",
+        claim_order_due_sql!(),
+        " ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
-        ), \
+        ), ",
+        fresh_run_deadline_ctes_sql!(),
+        ", \
         rate_limit_debit AS ( \
             UPDATE harvest_rate_limit_buckets b \
             SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) - 1.0, \
@@ -1111,6 +1258,7 @@ pub const fn claim_task_query() -> &'static str {
             FROM candidate \
             WHERE b.key = candidate.rate_limit_key \
               AND NOT (candidate.activity_name = ANY($5)) \
+              AND NOT (SELECT expired FROM run_expired_now) \
               AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
             RETURNING b.key AS debited_key \
         ), \
@@ -1141,9 +1289,11 @@ pub const fn claim_task_query() -> &'static str {
                   OR candidate.activity_name = ANY($5) \
                   OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = candidate.rate_limit_key) \
               ) \
+              AND NOT (SELECT expired FROM run_expired_now) \
             RETURNING harvest_task_queue.* \
         ) \
         SELECT * FROM claimed"
+    )
 }
 
 /// Resolve the cross-region DR fence binding for a claim (issue #954).
@@ -1214,6 +1364,7 @@ pub fn claim_task_query_fenced() -> &'static str {
              WHERE shard_id = $7 AND generation = $8 \
          ), ";
         let base = claim_task_query();
+        #[expect(clippy::expect_used, reason = "the claim query is a constant")]
         let base = base
             .strip_prefix("WITH ")
             .expect("claim query starts with WITH");
@@ -1241,11 +1392,25 @@ pub fn claim_task_query_fenced() -> &'static str {
 ///
 /// # Priority and anti-starvation
 ///
-/// Tasks are ordered `priority DESC, available_at ASC` so higher-priority work
+/// Tasks are ordered `priority DESC`, then by due time, so higher-priority work
 /// is claimed first.  When `priority_aging_secs` is `Some(K)`, each task's
 /// effective priority is boosted by `+1` for every `K` seconds it has been
 /// waiting in `PENDING` state.  This bounds the maximum starvation time for
 /// `Low` priority tasks even under sustained high-priority load.
+///
+/// # Continuations before new starts
+///
+/// Within one priority level, continuations of running workflows go first
+/// (issue #1824). A new start sorts as if it were due
+/// [`NEW_START_HANDICAP_SECS`] later, so it cannot starve. See
+/// [`CLAIM_ORDER_DUE_SQL`].
+///
+/// # Run deadline
+///
+/// The claim skips a task whose run is past its deadline (issue #1824). The
+/// task stays `PENDING`, and the claim takes the next eligible row. The
+/// timeout scanner then fails it with [`DEADLINE_EXCEEDED_ERROR`]. See
+/// [`EXPIRED_RUN_GATE_SQL`].
 ///
 /// # Sticky routing
 ///
@@ -1472,6 +1637,7 @@ pub async fn claim_task_of_kind_on_shard(
     // against the row this transaction already locked. Competing claimers
     // `SKIP LOCKED` past that row regardless — it is `RUNNING` either way — so
     // the added contention is the duration of a single PK probe.
+
     let mut tx = conn.build_transaction().read_committed();
     let outcome: ClaimOutcome = tx
         .run(
@@ -6895,6 +7061,7 @@ pub async fn sweep_terminal_tasks_into(
     }
 
     // A `batch_size` of 0 would make `LIMIT 0` delete nothing forever.
+    #[expect(clippy::expect_used, reason = "a constant caps the batch size")]
     let batch = i64::try_from(batch_size.clamp(1, MAX_TERMINAL_TASK_SWEEP_BATCH))
         .expect("the cap fits in i64");
     let (first_sql, next_sql) = if preview {
@@ -7375,6 +7542,9 @@ pub async fn pending_queue_demand_by_queue_name(
 pub fn claim_task_batched_candidates_query() -> &'static str {
     static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let rate_limit_available = effective_available_tokens_expr("b");
+        let due = claim_order_due_sql!();
+        let expired_cte = expired_runs_cte_sql!();
+        let expired_gate = expired_run_gate_sql!();
         format!(
             "WITH worker_info AS ( \
                  SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
@@ -7387,10 +7557,11 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
              paused_activities AS MATERIALIZED ( \
                  SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
                  FROM harvest_activity_pauses \
-             ) \
+             ), \
+             {expired_cte} \
              SELECT \
                  id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
-                 scheduled_at, schedule_to_close_at, \
+                 schedule_to_close_at, {due} AS claim_due_at, \
                  CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS sticky_rank, \
                  CASE \
                      WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
@@ -7439,6 +7610,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
                          AND e.state = 'PAUSED' \
                    ) \
                ) \
+               {expired_gate}\
                AND ( \
                    task_type != 'activity' \
                    OR activity_name IS NULL \
@@ -7497,7 +7669,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
                            THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
                            ELSE priority \
                        END) = $9 \
-                       AND scheduled_at > $10 \
+                       AND {due} > $10 \
                    ) \
                    OR ( \
                        (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) = $8 \
@@ -7506,10 +7678,10 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
                            THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
                            ELSE priority \
                        END) = $9 \
-                       AND scheduled_at = $10 AND id > $11 \
+                       AND {due} = $10 AND id > $11 \
                    ) \
                ) \
-             ORDER BY sticky_rank DESC, effective_priority DESC, scheduled_at ASC, id ASC \
+             ORDER BY sticky_rank DESC, effective_priority DESC, claim_due_at ASC, id ASC \
              LIMIT $12::BIGINT \
              FOR UPDATE SKIP LOCKED"
         )
@@ -7663,6 +7835,13 @@ fn candidate_still_build_and_capability_eligible(labels_expr: &str) -> String {
 /// substituted value, never the raw `NOW()`, so it can never regress to
 /// a time before what a concurrent transaction already committed.
 ///
+/// `run_expired` re-checks the run deadline of the candidate (issue #1824).
+/// The batch scan and this attempt are separate statements in one
+/// transaction, and `NOW()` stays at the transaction start. So a run can
+/// expire after the scan selected its task. The check reads the run on the
+/// `now_ts` clock and takes no lock. It gates both `rate_limit_debit` and
+/// `claimed`, so an expired run spends no token.
+///
 /// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
 /// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
 /// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
@@ -7700,6 +7879,16 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
              worker_info AS ( \
                  SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
              ), \
+             run_expired AS ( \
+                 SELECT EXISTS ( \
+                     SELECT 1 FROM harvest_task_queue t \
+                     JOIN harvest_workflow_executions e ON e.id = t.workflow_exec_id \
+                     WHERE t.id = $2 \
+                       AND e.state = 'RUNNING' \
+                       AND (e.deadline_at < (SELECT ts FROM now_ts) \
+                            OR e.chain_deadline_at < (SELECT ts FROM now_ts)) \
+                 ) AS expired \
+             ), \
              rate_limit_debit AS ( \
                  UPDATE harvest_rate_limit_buckets b \
                  SET tokens = {rate_limit_available} - 1.0, \
@@ -7708,6 +7897,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                    AND NOT ($7 = ANY($8)) \
                    AND {rate_limit_available} >= 1.0 \
                    AND ($9::timestamptz IS NULL OR $9::timestamptz > (SELECT ts FROM now_ts)) \
+                   AND NOT (SELECT expired FROM run_expired) \
                    AND {debit_eligibility} \
                  RETURNING b.key AS debited_key \
              ), \
@@ -7742,6 +7932,7 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
                        $9::timestamptz IS NULL \
                        OR $9::timestamptz > (SELECT ts FROM now_ts) \
                    ) \
+                   AND NOT (SELECT expired FROM run_expired) \
                    AND {claimed_eligibility} \
                  RETURNING harvest_task_queue.* \
              ) \
@@ -7819,10 +8010,10 @@ struct BatchedClaimCandidate {
     rate_limit_key: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     activity_name: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    scheduled_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     schedule_to_close_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    claim_due_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     sticky_rank: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -7832,18 +8023,21 @@ struct BatchedClaimCandidate {
 /// Keyset cursor resuming [`claim_task_batched_candidates_query`] just past
 /// the last row of an exhausted batch.
 ///
-/// Four columns, not three: `scheduled_at` and `effective_priority` commonly
+/// Four columns, not three: `claim_due_at` and `effective_priority` commonly
 /// tie across many rows in the same fixture (shared enqueue timestamp,
 /// shared priority). A cursor without `id` as a final tiebreak silently
 /// drops every row tied with the batch's own last row. That drop is not
 /// just once, but from every later batch too
 /// (`docs/assays/0005-claim-batched-seek-and-refine.md`, post-review item
 /// 1).
+///
+/// The third column is the claim-order due time, not `scheduled_at` (issue
+/// #1824). The cursor must compare the same key the scan sorts on.
 #[derive(Debug, Clone, Copy)]
 struct BatchCursor {
     sticky_rank: i32,
     effective_priority: i32,
-    scheduled_at: DateTime<Utc>,
+    claim_due_at: DateTime<Utc>,
     id: Uuid,
 }
 
@@ -7852,7 +8046,7 @@ impl From<&BatchedClaimCandidate> for BatchCursor {
         Self {
             sticky_rank: row.sticky_rank,
             effective_priority: row.effective_priority,
-            scheduled_at: row.scheduled_at,
+            claim_due_at: row.claim_due_at,
             id: row.id,
         }
     }
@@ -7918,7 +8112,7 @@ async fn fetch_claim_batch(
             cursor.map(|c| c.effective_priority),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            cursor.map(|c| c.scheduled_at),
+            cursor.map(|c| c.claim_due_at),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(cursor.map(|c| c.id))
         .bind::<diesel::sql_types::BigInt, _>(batch_size)
@@ -8794,17 +8988,180 @@ mod tests {
             "the cursor must be optional -- the first batch of an attempt \
              has no predecessor row to resume past; got:\n{sql}"
         );
+        let due_tie = format!("{CLAIM_ORDER_DUE_SQL} = $10 AND id > $11");
         assert!(
-            sql.contains("scheduled_at = $10 AND id > $11"),
+            sql.contains(&due_tie),
             "the cursor's final tiebreak must compare id, not just \
-             scheduled_at, or tied rows are silently skipped; got:\n{sql}"
+             the due time, or tied rows are silently skipped; got:\n{sql}"
         );
+        let due_after = format!("{CLAIM_ORDER_DUE_SQL} > $10");
         assert_eq!(
-            sql.matches("scheduled_at > $10").count() + sql.matches("scheduled_at = $10").count(),
+            sql.matches(&due_after).count() + sql.matches(&due_tie).count(),
             2,
             "the cursor OR-chain must have exactly one 'strictly after' \
-             branch and one 'tied, break on id' branch for scheduled_at; \
+             branch and one 'tied, break on id' branch for the due time; \
              got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("$10").count(),
+            2,
+            "only the two due-time branches bind $10; got:\n{sql}"
+        );
+    }
+
+    /// The SQL interval and the public constant name one handicap (issue #1824).
+    #[test]
+    fn claim_order_due_sql_spells_the_new_start_handicap() {
+        assert!(
+            CLAIM_ORDER_DUE_SQL.contains(&format!("INTERVAL '{NEW_START_HANDICAP_SECS} seconds'")),
+            "the SQL handicap must equal NEW_START_HANDICAP_SECS; got: {CLAIM_ORDER_DUE_SQL}"
+        );
+        assert!(CLAIM_ORDER_DUE_SQL.contains("new_start AND attempt = 0"));
+    }
+
+    /// Every claim variant sorts on the claim-order due time, after the
+    /// priority key (issue #1824).
+    #[test]
+    fn every_claim_query_sorts_on_the_claim_order_due_time() {
+        let order_key = format!("END DESC, {CLAIM_ORDER_DUE_SQL} ASC");
+        let variants = [
+            claim_task_query(),
+            claim_task_query_fenced(),
+            claim_task_by_id_query(),
+            claim_task_by_id_query_fenced(),
+            claim_task_query_for_kind(TaskType::Workflow, false),
+            claim_task_query_for_kind(TaskType::Activity, false),
+            claim_task_query_for_kind(TaskType::Workflow, true),
+            claim_task_query_for_kind(TaskType::Activity, true),
+        ];
+        for sql in variants {
+            assert_eq!(
+                sql.matches(&order_key).count(),
+                1,
+                "the due time must sort right after the priority key; got:\n{sql}"
+            );
+            assert!(!sql.contains("scheduled_at ASC"), "got:\n{sql}");
+        }
+        let batched = claim_task_batched_candidates_query();
+        assert!(batched.contains(&format!("{CLAIM_ORDER_DUE_SQL} AS claim_due_at")));
+        assert!(batched.contains("effective_priority DESC, claim_due_at ASC, id ASC"));
+    }
+
+    /// The expired-run gate (issue #1824) mirrors the timeout scanner, skips
+    /// a paused run, and takes no lock on the run row.
+    #[test]
+    fn expired_run_set_matches_the_scanner_and_takes_no_lock() {
+        for clause in [
+            "expired_runs AS MATERIALIZED",
+            "WHERE state = 'RUNNING'",
+            "deadline_at < NOW() OR chain_deadline_at < NOW()",
+        ] {
+            assert!(
+                EXPIRED_RUNS_CTE_SQL.contains(clause),
+                "missing {clause:?}; got:\n{EXPIRED_RUNS_CTE_SQL}"
+            );
+        }
+        for lock in ["FOR UPDATE", "FOR SHARE", "FOR KEY SHARE"] {
+            assert!(
+                !EXPIRED_RUNS_CTE_SQL.contains(lock),
+                "a run lock would invert the scanner's order"
+            );
+        }
+        assert!(EXPIRED_RUN_GATE_SQL.contains("workflow_exec_id IS NULL"));
+        assert!(EXPIRED_RUN_GATE_SQL.contains("NOT EXISTS"));
+    }
+
+    /// The batched attempt re-checks the run deadline on its own fresh clock
+    /// and gates both the debit and the claim on it (issue #1824).
+    #[test]
+    fn batched_attempt_rechecks_the_run_deadline_on_now_ts() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("e.deadline_at < (SELECT ts FROM now_ts)"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("e.chain_deadline_at < (SELECT ts FROM now_ts)"),
+            "got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("AND NOT (SELECT expired FROM run_expired)")
+                .count(),
+            2,
+            "the debit and the claim both read the re-check; got:\n{sql}"
+        );
+        assert!(
+            sql.starts_with("WITH now_ts AS"),
+            "now_ts stays the leading CTE"
+        );
+    }
+
+    /// The single-row claim re-checks the run deadline after the bucket lock,
+    /// and gates the debit and the claim on it (issue #1824).
+    #[test]
+    fn single_row_claim_rechecks_the_run_deadline_after_the_bucket_lock() {
+        let variants = [
+            claim_task_query(),
+            claim_task_query_fenced(),
+            claim_task_by_id_query(),
+            claim_task_by_id_query_fenced(),
+            claim_task_query_for_kind(TaskType::Workflow, false),
+            claim_task_query_for_kind(TaskType::Activity, true),
+        ];
+        for sql in variants {
+            assert_eq!(
+                sql.matches(FRESH_RUN_DEADLINE_CTES_SQL).count(),
+                1,
+                "got:\n{sql}"
+            );
+            assert_eq!(
+                sql.matches("AND NOT (SELECT expired FROM run_expired_now)")
+                    .count(),
+                2,
+                "the debit and the claim both read the re-check; got:\n{sql}"
+            );
+        }
+        let ctes = FRESH_RUN_DEADLINE_CTES_SQL;
+        let lock = ctes.find("FOR UPDATE OF b").expect("bucket lock");
+        let run = ctes.find("run_expired_now").expect("run check");
+        assert!(lock < run, "the clock is read after the lock");
+        assert!(
+            !ctes.contains("FOR KEY SHARE"),
+            "the run row is never locked"
+        );
+        assert_eq!(
+            ctes.matches("FOR UPDATE").count(),
+            1,
+            "only the bucket is locked"
+        );
+    }
+
+    /// Every claim variant carries the expired-run set and its gate exactly
+    /// once, inside `candidate` (issue #1824).
+    #[test]
+    fn every_claim_query_skips_expired_runs() {
+        let variants = [
+            claim_task_query(),
+            claim_task_query_fenced(),
+            claim_task_by_id_query(),
+            claim_task_by_id_query_fenced(),
+            claim_task_query_for_kind(TaskType::Workflow, false),
+            claim_task_query_for_kind(TaskType::Activity, false),
+            claim_task_query_for_kind(TaskType::Workflow, true),
+            claim_task_query_for_kind(TaskType::Activity, true),
+            claim_task_batched_candidates_query(),
+        ];
+        for sql in variants {
+            assert_eq!(sql.matches(EXPIRED_RUNS_CTE_SQL).count(), 1, "got:\n{sql}");
+            assert_eq!(sql.matches(EXPIRED_RUN_GATE_SQL).count(), 1, "got:\n{sql}");
+        }
+        let base = claim_task_query();
+        let candidate = base.find("candidate AS (").expect("candidate CTE");
+        let gate = base.find(EXPIRED_RUN_GATE_SQL).expect("gate");
+        let claimed = base.find("claimed AS (").expect("claimed CTE");
+        assert!(
+            candidate < gate && gate < claimed,
+            "the gate sits in candidate"
         );
     }
 
@@ -8869,12 +9226,12 @@ mod tests {
         );
         assert_eq!(
             sql.matches("SELECT ts FROM now_ts").count(),
-            10,
+            12,
             "every real-time read in this query -- both deadline checks, \
-             started_at, last_refilled_at, and the three NOW() reads \
+             started_at, last_refilled_at, the three NOW() reads \
              inside the rate-limit formula, rendered twice (SET and \
-             WHERE) -- must read the SAME materialized timestamp; \
-             got:\n{sql}"
+             WHERE), and the two run-deadline reads of issue #1824 -- \
+             must read the SAME materialized timestamp; got:\n{sql}"
         );
     }
 
@@ -11774,6 +12131,7 @@ mod tests {
             required_capabilities: None,
             context_headers: None,
             session_id: None,
+            new_start: false,
         };
         let NewTaskQueueItem {
             id: _,
@@ -11803,13 +12161,14 @@ mod tests {
             required_capabilities: _,
             context_headers: _,
             session_id: _,
+            new_start: _,
         } = sample;
         // The field destructure above is the compile-time proof that
         // NEW_TASK_QUEUE_ITEM_COLUMNS counts every field. This const block
         // is a second, independent compile-time check: the chunk size
         // computed from that count never crosses Postgres's ceiling.
         const {
-            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 27);
+            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 28);
             assert!(
                 ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
             );

@@ -5,7 +5,7 @@ use std::any::Any;
 #[cfg(feature = "connectors")]
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
@@ -1695,12 +1695,12 @@ async fn start_harvest_runtime(
     let router = ShardRouter::single();
 
     let (builder, runtime_already_started) = {
-        let mut guard = slot.lock().expect("harvest lock poisoned");
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
         (guard.builder.take(), guard.runtime.is_some())
     };
     #[cfg(feature = "connectors")]
     let connector_registrations = {
-        let mut guard = slot.lock().expect("harvest lock poisoned");
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut guard.connectors)
     };
 
@@ -2191,7 +2191,7 @@ async fn start_harvest_runtime(
     };
 
     {
-        let mut guard = slot.lock().expect("harvest lock poisoned");
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
         guard.runtime = Some(HarvestRuntime {
             runner,
             outbox,
@@ -2283,7 +2283,12 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     // The linked probe state reported the drain earlier. This call covers a
     // state with no linked probes.
     api_state.begin_draining();
-    let runtime = { slot.lock().expect("harvest lock poisoned").runtime.take() };
+    let runtime = {
+        slot.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .runtime
+            .take()
+    };
 
     let Some(runtime) = runtime else {
         // No runtime to stop (never started, or already stopped by a prior call).

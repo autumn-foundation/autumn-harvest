@@ -3634,6 +3634,7 @@ pub(crate) fn merge_paused_queue_banner_rows(
     by_queue
         .into_values()
         .map(|shard_rows| {
+            #[expect(clippy::expect_used, reason = "each group has at least one row")]
             let earliest = shard_rows
                 .iter()
                 .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
@@ -14998,6 +14999,7 @@ mod tests {
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
             timer_fires_at: None,
+            new_start: false,
         }
     }
 

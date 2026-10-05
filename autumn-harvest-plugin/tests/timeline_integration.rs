@@ -241,6 +241,11 @@ const INIT_SQL: &str = concat!(
     // issue #946: quota_key column on harvest_workflow_executions, referenced
     // by every WorkflowExecution::as_select() read-back in this suite.
     include_str!("../../autumn-harvest/migrations/20260725000000_harvest_workflow_quotas/up.sql"),
+    "\n",
+    // issue #1824: the new-start marker on harvest_task_queue. Every claim
+    // orders by it and `TaskQueueItem` selects it, so each claim in this suite
+    // needs it. Added inline for the same reason as the columns above.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
 );
 
 type HarvestApiApp = axum::Router;
