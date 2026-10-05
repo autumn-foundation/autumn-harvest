@@ -3463,6 +3463,20 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
                 Some(Timeout::Rollback)
             }
         }
+        // Another schema's `set_config` is a user function. It sets no bound,
+        // and it may change the real value, so it counts as a session clear.
+        "set_config"
+            if s.is_punct(k + 1, '(')
+                && k >= 2
+                && s.is_punct(k - 1, '.')
+                && !s.is(k - 2, "pg_catalog")
+                && lock_timeout_call(s, k + 1).is_some() =>
+        {
+            Some(Timeout::Set {
+                bounds: false,
+                local: false,
+            })
+        }
         // A named-argument call never sets a bound. When it may name
         // `lock_timeout`, it counts as a session clear, which fails closed.
         "set_config" if s.is_punct(k + 1, '(') && lock_timeout_call(s, k + 1) == Some(true) => {
@@ -7536,6 +7550,39 @@ fn an_array_comma_is_not_an_argument_separator() {
         let findings = lint_with_history(&[&earlier], call, true);
         assert_eq!(findings, [], "{earlier}\n{call}");
     }
+}
+
+#[test]
+fn a_set_config_in_another_schema_sets_no_bound() {
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    // `public.set_config` is a user function, which may not set the real value.
+    for setter in [
+        "SELECT public.set_config('lock_timeout', '5s', true);",
+        "DO $$\nBEGIN\n    PERFORM public.set_config('lock_timeout', '5s', true);\n    \
+         ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;",
+        "DO $$\nDECLARE v text;\nBEGIN\n    v := public.set_config('lock_timeout', '5s', true);\n    \
+         ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;",
+    ] {
+        let sql = format!("{setter}\n{lock}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            rules(&findings).contains(&Rule::LockTimeout),
+            "{sql}\n{findings:?}"
+        );
+        let n = findings.len();
+        let expected = if setter.starts_with("DO") { 2 } else { 1 };
+        assert_eq!(n, expected, "{sql}\n{findings:?}");
+    }
+    for call in ["pg_catalog.set_config", "set_config"] {
+        let sql = format!("SELECT {call}('lock_timeout', '5s', true);\n{lock}");
+        assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    }
+    // The user function may also change the real value, so it ends a bound.
+    let sql = format!(
+        "SET LOCAL lock_timeout = '5s';\nSELECT public.set_config('lock_timeout', '5s', true);\n{lock}"
+    );
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 #[test]

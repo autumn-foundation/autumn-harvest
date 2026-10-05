@@ -116,7 +116,8 @@ not accept it. `SET lock_timeout` must be its own statement. `ALTER ROLE ...
 SET lock_timeout` does not change the current session. Inside a `DO` block,
 `PERFORM set_config('lock_timeout', '5s', true)` also counts. It must be a
 bare `SELECT` or `PERFORM` of the call. A query with a filter may never call
-the function, so it does not count. The same call in a
+the function, so it does not count. A `set_config` in a schema other than
+`pg_catalog` is a user function, so it ends the bound. The same call in a
 function body does not count for the migration, because the body runs only
 when something calls the function. That includes a `BEGIN ATOMIC` body and the
 `RETURN` body of a SQL function. A lock in a function body needs its own
