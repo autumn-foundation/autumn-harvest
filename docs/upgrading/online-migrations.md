@@ -46,8 +46,11 @@ read, because it may drop the table.
 The lock must name the table exactly as the create does, schema included.
 
 A partition of a hot table is hot too, because it takes the live writes of its
-parent. The lint learns it from `PARTITION OF` or `ATTACH PARTITION` in an
-earlier migration. A detach or a drop does not make it cold again. The
+parent. An inheritance child of a hot table is hot for the same reason. A
+parent of a hot table is hot too, because its DDL recurses to the child. The
+lint learns each link from `PARTITION OF`, `ATTACH PARTITION`, `INHERIT` or
+`INHERITS` in an earlier migration. A detach or a drop does not make a table
+cold again. The
 partition manager creates `harvest_events_p_*` and `harvest_events_legacy` at
 run time, so the lint treats those names as hot.
 
@@ -311,7 +314,8 @@ reason. `20260915231809` is the first: it rebuilds a unique index on
 The list cannot grow. A digest pins its entries, so any new entry fails the
 build, and a new migration uses an annotation. An entry newer than the newest
 migration at the time the lint landed fails too. An entry that no longer
-matches a finding also fails the build.
+matches a finding also fails the build. An entry covers every finding of its
+rule in its file, so a digest pins the SQL of each listed migration as well.
 
 ## 8. Known limits
 

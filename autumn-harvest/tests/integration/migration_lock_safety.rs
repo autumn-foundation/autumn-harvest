@@ -43,6 +43,10 @@ const LEGACY_MIGRATION_DIGEST: u64 = 0x1dc3_f33d_ee51_d5ed;
 /// frozen: a new entry changes the digest, even below `GRANDFATHER_CEILING`.
 const GRANDFATHER_DIGEST: u64 = 0xe10d_069a_c2fc_ebb3;
 
+/// The `digest` of the SQL of each `GRANDFATHERED` migration. An entry covers
+/// every finding of its rule in that file, so the file must not change.
+const GRANDFATHERED_SQL_DIGEST: u64 = 0x1b47_72a0_0f9b_2f06;
+
 /// The newest migration that `GRANDFATHERED` may name.
 ///
 /// This is the newest migration on disk when the lint landed. A newer
@@ -264,6 +268,10 @@ struct History {
     /// Each partition of a hot table, without its schema. A partition takes
     /// the live writes of its parent, so it is hot too.
     partitions: BTreeSet<String>,
+    /// Each table with a hot partition or inheritance child, without its
+    /// schema. DDL on the parent recurses to its children, so it locks the hot
+    /// child too.
+    hot_parents: BTreeSet<String>,
     /// Each table that a migration created with `PARTITION BY`, without its
     /// schema. Postgres runs no `CONCURRENTLY` index DDL on such a table.
     partitioned: BTreeSet<String>,
@@ -307,6 +315,7 @@ impl History {
         let name = base(table);
         HOT_TABLES.contains(&name)
             || self.partitions.contains(name)
+            || self.hot_parents.contains(name)
             || name.starts_with(PARTITION_PREFIX)
             || name == LEGACY_PARTITION
     }
@@ -1830,11 +1839,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 learn_partition(history, parent.as_deref(), child.as_deref());
                 raws.push(Raw::lock(s.starts[k], "PARTITION OF", parent));
             }
-            Some("attach") if s.keyword(k + 1, "partition") => {
-                let parent = s.statement_table(s.starts[k]);
-                let child = s.qualified_name(k + 2).map(|(t, _)| t);
-                learn_partition(history, parent.as_deref(), child.as_deref());
-            }
+            Some("inherit" | "inherits" | "attach") => learn_link(&s, k, history),
             // A function body keeps its own changes, for the locks in it.
             _ => {
                 let change = recorded_change(&s, k, unconditional[k], (path_change, &path_bodies));
@@ -3970,10 +3975,43 @@ fn references(s: &Stmts, k: usize, history: &mut History) -> Option<Raw> {
 /// makes a later lock stricter. The history only grows, so a detach or a drop
 /// keeps the name hot.
 fn learn_partition(history: &mut History, parent: Option<&str>, child: Option<&str>) {
-    if let (Some(parent), Some(child)) = (parent, child)
-        && history.is_hot(parent)
-    {
+    let (Some(parent), Some(child)) = (parent, child) else {
+        return;
+    };
+    if history.is_hot(parent) {
         history.partitions.insert(base(child).to_string());
+    }
+    if history.is_hot(child) {
+        history.hot_parents.insert(base(parent).to_string());
+    }
+}
+
+/// Learn the parent and child that an `ATTACH PARTITION`, `INHERIT` or
+/// `INHERITS` at `k` links, for `learn_partition`.
+fn learn_link(s: &Stmts, k: usize, history: &mut History) {
+    let child = s.statement_table(s.starts[k]);
+    let parents: Vec<String> = if s.keyword(k, "attach") && s.keyword(k + 1, "partition") {
+        // The statement names the parent, and the clause names the partition.
+        let parent = s.statement_table(s.starts[k]);
+        let partition = s.qualified_name(k + 2).map(|(t, _)| t);
+        learn_partition(history, parent.as_deref(), partition.as_deref());
+        return;
+    } else if s.keyword(k, "inherit") && s.keyword(s.starts[k], "alter") {
+        s.qualified_name(k + 1)
+            .map(|(t, _)| t)
+            .into_iter()
+            .collect()
+    } else if s.keyword(k, "inherits") && s.is_punct(k + 1, '(') {
+        let close = closing_paren(s, k + 1).unwrap_or(k + 1);
+        (k + 2..close)
+            .filter(|&j| j == k + 2 || s.is_punct(j - 1, ','))
+            .filter_map(|j| s.qualified_name(j).map(|(t, _)| t))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for parent in &parents {
+        learn_partition(history, Some(parent), child.as_deref());
     }
 }
 
@@ -7702,6 +7740,30 @@ fn a_set_config_bound_applies_after_its_arguments() {
 }
 
 #[test]
+fn an_inheritance_link_to_a_hot_table_is_hot() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    // DDL on a parent recurses to its children, so it locks a hot child too.
+    let lock = "ALTER TABLE cold_parent ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], lock, true), []);
+    for link in [
+        "ALTER TABLE harvest_events INHERIT cold_parent;",
+        "ALTER TABLE cold_parent ATTACH PARTITION harvest_events FOR VALUES IN (1);",
+    ] {
+        let findings = lint_with_history(&[&format!("{set}{link}")], lock, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{link}\n{findings:?}"
+        );
+    }
+    // A child of a hot table shares its scans, so it is hot too.
+    let create = "CREATE TABLE scratch_child (y INT) INHERITS (harvest_events);";
+    let lock = "ALTER TABLE scratch_child ADD COLUMN z INT;";
+    let findings = lint_with_history(&[create], lock, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
 fn an_inner_routine_bound_does_not_cover_the_outer_body() {
     // Creating the inner routine changes nothing for the outer call.
     for (clause, setter) in [
@@ -8339,6 +8401,28 @@ fn the_grandfather_list_is_frozen() {
         key_digest(&grandfather_keys()),
         GRANDFATHER_DIGEST,
         "GRANDFATHERED changed. It is frozen, so a new migration uses the in-file annotation."
+    );
+}
+
+#[test]
+fn grandfathered_migrations_are_unchanged() {
+    // An entry covers every finding of its rule in that file. So the file
+    // must not change, or a new unsafe statement would hide behind it.
+    let migrations = load_migrations();
+    let texts: BTreeSet<String> = migrations
+        .iter()
+        .filter(|m| {
+            GRANDFATHERED
+                .iter()
+                .any(|(t, n, _, _)| *t == m.tree && *n == m.name)
+        })
+        .map(|m| format!("{}/{}\n{}", m.tree, m.name, m.sql.replace("\r\n", "\n")))
+        .collect();
+    assert_eq!(texts.len(), 8, "every grandfathered migration is on disk");
+    assert_eq!(
+        key_digest(&texts),
+        GRANDFATHERED_SQL_DIGEST,
+        "a grandfathered migration changed. Shipped migrations must not change."
     );
 }
 
