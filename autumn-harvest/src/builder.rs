@@ -1763,10 +1763,29 @@ impl HarvestBuilder {
     /// id is a compile-time-constant deployment decision, not runtime input, so
     /// a malformed one is a configuration bug that must not boot.
     #[must_use]
+    #[expect(clippy::expect_used, reason = "documented panic on a bad key id")]
     pub fn payload_codec_key(self, key_id: &str, codec: impl PayloadCodec + 'static) -> Self {
         self.payload_codecs
             .register_key(key_id, Arc::new(codec))
             .expect("invalid payload codec key id");
+        self
+    }
+
+    /// Register an AES-256-GCM [`AeadCodec`](crate::aead_codec::AeadCodec)
+    /// under its own key id (issue #1825).
+    ///
+    /// This is [`HarvestBuilder::payload_codec_key`] with the key id taken
+    /// from the codec. The envelope `kid` and the codec header then agree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the key id is already registered. A duplicate key id is a
+    /// configuration bug that must not boot.
+    #[must_use]
+    pub fn aead_payload_codec_key(self, codec: crate::aead_codec::AeadCodec) -> Self {
+        codec
+            .register_with(&self.payload_codecs)
+            .expect("invalid AEAD payload codec key");
         self
     }
 
@@ -1779,6 +1798,7 @@ impl HarvestBuilder {
     /// [`HarvestBuilder::payload_codec_key`]. Activating a key this process
     /// cannot encode with must not boot.
     #[must_use]
+    #[expect(clippy::expect_used, reason = "documented panic on an unknown key id")]
     pub fn active_payload_codec_key(self, key_id: &str) -> Self {
         self.payload_codecs
             .set_active_key(key_id)
@@ -2430,6 +2450,10 @@ impl HarvestBuilder {
     /// Panics when retention settings are invalid. Prefer [`Self::try_build`]
     /// if you want startup errors instead.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "documented panic: `try_build` returns the error"
+    )]
     pub fn build(self) -> BuiltHarvest {
         self.try_build()
             .expect("HarvestBuilder::build failed validation")
@@ -3364,10 +3388,10 @@ fn validate_local_activity_timeouts(
         if !activity.is_local {
             continue;
         }
-        if activity.default_start_to_close.is_some_and(|stc| stc > cap) {
+        if let Some(actual) = activity.default_start_to_close.filter(|stc| *stc > cap) {
             return Err(HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
                 activity: activity.name.to_string(),
-                actual: activity.default_start_to_close.unwrap(),
+                actual,
                 cap,
             });
         }
@@ -5704,6 +5728,35 @@ mod tests {
             "the builder's registry must reach the handler registry, which is \
              what the sweep, the writes and replay all read"
         );
+    }
+
+    /// The AEAD builder hook registers the codec under its own key id
+    /// (issue #1825).
+    #[test]
+    fn aead_payload_codec_key_registers_under_the_codec_key_id() {
+        use crate::aead_codec::{AEAD_CODEC_ID, AeadCodec, DataKey};
+
+        let codec = AeadCodec::new("2026-10", &DataKey::generate()).expect("codec");
+        let builder = HarvestBuilder::new().aead_payload_codec_key(codec);
+        let codecs = builder.payload_codecs();
+        assert_eq!(codecs.active_key_id(), "2026-10");
+        assert_eq!(
+            codecs.codec_for_key("2026-10").map(|c| c.codec_id()),
+            Some(AEAD_CODEC_ID)
+        );
+    }
+
+    /// A duplicate AEAD key id must not boot (issue #1825).
+    #[test]
+    #[should_panic(expected = "invalid AEAD payload codec key")]
+    fn aead_payload_codec_key_panics_on_a_duplicate_key_id() {
+        use crate::aead_codec::{AeadCodec, DataKey};
+
+        let first = AeadCodec::new("k1", &DataKey::generate()).expect("codec");
+        let second = AeadCodec::new("k1", &DataKey::generate()).expect("codec");
+        let _ = HarvestBuilder::new()
+            .aead_payload_codec_key(first)
+            .aead_payload_codec_key(second);
     }
 
     /// Both worker-parts hops must thread the configured durable-log policy

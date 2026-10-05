@@ -285,6 +285,10 @@ mod tls {
     /// The `prefer` and `allow` config: encryption without a certificate
     /// check. It reads no trust store, so a host without CA certificates can
     /// still encrypt.
+    #[expect(
+        clippy::expect_used,
+        reason = "the ring provider supports the defaults"
+    )]
     pub(super) fn encrypt_only() -> rustls::ClientConfig {
         static CONFIG: OnceLock<rustls::ClientConfig> = OnceLock::new();
         CONFIG

@@ -62,6 +62,23 @@ After a successful fire, `fire_claim_token` and `fire_claimed_until` are reset t
 
 No. If the crashed replica successfully called `start_or_load_workflow_execution` before crashing (before it could advance `next_run_at`), the retry by the healthy peer will receive `AlreadyExists` (because scheduled workflow IDs are deterministic: `sched:{workflow_name}:{logical_date}`). The `AlreadyExists` response is treated as a safe duplicate, not an error.
 
+### Buffered-Run Drain (issue #1820)
+
+The `BufferOne` and `BufferAll` overlap policies store pending slots in `buffered_runs`. Each tick drains them before it fires due slots. The drain uses the same claim:
+
+1. The drain skips a row with no free run slot or a matching admission gate. This check takes no claim and writes nothing.
+2. The drain generates a token and claims the row with the `UPDATE` above. If a peer holds a live claim, the drain skips the row.
+3. The drain reads the row again, so it uses the current `buffered_runs`, `runs_started` and capacity.
+4. The drain starts the buffered runs, then writes `buffered_runs` and `runs_started`. The write matches only this replica's token, and it clears the claim.
+
+Every other exit also releases the claim, but only while this replica's token still holds it. While the claim is live, one replica drains a row, and `runs_started` counts each slot once.
+
+The claim lasts 30 s, and the drain does not renew it. A drain that crashes or runs past 30 s can lose the claim to a peer. The peer then drains the same buffer again. `RejectDuplicate` on the deterministic workflow ID stops the second execution, as in the crash case above. The late drain's final write matches no row, so `runs_started` still counts each slot once.
+
+The drain and the tick fire path use one claim, so they do not overlap on a row while the claim is live. A schedule `PATCH` returns `409` while a drain holds the claim, as it does during a fire. The claim lasts at most 30 s. Retry the `PATCH`.
+
+The drain does not emit `harvest.schedule.fire_attempts`. A drain that skips a claimed row logs at `debug` level only. A drain claim can make a peer's tick record `lost_race` and fire the due slot one tick later.
+
 ---
 
 ## Observability: Verifying the Contract in Production
@@ -157,5 +174,4 @@ Workers with explicit shard assignments only poll their assigned shards. The sch
 ## Out of Scope for This Runbook
 
 - **Worker poll loop HA**: workers already coordinate via `FOR UPDATE SKIP LOCKED` in `queue.rs`. This runbook covers the scheduler tick path only.
-- **`drain_buffered_schedule_runs`**: the buffered-run drain path (for `BufferOne`/`BufferAll` overlap policies) has a lower-severity double-dispatch risk. In practice, `WorkflowIdReusePolicy::RejectDuplicate` on scheduled IDs prevents double execution. A dedicated claim guard for drain is tracked separately.
 - **Cross-region active-active**: single-region multi-replica is the target topology. Cross-region deployments with separate Postgres instances should pin the scheduler to a single region.

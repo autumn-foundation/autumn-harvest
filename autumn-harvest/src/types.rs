@@ -1611,6 +1611,26 @@ mod tests {
         assert_eq!(wrapped.shard(), ShardId::new(9));
     }
 
+    // Issue #1821: no UUID makes the string round-trip fail.
+    // The scanners therefore use `from_uuid` and have no failure branch.
+    #[test]
+    fn execution_id_parse_accepts_nil_and_max_uuids_1821() -> Result<(), uuid::Error> {
+        for id in [Uuid::nil(), Uuid::max()] {
+            let parsed: ExecutionId = id.to_string().parse()?;
+            assert_eq!(parsed, ExecutionId::from_uuid(id));
+        }
+        Ok(())
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn execution_id_parse_accepts_every_uuid_1821(bits in proptest::prelude::any::<u128>()) {
+            let id = Uuid::from_u128(bits);
+            let parsed = id.to_string().parse::<ExecutionId>();
+            proptest::prop_assert_eq!(parsed.ok(), Some(ExecutionId::from_uuid(id)));
+        }
+    }
+
     #[test]
     fn activity_exec_id_display_roundtrip() -> Result<(), uuid::Error> {
         let id = ActivityExecId::new();

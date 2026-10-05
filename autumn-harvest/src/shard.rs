@@ -1283,10 +1283,12 @@ fn split_options_preserving_escapes(options: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut has_token = false;
-    let mut chars = options.chars().peekable();
+    let mut chars = options.chars();
     while let Some(c) = chars.next() {
-        if c == '\\' && chars.peek().is_some() {
-            current.push(chars.next().expect("peeked Some above"));
+        if c == '\\'
+            && let Some(escaped) = chars.next()
+        {
+            current.push(escaped);
             has_token = true;
         } else if is_postgres_whitespace(c) {
             if has_token {
@@ -1599,6 +1601,7 @@ impl ShardedDbPool {
         by_group
             .into_values()
             .map(|shards| {
+                #[expect(clippy::expect_used, reason = "`pool_group` names only pooled shards")]
                 let pool = self
                     .pools
                     .get(&shards[0])
@@ -1644,6 +1647,7 @@ impl ShardedDbPool {
     /// and the default shard entry has been removed; [`ShardedDbPool::single`]
     /// and [`ShardedDbPool::from_map`] guarantee a default entry exists.
     #[must_use]
+    #[expect(clippy::expect_used, reason = "the constructors keep a default pool")]
     pub fn pool_for(&self, shard: ShardId) -> &DbPool {
         self.pools
             .get(&shard)
@@ -2000,6 +2004,16 @@ mod tests {
     fn router_with(shards: &[i32]) -> ShardRouter {
         let ids: Vec<ShardId> = shards.iter().copied().map(ShardId::new).collect();
         ShardRouter::new(ids.clone(), ids.clone(), ids[0])
+    }
+
+    // Issue #1821: the escape split no longer uses `expect`. Pin its output.
+    #[test]
+    #[cfg(feature = "db")]
+    fn split_options_keeps_escapes_and_a_trailing_backslash_1821() {
+        assert_eq!(
+            split_options_preserving_escapes("a\\ b\\,c  d\\"),
+            vec!["a b,c".to_owned(), "d\\".to_owned()]
+        );
     }
 
     #[test]

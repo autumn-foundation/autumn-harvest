@@ -1905,6 +1905,10 @@ mod db {
         }
         // `remaining` is empty, so every expected shard matched the `Ok(Some(_))`
         // "retiring" arm above and contributed to `least_elapsed`.
+        #[expect(
+            clippy::expect_used,
+            reason = "an empty `remaining` sets `least_elapsed`"
+        )]
         let (elapsed_secs, since) =
             least_elapsed.expect("every shard reached the retiring arm when `remaining` is empty");
         let window_secs = staleness_window.as_secs_f64();

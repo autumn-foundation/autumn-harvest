@@ -438,25 +438,18 @@ pub fn effective_chain_timeout(
 /// whole-chain lifetime and is terminated as a chain timeout. A chain-only expiry
 /// (no per-run deadline configured) is handled without panicking — the scanner
 /// selects rows on either disjunct, so `deadline_at` may be `None` here.
+///
+/// Returns `None` when no deadline fired before `now` (issue #1821).
 #[must_use]
 pub fn classify_workflow_timeout(
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
-) -> (chrono::DateTime<chrono::Utc>, TimeoutKind) {
-    let chain_fired = chain_deadline_at.is_some_and(|d| d < now);
-    if chain_fired {
-        (
-            chain_deadline_at.expect("chain_fired implies chain_deadline_at is Some"),
-            TimeoutKind::Chain,
-        )
-    } else {
-        (
-            deadline_at
-                .expect("selected row without a fired chain deadline implies deadline_at < NOW()"),
-            TimeoutKind::Run,
-        )
-    }
+) -> Option<(chrono::DateTime<chrono::Utc>, TimeoutKind)> {
+    let fired = |deadline: Option<chrono::DateTime<chrono::Utc>>| deadline.filter(|d| *d < now);
+    fired(chain_deadline_at)
+        .map(|chain| (chain, TimeoutKind::Chain))
+        .or_else(|| fired(deadline_at).map(|run| (run, TimeoutKind::Run)))
 }
 
 /// Find all tasks that have exceeded their timeout limits.
@@ -520,12 +513,6 @@ pub async fn find_timed_out_tasks(
     }
 
     Ok(results)
-}
-
-fn execution_id_from_uuid(id: uuid::Uuid) -> crate::types::ExecutionId {
-    id.to_string()
-        .parse()
-        .expect("database UUIDs must round-trip into ExecutionId")
 }
 
 fn timeout_error(task_name: &str, reason: &TimeoutReason) -> String {
@@ -1179,7 +1166,7 @@ async fn commit_workflow_execution_timeout(
             if let Some(parent_uuid) = parent_uuid {
                 wake_parent_for_child_timeout(
                     conn,
-                    execution_id_from_uuid(parent_uuid),
+                    ExecutionId::from_uuid(parent_uuid),
                     exec_id,
                     &error_msg,
                 )
@@ -1664,7 +1651,7 @@ pub async fn force_fail_activity(
     use crate::failure::IntoActivityErrorString;
     use crate::schema::harvest_task_queue::dsl;
 
-    let exec_id = execution_id_from_uuid(workflow_exec_id);
+    let exec_id = ExecutionId::from_uuid(workflow_exec_id);
     let reason = reason.map(str::to_owned);
 
     // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
@@ -1982,7 +1969,7 @@ async fn enforce_workflow_timeout(
             {
                 wake_parent_for_child_timeout(
                     conn,
-                    execution_id_from_uuid(parent_uuid),
+                    ExecutionId::from_uuid(parent_uuid),
                     exec_id,
                     &error,
                 )
@@ -2109,7 +2096,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
     let mut count = 0usize;
 
     for task in &expired {
-        let exec_id = execution_id_from_uuid(task.workflow_exec_id);
+        let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
         let exec_uuid = task.workflow_exec_id;
         let activity_id = ActivityExecId::from_uuid(task.activity_id);
         let task_id = task.id;
@@ -2299,12 +2286,16 @@ pub async fn enforce_workflow_execution_timeouts(
     let count = expired.len();
 
     for execution in &expired {
-        let exec_id = execution_id_from_uuid(execution.id);
+        let exec_id = ExecutionId::from_uuid(execution.id);
         // Chain deadline takes precedence when both fired (issue #617). A
-        // chain-only expiry has no per-run `deadline_at`, so classification must
-        // not `.expect()` `deadline_at`.
-        let (deadline, timeout_kind) =
-            classify_workflow_timeout(execution.deadline_at, execution.chain_deadline_at, now);
+        // chain-only expiry has no per-run `deadline_at`.
+        let Some((deadline, timeout_kind)) =
+            classify_workflow_timeout(execution.deadline_at, execution.chain_deadline_at, now)
+        else {
+            // The scan filter makes this unreachable. Skip the row, not the pass.
+            tracing::warn!(exec_id = %exec_id, "timed-out row has no fired deadline; skipping");
+            continue;
+        };
         let timed_out_at = Utc::now();
 
         let timeout_event = WorkflowEvent::WorkflowExecutionTimedOut {
@@ -4817,7 +4808,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
                 enforce_activity_timeout(
                     conn,
                     &task,
-                    execution_id_from_uuid(exec_uuid),
+                    ExecutionId::from_uuid(exec_uuid),
                     &reason,
                     circuit_breakers,
                     metrics,
@@ -4829,7 +4820,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
                 enforce_workflow_timeout(
                     conn,
                     &task,
-                    execution_id_from_uuid(exec_uuid),
+                    ExecutionId::from_uuid(exec_uuid),
                     &reason,
                     metrics,
                     payload_codecs,
@@ -5355,7 +5346,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
     let count = oversized.len();
 
     for row in &oversized {
-        let exec_id = execution_id_from_uuid(row.id);
+        let exec_id = ExecutionId::from_uuid(row.id);
         let event_count = row.event_count;
 
         let error_msg =
@@ -5438,7 +5429,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                 if let Some(parent_uuid) = parent_uuid {
                     wake_parent_for_child_timeout(
                         conn,
-                        execution_id_from_uuid(parent_uuid),
+                        ExecutionId::from_uuid(parent_uuid),
                         exec_id,
                         &error_msg,
                     )
@@ -6483,7 +6474,7 @@ mod tests {
         let run = now - Duration::seconds(10);
         let chain = now - Duration::seconds(5);
         // Both fired → chain wins (precedence).
-        let (fired, kind) = classify_workflow_timeout(Some(run), Some(chain), now);
+        let (fired, kind) = classify_workflow_timeout(Some(run), Some(chain), now).unwrap();
         assert_eq!(kind, TimeoutKind::Chain);
         assert_eq!(fired, chain);
     }
@@ -6495,11 +6486,11 @@ mod tests {
         let run = now - Duration::seconds(10);
         // Chain deadline in the future (not fired) → run wins.
         let future_chain = now + Duration::hours(1);
-        let (fired, kind) = classify_workflow_timeout(Some(run), Some(future_chain), now);
+        let (fired, kind) = classify_workflow_timeout(Some(run), Some(future_chain), now).unwrap();
         assert_eq!(kind, TimeoutKind::Run);
         assert_eq!(fired, run);
         // No chain deadline at all → run wins.
-        let (fired2, kind2) = classify_workflow_timeout(Some(run), None, now);
+        let (fired2, kind2) = classify_workflow_timeout(Some(run), None, now).unwrap();
         assert_eq!(kind2, TimeoutKind::Run);
         assert_eq!(fired2, run);
     }
@@ -6510,9 +6501,29 @@ mod tests {
         let now = Utc::now();
         let chain = now - Duration::seconds(5);
         // A chain-only expiry has no per-run deadline_at — must NOT panic.
-        let (fired, kind) = classify_workflow_timeout(None, Some(chain), now);
+        let (fired, kind) = classify_workflow_timeout(None, Some(chain), now).unwrap();
         assert_eq!(kind, TimeoutKind::Chain);
         assert_eq!(fired, chain);
+    }
+
+    // Issue #1821: a scanned row with no fired deadline must not panic the scanner.
+    #[test]
+    fn classify_workflow_timeout_without_a_fired_deadline_does_not_panic_1821() {
+        let now = Utc::now();
+        let future = now + chrono::Duration::hours(1);
+        for (run, chain) in [
+            (None, None),
+            (None, Some(future)),
+            (Some(future), None),
+            (Some(future), Some(future)),
+            (Some(now), None),
+        ] {
+            let result = std::panic::catch_unwind(|| classify_workflow_timeout(run, chain, now));
+            assert_eq!(result.ok(), Some(None), "run={run:?} chain={chain:?}");
+        }
+        let past = now - chrono::Duration::seconds(1);
+        let fired = classify_workflow_timeout(Some(future), Some(past), now);
+        assert_eq!(fired, Some((past, TimeoutKind::Chain)));
     }
 
     #[test]
