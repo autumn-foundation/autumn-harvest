@@ -178,7 +178,7 @@ An activity attempt owns its task row only through its claim. The claim is the p
 
 *Invariant.* A task-row write takes effect only while its claim is current. So only the current claim writes the terminal event and the terminal row state.
 
-*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release and the rate-limit deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
+*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral and the retry-budget deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
 
 The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs only on a worker without the handler. That worker never runs the activity, so it never issues an owner write for it.
 
@@ -196,7 +196,7 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 
 *Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
 
-A formal model of this protocol is tracked in issue #1819.
+*Model.* `formal/tla/ActivityClaim.tla` models this protocol (issue #1819). TLC checks the invariant over every interleaving of a bounded model (3 workers, 5 claims). With the fence off, it reproduces the #1789 bug. See [`formal-methods.md`](testing/formal-methods.md).
 
 **10. Suspension readiness (issue #1797)**
 
@@ -1711,6 +1711,9 @@ randomized- and model-checking-based testing layers:
   `heartbeat.rs` (issue #1800).
 * [`docs/testing/concurrency-model-checking.md`](testing/concurrency-model-checking.md)
   — the evaluation of loom / Shuttle / Turmoil behind the adoptions above.
+* [`docs/testing/formal-methods.md`](testing/formal-methods.md) — TLA+
+  models of the core protocols and Kani proofs of the pure kernels
+  (issue #1819).
 
 ---
 
