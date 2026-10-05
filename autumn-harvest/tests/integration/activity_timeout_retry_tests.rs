@@ -1053,12 +1053,19 @@ async fn timeout_duration_counts_from_the_handler_start() {
 /// Seed a one-token bucket that never refills, and point `task_id` at it.
 /// A bucket that refills would replace a missing refund on its own.
 async fn one_token_bucket(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
+    bucket(conn, task_id, 1.0).await
+}
+
+/// Seed a bucket with one token and room for `burst`, and point `task_id` at
+/// it. It never refills.
+async fn bucket(conn: &mut AsyncPgConnection, task_id: Uuid, burst: f64) -> String {
     let key = format!("t1809-bucket-{task_id}");
     diesel::sql_query(
         "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
-         VALUES ($1, 0.0, 1.0, 1.0, NOW())",
+         VALUES ($1, 0.0, $2, 1.0, NOW())",
     )
     .bind::<diesel::sql_types::Text, _>(key.as_str())
+    .bind::<diesel::sql_types::Double, _>(burst)
     .execute(conn)
     .await
     .expect("seed the rate-limit bucket");
@@ -1143,6 +1150,129 @@ async fn started_timeout_retry_keeps_its_rate_limit_debit() {
     assert!(
         tokens < 0.01,
         "the started attempt keeps its debit: {tokens}"
+    );
+}
+
+/// A terminal timeout of a claim whose handler never started refunds the
+/// claim's rate-limit token, as a retry does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unstarted_terminal_timeout_refunds_its_rate_limit_token() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-refund-final");
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (_exec_id, task_id) =
+        seed_activity(&mut conn, &queue, "t1809_refund_final", 1, timeouts).await;
+    let key = one_token_bucket(&mut conn, task_id).await;
+
+    claim(&mut conn, &queue, "w-refund-final").await;
+    age_claim(&mut conn, task_id).await;
+    enforce(&mut conn, None).await;
+
+    assert_eq!(
+        task_row(&mut conn, task_id).await.state,
+        "FAILED",
+        "the last attempt times out for good"
+    );
+    let tokens = bucket_tokens(&mut conn, &key).await;
+    assert!(
+        tokens >= 0.99,
+        "the unstarted attempt gives its token back: {tokens}"
+    );
+}
+
+/// A circuit breaker that tracks an activity moves its debit to dispatch, so
+/// its claim debits nothing. An unstarted timeout then refunds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unstarted_timeout_of_a_tracked_activity_refunds_nothing() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-tracked");
+    let activity = "t1809_tracked";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (_exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+    // Room for two tokens, so an extra refund shows.
+    let key = bucket(&mut conn, task_id, 2.0).await;
+
+    let claimed = queue::claim_task(
+        &mut conn,
+        std::slice::from_ref(&queue),
+        "w-tracked",
+        "",
+        None,
+        &[activity.to_string()],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("a claimable task");
+    assert_eq!(claimed.id, task_id);
+    age_claim(&mut conn, task_id).await;
+    enforce(&mut conn, Some(&trip_on(activity, 3))).await;
+
+    assert_eq!(
+        task_row(&mut conn, task_id).await.state,
+        "PENDING",
+        "the timeout retries"
+    );
+    let tokens = bucket_tokens(&mut conn, &key).await;
+    assert!(
+        (tokens - 1.0).abs() < 0.01,
+        "the tracked claim took no token, so none comes back: {tokens}"
+    );
+}
+
+/// A result write that fails before it knows its outcome reads the claim's
+/// timeout record. A record means the enforcer settled and counted the
+/// attempt, so the worker records nothing more and the record goes away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_result_write_honours_the_timeout_record() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+    let queue = unique("t1809-settle");
+    let activity = "t1809_settle";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+
+    let claimed = claim(&mut conn, &queue, "w-settle").await;
+    start(&mut conn, &claimed, exec_id, activity).await;
+    age_claim(&mut conn, task_id).await;
+    // The worker holds the claim as it saw it: aged, and started.
+    let held = task_row(&mut conn, task_id).await;
+    enforce(&mut conn, None).await;
+    assert_eq!(
+        task_row(&mut conn, task_id).await.timed_out_claims,
+        Some(vec![held.started_at]),
+        "the enforcer records the timed-out claim"
+    );
+
+    let settled = autumn_harvest::worker::settle_result_write_for_test(&pool, &held, None).await;
+    assert_eq!(
+        settled,
+        (Some(false), true),
+        "a timeout took the claim, so the failed write did not apply"
+    );
+    assert_eq!(
+        task_row(&mut conn, task_id).await.timed_out_claims,
+        Some(vec![]),
+        "the owner takes its record"
+    );
+
+    let unrelated = autumn_harvest::worker::settle_result_write_for_test(&pool, &held, None).await;
+    assert_eq!(
+        unrelated,
+        (None, false),
+        "without a record, the write outcome stays unknown"
     );
 }
 

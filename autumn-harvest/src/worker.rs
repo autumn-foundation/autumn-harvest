@@ -16088,6 +16088,43 @@ impl Drop for AttemptMetrics<'_> {
 /// connection, with a bounded acquire (issue #1788). If every try fails, the
 /// answer is unknown. The loss then counts as no timeout here, and a warning
 /// says so. The enforcing process counted the timeout in its own breaker.
+/// Settle the outcome of a result write against the claim's timeout record
+/// (issue #1809).
+///
+/// `applied` is the answer of the write: `Some(false)` when another path
+/// settled the attempt first, and `None` when it failed before ownership was
+/// known. Unless the write applied, the record is read and taken. A record
+/// means that a timeout took this claim. The enforcer then counted the
+/// attempt. Both writes are claim-fenced, so this write did not apply.
+///
+/// Returns the settled `applied` and whether a timeout took the claim.
+async fn settle_result_write(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    applied: Option<bool>,
+) -> (Option<bool>, bool) {
+    if applied == Some(true) {
+        return (applied, false);
+    }
+    let lost_to_timeout = claim_lost_to_timeout(pool, task).await;
+    let settled = if lost_to_timeout {
+        Some(false)
+    } else {
+        applied
+    };
+    (settled, lost_to_timeout)
+}
+
+/// Test entry point for [`settle_result_write`].
+#[doc(hidden)]
+pub async fn settle_result_write_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    applied: Option<bool>,
+) -> (Option<bool>, bool) {
+    settle_result_write(pool, task, applied).await
+}
+
 async fn claim_lost_to_timeout(pool: &DbPool, task: &TaskQueueItem) -> bool {
     let Some(started_at) = task.started_at else {
         return false;
@@ -17940,10 +17977,11 @@ async fn process_activity_task(
     .await;
     // A failed write still releases an admitted probe, without a trip. A
     // lost claim counts only when a timeout took it (see `on_claim_lost`).
-    let applied = finalized.as_ref().ok().copied();
+    let mut applied = finalized.as_ref().ok().copied();
     // A cancelled attempt took its record above, and reports no outcome.
-    if applied == Some(false) && circuit_outcome.is_some() {
-        attempt_metrics.counted_by_enforcer = claim_lost_to_timeout(pool, task).await;
+    if circuit_outcome.is_some() {
+        (applied, attempt_metrics.counted_by_enforcer) =
+            settle_result_write(pool, task, applied).await;
     }
     let lost_to_timeout = applied == Some(false)
         && attempt_metrics.counted_by_enforcer

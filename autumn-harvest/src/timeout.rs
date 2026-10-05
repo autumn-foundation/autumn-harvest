@@ -1315,6 +1315,21 @@ async fn commit_workflow_execution_timeout(
 // The `dispatch::buffered_settled` wrap (issue #1429) added two lines over
 // the 100-line cap. The transaction below is one atomic unit; splitting it
 // would only move lines around, not shrink the function.
+/// The rate-limit key whose token the claim of `task` debited (issue #1809).
+///
+/// The claim debits a token for a rate-limited activity, unless a circuit
+/// breaker tracks it. A tracked activity debits at dispatch instead, after
+/// any local wait. The enforcer cannot tell whether that dispatch happened,
+/// so it refunds nothing for a tracked activity.
+fn claim_rate_limit_debit<'a>(
+    task: &'a TaskQueueItem,
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    activity_name: &str,
+) -> Option<&'a str> {
+    let tracked = circuit_breakers.is_some_and(|breakers| breakers.has_policy(activity_name));
+    task.rate_limit_key.as_deref().filter(|_| !tracked)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn enforce_activity_timeout(
     conn: &mut AsyncPgConnection,
@@ -1616,12 +1631,15 @@ async fn enforce_activity_timeout(
                         .await?
                         {
                             queue::ClaimWrite::Applied => {
-                                // The claim debited a rate-limit token. An
-                                // attempt whose handler never started made no
-                                // downstream call, so the retry gives the
+                                // An attempt whose handler never started made
+                                // no downstream call, so the retry gives its
                                 // token back, as a drain release does.
                                 if !locked.handler_started
-                                    && let Some(key) = task.rate_limit_key.as_deref()
+                                    && let Some(key) = claim_rate_limit_debit(
+                                        task,
+                                        circuit_breakers,
+                                        activity_name,
+                                    )
                                 {
                                     queue::refund_rate_limit_token(conn, key).await?;
                                 }
@@ -1666,6 +1684,14 @@ async fn enforce_activity_timeout(
                 );
             }
             queue::fail_task(conn, task.id, &error).await?;
+            // A claim that never started its handler made no downstream call.
+            // A `PENDING` row holds no claim, so it holds no debit either.
+            if locked.state == "RUNNING"
+                && locked.current_started_claim.is_none()
+                && let Some(key) = claim_rate_limit_debit(task, circuit_breakers, activity_name)
+            {
+                queue::refund_rate_limit_token(conn, key).await?;
+            }
             record_timed_out_claim(conn, task.id, locked.current_started_claim).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(outcome(false, locked.current_started_claim))
