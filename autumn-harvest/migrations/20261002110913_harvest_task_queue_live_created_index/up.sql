@@ -38,13 +38,19 @@
 -- down.sql would drop an unrelated one. A matching but INVALID index means an
 -- out-of-band CONCURRENTLY build did not finish. Drop it with
 -- `DROP INDEX CONCURRENTLY` and build it again.
+--
+-- `lock_timeout` bounds the wait for `SHARE` (issue #1810). A long
+-- transaction on the table then fails this migration after 5 s, instead of
+-- queueing every later write behind it. Run the migration again.
+SET LOCAL lock_timeout = '5s';
+
 DO $$
 DECLARE
     existing_index_oid oid;
     existing_def text;
     existing_valid boolean;
 BEGIN
-    PERFORM set_config('TimeZone', 'UTC', true);
+    PERFORM pg_catalog.set_config('TimeZone', 'UTC', true);
 
     SELECT pg_class.oid, pg_get_indexdef(pg_class.oid), pg_index.indisvalid
       INTO existing_index_oid, existing_def, existing_valid
@@ -54,6 +60,7 @@ BEGIN
       AND pg_index.indrelid = 'harvest_task_queue'::regclass;
 
     IF existing_index_oid IS NULL THEN
+        -- lock-safety: allow blocking-index #1795 operators prebuild it CONCURRENTLY, see the header
         CREATE INDEX idx_harvest_tq_live_created
             ON harvest_task_queue
             ((COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00')), id)
