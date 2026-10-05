@@ -1,5 +1,5 @@
 # Migrations at or before LOCK_SAFETY_CUTOFF that the lock-safety lint does not bind (issue #1810).
-# One tree/name per line. Never add to this list: a new migration is always linted.
+# One tree/name per line. The list is frozen: LEGACY_MIGRATION_DIGEST pins it, and a new migration is always linted.
 autumn-harvest/migrations/20260409000000_harvest_initial
 autumn-harvest/migrations/20260410010000_harvest_workflow_start_uniqueness
 autumn-harvest/migrations/20260424000000_harvest_sticky_routing

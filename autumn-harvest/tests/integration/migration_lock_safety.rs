@@ -35,8 +35,9 @@ const LOCK_SAFETY_CUTOFF: &str = "20260914165542";
 /// linted, so a backdated name cannot skip the lint.
 const LEGACY_MIGRATIONS: &str = include_str!("lock_safety_legacy.txt");
 
-/// The number of entries in `LEGACY_MIGRATIONS`. The list may only shrink.
-const LEGACY_MIGRATION_COUNT: usize = 108;
+/// The `digest` of `LEGACY_MIGRATIONS`. The list is frozen: a swapped entry
+/// changes the digest even when the size stays the same.
+const LEGACY_MIGRATION_DIGEST: u64 = 0x1dc3_f33d_ee51_d5ed;
 
 /// The newest migration that `GRANDFATHERED` may name.
 ///
@@ -1679,13 +1680,19 @@ fn moved_index_key(s: &Stmts, at: usize, index: &str) -> Option<String> {
 /// The history key of `index`, in the schema that `owner` names.
 ///
 /// Postgres puts an index in the schema of its table. A name without a schema
-/// counts as `public`, the default `search_path`.
+/// goes to the first schema of `search_path`. The connection may set another
+/// path, so that schema is unknown. Such a key matches only a name without a
+/// schema, which resolves on the same path.
 fn index_key(owner: &str, index: &str) -> String {
     let schema = owner
         .rsplit_once('.')
-        .map_or("public", |(schema, _)| schema);
+        .map_or(PATH_SCHEMA, |(schema, _)| schema);
     format!("{schema}.{}", base(index))
 }
+
+/// Stands in for the unknown first schema of `search_path` in a history key.
+/// Parentheses never occur in an unquoted name.
+const PATH_SCHEMA: &str = "(search_path)";
 
 /// Stands in for a `.` inside a quoted identifier.
 ///
@@ -4151,6 +4158,16 @@ impl OnDisk {
         let key = format!("{}/{}", self.tree, self.name);
         self.version() > LOCK_SAFETY_CUTOFF || !legacy_migrations().contains(key.as_str())
     }
+}
+
+/// A 64-bit FNV-1a hash of `entries`, in sorted order, one per line.
+fn digest(entries: &BTreeSet<&str>) -> u64 {
+    entries
+        .iter()
+        .flat_map(|entry| entry.bytes().chain(*b"\n"))
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
 }
 
 /// The entries of `LEGACY_MIGRATIONS`, without comments and blank lines.
@@ -7025,9 +7042,9 @@ fn opaque_code_may_turn_conforming_strings_off() {
 fn opaque_code_leaves_later_index_names_unplaced() {
     let allow = "-- lock-safety: allow lock-timeout #1810 test fixture\n";
     let create = "CREATE INDEX idx ON scratch_t (x);";
-    let drop = "DROP INDEX public.idx;";
+    let drop = "DROP INDEX idx;";
     // The unread call may change `search_path`, so `idx` may sit in another
-    // schema, and `public.idx` stays unknown.
+    // schema, and `idx` stays unknown.
     let history = format!("{allow}CALL mystery();\n{create}");
     let findings = lint_with_history(&[&history], drop, true);
     assert!(!findings.is_empty(), "{findings:?}");
@@ -7175,12 +7192,12 @@ fn an_annotated_nonstandard_setter_cannot_hide_a_later_body() {
 #[test]
 fn an_inherited_path_change_leaves_index_names_unplaced() {
     let create = "CREATE INDEX idx ON scratch_t (x);";
-    let drop = "DROP INDEX public.idx;";
-    // Without a path change, the create teaches the history that `public.idx`
+    let drop = "DROP INDEX idx;";
+    // Without a path change, the create teaches the history that `idx`
     // sits on a cold table.
     assert_eq!(lint_with_history(&[create], drop, true), [], "{drop}");
     // After an inherited path change, `idx` may sit in another schema, so
-    // `public.idx` stays unknown, which counts as hot.
+    // `idx` stays unknown, which counts as hot.
     let history = ["SET search_path = scratch, public;", create];
     let findings = lint_with_history(&history, drop, true);
     assert!(!findings.is_empty(), "{findings:?}");
@@ -7380,12 +7397,12 @@ fn a_routine_created_in_an_uncalled_body_is_not_known() {
     let findings = lint_with_history(&[], &sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}\n{findings:?}");
     // A call of a function that may not exist runs unknown code, which may
-    // change `search_path`. So the index may not be in `public`.
+    // change `search_path`. So the index is not learnt.
     let function = "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
                     CREATE FUNCTION q() RETURNS void LANGUAGE plpgsql AS $i$\n    BEGIN\n        \
                     NULL;\n    END $i$;\nEND $o$;\n";
     let index = "CREATE INDEX idx ON scratch_t (x);";
-    let drop = "DROP INDEX public.idx;";
+    let drop = "DROP INDEX idx;";
     assert_eq!(
         lint_with_history(&[&format!("{function}{index}")], drop, true),
         []
@@ -7554,7 +7571,7 @@ fn a_conditional_commit_keeps_a_bound_only_on_both_paths() {
 #[test]
 fn a_local_path_change_does_not_carry_into_later_migrations() {
     let create = "CREATE INDEX idx ON scratch_t (x);";
-    let drop = "DROP INDEX public.idx;";
+    let drop = "DROP INDEX idx;";
     for local in [
         "SET LOCAL search_path = scratch, public;",
         "SELECT set_config('search_path', 'scratch, public', true);",
@@ -7612,7 +7629,7 @@ fn a_quoted_full_is_a_vacuum_table() {
 #[test]
 fn a_path_change_in_an_uncalled_body_does_not_carry() {
     let create = "CREATE INDEX idx ON scratch_t (x);";
-    let drop = "DROP INDEX public.idx;";
+    let drop = "DROP INDEX idx;";
     for change in [
         "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
          SET search_path = scratch, public;\nEND $$;",
@@ -7680,7 +7697,7 @@ fn an_uncalled_body_does_not_change_the_path_of_its_file() {
                    SET search_path = scratch, public;\nEND $$;\n";
     let index = "CREATE INDEX idx ON scratch_t (x);";
     let history = format!("{routine}{index}");
-    let drop = "DROP INDEX public.idx;";
+    let drop = "DROP INDEX idx;";
     assert_eq!(lint_with_history(&[&history], drop, true), [], "{history}");
     // A call of the routine in the same file runs the change, and so does a
     // call of a routine that calls it.
@@ -7701,8 +7718,9 @@ fn a_path_routine_from_an_earlier_migration_changes_the_path() {
                  PERFORM f();\nEND $$;";
     let rename = "ALTER FUNCTION f() RENAME TO h;";
     let index = "CREATE INDEX idx ON scratch_t (x);";
-    let drop = "DROP INDEX public.idx;";
-    // The call runs the change, so the index may not be in `public`.
+    let drop = "DROP INDEX idx;";
+    assert_eq!(lint_with_history(&[index], drop, true), []);
+    // The call runs the change, so the index is not learnt.
     for (earlier, call) in [
         (vec![routine], "SELECT f();"),
         (vec![routine, outer], "SELECT g();"),
@@ -7722,7 +7740,8 @@ fn a_path_routine_from_an_earlier_migration_changes_the_path() {
 #[test]
 fn a_role_change_may_change_the_path() {
     let index = "CREATE INDEX idx ON scratch_t (x);";
-    let drop = "DROP INDEX public.idx;";
+    let drop = "DROP INDEX idx;";
+    assert_eq!(lint_with_history(&[index], drop, true), []);
     // The `"$user"` entry of `search_path` follows the current role.
     for change in [
         "SET ROLE app_owner;",
@@ -7745,7 +7764,7 @@ fn a_role_change_may_change_the_path() {
 #[test]
 fn a_routine_that_runs_opaque_code_may_change_the_path() {
     let index = "CREATE INDEX idx ON scratch_t (x);";
-    let drop = "DROP INDEX public.idx;";
+    let drop = "DROP INDEX idx;";
     for body in ["CALL mystery();", "EXECUTE v;"] {
         let routine = format!(
             "CREATE FUNCTION outer_f(v text) RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
@@ -7759,6 +7778,23 @@ fn a_routine_that_runs_opaque_code_may_change_the_path() {
         let findings = lint_with_history(&[&history], drop, true);
         assert!(!findings.is_empty(), "{history}\n{findings:?}");
     }
+}
+
+#[test]
+fn an_unqualified_build_is_not_placed_in_public() {
+    // The connection may start with another `search_path`, so the build may
+    // land in another schema. `public.idx` may be an unknown hot index.
+    let create = "CREATE INDEX idx ON scratch_t (x);";
+    let findings = lint_with_history(&[create], "DROP INDEX public.idx;", true);
+    assert!(!findings.is_empty(), "{findings:?}");
+    // An unqualified drop resolves on the same path as the build.
+    assert_eq!(lint_with_history(&[create], "DROP INDEX idx;", true), []);
+    // A build on a qualified table has a known schema.
+    let qualified = "CREATE INDEX idx ON public.scratch_t (x);";
+    assert_eq!(
+        lint_with_history(&[qualified], "DROP INDEX public.idx;", true),
+        []
+    );
 }
 
 #[test]
@@ -8030,10 +8066,6 @@ fn legacy_entries_are_on_disk_and_before_the_cutoff() {
         .map(|m| format!("{}/{}", m.tree, m.name))
         .collect();
     let legacy = legacy_migrations();
-    assert!(
-        legacy.len() <= LEGACY_MIGRATION_COUNT,
-        "the legacy list grew. A new migration is always linted."
-    );
     for entry in &legacy {
         let version = entry.rsplit('/').next().and_then(|n| n.split('_').next());
         assert!(on_disk.contains(*entry), "{entry} is not on disk");
@@ -8042,6 +8074,22 @@ fn legacy_entries_are_on_disk_and_before_the_cutoff() {
             "{entry} is after the cutoff"
         );
     }
+}
+
+#[test]
+fn the_legacy_list_is_frozen() {
+    let mut a = legacy_migrations();
+    // Swapping one entry for another keeps the size but changes the digest.
+    let first = *a.iter().next().expect("the list is not empty");
+    a.remove(first);
+    a.insert("autumn-harvest/migrations/20260914010101_new_change");
+    assert_eq!(a.len(), legacy_migrations().len());
+    assert_ne!(digest(&a), digest(&legacy_migrations()));
+    assert_eq!(
+        digest(&legacy_migrations()),
+        LEGACY_MIGRATION_DIGEST,
+        "the legacy list changed. It is frozen, so a new migration is always linted."
+    );
 }
 
 #[test]

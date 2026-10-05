@@ -81,7 +81,9 @@ These statements take a blocking lock for `lock-timeout`:
 
 The lint reads the history of earlier migrations. It finds the table of a
 `DROP INDEX` from the migration that created the index. The index sits in the
-schema of its table, and a name without a schema means `public`. A
+schema of its table. A name without a schema goes to the first schema of the
+connection's `search_path`, which may not be `public`. So it matches only a
+name without a schema, never `public.<name>`. A
 `DROP INDEX` or `DROP TABLE` that surely runs makes the lint forget the index.
 After a `search_path` change, an unqualified name has no known schema, so the
 lint neither learns nor places it. A call of a routine whose body may change
