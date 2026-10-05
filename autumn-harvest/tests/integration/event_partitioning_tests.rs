@@ -40,7 +40,7 @@ use autumn_harvest::worker::DbPool;
 use chrono::{DateTime, TimeZone, Utc};
 use diesel::sql_types::{BigInt, Bool, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -193,14 +193,18 @@ async fn backdate_events(conn: &mut AsyncPgConnection, exec: uuid::Uuid, at: Dat
     partition::ensure_cohort(conn, at)
         .await
         .expect("materialize the destination cohort");
-    diesel::sql_query(
-        "UPDATE harvest_events
-            SET cohort = harvest_event_cohort($1), timestamp = $1
-          WHERE workflow_exec_id = $2",
-    )
-    .bind::<Timestamptz, _>(at)
-    .bind::<diesel::sql_types::Uuid, _>(exec)
-    .execute(conn)
+    // The guard rejects a `timestamp` change, so the fixture turns it off.
+    autumn_harvest::append_only::with_guard_off(conn, async |c| {
+        diesel::sql_query(
+            "UPDATE harvest_events
+                SET cohort = harvest_event_cohort($1), timestamp = $1
+              WHERE workflow_exec_id = $2",
+        )
+        .bind::<Timestamptz, _>(at)
+        .bind::<diesel::sql_types::Uuid, _>(exec)
+        .execute(c)
+        .await
+    })
     .await
     .expect("backdate events");
 }
@@ -10134,4 +10138,242 @@ async fn a_session_statement_timeout_does_not_stop_the_drain_census() {
         .await,
         0
     );
+}
+
+// ══ Issue #1817: the append-only guard survives every layout change ══════════
+
+/// Try a plain `event_data` rewrite on every row of `exec`.
+///
+/// Each call writes a new value, so a repeat call is never a no-op.
+async fn plain_rewrite_error(conn: &mut AsyncPgConnection, exec: uuid::Uuid) -> Option<String> {
+    diesel::sql_query(
+        "UPDATE harvest_events \
+         SET event_data = jsonb_set(event_data, '{forged}', to_jsonb(clock_timestamp()::text)) \
+         WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec)
+    .execute(conn)
+    .await
+    .err()
+    .map(|e| e.to_string())
+}
+
+async fn assert_guarded(conn: &mut AsyncPgConnection, exec: uuid::Uuid, layout: &str) {
+    let err = plain_rewrite_error(conn, exec)
+        .await
+        .unwrap_or_else(|| panic!("{layout}: a plain event_data rewrite must be rejected"));
+    assert!(
+        err.contains("append-only"),
+        "{layout}: the append-only guard must reject the rewrite; got {err}"
+    );
+}
+
+async fn seed_with_history(conn: &mut AsyncPgConnection, id: &str) -> uuid::Uuid {
+    let exec = insert_execution(conn, "guard_wf", id, Utc::now(), None).await;
+    autumn_harvest::store::append_events(conn, ExecutionId::from_uuid(exec), &sample_events(), 0)
+        .await
+        .expect("seed history");
+    exec
+}
+
+#[tokio::test]
+async fn the_append_only_guard_survives_enable_and_disable() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Populated shard: the legacy table is attached whole.
+    let legacy = seed_with_history(&mut conn, "guard-legacy").await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable over a populated table");
+    assert!(
+        partition::operator_triggers(&mut conn)
+            .await
+            .expect("list operator triggers")
+            .is_empty(),
+        "harvest's own guard is not an operator trigger"
+    );
+    assert_guarded(&mut conn, legacy, "legacy partition").await;
+    let fresh_cohort = seed_with_history(&mut conn, "guard-new-cohort").await;
+    assert_guarded(&mut conn, fresh_cohort, "post-cutover cohort").await;
+
+    // Revert: `LIKE` copies no triggers, so disable must reinstall it.
+    partition::disable_partitioning(&mut conn)
+        .await
+        .expect("disable");
+    assert_guarded(&mut conn, legacy, "flat layout after disable").await;
+
+    // Empty shard: the legacy table is dropped, the parent is new.
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable over an empty table");
+    let empty_path = seed_with_history(&mut conn, "guard-fresh").await;
+    assert_guarded(&mut conn, empty_path, "fresh partitioned layout").await;
+    reset_to_unpartitioned(&mut conn).await;
+}
+
+#[tokio::test]
+async fn the_large_table_plan_keeps_the_append_only_guard() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    let legacy = seed_with_history(&mut conn, "guard-plan").await;
+    run_plan_phases(&mut conn, 1..=4).await;
+    assert_eq!(
+        events_relkind(&mut conn).await,
+        "p",
+        "the plan converts the table"
+    );
+    assert_guarded(&mut conn, legacy, "legacy partition after the plan").await;
+    let fresh_cohort = seed_with_history(&mut conn, "guard-plan-new").await;
+    assert_guarded(
+        &mut conn,
+        fresh_cohort,
+        "post-cutover cohort after the plan",
+    )
+    .await;
+    reset_to_unpartitioned(&mut conn).await;
+}
+
+#[tokio::test]
+async fn an_operator_trigger_sharing_the_append_only_guard_name_still_refuses() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    // Same name and function as harvest's guard, but AFTER, not BEFORE.
+    conn.batch_execute(
+        "DROP TRIGGER harvest_events_append_only_trg ON harvest_events;
+         CREATE TRIGGER harvest_events_append_only_trg AFTER UPDATE ON harvest_events
+             FOR EACH ROW EXECUTE FUNCTION harvest_events_guard_append_only();",
+    )
+    .await
+    .expect("install the impostor");
+    let refused = partition::enable_partitioning(&mut conn, &EnableOptions::default()).await;
+
+    conn.batch_execute(
+        "DROP TRIGGER harvest_events_append_only_trg ON harvest_events;
+         CREATE TRIGGER harvest_events_append_only_trg BEFORE UPDATE ON harvest_events
+             FOR EACH ROW EXECUTE FUNCTION harvest_events_guard_append_only();",
+    )
+    .await
+    .expect("restore the real guard");
+    let err = refused.expect_err("an impostor guard must refuse the conversion");
+    assert!(
+        err.to_string().contains("harvest_events_append_only_trg"),
+        "the refusal must name the impostor; got {err}"
+    );
+}
+
+/// Partitions of `harvest_events` that lack the append-only guard.
+async fn partitions_without_the_guard(conn: &mut AsyncPgConnection) -> Vec<String> {
+    diesel::sql_query(
+        "SELECT i.inhrelid::regclass::text AS v FROM pg_inherits i
+          WHERE i.inhparent = 'harvest_events'::regclass
+            AND NOT EXISTS (SELECT 1 FROM pg_trigger tg
+                             WHERE tg.tgrelid = i.inhrelid
+                               AND tg.tgname = 'harvest_events_append_only_trg'
+                               AND tg.tgenabled = 'O')
+          ORDER BY 1",
+    )
+    .load::<TextRow>(conn)
+    .await
+    .expect("list unguarded partitions")
+    .into_iter()
+    .map(|r| r.v)
+    .collect()
+}
+
+#[tokio::test]
+async fn the_append_only_guard_survives_a_default_partition_drain() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Park rows in DEFAULT, then drain them. The drain detaches and
+    // re-attaches DEFAULT, which drops and re-clones its triggers.
+    let today = partition::partition_name(partition::cohort_start(
+        Utc::now(),
+        partition::DEFAULT_COHORT_WIDTH_SECS,
+    ));
+    diesel::sql_query(format!("DROP TABLE {today}"))
+        .execute(&mut conn)
+        .await
+        .expect("open a maintenance gap");
+    let exec = seed_with_history(&mut conn, "guard-drain").await;
+    let moved = partition::drain_default(&mut conn).await.expect("drain");
+    assert_eq!(moved, 3, "the drain moves every parked row");
+
+    assert_eq!(
+        partitions_without_the_guard(&mut conn).await,
+        Vec::<String>::new(),
+        "every partition keeps the guard after a drain"
+    );
+    assert_guarded(&mut conn, exec, "a row moved out of DEFAULT").await;
+    reset_to_unpartitioned(&mut conn).await;
+}
+
+#[tokio::test]
+async fn the_guard_migration_installs_on_an_already_partitioned_shard() {
+    // An operator can enable partitioning before this migration runs.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    let legacy = seed_with_history(&mut conn, "guard-premigrated").await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    // Return to the pre-migration schema, then apply the migration.
+    conn.batch_execute(include_str!(
+        "../../migrations/20261004160009_harvest_events_append_only_guard/down.sql"
+    ))
+    .await
+    .expect("down migration");
+    assert!(
+        plain_rewrite_error(&mut conn, legacy).await.is_none(),
+        "the down migration removes the guard from every partition"
+    );
+    conn.batch_execute(include_str!(
+        "../../migrations/20261004160009_harvest_events_append_only_guard/up.sql"
+    ))
+    .await
+    .expect("up migration on a partitioned shard");
+
+    assert_eq!(
+        partitions_without_the_guard(&mut conn).await,
+        Vec::<String>::new(),
+        "the migration clones the guard onto every existing partition"
+    );
+    assert_guarded(&mut conn, legacy, "legacy partition after the migration").await;
+    reset_to_unpartitioned(&mut conn).await;
+}
+
+#[tokio::test]
+async fn a_disabled_append_only_guard_refuses_the_conversion() {
+    // The most likely change an operator makes to the guard.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+
+    conn.batch_execute("ALTER TABLE harvest_events DISABLE TRIGGER harvest_events_append_only_trg")
+        .await
+        .expect("disable the guard");
+    let refused = partition::enable_partitioning(&mut conn, &EnableOptions::default()).await;
+    conn.batch_execute("ALTER TABLE harvest_events ENABLE TRIGGER harvest_events_append_only_trg")
+        .await
+        .expect("re-enable the guard");
+
+    let err = refused.expect_err("a disabled guard must refuse the conversion");
+    assert!(
+        err.to_string().contains("Re-enable it"),
+        "the refusal must say how to restore harvest's own guard; got {err}"
+    );
+    reset_to_unpartitioned(&mut conn).await;
 }

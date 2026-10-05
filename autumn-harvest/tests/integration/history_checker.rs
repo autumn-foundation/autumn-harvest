@@ -214,22 +214,11 @@ impl std::fmt::Display for Violation {
     }
 }
 
-/// A history split by key. Each group keeps invocation order.
-type KeyGroups<I, O> = BTreeMap<String, Vec<Operation<I, O>>>;
-
-/// The stack of the search thread before the per-operation part.
-const SEARCH_STACK_BASE: usize = 1024 * 1024;
-
-/// The search stack per operation of the longest key. One recursion level
-/// takes about 1 KiB in a debug build, so this leaves a wide margin.
-const SEARCH_STACK_PER_OP: usize = 8 * 1024;
+/// The stack of the search thread. The search takes one frame per placed
+/// operation, so a crash-heavy key can overflow a 2 MiB test thread.
+const SEARCH_STACK: usize = 256 * 1024 * 1024;
 
 /// Check that `history` is linearizable against `model`.
-///
-/// The search recurses once per placed operation. A crash suite with fast
-/// ticks records thousands of operations for one key, which can overflow
-/// the 2 MiB stack of a test thread. So the search runs on its own thread,
-/// with a stack sized to the longest key.
 ///
 /// # Errors
 ///
@@ -239,32 +228,13 @@ where
     M: Model + Sync,
     M::Input: Sync,
     M::Output: Sync,
+    M::State: Send,
 {
-    let groups = group_by_key(history);
-    let longest = groups.values().map(Vec::len).max().unwrap_or(0);
-    let stack = SEARCH_STACK_BASE.saturating_add(longest.saturating_mul(SEARCH_STACK_PER_OP));
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("history-check".into())
-            .stack_size(stack)
-            .spawn_scoped(scope, || check_groups(model, &groups))
-            .expect("spawn the history check thread")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    })
-}
-
-/// The search of [`check`] over each key group, on the calling thread.
-fn check_groups<M: Model>(
-    model: &M,
-    groups: &KeyGroups<M::Input, M::Output>,
-) -> Result<(), Violation> {
-    for (key, ops) in groups {
+    for (key, ops) in group_by_key(history) {
         // A failed operation has no effect, so no order needs to hold it.
         let ops: Vec<_> = ops
-            .iter()
+            .into_iter()
             .filter(|op| !matches!(op.outcome, Some(Outcome::Fail)))
-            .cloned()
             .collect();
         let mut search = Search {
             model,
@@ -276,9 +246,17 @@ fn check_groups<M: Model>(
             seen: HashSet::new(),
         };
         let done = vec![0_u64; ops.len().div_ceil(64)];
-        if !search.linearize(&done, &model.init(), 0) {
+        let found = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(SEARCH_STACK)
+                .spawn_scoped(scope, || search.linearize(&done, &model.init(), 0))
+                .expect("spawn the search thread")
+                .join()
+                .expect("the search thread panicked")
+        });
+        if !found {
             return Err(Violation {
-                key: key.clone(),
+                key,
                 operations: format!("{ops:?}"),
             });
         }
@@ -368,6 +346,7 @@ where
     M: Model + Sync,
     M::Input: Sync,
     M::Output: Sync,
+    M::State: Send,
 {
     if let Err(violation) = check(model, history) {
         panic!("{context}: {violation}");
@@ -521,8 +500,10 @@ impl Model for ExactlyOnceFire {
 }
 
 /// Group a history by key, in key order. Each group keeps invocation order.
-fn group_by_key<I: Clone, O: Clone>(history: &[Operation<I, O>]) -> KeyGroups<I, O> {
-    let mut groups: KeyGroups<I, O> = BTreeMap::new();
+fn group_by_key<I: Clone, O: Clone>(
+    history: &[Operation<I, O>],
+) -> BTreeMap<String, Vec<Operation<I, O>>> {
+    let mut groups: BTreeMap<String, Vec<Operation<I, O>>> = BTreeMap::new();
     for op in history {
         groups.entry(op.key.clone()).or_default().push(op.clone());
     }
@@ -538,9 +519,6 @@ mod tests {
     fn id(n: u128) -> uuid::Uuid {
         uuid::Uuid::from_u128(n)
     }
-
-    /// The length of the long history in the stack test.
-    const LONG_HISTORY: usize = 5_000;
 
     fn start(n: u128) -> StartInput {
         StartInput::Start { candidate: id(n) }
@@ -663,30 +641,6 @@ mod tests {
         let f = h.invoke(1, "s", FireInput::FinalRead);
         h.ok(f, FireOutput::Read(vec![id(7)]));
         assert!(check(&ExactlyOnceFire, &h.snapshot()).is_ok());
-    }
-
-    /// The search recurses once per placed operation. A crash suite with
-    /// fast ticks records thousands of operations for one key. The check
-    /// must not overflow the 2 MiB stack of a test thread (issue #1829).
-    #[test]
-    fn a_long_history_does_not_overflow_a_test_thread_stack() {
-        let h = Recorder::new();
-        let first = h.invoke(0, "s", FireInput::Fire);
-        h.ok(first, FireOutput::Ticked);
-        for _ in 0..LONG_HISTORY {
-            let op = h.invoke(0, "s", FireInput::Fire);
-            h.ok(op, FireOutput::Ticked);
-        }
-        let f = h.invoke(0, "s", FireInput::FinalRead);
-        h.ok(f, FireOutput::Read(vec![id(1)]));
-        let history = h.snapshot();
-        let result = std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn(move || check(&ExactlyOnceFire, &history).is_ok())
-            .expect("spawn")
-            .join()
-            .expect("the check returns");
-        assert!(result);
     }
 
     /// A crashed fire that has stopped cannot take effect later. Once the

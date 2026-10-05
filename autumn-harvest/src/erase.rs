@@ -770,6 +770,10 @@ mod db {
 
         let mut events_scrubbed = 0usize;
         let mut fields_tombstoned = 0usize;
+        // The append-only guard trigger rejects an `event_data` rewrite
+        // without this sanction (issue #1817). Every caller runs inside the
+        // erase transaction, so the setting reaches each UPDATE below.
+        crate::append_only::sanction(conn, crate::append_only::EventRewrite::Erase).await?;
         for (row_id, mut event_data) in raw_events {
             let count = tombstone_payload_fields(&mut event_data);
             if count > 0 {
@@ -802,6 +806,7 @@ mod db {
                 fields_tombstoned += count;
             }
         }
+        crate::append_only::revoke(conn).await?;
         Ok((events_scrubbed, fields_tombstoned))
     }
 

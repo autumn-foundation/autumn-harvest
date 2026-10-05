@@ -17,6 +17,11 @@
 --       WHERE assigned_build_id IS NOT NULL;
 -- The block below accepts a prebuilt index only if its definition matches
 -- and it is valid. It raises an error otherwise.
+--
+-- The plain build waits at most 5 s for its lock, then the migration fails.
+-- Run it again, or prebuild the index as shown above.
+SET LOCAL lock_timeout = '5s';
+
 DO $$
 DECLARE
     existing_index_oid oid;
@@ -31,6 +36,7 @@ BEGIN
       AND pg_index.indrelid = 'harvest_workflow_executions'::regclass;
 
     IF existing_index_oid IS NULL THEN
+        -- lock-safety: allow blocking-index #1814 operators prebuild it CONCURRENTLY
         CREATE INDEX idx_harvest_we_ramp_guard_outcome
             ON harvest_workflow_executions (queue_name, assigned_build_id, created_at)
             WHERE assigned_build_id IS NOT NULL;

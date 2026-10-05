@@ -537,10 +537,13 @@ async fn detects_restore_point_skew_across_shards() {
 
     // Shard B was restored to an hour earlier than shard A. Its newest event
     // is correspondingly older -- the proxy the check reads.
-    diesel::sql_query("UPDATE harvest_events SET timestamp = NOW() - INTERVAL '1 hour'")
-        .execute(&mut b)
-        .await
-        .expect("backdate shard b");
+    autumn_harvest::append_only::with_guard_off(&mut b, async |c| {
+        diesel::sql_query("UPDATE harvest_events SET timestamp = NOW() - INTERVAL '1 hour'")
+            .execute(c)
+            .await
+    })
+    .await
+    .expect("backdate shard b");
 
     let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
     let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;

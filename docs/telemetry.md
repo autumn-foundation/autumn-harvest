@@ -15,7 +15,7 @@ dependency (rendering is done entirely through autumn-web's existing
 
 ```toml
 [dependencies]
-autumn-harvest-plugin = { version = "0.4", features = ["metrics"] }
+autumn-harvest-plugin = { version = "0.7", features = ["metrics"] }
 ```
 
 ```rust
@@ -99,7 +99,7 @@ Enable the in-tree `metrics-rs` adapter in your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.2", features = ["metrics-rs"] }
+autumn-harvest = { version = "0.7", features = ["metrics-rs"] }
 metrics-exporter-prometheus = "0.16"
 ```
 

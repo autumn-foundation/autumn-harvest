@@ -446,12 +446,16 @@ async fn seed_execution(
 /// `WorkflowEvent`'s own timestamp field alone cannot make a fixture look old.
 async fn backdate_events(pool: &DbPool, exec_id: ExecutionId, interval: &str) {
     let mut conn = pool.get().await.expect("pooled conn");
-    diesel::sql_query(format!(
+    let sql = format!(
         "UPDATE harvest_events SET timestamp = NOW() - INTERVAL '{interval}' \
          WHERE workflow_exec_id = $1"
-    ))
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .execute(&mut conn)
+    );
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::sql_query(sql)
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(c)
+            .await
+    })
     .await
     .expect("backdate events");
 }

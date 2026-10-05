@@ -276,7 +276,7 @@ harvest worker health                     # rollup: active / draining / stale
 When you need to roll a node — deploy, autoscale-down, drain a host before
 maintenance — request a remote drain instead of sending `SIGTERM`. The
 worker stops claiming new tasks within two heartbeat intervals and finishes
-its in-flight work before exiting:
+or gives back its in-flight work before exiting:
 
 ```bash
 # Dry run first: who would be affected, what's in-flight, on which shards.
@@ -303,6 +303,40 @@ curl -s 'http://localhost:3000/api/harvest/workers/drain-preview?queue=email-wor
 Drain requests are recorded in the audit log under the `worker.drain`
 operation, so you have a "who quiesced this node, when" record without
 correlating shell history across machines.
+
+### What a drain does with its claims
+
+A `SIGTERM` and a remote drain run the same drain (issue #1813):
+
+1. The worker stops claiming tasks.
+2. It gives back each claimed task that has not started. The task is
+   `PENDING` again at once and does not use an attempt.
+3. It lets running tasks finish.
+4. One join window before the deadline, it cancels running activities. The
+   join window is `cancellation_grace_period`, capped at half the drain.
+   Running workflow tasks are not cancelled. `workflow_task_timeout` bounds
+   them.
+5. It gives back the claim of each cancelled activity whose handler returns
+   a retryable error. A peer retries it at once. The cancelled attempt
+   raises `attempt`, and the peer runs the next attempt even past
+   `max_attempts`. A handler that returns `Ok` completes as usual. A
+   non-retryable error fails the activity as usual.
+6. At the deadline it stops waiting. A handler that ignored the cancel keeps
+   its claim. The worker keeps its lease and the task heartbeat alive until
+   that handler returns, even after `run` returns, so no peer starts a
+   second copy. The worker also gives back each claim it abandoned in the
+   drain, such as one whose release write failed. The claim fence
+   (#1789) rejects stale writes. If the process exits, orphan reclaim
+   recovers the task.
+
+A cancel cannot be undone. A later remote deadline does not give the
+activities back.
+
+The deadline is `WorkerConfig::shutdown_timeout`, or the remote drain
+deadline. The default is 25 s. Keep `shutdown_timeout` at least 5 s below
+the platform grace period. On Kubernetes that is
+`terminationGracePeriodSeconds`, 30 s by default. A larger value lets the
+platform kill the process before the drain gives back its claims.
 
 ## Reuse policies
 

@@ -56,9 +56,9 @@ Drain a specific worker:
 harvest worker drain <worker-id>
 ```
 
-The server sets the worker's status to `Draining`. The worker will finish its
-current tasks and then transition to `Stopped` within one heartbeat interval
-(default: 5 s) after quiescing.
+The server sets the worker's status to `Draining`. The worker finishes or
+gives back its current tasks. It then transitions to `Stopped` within one
+heartbeat interval (default: 5 s) after quiescing.
 
 To specify an explicit deadline (RFC 3339):
 
@@ -67,7 +67,12 @@ harvest worker drain <worker-id> --deadline 2026-05-09T14:30:00Z
 ```
 
 When `--deadline` is omitted the server uses the configured
-`WorkerConfig::shutdown_timeout` (default 30 s from the current time).
+`WorkerConfig::shutdown_timeout` (default 25 s from the current time).
+
+One join window before the deadline, the worker cancels its running
+activities. It releases the claim of each one whose handler returns a
+retryable error. A handler that ignores the cancel keeps its claim. See
+[What a drain does with its claims](../getting-started/10-operations.md#what-a-drain-does-with-its-claims).
 
 ### Drain outcome codes
 
@@ -150,7 +155,8 @@ and `request_id`.
 | Mistake | Fix |
 |---------|-----|
 | Terminating the process before `Stopped` | Poll with `--wait` or `worker get` until status is `Stopped` |
-| Forgetting `--deadline` on a slow worker | The default deadline is `shutdown_timeout` (30 s); set a longer deadline for workers with large in-flight batches |
+| Forgetting `--deadline` on a slow worker | The default deadline is `shutdown_timeout` (25 s); set a longer deadline for workers with large in-flight batches |
+| `shutdown_timeout` at or above the platform grace period | Keep it at least 5 s below `terminationGracePeriodSeconds`, or the platform kills the worker before the drain releases its claims |
 | Draining the wrong shard | Use `--shard-id` with `drain-preview` to scope the preview first |
 | Ignoring `unavailable_shards` in the response | The worker may be on an unreachable shard; retry after shard recovers |
 
