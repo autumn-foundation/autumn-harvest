@@ -60,9 +60,9 @@ non-web or other-framework contexts.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.4", features = ["db"] }
-autumn-harvest-plugin = "0.4"
-autumn-web = { version = "0.5", features = ["ws"] }
+autumn-harvest = { version = "0.7", features = ["db"] }
+autumn-harvest-plugin = "0.7"
+autumn-web = { version = "0.8", features = ["ws"] }
 # ... plus standard deps (serde_json, chrono, uuid, tokio, tracing, etc.)
 ```
 

@@ -14,6 +14,7 @@ use autumn_web::db;
 use autumn_web::error::AutumnError;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::plugin::Plugin;
+use autumn_web::plugin_contract::PluginContract;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -1129,7 +1130,32 @@ const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: boo
     mcp_tools_enabled && !has_tool_middleware
 }
 
+/// The `autumn-web` series this crate supports.
+///
+/// It must equal the `autumn-web` requirement in this crate's `Cargo.toml`.
+/// A unit test enforces that, so a dependency bump cannot leave it stale.
+pub const AUTUMN_WEB_REQUIREMENT: &str = "0.8";
+
+/// The compatibility contract that [`HarvestPlugin`] declares to Autumn.
+///
+/// Harvest does not release in lockstep with Autumn, so the contract names an
+/// explicit `autumn-web` range, not `lockstep_contract`.
+#[must_use]
+pub fn harvest_plugin_contract() -> PluginContract {
+    PluginContract::new(env!("CARGO_PKG_NAME"))
+        .plugin_version(env!("CARGO_PKG_VERSION"))
+        .autumn_web(AUTUMN_WEB_REQUIREMENT)
+}
+
 impl Plugin for HarvestPlugin {
+    /// Declares the `autumn-web` range that Harvest supports.
+    ///
+    /// `AppBuilder::plugin` panics at registration when the host framework is
+    /// outside this range. `autumn plugin-check` fails a plugin with no range.
+    fn contract(&self) -> Option<PluginContract> {
+        Some(harvest_plugin_contract())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
@@ -1158,7 +1184,7 @@ impl Plugin for HarvestPlugin {
         let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
 
         // Autumn owns migrations for every set that lives in the application
-        // database (autumn-web 0.7). See `register_plugin_migrations`.
+        // database (since autumn-web 0.7). See `register_plugin_migrations`.
         let app = register_plugin_migrations(app, require_embedded_harvest_mode);
 
         let api_state = HarvestApiState::new();
@@ -2345,7 +2371,7 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
 /// async executor thread.
 ///
 /// `autumn_web::migrate::run_pending`/`pending_migrations` are synchronous and
-/// genuinely block the calling thread: as of autumn-web 0.7 both route through
+/// genuinely block the calling thread: since autumn-web 0.7 both route through
 /// `with_migration_connection!`, which runs the connect *and* the migration
 /// body on a freshly spawned `std::thread::scope` thread and `join()`s it.
 /// `spawn_blocking` keeps that join off an async worker thread, where it would
@@ -2601,6 +2627,54 @@ mod migration_remedy_tests {
 mod tests {
     use super::*;
     use std::any::TypeId;
+
+    /// The declared range is the `autumn-web` requirement in `Cargo.toml`.
+    /// A dependency bump that skips the constant fails here.
+    #[test]
+    fn contract_range_matches_the_cargo_toml_requirement() {
+        let manifest: toml::Table =
+            toml::from_str(include_str!("../Cargo.toml")).expect("the crate manifest parses");
+        let requirement = manifest["dependencies"]["autumn-web"]
+            .as_str()
+            .expect("autumn-web is a plain version requirement");
+        assert_eq!(AUTUMN_WEB_REQUIREMENT, requirement);
+    }
+
+    /// The contract accepts the `autumn-web` this crate compiles against.
+    /// Otherwise `AppBuilder::plugin` panics when an app mounts the plugin.
+    #[test]
+    fn contract_accepts_the_compiled_autumn_web() {
+        use autumn_web::plugin_contract::{AUTUMN_WEB_VERSION, ContractVerdict, evaluate};
+
+        let contract = HarvestPlugin::new()
+            .contract()
+            .expect("HarvestPlugin declares a contract");
+        assert_eq!(contract, harvest_plugin_contract());
+        assert_eq!(contract.plugin, "autumn-harvest-plugin");
+        assert_eq!(
+            contract.plugin_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(contract.experimental_surfaces, Vec::<String>::new());
+        assert_eq!(
+            evaluate(&contract, AUTUMN_WEB_VERSION),
+            ContractVerdict::Compatible
+        );
+    }
+
+    /// The range excludes the previous and the next `autumn-web` series.
+    #[test]
+    fn contract_rejects_other_autumn_web_series() {
+        use autumn_web::plugin_contract::{ContractVerdict, evaluate};
+
+        let contract = harvest_plugin_contract();
+        for other in ["0.7.0", "0.9.0"] {
+            assert!(
+                matches!(evaluate(&contract, other), ContractVerdict::Incompatible(_)),
+                "autumn-web {other} must be outside the declared range"
+            );
+        }
+    }
 
     /// Issue #1812: the shutdown hook sets the drain, also with no runtime.
     #[tokio::test]

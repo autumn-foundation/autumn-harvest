@@ -1787,8 +1787,8 @@ jobs:
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
-        # Harvest 0.6 is not available on crates.io until this release lands.
-        # Patch only the two workspace crates under test; autumn-web 0.7 still
+        # Harvest 0.7 is not available on crates.io until this release lands.
+        # Patch only the two workspace crates under test; autumn-web 0.8 still
         # resolves from crates.io, just as it will for users of `harvest new`.
         run: |
           cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml" \

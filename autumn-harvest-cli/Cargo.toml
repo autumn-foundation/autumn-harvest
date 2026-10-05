@@ -26,7 +26,7 @@ default-run = "harvest"
 # `tls` gives `harvest dr` and `harvest backup verify` the `pg_tls` connector,
 # so a managed Postgres that refuses plaintext is reachable. Its rustls crates
 # are the ones `harvest migrate` already uses.
-autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger", "tls"] }
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger", "tls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 # `harvest migrate` builds its own Postgres connection so it can offer TLS,
 # which `AsyncPgConnection::establish` (NoTls) cannot -- a managed Harvest
@@ -35,7 +35,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # autumn-web's own migration path, so this unifies rather than widening.
 diesel-async = { workspace = true }
 tokio-postgres = "0.7.18"
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 url = "2"
