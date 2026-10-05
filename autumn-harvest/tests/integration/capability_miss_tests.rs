@@ -4111,11 +4111,12 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_released_by_the_stale_disp
     .expect("requeue then re-claim with the same worker");
 
     // The stale dispatcher, still holding its pre-requeue snapshot, releases.
+    // It passes the new claim's attempt, so only `crash_strikes` differs and
+    // this test pins that guard alone. Issue #1917 covers `attempt`.
     let mut conn = connect(&url).await;
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task.id,
-        "worker-a",
+        &queue::TaskClaim::new(task.id, "worker-a", 3),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         task.crash_strikes,
@@ -4209,8 +4210,7 @@ async fn the_release_reports_the_cardinality_it_actually_committed() {
 
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task_id,
-        "incapable",
+        &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
@@ -4268,8 +4268,7 @@ async fn release_never_writes_the_error_column() {
 
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task_id,
-        "incapable",
+        &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         // A workflow-type lookup miss is `BeforeHandler`: the crash-strike
         // counter is preserved (Codex round-12 P1) and `attempt` is restored
@@ -4313,8 +4312,7 @@ async fn release_never_writes_the_error_column() {
 
     let released2 = queue::release_task_for_capability_miss(
         &mut conn,
-        task2,
-        "incapable",
+        &queue::TaskClaim::new(task2, "incapable", load_task(&url, task2).await.attempt),
         Duration::from_secs(1),
         // A workflow-type lookup miss is `BeforeHandler`: the crash-strike
         // counter is preserved (Codex round-12 P1) and `attempt` is restored
@@ -4365,8 +4363,11 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
 
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task_id,
-        "worker-we-are",
+        &queue::TaskClaim::new(
+            task_id,
+            "worker-we-are",
+            load_task(&url, task_id).await.attempt,
+        ),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
@@ -4778,8 +4779,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
 
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task_id,
-        "incapable",
+        &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
@@ -4827,8 +4827,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
 
     let released2 = queue::release_task_for_capability_miss(
         &mut conn,
-        task2,
-        "incapable",
+        &queue::TaskClaim::new(task2, "incapable", load_task(&url, task2).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::AfterHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
