@@ -1,1 +1,4 @@
 msrv = "1.88.0"
+# Issue #1821: `expect_used` and `unwrap_used` gate non-test code only.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true

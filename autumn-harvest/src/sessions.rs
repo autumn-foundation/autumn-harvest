@@ -803,10 +803,7 @@ async fn break_session_and_fail_members(
                 let Some(activity_name) = task.activity_name.as_deref() else {
                     continue;
                 };
-                let exec_id: crate::types::ExecutionId = exec_uuid
-                    .to_string()
-                    .parse()
-                    .expect("database UUIDs must round-trip into ExecutionId");
+                let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
 
                 let history =
                     crate::timeout::lock_workflow_execution_and_load_history(conn, exec_id, codecs)

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 #[cfg(feature = "db")]
 use std::{collections::HashMap, time::Instant};
@@ -1189,14 +1189,12 @@ impl RetentionMonitor {
         AtomicU64::fetch_add(&self.iterations_completed, 1, Ordering::Relaxed);
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex has been poisoned.
+    /// Returns a copy of the current retention status.
     #[must_use]
     pub fn snapshot(&self) -> RetentionStatus {
         self.inner
             .lock()
-            .expect("retention monitor lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -1208,7 +1206,7 @@ impl RetentionMonitor {
     /// cannot ride along in the same `update`.
     #[cfg(feature = "db")]
     fn update_partitions(&self, shard: ShardId, outcome: crate::partition::MaintenanceOutcome) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -1228,7 +1226,7 @@ impl RetentionMonitor {
     /// returns to `None` instead of going stale.
     #[cfg(feature = "db")]
     fn clear_partitions(&self, shard: ShardId) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -1248,7 +1246,7 @@ impl RetentionMonitor {
     /// `update`.
     #[cfg(feature = "db")]
     fn update_rate_limit_buckets(&self, shard: ShardId, outcome: RateLimitBucketGcOutcome) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -1264,7 +1262,7 @@ impl RetentionMonitor {
     /// cannot ride along in that phase's `update`.
     #[cfg(feature = "db")]
     fn update_terminal_tasks(&self, shard: ShardId, outcome: TerminalTaskGcOutcome) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -1276,7 +1274,7 @@ impl RetentionMonitor {
 
     #[cfg(feature = "db")]
     fn update(&self, shard: ShardId, result: RetentionTickResult) {
-        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = guard
             .per_shard
             .iter_mut()
@@ -2206,8 +2204,10 @@ struct CandidateExecution {
     state: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     context_headers: Option<serde_json::Value>,
-    #[diesel(sql_type = Nullable<Timestamptz>) ]
-    completed_at: Option<DateTime<Utc>>,
+    /// Non-null: the scan filters `completed_at IS NOT NULL`. A NULL fails the
+    /// load with an error, not a panic (issue #1821).
+    #[diesel(sql_type = Timestamptz)]
+    completed_at: DateTime<Utc>,
     /// Legal-hold columns (issue #747), read only for the per-candidate skip
     /// gate. The SELECT's WHERE clause is intentionally NOT changed — the gate
     /// is evaluated in Rust so the two-variant bind numbering stays stable.
@@ -2261,12 +2261,20 @@ impl Drop for RetentionLeaseGuard {
         if self.active {
             let pool = self.pool.clone();
             let lease_id = self.lease_id.clone();
-            let ids = {
-                let guard = self.active_ids.lock().expect("lease guard lock poisoned");
-                guard.clone()
+            // A panic here during unwinding aborts the process (issue #1821).
+            // A poisoned list is still a valid list, so recover it.
+            let ids = self
+                .active_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            // `tokio::spawn` panics without a runtime. Skip the release instead.
+            // The rows then keep the lease, as they do after a process crash.
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
             };
             if !ids.is_empty() {
-                tokio::spawn(async move {
+                runtime.spawn(async move {
                     if let Ok(mut conn) = pool.get().await {
                         let _ = diesel::update(
                             harvest_workflow_executions::table
@@ -2562,7 +2570,7 @@ async fn run_shard_tick(
             guard
                 .active_ids
                 .lock()
-                .expect("lease guard lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .extend(ids);
         }
 
@@ -2579,9 +2587,7 @@ async fn run_shard_tick(
 
         let mut batch_failed = false;
         for candidate in candidates {
-            let completed_at = candidate
-                .completed_at
-                .expect("retention candidate query enforces completed_at IS NOT NULL");
+            let completed_at = candidate.completed_at;
             let candidate_cursor = RetentionScanCursor {
                 completed_at,
                 id: candidate.id,
@@ -3007,12 +3013,7 @@ async fn run_shard_tick(
                 }
             }
 
-            {
-                let mut active_guard = guard.active_ids.lock().expect("lease guard lock poisoned");
-                if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
-                    active_guard.swap_remove(pos);
-                }
-            }
+            release_active_id(&guard.active_ids, candidate.id);
 
             if !has_failed {
                 outcome.next_cursor = Some(candidate_cursor);
@@ -3881,13 +3882,19 @@ async fn routine_skip_candidate(
         outcome.next_cursor = Some(candidate_cursor);
     }
 
-    {
-        let mut active_guard = active_ids.lock().expect("lease guard lock poisoned");
-        if let Some(pos) = active_guard.iter().position(|&x| x == candidate_id) {
-            active_guard.swap_remove(pos);
-        }
-    }
+    release_active_id(active_ids, candidate_id);
     Ok(())
+}
+
+/// Removes `id` from the tick's lease list.
+///
+/// A poisoned lock still holds a valid list, so the call recovers it.
+#[cfg(feature = "db")]
+fn release_active_id(active_ids: &Mutex<Vec<uuid::Uuid>>, id: uuid::Uuid) {
+    let mut ids = active_ids.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(pos) = ids.iter().position(|&x| x == id) {
+        ids.swap_remove(pos);
+    }
 }
 
 #[cfg(feature = "db")]
@@ -5196,7 +5203,7 @@ mod tests {
             workflow_name: "test".to_string(),
             workflow_id: "ok".to_string(),
             state: "COMPLETED".to_string(),
-            completed_at: Some(Utc::now() - chrono::Duration::days(10)),
+            completed_at: Utc::now() - chrono::Duration::days(10),
             context_headers: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
@@ -5210,7 +5217,7 @@ mod tests {
             workflow_name: "test".to_string(),
             workflow_id: "skip".to_string(),
             state: "COMPLETED".to_string(),
-            completed_at: Some(Utc::now() - chrono::Duration::days(9)),
+            completed_at: Utc::now() - chrono::Duration::days(9),
             context_headers: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
@@ -5228,7 +5235,7 @@ mod tests {
 
         // candidate 1 (success)
         let cursor1 = RetentionScanCursor {
-            completed_at: candidate_ok.completed_at.unwrap(),
+            completed_at: candidate_ok.completed_at,
             id: candidate_ok.id,
         };
         if !has_skipped {
@@ -5237,7 +5244,7 @@ mod tests {
 
         // candidate 2 (skipped)
         let cursor2 = RetentionScanCursor {
-            completed_at: candidate_skip.completed_at.unwrap(),
+            completed_at: candidate_skip.completed_at,
             id: candidate_skip.id,
         };
         has_skipped = true;
@@ -5333,5 +5340,102 @@ mod tests {
         assert_eq!(v["newly_held"], true);
         assert_eq!(v["legal_hold_reason"], "subpoena");
         assert!(v.get("released").is_none(), "false flag is omitted");
+    }
+
+    /// Builds a pool that never connects. Its host refuses every dial.
+    #[cfg(feature = "db")]
+    fn unconnected_pool() -> crate::worker::DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused:unused@127.0.0.1:1/unused");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds")
+    }
+
+    /// Returns an active lease guard over `active_ids`.
+    #[cfg(feature = "db")]
+    fn active_guard(active_ids: Arc<Mutex<Vec<uuid::Uuid>>>) -> RetentionLeaseGuard {
+        RetentionLeaseGuard {
+            pool: unconnected_pool(),
+            lease_id: "retention-lease-test".to_owned(),
+            active_ids,
+            active: true,
+        }
+    }
+
+    /// Returns an active lease guard whose `active_ids` lock is poisoned.
+    #[cfg(feature = "db")]
+    fn guard_with_poisoned_lock() -> RetentionLeaseGuard {
+        let active_ids = Arc::new(Mutex::new(vec![uuid::Uuid::new_v4()]));
+        let poisoner = Arc::clone(&active_ids);
+        let joined = std::thread::spawn(move || {
+            let _held = poisoner.lock();
+            panic!("poison the lease lock");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoner thread must panic");
+        assert!(active_ids.is_poisoned());
+        active_guard(active_ids)
+    }
+
+    // Issue #1821: a panic in `Drop` during unwinding aborts the process.
+    #[tokio::test]
+    #[cfg(feature = "db")]
+    async fn lease_guard_drop_survives_a_poisoned_lock_1821() {
+        // The current-thread runtime does not poll the release task here.
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let before = metrics.num_alive_tasks();
+        drop(guard_with_poisoned_lock());
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            before + 1,
+            "a poisoned list must still release its leases"
+        );
+    }
+
+    // Issue #1821: a guard can drop outside a Tokio runtime.
+    #[test]
+    #[cfg(feature = "db")]
+    fn lease_guard_drop_survives_a_missing_runtime_1821() {
+        drop(active_guard(Arc::new(Mutex::new(vec![
+            uuid::Uuid::new_v4(),
+        ]))));
+    }
+
+    // Issue #1821: a status read survives a poisoned monitor lock.
+    #[test]
+    fn retention_snapshot_survives_a_poisoned_lock_1821() {
+        let monitor =
+            RetentionMonitor::new(RetentionConfig::default(), [ShardId::new(0)].into_iter());
+        let inner = Arc::clone(&monitor.inner);
+        let joined = std::thread::spawn(move || {
+            let _held = inner.lock();
+            panic!("poison the monitor lock");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoner thread must panic");
+        assert!(monitor.inner.is_poisoned());
+        assert_eq!(monitor.snapshot().per_shard.len(), 1);
+    }
+
+    // Issue #1821: the tick releases a lease after a poisoned lock.
+    #[test]
+    #[cfg(feature = "db")]
+    fn release_active_id_survives_a_poisoned_lock_1821() {
+        let mut guard = guard_with_poisoned_lock();
+        let id = guard
+            .active_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[0];
+        release_active_id(&guard.active_ids, id);
+        let left = guard
+            .active_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        assert_eq!(left, 0);
+        guard.active = false;
     }
 }

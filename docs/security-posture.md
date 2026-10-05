@@ -652,6 +652,157 @@ from the retention janitor and from PII erasure until released — see
 
 ---
 
+## Payload encryption at rest (issue #1825)
+
+By default, Harvest stores workflow payloads in `harvest_events` as plain
+JSON. A workflow that carries PII or secrets must encrypt them. Use
+`autumn_harvest::aead_codec::AeadCodec`.
+
+### What the codec does
+
+- It uses AES-256-GCM from the RustCrypto `aes-gcm` crate. Harvest implements
+  no cipher of its own.
+- Each encode reads a fresh 96-bit nonce from the operating system RNG.
+- Each payload starts with a header that holds the format version and the
+  key id. The header is AEAD associated data, so it is authenticated.
+- Decode fails for a wrong key, a changed byte, a changed header or a
+  truncated payload.
+- `DataKey` clears its bytes on drop. The AES round keys and the GHASH state
+  are also cleared on drop. On aarch64, upstream `polyval` does not yet clear
+  the GHASH state.
+- `Debug` output and error text never hold key material or plaintext.
+
+### What the codec does not cover
+
+The codec encrypts the payload fields of `harvest_events.event_data` only:
+`input`, `output`, `payload`, `details`, `value` and
+`last_completion_result`. ADR-0003 and the current schema keep these columns
+in clear, so that operators can query them:
+
+- `harvest_workflow_executions.input`, `.output`, `.memo` and `.search_attrs`;
+- `harvest_task_queue.input`, `.output` and `.heartbeat_details`;
+- `harvest_signals.payload` and `harvest_dead_letters.input`;
+- other denormalized copies, for example schedule inputs and outbox rows.
+
+Event types, ids, timestamps and workflow names also stay in clear. Do not put
+PII in a memo, a search attribute, a workflow id or a workflow name. If these
+columns must not hold PII, encrypt the value in workflow code before Harvest
+sees it. Also use Postgres disk encryption.
+
+The associated data binds the version and the key id, not the row. A writer
+with access to `harvest_events` can copy a ciphertext to another field, event
+or execution under the same key, and it decodes. Restrict write access to the
+Harvest database.
+
+### Key providers
+
+Load each data key once, at startup, through a `KeyProvider`:
+
+| Provider | Key source |
+|----------|------------|
+| `EnvKeyProvider` | An environment variable that holds base64. The key stays in the process environment. |
+| `FileKeyProvider` | `<dir>/<key_id>.key` that holds base64, for example a secret volume. |
+| `KmsKeyProvider` | A wrapped data key that a KMS unwraps (envelope encryption). |
+
+The `autumn-harvest-plugin` `aws-kms` feature adds `aws_kms::AwsKms`, which
+implements `KmsDecrypt` for AWS KMS. The core crate has no cloud dependency. To
+make a wrapped key, call `GenerateDataKey` with the codec key id as the
+encryption context:
+
+```sh
+aws kms generate-data-key --key-id "$KMS_KEY_ARN" --key-spec AES_256 \
+  --encryption-context harvest_codec_key_id=2026-10 \
+  --query CiphertextBlob --output text > 2026-10.wrapped.b64
+```
+
+The CLI writes the wrapped key as base64. Load it with
+`with_wrapped_key_base64`. Never store the `Plaintext` field. KMS refuses to
+unwrap the key under another key id or another KMS key.
+
+The application needs the plugin feature, and `aws-config` to load AWS
+credentials. The plugin re-exports `aws_sdk_kms`.
+
+```toml
+[dependencies]
+autumn-harvest-plugin = { version = "0.6", features = ["aws-kms"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+```
+
+```rust,ignore
+use autumn_harvest::aead_codec::{AeadCodec, KmsKeyProvider};
+use autumn_harvest_plugin::aws_kms::{AwsKms, aws_sdk_kms};
+
+let kms = AwsKms::new(aws_sdk_kms::Client::new(&aws_config::load_from_env().await));
+let wrapped = std::fs::read_to_string("2026-10.wrapped.b64")?;
+let keys = KmsKeyProvider::new(kms, kms_key_arn).with_wrapped_key_base64("2026-10", &wrapped)?;
+let harvest = HarvestBuilder::new()
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
+    .try_build()?;
+```
+
+Use `aead_payload_codec_key`, not `payload_codec`, from the first deployment.
+It writes the key id into each envelope, so a later rotation needs no
+`legacy` key.
+
+The first key registered becomes active at once. That is safe for one
+process. In a fleet with more than one process, an upgraded process could
+then write keyed envelopes before every reader can decode them. So, for a
+fleet, do the rollout in two steps:
+
+1. Register `IdentityCodec` under `CODEC_LEGACY_KEY_ID` before the AEAD
+   codec. The legacy key stays active, so writes do not change. Deploy this
+   build to every process.
+2. Call `codec_rotation::activate_codec_key` for the AEAD key id. That call
+   checks that every live worker can read the key, records it, and then
+   switches new writes to it.
+
+Activation encrypts new writes only. Payloads that an existing deployment
+already stored stay in clear. The rotation sweep re-keys ciphertext only, so
+it never encrypts them, and its census does not count them. A sweep can
+therefore report completion while old plaintext remains. To remove old
+plaintext, let retention delete it, or erase it with
+`POST /workflows/{id}/erase-payloads` (terminal executions only). Harvest has
+no plaintext-to-ciphertext migration. That migration would be a third
+in-place mutation of `harvest_events`, and the engine invariants in
+`CLAUDE.md` allow two.
+
+```rust,ignore
+use autumn_harvest::payload_codec::{CODEC_LEGACY_KEY_ID, IdentityCodec};
+
+let harvest = HarvestBuilder::new()
+    .payload_codec_key(CODEC_LEGACY_KEY_ID, IdentityCodec)
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
+    .try_build()?;
+```
+
+A deployment that already uses `payload_codec(AeadCodec)` has history with no
+`kid`. Keep that `payload_codec` call when you add keyed codecs. The kid-less
+history decodes through it.
+
+### Rotation and the nonce limit
+
+A random 96-bit nonce can repeat. NIST SP 800-38D limits each key to 2^32
+encodes with random nonces. At that limit, the chance of any repeated nonce is
+about 2^-33. Each payload field is one encode. The rotation sweep re-encodes
+each stored field, so the sweep also counts against the new key. Rotate each
+key well before the limit, and at once after a key leak.
+
+To rotate, load a codec for the new key id and register it. Activate it with
+`codec_rotation::activate_codec_key`. The issue #948 sweep then re-encrypts
+stored ciphertext under the new key. It does not touch stored plaintext.
+
+The sweep does not re-encrypt offloaded blobs (issue #524). Retirement
+removes the old codec from the registry, so the read path can no longer
+decode a blob that the old key encrypted. If you use payload offloading,
+re-key the offloaded blobs before you retire the old key. Then retire the old
+key. Destroy the old key material only after that. See "What zero does and
+does not authorise" in
+[`operations/codec-key-rotation.md`](operations/codec-key-rotation.md).
+`replay_fidelity_is_byte_identical_across_a_sweep` proves that replay stays
+byte-identical across a sweep with this codec.
+
+---
+
 ## Production-readiness checklist
 
 Before deploying the Harvest management API to a production environment, verify
@@ -735,6 +886,12 @@ record. Without it, records default to `"anonymous"`.
 Authentication middleware applies uniformly across all shards because it wraps
 the router layer, not individual handlers. No extra configuration is needed for
 multi-shard deployments.
+
+### 6. Payloads that carry PII are encrypted
+
+If a workflow carries PII or secrets, register an `AeadCodec` with
+`aead_payload_codec_key`. Load the key from a `KeyProvider`, never from
+source code. Read [what the codec does not cover](#what-the-codec-does-not-cover).
 
 ---
 
