@@ -110,6 +110,7 @@ chrono-tz = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+lru = "0.18.2"
 # pinned because: rehearsed 2.2 -> 3.0 (Ballast, 2026-10-05) to collapse the
 # duplicate croner instance against autumn-web's own `^3.0` (deny.toml's
 # [bans] comment flagged this as the one dedup both sides are in reach for).
