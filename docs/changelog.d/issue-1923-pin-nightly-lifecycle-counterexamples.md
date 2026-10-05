@@ -20,3 +20,8 @@ place for a new counterexample.
 
 No engine code changes. There is no new `WorkflowEvent` variant and no
 migration.
+
+**Evidence.** On `e22a53bb`, the replay fails on all 3 sequences at the
+nightly steps (6, 5 and 6), with the nightly error: "the claim took a task
+due at ..., but the earliest is ...". The gap is 5 seconds each time. On
+`trunk-dev`, the replay and the 128-case property pass.
