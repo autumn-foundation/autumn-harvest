@@ -28,6 +28,16 @@ use super::ci_run_coverage::{NO_FULL_RUN_FLAGS, SHELL_OPERATORS, parse_workflow,
 /// must stay in scope, so the cutoff is the migration just before it.
 const LOCK_SAFETY_CUTOFF: &str = "20260914165542";
 
+/// Each migration at or before `LOCK_SAFETY_CUTOFF` that was on disk when the
+/// lint landed, as `tree/name`.
+///
+/// Only these are exempt. A new migration with an old version is still
+/// linted, so a backdated name cannot skip the lint.
+const LEGACY_MIGRATIONS: &str = include_str!("lock_safety_legacy.txt");
+
+/// The number of entries in `LEGACY_MIGRATIONS`. The list may only shrink.
+const LEGACY_MIGRATION_COUNT: usize = 108;
+
 /// The newest migration that `GRANDFATHERED` may name.
 ///
 /// This is the newest migration on disk when the lint landed. A newer
@@ -4096,8 +4106,18 @@ impl OnDisk {
     }
 
     fn in_scope(&self) -> bool {
-        self.version() > LOCK_SAFETY_CUTOFF
+        let key = format!("{}/{}", self.tree, self.name);
+        self.version() > LOCK_SAFETY_CUTOFF || !legacy_migrations().contains(key.as_str())
     }
+}
+
+/// The entries of `LEGACY_MIGRATIONS`, without comments and blank lines.
+fn legacy_migrations() -> BTreeSet<&'static str> {
+    LEGACY_MIGRATIONS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
 }
 
 fn workspace_root() -> PathBuf {
@@ -7891,6 +7911,45 @@ fn migrations_after_the_cutoff_are_lock_safe() {
          See docs/upgrading/online-migrations.md.",
         failures.join("\n  ")
     );
+}
+
+#[test]
+fn legacy_entries_are_on_disk_and_before_the_cutoff() {
+    let migrations = load_migrations();
+    let on_disk: BTreeSet<String> = migrations
+        .iter()
+        .map(|m| format!("{}/{}", m.tree, m.name))
+        .collect();
+    let legacy = legacy_migrations();
+    assert!(
+        legacy.len() <= LEGACY_MIGRATION_COUNT,
+        "the legacy list grew. A new migration is always linted."
+    );
+    for entry in &legacy {
+        let version = entry.rsplit('/').next().and_then(|n| n.split('_').next());
+        assert!(on_disk.contains(*entry), "{entry} is not on disk");
+        assert!(
+            version.is_some_and(|v| v <= LOCK_SAFETY_CUTOFF),
+            "{entry} is after the cutoff"
+        );
+    }
+}
+
+#[test]
+fn a_new_backdated_migration_is_in_scope() {
+    let at = |tree: &'static str, name: &str| OnDisk {
+        tree,
+        name: name.to_string(),
+        sql: String::new(),
+        run_in_transaction: true,
+    };
+    // A version at or before the cutoff does not exempt a new migration.
+    assert!(at("autumn-harvest/migrations", "20260914010101_new_change").in_scope());
+    let legacy = load_migrations()
+        .into_iter()
+        .find(|m| m.version() <= LOCK_SAFETY_CUTOFF)
+        .expect("a legacy migration is on disk");
+    assert!(!legacy.in_scope(), "{}", legacy.name);
 }
 
 #[test]

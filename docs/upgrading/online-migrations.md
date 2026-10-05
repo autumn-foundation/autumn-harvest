@@ -287,7 +287,9 @@ choice, not an accident.
 ## 7. Grandfathered migrations
 
 Migrations up to and including `20260914165542` shipped before the lint, and
-the lint does not read them. Some shipped migrations after the cutoff break a
+the lint does not read them. Only the ones on disk when the lint landed are
+exempt, and `lock_safety_legacy.txt` lists them. A new migration with an older
+version is still linted. Some shipped migrations after the cutoff break a
 rule. They cannot change, because a database may have applied them already.
 The `GRANDFATHERED` list in the lint names each one, with the rule and the
 reason. `20260915231809` is the first: it rebuilds a unique index on
