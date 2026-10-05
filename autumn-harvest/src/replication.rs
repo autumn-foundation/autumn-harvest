@@ -779,12 +779,12 @@ impl FenceRegistry {
                 return Err(conflict);
             }
             pinned.generations.insert(shard.as_i32(), generation);
+            // Stored under the write lock, after the map. A reader that sees
+            // `true` then waits on the lock, so it never finds an empty
+            // registry. A release cannot clear the flag between the two steps.
+            ENABLED.store(true, Ordering::Release);
             drop(guard);
         }
-        // Published only after the map is visible and the lock is released, so
-        // a reader that observes `is_enabled() == true` can never then find an
-        // empty registry.
-        ENABLED.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -867,12 +867,12 @@ impl FenceRegistry {
                 pinned.generations.insert(shard.as_i32(), *generation);
             }
             pinned.default_shard = Some(default_shard);
+            // Stored under the write lock, after the map AND the default
+            // shard. A reader that observes `is_enabled()` then waits on the
+            // lock, so it never finds a half-built registry.
+            ENABLED.store(true, Ordering::Release);
             drop(guard);
         }
-        // Published only after the map AND the default shard are visible, so a
-        // reader that observes `is_enabled()` can never find a half-built
-        // registry.
-        ENABLED.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -899,10 +899,18 @@ impl FenceRegistry {
         let mut guard = PINNED
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pinned) = guard.as_mut() {
-            for shard in held {
-                *pinned.holders.entry(shard.as_i32()).or_insert(0) += 1;
+        let pinned = guard.get_or_insert_with(Pinned::default);
+        for shard in held {
+            let key = shard.as_i32();
+            // A release can run between the publish and this lock. Restore
+            // the sentinel it removed, so a counted holder always has a pin.
+            let generation = *pinned.generations.entry(key).or_insert(HELD);
+            if generation == HELD {
+                *pinned.holders.entry(key).or_insert(0) += 1;
             }
+        }
+        if !pinned.generations.is_empty() {
+            ENABLED.store(true, Ordering::Release);
         }
         drop(guard);
         Ok(())
@@ -931,10 +939,12 @@ impl FenceRegistry {
             }
             pinned.generations.is_empty()
         });
-        drop(guard);
+        // Stored under the write lock. A publisher waits on the lock, so its
+        // `true` always lands after this `false` and never before it.
         if empty {
             ENABLED.store(false, Ordering::Release);
         }
+        drop(guard);
     }
 
     /// Whether `shard` is held: pinned to the sentinel, waiting for a probe.
@@ -1084,9 +1094,9 @@ impl FenceRegistry {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = None;
+            ENABLED.store(false, Ordering::Release);
             drop(guard);
         }
-        ENABLED.store(false, Ordering::Release);
     }
 }
 
@@ -3157,6 +3167,37 @@ mod tests {
             FenceRegistry::expected(ShardId::new(4)),
             Some(ShardGeneration(2))
         );
+        FenceRegistry::clear();
+    }
+
+    /// A release that races a publish must not switch the fence off over
+    /// the new pin (issue #1823). The flag and the map change under one lock.
+    #[test]
+    fn a_release_racing_a_publish_leaves_the_fence_on() {
+        let _serial = registry_guard();
+        for round in 0..2_000 {
+            FenceRegistry::clear();
+            FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("hold");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let release = {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    FenceRegistry::release_held(ShardId::new(3));
+                })
+            };
+            barrier.wait();
+            FenceRegistry::register(ShardId::new(4), ShardGeneration(2)).expect("pin");
+            release.join().expect("release thread");
+            assert!(
+                FenceRegistry::is_enabled(),
+                "round {round}: a live pin must keep the fence on"
+            );
+            assert_eq!(
+                FenceRegistry::binding(ShardId::new(4)),
+                Some((ShardId::new(4), ShardGeneration(2)))
+            );
+        }
         FenceRegistry::clear();
     }
 
