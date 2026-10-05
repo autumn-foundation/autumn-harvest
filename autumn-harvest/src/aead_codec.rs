@@ -1084,4 +1084,81 @@ mod tests {
             json!({"user": "alice"})
         );
     }
+
+    // ── Coverage boundary: failure text (issue #1920) ───────────────────
+
+    const SECRET: &str = "123-45-6789";
+
+    /// One event per free-form failure string, each with a payload field.
+    fn failure_events() -> Vec<(&'static str, WorkflowEvent)> {
+        let msg = || format!("bad ssn {SECRET}");
+        vec![
+            (
+                "WorkflowStarted.last_error",
+                WorkflowEvent::WorkflowStarted {
+                    input: json!({"ssn": SECRET}),
+                    timestamp: chrono::Utc::now(),
+                    last_completion_result: None,
+                    last_error: Some(msg()),
+                    scheduled_time: None,
+                },
+            ),
+            (
+                "WorkflowFailed.error",
+                WorkflowEvent::WorkflowFailed {
+                    error: msg(),
+                    error_type: None,
+                    details: Some(json!({"ssn": SECRET})),
+                    non_retryable: None,
+                },
+            ),
+            (
+                "ActivityFailed.error",
+                WorkflowEvent::ActivityFailed {
+                    activity_id: crate::types::ActivityExecId::new(),
+                    error: msg(),
+                    attempt: 1,
+                    error_type: "Error".into(),
+                    non_retryable: false,
+                    details: Some(json!({"ssn": SECRET})),
+                },
+            ),
+            (
+                "UpdateFailed.error",
+                WorkflowEvent::UpdateFailed {
+                    update_id: crate::types::UpdateId::new(),
+                    error: msg(),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn failure_text_stays_in_clear_but_payload_fields_do_not() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        for (name, event) in failure_events() {
+            let stored = codecs.encode_event(&event).unwrap().to_string();
+            assert!(
+                stored.contains(&format!("bad ssn {SECRET}")),
+                "{name}: failure text is in clear by design"
+            );
+            assert!(
+                !stored.contains(&format!("\"ssn\":\"{SECRET}\"")),
+                "{name}: the payload field is encrypted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_security_posture_doc_lists_failure_text_as_uncovered() {
+        let doc = include_str!("../../docs/security-posture.md");
+        let start = doc.find("### What the codec does not cover").unwrap();
+        let section = &doc[start..];
+        let end = section[4..].find("\n### ").map_or(section.len(), |i| i + 4);
+        let section = &section[..end];
+        for needle in ["`error`", "`last_error`", "`reason`", "`message`"] {
+            assert!(section.contains(needle), "section must name {needle}");
+        }
+    }
 }

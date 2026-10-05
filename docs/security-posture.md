@@ -684,6 +684,24 @@ in clear, so that operators can query them:
 - `harvest_signals.payload` and `harvest_dead_letters.input`;
 - other denormalized copies, for example schedule inputs and outbox rows.
 
+Failure text also stays in clear (issue #1920). The codec does not encrypt
+these free-form strings in `harvest_events.event_data`:
+
+- `error` in `WorkflowFailed`, `ActivityFailed`, `ActivityFailedExternally`,
+  `LocalActivityFailed`, `LocalActivityExhausted`, `ChildWorkflowFailed` and
+  `UpdateFailed`;
+- `last_error` in `WorkflowStarted`;
+- `reason` in `WorkflowCancelled`, `WorkflowResetFork`,
+  `WorkflowResetTerminated`, `WorkflowExecutionPaused` and `WorkflowRedriven`;
+- `message` in `ExternalAwaitFailed`.
+
+The `error` columns of `harvest_workflow_executions`, `harvest_task_queue`
+and `harvest_dead_letters` are also in clear. Erasure
+(issue #495) keeps operational error text on purpose. A validation message
+often quotes the bad value, for example an email or an SSN. Keep PII out of
+error strings. Put it in `details`, which the codec encrypts. The
+[audit export](./audit-export.md) ships the clear text.
+
 Event types, ids, timestamps and workflow names also stay in clear. Do not put
 PII in a memo, a search attribute, a workflow id or a workflow name. If these
 columns must not hold PII, encrypt the value in workflow code before Harvest
@@ -891,7 +909,8 @@ multi-shard deployments.
 
 If a workflow carries PII or secrets, register an `AeadCodec` with
 `aead_payload_codec_key`. Load the key from a `KeyProvider`, never from
-source code. Read [what the codec does not cover](#what-the-codec-does-not-cover).
+source code. Keep PII out of error text. Read
+[what the codec does not cover](#what-the-codec-does-not-cover).
 
 ---
 
