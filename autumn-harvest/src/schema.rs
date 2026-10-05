@@ -325,6 +325,9 @@ diesel::table! {
         /// started.
         handler_started_attempt -> Nullable<Int4>,
         timed_out_claims -> Nullable<Array<Nullable<Timestamptz>>>,
+        /// When the handler of `handler_started_attempt` started (issue
+        /// #1809).
+        handler_started_at -> Nullable<Timestamptz>,
         /// `TRUE` on the first workflow task of a freshly admitted run
         /// (issue #1824). Set only by the workflow start path. The claim
         /// order reads it while `attempt = 0`.

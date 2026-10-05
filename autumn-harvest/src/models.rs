@@ -589,6 +589,10 @@ pub struct TaskQueueItem {
     /// claim times out.
     #[serde(default)]
     pub timed_out_claims: Option<Vec<Option<DateTime<Utc>>>>,
+    /// When the handler of `handler_started_attempt` started (issue #1809).
+    /// A timeout enforcer measures the attempt duration from it.
+    #[serde(default)]
+    pub handler_started_at: Option<DateTime<Utc>>,
     /// `true` on the first workflow task of a freshly admitted run (issue
     /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
     #[serde(default)]

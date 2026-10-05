@@ -9,6 +9,10 @@
 -- claim increments attempt, so the column equals attempt only after the
 -- current claim started its handler. No path needs to clear it.
 --
+-- The same write sets handler_started_at. A timeout enforcer measures the
+-- attempt duration from it, so the wait between the claim and the handler
+-- start stays out of the activity latency.
+--
 -- A nullable column with no default changes only the catalog. The ALTER
 -- still takes an ACCESS EXCLUSIVE lock on a hot table, so it waits at most
 -- 5 s for that lock. Then the migration fails, and the operator runs it
@@ -17,11 +21,16 @@ SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS handler_started_attempt INT4;
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS timed_out_claims TIMESTAMPTZ[];
+ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS handler_started_at TIMESTAMPTZ;
 
 COMMENT ON COLUMN harvest_task_queue.handler_started_attempt IS
     'The attempt whose activity handler started (issue #1809). Written with '
     'ActivityStarted. Equal to attempt only after the current claim started '
     'its handler. NULL when no attempt started.';
+COMMENT ON COLUMN harvest_task_queue.handler_started_at IS
+    'When the handler of attempt handler_started_attempt started (issue '
+    '#1809). Written with handler_started_attempt. A timeout enforcer '
+    'measures the attempt duration from it.';
 COMMENT ON COLUMN harvest_task_queue.timed_out_claims IS
     'The started_at of each claim that the timeout enforcer timed out after '
     'its handler started, newest last (issue #1809). The worker that held a '

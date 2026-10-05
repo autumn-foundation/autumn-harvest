@@ -3040,6 +3040,9 @@ pub(crate) async fn take_timed_out_claim(
 ///
 /// The write sets `handler_started_attempt` to the claim's `attempt`. The
 /// timeout enforcer feeds the circuit breaker only when the two are equal.
+/// It also sets `handler_started_at`, from which the enforcer measures the
+/// attempt duration. `clock_timestamp()`, not `NOW()`: the start transaction
+/// can wait on the execution row lock first.
 /// Call it in the transaction that appends `ActivityStarted`, after
 /// [`lock_claim_for_update`] returns [`ClaimLock::Held`]. A WASM activity
 /// calls it after its module resolves instead. The claim fence then makes it
@@ -3055,7 +3058,12 @@ pub(crate) async fn mark_claim_handler_started(
     use crate::schema::harvest_task_queue::dsl;
 
     let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
-        .set(dsl::handler_started_attempt.eq(claim.attempt))
+        .set((
+            dsl::handler_started_attempt.eq(claim.attempt),
+            dsl::handler_started_at.eq(diesel::dsl::sql::<
+                diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+            >("clock_timestamp()")),
+        ))
         .into_boxed();
     let updated = fence(update, Some(claim))
         .execute(conn)

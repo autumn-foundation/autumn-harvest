@@ -995,6 +995,54 @@ async fn started_timeout_feeds_the_breaker() {
     );
 }
 
+/// Records the `harvest.activity.duration` samples of failed attempts.
+#[derive(Default)]
+struct DurationLog(Mutex<Vec<f64>>);
+
+impl MetricsRecorder for DurationLog {
+    fn record_activity_completed_with_error_type(
+        &self,
+        _activity_name: &str,
+        _queue: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+        _error_type: Option<&str>,
+    ) {
+        if status == ActivityStatus::Failed {
+            self.0.lock().unwrap().push(duration_secs);
+        }
+    }
+}
+
+/// The enforcer measures a timed-out attempt from its handler start, as the
+/// worker does. The wait between the claim and the handler start is local
+/// setup, so it stays out of the activity latency.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_duration_counts_from_the_handler_start() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-duration");
+    let activity = "t1809_duration";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 1, timeouts).await;
+
+    let claimed = claim(&mut conn, &queue, "w-duration").await;
+    age_claim(&mut conn, task_id).await;
+    start(&mut conn, &claimed, exec_id, activity).await;
+    let durations = DurationLog::default();
+    enforce_with(&mut conn, None, &durations).await;
+
+    let samples = durations.0.lock().unwrap().clone();
+    assert_eq!(samples.len(), 1, "one failed attempt: {samples:?}");
+    assert!(
+        samples[0] < 60.0,
+        "the sample covers the handler run, not the 10 minutes since the claim: {samples:?}"
+    );
+}
+
 /// ADR 0004 §2, on the retry path: a retried timeout of a started attempt
 /// feeds the breaker. A later claim is a new attempt, so the start of an
 /// earlier attempt does not mark it started.

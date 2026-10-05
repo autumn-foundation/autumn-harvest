@@ -52,9 +52,11 @@ decision.
   SQLite crate docs, which now state that SQLite keeps terminal timeouts.
 
 **Invariants.** Migration
-`20261003202429_harvest_task_queue_handler_started_attempt` adds two nullable
-columns to `harvest_task_queue`. The start transaction writes the claim's
-`attempt` to `handler_started_attempt`, under the claim lock. The timeout
+`20261003202429_harvest_task_queue_handler_started_attempt` adds three
+nullable columns to `harvest_task_queue`. The start transaction writes the
+claim's `attempt` to `handler_started_attempt`, under the claim lock, and the
+start time to `handler_started_at`. The timeout enforcer measures a timed-out
+attempt from that start time, as the worker does. The timeout
 enforcer appends the timed-out claim's `started_at` to `timed_out_claims`,
 when the handler started. The claim's owner removes that entry as it reads it.
 No new
