@@ -1763,6 +1763,7 @@ impl HarvestBuilder {
     /// id is a compile-time-constant deployment decision, not runtime input, so
     /// a malformed one is a configuration bug that must not boot.
     #[must_use]
+    #[expect(clippy::expect_used, reason = "documented panic on a bad key id")]
     pub fn payload_codec_key(self, key_id: &str, codec: impl PayloadCodec + 'static) -> Self {
         self.payload_codecs
             .register_key(key_id, Arc::new(codec))
@@ -1797,6 +1798,7 @@ impl HarvestBuilder {
     /// [`HarvestBuilder::payload_codec_key`]. Activating a key this process
     /// cannot encode with must not boot.
     #[must_use]
+    #[expect(clippy::expect_used, reason = "documented panic on an unknown key id")]
     pub fn active_payload_codec_key(self, key_id: &str) -> Self {
         self.payload_codecs
             .set_active_key(key_id)
@@ -2448,6 +2450,10 @@ impl HarvestBuilder {
     /// Panics when retention settings are invalid. Prefer [`Self::try_build`]
     /// if you want startup errors instead.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "documented panic: `try_build` returns the error"
+    )]
     pub fn build(self) -> BuiltHarvest {
         self.try_build()
             .expect("HarvestBuilder::build failed validation")
@@ -3382,10 +3388,10 @@ fn validate_local_activity_timeouts(
         if !activity.is_local {
             continue;
         }
-        if activity.default_start_to_close.is_some_and(|stc| stc > cap) {
+        if let Some(actual) = activity.default_start_to_close.filter(|stc| *stc > cap) {
             return Err(HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
                 activity: activity.name.to_string(),
-                actual: activity.default_start_to_close.unwrap(),
+                actual,
                 cap,
             });
         }

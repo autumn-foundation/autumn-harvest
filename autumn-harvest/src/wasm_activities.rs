@@ -358,12 +358,20 @@ impl WasmModuleStore {
         // via `Config::operator_cost`: fuel would still not be length-proportional
         // (the cost is per instruction either way), so it would buy no real bound
         // while silently changing what `DEFAULT_FUEL` means for every guest.
+        #[expect(
+            clippy::expect_used,
+            reason = "the fixed engine configuration is valid"
+        )]
         let engine = Engine::new(&config)
             .expect("wasmtime engine construction from a fixed valid config never fails");
 
         let ticker_stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&ticker_stop);
         let ticker_engine = engine.clone();
+        #[expect(
+            clippy::expect_used,
+            reason = "documented panic: the store needs the epoch ticker"
+        )]
         let ticker = std::thread::Builder::new()
             .name("harvest-wasm-epoch".to_string())
             .spawn(move || {

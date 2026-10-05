@@ -242,12 +242,6 @@ mod scanner {
     /// in the dead-letter reason discriminator.
     pub const QUARANTINE_REASON: &str = "poison_pill";
 
-    fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
-        id.to_string()
-            .parse()
-            .expect("database UUIDs must round-trip into ExecutionId")
-    }
-
     /// Re-check, under a row lock, whether the worker that holds `worker_id`
     /// is still dead. Guards against a worker that resurrected between the
     /// broad scan and acquiring the task lock.
@@ -600,7 +594,7 @@ mod scanner {
         if parent_close_policy.is_none()
             && let Some(parent_uuid) = parent_id
         {
-            let parent_exec_id = execution_id_from_uuid(parent_uuid);
+            let parent_exec_id = ExecutionId::from_uuid(parent_uuid);
             // Issue #956: a cross-shard parent is not on this connection.
             // `append_single_event` requires the parent row, so appending here
             // would `NotFound` and roll back this poison-pill seal — leaving the
@@ -777,7 +771,7 @@ mod scanner {
                             Some(exec_uuid) => {
                                 fail_owning_workflow(
                                     conn,
-                                    execution_id_from_uuid(exec_uuid),
+                                    ExecutionId::from_uuid(exec_uuid),
                                     &error,
                                     Some(metrics),
                                     codecs,
@@ -825,7 +819,7 @@ mod scanner {
                 }
 
                 if let Some(exec_uuid) = task.workflow_exec_id {
-                    let exec_id = execution_id_from_uuid(exec_uuid);
+                    let exec_id = ExecutionId::from_uuid(exec_uuid);
                     if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
                         conn,
                         exec_id,

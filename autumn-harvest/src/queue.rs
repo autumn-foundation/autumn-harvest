@@ -1214,6 +1214,7 @@ pub fn claim_task_query_fenced() -> &'static str {
              WHERE shard_id = $7 AND generation = $8 \
          ), ";
         let base = claim_task_query();
+        #[expect(clippy::expect_used, reason = "the claim query is a constant")]
         let base = base
             .strip_prefix("WITH ")
             .expect("claim query starts with WITH");
@@ -6895,6 +6896,7 @@ pub async fn sweep_terminal_tasks_into(
     }
 
     // A `batch_size` of 0 would make `LIMIT 0` delete nothing forever.
+    #[expect(clippy::expect_used, reason = "a constant caps the batch size")]
     let batch = i64::try_from(batch_size.clamp(1, MAX_TERMINAL_TASK_SWEEP_BATCH))
         .expect("the cap fits in i64");
     let (first_sql, next_sql) = if preview {

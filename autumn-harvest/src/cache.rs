@@ -103,7 +103,7 @@ impl WorkflowCache {
     pub fn new(max_size: usize) -> Self {
         // Havoc prevention: Cap max capacity to prevent OOM, and floor at 1 to prevent panic.
         let safe_size = max_size.clamp(1, 1_000_000);
-        let cap = NonZeroUsize::new(safe_size).expect("clamp ensures size >= 1");
+        let cap = NonZeroUsize::new(safe_size).unwrap_or(NonZeroUsize::MIN);
         Self {
             inner: LruCache::new(cap),
             resident_enabled: true,
