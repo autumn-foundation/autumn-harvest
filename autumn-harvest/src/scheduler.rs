@@ -1252,6 +1252,40 @@ pub async fn tick_once_sharded(
     .await
 }
 
+/// Whether this scheduler pass may write to `shard` (issue #1823).
+///
+/// A single pool names its shard through the default pin. A held shard may be an unpromoted standby. A fenced shard belongs to
+/// another region. The schedule writes do not pass the persist assert, so
+/// the pass checks first. It is a preflight, as the admin API check is. A
+/// start that a fire issues still asserts the fence in its own transaction.
+async fn scheduler_may_write(
+    conn: &mut AsyncPgConnection,
+    shard: ShardId,
+    single_pool: bool,
+) -> bool {
+    let fence_key = if single_pool {
+        ShardId::UNENCODED
+    } else {
+        shard
+    };
+    if crate::replication::shard_writes_held(Some(fence_key)) {
+        return false;
+    }
+    #[cfg(feature = "db")]
+    if let Err(error) = crate::replication::assert_fence(conn, fence_key).await {
+        tracing::error!(
+            shard_id = shard.as_i32(),
+            error = %error,
+            "scheduler skips a fenced shard; restart this process against the region that \
+             holds authority"
+        );
+        return false;
+    }
+    #[cfg(not(feature = "db"))]
+    let _ = (conn, shard);
+    true
+}
+
 /// [`tick_once_sharded`], with a caller-owned per-schedule registration backoff
 /// (issue #1157, defect 2).
 ///
@@ -1319,11 +1353,15 @@ pub async fn tick_once_sharded_with_backoff(
     #[cfg(not(feature = "db"))]
     let active_gates: Vec<crate::admission_gate::AdmissionGate> = Vec::new();
 
+    let single_pool = pool.len() == 1;
     for (shard, shard_pool) in pool.iter_shards() {
         let mut conn = shard_pool
             .get()
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
+        if !scheduler_may_write(&mut conn, shard, single_pool).await {
+            continue;
+        }
 
         // Issue #1157: on a converged shard this pass is read-only — no
         // transaction, no advisory lock, no UPDATE. Only a schedule that

@@ -1850,8 +1850,32 @@ mod db {
         //
         // Logical shards that share one pool share one database. A row for
         // any of them is then expected there.
+        //
+        // A worker on one database may share it with workers for other
+        // logical shards. Their rows are expected there, so it only warns.
+        let single_database = worker.is_some()
+            && targets
+                .iter()
+                .all(|(_, pool)| std::ptr::eq(pool.manager(), fallback_pool.manager()));
         for ((shard, pool), markers) in targets.iter().zip(&probed) {
             let Some(markers) = markers else { continue };
+            if single_database {
+                if !markers.generation_shards.is_empty()
+                    && !markers.generation_shards.contains(shard)
+                {
+                    tracing::warn!(
+                        shard_id = shard.as_i32(),
+                        rows = ?markers
+                            .generation_shards
+                            .iter()
+                            .map(|s| s.as_i32())
+                            .collect::<Vec<_>>(),
+                        "this database holds the rows of other logical shards; this worker \
+                         provisions its own row beside them"
+                    );
+                }
+                continue;
+            }
             let colocated = |row: &ShardId| {
                 targets.iter().any(|(peer, peer_pool)| {
                     peer == row && std::ptr::eq(peer_pool.manager(), pool.manager())

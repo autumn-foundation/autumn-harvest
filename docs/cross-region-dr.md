@@ -200,7 +200,9 @@ The log line says which rule it broke, and what to change:
 - `Disabled` on a DR database.
 - A fenced process that cannot name the shard it serves.
 - A fenced process whose shard number differs from the row in the database.
-  A shard database holds its own row only.
+  A shard database holds its own row only. One exception: a worker on a
+  single database may share it with workers for other logical shards. It
+  logs a warning and provisions its own row beside theirs.
 - A fenced process on a DR **standby**: a database with a DR subscription, or
   a server in recovery. No Harvest process writes to a standby. The runbook
   starts processes only after promotion.
@@ -320,6 +322,10 @@ Admin writes go through the same check as worker writes (issue #1823).
   carries no DDL, so the partitioned layout must be built on both sides.
 - **In-process partition maintenance.** The retention janitor runs
   `assert_fence` on each shard before it creates or drops partitions.
+- **The scheduler.** Each scheduler pass runs `assert_fence` on each shard
+  before it writes `harvest_schedules`. A fenced or held shard gets no
+  write, and the log names it. Each workflow start that a fire issues also
+  asserts the fence in its own transaction.
 
 These direct-database commands are exempt, by design:
 

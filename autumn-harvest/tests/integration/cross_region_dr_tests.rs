@@ -2823,6 +2823,97 @@ async fn a_worker_pins_every_colocated_shard() {
     );
 }
 
+/// A fenced scheduler writes nothing (issue #1823). Its schedule-table writes
+/// do not pass the persist assert, so each shard pass checks the fence first.
+#[tokio::test]
+async fn a_fenced_scheduler_writes_nothing() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fencedsched");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .unwrap();
+    conn.batch_execute(
+        "INSERT INTO harvest_schedules (id, workflow_name, schedule_expr, timezone, catchup, \
+           max_active_runs, is_paused, next_run_at, jitter_secs, overlap_policy, \
+           buffered_runs, buffer_all_max, skip_policy) \
+         VALUES (gen_random_uuid(), 'dr_fenced_wf', 'interval:60', 'UTC', false, 10, false, \
+           now() - interval '5 seconds', 0, 'skip', '[]', 100, 'skip');
+         CREATE TABLE test_write_log (tbl text NOT NULL, op text NOT NULL);
+         CREATE FUNCTION test_note_write() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO test_write_log VALUES (TG_TABLE_NAME, TG_OP);
+           RETURN NULL;
+         END $$;
+         CREATE TRIGGER test_note_write AFTER INSERT OR UPDATE OR DELETE ON harvest_schedules
+           FOR EACH STATEMENT EXECUTE FUNCTION test_note_write();
+         CREATE TRIGGER test_note_write AFTER INSERT OR UPDATE OR DELETE
+           ON harvest_workflow_executions
+           FOR EACH STATEMENT EXECUTE FUNCTION test_note_write();",
+    )
+    .await
+    .expect("seed a due schedule and the write log");
+
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let _ = autumn_harvest::tick_once(
+        dr_pool(&url),
+        registry,
+        std::sync::Arc::new(autumn_harvest::DagCatalog::default()),
+        std::sync::Arc::new(Vec::new()),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await;
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let writes = diesel::sql_query("SELECT count(*) AS n FROM test_write_log")
+        .get_result::<Count>(&mut conn)
+        .await
+        .expect("read the write log")
+        .n;
+    assert_eq!(writes, 0, "a fenced scheduler must not write");
+}
+
+/// Workers may split the logical shards of one database (issue #1823). A
+/// second worker finds the first worker's row there and still starts.
+#[tokio::test]
+async fn split_workers_on_one_database_both_start() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("splitworkers");
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .unwrap();
+    }
+    let assigned = [ShardId::new(1)];
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments(assigned),
+    );
+    let pool = dr_pool(&url);
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    let started = pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &assigned).await;
+    let Ok((fenced, held)) = started else {
+        panic!("a worker for another logical shard on this database must start");
+    };
+    assert!(held.is_empty());
+    assert!(fenced.is_some());
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(1)),
+        Some(ShardGeneration::INITIAL)
+    );
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]
