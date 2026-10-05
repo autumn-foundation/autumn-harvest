@@ -2914,6 +2914,45 @@ async fn split_workers_on_one_database_both_start() {
     );
 }
 
+/// A fenced pass outlives an idle-in-transaction timeout (issue #1823). The
+/// guard runs no query while the pass works. A server timeout must not end
+/// its transaction and free the lock mid-pass.
+#[tokio::test]
+async fn a_fenced_pass_outlives_an_idle_transaction_timeout() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("passidle");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    diesel::sql_query(format!(
+        "ALTER DATABASE \"{db}\" SET idle_in_transaction_session_timeout = '300ms'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("set the idle timeout");
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass(&pool, ShardId::new(0))
+        .await
+        .expect("open the pass")
+        .expect("a pinned shard gets a guard");
+    // Well past the timeout, as a long pass would be.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    let bump_url = url.clone();
+    let bump = tokio::spawn(async move {
+        let mut conn = connect(&bump_url).await;
+        bump_generation(&mut conn, ShardId::new(0), "failover", "test").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let waited = !bump.is_finished();
+    drop(guard);
+    let _ = bump.await;
+
+    assert!(waited, "the idle timeout must not free the pass lock");
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

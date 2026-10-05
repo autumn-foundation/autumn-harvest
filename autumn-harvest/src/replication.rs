@@ -1460,6 +1460,21 @@ mod db {
     ) -> HarvestResult<FencePassGuard> {
         use diesel_async::SimpleAsyncConnection as _;
         conn.batch_execute("BEGIN").await.map_err(database_error)?;
+        // The guard runs no query while the pass works. A server timeout
+        // must not end its transaction and free the lock mid-pass, so this
+        // transaction turns them off. PostgreSQL 17 adds
+        // `transaction_timeout`; older servers do not know it.
+        conn.batch_execute(
+            "SET LOCAL idle_in_transaction_session_timeout = 0; \
+             SET LOCAL statement_timeout = 0; \
+             DO $$ BEGIN \
+               IF current_setting('server_version_num')::int >= 170000 THEN \
+                 PERFORM set_config('transaction_timeout', '0', true); \
+               END IF; \
+             END $$",
+        )
+        .await
+        .map_err(database_error)?;
         diesel::sql_query(FENCE_PASS_LOCK_SHARED)
             .execute(&mut conn)
             .await
