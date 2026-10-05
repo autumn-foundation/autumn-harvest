@@ -210,6 +210,10 @@ const INIT_SQL: &str = concat!(
     // selects it too, so omitting it fails every read in this suite the same
     // way omitting `capability_misses` would.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
+    // issue #1824: the new-start marker on harvest_task_queue. Every claim
+    // orders by it and `TaskQueueItem` selects it, so each claim in this suite
+    // needs it. Added inline for the same reason as the columns above.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
     // 20260706000001_harvest_start_throttle is deliberately omitted: the tick's
     // dispatch path probes `to_regclass('harvest_start_throttle')` and treats a
     // missing table as "no pending throttled starts" (see

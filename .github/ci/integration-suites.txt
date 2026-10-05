@@ -90,6 +90,8 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          child_timeout_tests
 linux        autumn-harvest         integration                      -                          claim_batched_tests
 linux        autumn-harvest         integration                      -                          claim_budget_tests
+linux        autumn-harvest         integration                      -                          claim_continuation_priority_tests
+linux        autumn-harvest         integration                      -                          claim_run_deadline_tests
 linux        autumn-harvest         integration                      -                          completion_callback_outcome_batch_perf
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          completion_trigger_outbox_queue_perf
@@ -104,8 +106,10 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          external_outbox_scan_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
+linux        autumn-harvest         integration                      -                          history_crash_tests
 linux        autumn-harvest         integration                      -                          host_clock_skew_tests
 linux        autumn-harvest         integration                      -                          integration_e2e
+linux        autumn-harvest         integration                      -                          lifecycle_model_props
 linux        autumn-harvest         integration                      -                          lineage_store_tests
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          migrate_tests
@@ -155,6 +159,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          terminal_task_gc_tests
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          throttle_bucket_prelock_batch_perf
+linux        autumn-harvest         integration                      -                          throwaway_db
 linux        autumn-harvest         integration                      -                          transactional_start_tests
 linux        autumn-harvest         integration                      -                          triage_tests
 linux        autumn-harvest         integration                      -                          typed_stub_deferred_admission_tests
