@@ -32,9 +32,27 @@ use uuid::Uuid;
 #[derive(Debug, Default)]
 struct RecordingMetrics {
     quarantined: Mutex<Vec<(String, String)>>,
+    terminal: Mutex<Vec<String>>,
+    canary_failures: Mutex<Vec<(String, u16)>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
+    fn record_workflow_terminal(
+        &self,
+        workflow_name: &str,
+        _queue: &str,
+        _status: autumn_harvest::telemetry::WorkflowStatus,
+    ) {
+        self.terminal.lock().unwrap().push(workflow_name.to_owned());
+    }
+
+    fn record_canary_failure(&self, queue: &str, shard: u16) {
+        self.canary_failures
+            .lock()
+            .unwrap()
+            .push((queue.to_owned(), shard));
+    }
+
     fn record_task_quarantined(&self, queue: &str, reason: &str) {
         self.quarantined
             .lock()
@@ -340,6 +358,53 @@ async fn orphan_at_threshold_is_quarantined() {
     assert_eq!(
         recorded,
         vec![("default".to_string(), QUARANTINE_REASON.to_string())]
+    );
+}
+
+/// A canary probe failed by a crash quarantine is a canary failure (issue #1816).
+///
+/// The terminal helper skips a probe. Without a canary failure, the probe is
+/// lost from the canary SLO, and a crash-looping probe pipeline looks green.
+#[tokio::test]
+async fn quarantine_of_a_canary_probe_records_a_canary_failure() {
+    let (mut conn, _container) = setup_db().await;
+    let probe = format!(
+        "{}__default",
+        autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX
+    );
+    let exec_id = insert_running_workflow(&mut conn, "wf-canary").await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET workflow_name = $2, shard_id = 2 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .bind::<diesel::sql_types::Text, _>(&probe)
+    .execute(&mut conn)
+    .await
+    .expect("make the execution a canary probe on shard 2");
+    insert_running_task(&mut conn, Some(exec_id), "dead-worker-2", 2).await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        None,
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
+
+    assert_eq!(summary.quarantined, 1);
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");
+    assert_eq!(
+        *metrics.canary_failures.lock().unwrap(),
+        vec![("default".to_owned(), 2)],
+        "one canary failure on the probe's queue and shard"
+    );
+    assert!(
+        metrics.terminal.lock().unwrap().is_empty(),
+        "a probe never records a business terminal"
     );
 }
 

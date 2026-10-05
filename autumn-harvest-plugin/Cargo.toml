@@ -34,6 +34,13 @@ metrics = []
 connectors = ["dep:async-trait", "dep:sha2"]
 kafka = ["connectors", "dep:rdkafka"]
 sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
+# AWS KMS binding for the core AES-256-GCM payload codec (issue #1825).
+# `autumn_harvest_plugin::aws_kms::AwsKms` implements the core `KmsDecrypt`
+# trait, so the core crate keeps zero cloud dependencies (the issue #944 rule,
+# enforced by `tests/connector_dependency_graph.rs`). Like `sqs`, it brings in
+# `aws-lc-rs`, which needs cmake and a C compiler. The locked `aws-sdk-kms`
+# 1.99.0 needs Rust 1.88, so the effective MSRV does not rise.
+aws-kms = ["dep:aws-sdk-kms", "dep:async-trait"]
 # Zero-setup local dev runtime (issue #525) — the `harvest-dev` binary.
 #
 # Off by default and never in a release build. It provisions an **ephemeral**
@@ -148,6 +155,9 @@ rdkafka = { version = "0.38", default-features = false, features = ["cmake-build
 # `default-https-client`, same target), so it's left as-is.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"], optional = true }
 aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+# KMS client for the `aws-kms` feature. Same feature choice as `aws-sdk-sqs`,
+# for the same reason.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 
 [[bin]]
 # Zero-setup local dev runtime (issue #525). `cargo dev` is the workspace alias

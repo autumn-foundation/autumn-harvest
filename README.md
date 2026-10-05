@@ -519,6 +519,10 @@ Prometheus examples use only ADR-0001/#138 metric names and bounded labels;
 operators without Prometheus can run the equivalent CLI/API checks documented
 in [`docs/alerts/README.md`](docs/alerts/README.md).
 
+For SLO-based paging, add the optional burn-rate pack in
+[`docs/alerts/slo.md`](docs/alerts/slo.md). It pages on error-budget burn for
+workflow-task success, schedule-to-start latency, and canary success.
+
 ### Measured performance baselines
 
 [`docs/benchmarks.md`](docs/benchmarks.md) publishes **end-to-end** numbers —

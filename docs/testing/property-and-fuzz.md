@@ -67,11 +67,58 @@ PROPTEST_CASES=100000 cargo test -p autumn-harvest --features db --test property
 
 ### CI
 
-The pure suites execute via the existing `cargo test -p autumn-harvest
---no-default-features` line in the `test` job. The `db`-gated suites execute via
-a dedicated **"Run db-gated property suites"** step
-(`cargo test -p autumn-harvest --features db --test property`) — they were
-previously only *compiled* (never executed) by the `--no-run` / `--lib` db steps.
+The pure suites run in the `test` job, through `cargo test -p autumn-harvest
+--no-default-features`. The `db`-gated suites run through the `allos` row
+`property db` in `.github/ci/integration-suites.txt`.
+
+The nightly workflow `.github/workflows/proptest-nightly.yml` runs 100000
+cases of each deep pass: the `property` target, and the lifecycle model in
+8 shards. A failed scheduled run opens an issue. The guard
+`proptest_nightly_runs_both_deep_passes` in `ci_run_coverage.rs` keeps it
+wired. The in-crate proptests in `src/` are not part of the deep pass.
+
+### Stateful lifecycle model (issue #1829)
+
+`tests/integration/lifecycle_model_props.rs` is a stateful, model-based
+property test, in the style of ShardStore (SOSP'21). Proptest generates a
+sequence of client operations: start, claim, heartbeat, park, complete,
+signal, cancel, worker death, worker revival and orphan reclaim. Each
+operation runs against a real Postgres and against a small reference
+model. After each operation the test asserts three things:
+
+1. The operation returns what the model predicts.
+2. The rows of the case equal the model state.
+3. Each run state change is in `lifecycle::TRANSITIONS`.
+
+The model follows the documented contracts: the reuse-policy matrix, the
+claim fence `(worker_id, attempt)`, the lost-wake rule of the park, and the
+orphan reclaim rules. Short motifs in the strategy reach rare branches,
+such as a wake that races a park. A coverage check fails the run when no
+case reaches a branch.
+
+The test also compares the lifecycle events of each run and the
+dead-letter count. A claim must take the pending task with the earliest
+`scheduled_at`.
+
+The test needs Docker, or `HARVEST_TEST_DATABASE_URL`. Each case truncates
+the engine tables, so with that variable set the test creates a throwaway
+database on the server and drops it at the end. The DSN can be a URL or a
+libpq keyword/value string.
+
+```bash
+cargo test -p autumn-harvest --test integration lifecycle_model_props::
+PROPTEST_CASES=2000 cargo test -p autumn-harvest --test integration lifecycle_model_props::
+```
+
+CI runs the default 128 cases through the `linux` manifest row, in the
+`test-db-linux` job. That job is not a required check yet. One case costs
+about 150 ms, so the nightly runs 8 shards of 12500 cases, 100000 in total.
+A shrink stops after 20 minutes, so a late failure still prints its
+sequence.
+
+A failure prints the shrunk operation sequence and the first step where the
+database and the model disagree. To keep a counterexample, add it to the
+model self-tests at the end of the file, or as a fixed sequence.
 
 ---
 
