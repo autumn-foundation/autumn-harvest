@@ -15,8 +15,10 @@ its own claim.
 the `attempt`. Build it with `TaskClaim::new(task.id, worker_id, task.attempt)`.
 
 The TLA+ model `WorkflowTaskClaim` found the gap (issue #1819). Its fixed
-config now checks the new guard. `WorkflowTaskClaimCapMissPreFix.cfg` keeps
-the old guard as a counter-example.
+config now checks the new guard. `WorkflowTaskClaimCapMissGap.cfg` became
+`WorkflowTaskClaimCapMissPreFix.cfg`, which keeps the old guard as a
+counter-example. `WorkflowTaskClaimCapMissFix.cfg` merged into
+`WorkflowTaskClaim.cfg`. The #1819 fragment uses the old names.
 
 Test evidence: the DB test
 `a_capability_miss_release_from_a_stale_attempt_does_not_free_the_current_claim_1917`

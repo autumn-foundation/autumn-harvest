@@ -2780,9 +2780,8 @@ pub(crate) async fn claim_held_for_update_skip_locked(
 /// Whether a later claim of the same worker holds the row with the same
 /// `crash_strikes` (issue #1789).
 ///
-/// Such a claim passes a guard on `(worker_id, crash_strikes)`, for example
-/// the capability-miss release, but it is not `claim`. The read takes no
-/// lock.
+/// Such a claim passes a guard on `(worker_id, crash_strikes)` alone, but it
+/// is not `claim`. The read takes no lock.
 ///
 /// # Errors
 ///
@@ -4273,8 +4272,10 @@ async fn announce_deferred_task(
 /// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests
 /// (issue #804).
 ///
-/// `$1` = task id, `$2` = the releasing worker's id, `$3` = the backoff in
-/// seconds.
+/// The parameters identify the row and the claim. `$1` is the task id, `$2`
+/// the releasing worker's id and `$3` the backoff in seconds. `$4` is the
+/// claim's `crash_strikes`, `$5` the handler frontier and `$6` the claim's
+/// `attempt`.
 ///
 /// The `phase` selects between three literal statements rather than binding
 /// flags, mirroring [`park_workflow_task_query`]. Taking the phase itself —
@@ -10865,22 +10866,6 @@ mod tests {
         }
     }
 
-    /// The release must be guarded on the **claim epoch**, not just the claim's
-    /// worker id (issue #804, Codex round-37 P1).
-    ///
-    /// `poison_pill::requeue_orphan` hands an orphaned row back to the pool as
-    /// `PENDING` / `worker_id = NULL` with `crash_strikes + 1`, and nothing
-    /// stops the *same* worker from winning it again. A guard keyed on
-    /// `(state, worker_id)` alone therefore matches that **new** claim, so a
-    /// stale dispatcher's release would re-`PENDING` a row whose replacement
-    /// handler is already running — inviting a second concurrent claim and
-    /// duplicate side effects, and decrementing an `attempt` that belongs to
-    /// the new dispatch.
-    ///
-    /// `crash_strikes` is the discriminator because the requeue that creates
-    /// this race is the thing that bumps it. The terminal escalation guard
-    /// ([`claim_still_held_for_update`]) already keys on it for exactly
-    /// this reason; the release is the far more common path and must match.
     /// A stuck-running requeue keeps `crash_strikes`, and the same worker can
     /// claim the row again. Only `attempt` tells the two claims apart
     /// (issue #1917).
@@ -10900,6 +10885,22 @@ mod tests {
         }
     }
 
+    /// The release must be guarded on the **claim epoch**, not just the claim's
+    /// worker id (issue #804, Codex round-37 P1).
+    ///
+    /// `poison_pill::requeue_orphan` hands an orphaned row back to the pool as
+    /// `PENDING` / `worker_id = NULL` with `crash_strikes + 1`, and nothing
+    /// stops the *same* worker from winning it again. A guard keyed on
+    /// `(state, worker_id)` alone therefore matches that **new** claim, so a
+    /// stale dispatcher's release would re-`PENDING` a row whose replacement
+    /// handler is already running — inviting a second concurrent claim and
+    /// duplicate side effects, and decrementing an `attempt` that belongs to
+    /// the new dispatch.
+    ///
+    /// `crash_strikes` is the discriminator because the requeue that creates
+    /// this race is the thing that bumps it. The terminal escalation guard
+    /// ([`claim_still_held_for_update`]) already keys on it for exactly
+    /// this reason; the release is the far more common path and must match.
     #[test]
     fn capability_miss_release_is_guarded_on_the_claim_epoch() {
         for phase in [

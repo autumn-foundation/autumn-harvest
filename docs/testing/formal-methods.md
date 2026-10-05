@@ -102,10 +102,9 @@ one task row and these actions:
 `Fenced = FALSE` gives it only `state = 'RUNNING'`, as before #1789.
 
 `SelfRelease` uses the full `claim_held` guard, which is stronger than the
-pause and capability-miss guards in the code. Two facts make it equivalent
-here. The pause releases run in the claim's own transaction. The
-capability-miss release runs only on a worker without the handler, which
-never starts the activity.
+pause guards in the code. The pause releases run in the claim's own
+transaction, so the stronger guard is equivalent here. The capability-miss
+release checks `claim_held` and `crash_strikes` (issue #1917).
 
 Invariants:
 

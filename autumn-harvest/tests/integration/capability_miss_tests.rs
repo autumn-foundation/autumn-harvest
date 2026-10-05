@@ -4110,10 +4110,12 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_released_by_the_stale_disp
     .expect("requeue then re-claim with the same worker");
 
     // The stale dispatcher, still holding its pre-requeue snapshot, releases.
+    // It passes the new claim's attempt, so only `crash_strikes` differs and
+    // this test pins that guard alone. Issue #1917 covers `attempt`.
     let mut conn = connect(&url).await;
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        &queue::TaskClaim::new(task.id, "worker-a", task.attempt),
+        &queue::TaskClaim::new(task.id, "worker-a", 3),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         task.crash_strikes,
