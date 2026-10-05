@@ -420,11 +420,17 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
                 rule: Rule::ConcurrentlyInTransaction,
                 line: hit.line,
                 stmt: hit.at,
-                detail: format!(
-                    "{} CONCURRENTLY takes exactly one index and no CASCADE, so Postgres \
-                     rejects the statement.",
-                    hit.verb
-                ),
+                detail: if hit.verb == "REINDEX SYSTEM" {
+                    "REINDEX SYSTEM does not support CONCURRENTLY, so Postgres rejects the \
+                     statement."
+                        .to_string()
+                } else {
+                    format!(
+                        "{} CONCURRENTLY takes exactly one index and no CASCADE, so Postgres \
+                         rejects the statement.",
+                        hit.verb
+                    )
+                },
             });
             continue;
         }
@@ -1447,7 +1453,8 @@ enum Kind {
     Index { concurrent: bool },
     /// Any other statement that takes a blocking lock.
     Lock,
-    /// A `CONCURRENTLY` form that Postgres rejects outright.
+    /// A `CONCURRENTLY` form that Postgres rejects outright: a `DROP INDEX` of
+    /// more than one index or with `CASCADE`, or `REINDEX SYSTEM`.
     RejectedConcurrent,
 }
 
@@ -4463,6 +4470,16 @@ fn reindex(s: &Stmts, k: usize) -> Option<Raw> {
         concurrent = true;
         j += 1;
     }
+    // Postgres rejects `CONCURRENTLY` for the system catalogs.
+    if scope == "system" && concurrent {
+        return Some(Raw {
+            at: k,
+            verb: "REINDEX SYSTEM",
+            index: None,
+            table: None,
+            kind: Kind::RejectedConcurrent,
+        });
+    }
     let name = s.qualified_name(j).map(|(name, _)| name);
     let (index, table) = match scope {
         "index" => (name, None),
@@ -5070,6 +5087,25 @@ fn the_reindex_concurrently_option_form_is_concurrent() {
         rules(&lint_with_history(&[], sql, true)),
         [Rule::ConcurrentlyInTransaction]
     );
+}
+
+#[test]
+fn a_concurrent_system_reindex_is_rejected() {
+    // Postgres rejects `CONCURRENTLY` for system catalogs.
+    for sql in [
+        "REINDEX SYSTEM CONCURRENTLY app;",
+        "REINDEX (CONCURRENTLY) SYSTEM app;",
+    ] {
+        let findings = lint_with_history(&[], sql, false);
+        assert_eq!(
+            rules(&findings),
+            [Rule::ConcurrentlyInTransaction],
+            "{sql}\n{findings:?}"
+        );
+    }
+    // The database form skips the catalogs and runs.
+    let sql = "REINDEX DATABASE CONCURRENTLY app;";
+    assert_eq!(lint_with_history(&[], sql, false), [], "{sql}");
 }
 
 #[test]

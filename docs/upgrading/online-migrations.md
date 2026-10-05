@@ -239,6 +239,8 @@ therefore breaks the migration. The lint flags it. `SHARE UPDATE EXCLUSIVE`
 does not block reads or writes, so this statement needs no `lock_timeout`.
 `DROP INDEX CONCURRENTLY` takes exactly one index and no `CASCADE`. Postgres
 rejects any other form, so the lint flags it.
+`REINDEX SYSTEM` does not support `CONCURRENTLY` at all, so the lint flags that
+form too.
 
 **`harvest_events` is different.** The opt-in partitioned layout turns it
 into a partitioned parent. Postgres does not build or drop an index
