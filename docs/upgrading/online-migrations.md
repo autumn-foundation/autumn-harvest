@@ -355,7 +355,8 @@ rule in its file, so a digest pins the SQL of each listed migration as well.
   off, each statement with a backslash counts the same way, later in the file
   and in later migrations, until an `on` that surely runs. A reset restores
   the connection default, which may be off. An `on` in a function body or in a
-  branch does not count. Nor does a `set_config` that may not be the built-in. A `ROLLBACK` restores the value from the start of its
+  branch does not count. A `set_config` counts only as a bare
+  `SELECT pg_catalog.set_config(...)` or `PERFORM`, as for `lock_timeout`. A `ROLLBACK` restores the value from the start of its
   transaction. A top-level `SET LOCAL` ends at the commit. A local value in a
   routine body carries, because the body may run in any later transaction.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a

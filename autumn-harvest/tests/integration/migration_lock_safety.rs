@@ -2304,9 +2304,11 @@ fn conforming_change(s: &Stmts, k: usize, path_change: Option<usize>) -> Option<
         .is_some_and(|n| n.eq_ignore_ascii_case("standard_conforming_strings"));
     let scope = |read: fn(&str) -> bool| s.is_punct(k + 5, ',') && literal(k + 6).is_some_and(read);
     let (session, local) = (scope(pg_false), scope(pg_true));
+    // Like a timeout bound, an `on` counts only from a bare built-in call.
+    // A filtered call may not run, and an unqualified one may not be the built-in.
     named
         .then(|| (s.is_punct(k + 3, ',') && on(k + 4), local))
-        .filter(|&(on, _)| !on || session)
+        .filter(|&(on, _)| !on || (session && s.is_bare_call(k)))
 }
 
 /// The setting that the `set_config` call at `k` names, if it is one literal.
@@ -7332,20 +7334,22 @@ fn only_the_built_in_set_config_turns_conforming_strings_on() {
             .iter()
             .any(|f| f.detail.contains("standard_conforming_strings"))
     };
-    // Another schema's `set_config`, or an unqualified one after a path
-    // change, may be a user function.
+    // An unqualified `set_config` may be a user function, because the
+    // connection may start with any path. A filtered call may not run.
     for on in [
         "SELECT other.set_config('standard_conforming_strings', 'on', false);",
         "SET search_path = other, pg_catalog;\nSELECT set_config('standard_conforming_strings', 'on', false);",
+        "SELECT set_config('standard_conforming_strings', 'on', false);",
+        "SELECT pg_catalog.set_config('standard_conforming_strings', 'on', false) WHERE false;",
     ] {
         let sql = format!("{on}\n{hidden}");
         let findings = lint_with_history(&[off], &sql, true);
         assert!(tainted(&findings), "{sql}\n{findings:?}");
     }
-    // The built-in turns it on.
+    // A bare call of the built-in turns it on.
     for on in [
         "SELECT pg_catalog.set_config('standard_conforming_strings', 'on', false);",
-        "SELECT set_config('standard_conforming_strings', 'on', false);",
+        "DO $$\nBEGIN\n    PERFORM pg_catalog.set_config('standard_conforming_strings', 'on', false);\nEND $$;",
     ] {
         let sql = format!("{on}\n{hidden}");
         let findings = lint_with_history(&[off], &sql, true);
@@ -8578,8 +8582,8 @@ fn a_local_conforming_strings_value_keeps_the_session_taint() {
         let findings = lint_with_history(&[], &sql, false);
         assert!(tainted(&findings), "{local}\n{findings:?}");
     }
-    let sql =
-        format!("{off}SELECT set_config('standard_conforming_strings', 'on', false);\n{probe}");
+    let on = "SELECT pg_catalog.set_config('standard_conforming_strings', 'on', false);";
+    let sql = format!("{off}{on}\n{probe}");
     let findings = lint_with_history(&[], &sql, true);
     assert!(!tainted(&findings), "{findings:?}");
 }
