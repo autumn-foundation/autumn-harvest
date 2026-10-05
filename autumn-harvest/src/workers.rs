@@ -1135,6 +1135,14 @@ pub struct PayloadPolicy {
     /// It also holds the rate limit, the concurrency limit and any WASM
     /// binding.
     pub activities: Vec<(String, serde_json::Value)>,
+    /// The registry defaults a local activity runs with: its retry policy, its
+    /// start-to-close timeout and the retry-after ceiling. A local activity has
+    /// no task row, so the worker applies its own defaults.
+    pub local_activity_defaults: serde_json::Value,
+    /// The module host's policy with the `hot-code-swap` feature: capabilities,
+    /// limits, activity allowlist and queue-override permission. A refusal or
+    /// an exhausted limit fails the workflow.
+    pub module_host: serde_json::Value,
 }
 
 impl PayloadPolicy {
@@ -1151,6 +1159,8 @@ impl PayloadPolicy {
             "offload_threshold": self.offload_threshold,
             "activity_interceptors": self.activity_interceptors,
             "activities": self.activities,
+            "local_activity_defaults": self.local_activity_defaults,
+            "module_host": self.module_host,
         })
     }
 }
@@ -3708,41 +3718,12 @@ mod tests {
         );
     }
 
-    /// Issue #1815: the payload caps, the history policy, the offloader, the
-    /// codec keys and the interceptors decide whether a task's payloads pass.
-    /// Workers that differ in any of them are in different cohorts.
-    #[test]
-    fn the_cohort_key_includes_the_payload_policy() {
+    /// One payload policy per field, each differing from the default in that
+    /// field alone.
+    fn payload_variants() -> Vec<super::PayloadPolicy> {
         use super::PayloadPolicy;
-        let queues = vec!["a".to_owned()];
-        let none = std::collections::HashMap::<String, u32>::new();
-        let labels = std::collections::HashMap::<String, String>::new();
-        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
-        let budgets = crate::retry_budget::RetryBudgetConfig::default();
-        let cohort = |payload: PayloadPolicy| {
-            super::worker_cohort(&super::CohortPolicy {
-                queues: &queues,
-                queue_weights: &none,
-                build_id: "v1",
-                labels: &labels,
-                slots: super::SlotPolicy::of(10, 10, None),
-                session_slots: 0,
-                priority_aging_secs: None,
-                ineligible_activities: &[],
-                shard_assignments: &[],
-                registered_workflows: &[],
-                registered_activities: &[],
-                circuit_breakers: &breakers,
-                dispatch_channel: false,
-                retry_budgets: &budgets,
-                outcome_window: std::time::Duration::from_secs(300),
-                peer_stale_secs: 120,
-                execution: super::ExecutionPolicy::default(),
-                payload,
-            })
-        };
         let base = PayloadPolicy::default();
-        let variants = [
+        vec![
             PayloadPolicy {
                 max_activity_input_bytes: 1,
                 ..base.clone()
@@ -3791,7 +3772,52 @@ mod tests {
                 activities: vec![("charge".to_owned(), serde_json::json!({"result_cap": 1024}))],
                 ..base.clone()
             },
-        ];
+            PayloadPolicy {
+                local_activity_defaults: serde_json::json!({"start_to_close_ms": 500}),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                module_host: serde_json::json!({"allow_queue_override": true}),
+                ..base
+            },
+        ]
+    }
+
+    /// Issue #1815: the payload caps, the history policy, the offloader, the
+    /// codec keys and the interceptors decide whether a task's payloads pass.
+    /// Workers that differ in any of them are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_payload_policy() {
+        use super::PayloadPolicy;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |payload: PayloadPolicy| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: false,
+                retry_budgets: &budgets,
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload,
+            })
+        };
+        let base = PayloadPolicy::default();
+        let variants = payload_variants();
         for variant in variants {
             assert_ne!(cohort(base.clone()), cohort(variant.clone()), "{variant:?}");
         }

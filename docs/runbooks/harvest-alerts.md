@@ -3415,7 +3415,9 @@ task budgets (`workflow_task_timeout`, `max_local_activity_start_to_close`)
 and the quarantine limits (`workflow_panic_max_attempts`,
 `poison_pill_threshold`). So do the payload caps, the history policy, the
 payload offloader, the registered codec keys, the activity interceptor chain
-and each activity's own caps, rate and concurrency limits and WASM binding. Each heartbeat reads the codec keys afresh, because a reload can
+and each activity's own caps, rate and concurrency limits and WASM binding.
+So do the defaults a local activity runs with, because it has no task row,
+and the hot-code-swap module host's policy. Each heartbeat reads the codec keys afresh, because a reload can
 register or retire one. A
 worker with the cache off replays full histories, a shorter budget times out
 tasks that its peers finish, and a smaller result cap fails results that its

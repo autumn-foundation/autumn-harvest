@@ -68,8 +68,10 @@ heartbeat check only. A worker that was alive but sick passed that check.
   `max_activity_result_bytes`, `max_signal_payload_bytes`,
   `max_current_details_bytes`, the history policy, the offload threshold, the
   activity interceptor chain, and each activity's effective result and input
-  caps, local flag, rate limit, concurrency limit and WASM binding), and the
-  registered codec key ids, which the
+  caps, local flag, rate limit, concurrency limit and WASM binding, a local
+  activity's own retry and start-to-close defaults, the registry's
+  local-activity defaults and retry-after ceiling, and the hot-code-swap
+  module-host policy), and the registered codec key ids, which the
   heartbeat reads on every tick because a reload can change them, with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A

@@ -1238,6 +1238,20 @@ impl HandlerRegistry {
                 .map(|interceptor| interceptor.policy())
                 .collect(),
             activities: self.activity_policies(),
+            local_activity_defaults: serde_json::json!({
+                "retry_policy": self.default_activity_retry_policy,
+                "start_to_close_ms": self
+                    .default_activity_start_to_close
+                    .map(|timeout| timeout.as_millis()),
+                "retry_after_ceiling_ms": self.retry_after_ceiling.as_millis(),
+            }),
+            #[cfg(feature = "hot-code-swap")]
+            module_host: self
+                .module_host
+                .as_ref()
+                .map_or(serde_json::Value::Null, module_host_policy),
+            #[cfg(not(feature = "hot-code-swap"))]
+            module_host: serde_json::Value::Null,
         }
     }
 
@@ -1248,9 +1262,10 @@ impl HandlerRegistry {
     /// is its effective result and input caps and whether it runs locally. It
     /// is also its rate limit, its concurrency limit and its WASM binding. A
     /// WASM-bound activity runs a sandboxed guest instead of the native
-    /// handler. The defaults for retries, timeouts and the queue stay out.
-    /// They are stored on the task row at scheduling, so every worker shares
-    /// them.
+    /// handler. For a remote activity, the defaults for retries, timeouts and
+    /// the queue stay out. They are stored on the task row at scheduling, so
+    /// every worker shares them. A local activity has no row, so its defaults
+    /// are in.
     fn activity_policies(&self) -> Vec<(String, serde_json::Value)> {
         let mut policies: Vec<(String, serde_json::Value)> = self
             .activities
@@ -1283,6 +1298,16 @@ impl HandlerRegistry {
                     "concurrency_key": info.concurrency_key,
                     "wasm": wasm,
                 });
+                // A local activity has no task row, so its own defaults apply
+                // on this worker.
+                let mut policy = policy;
+                if info.is_local {
+                    policy["retry_policy"] = serde_json::json!(info.default_retry_policy);
+                    policy["start_to_close_ms"] = serde_json::json!(
+                        info.default_start_to_close
+                            .map(|timeout| timeout.as_millis())
+                    );
+                }
                 (name.clone(), policy)
             })
             .collect();
@@ -27586,6 +27611,24 @@ impl Drop for DbOpTimer {
     }
 }
 
+/// The module host's policy, for the worker's cohort key (issue #1815).
+///
+/// The loaded modules stay out. Each execution names its own build, and a
+/// missing module is a capability miss, which the window does not count.
+#[cfg(feature = "hot-code-swap")]
+fn module_host_policy(host: &crate::hot_swap::ModuleHost) -> serde_json::Value {
+    serde_json::json!({
+        "allow_clock": host.capabilities.allow_clock,
+        "allow_random": host.capabilities.allow_random,
+        "allow_env": host.capabilities.allow_env,
+        "memory_bytes": host.limits.memory_bytes,
+        "fuel": host.limits.fuel,
+        "max_wall_clock_ms": host.limits.max_wall_clock.as_millis(),
+        "allowed_activities": host.allowed_activities,
+        "allow_queue_override": host.allow_queue_override,
+    })
+}
+
 /// What a claim-fenced recovery write did (issue #1815).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimRecovery {
@@ -37678,6 +37721,32 @@ mod tests {
             plain,
             policy(vec![act("charge", None, true), act("audit", None, false)]),
             "a local activity"
+        );
+
+        // A local activity has no task row, so its own defaults are in. A
+        // remote activity's defaults are stored on its row, so they are not.
+        let with_timeout = |is_local| {
+            let mut info = act("charge", None, is_local);
+            info.default_start_to_close = Some(Duration::from_secs(1));
+            info
+        };
+        assert_ne!(
+            policy(vec![act("charge", None, true)]),
+            policy(vec![with_timeout(true)]),
+            "a local activity's own start-to-close"
+        );
+        assert_eq!(
+            policy(vec![act("charge", None, false)]),
+            policy(vec![with_timeout(false)]),
+            "a remote activity's start-to-close is on its row"
+        );
+        let registry_default = HandlerRegistry::new(vec![], vec![act("charge", None, true)])
+            .with_activity_defaults(None, Some(Duration::from_secs(1)))
+            .payload_policy();
+        assert_ne!(
+            policy(vec![act("charge", None, true)]),
+            registry_default,
+            "the registry's local-activity start-to-close"
         );
     }
 
