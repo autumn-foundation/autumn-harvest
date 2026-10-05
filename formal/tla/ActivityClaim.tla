@@ -16,9 +16,9 @@
 (* reused pair cannot hide a stale write.                                  *)
 (*                                                                         *)
 (* SelfRelease uses the full claim_held guard. The pause releases run in   *)
-(* the claim's own transaction. The capability-miss release runs only on   *)
-(* a worker without the handler, which never starts the activity. Both     *)
-(* facts make the stronger guard equivalent for this model.                *)
+(* the claim's own transaction, so the stronger guard is equivalent for    *)
+(* them. The capability-miss release checks claim_held and crash_strikes   *)
+(* (issue #1917).                                                          *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
