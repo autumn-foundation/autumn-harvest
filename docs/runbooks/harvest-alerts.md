@@ -1639,7 +1639,8 @@ events by design (e.g. a long-lived entity workflow deliberately operating
 close to its configured cap) is expected, not an incident — the alert fires
 once per execution and does not repeat unless the execution keeps growing
 past the point already investigated. A worker with an unlimited event cap
-(`history_event_hard_cap_unlimited()`) shows a flat series. That is the
+(`history_event_hard_cap_unlimited()`) or a warn fraction of `0`
+(`history_bloat_warn_fraction(0.0)`) shows a flat series. That is the
 disabled state, not a health signal.
 
 ### Safe actions
