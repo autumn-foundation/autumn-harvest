@@ -196,6 +196,8 @@ pub fn test_partitioned_layout_requested() -> bool {
 pub mod activity_pause;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
+/// AES-256-GCM payload codec and data-key providers (issue #1825).
+pub mod aead_codec;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Pure token-secret helpers shared by the mint route and the CLI (issue #942).
