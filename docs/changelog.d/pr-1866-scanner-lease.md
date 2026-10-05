@@ -54,7 +54,9 @@ size, so adding workers to clear a backlog added database load in proportion.
   clock until its last queue drains. A queued row keeps its reason when an
   earlier one starts to match. If its reason stops matching, it moves to the
   first other reason that still matches. It waits there in a moved list of
-  ids, which shares each batch with the queue and drops no move.
+  at most one batch, which shares each batch with the queue. A move that
+  does not fit goes back to the front of its source queue and is tried
+  again, so no move is dropped and no list grows past its bound.
   No later lane hands it out under its own reason while it waits. The
   probe for such rows loads ids only, not payloads. The
   lanes give up their batch ids only after every load of the pass succeeds. The four

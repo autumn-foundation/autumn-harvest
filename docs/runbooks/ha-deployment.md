@@ -255,10 +255,12 @@ the later reason takes it. So the row does not wait for a whole sweep. A
 queued row keeps its reason, also when an earlier reason starts to match
 later. If its reason stops matching before it loads, it moves to the first
 other reason that still matches. It waits in a moved list of that reason,
-which holds ids only. No other reason hands it out while it waits, and no
-move is dropped. The list holds each row once, so it never outgrows the live
-rows. Moved and queued rows share each batch, so neither can starve the
-other, and moves never stop a refill.
+which holds at most one batch of ids. No other reason hands it out while it
+waits. A move that does not fit is not dropped. It goes back to the front of
+the queue it came from, so that reason still holds it and tries the move again
+on the next pass. That source slows down until the moved list drains, so no
+list grows past its bound. Moved and queued rows share each batch, so neither
+can starve the other, and moves never stop a refill.
 
 A row that fails to enforce is tried again first in the next batch, for at
 most three passes in a row. Retried and queued rows share the batch limit.
