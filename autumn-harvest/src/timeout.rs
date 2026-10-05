@@ -719,8 +719,7 @@ struct TimeoutScanLane {
     /// The retried ids of the last loaded batch, with their tries.
     loaded_retries: std::collections::HashMap<uuid::Uuid, u32>,
     /// Ids that moved here from another reason. They stay out of `queued`,
-    /// so moves never hold back a refill. At most one refill page of them
-    /// waits.
+    /// so moves never hold back a refill. Each id appears once.
     moved: std::collections::VecDeque<uuid::Uuid>,
     /// Which of moved and queued ids gets the odd slot of the next batch.
     /// It flips each pass that has both, so neither can starve the other.
@@ -1052,7 +1051,7 @@ pub async fn find_timed_out_tasks_batch(
     for lane in &mut cursor.lanes {
         lane.commit_batch(take);
     }
-    admit_moves(&mut cursor.lanes, moves, take);
+    admit_moves(&mut cursor.lanes, moves);
     Ok(results)
 }
 
@@ -1062,16 +1061,15 @@ pub async fn find_timed_out_tasks_batch(
 /// the row reserved for its new reason across passes. A later lane never
 /// takes a held row, so it cannot record the wrong reason.
 ///
-/// A lane holds at most one refill page of moved ids, as for its queue. So
-/// steady moves cannot grow it without bound. A row past that, or one the
-/// lane already holds, is left out. That lane's next sweep finds a row that
-/// still matches, unless a later lane takes it first.
-fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>, limit: usize) {
+/// No move is dropped. Three other lanes can each move a full batch here in
+/// one pass, so any cap could drop a move after its source batch committed.
+/// The list stays bounded without a cap. It holds ids only, and never one the
+/// lane already holds, so it has at most one entry per live row. Each pass
+/// hands out at least half a batch of it while it has rows.
+fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>) {
     if moves.is_empty() {
         return;
     }
-    let (_, page_rows) = timeout_scan_bounds(i64::try_from(limit).unwrap_or(MAX_PAGE_ROWS));
-    let cap = usize::try_from(page_rows).unwrap_or(usize::MAX);
     let mut held: Vec<HashSet<uuid::Uuid>> = lanes
         .iter()
         .map(|lane| {
@@ -1084,7 +1082,7 @@ fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>
         })
         .collect();
     for (other, id) in moves {
-        if lanes[other].moved.len() < cap && held[other].insert(id) {
+        if held[other].insert(id) {
             lanes[other].moved.push_back(id);
         }
     }
@@ -6999,16 +6997,11 @@ mod tests {
     #[test]
     fn moved_rows_do_not_hold_back_a_refill() {
         let mut lanes: [TimeoutScanLane; 4] = Default::default();
-        admit_moves(&mut lanes, vec![(3, uuid::Uuid::new_v4())], 1);
+        admit_moves(&mut lanes, vec![(3, uuid::Uuid::new_v4())]);
         // The lane refills when its queue runs empty. A move must not fill
         // that queue, or steady moves would stop the lane's sweep.
         assert!(lanes[3].queued.is_empty());
         assert_eq!(lanes[3].moved.len(), 1);
-        // A lane holds at most one refill page of moved rows.
-        let page = usize::try_from(REFILL_BATCHES).expect("fits");
-        let more = (0..page).map(|_| (3, uuid::Uuid::new_v4())).collect();
-        admit_moves(&mut lanes, more, 1);
-        assert_eq!(lanes[3].moved.len(), page);
     }
 
     #[test]
@@ -7037,18 +7030,23 @@ mod tests {
         assert_eq!(lane.batch_split(4), (0, 4, 0));
     }
 
-    /// A move past one batch stays reserved for its new reason. Dropping it
-    /// would let a later lane take the row under that lane's reason.
-    #[test]
-    fn moves_past_one_batch_stay_reserved() {
-        let mut lanes: [TimeoutScanLane; 4] = Default::default();
-        let moved: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
-        admit_moves(&mut lanes, moved.iter().map(|id| (3, *id)).collect(), 1);
-        assert_eq!(lanes[3].moved, moved);
-    }
-
     /// The probe for lapsed rows needs their ids only. It must not load task
     /// payloads, which a batch of 100,000 rows makes large.
+    /// Three source lanes can each move a full batch into one lane in one
+    /// pass. No move is dropped, or a later lane could take the row under
+    /// its own reason.
+    #[test]
+    fn moves_from_every_source_lane_stay_reserved() {
+        let mut lanes: [TimeoutScanLane; 4] = Default::default();
+        let page = usize::try_from(REFILL_BATCHES).expect("fits");
+        let moved: Vec<uuid::Uuid> = (0..3 * page).map(|_| uuid::Uuid::new_v4()).collect();
+        admit_moves(&mut lanes, moved.iter().map(|id| (3, *id)).collect());
+        assert_eq!(lanes[3].moved, moved);
+        // A row the lane already holds is not added twice.
+        admit_moves(&mut lanes, vec![(3, moved[0])]);
+        assert_eq!(lanes[3].moved.len(), moved.len());
+    }
+
     #[test]
     fn the_lapsed_row_probe_selects_ids_only() {
         for (_, predicate) in task_timeout_scans() {
@@ -7064,7 +7062,7 @@ mod tests {
         let moved = ids(2);
         let mut lanes: [TimeoutScanLane; 4] = Default::default();
         lanes[3].moved = waiting.clone().into();
-        admit_moves(&mut lanes, moved.iter().map(|id| (3, *id)).collect(), 4);
+        admit_moves(&mut lanes, moved.iter().map(|id| (3, *id)).collect());
         // First in, first out among moved rows.
         let order: Vec<_> = lanes[3].moved.iter().copied().collect();
         assert_eq!(order, [waiting, moved].concat());
