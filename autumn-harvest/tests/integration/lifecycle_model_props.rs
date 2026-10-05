@@ -941,7 +941,10 @@ fn apply_model(model: &mut Model, op: Op, db: &Res) -> Res {
     }
 }
 
-/// The pending tasks of `queue` that are due, with their `scheduled_at`.
+/// The pending tasks of `queue` that are due, with their claim-order due time.
+///
+/// The claim sorts on [`autumn_harvest::queue::CLAIM_ORDER_DUE_SQL`], not on
+/// `scheduled_at`. A new start sorts as if it were due later (issue #1824).
 async fn due_tasks(
     conn: &mut AsyncPgConnection,
     queue: &str,
@@ -953,10 +956,11 @@ async fn due_tasks(
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
         scheduled_at: chrono::DateTime<chrono::Utc>,
     }
-    diesel::sql_query(
-        "SELECT id, scheduled_at FROM harvest_task_queue \
+    diesel::sql_query(format!(
+        "SELECT id, {} AS scheduled_at FROM harvest_task_queue \
          WHERE queue_name = $1 AND state = 'PENDING' AND scheduled_at <= NOW()",
-    )
+        autumn_harvest::queue::CLAIM_ORDER_DUE_SQL
+    ))
     .bind::<Text, _>(queue)
     .load::<Row>(conn)
     .await
