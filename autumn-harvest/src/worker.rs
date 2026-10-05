@@ -33912,7 +33912,7 @@ impl Worker {
     /// id share one lease row, so each hides the other while both run. That
     /// is true of the normal heartbeat too.
     fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
-        let interval = self.config.worker_heartbeat_interval;
+        let interval = keeper_interval(self.config.worker_heartbeat_interval);
         if self.dispatched.tracker.is_empty() {
             // Every body ended in the drain. One of them can still have left
             // its claim `RUNNING` after a failed write, so sweep anyway.
@@ -34029,6 +34029,17 @@ fn drain_cancel_at(
     deadline
         .checked_sub(join_window.min(drain / 2))
         .map_or(started, |at| at.max(started))
+}
+
+/// The interval the lease keeper works to (issue #1813).
+///
+/// It is half the stale window that orphan reclaim applies, see
+/// [`worker_stale_secs`]. That window is at least one second, so the result
+/// is at least 500 ms, even for a tiny configured heartbeat interval. A zero
+/// interval would give a zero refresh bound and a hot retry loop.
+fn keeper_interval(heartbeat_interval: Duration) -> Duration {
+    let stale_secs = u64::try_from(worker_stale_secs(heartbeat_interval)).unwrap_or(1);
+    Duration::from_secs(stale_secs) / 2
 }
 
 /// The time limit for one lease refresh after a drain (issue #1813).
@@ -38698,6 +38709,26 @@ mod tests {
         assert!(sets.live.is_empty());
         assert!(sets.ended.is_empty(), "a released claim is not abandoned");
         assert!(sets.settled.is_empty(), "the drop clears the settled mark");
+    }
+
+    /// The keeper interval follows the stale window that orphan reclaim
+    /// applies, so it is never zero (issue #1813).
+    #[test]
+    fn keeper_interval_is_half_the_floored_stale_window() {
+        assert_eq!(
+            keeper_interval(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            keeper_interval(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        for tiny in [Duration::from_nanos(1), Duration::from_millis(10)] {
+            let interval = keeper_interval(tiny);
+            assert_eq!(interval, Duration::from_millis(500), "{tiny:?}");
+            assert!(lease_refresh_bound(interval) > Duration::ZERO);
+            assert!(next_lease_refresh(interval, false) > Duration::ZERO);
+        }
     }
 
     /// A failed lease refresh retries well before the lease goes stale
