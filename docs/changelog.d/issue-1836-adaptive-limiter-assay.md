@@ -5,8 +5,8 @@ simulation. Pre-registration: `docs/rnd/2026-10-05-adaptive-concurrency-limiter-
 Report: `docs/assays/0014-adaptive-concurrency-limiter.md`. No engine source
 changed.
 
-Verdict: kill, as registered. On the retrograde-collapse plant the best AIMD
-candidate reached 18.8% of achievable goodput against an 85% line, and
+Verdict: kill, as registered. A first sweep with a tick-count completion model was superseded by a duration-aware rerun after review. The verdict did not change. On the retrograde-collapse plant the best AIMD
+candidate reached 18.1% of achievable goodput against an 85% line, and
 Gradient2 reached 0.0%. The real `DefaultSlotTuner` also fails: it grows to the
 cap in every cell when permit waits are reported. The AIMD failure is mostly a
 pre-registration defect, and the Gradient2 failure depends on per-tick

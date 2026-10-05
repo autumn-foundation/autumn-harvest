@@ -1,6 +1,6 @@
 # Assay #14: does a latency-driven limiter beat `DefaultSlotTuner` on the #1836 scenario?
 
-**⛏️ Prospect: latency-driven limiter vs `DefaultSlotTuner` (#1836) — kill: best candidate 18.8% of achievable goodput vs 85% line on S2, ledger #14.**
+**⛏️ Prospect: latency-driven limiter vs `DefaultSlotTuner` (#1836) — kill: best candidate 18.1% of achievable goodput vs 85% line on S2, ledger #14.**
 
 ## 🎯 Question
 
@@ -33,7 +33,7 @@ Netflix `concurrency-limits` numbers are inadmissible here and were not used.
 
 `docs/assays/apparatus/0014-adaptive-concurrency-limiter/`, non-production,
 outside the workspace. A deterministic closed-loop simulator, one tick per
-second, 1,800 s per run, 4 scenarios x 2 start limits x 6 arms x 5 seeds. Arm B
+second, 1,800 s per run, event-driven within a tick, 4 scenarios x 2 start limits x 6 arms x 5 seeds. Arm B
 calls the real `DefaultSlotTuner::decide` and `apply_action` from
 `autumn-harvest` at tree `e22a53b`. Arms A, C1 and C2 are written in the
 apparatus.
@@ -48,56 +48,74 @@ apparatus.
 * Gradient2 is a port from memory of the Netflix defaults. It was not diffed
   against the upstream source.
 * In-flight equals the limit. Backlog is unbounded. No retries, no pool, no DB.
-* No tests, no CI. Seeds 1-5 fixed. The run is deterministic and was repeated
+* A request's service time is fixed at start from the in-flight count then. A
+  later knee step or load change does not reshape requests already running.
+* Limiters see the timeout-capped latency (at most 500 ms).
+* No tests, no CI. Seeds 1-5 fixed. Each run is deterministic and was repeated
   with a byte-identical result.
 
 ## 📊 Assay
 
-One registered sweep, all runs in `results/run1.csv` (per-seed efficiency in
-column 4). Efficiency is window-mean goodput over achievable goodput. Registered
-order was S2 first.
+**Two sweeps, both reported.** Run 1 (`results/run1-tick-count-model-superseded.csv`)
+computed completions per tick as `n / base latency`, so a slow or timed-out
+request never held a slot longer. Codex review (P2) correctly called this
+biased: it is not a closed loop. Run 2 (`results/run2.csv`) replaces it with a
+duration-aware event simulation. Each request draws its own service time at
+start, holds its slot until it completes or reaches the 500 ms timeout, and a
+freed slot restarts only while in-flight is under the limit. The registration
+already said "closed loop, in-flight equals the limit", so run 2 is the faithful
+implementation of the registered plant, not a new assay. Same seeds, same lines,
+same arms and parameters. **Run 2 is the graded run. Run 1 is superseded and
+kept so the correction is visible.** The verdict did not change between them.
+Run 2 is deterministic (rerun, byte-identical).
+
+Efficiency is window-mean goodput over achievable goodput. Registered order was
+S2 first. Run 2, median of 5 seeds:
 
 | cell | A fixed | B-grow | B-gated | C1 AIMD | C2 Gradient2 |
 |:--|--:|--:|--:|--:|--:|
-| S2 retrograde, start 20 | 49.5% | 0.0% | 49.5% | 18.6% | 0.0% |
-| S2 retrograde, start 150 | 0.0% | 0.0% | 0.0% | 18.8% | 0.0% |
-| S1 plateau, start 20 | 49.5% | 55.4% (limit 200) | 49.5% | 18.6% | 55.4% (limit 200) |
-| S1 plateau, start 150 | 85.7% | 55.4% | 85.7% | 18.4% | 55.4% |
-| S3 K 40 to 20, start 20 | 99.0% | 1.5% | 99.0% | 37.8% | 1.5% |
-| S3 K 40 to 20, start 150 | 11.4% | 1.5% | 11.4% | 36.5% | 1.5% |
-| S4 K 20 to 40, start 20 | 49.5% | 55.3% | 49.5% | 18.9% | 55.3% |
-| S4 K 20 to 40, start 150 | 85.8% | 55.3% | 85.8% | 18.3% | 55.3% |
+| S2 retrograde, start 20 | 47.6% | 0.0% | 47.6% | 18.1% | 0.0% |
+| S2 retrograde, start 150 | 0.0% | 0.0% | 0.0% | 18.1% | 0.0% |
+| S1 plateau, start 20 | 47.6% | 62.9% (limit 200) | 47.6% | 18.1% | 62.9% (limit 200) |
+| S1 plateau, start 150 | 88.2% | 62.9% | 88.2% | 18.0% | 62.9% |
+| S3 K 40 to 20, start 20 | 95.1% | 3.1% | 95.1% | 37.1% | 3.1% |
+| S3 K 40 to 20, start 150 | 17.4% | 3.1% | 17.4% | 36.4% | 3.1% |
+| S4 K 20 to 40, start 20 | 47.5% | 62.9% | 47.5% | 18.5% | 62.9% |
+| S4 K 20 to 40, start 150 | 88.0% | 62.9% | 88.0% | 18.6% | 62.9% |
 
-Pass counts against the registered lines, per arm, out of 8 cells: A 3 on L1,
-B-grow 0, B-gated 3, C1 0, C2 0. No candidate meets L1 or L2 in any cell. Worst
-seeds track the medians within 2 points everywhere, so variance is not the story.
+Cells meeting L1, out of 8: A 3, B-grow 0, B-gated 3, C1 0, C2 0. No candidate
+meets L1 or L2 in any cell. Worst seeds track the medians within 2 points in
+every candidate cell except C1 on S3/S4 (up to 2.3 points), so variance is not
+the story. Run 1 gave the same pass counts (A 3, B-gated 3, others 0).
 
 **Mechanisms, from a trace of C2 on S2 (`results/trace-c2-s2-start20-seed1.txt`).**
 
-* **C2:** goodput peaks at 235/s at t = 60 s and falls to zero by t = 540 s while
-  the limit keeps rising to the 200 cap. The long-window RTT baseline follows
-  the degraded latency upward, so the long/short ratio returns to 1, the
-  gradient clamps at 1.0, and the controller grows again. It reads a permanently
-  slow downstream as normal.
+* **C2:** goodput peaks at 381/s at t = 19 s, with the limit at 40 (achievable
+  400/s), then falls to zero by about t = 540 s while the limit keeps rising to
+  the 200 cap. The peak is taken over every tick. An earlier draft quoted 235/s,
+  which was only the largest value among every-60th-tick trace samples. The
+  long-window RTT baseline follows the degraded latency upward, so the long/short
+  ratio returns to 1, the gradient clamps at 1.0, and the controller grows again.
+  It reads a permanently slow downstream as normal.
 * **C1:** the registered rule "any timeout multiplies by 0.9" meets a plant in
   which 1% of requests run 10x slow and so exceed the 500 ms timeout even when
-  healthy. The limit decays to about 7. This is a defect in the pre-registration
+  healthy. The limit decays to about 8. This is a defect in the pre-registration
   (plant and rule interact), not a finding about AIMD.
 * **B-grow:** grows to the 200 cap in every cell. This confirms the premise of
   #1836 under the growth-favourable permit-wait model. **B-gated** never moves,
   so it is the fixed arm in practice.
 
 **Post-hoc diagnostic, not graded.** Arm `C1b-diag` gates the timeout signal on a
-5% timeout rate instead of "any". It clears L1 in every cell and L2 on S2, but
-fails L2 on every plateau cell (median limit 115 against `K = 40`, 2.9x). Its
-latency baseline is a 60-tick window minimum, so it also chases degradation.
-This was chosen after seeing the C1 numbers, so it earns no verdict. It is the
-only lead in the data.
+5% timeout rate instead of "any". In run 2 it clears L1 on every plateau cell
+(96-97%) but reaches only 58.8% on S2, below the 85% line, and fails L2 on every
+plateau cell (median limit 114 against `K = 40`, 2.9x). It was chosen after
+seeing the C1 numbers, so it earns no verdict. Under run 1 it looked closer
+(91% on S2); the duration-aware model removed that, so it is not a lead either.
 
 ## 🏁 Verdict
 
 **Kill, as registered.** Neither candidate meets L1 or L2 in any cell. Against
-the 85% L1 line on the riskiest cell, S2, the best candidate reached 18.8%
+the 85% L1 line on the riskiest cell, S2, the best candidate reached 18.1%
 (C1) and C2 reached 0.0%. The kill rule fired on its first clause. The
 second clause (incumbent passes everything) did not apply: B fails too.
 
@@ -129,7 +147,7 @@ latency curve is measured, not modelled.
 ```sh
 cd docs/assays/apparatus/0014-adaptive-concurrency-limiter
 cargo build --release
-./target/release/adaptive_limiter_assay > results/run1.csv   # about 7 s
+./target/release/adaptive_limiter_assay > results/run2.csv   # about 13 s
 TRACE=1 ./target/release/adaptive_limiter_assay              # C2 on S2 trace
 ```
 

@@ -166,36 +166,71 @@ struct Run {
     limit: Vec<usize>,
 }
 
+#[derive(PartialEq)]
+struct Done {
+    at: f64,
+    lat: f64,
+    timed_out: bool,
+}
+impl Eq for Done {}
+impl PartialOrd for Done {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Done {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        o.at.partial_cmp(&self.at).unwrap()
+    }
+}
+
+fn start_request(s: &Scenario, rng: &mut Rng, now: f64, in_flight: usize, heap: &mut std::collections::BinaryHeap<Done>) {
+    let k = knee_at(s, now as usize);
+    let base = plant_latency(s.plant, in_flight as f64, k);
+    let mut l = base * (SIGMA * rng.normal() - SIGMA * SIGMA / 2.0).exp();
+    if rng.unit() < TAIL_P {
+        l *= TAIL_X;
+    }
+    let timed_out = l > TIMEOUT;
+    let lat = l.min(TIMEOUT);
+    heap.push(Done { at: now + lat, lat, timed_out });
+}
+
 fn simulate(s: &Scenario, lim: &mut dyn Limiter, seed: u64) -> Run {
     let mut rng = Rng(seed.wrapping_mul(0x1234_5678_9ABC_DEF1));
-    let mut carry = 0.0;
+    let mut heap = std::collections::BinaryHeap::new();
+    let mut in_flight = 0usize;
     let mut run = Run { goodput: vec![], limit: vec![] };
     for t in 0..DURATION {
         let n = lim.limit();
-        let k = knee_at(s, t);
-        let base = plant_latency(s.plant, n as f64, k);
-        carry += n as f64 / base;
-        let count = carry.floor() as usize;
-        carry -= count as f64;
-        let mut lats = Vec::with_capacity(count);
+        while in_flight < n {
+            in_flight += 1;
+            start_request(s, &mut rng, t as f64, in_flight, &mut heap);
+        }
+        let end = (t + 1) as f64;
+        let mut lats: Vec<f64> = vec![];
         let mut timeouts = 0;
-        for _ in 0..count {
-            let mut l = base * (SIGMA * rng.normal() - SIGMA * SIGMA / 2.0).exp();
-            if rng.unit() < TAIL_P {
-                l *= TAIL_X;
-            }
-            if l > TIMEOUT {
+        while heap.peek().is_some_and(|d| d.at < end) {
+            let d = heap.pop().unwrap();
+            in_flight -= 1;
+            lats.push(d.lat);
+            if d.timed_out {
                 timeouts += 1;
             }
-            lats.push(l);
+            if in_flight < lim.limit() {
+                in_flight += 1;
+                start_request(s, &mut rng, d.at, in_flight, &mut heap);
+            }
         }
+        let count = lats.len();
         let ok = count - timeouts;
         lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mean = if count > 0 { lats.iter().sum::<f64>() / count as f64 } else { base };
-        let median = if count > 0 { lats[count / 2] } else { base };
+        let base = plant_latency(s.plant, n as f64, knee_at(s, t));
+        let mean = if count > 0 { lats.iter().sum::<f64>() / count as f64 } else { base.min(TIMEOUT) };
+        let median = if count > 0 { lats[count / 2] } else { base.min(TIMEOUT) };
         run.goodput.push(ok as f64);
         run.limit.push(n);
-        lim.observe(&Tick { mean_lat: mean, median_lat: median, timeouts, completions: count, in_flight: n });
+        lim.observe(&Tick { mean_lat: mean, median_lat: median, timeouts, completions: count, in_flight });
     }
     run
 }
@@ -276,6 +311,8 @@ fn trace() {
     for t in (0..DURATION).step_by(60) {
         println!("t={t} limit={} goodput={}", r.limit[t], r.goodput[t]);
     }
+    let (pt, pg) = r.goodput.iter().enumerate().fold((0, 0.0), |a, (i, &g)| if g > a.1 { (i, g) } else { a });
+    println!("peak over every tick: t={pt} goodput={pg} limit={}", r.limit[pt]);
 }
 
 fn main() {
