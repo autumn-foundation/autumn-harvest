@@ -2955,9 +2955,8 @@ pub(crate) async fn claim_held_for_update_skip_locked(
 /// Whether a later claim of the same worker holds the row with the same
 /// `crash_strikes` (issue #1789).
 ///
-/// Such a claim passes a guard on `(worker_id, crash_strikes)`, for example
-/// the capability-miss release, but it is not `claim`. The read takes no
-/// lock.
+/// Such a claim passes a guard on `(worker_id, crash_strikes)` alone, but it
+/// is not `claim`. The read takes no lock.
 ///
 /// # Errors
 ///
@@ -4448,8 +4447,10 @@ async fn announce_deferred_task(
 /// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests
 /// (issue #804).
 ///
-/// `$1` = task id, `$2` = the releasing worker's id, `$3` = the backoff in
-/// seconds.
+/// The parameters identify the row and the claim. `$1` is the task id, `$2`
+/// the releasing worker's id and `$3` the backoff in seconds. `$4` is the
+/// claim's `crash_strikes`, `$5` the handler frontier and `$6` the claim's
+/// `attempt`.
 ///
 /// The `phase` selects between three literal statements rather than binding
 /// flags, mirroring [`park_workflow_task_query`]. Taking the phase itself —
@@ -4473,10 +4474,11 @@ async fn announce_deferred_task(
 ///   `record_workflow_started` reads, and once the handler has begun, the start
 ///   metric has already fired. See that predicate for the full argument.
 ///
-/// One statement, guarded on `state = 'RUNNING' AND worker_id = $2` so it can
-/// only ever undo *this* worker's own claim — a concurrent poison-pill reclaim
-/// that already took the row simply matches 0 rows here (mirrors
-/// [`crate::queue_pause::release_claim`]).
+/// One statement, guarded on the claim: `state = 'RUNNING' AND worker_id = $2
+/// AND crash_strikes = $4 AND attempt = $6`. It can only undo *this* claim. A
+/// concurrent reclaim that already took the row matches 0 rows here. The
+/// `attempt` term is checked against the row before the `SET`, so the arm that
+/// lowers `attempt` still matches its own claim (issue #1917).
 ///
 /// Two details that are load-bearing rather than incidental:
 ///
@@ -4541,6 +4543,7 @@ pub const fn release_task_for_capability_miss_query(
            AND state = 'RUNNING' \
            AND worker_id = $2 \
            AND crash_strikes = $4 \
+           AND attempt = $6 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     } else if phase.restores_dispatch_attempt() {
@@ -4573,6 +4576,7 @@ pub const fn release_task_for_capability_miss_query(
            AND state = 'RUNNING' \
            AND worker_id = $2 \
            AND crash_strikes = $4 \
+           AND attempt = $6 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     } else {
@@ -4604,6 +4608,7 @@ pub const fn release_task_for_capability_miss_query(
            AND state = 'RUNNING' \
            AND worker_id = $2 \
            AND crash_strikes = $4 \
+           AND attempt = $6 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     }
@@ -4691,13 +4696,20 @@ pub const fn release_task_for_capability_miss_query(
 /// that creates the race is what bumps it; the terminal escalation guard
 /// ([`claim_still_held_for_update`]) already keys on it.
 ///
+/// `claim.attempt` is the `attempt` value of that claim. It closes the other
+/// path to the same race (issue #1917). The stuck-running requeue
+/// (`poison_pill::requeue_stuck_task`) keeps `crash_strikes`, and the same
+/// worker can win the row again. A workflow cycle reaches this release after
+/// its handler starts, so a stale cycle can still run. Only `attempt` tells its
+/// claim apart from the later one. `formal/tla/WorkflowTaskClaim.tla` models
+/// this race.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn release_task_for_capability_miss(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    worker_id: &str,
+    claim: &TaskClaim,
     backoff: StdDuration,
     phase: crate::error::CapabilityMissPhase,
     claim_crash_strikes: i32,
@@ -4706,18 +4718,19 @@ pub async fn release_task_for_capability_miss(
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
     let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
     let released = diesel::sql_query(release_task_for_capability_miss_query(phase))
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Uuid, _>(claim.task_id)
+        .bind::<diesel::sql_types::Text, _>(&claim.worker_id)
         .bind::<diesel::sql_types::Double, _>(backoff_secs)
         .bind::<diesel::sql_types::Integer, _>(claim_crash_strikes)
         .bind::<diesel::sql_types::Text, _>(frontier)
+        .bind::<diesel::sql_types::Integer, _>(claim.attempt)
         .get_results::<DistinctMissWorkersRow>(conn)
         .await
         .map_err(crate::error::database_error)?;
     // Dispatch hint (issue #1312). The release statement returns the miss
     // cardinality rather than the hint columns, so the hint is read by id.
     if !released.is_empty() {
-        record_pending_hints(conn, &[task_id]).await;
+        record_pending_hints(conn, &[claim.task_id]).await;
     }
     Ok(released
         .into_iter()
@@ -11363,8 +11376,11 @@ mod tests {
                  so rolling `attempt` back to 0 would make the next capable \
                  claim re-emit `harvest.workflow.started`: {sql}",
             );
+            // Only the `SET` list writes. The `WHERE` guard reads `attempt`
+            // to identify the claim (issue #1917).
+            let set_list = sql.split(" WHERE ").next().unwrap_or(sql);
             assert!(
-                !sql.contains("attempt ="),
+                !set_list.contains("attempt ="),
                 "{phase:?}: a post-handler release must leave `attempt` alone \
                  entirely, not rewrite it to some other value: {sql}",
             );
@@ -11403,6 +11419,25 @@ mod tests {
                  cardinality -- a value derived from the caller's earlier \
                  snapshot silently over-reports when a peer's re-registration \
                  invalidated an entry in between: {sql}",
+            );
+        }
+    }
+
+    /// A stuck-running requeue keeps `crash_strikes`, and the same worker can
+    /// claim the row again. Only `attempt` tells the two claims apart
+    /// (issue #1917).
+    #[test]
+    fn capability_miss_release_is_guarded_on_the_claim_attempt() {
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            let sql = release_task_for_capability_miss_query(phase);
+            assert!(
+                sql.contains("AND attempt = $6"),
+                "{phase:?}: a stale release must not match a later claim of the \
+                 same worker with the same crash_strikes: {sql}",
             );
         }
     }

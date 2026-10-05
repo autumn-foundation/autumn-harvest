@@ -1782,6 +1782,7 @@ impl HarvestBuilder {
     /// Panics when the key id is already registered. A duplicate key id is a
     /// configuration bug that must not boot.
     #[must_use]
+    #[expect(clippy::expect_used, reason = "documented panic on a duplicate key id")]
     pub fn aead_payload_codec_key(self, codec: crate::aead_codec::AeadCodec) -> Self {
         codec
             .register_with(&self.payload_codecs)
