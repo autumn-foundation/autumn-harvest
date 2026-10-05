@@ -995,21 +995,25 @@ async fn started_timeout_feeds_the_breaker() {
     );
 }
 
-/// Records the `harvest.activity.duration` samples of failed attempts.
-#[derive(Default)]
-struct DurationLog(Mutex<Vec<f64>>);
+/// Records the `harvest.activity.duration` samples of one activity's failed
+/// attempts. The enforcer scans every task, so a shared database can hold
+/// expired tasks of other tests.
+struct DurationLog {
+    activity: &'static str,
+    samples: Mutex<Vec<f64>>,
+}
 
 impl MetricsRecorder for DurationLog {
     fn record_activity_completed_with_error_type(
         &self,
-        _activity_name: &str,
+        activity_name: &str,
         _queue: &str,
         duration_secs: f64,
         status: ActivityStatus,
         _error_type: Option<&str>,
     ) {
-        if status == ActivityStatus::Failed {
-            self.0.lock().unwrap().push(duration_secs);
+        if activity_name == self.activity && status == ActivityStatus::Failed {
+            self.samples.lock().unwrap().push(duration_secs);
         }
     }
 }
@@ -1032,14 +1036,113 @@ async fn timeout_duration_counts_from_the_handler_start() {
     let claimed = claim(&mut conn, &queue, "w-duration").await;
     age_claim(&mut conn, task_id).await;
     start(&mut conn, &claimed, exec_id, activity).await;
-    let durations = DurationLog::default();
+    let durations = DurationLog {
+        activity,
+        samples: Mutex::default(),
+    };
     enforce_with(&mut conn, None, &durations).await;
 
-    let samples = durations.0.lock().unwrap().clone();
+    let samples = durations.samples.lock().unwrap().clone();
     assert_eq!(samples.len(), 1, "one failed attempt: {samples:?}");
     assert!(
         samples[0] < 60.0,
         "the sample covers the handler run, not the 10 minutes since the claim: {samples:?}"
+    );
+}
+
+/// Seed a one-token bucket that never refills, and point `task_id` at it.
+/// A bucket that refills would replace a missing refund on its own.
+async fn one_token_bucket(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
+    let key = format!("t1809-bucket-{task_id}");
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
+         VALUES ($1, 0.0, 1.0, 1.0, NOW())",
+    )
+    .bind::<diesel::sql_types::Text, _>(key.as_str())
+    .execute(conn)
+    .await
+    .expect("seed the rate-limit bucket");
+    set_task(conn, task_id, &format!("rate_limit_key = '{key}'")).await;
+    key
+}
+
+/// The tokens left in the bucket `key`.
+async fn bucket_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+        .bind::<diesel::sql_types::Text, _>(key)
+        .get_result::<Tokens>(conn)
+        .await
+        .expect("read the rate-limit bucket")
+        .tokens
+}
+
+/// A retried timeout of an attempt whose handler never started refunds the
+/// claim's rate-limit token. The attempt made no downstream call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unstarted_timeout_retry_refunds_its_rate_limit_token() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-refund");
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (_exec_id, task_id) = seed_activity(&mut conn, &queue, "t1809_refund", 3, timeouts).await;
+    let key = one_token_bucket(&mut conn, task_id).await;
+
+    claim(&mut conn, &queue, "w-refund").await;
+    assert!(
+        bucket_tokens(&mut conn, &key).await < 0.01,
+        "the claim takes the token"
+    );
+    age_claim(&mut conn, task_id).await;
+    enforce(&mut conn, None).await;
+
+    assert_eq!(
+        task_row(&mut conn, task_id).await.state,
+        "PENDING",
+        "the timeout retries"
+    );
+    let tokens = bucket_tokens(&mut conn, &key).await;
+    assert!(
+        tokens >= 0.99,
+        "the unstarted attempt gives its token back: {tokens}"
+    );
+}
+
+/// A retried timeout of a started attempt keeps its debit: the handler ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn started_timeout_retry_keeps_its_rate_limit_debit() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-debit");
+    let activity = "t1809_debit";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+    let key = one_token_bucket(&mut conn, task_id).await;
+
+    let claimed = claim(&mut conn, &queue, "w-debit").await;
+    start(&mut conn, &claimed, exec_id, activity).await;
+    age_claim(&mut conn, task_id).await;
+    enforce(&mut conn, None).await;
+
+    assert_eq!(
+        task_row(&mut conn, task_id).await.state,
+        "PENDING",
+        "the timeout retries"
+    );
+    let tokens = bucket_tokens(&mut conn, &key).await;
+    assert!(
+        tokens < 0.01,
+        "the started attempt keeps its debit: {tokens}"
     );
 }
 

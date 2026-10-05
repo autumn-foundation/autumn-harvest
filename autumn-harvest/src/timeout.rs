@@ -1616,6 +1616,15 @@ async fn enforce_activity_timeout(
                         .await?
                         {
                             queue::ClaimWrite::Applied => {
+                                // The claim debited a rate-limit token. An
+                                // attempt whose handler never started made no
+                                // downstream call, so the retry gives the
+                                // token back, as a drain release does.
+                                if !locked.handler_started
+                                    && let Some(key) = task.rate_limit_key.as_deref()
+                                {
+                                    queue::refund_rate_limit_token(conn, key).await?;
+                                }
                                 let started_attempt =
                                     task.started_at.filter(|_| locked.handler_started);
                                 record_timed_out_claim(conn, task.id, started_attempt).await?;
