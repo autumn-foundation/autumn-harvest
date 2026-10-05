@@ -245,7 +245,9 @@ The guard fails safe: when it cannot read, it does not abort.
   that already holds the same write is left as is, and its step stays. So
   two logical shards on one pool cannot split the ramp identity.
 - A request with an `Idempotency-Key` header gets a caller id derived from
-  the route, the queue and the key. Retry a partial fan-out (`207`) with the
+  the route, the queue, the key and the request body. A reused key with a
+  changed body gets a new caller id, so every pool rewrites the ramp under
+  it. The UI set-policy form does the same with a hidden operation id. Retry a partial fan-out (`207`) with the
   same key. Every pool then stores the same `ramp_id`, and the guard judges
   one generation. A retry without a key gets a new caller id. The pools that
   the first request reached keep the old id, so the ramp splits into two

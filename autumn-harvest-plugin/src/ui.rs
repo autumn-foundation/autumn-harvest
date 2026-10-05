@@ -526,6 +526,27 @@ fn set_policy_operation_id(raw: Option<&str>) -> uuid::Uuid {
         .unwrap_or_else(uuid::Uuid::new_v4)
 }
 
+/// The caller `ramp_id` of one "Set Build Policy" submission (issue #1814).
+///
+/// It derives from the operation id and the request. A retry of the same
+/// form gets the same id. A changed request under the same operation id
+/// gets a new id, so every shard rewrites the ramp under that new id.
+fn set_policy_ramp_id(
+    operation_id: uuid::Uuid,
+    queue_name: &str,
+    build_id: &str,
+    deployment_name: Option<&str>,
+) -> uuid::Uuid {
+    let operation = operation_id.to_string();
+    crate::api::derived_ramp_id(&[
+        Some("ui-policy"),
+        Some(operation.as_str()),
+        Some(queue_name),
+        Some(build_id),
+        deployment_name,
+    ])
+}
+
 /// The redirect after a failed "Set Build Policy" submission. It echoes the
 /// entered values, the error and the operation id back into the form.
 fn set_policy_failure_redirect(
@@ -8252,21 +8273,22 @@ async fn build_routing_set_policy_ui(
     let queue_name = form.queue_name.trim().to_string();
     let build_id = form.build_id.trim().to_string();
     let deployment_name_raw = form.deployment_name.clone().unwrap_or_default();
-    // One ramp id for every shard, so a retained ramp keeps one identity. A
-    // retry of the same form reuses it (issue #1814).
-    let ramp_id = set_policy_operation_id(form.operation_id.as_deref());
+    // A retry of the same form reuses the operation id (issue #1814).
+    let operation_id = set_policy_operation_id(form.operation_id.as_deref());
     if queue_name.is_empty() || build_id.is_empty() {
         let redirect_url = set_policy_failure_redirect(
             "queue_name and build_id must not be empty",
             &queue_name,
             &build_id,
             &deployment_name_raw,
-            ramp_id,
+            operation_id,
         );
         return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
+    // One ramp id for every shard, so a retained ramp keeps one identity.
+    let ramp_id = set_policy_ramp_id(operation_id, &queue_name, &build_id, deployment_name);
     // Fan out to all shards so every shard's get_build_policy() sees the new policy
     // when evaluating assigned_build_id at workflow start time.
     let mut last_policy = None;
@@ -8341,7 +8363,7 @@ async fn build_routing_set_policy_ui(
         &queue_name,
         &build_id,
         &deployment_name_raw,
-        ramp_id,
+        operation_id,
     );
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
@@ -15835,6 +15857,23 @@ mod tests {
         assert_ne!(
             set_policy_operation_id(Some("not-a-uuid")),
             set_policy_operation_id(Some("not-a-uuid"))
+        );
+    }
+
+    /// A retry of the same form keeps its ramp id. A changed request under
+    /// the same operation id gets a new one.
+    #[test]
+    fn set_policy_ramp_id_depends_on_the_request() {
+        let op = uuid::Uuid::new_v4();
+        let id = |build: &str, deployment: Option<&str>| {
+            set_policy_ramp_id(op, "default", build, deployment)
+        };
+        assert_eq!(id("sha-1", Some("prod")), id("sha-1", Some("prod")));
+        assert_ne!(id("sha-1", Some("prod")), id("sha-1", Some("prod-v2")));
+        assert_ne!(id("sha-1", None), id("sha-2", None));
+        assert_ne!(
+            id("sha-1", None),
+            set_policy_ramp_id(uuid::Uuid::new_v4(), "default", "sha-1", None)
         );
     }
 

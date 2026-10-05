@@ -398,3 +398,47 @@ async fn a_retried_policy_update_with_one_idempotency_key_keeps_one_ramp_id() {
     assert!(ids[0].is_some(), "a retained ramp has an id: {ids:?}");
     assert_eq!(ids[0], ids[1], "one key gives one ramp id");
 }
+
+/// A client reuses an `Idempotency-Key` with a changed ramp. The first
+/// request reached shard A only. The retry with a new percentage reaches
+/// both shards. Both must store one `ramp_id` (issue #1814). With the old
+/// id, shard A rewrote its ramp under an unchanged id, and the reset trigger
+/// cleared it.
+#[tokio::test]
+async fn a_reused_key_with_a_changed_ramp_keeps_one_ramp_id_on_every_shard() {
+    let (url_a, _container_a) = setup_test_database_url().await;
+    let (url_b, _container_b) = setup_test_database_url().await;
+    let mut apps = Vec::new();
+    let mut pools = Vec::new();
+    for url in [&url_a, &url_b] {
+        let pool = build_test_pool(url);
+        let mut conn = pool.get().await.expect("get conn");
+        set_build_policy(&mut conn, "default", "base-v1", None)
+            .await
+            .expect("seed base policy");
+        drop(conn);
+        pools.push(pool.clone());
+        apps.push(build_ramp_app(pool));
+    }
+    let ramp = |percent: i32| json!({ "queue_name": "default", "target_build_id": "canary-v2", "ramp_percent": percent });
+    // The first request reached shard A only.
+    let (status, body) = post_json_with_key(
+        &apps[0],
+        "/admin/build-routing/ramp",
+        ramp(25),
+        Some("k-1814"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The retry changes the percentage and reaches both shards.
+    let mut ids = Vec::new();
+    for (app, pool) in apps.iter().zip(&pools) {
+        let (status, body) =
+            post_json_with_key(app, "/admin/build-routing/ramp", ramp(50), Some("k-1814")).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        ids.push(stored_ramp_id(pool).await);
+    }
+    assert!(ids[0].is_some(), "shard A keeps an id: {ids:?}");
+    assert_eq!(ids[0], ids[1], "both shards hold one generation");
+}

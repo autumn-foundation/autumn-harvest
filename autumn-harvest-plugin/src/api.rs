@@ -47922,7 +47922,12 @@ async fn set_build_policy_handler(
 
     // One ramp id for every shard, so a retained ramp keeps one identity
     // (issue #1814). A retry with the same `Idempotency-Key` reuses it.
-    let ramp_id = match fan_out_ramp_id(&headers, "policy", queue_name) {
+    let ramp_id = match fan_out_ramp_id(
+        &headers,
+        "policy",
+        queue_name,
+        &[Some(build_id), deployment],
+    ) {
         Ok(id) => id,
         Err(response) => return response,
     };
@@ -48033,30 +48038,45 @@ async fn set_build_policy_handler(
     }
 }
 
+/// A caller `ramp_id` derived from the parts of one request (issue #1814).
+///
+/// Each part has a length prefix, and a missing part has its own marker. So
+/// no two different part lists give one id.
+pub(crate) fn derived_ramp_id(parts: &[Option<&str>]) -> uuid::Uuid {
+    use std::fmt::Write as _;
+
+    let mut name = String::from("build-routing");
+    for part in parts {
+        match part {
+            Some(text) => {
+                let _ = write!(name, "/{}:{text}", text.len());
+            }
+            None => name.push_str("/-"),
+        }
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
+}
+
 /// The `ramp_id` of one build-routing fan-out (issue #1814).
 ///
 /// A request with an `Idempotency-Key` header gets an id derived from the
-/// route, the queue and the key. A retry after a partial fan-out therefore
-/// writes the same id on every shard. A request with no key gets a new id.
+/// route, the queue, the key and the payload. A retry after a partial
+/// fan-out therefore writes the same id on every shard. A reused key with a
+/// changed payload gets a new id, so every shard rewrites the ramp under
+/// that new id. A request with no key gets a new id.
 #[allow(clippy::result_large_err)]
 fn fan_out_ramp_id(
     headers: &axum::http::HeaderMap,
     route: &str,
     queue_name: &str,
+    payload: &[Option<&str>],
 ) -> Result<uuid::Uuid, axum::response::Response> {
     let Some(key) = extract_start_idempotency_header_key(headers)? else {
         return Ok(uuid::Uuid::new_v4());
     };
-    // Lengths come first, so no two different inputs give one name.
-    let name = format!(
-        "build-routing/{}:{route}/{}:{queue_name}/{key}",
-        route.len(),
-        queue_name.len()
-    );
-    Ok(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_OID,
-        name.as_bytes(),
-    ))
+    let mut parts = vec![Some(route), Some(queue_name), Some(key.as_str())];
+    parts.extend_from_slice(payload);
+    Ok(derived_ramp_id(&parts))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -48101,7 +48121,13 @@ async fn set_build_ramp_handler(
     // One id for this ramp on every shard. The ramp guard matches its abort
     // markers to a ramp by this id, not by clocks (issue #1814). A retry with
     // the same `Idempotency-Key` reuses it.
-    let ramp_id = match fan_out_ramp_id(&headers, "ramp", queue_name) {
+    let percent = body.ramp_percent.to_string();
+    let ramp_id = match fan_out_ramp_id(
+        &headers,
+        "ramp",
+        queue_name,
+        &[Some(target_build_id), Some(percent.as_str())],
+    ) {
         Ok(id) => id,
         Err(response) => return response,
     };
@@ -50397,6 +50423,21 @@ mod tests {
 
     // ── issue #1814: one ramp id per keyed build-routing fan-out ────────────
 
+    const PAYLOAD: &[Option<&str>] = &[Some("canary-v2"), Some("25")];
+
+    /// A reused key with a changed payload gets a new id. An exact retry
+    /// keeps its id.
+    #[test]
+    fn a_keyed_ramp_id_depends_on_the_payload() {
+        let headers = idempotency_headers("deploy-42");
+        let id = |payload: &[Option<&str>]| {
+            fan_out_ramp_id(&headers, "ramp", "default", payload).expect("id")
+        };
+        assert_eq!(id(PAYLOAD), id(PAYLOAD));
+        assert_ne!(id(PAYLOAD), id(&[Some("canary-v2"), Some("50")]));
+        assert_ne!(id(&[Some("b"), None]), id(&[Some("b"), Some("")]));
+    }
+
     fn idempotency_headers(key: &str) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -50411,8 +50452,8 @@ mod tests {
     #[test]
     fn a_keyed_fan_out_gets_the_same_ramp_id_on_retry() {
         let headers = idempotency_headers("deploy-42");
-        let first = fan_out_ramp_id(&headers, "ramp", "default").expect("id");
-        let retry = fan_out_ramp_id(&headers, "ramp", "default").expect("id");
+        let first = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let retry = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
         assert_eq!(first, retry);
     }
 
@@ -50420,11 +50461,16 @@ mod tests {
     #[test]
     fn a_keyed_ramp_id_depends_on_key_queue_and_route() {
         let headers = idempotency_headers("deploy-42");
-        let base = fan_out_ramp_id(&headers, "ramp", "default").expect("id");
-        let other_key =
-            fan_out_ramp_id(&idempotency_headers("deploy-43"), "ramp", "default").expect("id");
-        let other_queue = fan_out_ramp_id(&headers, "ramp", "billing").expect("id");
-        let other_route = fan_out_ramp_id(&headers, "policy", "default").expect("id");
+        let base = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let other_key = fan_out_ramp_id(
+            &idempotency_headers("deploy-43"),
+            "ramp",
+            "default",
+            PAYLOAD,
+        )
+        .expect("id");
+        let other_queue = fan_out_ramp_id(&headers, "ramp", "billing", PAYLOAD).expect("id");
+        let other_route = fan_out_ramp_id(&headers, "policy", "default", PAYLOAD).expect("id");
         assert_ne!(base, other_key);
         assert_ne!(base, other_queue);
         assert_ne!(base, other_route);
@@ -50434,15 +50480,15 @@ mod tests {
     #[test]
     fn an_unkeyed_fan_out_gets_a_new_ramp_id() {
         let headers = axum::http::HeaderMap::new();
-        let first = fan_out_ramp_id(&headers, "ramp", "default").expect("id");
-        let second = fan_out_ramp_id(&headers, "ramp", "default").expect("id");
+        let first = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let second = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
         assert_ne!(first, second);
     }
 
     /// An empty key is a client error, as on the start route.
     #[test]
     fn an_empty_idempotency_key_is_rejected() {
-        let result = fan_out_ramp_id(&idempotency_headers("  "), "ramp", "default");
+        let result = fan_out_ramp_id(&idempotency_headers("  "), "ramp", "default", PAYLOAD);
         assert_eq!(
             result.expect_err("an empty key is a 400").status(),
             axum::http::StatusCode::BAD_REQUEST
