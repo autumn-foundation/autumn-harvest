@@ -1039,7 +1039,7 @@ Each task queue is identified by a name string. Tasks are enqueued with a `queue
 
 - **At-most-once delivery** for the initial attempt (no duplicate execution).
 - **At-least-once delivery** across retries (a task may execute multiple times if it fails).
-- **Ordering:** Within a queue, tasks are ordered by `(priority DESC, scheduled_at ASC)`. Priority 0 is default; higher numbers execute first.
+- **Ordering:** Within a queue, tasks are ordered by `priority DESC`, then by due time. Priority 0 is default; higher numbers execute first. Within one priority, continuations of running workflows go before new starts. See [`operations/claim-order.md`](operations/claim-order.md).
 - **Delayed scheduling:** Tasks can be enqueued with a future `scheduled_at` for retry backoff or scheduled execution.
 - **Visibility timeout:** If a worker claims a task and doesn't complete it within `start_to_close`, the scheduler marks it as failed and requeues it.
 

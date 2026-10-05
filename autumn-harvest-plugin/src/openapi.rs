@@ -85,6 +85,7 @@ pub struct OpenApiError(String);
 /// Written by `scripts/regenerate-openapi.sh`. Never edit it by hand.
 const OPENAPI_JSON: &str = include_str!("../openapi.json");
 
+#[expect(clippy::expect_used, reason = "a unit test parses the generated file")]
 static DOCUMENT: LazyLock<Value> = LazyLock::new(|| {
     serde_json::from_str(OPENAPI_JSON).expect("the generated openapi.json must be valid JSON")
 });

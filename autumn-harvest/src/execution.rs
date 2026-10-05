@@ -5,6 +5,7 @@
 
 use chrono::Utc;
 use diesel::ExpressionMethods;
+use diesel::NullableExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -1513,6 +1514,9 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
     enqueue.priority = request.priority.as_i32();
+    // A fresh admission yields to continuations at claim (issue #1824). A
+    // workflow retry continues a failed run, so it does not yield.
+    enqueue.new_start = request.retry_of_exec_id.is_none();
     if request.delay.is_some_and(|d| d > chrono::Duration::zero()) || request.start_at.is_some() {
         enqueue.scheduled_at = target_start_time;
     }
@@ -4050,9 +4054,9 @@ pub async fn resolve_live_attempt(
     exec_id: ExecutionId,
 ) -> HarvestResult<(WorkflowExecution, ShardId)> {
     let mut chain = walk_retry_chain(conn, pool, held_shard, exec_id).await?;
-    Ok(chain
+    chain
         .pop()
-        .expect("walk_retry_chain always returns at least the addressed row"))
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
 /// Walk the workflow-level retry chain (issue #523) from `exec_id`.
@@ -4184,6 +4188,7 @@ pub async fn walk_retry_chain(
     )];
     for _ in 0..RETRY_CHAIN_MAX_DEPTH {
         let (current_id, current_failed) = {
+            #[expect(clippy::expect_used, reason = "the chain starts with one row")]
             let (current, _) = chain
                 .last()
                 .expect("the chain is seeded with the addressed row");
@@ -4328,6 +4333,7 @@ async fn walk_retry_chain_on_conn_only(
     let mut chain = vec![load_execution_row(conn, exec_id).await?];
     for _ in 0..RETRY_CHAIN_MAX_DEPTH {
         let (current_id, current_failed) = {
+            #[expect(clippy::expect_used, reason = "the chain starts with one row")]
             let current = chain
                 .last()
                 .expect("the chain is seeded with the addressed row");
@@ -4418,7 +4424,7 @@ pub async fn resolve_live_attempt_id_best_effort(
         let chain = walk_retry_chain_on_conn_only(conn, exec_id).await?;
         let target = chain
             .last()
-            .expect("walk_retry_chain_on_conn_only always returns at least the addressed row")
+            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?
             .id;
         return Ok((ExecutionId::from_uuid(target), None));
     };
@@ -5821,20 +5827,19 @@ pub(crate) async fn parent_close_cascade_event_count(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
 ) -> HarvestResult<u64> {
-    let policies: Vec<Option<String>> = harvest_workflow_executions::table
+    let policies: Vec<String> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(parent_exec_id.as_uuid())))
         .filter(harvest_workflow_executions::parent_close_policy.is_not_null())
         // Must mirror apply_parent_close_cascade's RUNNING|PAUSED selection so the
         // history-cap preflight count matches the events actually appended (#383).
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        .select(harvest_workflow_executions::parent_close_policy)
-        .load::<Option<String>>(conn)
+        .select(harvest_workflow_executions::parent_close_policy.assume_not_null())
+        .load::<String>(conn)
         .await
         .map_err(database_error)?;
 
-    policies.into_iter().try_fold(0_u64, |count, policy_opt| {
-        let policy = policy_opt
-            .expect("filtered by is_not_null")
+    policies.into_iter().try_fold(0_u64, |count, policy| {
+        let policy = policy
             .parse::<ParentClosePolicy>()
             .map_err(HarvestError::Config)?;
         Ok(count + u64::from(policy != ParentClosePolicy::Abandon))
@@ -5865,25 +5870,24 @@ pub(crate) async fn apply_parent_close_cascade(
     // still an active child, so the parent-close cascade must reach it too —
     // otherwise it could be resumed after the parent closed despite a
     // RequestCancel/Terminate policy.
-    let running_children: Vec<(Uuid, String, Option<String>)> = harvest_workflow_executions::table
+    let running_children: Vec<(Uuid, String, String)> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(parent_exec_id.as_uuid())))
         .filter(harvest_workflow_executions::parent_close_policy.is_not_null())
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .select((
             harvest_workflow_executions::id,
             harvest_workflow_executions::workflow_name,
-            harvest_workflow_executions::parent_close_policy,
+            harvest_workflow_executions::parent_close_policy.assume_not_null(),
         ))
-        .load::<(Uuid, String, Option<String>)>(conn)
+        .load::<(Uuid, String, String)>(conn)
         .await
         .map_err(database_error)?;
 
     let mut deferred = Vec::new();
     let mut closed_children = Vec::new();
 
-    for (child_uuid, child_workflow_name, policy_opt) in running_children {
+    for (child_uuid, child_workflow_name, policy_str) in running_children {
         let child_exec_id = ExecutionId::from_uuid(child_uuid);
-        let policy_str = policy_opt.expect("filtered by is_not_null");
         let policy = policy_str.parse::<ParentClosePolicy>().map_err(|_| {
             HarvestError::InvalidParentClosePolicy {
                 child_exec_id,

@@ -844,6 +844,7 @@ fn terminate_process(pid: u32) {
 /// If the record cannot be read, rewritten or written back — a test helper that
 /// silently did nothing would make the reaper test vacuous.
 #[doc(hidden)] // exposed for the #525 reaper test; not a stable API
+#[expect(clippy::expect_used, reason = "documented panic in a test helper")]
 pub fn rewrite_owner_pid_for_test(session_dir: &Path, owner_pid: u32) {
     let path = session_dir.join(SESSION_RECORD_FILE);
     let raw = std::fs::read_to_string(&path).expect("session record should be readable");

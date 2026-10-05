@@ -1,5 +1,11 @@
 //! Autumn plugin crate for autumn-harvest.
 
+// Issue #1821: a panic on a request path drops that request. A panic that
+// poisons a shared lock can fail every later request on the replica. Non-test
+// code returns an error instead. Each remaining site carries an `expect`
+// attribute with its reason.
+#![warn(clippy::expect_used, clippy::unwrap_used)]
+
 pub mod api;
 /// Scoped API tokens + rotation for the management API (issue #942).
 pub mod api_token;
@@ -17,6 +23,9 @@ pub mod callback_deliverer;
 /// `HarvestPlugin` when an embedder configures `audit_export_webhook(...)`
 /// without supplying their own sink (issue #953).
 pub mod audit_sink;
+/// AWS KMS binding for the core AES-256-GCM payload codec (issue #1825).
+#[cfg(feature = "aws-kms")]
+pub mod aws_kms;
 /// Startup and shutdown steps that `HarvestPlugin` and `HarvestEmbedding`
 /// share (issue #1613).
 mod boot;

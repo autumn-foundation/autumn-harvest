@@ -73,7 +73,7 @@ Issue #1552, which this issue lists, shipped in #1778. The plugin's default
 drain deadline and the connector's `shutdown_timeout` now use
 `DEFAULT_SHUTDOWN_TIMEOUT`.
 
-**Upgrade.** See `docs/upgrading/0.7.0.md`, section 1.5.
+**Upgrade.** See `docs/upgrading/0.7.0.md`, section 1.6.
 
 **Tests.**
 
