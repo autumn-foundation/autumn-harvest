@@ -306,9 +306,10 @@ The `GRANDFATHERED` list in the lint names each one, with the rule and the
 reason. `20260915231809` is the first: it rebuilds a unique index on
 `harvest_workflow_executions` inside its transaction.
 
-The list cannot grow. An entry newer than the newest migration at the time the
-lint landed fails the build, so a new migration uses an annotation. An entry
-that no longer matches a finding also fails the build.
+The list cannot grow. A digest pins its entries, so any new entry fails the
+build, and a new migration uses an annotation. An entry newer than the newest
+migration at the time the lint landed fails too. An entry that no longer
+matches a finding also fails the build.
 
 ## 8. Known limits
 

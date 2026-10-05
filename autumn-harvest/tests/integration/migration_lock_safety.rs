@@ -39,6 +39,10 @@ const LEGACY_MIGRATIONS: &str = include_str!("lock_safety_legacy.txt");
 /// changes the digest even when the size stays the same.
 const LEGACY_MIGRATION_DIGEST: u64 = 0x1dc3_f33d_ee51_d5ed;
 
+/// The `digest` of the `tree/name rule` keys of `GRANDFATHERED`. The list is
+/// frozen: a new entry changes the digest, even below `GRANDFATHER_CEILING`.
+const GRANDFATHER_DIGEST: u64 = 0xe10d_069a_c2fc_ebb3;
+
 /// The newest migration that `GRANDFATHERED` may name.
 ///
 /// This is the newest migration on disk when the lint landed. A newer
@@ -2743,7 +2747,8 @@ fn param_range(s: &Stmts, open: usize, procedure: bool) -> Option<(usize, usize,
     let (mut fewest, mut most) = (0, 0);
     // The flags of the open parameter: seen, `OUT`, and with a default.
     let (mut seen, mut out, mut default) = (false, false, false);
-    // Whether the open parameter, and so the last one seen, is `VARIADIC`.
+    // Whether the last argument parameter is `VARIADIC`. A function may
+    // declare `OUT` parameters after it, which are not arguments.
     let mut variadic = false;
     let mut parens = 0_usize;
     let mut brackets = 0_usize;
@@ -2774,11 +2779,12 @@ fn param_range(s: &Stmts, open: usize, procedure: bool) -> Option<(usize, usize,
         if parens == 1 && brackets == 0 && s.is_punct(j, ',') {
             count(seen, out, default);
             (seen, out, default) = (false, false, false);
-            variadic = false;
             continue;
         }
         if parens == 1 {
-            variadic |= !seen && s.keyword(j, "variadic");
+            if !seen && (procedure || !s.keyword(j, "out")) {
+                variadic = s.keyword(j, "variadic");
+            }
             out |= !seen && s.keyword(j, "out");
             default |= s.keyword(j, "default") || s.is_punct(j, '=');
         }
@@ -4324,6 +4330,19 @@ fn lint_all(migrations: &[OnDisk]) -> Vec<Vec<Finding>> {
         analyse(&m.sql, history);
     }
     out
+}
+
+/// The `digest` of owned keys.
+fn key_digest(keys: &BTreeSet<String>) -> u64 {
+    digest(&keys.iter().map(String::as_str).collect())
+}
+
+/// The `tree/name rule` key of each `GRANDFATHERED` entry.
+fn grandfather_keys() -> BTreeSet<String> {
+    GRANDFATHERED
+        .iter()
+        .map(|(tree, name, rule, _)| format!("{tree}/{name} {}", rule.id()))
+        .collect()
 }
 
 fn grandfathered(tree: &str, name: &str, rule: Rule) -> bool {
@@ -7653,6 +7672,14 @@ fn a_variadic_routine_accepts_any_number_of_trailing_arguments() {
     // A call with too few arguments reaches another routine.
     let findings = lint_with_history(&[earlier], "SELECT f(0);", true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // A function may declare `OUT` parameters after the variadic one.
+    let earlier = earlier.replace("VARIADIC xs int[])", "VARIADIC xs int[], OUT result int)");
+    let earlier = earlier.replace("RETURNS void ", "");
+    assert_eq!(
+        lint_with_history(&[&earlier], "SELECT f(0, 1, 2);", true),
+        [],
+        "{earlier}"
+    );
 }
 
 #[test]
@@ -8279,6 +8306,21 @@ fn a_grandfather_entry_binds_to_its_tree() {
     const NAME: &str = "20260915231809_harvest_migrated_seal_terminal_at";
     assert!(grandfathered(CORE_TREE, NAME, Rule::LockTimeout));
     assert!(!grandfathered(APP_TREE, NAME, Rule::LockTimeout));
+}
+
+#[test]
+fn the_grandfather_list_is_frozen() {
+    let mut entries = grandfather_keys();
+    // A new entry below the ceiling changes the digest.
+    entries.insert(format!(
+        "{CORE_TREE}/20261002000001_new_change lock-timeout"
+    ));
+    assert_ne!(key_digest(&entries), key_digest(&grandfather_keys()));
+    assert_eq!(
+        key_digest(&grandfather_keys()),
+        GRANDFATHER_DIGEST,
+        "GRANDFATHERED changed. It is frozen, so a new migration uses the in-file annotation."
+    );
 }
 
 #[test]
