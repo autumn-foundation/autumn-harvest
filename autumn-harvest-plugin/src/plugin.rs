@@ -2370,10 +2370,10 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
 /// Harvest storage databases, awaiting the result off the calling task's own
 /// async executor thread.
 ///
-/// `autumn_web::migrate::run_pending`/`pending_migrations` are synchronous and
-/// genuinely block the calling thread: since autumn-web 0.7 both route through
-/// `with_migration_connection!`, which runs the connect *and* the migration
-/// body on a freshly spawned `std::thread::scope` thread and `join()`s it.
+/// `autumn_web::migrate::run_pending` and `pending_migrations` are synchronous.
+/// They block the calling thread. Since autumn-web 0.7, both route through
+/// `with_migration_connection!`. That macro runs the connect *and* the
+/// migration body on a new `std::thread::scope` thread and `join()`s it.
 /// `spawn_blocking` keeps that join off an async worker thread, where it would
 /// otherwise stall the worker for the full duration of the migration.
 ///
