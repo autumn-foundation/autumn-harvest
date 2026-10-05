@@ -2276,8 +2276,9 @@ struct Routine {
     at: usize,
     /// Whether the body is in a language other than PL/pgSQL or SQL.
     foreign: bool,
-    /// Whether the `CREATE` surely runs. A routine created in an uncalled body
-    /// or a branch may not exist. A call is always sure.
+    /// Whether the `CREATE` surely runs and stays. A routine created in an
+    /// uncalled body or a branch may not exist. A later `ROLLBACK` may undo
+    /// the `CREATE`. A call is always sure.
     sure: bool,
 }
 
@@ -2333,10 +2334,7 @@ fn call_clears(
     // The lint does not compare parameter types, so any overload with the
     // same name and arity may be the one that runs.
     let keeps = |call: &Routine, clearing: &BTreeSet<usize>| {
-        let mut matches = (0..routines.len()).filter(|&i| {
-            let r = &routines[i];
-            r.at < call.at && r.name == call.name && r.accepts(call)
-        });
+        let mut matches = (0..routines.len()).filter(|&i| reaches(s, &routines[i], call));
         let first = matches.next();
         // After a `search_path` change, an unqualified name may reach a
         // routine in another schema.
@@ -2390,14 +2388,7 @@ fn call_clears(
         // A `CALL` that no earlier `CREATE` here matches, or a call of a
         // locking routine from an earlier migration, may take any lock.
         let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c <= call.at);
-        // A call that runs now reaches only a routine that surely exists.
-        let resolved = !unplaced
-            && routines.iter().any(|r| {
-                r.at < call.at
-                    && (r.sure || !s.toks[call.at].runs)
-                    && r.name == call.name
-                    && r.accepts(call)
-            });
+        let resolved = !unplaced && routines.iter().any(|r| reaches(s, r, call));
         let unread = s.keyword(call.at, "call") || inherited_locking.contains(callee);
         let self_bounded = !unplaced && reaches_self_bounded(call, raws, history);
         if !foreign && !resolved && unread && !self_bounded {
@@ -2430,9 +2421,22 @@ fn call_clears(
     body_timeouts.sort_by_key(|(k, _)| *k);
 }
 
+/// Whether `call` may reach the routine `r` that this file creates earlier.
+///
+/// The names and the argument count must match. A call that runs now reaches
+/// only a routine that surely exists.
+fn reaches(s: &Stmts, r: &Routine, call: &Routine) -> bool {
+    r.at < call.at && (r.sure || !s.toks[call.at].runs) && r.name == call.name && r.accepts(call)
+}
+
 /// Each routine that the file creates.
 fn file_routines(s: &Stmts) -> Vec<Routine> {
     let unconditional = unconditional(s);
+    // The lint does not track which transaction a `ROLLBACK` ends. So it may
+    // undo any earlier `CREATE`, which fails closed.
+    let last_rollback = (0..s.toks.len())
+        .rev()
+        .find(|&k| s.starts[k] == k && (s.keyword(k, "rollback") || s.keyword(k, "abort")));
     (0..s.toks.len())
         .filter_map(|k| {
             let keyword = routine_keyword(s, k)?;
@@ -2445,7 +2449,7 @@ fn file_routines(s: &Stmts) -> Vec<Routine> {
                 min_arity: range.map(|(fewest, _)| fewest),
                 at: k,
                 foreign,
-                sure: s.toks[k].runs && unconditional[k],
+                sure: s.toks[k].runs && unconditional[k] && last_rollback.is_none_or(|r| r < k),
             })
         })
         .collect()
@@ -2882,9 +2886,9 @@ fn opaque_points(s: &Stmts, history: &History) -> Vec<usize> {
         .chain(inherited.into_iter().flatten().map(String::as_str))
         .collect();
     let resolved = |call: &Routine| {
-        routines
-            .iter()
-            .any(|r| !r.foreign && r.at < call.at && r.name == call.name && r.accepts(call))
+        routines.iter().any(|r| {
+            !r.foreign && r.sure && r.at < call.at && r.name == call.name && r.accepts(call)
+        })
     };
     (0..s.toks.len())
         .filter(|&k| s.toks[k].runs)
@@ -7312,6 +7316,74 @@ fn a_routine_created_in_an_uncalled_body_is_not_known() {
         nested("", "NULL;")
     );
     let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}\n{findings:?}");
+    // A call of a function that may not exist runs unknown code, which may
+    // change `search_path`. So the index may not be in `public`.
+    let function = "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
+                    CREATE FUNCTION q() RETURNS void LANGUAGE plpgsql AS $i$\n    BEGIN\n        \
+                    NULL;\n    END $i$;\nEND $o$;\n";
+    let index = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX public.idx;";
+    assert_eq!(
+        lint_with_history(&[&format!("{function}{index}")], drop, true),
+        []
+    );
+    let history = format!("{function}SELECT q();\n{index}");
+    let findings = lint_with_history(&[&history], drop, true);
+    assert!(!findings.is_empty(), "{history}\n{findings:?}");
+}
+
+#[test]
+fn an_uncertain_definition_does_not_keep_the_bound() {
+    // `p` may not exist, so the call may reach a routine that clears the bound.
+    let nested = "CREATE FUNCTION outer_f() RETURNS void LANGUAGE plpgsql AS $o$\nBEGIN\n    \
+                  CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql AS $i$\n    BEGIN\n        \
+                  NULL;\n    END $i$;\nEND $o$;";
+    let sql = format!(
+        "SET LOCAL lock_timeout = '5s';\n{nested}\n\
+         -- lock-safety: allow lock-timeout #1810 test fixture\nCALL p();\n\
+         ALTER TABLE harvest_events ADD COLUMN x INT;"
+    );
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.starts_with("ALTER TABLE locks harvest_events")),
+        "{sql}\n{findings:?}"
+    );
+}
+
+#[test]
+fn a_rolled_back_definition_is_not_known() {
+    let lock = "ALTER TABLE harvest_events ADD COLUMN y INT;";
+    let create = |clause: &str, body: &str| {
+        format!(
+            "CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql {clause}AS $$\nBEGIN\n    {body}\nEND $$;\n\
+             ROLLBACK;"
+        )
+    };
+    // The `ROLLBACK` undoes the `CREATE`, so a call reaches the old `p`.
+    let bounded = create("SET lock_timeout = '5s' ", lock);
+    let plain = create("", lock);
+    for (history, sql) in [
+        (vec![bounded.as_str()], "CALL p();"),
+        (
+            vec![plain.as_str()],
+            "SET LOCAL lock_timeout = '5s';\nCALL p();",
+        ),
+    ] {
+        let findings = lint_with_history(&history, sql, false);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{history:?}\n{sql}\n{findings:?}"
+        );
+    }
+    let sql = format!(
+        "{}\nSET LOCAL lock_timeout = '5s';\nCALL p();",
+        create("", "NULL;")
+    );
+    let findings = lint_with_history(&[], &sql, false);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}\n{findings:?}");
 }
 
