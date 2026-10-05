@@ -163,7 +163,7 @@ terminationGracePeriodSeconds >= preStop sleep
 ```
 
 Set `shutdown_timeout_secs` above `WorkerConfig::shutdown_timeout` (default
-30 seconds). Otherwise autumn-web stops the worker drain before it ends. With
+25 seconds, issue #1813). Otherwise autumn-web stops the worker drain before it ends. With
 a 10 second `preStop`, `shutdown_timeout_secs = 45` and the other defaults,
 use at least 70 seconds.
 

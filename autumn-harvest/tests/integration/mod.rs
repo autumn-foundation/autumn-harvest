@@ -120,6 +120,7 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod drain_release_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 mod event_batch_tests;

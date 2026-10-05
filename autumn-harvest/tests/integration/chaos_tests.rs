@@ -25,6 +25,8 @@
 #[cfg(unix)]
 mod infra_faults;
 
+mod drain_hold;
+
 use std::sync::Arc;
 use std::time::Duration;
 

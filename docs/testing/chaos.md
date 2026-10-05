@@ -55,6 +55,7 @@ off.
 | `POISON_RECLAIM_BEFORE_LOAD` | `poison.reclaim.before_load` | ERROR | AC1(b) — a transient Diesel/connection error at the reclaim scan |
 | `NOTIFY_TASK_ENQUEUED` | `notify.task_enqueued` | DROP_NOTIFY | AC1(c) — a dropped `LISTEN`/`NOTIFY` wake; dispatch must converge via the poll loop |
 | `DISPATCH_AFTER_CLAIM_BEFORE_ACK` | `dispatch.after_claim.before_ack` | KILL, DELAY | #1312 — a worker death between the by-id claim commit and the reference ack |
+| `WORKER_DISPATCH_BEFORE_START` | `worker.dispatch.before_start` | KILL, DELAY | #1813 — a shutdown between the claim and the task start |
 
 Caps declare the primitive classes a point can host:
 

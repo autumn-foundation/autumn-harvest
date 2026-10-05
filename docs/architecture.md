@@ -190,13 +190,14 @@ An activity attempt owns its task row only through its claim. The claim is the p
 
 *Invariant.* A task-row write takes effect only while its claim is current. So only the current claim writes the terminal event and the terminal row state.
 
-*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral and the retry-budget deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
+*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral, the retry-budget deferral and the drain release of a task that never started (issue #1813). Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
 
 The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue #1917). On an activity row it runs only on a worker without the handler, before the activity starts.
 
 *Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write and claim check uses it, in its own statement:
 
-- Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task` and `record_heartbeat`.
+- Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task`, `defer_claimed_retry_for_budget`, `release_unstarted_claim`, `release_abandoned_claim` and `record_heartbeat`.
+- Drain release of a joined activity (issue #1813): `requeue_claimed_task_for_retry`. It keeps `attempt`, because the handler ran.
 - Workflow-task writes: `requeue_claimed_workflow_task_after_deadlock` (issue #1797).
 - `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
 - `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
