@@ -35,6 +35,10 @@ const LOCK_SAFETY_CUTOFF: &str = "20260914165542";
 /// linted, so a backdated name cannot skip the lint.
 const LEGACY_MIGRATIONS: &str = include_str!("lock_safety_legacy.txt");
 
+/// The `digest` of the SQL of each legacy migration. The lint never reads
+/// those files, so they must not change.
+const LEGACY_SQL_DIGEST: u64 = 0x164b_fc16_3dc5_b59f;
+
 /// The `digest` of `LEGACY_MIGRATIONS`. The list is frozen: a swapped entry
 /// changes the digest even when the size stays the same.
 const LEGACY_MIGRATION_DIGEST: u64 = 0x1dc3_f33d_ee51_d5ed;
@@ -287,8 +291,6 @@ struct History {
     /// Whether an earlier migration may have changed `search_path`. A session
     /// value outlives its file, so a later file starts after the change.
     search_path_changed: bool,
-    /// Whether an earlier migration left `standard_conforming_strings` off.
-    nonstandard_strings: bool,
     /// Each routine whose body may take a lock, without its schema. A call of
     /// such a routine in a later migration counts as a lock.
     locking_routines: BTreeSet<String>,
@@ -2052,7 +2054,7 @@ fn unreadable_settings(
     history: &mut History,
     raws: &mut Vec<Raw>,
 ) {
-    nonstandard_strings(s, sql, unconditional, (path_change, opaque), history, raws);
+    nonstandard_strings(s, sql, unconditional, (path_change, opaque), raws);
     routine_resets(s, history, raws);
 }
 
@@ -2073,7 +2075,6 @@ fn nonstandard_strings(
     sql: &str,
     unconditional: &[bool],
     (path_change, opaque): (Option<usize>, &[usize]),
-    history: &mut History,
     raws: &mut Vec<Raw>,
 ) {
     let backslash_lines: BTreeSet<usize> = sql
@@ -2082,11 +2083,19 @@ fn nonstandard_strings(
         .filter(|(_, text)| text.contains('\\'))
         .map(|(n, _)| n + 1)
         .collect();
+    // Before the file turns the setting off, only a backslash in a plain
+    // `'...'` literal reads differently. An `E'...'` literal, a comment and a
+    // dollar quote read the same either way.
+    let plain_lines = plain_literal_backslash_lines(sql);
+    let mut turned_off = false;
     // The session value, and a transaction-local `off` above it. The session
     // value when the transaction began, and whether the transaction has turned
     // either value off. A rollback restores the saved value. A rollback to a
     // savepoint may restore any value from the transaction.
-    let mut session = history.nonstandard_strings;
+    // The connection or a role default may start with the setting off. A
+    // migration may run alone on a new connection, so an `on` from an earlier
+    // file does not carry. Each file starts with the setting maybe off.
+    let mut session = true;
     let mut local = false;
     let mut hidden = false;
     let mut saved = session;
@@ -2111,11 +2120,21 @@ fn nonstandard_strings(
                 }
             }
         }
+        // A reset restores the connection default, which may be off.
+        let resets = s.is(k + 1, "standard_conforming_strings") || s.keyword(k + 1, "all");
+        if sure && s.starts[k] == k && s.keyword(k, "reset") && resets {
+            (session, local) = (true, false);
+        }
         let top_start = s.starts[k] == k && s.toks[k].depth == 0 && !s.is_punct(k, ';');
         if top_start && (session || local || hidden) {
             let last = s.end(k).saturating_sub(1).max(k);
             let lines = s.toks[k].line..=s.toks[last].line;
-            if backslash_lines.range(lines).next().is_some() {
+            let suspect = if turned_off || hidden {
+                &backslash_lines
+            } else {
+                &plain_lines
+            };
+            if suspect.range(lines).next().is_some() {
                 raws.push(Raw::lock(k, NONSTANDARD_STRINGS, None));
             }
         }
@@ -2131,18 +2150,88 @@ fn nonstandard_strings(
                 raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
                 local = true;
                 any_local_off = true;
+                turned_off = true;
             }
             Some((false, false)) => {
                 raws.push(Raw::lock(s.starts[k], NONSTANDARD_STRINGS, None));
                 (session, local) = (true, false);
                 any_session_off = true;
+                turned_off = true;
             }
             Some((true, _)) if sure => (session, local) = (false, false),
             Some((true, _)) | None => {}
         }
     }
-    // The file ends its transaction, so only the session value carries.
-    history.nonstandard_strings = session;
+}
+
+/// The lines of `sql` with a backslash inside a plain `'...'` literal.
+///
+/// The scan skips comments, quoted names, dollar quotes and `E'...'` literals.
+/// A backslash in those reads the same whatever `standard_conforming_strings`
+/// says.
+fn plain_literal_backslash_lines(sql: &str) -> BTreeSet<usize> {
+    let b = sql.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let at = |i: usize, text: &[u8]| b.get(i..i + text.len()) == Some(text);
+    let mut out = BTreeSet::new();
+    let (mut i, mut line) = (0, 1);
+    // Advance past `until`, counting lines on the way.
+    let skip_to = |i: &mut usize, line: &mut usize, until: &[u8]| {
+        while *i < b.len() && !at(*i, until) {
+            *line += usize::from(b[*i] == b'\n');
+            *i += 1;
+        }
+        *i = (*i + until.len()).min(b.len());
+    };
+    while i < b.len() {
+        match b[i] {
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b'-' if at(i, b"--") => skip_to(&mut i, &mut line, b"\n"),
+            b'/' if at(i, b"/*") => skip_to(&mut i, &mut line, b"*/"),
+            b'"' => {
+                i += 1;
+                skip_to(&mut i, &mut line, b"\"");
+            }
+            b'$' if !(i > 0 && ident(b[i - 1])) => {
+                let end =
+                    (i + 1..b.len()).find(|&j| !ident(b[j]) || b[j].is_ascii_digit() && j == i + 1);
+                match end.filter(|&j| b[j] == b'$') {
+                    Some(j) => {
+                        let tag = b[i..=j].to_vec();
+                        i = j + 1;
+                        skip_to(&mut i, &mut line, &tag);
+                    }
+                    None => i += 1,
+                }
+            }
+            b'\'' => {
+                let escaped =
+                    i > 0 && b[i - 1].eq_ignore_ascii_case(&b'e') && !(i > 1 && ident(b[i - 2]));
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' if escaped => i += 2,
+                        b'\\' => {
+                            out.insert(line);
+                            i += 1;
+                        }
+                        b'\'' if at(i, b"''") => i += 2,
+                        b'\'' => break,
+                        c => {
+                            line += usize::from(c == b'\n');
+                            i += 1;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 /// The new `standard_conforming_strings` value that the token at `k` sets, if
@@ -2156,10 +2245,6 @@ fn conforming_change(s: &Stmts, k: usize, path_change: Option<usize>) -> Option<
     let literal = |j: usize| s.word(j).or_else(|| s.string(j));
     let on = |j: usize| literal(j).is_some_and(pg_true);
     let start = s.starts[k] == k;
-    if start && s.keyword(k, "reset") {
-        let resets = s.is(k + 1, "standard_conforming_strings") || s.keyword(k + 1, "all");
-        return resets.then_some((true, false));
-    }
     if start && s.keyword(k, "set") {
         let name = if s.keyword(k + 1, "local") || s.keyword(k + 1, "session") {
             k + 2
@@ -6288,10 +6373,9 @@ fn a_foreign_routine_body_is_not_sql() {
 fn foreign_routine_text_changes_no_setting() {
     let routine = "CREATE FUNCTION f() RETURNS void LANGUAGE plpython3u AS $$\n\
                    # ; SET standard_conforming_strings = off;\npass\n$$;";
-    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let probe = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
     // Postgres only stores the source, so the setting stays on.
-    assert_eq!(lint_with_history(&[routine], hidden, true), [], "{hidden}");
-    let sql = format!("{routine}\n{hidden}");
+    let sql = format!("SET standard_conforming_strings = on;\n{routine}\n{probe}");
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
@@ -7174,26 +7258,25 @@ fn an_alter_routine_that_drops_its_bound_is_unbounded() {
 #[test]
 fn nonstandard_strings_carry_into_later_migrations() {
     let off = "-- lock-safety: allow lock-timeout #1810 test fixture\nSET standard_conforming_strings = off;";
-    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
-    let findings = lint_with_history(&[off], hidden, true);
-    assert!(
+    let probe = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let tainted = |findings: &[Finding]| {
         findings
             .iter()
-            .any(|f| f.detail.contains("standard_conforming_strings")),
-        "{findings:?}"
-    );
+            .any(|f| f.detail.contains("standard_conforming_strings"))
+    };
+    let findings = lint_with_history(&[off], probe, true);
+    assert!(tainted(&findings), "{findings:?}");
     // Without a backslash, the setting changes nothing.
     let plain = "SET LOCAL lock_timeout = '5s';\nALTER TABLE harvest_events ADD COLUMN x INT;";
     assert_eq!(lint_with_history(&[off], plain, true), []);
-    // A later reset ends the taint.
-    let reset = format!("{off}\nRESET standard_conforming_strings;");
-    let findings = lint_with_history(&[&reset], hidden, true);
-    assert!(
-        !findings
-            .iter()
-            .any(|f| f.detail.contains("standard_conforming_strings")),
-        "{findings:?}"
-    );
+    // A reset restores the connection default, which may be off too.
+    let sql = format!("{off}\nRESET standard_conforming_strings;\n{probe}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(tainted(&findings), "{findings:?}");
+    // An explicit `on` ends the taint.
+    let sql = format!("{off}\nSET standard_conforming_strings = on;\n{probe}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(!tainted(&findings), "{findings:?}");
 }
 
 #[test]
@@ -7287,7 +7370,8 @@ fn a_computed_setting_name_may_turn_conforming_strings_off() {
 #[test]
 fn a_local_nonstandard_setting_ends_at_the_commit() {
     let allow = "-- lock-safety: allow lock-timeout #1810 test fixture\n";
-    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let on = "SET standard_conforming_strings = on;\n";
+    let probe = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
     let tainted = |findings: &[Finding]| {
         findings
             .iter()
@@ -7297,33 +7381,29 @@ fn a_local_nonstandard_setting_ends_at_the_commit() {
         "SET LOCAL standard_conforming_strings = off;",
         "SELECT set_config('standard_conforming_strings', 'off', true);",
     ] {
-        // The file ends its transaction, so a later migration reads as `on`.
-        let earlier = format!("{allow}{local}");
-        let findings = lint_with_history(&[&earlier], hidden, true);
-        assert!(!tainted(&findings), "{earlier}\n{findings:?}");
-        // A `COMMIT` ends the local value inside the file too.
-        let sql = format!("{allow}{local}\nCOMMIT;\n{hidden}");
+        // A `COMMIT` ends the local value.
+        let sql = format!("{on}{allow}{local}\nCOMMIT;\n{probe}");
         let findings = lint_with_history(&[], &sql, false);
         assert!(!tainted(&findings), "{sql}\n{findings:?}");
         // Before the commit, the local value hides the body.
-        let sql = format!("{allow}{local}\n{hidden}");
+        let sql = format!("{on}{allow}{local}\n{probe}");
         let findings = lint_with_history(&[], &sql, true);
         assert!(tainted(&findings), "{sql}\n{findings:?}");
     }
     // A routine body may run its local value in any later transaction.
-    let earlier = format!(
-        "{allow}CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
-         PERFORM set_config('standard_conforming_strings', 'off', true);\nEND $$;"
+    let sql = format!(
+        "{on}{allow}CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+         PERFORM set_config('standard_conforming_strings', 'off', true);\nEND $$;\n{probe}"
     );
-    let findings = lint_with_history(&[&earlier], hidden, true);
-    assert!(tainted(&findings), "{earlier}\n{findings:?}");
-    // A session value under a local one still carries.
-    let earlier = format!(
-        "{allow}SET standard_conforming_strings = off;\n\
-         {allow}SET LOCAL standard_conforming_strings = off;"
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(tainted(&findings), "{sql}\n{findings:?}");
+    // A session value under a local one outlives the commit.
+    let sql = format!(
+        "{on}{allow}SET standard_conforming_strings = off;\n\
+         {allow}SET LOCAL standard_conforming_strings = off;\nCOMMIT;\n{probe}"
     );
-    let findings = lint_with_history(&[&earlier], hidden, true);
-    assert!(tainted(&findings), "{earlier}\n{findings:?}");
+    let findings = lint_with_history(&[], &sql, false);
+    assert!(tainted(&findings), "{sql}\n{findings:?}");
 }
 
 #[test]
@@ -7941,6 +8021,29 @@ fn the_lint_checks_the_version_ordered_history_too() {
 }
 
 #[test]
+fn conforming_strings_start_unknown_in_each_migration() {
+    // The connection or a role default may start with the setting off, so
+    // `\163` may spell `s` and hide `harvest_events`.
+    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let flagged = |findings: &[Finding]| {
+        findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings"))
+    };
+    let findings = lint_with_history(&[], hidden, true);
+    assert!(flagged(&findings), "{findings:?}");
+    // An earlier migration may run on another connection, so its `on` does
+    // not carry.
+    let on = "SET standard_conforming_strings = on;";
+    let findings = lint_with_history(&[on], hidden, true);
+    assert!(flagged(&findings), "{findings:?}");
+    // An explicit `on` in the same file makes the literal readable.
+    let sql = format!("{on}\n{hidden}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(!flagged(&findings), "{findings:?}");
+}
+
+#[test]
 fn an_inner_routine_bound_does_not_cover_the_outer_body() {
     // Creating the inner routine changes nothing for the outer call.
     for (clause, setter) in [
@@ -8370,28 +8473,25 @@ fn a_call_of_an_unread_or_locking_routine_is_a_lock() {
 #[test]
 fn a_local_conforming_strings_value_keeps_the_session_taint() {
     let off = "-- lock-safety: allow lock-timeout #1810 test fixture\nSET standard_conforming_strings = off;\n";
-    let hidden = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let probe = "SET LOCAL lock_timeout = '5s';\nDO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let tainted = |findings: &[Finding]| {
+        findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings"))
+    };
+    // A local `on` ends at the commit, and the session `off` returns.
     for local in [
         "SET LOCAL standard_conforming_strings = on;",
         "SELECT set_config('standard_conforming_strings', 'on', true);",
     ] {
-        let earlier = format!("{off}{local}");
-        let findings = lint_with_history(&[&earlier], hidden, true);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.detail.contains("standard_conforming_strings")),
-            "{local}"
-        );
+        let sql = format!("{off}{local}\nCOMMIT;\n{probe}");
+        let findings = lint_with_history(&[], &sql, false);
+        assert!(tainted(&findings), "{local}\n{findings:?}");
     }
-    let earlier = format!("{off}SELECT set_config('standard_conforming_strings', 'on', false);");
-    let findings = lint_with_history(&[&earlier], hidden, true);
-    assert!(
-        !findings
-            .iter()
-            .any(|f| f.detail.contains("standard_conforming_strings")),
-        "{findings:?}"
-    );
+    let sql =
+        format!("{off}SELECT set_config('standard_conforming_strings', 'on', false);\n{probe}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(!tainted(&findings), "{findings:?}");
 }
 
 #[test]
@@ -8538,6 +8638,28 @@ fn the_legacy_list_is_frozen() {
         digest(&legacy_migrations()),
         LEGACY_MIGRATION_DIGEST,
         "the legacy list changed. It is frozen, so a new migration is always linted."
+    );
+}
+
+#[test]
+fn legacy_migrations_are_unchanged() {
+    // The lint never reads a legacy migration, so its file must not change,
+    // or a new unsafe statement would skip the lint.
+    let legacy = legacy_migrations();
+    let texts: BTreeSet<String> = load_migrations()
+        .iter()
+        .filter(|m| legacy.contains(format!("{}/{}", m.tree, m.name).as_str()))
+        .map(|m| format!("{}/{}\n{}", m.tree, m.name, m.sql.replace("\r\n", "\n")))
+        .collect();
+    assert_eq!(
+        texts.len(),
+        legacy.len(),
+        "every legacy migration is on disk"
+    );
+    assert_eq!(
+        key_digest(&texts),
+        LEGACY_SQL_DIGEST,
+        "a legacy migration changed. Shipped migrations must not change."
     );
 }
 

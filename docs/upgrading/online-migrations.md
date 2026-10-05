@@ -313,7 +313,8 @@ choice, not an accident.
 Migrations up to and including `20260914165542` shipped before the lint, and
 the lint does not read them. Only the ones on disk when the lint landed are
 exempt, and `lock_safety_legacy.txt` lists them. A new migration with an older
-version is still linted. Some shipped migrations after the cutoff break a
+version is still linted. A digest pins the SQL of each legacy migration, so an
+edit to one fails the build. Some shipped migrations after the cutoff break a
 rule. They cannot change, because a database may have applied them already.
 The `GRANDFATHERED` list in the lint names each one, with the rule and the
 reason. `20260915231809` is the first: it rebuilds a unique index on
@@ -337,12 +338,18 @@ rule in its file, so a digest pins the SQL of each listed migration as well.
   as code, in any quote form. That includes `FOR ... IN EXECUTE`,
   `RETURN QUERY EXECUTE` and `OPEN ... FOR EXECUTE`. Any other string is data.
 - The lint reads string literals as `standard_conforming_strings = on` does.
-  A statement that may turn the setting off counts as a lock on an unknown
-  table that no bound covers. That includes a `set_config` call whose name is
-  not one literal. While it is off, each statement with a
-  backslash counts the same way, later in the file and in later migrations,
-  until a reset that surely runs. A reset in a function body or in a branch
-  does not count. Nor does a `set_config` that may not be the built-in. A `ROLLBACK` restores the value from the start of its
+  The connection or a role default may start with the setting off, and a
+  migration may run alone on a new connection. So each migration starts with
+  the setting maybe off. Until the file sets it on, a statement with a
+  backslash in a plain `'...'` literal counts as a lock on an unknown table
+  that no bound covers. Set `standard_conforming_strings = on` first in a
+  migration that needs such a literal.
+  A statement that may turn the setting off counts the same way. That
+  includes a `set_config` call whose name is not one literal. While it is
+  off, each statement with a backslash counts the same way, later in the file
+  and in later migrations, until an `on` that surely runs. A reset restores
+  the connection default, which may be off. An `on` in a function body or in a
+  branch does not count. Nor does a `set_config` that may not be the built-in. A `ROLLBACK` restores the value from the start of its
   transaction. A top-level `SET LOCAL` ends at the commit. A local value in a
   routine body carries, because the body may run in any later transaction.
 - The lint reads only PL/pgSQL and SQL. A `DO` body in another language, or a
