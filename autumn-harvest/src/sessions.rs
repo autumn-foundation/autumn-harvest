@@ -374,6 +374,8 @@ pub fn spawn_session_slot_reconciler(
     registry: SessionSlotRegistry,
     cancel: tokio_util::sync::CancellationToken,
     interval: std::time::Duration,
+    // The shard this pool serves (issue #1823). A held shard gets no write.
+    shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
     // Keep the worker dispatch binding for hints (issue #1431).
     crate::dispatch::spawn_bound(async move {
@@ -381,6 +383,10 @@ pub fn spawn_session_slot_reconciler(
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
+            }
+            // A held shard gets no write until the resolver releases it (issue #1823).
+            if crate::replication::shard_writes_held(shard) {
+                continue;
             }
             // Selected against `cancel` (issue #1426). A pool may have no
             // deadpool `Timeouts`, so `pool.get()` alone can park this task

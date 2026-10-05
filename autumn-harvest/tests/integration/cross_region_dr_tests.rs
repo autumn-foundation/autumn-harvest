@@ -2475,7 +2475,7 @@ async fn a_worker_holds_a_shard_it_cannot_probe_and_claims_nothing_there() {
         ShardId::new(0),
     ));
     let Ok((fenced, mut held)) =
-        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &unreachable).await
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &unreachable, &[]).await
     else {
         panic!("an unreachable shard is held, not refused");
     };
@@ -2542,7 +2542,7 @@ async fn an_unprobeable_shard_reuses_the_process_pin() {
         ShardId::new(0),
     ));
     let Ok((fenced, held)) =
-        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &unreachable).await
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &unreachable, &[]).await
     else {
         panic!("a pinned shard needs no probe to start");
     };
@@ -2560,7 +2560,8 @@ async fn an_unprobeable_shard_reuses_the_process_pin() {
     );
 
     // A worker with no shard identity resolves through the default shard.
-    let Ok((fenced, held)) = pin_worker_fence(DrFencing::Auto, DR_PREFIX, None, &unreachable).await
+    let Ok((fenced, held)) =
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, None, &unreachable, &[]).await
     else {
         panic!("the default shard pin covers a worker with no shard identity");
     };
@@ -2625,6 +2626,165 @@ async fn a_worker_defers_its_startup_writes_on_a_held_shard() {
         .expect("worker task joins");
 
     assert!(!while_held, "a held shard must not get a fleet row");
+}
+
+/// A fenced worker holds an unassigned shard it cannot probe (issue #1823).
+/// It serves its assigned shard, and cross-shard writes to the held shard
+/// fail closed. Only an assigned shard it cannot probe refuses the start.
+#[tokio::test]
+async fn a_fenced_worker_holds_an_unassigned_shard_it_cannot_probe() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holdunassigned");
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .unwrap();
+    }
+    let healthy = dr_pool(&url);
+    let unreachable = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    let targets = || {
+        Some((
+            vec![
+                (ShardId::new(0), healthy.clone()),
+                (ShardId::new(1), unreachable.clone()),
+            ],
+            ShardId::new(0),
+        ))
+    };
+
+    let refused = pin_worker_fence(
+        DrFencing::Auto,
+        DR_PREFIX,
+        targets(),
+        &healthy,
+        &[ShardId::new(1)],
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "an assigned shard that cannot be pinned refuses"
+    );
+    FenceRegistry::clear();
+
+    let Ok((fenced, held)) = pin_worker_fence(
+        DrFencing::Auto,
+        DR_PREFIX,
+        targets(),
+        &healthy,
+        &[ShardId::new(0)],
+    )
+    .await
+    else {
+        panic!("an unassigned shard must not refuse the worker");
+    };
+    let fenced: Vec<ShardId> = fenced
+        .expect("the assigned shard is fenced")
+        .into_iter()
+        .map(|(shard, _)| shard)
+        .collect();
+    let held: Vec<ShardId> = held.into_iter().map(|(shard, _)| shard).collect();
+    assert_eq!(fenced, vec![ShardId::new(0)]);
+    assert_eq!(held, vec![ShardId::new(1)]);
+    assert!(FenceRegistry::is_held(ShardId::new(1)));
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(0)),
+        Some(ShardGeneration::INITIAL)
+    );
+}
+
+/// A worker issues no write statement on a held shard (issue #1823). A
+/// statement trigger on every Harvest table records each write attempt.
+#[tokio::test]
+async fn a_held_shard_gets_no_worker_write_statement() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holdnowrite");
+    {
+        let mut conn = connect(&url).await;
+        conn.batch_execute(
+            "CREATE TABLE test_write_log (tbl text NOT NULL, op text NOT NULL);
+             CREATE FUNCTION test_note_write() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               INSERT INTO test_write_log VALUES (TG_TABLE_NAME, TG_OP);
+               RETURN NULL;
+             END $$;
+             DO $$
+             DECLARE t text;
+             BEGIN
+               FOR t IN
+                 SELECT c.relname FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+                   AND c.relname LIKE 'harvest\\_%' AND NOT c.relispartition
+               LOOP
+                 EXECUTE format(
+                   'CREATE TRIGGER test_note_write AFTER INSERT OR UPDATE OR DELETE ON %I \
+                    FOR EACH STATEMENT EXECUTE FUNCTION test_note_write()', t);
+               END LOOP;
+             END $$;",
+        )
+        .await
+        .expect("install the write log");
+    }
+    FenceRegistry::hold(&[ShardId::new(0)], ShardId::new(0)).expect("hold");
+
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(0)]),
+    );
+    config.worker_heartbeat_interval = std::time::Duration::from_millis(200);
+    config.poll_interval = std::time::Duration::from_millis(100);
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(config, registry).expect("worker builds"),
+    );
+    let runner = std::sync::Arc::clone(&worker);
+    let pool = dr_pool(&url);
+    let run = tokio::spawn(async move { runner.run(&pool).await });
+
+    let writes = |url: String| async move {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            tbl: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            op: String,
+        }
+        let mut conn = connect(&url).await;
+        diesel::sql_query("SELECT tbl, op FROM test_write_log ORDER BY tbl, op")
+            .load::<Row>(&mut conn)
+            .await
+            .expect("read the write log")
+            .into_iter()
+            .map(|row| format!("{} {}", row.op, row.tbl))
+            .collect::<Vec<_>>()
+    };
+    // Many poll, heartbeat and monitor ticks pass while the shard is held.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let while_held = writes(url.clone()).await;
+
+    FenceRegistry::release_held(ShardId::new(0));
+    eventually(
+        "a write after the release",
+        std::time::Duration::from_secs(20),
+        || {
+            let url = url.clone();
+            async move { !writes(url).await.is_empty() }
+        },
+    )
+    .await;
+    worker.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("worker stops")
+        .expect("worker task joins");
+
+    assert!(
+        while_held.is_empty(),
+        "a held shard must get no write statement: {while_held:?}"
+    );
 }
 
 /// A held shard that turns out to carry a DR marker stops the worker. A pin

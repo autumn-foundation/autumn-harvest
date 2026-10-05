@@ -229,16 +229,19 @@ shard is plain:
 - A worker **holds** the shard. It starts, registers and serves its other
   shards, as before (issue #961). The held shard is pinned to a sentinel
   generation that no row holds, so the worker claims nothing there and every
-  append there fails closed. It also writes no fleet row, heartbeat or
-  rate-limit bucket there, because the database may be an unpromoted
-  standby. A background task probes again with backoff. A
+  append there fails closed. No worker task writes there either: no fleet
+  row, heartbeat, rate-limit bucket or monitor tick. The database may be an
+  unpromoted standby. A background task probes again with backoff. A
   shard with no marker is released and runs unfenced. A shard with a marker
   stops the worker, because a pin is fixed for the life of a process. The
   restarted worker pins it.
 - A shard this process already pinned keeps that pin. The runner pins
   before its worker starts, so a brief outage does not hold or stop it.
-- A fenced worker with a shard it cannot reach refuses to start. It cannot
-  pin that shard.
+- A fenced worker with an assigned shard it cannot reach refuses to start.
+  It cannot pin that shard.
+- A fenced worker holds an unassigned shard it cannot reach, and it serves
+  its assigned shards. A cross-shard write to the held shard fails closed.
+  When that shard returns, the worker stops, and the restart pins it.
 - `HarvestRunner::start` retries the probe with backoff for a few seconds,
   then refuses to start.
 

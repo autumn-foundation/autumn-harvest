@@ -1054,6 +1054,10 @@ mod scanner {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(interval) => {}
                 }
+                // A held shard gets no write until the resolver releases it (issue #1823).
+                if crate::replication::shard_writes_held(shard) {
+                    continue;
+                }
                 // Selected against `cancel` (issue #1426). A pool may have no
                 // deadpool `Timeouts`, so `pool.get()` alone can park this task
                 // indefinitely on an exhausted shard pool. The top-of-loop select

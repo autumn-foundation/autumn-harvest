@@ -624,6 +624,17 @@ pub fn dr_config() -> DrConfig {
 /// The generations this process pinned at startup, one per shard.
 static PINNED: RwLock<Option<Pinned>> = RwLock::new(None);
 
+/// Whether a worker must skip writes to `shard` (issue #1823).
+///
+/// A held shard may be an unpromoted logical standby, so no worker task
+/// writes there until the resolver releases it. `None` names a single-pool
+/// worker's database, which resolves through the default shard. With no
+/// fence on, this is one atomic load.
+#[must_use]
+pub fn shard_writes_held(shard: Option<ShardId>) -> bool {
+    FenceRegistry::is_held(shard.unwrap_or(ShardId::UNENCODED))
+}
+
 /// The sentinel a held shard is pinned to (issue #1823). No row holds it,
 /// so the claim gate selects nothing and the persist assert fails closed.
 const HELD: ShardGeneration = ShardGeneration(i64::MIN);
@@ -945,6 +956,22 @@ impl FenceRegistry {
             ENABLED.store(false, Ordering::Release);
         }
         drop(guard);
+    }
+
+    /// Whether this process pins any shard to a real generation.
+    #[must_use]
+    pub fn has_real_pin() -> bool {
+        if !Self::is_enabled() {
+            return false;
+        }
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard
+            .as_ref()
+            .is_some_and(|pinned| pinned.generations.values().any(|pin| *pin != HELD));
+        drop(guard);
+        found
     }
 
     /// Whether `shard` is held: pinned to the sentinel, waiting for a probe.
@@ -1602,7 +1629,7 @@ mod db {
         targets: Option<(Vec<(ShardId, crate::worker::DbPool)>, ShardId)>,
         fallback_pool: &crate::worker::DbPool,
     ) -> HarvestResult<Option<Vec<(ShardId, crate::worker::DbPool)>>> {
-        pin_fence(mode, slot_prefix, targets, fallback_pool, false)
+        pin_fence(mode, slot_prefix, targets, fallback_pool, None)
             .await
             .map(|(fenced, _)| fenced)
     }
@@ -1622,20 +1649,22 @@ mod db {
     ///
     /// # Errors
     ///
-    /// As [`pin_process_fence`]. In addition, a fenced process with a shard
-    /// it cannot probe refuses to start, as `Enabled` always did: it cannot
-    /// pin that shard.
+    /// As [`pin_process_fence`]. In addition, a fenced worker refuses to
+    /// start when it cannot probe an assigned shard: it cannot pin that
+    /// shard. An unassigned shard is held instead, so an outage there does
+    /// not stop the worker. `assigned` empty means every target is assigned.
     #[allow(clippy::type_complexity)]
     pub async fn pin_worker_fence(
         mode: super::DrFencing,
         slot_prefix: &str,
         targets: Option<(Vec<(ShardId, crate::worker::DbPool)>, ShardId)>,
         fallback_pool: &crate::worker::DbPool,
+        assigned: &[ShardId],
     ) -> HarvestResult<(
         Option<Vec<(ShardId, crate::worker::DbPool)>>,
         Vec<(ShardId, crate::worker::DbPool)>,
     )> {
-        pin_fence(mode, slot_prefix, targets, fallback_pool, true).await
+        pin_fence(mode, slot_prefix, targets, fallback_pool, Some(assigned)).await
     }
 
     /// Re-probe the shards [`pin_worker_fence`] held (issue #1823).
@@ -1664,11 +1693,13 @@ mod db {
             .await;
             match probed {
                 Err(_) => index += 1,
-                Ok(markers) if markers.is_dr() => {
+                // A fencing process must pin a returning shard. A pin is
+                // taken only at startup, so the process restarts.
+                Ok(markers) if markers.is_dr() || FenceRegistry::has_real_pin() => {
                     return Err(crate::error::HarvestError::Config(format!(
-                        "shard {} was unreachable at startup and now carries a DR marker. A \
-                         pin is fixed for the life of a process, so this process stops. \
-                         Restart it to pin the shard.",
+                        "shard {} was unreachable at startup and must now be pinned. A pin \
+                         is fixed for the life of a process, so this process stops. Restart \
+                         it to pin the shard.",
                         shard.as_i32()
                     )));
                 }
@@ -1685,15 +1716,16 @@ mod db {
         Ok(())
     }
 
-    /// The shared startup path. `tolerate_unprobed` selects the worker's
-    /// behaviour for a shard it cannot probe. See [`pin_worker_fence`].
+    /// The shared startup path. `worker` is the worker's shard assignment,
+    /// or `None` for a process pin. A worker tolerates a shard it cannot
+    /// probe. See [`pin_worker_fence`].
     #[allow(clippy::type_complexity, clippy::too_many_lines)]
     async fn pin_fence(
         mode: super::DrFencing,
         slot_prefix: &str,
         targets: Option<(Vec<(ShardId, crate::worker::DbPool)>, ShardId)>,
         fallback_pool: &crate::worker::DbPool,
-        tolerate_unprobed: bool,
+        worker: Option<&[ShardId]>,
     ) -> HarvestResult<(
         Option<Vec<(ShardId, crate::worker::DbPool)>>,
         Vec<(ShardId, crate::worker::DbPool)>,
@@ -1711,7 +1743,7 @@ mod db {
         // does not hold a shard the process already fences.
         let mut reused: Vec<(usize, ShardId, ShardGeneration)> = Vec::new();
         for (index, (shard, pool)) in probe_targets.iter().enumerate() {
-            if tolerate_unprobed {
+            if worker.is_some() {
                 let once = async {
                     let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
                     probe_dr_markers(&mut conn, slot_prefix).await
@@ -1760,11 +1792,21 @@ mod db {
             }
             return Ok((None, held));
         }
-        if !held.is_empty() {
+        // A shard outside this worker's assignment does not block it. The
+        // worker holds that shard, so a cross-shard write there fails closed.
+        // An assigned shard, or a worker with no explicit assignment, refuses.
+        let assigned_held = held
+            .iter()
+            .filter(|(shard, _)| match (worker, targets.as_ref()) {
+                (Some(assigned), Some(_)) if !assigned.is_empty() => assigned.contains(shard),
+                _ => true,
+            })
+            .count();
+        if assigned_held > 0 {
             return Err(crate::error::HarvestError::Config(format!(
-                "DR fencing is on, but {} shard(s) could not be probed, so they cannot be \
-                 pinned. Refusing to start rather than run them unfenced.",
-                held.len()
+                "DR fencing is on, but {assigned_held} assigned shard(s) could not be \
+                 probed, so they cannot be pinned. Refusing to start rather than run them \
+                 unfenced."
             )));
         }
         if probed.iter().flatten().any(DrMarkers::is_standby) {
@@ -1822,14 +1864,23 @@ mod db {
             }
         }
 
+        let held_shards: Vec<ShardId> = held.iter().map(|(shard, _)| *shard).collect();
         let mut pins = Vec::with_capacity(targets.len());
         for (index, (shard, pool)) in targets.iter().enumerate() {
+            if held_shards.contains(shard) {
+                continue;
+            }
             if let Some((_, _, generation)) = reused.iter().find(|(at, ..)| *at == index) {
                 pins.push((*shard, *generation));
                 continue;
             }
             let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
             pins.push((*shard, ensure_generation_row(&mut conn, *shard).await?));
+        }
+        // Held first, so the default shard is never briefly unpinned.
+        if !held_shards.is_empty() {
+            FenceRegistry::hold(&held_shards, default_shard)
+                .map_err(|conflict| crate::error::HarvestError::Config(conflict.to_string()))?;
         }
         FenceRegistry::publish(&pins, default_shard)
             .map_err(|conflict| crate::error::HarvestError::Config(conflict.to_string()))?;
@@ -1840,7 +1891,11 @@ mod db {
                 "pinned shard write-authority generation for cross-region DR fencing"
             );
         }
-        Ok((Some(targets), Vec::new()))
+        let fenced = targets
+            .into_iter()
+            .filter(|(shard, _)| !held_shards.contains(shard))
+            .collect();
+        Ok((Some(fenced), held))
     }
 
     // ── Replication lag ────────────────────────────────────────────────────

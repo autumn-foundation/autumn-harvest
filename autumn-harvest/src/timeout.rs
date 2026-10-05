@@ -5183,6 +5183,10 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                     // Check for timed out tasks
                 }
             }
+            // A held shard gets no write until the resolver releases it (issue #1823).
+            if crate::replication::shard_writes_held(pool_shard) {
+                continue;
+            }
 
             // Bounded to `interval`. Unbounded pool contention here would
             // silently stretch this loop's actual period past `interval`,

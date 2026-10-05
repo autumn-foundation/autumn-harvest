@@ -4027,6 +4027,10 @@ pub fn spawn_audit_export_checker_for_shard(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
+            // A held shard gets no write until the resolver releases it (issue #1823).
+            if crate::replication::shard_writes_held(shard) {
+                continue;
+            }
 
             // Read the config ONCE. Use this same snapshot for both the
             // registration decision below and the tick itself (Codex review

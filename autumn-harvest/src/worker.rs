@@ -27724,6 +27724,10 @@ fn spawn_pause_auto_resumer(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
+            // A held shard gets no write until the resolver releases it (issue #1823).
+            if crate::replication::shard_writes_held(shard) {
+                continue;
+            }
 
             // Selected against `cancel` (issue #1426). See the comment
             // above `spawn_worker_heartbeat`'s own `pool.get()` call for
@@ -30459,6 +30463,7 @@ impl Worker {
             &self.config.dr.slot_prefix,
             self.dr_fence_targets(fallback_pool),
             fallback_pool,
+            &self.config.shard_assignments,
         )
         .await
         .map_err(|error| {
@@ -30752,12 +30757,13 @@ impl Worker {
         // same interval via `enforce_timeouts_once`).
         let session_slot_reconcilers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|(shard_pool, _shard)| {
+            .map(|(shard_pool, shard)| {
                 crate::sessions::spawn_session_slot_reconciler(
                     shard_pool.clone(),
                     Arc::clone(&self.session_slots_in_use),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
+                    *shard,
                 )
             })
             .collect();
