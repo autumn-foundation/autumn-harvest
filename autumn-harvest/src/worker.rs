@@ -16807,6 +16807,7 @@ async fn process_activity_task(
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
     task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
+    deferred_failure: &DeferredActivityFailure,
     pool_shard: u16,
     shutdown: &CancellationToken,
     drain_cancel: &CancellationToken,
@@ -16866,7 +16867,13 @@ async fn process_activity_task(
     };
     if let Some(result) = session_result {
         if let Some(failed) = session_task_outcome(&result) {
-            task_outcomes.record(failed, outlier_clock.elapsed());
+            record_activity_outcome(
+                task_outcomes,
+                deferred_failure,
+                outlier_clock,
+                failed,
+                result.as_ref().err(),
+            );
         }
         return result.map(|_| ());
     }
@@ -16940,7 +16947,13 @@ async fn process_activity_task(
                 }
                 // Issue #1815: a deferral that failed to persist is a failed
                 // setup write. A persisted or lease-lost deferral is skipped.
-                return count_setup_failure(task_outcomes, outlier_clock, deferred).map(|_| ());
+                return count_setup_failure(
+                    task_outcomes,
+                    deferred_failure,
+                    outlier_clock,
+                    deferred,
+                )
+                .map(|_| ());
             }
         }
     }
@@ -16969,6 +16982,7 @@ async fn process_activity_task(
         {
             let mut conn = count_setup_failure(
                 task_outcomes,
+                deferred_failure,
                 outlier_clock,
                 crate::pool::acquire_within_pool_bound(pool).await,
             )
@@ -16977,6 +16991,7 @@ async fn process_activity_task(
             })?;
             if !count_setup_failure(
                 task_outcomes,
+                deferred_failure,
                 outlier_clock,
                 queue::try_consume_rate_limit_token(&mut conn, key).await,
             )
@@ -17018,6 +17033,7 @@ async fn process_activity_task(
                 // failed setup write (issue #1815).
                 let deferred = count_setup_failure(
                     task_outcomes,
+                    deferred_failure,
                     outlier_clock,
                     queue::defer_claimed_rate_limited_task(
                         &mut conn,
@@ -17047,6 +17063,7 @@ async fn process_activity_task(
             Some(conn) => conn,
             None => count_setup_failure(
                 task_outcomes,
+                deferred_failure,
                 outlier_clock,
                 crate::pool::acquire_within_pool_bound(pool).await,
             )
@@ -17082,7 +17099,12 @@ async fn process_activity_task(
             (other, _) => other,
         };
         // Issue #1815: a failed start write is a failed setup write.
-        let started_opt = match count_setup_failure(task_outcomes, outlier_clock, started_result) {
+        let started_opt = match count_setup_failure(
+            task_outcomes,
+            deferred_failure,
+            outlier_clock,
+            started_result,
+        ) {
             Ok(started_opt) => started_opt,
             Err(error) => {
                 // Undo the dispatch reservation: the token and the probe.
@@ -17206,7 +17228,13 @@ async fn process_activity_task(
         // any attempt.
         let write = finalize_write_for_outcome(&finalized);
         if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write) {
-            task_outcomes.record(failed, outlier_clock.elapsed());
+            record_activity_outcome(
+                task_outcomes,
+                deferred_failure,
+                outlier_clock,
+                failed,
+                finalized.as_ref().err(),
+            );
         }
         return finalized.map(|_| ());
     }
@@ -17599,10 +17627,16 @@ async fn process_activity_task(
     // finalization. A failed finalization counts as a failure, so a worker
     // that loses its writes cannot report a clean ratio. A cancelled attempt
     // is skipped, as in the circuit breaker.
-    let record_outcome = |finalized: Option<queue::ClaimWrite>| {
+    let record_outcome = |finalized: Option<queue::ClaimWrite>, error: Option<&HarvestError>| {
         if let Some(failed) = activity_attempt_outcome(status, was_cancelled, finalized) {
             // Through finalization: a slow persist path is part of the attempt.
-            task_outcomes.record(failed, outlier_clock.elapsed());
+            record_activity_outcome(
+                task_outcomes,
+                deferred_failure,
+                outlier_clock,
+                failed,
+                error,
+            );
         }
     };
     // Parse the structured payload once and reuse for both the histogram
@@ -17666,7 +17700,7 @@ async fn process_activity_task(
         {
             Ok(policy) => policy,
             Err(error) => {
-                record_outcome(None);
+                record_outcome(None, None);
                 return Err(error);
             }
         }
@@ -17746,7 +17780,7 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
-        record_outcome(Some(queue::ClaimWrite::Applied));
+        record_outcome(Some(queue::ClaimWrite::Applied), None);
         return Ok(());
     }
 
@@ -17791,7 +17825,10 @@ async fn process_activity_task(
         &activity_result,
     )
     .await;
-    record_outcome(finalize_write_for_outcome(&finalized));
+    record_outcome(
+        finalize_write_for_outcome(&finalized),
+        finalized.as_ref().err(),
+    );
     finalized.map(|_| ())
 }
 
@@ -17803,6 +17840,7 @@ async fn process_activity_task(
 /// in the p99.
 fn count_setup_failure<T>(
     window: &crate::worker_outlier::TaskOutcomeWindow,
+    deferred: &DeferredActivityFailure,
     started: std::time::Instant,
     result: HarvestResult<T>,
 ) -> HarvestResult<T> {
@@ -17810,9 +17848,27 @@ fn count_setup_failure<T>(
         && error.handler_not_registered().is_none()
         && error.terminal_write_claim_ambiguous().is_none()
     {
-        window.record(true, started.elapsed());
+        record_activity_outcome(window, deferred, started, true, Some(error));
     }
     result
+}
+
+/// Count one activity attempt in the outlier window (issue #1815).
+///
+/// A failure with a transient database error goes to `deferred` instead. The
+/// dispatch loop releases that claim, and counts the attempt after it.
+fn record_activity_outcome(
+    window: &crate::worker_outlier::TaskOutcomeWindow,
+    deferred: &DeferredActivityFailure,
+    started: std::time::Instant,
+    failed: bool,
+    error: Option<&HarvestError>,
+) {
+    if failed && error.is_some_and(crate::pool::is_transient_db_error) {
+        deferred.defer();
+    } else {
+        window.record(failed, started.elapsed());
+    }
 }
 
 /// The claim write a finalize result stands for, for the outlier window
@@ -25295,6 +25351,29 @@ impl CycleFailure {
     }
 }
 
+/// An activity failure that waits for the dispatch loop's claim recovery
+/// (issue #1815).
+///
+/// A transient database error goes back to the dispatch loop, which then
+/// releases the claim. The release can retry for seconds, or find that a peer
+/// owns the claim. The activity path marks the failure here instead of
+/// counting it. The loop counts it after the release, with the full elapsed
+/// time, unless the claim was lost.
+#[derive(Debug, Default)]
+struct DeferredActivityFailure(std::sync::atomic::AtomicBool);
+
+impl DeferredActivityFailure {
+    /// Leave the failed attempt to the dispatch loop.
+    fn defer(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether an attempt waits, and clear the mark.
+    fn take(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Run the workflow decision cycle under its issue #494 wall-clock budget.
 ///
 /// Deliberately generic and free of every engine type, because the thing worth
@@ -25464,6 +25543,8 @@ async fn process_task(
     workflow_body_timeout: Option<Duration>,
     // Issue #1815: the activity path records each attempt here.
     task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
+    // Issue #1815: an activity failure that waits for the claim release.
+    deferred_failure: &DeferredActivityFailure,
     // Issue #1815: the `shard` label of `pool`.
     pool_shard: u16,
     // Issue #1813: the drain's cancel for running activities.
@@ -25537,6 +25618,7 @@ async fn process_task(
                 max_concurrent_sessions,
                 session_slots_in_use,
                 task_outcomes,
+                deferred_failure,
                 pool_shard,
                 shutdown,
                 drain_cancel,
@@ -27946,15 +28028,16 @@ const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> O
     }
 }
 
-/// Record a failed workflow task once its recovery write has run (issue
-/// #1815).
+/// Record a failed task once its claim recovery has run (issue #1815).
+///
+/// A workflow task and an activity with a deferred failure both count here.
 ///
 /// A lost claim means a peer owns the task. The stale attempt then stays out
 /// of the window, as in the activity finalization path. A recovery that did
 /// not reach the database still counts, because this worker may still hold
 /// the claim. `elapsed` is taken after the recovery, because the task is not
 /// done until its claim is released or quarantined.
-fn record_failed_workflow_task(
+fn record_failed_task(
     window: &crate::worker_outlier::TaskOutcomeWindow,
     recovery: ClaimRecovery,
     elapsed: Duration,
@@ -34388,6 +34471,10 @@ impl Worker {
                 "executing task"
             );
 
+            // Issue #1815: an activity failure that the claim release below
+            // must settle before it counts.
+            let deferred_failure = DeferredActivityFailure::default();
+
             // Apply per-workflow-task wall-clock budget when configured and
             // this is a workflow task with a non-zero timeout.
             if !workflow_task_timeout.is_zero() && task_type == "workflow" {
@@ -34428,6 +34515,7 @@ impl Worker {
                     capability_miss_policy,
                     Some(workflow_task_timeout),
                     &task_outcomes,
+                    &deferred_failure,
                     pool_shard,
                     &drain_cancel,
                 )
@@ -34460,7 +34548,7 @@ impl Worker {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .remove(&exec_id);
                         }
-                        record_failed_workflow_task(
+                        record_failed_task(
                             &task_outcomes,
                             ClaimRecovery::Applied,
                             dispatched_at.elapsed(),
@@ -34562,11 +34650,7 @@ impl Worker {
                         };
                         #[cfg(not(feature = "db"))]
                         let recovery = ClaimRecovery::Applied;
-                        record_failed_workflow_task(
-                            &task_outcomes,
-                            recovery,
-                            dispatched_at.elapsed(),
-                        );
+                        record_failed_task(&task_outcomes, recovery, dispatched_at.elapsed());
                     }
                     Ok(TaskDispatchOutcome::BodyTimedOut) => {
                         // Release the concurrency slot immediately so other
@@ -34686,11 +34770,7 @@ impl Worker {
                             let _ = decision;
                             ClaimRecovery::Applied
                         };
-                        record_failed_workflow_task(
-                            &task_outcomes,
-                            recovery,
-                            dispatched_at.elapsed(),
-                        );
+                        record_failed_task(&task_outcomes, recovery, dispatched_at.elapsed());
                     }
                 }
             } else {
@@ -34720,6 +34800,7 @@ impl Worker {
                     // not a workflow task" path, which was never wrapped.
                     None,
                     &task_outcomes,
+                    &deferred_failure,
                     pool_shard,
                     &drain_cancel,
                 )
@@ -34737,7 +34818,7 @@ impl Worker {
                 }
                 // Issue #1815: a re-pended failure already ran its recovery.
                 if matches!(outcome, Ok(TaskDispatchOutcome::RequeuedAfterFailure)) {
-                    record_failed_workflow_task(
+                    record_failed_task(
                         &task_outcomes,
                         ClaimRecovery::Applied,
                         dispatched_at.elapsed(),
@@ -34782,12 +34863,10 @@ impl Worker {
                     };
                     #[cfg(not(feature = "db"))]
                     let recovery = ClaimRecovery::Applied;
-                    if workflow_failed == Some(true) {
-                        record_failed_workflow_task(
-                            &task_outcomes,
-                            recovery,
-                            dispatched_at.elapsed(),
-                        );
+                    // An activity defers only a transient error, which the
+                    // release above handles.
+                    if workflow_failed == Some(true) || deferred_failure.take() {
+                        record_failed_task(&task_outcomes, recovery, dispatched_at.elapsed());
                     }
                 }
             }
@@ -43470,10 +43549,10 @@ mod tests {
 
         let window = crate::worker_outlier::TaskOutcomeWindow::new(16, Duration::from_secs(300));
         let latency = Duration::from_millis(40);
-        record_failed_workflow_task(&window, ClaimRecovery::ClaimLost, latency);
+        record_failed_task(&window, ClaimRecovery::ClaimLost, latency);
         assert_eq!(window.snapshot().tasks, 0, "a lost claim adds nothing");
-        record_failed_workflow_task(&window, ClaimRecovery::Applied, latency);
-        record_failed_workflow_task(&window, ClaimRecovery::Failed, latency);
+        record_failed_task(&window, ClaimRecovery::Applied, latency);
+        record_failed_task(&window, ClaimRecovery::Failed, latency);
         let stats = window.snapshot();
         assert_eq!((stats.tasks, stats.failures), (2, 2));
 
@@ -43508,16 +43587,40 @@ mod tests {
     #[test]
     fn a_failed_activity_setup_counts_but_a_capability_miss_does_not() {
         let window = crate::worker_outlier::TaskOutcomeWindow::default();
-        assert!(count_setup_failure(&window, std::time::Instant::now(), Ok(())).is_ok());
+        assert!(
+            count_setup_failure(
+                &window,
+                &DeferredActivityFailure::default(),
+                std::time::Instant::now(),
+                Ok(())
+            )
+            .is_ok()
+        );
         let miss: HarvestResult<()> = Err(HarvestError::HandlerNotRegistered {
             kind: "activity",
             name: "missing".to_owned(),
             phase: CapabilityMissPhase::BeforeHandler,
         });
-        assert!(count_setup_failure(&window, std::time::Instant::now(), miss).is_err());
+        assert!(
+            count_setup_failure(
+                &window,
+                &DeferredActivityFailure::default(),
+                std::time::Instant::now(),
+                miss
+            )
+            .is_err()
+        );
         assert_eq!(window.snapshot().tasks, 0, "a capability miss is a release");
         let lost: HarvestResult<()> = Err(crate::error::database_error("pool closed"));
-        assert!(count_setup_failure(&window, std::time::Instant::now(), lost).is_err());
+        assert!(
+            count_setup_failure(
+                &window,
+                &DeferredActivityFailure::default(),
+                std::time::Instant::now(),
+                lost
+            )
+            .is_err()
+        );
         let snap = window.snapshot();
         assert_eq!(
             (snap.tasks, snap.failures),
@@ -43527,12 +43630,63 @@ mod tests {
         let ambiguous: HarvestResult<()> = Err(HarvestError::TerminalWriteClaimAmbiguous {
             task_id: uuid::Uuid::nil(),
         });
-        assert!(count_setup_failure(&window, std::time::Instant::now(), ambiguous).is_err());
+        assert!(
+            count_setup_failure(
+                &window,
+                &DeferredActivityFailure::default(),
+                std::time::Instant::now(),
+                ambiguous
+            )
+            .is_err()
+        );
         assert_eq!(
             window.snapshot().tasks,
             1,
             "an ambiguous claim is released, so it is skipped"
         );
+    }
+
+    /// Issue #1815: a transient setup error goes back to the dispatch loop,
+    /// which releases the claim. The attempt counts after that release, with
+    /// its full time, and not at all when a peer took the claim.
+    #[test]
+    fn a_transient_setup_failure_waits_for_the_claim_release() {
+        let window = crate::worker_outlier::TaskOutcomeWindow::default();
+        let deferred = DeferredActivityFailure::default();
+        let transient: HarvestResult<()> = Err(HarvestError::PoolAcquireTimeout {
+            waited: Duration::from_secs(1),
+        });
+        let started = std::time::Instant::now();
+        assert!(count_setup_failure(&window, &deferred, started, transient).is_err());
+        assert_eq!(window.snapshot().tasks, 0, "the release has not run yet");
+
+        // The release lost the claim to a peer, so the attempt is not counted.
+        assert!(deferred.take());
+        record_failed_task(&window, ClaimRecovery::ClaimLost, started.elapsed());
+        assert_eq!(window.snapshot().tasks, 0);
+        assert!(!deferred.take(), "take clears the mark");
+
+        // A failed finalize with a lost connection waits the same way.
+        record_activity_outcome(
+            &window,
+            &deferred,
+            started,
+            true,
+            Some(&crate::error::database_error("connection closed")),
+        );
+        assert!(deferred.take());
+        record_failed_task(&window, ClaimRecovery::Applied, Duration::from_secs(40));
+        let snap = window.snapshot();
+        assert_eq!((snap.tasks, snap.failures), (1, 1));
+        assert!(
+            snap.p99_latency_ms.is_some_and(|ms| ms >= 40_000),
+            "the sample includes the release time: {snap:?}"
+        );
+
+        // A success with no error is counted at once.
+        record_activity_outcome(&window, &deferred, started, false, None);
+        assert!(!deferred.take());
+        assert_eq!(window.snapshot().tasks, 2);
     }
 
     /// Issue #1815: a setup failure keeps the time the attempt spent before it
@@ -43544,7 +43698,10 @@ mod tests {
             .checked_sub(Duration::from_secs(2))
             .expect("the clock is past two seconds");
         let lost: HarvestResult<()> = Err(crate::error::database_error("pool timeout"));
-        assert!(count_setup_failure(&window, started, lost).is_err());
+        assert!(
+            count_setup_failure(&window, &DeferredActivityFailure::default(), started, lost)
+                .is_err()
+        );
         let p99 = window.snapshot().p99_latency_ms.expect("one sample");
         assert!(p99 >= 2_000, "the sample keeps its 2 s: {p99} ms");
     }

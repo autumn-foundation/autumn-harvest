@@ -35,7 +35,10 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - A failed activity attempt counts as a failure. So does an attempt that an
   open circuit breaker rejects, because the breaker belongs to the worker.
   An activity that succeeds but does not finalize also counts as a failure.
-  So does an activity whose setup loses its database write.
+  So does an activity whose setup loses its database write. When that write
+  fails with a transient database error, the dispatch loop releases the
+  claim first. The attempt then counts with the release time, and not at all
+  when a peer took the claim.
   A cancelled activity attempt is not counted, and neither is one whose
   claim a later owner took before it finalized. A session acquire or release
   counts when it finalizes or fails, but not when it defers for capacity.
