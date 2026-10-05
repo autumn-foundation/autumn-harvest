@@ -1473,7 +1473,7 @@ Enable the `schema` Cargo feature and derive `JsonSchema` on your types:
 
 ```toml
 # In your Cargo.toml:
-autumn-harvest = { version = "0.3", features = ["schema"] }
+autumn-harvest = { version = "0.7", features = ["schema"] }
 schemars = "0.8"
 ```
 

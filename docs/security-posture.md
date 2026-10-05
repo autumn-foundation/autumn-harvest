@@ -724,7 +724,7 @@ credentials. The plugin re-exports `aws_sdk_kms`.
 
 ```toml
 [dependencies]
-autumn-harvest-plugin = { version = "0.6", features = ["aws-kms"] }
+autumn-harvest-plugin = { version = "0.7", features = ["aws-kms"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 ```
 

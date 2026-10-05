@@ -74,8 +74,8 @@ Workflow orchestration is a heavyweight dependency. Many Autumn users will never
 ```toml
 # Cargo.toml — only when you need workflows
 [dependencies]
-autumn-web = "0.7"
-autumn-harvest = "0.6"
+autumn-web = "0.8"
+autumn-harvest = "0.7"
 ```
 
 The `autumn-harvest-macros` crate is separate from `autumn-macros` because proc-macro crates cannot export non-macro items. Harvest macros generate different companion functions (`__autumn_workflow_info_*`, `__autumn_activity_info_*`) that need their own expansion logic.
