@@ -184,8 +184,9 @@ soon as all positive-weight queues are drained.
 ### Composition with within-queue priority (#249)
 
 Weights decide **which queue** to claim from. Once a queue is selected, the
-standard `ORDER BY priority DESC, scheduled_at ASC` SQL ordering picks the best
-row within that queue — fully unchanged.
+standard claim order picks the best row within that queue: `priority`, then
+the claim-order due time. See
+[`operations/claim-order.md`](../operations/claim-order.md).
 
 ### Observability
 

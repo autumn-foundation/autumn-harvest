@@ -239,6 +239,7 @@ impl Default for Metadata {
 /// `embedded_set_is_well_formed_and_matches_the_build_manifest` unit test
 /// rather than left to fail against a production database.
 #[must_use]
+#[expect(clippy::expect_used, reason = "a unit test checks the embedded set")]
 pub fn embedded() -> Vec<MigrationScript> {
     let mut scripts: Vec<MigrationScript> = EMBEDDED_MIGRATION_SCRIPTS
         .iter()
