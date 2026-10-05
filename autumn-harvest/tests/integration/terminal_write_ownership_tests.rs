@@ -1254,12 +1254,10 @@ async fn a_capability_miss_release_from_a_stale_attempt_does_not_free_the_curren
 
         let released = queue::release_task_for_capability_miss(
             &mut conn,
-            fx.stale.id,
-            &fx.worker_id,
+            &queue::TaskClaim::new(fx.stale.id, &fx.worker_id, fx.stale.attempt),
             Duration::from_secs(1),
             phase,
             fx.stale.crash_strikes,
-            fx.stale.attempt,
             "q1917-frontier",
         )
         .await
@@ -1278,12 +1276,10 @@ async fn a_capability_miss_release_from_a_stale_attempt_does_not_free_the_curren
 
         let released = queue::release_task_for_capability_miss(
             &mut conn,
-            fx.current.id,
-            &fx.worker_id,
+            &queue::TaskClaim::new(fx.current.id, &fx.worker_id, fx.current.attempt),
             Duration::from_secs(1),
             phase,
             fx.current.crash_strikes,
-            fx.current.attempt,
             "q1917-frontier",
         )
         .await

@@ -15,8 +15,7 @@ ActivityClaim      ActivityClaimReach.cfg          violation:NoStaleOwnerAfterFi
 WorkflowTaskClaim  WorkflowTaskClaim.cfg           pass
 WorkflowTaskClaim  WorkflowTaskClaimPreFix.cfg     violation:TerminalByCurrentClaim
 WorkflowTaskClaim  WorkflowTaskClaimReach.cfg      violation:NoStaleCycleOfTheHolder
-WorkflowTaskClaim  WorkflowTaskClaimCapMissGap.cfg violation:OwnerWritesByCurrentClaim
-WorkflowTaskClaim  WorkflowTaskClaimCapMissFix.cfg pass
+WorkflowTaskClaim  WorkflowTaskClaimCapMissPreFix.cfg violation:OwnerWritesByCurrentClaim
 CodecRotation      CodecRotation.cfg               pass
 CodecRotation      CodecRotationBlindWrite.cfg     violation:ErasureIsFinal
 CodecRotation      CodecRotationReach.cfg          violation:NoSweepRacesErasure

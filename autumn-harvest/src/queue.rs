@@ -4298,10 +4298,11 @@ async fn announce_deferred_task(
 ///   `record_workflow_started` reads, and once the handler has begun, the start
 ///   metric has already fired. See that predicate for the full argument.
 ///
-/// One statement, guarded on `state = 'RUNNING' AND worker_id = $2` so it can
-/// only ever undo *this* worker's own claim — a concurrent poison-pill reclaim
-/// that already took the row simply matches 0 rows here (mirrors
-/// [`crate::queue_pause::release_claim`]).
+/// One statement, guarded on the claim: `state = 'RUNNING' AND worker_id = $2
+/// AND crash_strikes = $4 AND attempt = $6`. It can only undo *this* claim. A
+/// concurrent reclaim that already took the row matches 0 rows here. The
+/// `attempt` term is checked against the row before the `SET`, so the arm that
+/// lowers `attempt` still matches its own claim (issue #1917).
 ///
 /// Two details that are load-bearing rather than incidental:
 ///
@@ -4366,6 +4367,7 @@ pub const fn release_task_for_capability_miss_query(
            AND state = 'RUNNING' \
            AND worker_id = $2 \
            AND crash_strikes = $4 \
+           AND attempt = $6 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     } else if phase.restores_dispatch_attempt() {
@@ -4398,6 +4400,7 @@ pub const fn release_task_for_capability_miss_query(
            AND state = 'RUNNING' \
            AND worker_id = $2 \
            AND crash_strikes = $4 \
+           AND attempt = $6 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     } else {
@@ -4429,6 +4432,7 @@ pub const fn release_task_for_capability_miss_query(
            AND state = 'RUNNING' \
            AND worker_id = $2 \
            AND crash_strikes = $4 \
+           AND attempt = $6 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     }
@@ -4516,34 +4520,41 @@ pub const fn release_task_for_capability_miss_query(
 /// that creates the race is what bumps it; the terminal escalation guard
 /// ([`claim_still_held_for_update`]) already keys on it.
 ///
+/// `claim.attempt` is the `attempt` value of that claim. It closes the other
+/// path to the same race (issue #1917). The stuck-running requeue
+/// (`poison_pill::requeue_stuck_task`) keeps `crash_strikes`, and the same
+/// worker can win the row again. A workflow cycle reaches this release after
+/// its handler starts, so a stale cycle can still run. Only `attempt` tells its
+/// claim apart from the later one. `formal/tla/WorkflowTaskClaim.tla` models
+/// this race.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn release_task_for_capability_miss(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    worker_id: &str,
+    claim: &TaskClaim,
     backoff: StdDuration,
     phase: crate::error::CapabilityMissPhase,
     claim_crash_strikes: i32,
-    _claim_attempt: i32,
     frontier: &str,
 ) -> HarvestResult<Option<i32>> {
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
     let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
     let released = diesel::sql_query(release_task_for_capability_miss_query(phase))
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Uuid, _>(claim.task_id)
+        .bind::<diesel::sql_types::Text, _>(&claim.worker_id)
         .bind::<diesel::sql_types::Double, _>(backoff_secs)
         .bind::<diesel::sql_types::Integer, _>(claim_crash_strikes)
         .bind::<diesel::sql_types::Text, _>(frontier)
+        .bind::<diesel::sql_types::Integer, _>(claim.attempt)
         .get_results::<DistinctMissWorkersRow>(conn)
         .await
         .map_err(crate::error::database_error)?;
     // Dispatch hint (issue #1312). The release statement returns the miss
     // cardinality rather than the hint columns, so the hint is read by id.
     if !released.is_empty() {
-        record_pending_hints(conn, &[task_id]).await;
+        record_pending_hints(conn, &[claim.task_id]).await;
     }
     Ok(released
         .into_iter()
@@ -10807,8 +10818,11 @@ mod tests {
                  so rolling `attempt` back to 0 would make the next capable \
                  claim re-emit `harvest.workflow.started`: {sql}",
             );
+            // Only the `SET` list writes. The `WHERE` guard reads `attempt`
+            // to identify the claim (issue #1917).
+            let set_list = sql.split(" WHERE ").next().unwrap_or(sql);
             assert!(
-                !sql.contains("attempt ="),
+                !set_list.contains("attempt ="),
                 "{phase:?}: a post-handler release must leave `attempt` alone \
                  entirely, not rewrite it to some other value: {sql}",
             );

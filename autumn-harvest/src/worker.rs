@@ -25486,8 +25486,9 @@ async fn release_capability_miss(
             // round-36 P2). See `release_task_for_capability_miss`.
             let released = queue::release_task_for_capability_miss(
                 conn,
-                task.id,
-                worker_id,
+                // A stuck-running requeue keeps `crash_strikes`, so only
+                // `attempt` tells this claim from a later one (issue #1917).
+                &queue::TaskClaim::new(task.id, worker_id, task.attempt),
                 delay,
                 missing.phase,
                 // The claim epoch this dispatch holds. A poison-pill requeue
@@ -25495,9 +25496,6 @@ async fn release_capability_miss(
                 // alone would also match that replacement claim (Codex
                 // round-37 P1).
                 task.crash_strikes,
-                // A stuck-running requeue keeps `crash_strikes`, so only
-                // `attempt` tells this claim from a later one (issue #1917).
-                task.attempt,
                 // The frontier these counters are evidence about (Codex
                 // round-46 P1): a release that lands on a DIFFERENT handler
                 // than the row records restarts the count at 1 rather than
