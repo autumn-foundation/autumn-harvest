@@ -312,7 +312,8 @@ pub fn effective_lease_ttl(ttl: Duration, interval: Duration, jitter: f64) -> Du
 /// A checker that scans exactly its lease shard uses the bare scanner name.
 /// Any other scope adds its sorted shard ids, for example `timeout:1,2`. A
 /// long list becomes `timeout:sha256:<hex>`, so the key stays short. An
-/// empty scope counts as shard 0, because the checker then scans shard 0. Two
+/// empty scope has its own key, `timeout:none`. Its pass is not the pass of
+/// any listed scope: with a sharded pool, it fires no event batches. Two
 /// checkers then share a lease only when they scan the same shards. This
 /// matters when workers share one pool but have different shard assignments.
 /// A shared lease there would leave the standbys' shards unscanned.
@@ -325,11 +326,12 @@ pub fn lease_scanner_key(
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
 
-    let mut ids: Vec<i32> = scope.iter().map(|s| s.as_i32()).collect();
-    // An empty scope scans shard 0, so it is keyed as shard 0.
-    if ids.is_empty() {
-        ids.push(0);
+    // No shard list can produce `none`, so an empty scope shares no lease
+    // with a listed one.
+    if scope.is_empty() {
+        return format!("{}:none", scanner.as_str());
     }
+    let mut ids: Vec<i32> = scope.iter().map(|s| s.as_i32()).collect();
     ids.sort_unstable();
     ids.dedup();
     if ids == [lease_shard.as_i32()] {
@@ -681,7 +683,10 @@ mod tests {
         use crate::scanner_health::Scanner;
         use crate::types::ShardId;
         let s = |n| ShardId::new(n);
-        assert_eq!(lease_scanner_key(Scanner::Timeout, s(0), &[]), "timeout");
+        assert_eq!(
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(0)]),
+            "timeout"
+        );
         assert_eq!(
             lease_scanner_key(Scanner::Timeout, s(3), &[s(3)]),
             "timeout"
@@ -720,20 +725,23 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_scope_is_keyed_as_the_shard_it_scans() {
+    fn an_empty_scope_has_its_own_key() {
         use crate::scanner_health::Scanner;
         use crate::types::ShardId;
         let s = |n| ShardId::new(n);
-        // An empty assignment list scans shard 0, not the lease shard.
-        assert_ne!(
-            lease_scanner_key(Scanner::Timeout, s(5), &[]),
-            lease_scanner_key(Scanner::Timeout, s(5), &[s(5)]),
-            "an empty scope and a shard-5 scope do different work"
-        );
-        assert_eq!(
-            lease_scanner_key(Scanner::Timeout, s(5), &[]),
-            lease_scanner_key(Scanner::Timeout, s(5), &[s(0)])
-        );
+        // With a sharded pool, an empty scope skips the event batches that a
+        // shard-0 scope fires. So the two must not share a lease.
+        for lease_shard in [s(0), s(5)] {
+            let empty = lease_scanner_key(Scanner::Timeout, lease_shard, &[]);
+            for scope in [vec![s(0)], vec![s(5)], vec![s(0), s(5)]] {
+                assert_ne!(
+                    empty,
+                    lease_scanner_key(Scanner::Timeout, lease_shard, &scope),
+                    "an empty scope and {scope:?} do different work"
+                );
+            }
+            assert_eq!(empty, "timeout:none");
+        }
     }
 
     #[test]

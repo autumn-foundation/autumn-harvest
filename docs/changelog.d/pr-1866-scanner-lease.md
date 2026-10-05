@@ -9,6 +9,9 @@ size, so adding workers to clear a backlog added database load in proportion.
   Each tick takes or renews the `timeout` lease with one atomic upsert on the
   database clock, under a 1 s `lock_timeout`. The upsert reads the clock
   after its row-lock wait. Only the holder runs the pass.
+  A checker whose shard scope is not just its lease shard adds the scope to
+  the key, as in `timeout:1,2`. An empty scope uses `timeout:none`, because
+  with a sharded pool its pass fires no event batches.
   A standby still refreshes its active codec key, because codec key
   retirement counts on every process to do that once per tick. A graceful
   stop expires the lease at once. After a crash, a standby takes over within
@@ -104,6 +107,8 @@ Tests run in `scanner_lease_tests` against Postgres 16:
   lease, and a standby leads on its next tick (RED: no lease taken).
 - A failed lease query fails open, and a standby picks up a new active codec
   key.
+- An empty scope never shares a lease key with a listed scope (RED: an empty
+  scope and `[0]` both used `timeout`).
 - A renewal that waits 400 ms for the row lock on a 100 ms lease returns a
   live lease (RED: the lease had expired).
 - A queued row that an earlier reason starts to match is still handed out
