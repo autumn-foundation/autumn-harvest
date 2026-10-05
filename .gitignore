@@ -29,3 +29,7 @@ clients/typescript/*.tgz
 # scripts/check-agentd-runtime-artifacts-ignored.sh.
 /agentd.db*
 /agentd.sock*
+
+# TLC trace dumps from a manual run in formal/tla (issue #1819).
+formal/tla/*_TTrace_*
+formal/tla/states/
