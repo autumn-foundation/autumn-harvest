@@ -1081,6 +1081,7 @@ async fn checkers_with_different_scopes_each_lead() {
 async fn a_failed_lease_query_fails_open() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
+    warm_pool(&pool).await;
     let checker = spawn_checker(
         &pool,
         Spec::new(
