@@ -55,11 +55,11 @@
 //! `ActivityStarted`/`ActivityFailed { attempt }` per attempt. So `attempt` is
 //! the **maximum** `attempt` field seen on `ActivityFailed` (resp.
 //! `LocalActivityFailed`/`LocalActivityExhausted`) events for the id, defaulting
-//! to `1` for a first-try completion. `ActivityTimedOut` carries no `attempt`
-//! field. A retried timeout appends no event (issue #1809). So a timed-out
-//! step reports the number of its `ActivityStarted` events, or `1` when it
-//! never started. That is a lower bound: an attempt that timed out before its
-//! handler started appends no `ActivityStarted`.
+//! to `1` for a first-try completion. `ActivityCompleted` and `ActivityTimedOut`
+//! carry no `attempt` field. A retried timeout appends no event (issue #1809).
+//! So a completed or timed-out step reports at least the number of its
+//! `ActivityStarted` events. That is a lower bound: an attempt that timed out
+//! before its handler started appends no `ActivityStarted`.
 //!
 //! ### signal_wait caveat
 //!
@@ -204,10 +204,10 @@ pub struct TimelineStep {
     /// **Caveat (lower bound):** derived as the max `attempt` field on the id's
     /// `ActivityFailed`/`LocalActivityFailed`/`LocalActivityExhausted` events
     /// (default `1`). Success and timeout events carry no attempt field, so a
-    /// succeeded-after-N-failures step reports `N`, not the true final `N+1` —
-    /// treat it as a **lower bound** on the final attempt number. A timed-out
-    /// step reports the number of its `ActivityStarted` events (issue #1809).
-    /// An attempt that timed out before its handler started is not counted.
+    /// completed or timed-out step also counts its `ActivityStarted` events
+    /// (issue #1809). Treat the result as a **lower bound** on the final
+    /// attempt number. An attempt that timed out before its handler started
+    /// appends no event, so it is not counted.
     pub attempt: Option<i32>,
 }
 
@@ -383,6 +383,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             WorkflowEvent::ActivityCompleted { activity_id, .. }
             | WorkflowEvent::ActivityCompletedExternally { activity_id, .. } => {
                 if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
+                    acc.record_started_attempts();
                     acc.close(ts, StepOutcome::Completed);
                 }
             }
@@ -398,11 +399,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             }
             WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
                 if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
-                    // A retried timeout appends no event (issue #1809), so the
-                    // starts count the attempts.
-                    if acc.starts > 0 {
-                        acc.record_attempt(acc.starts);
-                    }
+                    acc.record_started_attempts();
                     acc.close(ts, StepOutcome::TimedOut);
                 }
             }
@@ -699,8 +696,8 @@ struct Acc {
     ended_at: Option<DateTime<Utc>>,
     outcome: Option<StepOutcome>,
     max_failed_attempt: Option<i32>,
-    /// `ActivityStarted` events seen. A timed-out step reports it as its
-    /// attempt (issue #1809).
+    /// `ActivityStarted` events seen. A completed or timed-out step reports at
+    /// least this many attempts (issue #1809).
     starts: u32,
     /// Whether the wait/exec split can ever apply (regular activities only).
     split_applicable: bool,
@@ -735,6 +732,15 @@ impl Acc {
     fn record_attempt(&mut self, attempt: u32) {
         let attempt = i32::try_from(attempt).unwrap_or(i32::MAX);
         self.max_failed_attempt = Some(self.max_failed_attempt.map_or(attempt, |m| m.max(attempt)));
+    }
+
+    /// Counts each started attempt (issue #1809). A retried timeout appends
+    /// no event, so only the starts show it. An external activity records no
+    /// start, so this leaves it unchanged.
+    fn record_started_attempts(&mut self) {
+        if self.starts > 0 {
+            self.record_attempt(self.starts);
+        }
     }
 
     /// Mark this step terminated (last-writer-wins).
@@ -1098,7 +1104,7 @@ mod tests {
         ];
         let tl = derive(&rows, Some(60), 60);
         let act = find(&tl.steps, StepKind::Activity);
-        assert_eq!(act.attempt, Some(2), "max failed attempt");
+        assert_eq!(act.attempt, Some(3), "three started attempts");
         assert_eq!(act.outcome, StepOutcome::Completed);
         // final attempt's start @ 35: exec = 50-35 = 15, wait = 35-10 = 25, total = 40.
         assert_eq!(act.exec_ms, Some(15));
@@ -1386,6 +1392,43 @@ mod tests {
         let tl = derive(&rows, Some(200), 200);
         let act = find(&tl.steps, StepKind::Activity);
         assert_eq!(act.outcome, StepOutcome::TimedOut);
+        assert_eq!(act.attempt, Some(3));
+    }
+
+    #[test]
+    fn success_after_retried_timeouts_reports_each_started_attempt() {
+        let a1 = ActivityExecId::new();
+        let mut rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a1,
+                    name: "slow".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+        ];
+        for at in [20, 40, 60] {
+            rows.push(row(
+                at,
+                WorkflowEvent::ActivityStarted {
+                    activity_id: a1,
+                    worker_id: WorkerId::new("w"),
+                },
+            ));
+        }
+        rows.push(row(
+            80,
+            WorkflowEvent::ActivityCompleted {
+                activity_id: a1,
+                output: serde_json::Value::Null,
+            },
+        ));
+        let tl = derive(&rows, Some(80), 80);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.outcome, StepOutcome::Completed);
         assert_eq!(act.attempt, Some(3));
     }
 
