@@ -1435,8 +1435,7 @@ mod db {
         expected: ShardGeneration,
     ) -> HarvestResult<FencePassGuard> {
         use deadpool::managed::Manager as _;
-        use diesel_async::SimpleAsyncConnection as _;
-        let mut conn = tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
+        let conn = tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
             .await
             .map_err(|_| {
                 crate::error::HarvestError::Database(
@@ -1444,6 +1443,22 @@ mod db {
                 )
             })?
             .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+        begin_fenced_pass_on(conn, shard, expected).await
+    }
+
+    /// [`begin_fenced_pass_at`] on a connection the caller opened (issue
+    /// #1823). The guard owns it, and closes it on drop. The caller must
+    /// not run its own writes on this connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_pass`].
+    pub async fn begin_fenced_pass_on(
+        mut conn: AsyncPgConnection,
+        shard: ShardId,
+        expected: ShardGeneration,
+    ) -> HarvestResult<FencePassGuard> {
+        use diesel_async::SimpleAsyncConnection as _;
         conn.batch_execute("BEGIN").await.map_err(database_error)?;
         diesel::sql_query(FENCE_PASS_LOCK_SHARED)
             .execute(&mut conn)
@@ -2801,9 +2816,9 @@ mod db {
 #[cfg(feature = "db")]
 pub use db::{
     FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority, assert_fence,
-    begin_fenced_pass, begin_fenced_pass_at, bump_generation, current_generation,
-    ensure_generation_row, measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers,
-    query_replication_status, record_replication_heartbeat, resolve_held,
+    begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on, bump_generation,
+    current_generation, ensure_generation_row, measure_rpo, pin_process_fence, pin_worker_fence,
+    probe_dr_markers, query_replication_status, record_replication_heartbeat, resolve_held,
 };
 
 #[cfg(test)]

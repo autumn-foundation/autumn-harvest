@@ -6140,6 +6140,33 @@ async fn direct_write_authority(
     })
 }
 
+/// Open a fence barrier for one partition command on one shard (issue
+/// #1823), at the epoch the operator stated. A shard with no stated epoch
+/// has no DR marker, so it needs no barrier.
+///
+/// The barrier takes its own connection. A bump cannot commit while the
+/// caller holds it, so the command's DDL and row moves keep their authority.
+async fn partition_fence(
+    dsn: &str,
+    shard_id: i32,
+    expect_generation: &[ExpectGeneration],
+) -> Result<Option<autumn_harvest::replication::FencePassGuard>, String> {
+    let Some(expected) =
+        expected_generation_for(expect_generation, shard_id).map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;
+    autumn_harvest::replication::begin_fenced_pass_on(
+        conn,
+        autumn_harvest::types::ShardId::new(shard_id),
+        autumn_harvest::replication::ShardGeneration::new(expected),
+    )
+    .await
+    .map(Some)
+    .map_err(|e| e.to_string())
+}
+
 /// [`direct_write_authority`] for every shard of a rebalance pool, before any
 /// write. A rebalance moves history between two shards, so both must hold
 /// authority. The returned guards hold each stated epoch until the caller
@@ -6490,6 +6517,15 @@ async fn run_partition_enable(
             out.push(row);
             continue;
         }
+        // Held until this shard's mutation ends (issue #1823).
+        let _fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                row.error = Some(error);
+                out.push(row);
+                continue;
+            }
+        };
         // Per-shard independence is deliberate: a shard is a database, and a
         // half-converted cluster is a supported state (each shard's layout is
         // detected at runtime), so one shard's lock timeout must not abort the
@@ -6542,6 +6578,15 @@ async fn run_partition_maintain(
             out.push(row);
             continue;
         }
+        // Held until this shard's mutation ends (issue #1823).
+        let _fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                row.error = Some(error);
+                out.push(row);
+                continue;
+            }
+        };
         match autumn_harvest::partition::maintain(
             &mut conn,
             autumn_harvest::chrono::Utc::now(),
@@ -6604,6 +6649,15 @@ async fn run_partition_disable(
             out.push(row);
             continue;
         }
+        // Held until this shard's mutation ends (issue #1823).
+        let _fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                row.error = Some(error);
+                out.push(row);
+                continue;
+            }
+        };
         match autumn_harvest::partition::disable_partitioning(&mut conn).await {
             Ok(report) => {
                 row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);

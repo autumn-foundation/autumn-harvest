@@ -1141,7 +1141,22 @@ impl HarvestRunner {
         })?;
 
         // Sync static triggers before starting workers (issue #517)
+        let single_pool = prepared.storage_pool.sharded_pool().len() == 1;
         for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
+            // Issue #1823: a bump cannot commit while the sync writes. A single
+            // pool names its shard through the default pin.
+            let fence_key = if single_pool {
+                autumn_harvest::types::ShardId::UNENCODED
+            } else {
+                shard_id
+            };
+            let _fence = autumn_harvest::replication::begin_fenced_pass(shard_pool, fence_key)
+                .await
+                .map_err(|error| {
+                    AutumnError::service_unavailable_msg(format!(
+                        "refusing to start: shard {shard_id} is fenced: {error}"
+                    ))
+                })?;
             let mut conn = shard_pool.get().await.map_err(|e| {
                 AutumnError::service_unavailable_msg(format!(
                     "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
