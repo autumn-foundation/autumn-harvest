@@ -1847,9 +1847,20 @@ mod db {
         // means this process names the database wrongly. Pinning would add a
         // second row, and `harvest dr fence` on the real shard would then
         // fence nothing this process checks.
-        for ((shard, _), markers) in targets.iter().zip(&probed) {
+        //
+        // Logical shards that share one pool share one database. A row for
+        // any of them is then expected there.
+        for ((shard, pool), markers) in targets.iter().zip(&probed) {
             let Some(markers) = markers else { continue };
-            if !markers.generation_shards.is_empty() && !markers.generation_shards.contains(shard) {
+            let colocated = |row: &ShardId| {
+                targets.iter().any(|(peer, peer_pool)| {
+                    peer == row && std::ptr::eq(peer_pool.manager(), pool.manager())
+                })
+            };
+            if !markers.generation_shards.is_empty()
+                && !markers.generation_shards.contains(shard)
+                && !markers.generation_shards.iter().any(colocated)
+            {
                 return Err(crate::error::HarvestError::Config(format!(
                     "this process serves shard {} on a database whose harvest_shard_generation \
                      names shard(s) {:?}. Configure the shard number the operator fences with \

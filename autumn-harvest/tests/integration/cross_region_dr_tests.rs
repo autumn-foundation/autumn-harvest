@@ -2787,6 +2787,42 @@ async fn a_held_shard_gets_no_worker_write_statement() {
     );
 }
 
+/// A worker whose logical shards share one database pins every one of them
+/// (issue #1823). Fencing shard 1 must stop its shard-1 claims too.
+#[tokio::test]
+async fn a_worker_pins_every_colocated_shard() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("colocated");
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .unwrap();
+    }
+    let assigned = [ShardId::new(0), ShardId::new(1)];
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments(assigned),
+    );
+    let pool = dr_pool(&url);
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    let Ok((fenced, held)) =
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &assigned).await
+    else {
+        panic!("colocated shards on one database must start");
+    };
+    assert!(held.is_empty());
+    assert_eq!(fenced.map(|targets| targets.len()), Some(2));
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(0)),
+        Some(ShardGeneration::INITIAL)
+    );
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(1)),
+        Some(ShardGeneration::INITIAL),
+        "every colocated shard is pinned"
+    );
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

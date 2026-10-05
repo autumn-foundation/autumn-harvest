@@ -34363,9 +34363,18 @@ pub fn dr_fence_targets(
     // logical shard is numbered something else, so an operator's
     // `harvest dr fence --shard 7=...` would bump a different row and fence
     // nothing at all.
+    //
+    // Several logical shards may share this one database, and one poll loop
+    // drains them all. Every one is pinned, so fencing any of them stops
+    // this worker's claims and appends for it (issue #1823).
     // UFCS: diesel's blanket `RunQueryDsl::first` shadows `slice::first`.
     let shard = <[crate::types::ShardId]>::first(&config.shard_assignments).copied()?;
-    Some((vec![(shard, fallback_pool.clone())], shard))
+    let targets = config
+        .shard_assignments
+        .iter()
+        .map(|shard| (*shard, fallback_pool.clone()))
+        .collect();
+    Some((targets, shard))
 }
 
 #[cfg(test)]
