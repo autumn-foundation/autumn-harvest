@@ -17,6 +17,9 @@ pub mod callback_deliverer;
 /// `HarvestPlugin` when an embedder configures `audit_export_webhook(...)`
 /// without supplying their own sink (issue #953).
 pub mod audit_sink;
+/// AWS KMS binding for the core AES-256-GCM payload codec (issue #1825).
+#[cfg(feature = "aws-kms")]
+pub mod aws_kms;
 /// Startup and shutdown steps that `HarvestPlugin` and `HarvestEmbedding`
 /// share (issue #1613).
 mod boot;

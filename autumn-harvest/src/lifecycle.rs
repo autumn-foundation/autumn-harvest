@@ -593,6 +593,18 @@ mod tests {
         assert_eq!(reopeners[0].from, Some(Failed));
         assert_eq!(reopeners[0].writer, "reactivate_failed_execution");
     }
+
+    /// Every pair of states, so the check is exhaustive (issue #1819).
+    #[test]
+    fn migration_states_are_one_way() {
+        for from in WorkflowState::ALL {
+            for to in WorkflowState::ALL {
+                assert!(!is_sanctioned(Migrated, to), "MIGRATED -> {to:?}");
+                assert!(!is_sanctioned(from, Migrating), "{from:?} -> MIGRATING");
+                assert!(!is_sanctioned(from, from), "{from:?} -> itself");
+            }
+        }
+    }
 }
 
 /// CLAUDE.md names exactly two writers of stored `harvest_events.event_data`.

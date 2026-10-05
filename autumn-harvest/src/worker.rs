@@ -33657,6 +33657,11 @@ pub(crate) async fn quarantine_workflow_task_timeout_for_build(
     let mut workflow_id_str = String::new();
     let mut schedule_id_opt: Option<uuid::Uuid> = None;
     let mut origin_opt: Option<String> = None;
+    // The canary failure metric needs the probe's shard, name, and queue
+    // (issue #1816). The caller's labels can be the `unknown` and `default`
+    // fallbacks.
+    let mut shard_id: i32 = 0;
+    let mut row_labels: Option<(String, String)> = None;
     let (owner, severity) = match exec_id_opt {
         Some(exec_uuid) => {
             let res = exec_dsl::harvest_workflow_executions
@@ -33669,6 +33674,9 @@ pub(crate) async fn quarantine_workflow_task_timeout_for_build(
                     exec_dsl::workflow_id,
                     exec_dsl::schedule_id,
                     exec_dsl::origin,
+                    exec_dsl::shard_id,
+                    exec_dsl::workflow_name,
+                    exec_dsl::queue_name,
                 ))
                 .first::<(
                     Option<String>,
@@ -33678,6 +33686,9 @@ pub(crate) async fn quarantine_workflow_task_timeout_for_build(
                     String,
                     Option<uuid::Uuid>,
                     Option<String>,
+                    i32,
+                    String,
+                    String,
                 )>(&mut conn)
                 .await
                 .optional();
@@ -33689,8 +33700,10 @@ pub(crate) async fn quarantine_workflow_task_timeout_for_build(
                 }
             };
             match res {
-                Some((o, s, p, pcp, wid, sched_id, orig)) => {
+                Some((o, s, p, pcp, wid, sched_id, orig, shard, name, queue)) => {
                     exec_exists = true;
+                    shard_id = shard;
+                    row_labels = Some((name, queue));
                     parent_id_opt = p;
                     parent_close_policy_opt = pcp;
                     workflow_id_str = wid;
@@ -33903,13 +33916,23 @@ pub(crate) async fn quarantine_workflow_task_timeout_for_build(
             // actually committed.
             crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
             if let Some(q) = queue_used {
+                let (workflow_name, q) = row_labels
+                    .as_ref()
+                    .map_or((workflow_name, q.as_str()), |(name, queue)| {
+                        (name.as_str(), queue.as_str())
+                    });
                 crate::telemetry::emit_workflow_terminal_for_build(
                     metrics,
                     workflow_name,
-                    &q,
+                    q,
                     &crate::telemetry::build_id_label(build_id),
                     crate::telemetry::WorkflowStatus::Failed,
                 );
+                // The terminal above skips a canary probe. A quarantined probe
+                // is a failed probe, so the canary SLI must count it.
+                if crate::canary::is_canary_workflow(workflow_name) {
+                    metrics.record_canary_failure(q, u16::try_from(shard_id).unwrap_or(0));
+                }
                 if let Some(exec_uuid) = exec_id_opt {
                     let exec_id = execution_id_from_uuid(exec_uuid);
                     check_and_report_unfinished_handlers_for_worker(

@@ -124,6 +124,7 @@ mod external_completion_tests;
 mod external_outbox_scan_tests;
 mod fanout_tests;
 mod force_fail_tests;
+mod formal_models_coverage;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
@@ -260,6 +261,7 @@ mod signal_tests;
 #[cfg(feature = "db")]
 mod signal_with_start_tests;
 mod sla_breach_tests;
+mod slo_pack_docs;
 mod slot_tuner_tests;
 mod sqlite_feasibility_docs;
 #[cfg(feature = "db")]
