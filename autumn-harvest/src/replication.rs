@@ -1706,16 +1706,31 @@ mod db {
         // tolerates that; every other caller refuses to start.
         let mut probed: Vec<Option<DrMarkers>> = Vec::with_capacity(probe_targets.len());
         let mut held: Vec<(ShardId, crate::worker::DbPool)> = Vec::new();
-        for (shard, pool) in &probe_targets {
+        // Shards this process pinned before, keyed by their position. A
+        // worker reuses such a pin when its probe fails, so a brief outage
+        // does not hold a shard the process already fences.
+        let mut reused: Vec<(usize, ShardId, ShardGeneration)> = Vec::new();
+        for (index, (shard, pool)) in probe_targets.iter().enumerate() {
             if tolerate_unprobed {
                 let once = async {
                     let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
                     probe_dr_markers(&mut conn, slot_prefix).await
                 }
                 .await;
-                match once {
-                    Ok(markers) => probed.push(Some(markers)),
-                    Err(error) => {
+                let pinned = FenceRegistry::binding(*shard).filter(|(_, pin)| *pin != super::HELD);
+                match (once, pinned) {
+                    (Ok(markers), _) => probed.push(Some(markers)),
+                    (Err(error), Some((resolved, generation))) => {
+                        tracing::warn!(
+                            shard_id = resolved.as_i32(),
+                            generation = generation.as_i64(),
+                            error = %error,
+                            "DR marker probe failed; the worker reuses this process's pin"
+                        );
+                        probed.push(None);
+                        reused.push((index, resolved, generation));
+                    }
+                    (Err(error), None) => {
                         tracing::warn!(
                             shard_id = shard.as_i32(),
                             error = %error,
@@ -1730,7 +1745,7 @@ mod db {
                 probed.push(Some(probe_pool(pool, slot_prefix).await?));
             }
         }
-        let dr_configured = probed.iter().flatten().any(DrMarkers::is_dr);
+        let dr_configured = !reused.is_empty() || probed.iter().flatten().any(DrMarkers::is_dr);
         let fence = mode
             .resolve(dr_configured)
             .map_err(crate::error::HarvestError::Config)?;
@@ -1752,8 +1767,7 @@ mod db {
                 held.len()
             )));
         }
-        let probed: Vec<DrMarkers> = probed.into_iter().flatten().collect();
-        if probed.iter().any(DrMarkers::is_standby) {
+        if probed.iter().flatten().any(DrMarkers::is_standby) {
             return Err(crate::error::HarvestError::Config(
                 "this database is a DR standby: it has a DR subscription or is in recovery. \
                  No Harvest process may write to a standby. Promote it first (runbook step 2), \
@@ -1764,7 +1778,16 @@ mod db {
 
         let (targets, default_shard) = match targets {
             Some(targets) => targets,
-            None => match probed[0].generation_shards.as_slice() {
+            // The fallback pool was not probed, but the process pin names
+            // its shard.
+            None if !reused.is_empty() => {
+                let shard = reused[0].1;
+                (vec![(shard, fallback_pool.clone())], shard)
+            }
+            None => match probed[0]
+                .as_ref()
+                .map_or(&[][..], |markers| markers.generation_shards.as_slice())
+            {
                 [shard] => (vec![(*shard, fallback_pool.clone())], *shard),
                 rows => {
                     return Err(crate::error::HarvestError::Config(format!(
@@ -1783,6 +1806,7 @@ mod db {
         // second row, and `harvest dr fence` on the real shard would then
         // fence nothing this process checks.
         for ((shard, _), markers) in targets.iter().zip(&probed) {
+            let Some(markers) = markers else { continue };
             if !markers.generation_shards.is_empty() && !markers.generation_shards.contains(shard) {
                 return Err(crate::error::HarvestError::Config(format!(
                     "this process serves shard {} on a database whose harvest_shard_generation \
@@ -1799,7 +1823,11 @@ mod db {
         }
 
         let mut pins = Vec::with_capacity(targets.len());
-        for (shard, pool) in &targets {
+        for (index, (shard, pool)) in targets.iter().enumerate() {
+            if let Some((_, _, generation)) = reused.iter().find(|(at, ..)| *at == index) {
+                pins.push((*shard, *generation));
+                continue;
+            }
             let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
             pins.push((*shard, ensure_generation_row(&mut conn, *shard).await?));
         }

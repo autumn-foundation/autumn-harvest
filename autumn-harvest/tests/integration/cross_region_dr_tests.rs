@@ -2524,6 +2524,49 @@ async fn a_worker_holds_a_shard_it_cannot_probe_and_claims_nothing_there() {
     assert!(after_release.is_some(), "a released shard claims normally");
 }
 
+/// A shard this process already pinned keeps that pin when a later worker
+/// cannot probe it (issue #1823). The runner pins before its worker starts.
+/// A brief outage at that moment must not hold, refuse or stop the worker.
+#[tokio::test]
+async fn an_unprobeable_shard_reuses_the_process_pin() {
+    let _serial = registry_guard().await;
+    let unreachable = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::new(3))],
+        ShardId::new(0),
+    )
+    .expect("the runner pins first");
+
+    let targets = Some((
+        vec![(ShardId::new(0), unreachable.clone())],
+        ShardId::new(0),
+    ));
+    let Ok((fenced, held)) =
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &unreachable).await
+    else {
+        panic!("a pinned shard needs no probe to start");
+    };
+    let fenced: Vec<ShardId> = fenced
+        .expect("the pinned shard stays fenced")
+        .into_iter()
+        .map(|(shard, _)| shard)
+        .collect();
+    assert_eq!(fenced, vec![ShardId::new(0)]);
+    assert!(held.is_empty(), "a pinned shard is never held");
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(0)),
+        Some(ShardGeneration::new(3)),
+        "the process pin is kept"
+    );
+
+    // A worker with no shard identity resolves through the default shard.
+    let Ok((fenced, held)) = pin_worker_fence(DrFencing::Auto, DR_PREFIX, None, &unreachable).await
+    else {
+        panic!("the default shard pin covers a worker with no shard identity");
+    };
+    assert!(fenced.is_some() && held.is_empty());
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

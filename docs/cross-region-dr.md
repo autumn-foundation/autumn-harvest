@@ -233,6 +233,8 @@ shard is plain:
   shard with no marker is released and runs unfenced. A shard with a marker
   stops the worker, because a pin is fixed for the life of a process. The
   restarted worker pins it.
+- A shard this process already pinned keeps that pin. The runner pins
+  before its worker starts, so a brief outage does not hold or stop it.
 - A fenced worker with a shard it cannot reach refuses to start. It cannot
   pin that shard.
 - `HarvestRunner::start` retries the probe with backoff for a few seconds,
