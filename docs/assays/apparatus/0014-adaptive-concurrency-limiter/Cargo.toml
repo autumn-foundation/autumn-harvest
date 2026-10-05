@@ -1,0 +1,14 @@
+# NON-PRODUCTION THROWAWAY APPARATUS. See ../../0014-adaptive-concurrency-limiter.md.
+#
+# Deliberately NOT a member of the workspace root Cargo.toml and must never
+# become one. It answers one assay question and nothing depends on it.
+[package]
+name = "adaptive_limiter_assay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+autumn-harvest = { path = "../../../../autumn-harvest", default-features = false }
