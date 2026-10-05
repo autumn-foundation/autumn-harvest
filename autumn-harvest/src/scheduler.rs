@@ -1,7 +1,7 @@
 //! DAG scheduler and runtime execution.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -354,27 +354,23 @@ impl SchedulerMonitor {
     }
 
     /// Snapshot the current scheduler heartbeat state.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal scheduler monitor mutex is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> SchedulerSnapshot {
         self.inner
             .lock()
-            .expect("scheduler monitor lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
     fn mark_tick(&self, dag_count: usize) {
-        let mut guard = self.inner.lock().expect("scheduler monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard.running = true;
         guard.dag_count = dag_count;
         guard.last_tick_at = Some(Utc::now());
     }
 
     fn mark_stopped(&self, dag_count: usize) {
-        let mut guard = self.inner.lock().expect("scheduler monitor lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard.running = false;
         guard.dag_count = dag_count;
     }
@@ -2005,6 +2001,10 @@ async fn find_reusable_dag_workflow_schedule(
     match classify_workflow_name_holder(dag_name, workflow_name, holder_shape) {
         WorkflowNameHolder::Vacant => Ok(dag_row),
         WorkflowNameHolder::WorkflowOnly => {
+            #[expect(
+                clippy::expect_used,
+                reason = "the classifier gives this variant only for a present holder"
+            )]
             let workflow_only_row = foreign_holder.expect("classified from a present holder");
             match dag_row {
                 Some(dag_row) => {
@@ -2021,6 +2021,10 @@ async fn find_reusable_dag_workflow_schedule(
             }
         }
         WorkflowNameHolder::Squatter => {
+            #[expect(
+                clippy::expect_used,
+                reason = "the classifier gives this variant only for a present holder"
+            )]
             let squatter = foreign_holder.expect("classified from a present holder");
             if !release_squatted_workflow_name(conn, squatter, workflow_name).await? {
                 // The holder stopped matching the squat we classified between
@@ -2042,6 +2046,10 @@ async fn find_reusable_dag_workflow_schedule(
             Ok(dag_row)
         }
         WorkflowNameHolder::Conflict => {
+            #[expect(
+                clippy::expect_used,
+                reason = "the classifier gives this variant only for a present holder"
+            )]
             let holder = foreign_holder.expect("classified from a present holder");
             Err(HarvestError::Config(format!(
                 "schedule registration conflict: workflow_name '{workflow_name}' requested by \

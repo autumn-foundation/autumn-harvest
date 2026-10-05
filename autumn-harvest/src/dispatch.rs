@@ -1964,7 +1964,9 @@ impl TaskDispatch for MemoryDispatch {
     }
 }
 
-#[cfg(all(test, feature = "testing"))]
+// Two `cfg` attributes, not `all(...)`: clippy then sees test code (issue #1821).
+#[cfg(test)]
+#[cfg(feature = "testing")]
 mod tests {
     use super::*;
 

@@ -165,6 +165,10 @@ const LEGACY_INIT_SQL: &str = concat!(
     // set on the same claim, so omitting it fails the legacy path's claim exactly
     // as omitting `capability_misses` would.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
+    // issue #1824: the new-start marker on harvest_task_queue. Every claim
+    // orders by it and `TaskQueueItem` selects it, so each claim in this suite
+    // needs it. Added inline for the same reason as the columns above.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
     // issue #946: WorkflowExecution::as_select() (the modern start path's
     // read-back) references the quota_key column even for a fresh (no quota
     // policy configured) execution.
