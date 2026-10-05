@@ -71,7 +71,7 @@ These statements take a blocking lock for `lock-timeout`:
 
 - `ALTER TABLE`, in every form;
 - `LOCK TABLE`, `DROP TABLE`, `TRUNCATE`, `CLUSTER` and `VACUUM FULL`.
-  `CASCADE` also locks every table whose foreign key reaches the target, so
+  On those, and on a drop in `ALTER TABLE`, `CASCADE` also locks every table whose foreign key reaches the target, so
   it counts as a lock on an unknown table;
 - `CREATE`, `ALTER` and `DROP TRIGGER`; `CREATE`, `ALTER` and `DROP POLICY`;
   `CREATE` and `DROP RULE`; `ALTER INDEX`;

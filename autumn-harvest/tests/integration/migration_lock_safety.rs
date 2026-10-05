@@ -4321,6 +4321,11 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                     referenced(history, &table)
                         .map(|t| Raw::lock(k, "ALTER TABLE DROP CONSTRAINT", Some(t))),
                 );
+                // CASCADE also drops the foreign keys of each referencing table,
+                // and the lint does not track which tables reference this one.
+                if (k..s.end(k)).any(|j| s.keyword(j, "cascade")) {
+                    raws.push(Raw::lock(k, "ALTER TABLE ... DROP ... CASCADE", None));
+                }
             }
             // ATTACH and DETACH PARTITION also lock the partition they name.
             // INHERIT and NO INHERIT also lock the parent.
@@ -5462,6 +5467,30 @@ fn code_after_a_return_does_not_surely_run() {
             "{exit}: {findings:?}"
         );
     }
+}
+
+#[test]
+fn a_cascading_alter_drop_may_lock_a_referencing_table() {
+    // A hot table may hold a foreign key to the cold one. CASCADE drops that
+    // key, and its triggers, on the hot table.
+    let history = ["ALTER TABLE harvest_events ADD CONSTRAINT ev_fk \
+                    FOREIGN KEY (x) REFERENCES scratch_t (id);"];
+    for drop in [
+        "ALTER TABLE scratch_t DROP CONSTRAINT scratch_t_pkey CASCADE;",
+        "ALTER TABLE scratch_t DROP COLUMN id CASCADE;",
+    ] {
+        let findings = lint_with_history(&history, drop, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{drop}\n{findings:?}"
+        );
+        let bounded = format!("SET LOCAL lock_timeout = '5s';\n{drop}");
+        assert_eq!(lint_with_history(&history, &bounded, true), [], "{bounded}");
+    }
+    // Without CASCADE, Postgres refuses to drop a key that another table uses.
+    let drop = "ALTER TABLE scratch_t DROP COLUMN id;";
+    assert_eq!(lint_with_history(&history, drop, true), [], "{drop}");
 }
 
 #[test]
