@@ -214,15 +214,22 @@ impl std::fmt::Display for Violation {
     }
 }
 
+/// The stack of the search thread. The search takes one frame per placed
+/// operation, so a crash-heavy key can overflow a 2 MiB test thread.
+const SEARCH_STACK: usize = 256 * 1024 * 1024;
+
 /// Check that `history` is linearizable against `model`.
 ///
 /// # Errors
 ///
 /// Returns the first key whose sub-history has no valid order.
-pub fn check<M: Model>(
-    model: &M,
-    history: &[Operation<M::Input, M::Output>],
-) -> Result<(), Violation> {
+pub fn check<M>(model: &M, history: &[Operation<M::Input, M::Output>]) -> Result<(), Violation>
+where
+    M: Model + Sync,
+    M::Input: Sync,
+    M::Output: Sync,
+    M::State: Send,
+{
     for (key, ops) in group_by_key(history) {
         // A failed operation has no effect, so no order needs to hold it.
         let ops: Vec<_> = ops
@@ -239,7 +246,15 @@ pub fn check<M: Model>(
             seen: HashSet::new(),
         };
         let done = vec![0_u64; ops.len().div_ceil(64)];
-        if !search.linearize(&done, &model.init(), 0) {
+        let found = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(SEARCH_STACK)
+                .spawn_scoped(scope, || search.linearize(&done, &model.init(), 0))
+                .expect("spawn the search thread")
+                .join()
+                .expect("the search thread panicked")
+        });
+        if !found {
             return Err(Violation {
                 key,
                 operations: format!("{ops:?}"),
@@ -326,11 +341,13 @@ impl<M: Model> Search<'_, M> {
 }
 
 /// Check `history` and panic with the violation and `context` if it fails.
-pub fn assert_linearizable<M: Model>(
-    model: &M,
-    history: &[Operation<M::Input, M::Output>],
-    context: &str,
-) {
+pub fn assert_linearizable<M>(model: &M, history: &[Operation<M::Input, M::Output>], context: &str)
+where
+    M: Model + Sync,
+    M::Input: Sync,
+    M::Output: Sync,
+    M::State: Send,
+{
     if let Err(violation) = check(model, history) {
         panic!("{context}: {violation}");
     }

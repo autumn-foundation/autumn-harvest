@@ -10,8 +10,7 @@ For a short, runnable start, read the getting-started fork,
 page explains each part of that chapter and the parts that it leaves out.
 
 > `HarvestEmbedding`, `StandaloneAdminAuth`, `render_prometheus` and
-> `build_webhook_router` are not in the 0.6.0 release. Use a checkout of this
-> repository until the next release ships.
+> `build_webhook_router` ship in 0.7.0 and later.
 
 ## Contents
 
@@ -56,15 +55,15 @@ multi-shard pool, run one invocation per shard, each with its own
 
 **These crates.** The Axum types come from the `autumn_web::reexports::axum`
 re-export, so the version always matches the router. The `path` keys point
-into a checkout of this repository, next to your crate. Remove them when a
-release after 0.6.0 ships `HarvestEmbedding`.
+into a checkout of this repository, next to your crate. Remove them to build
+against the 0.7.0 release from crates.io.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.6.0", path = "../autumn-harvest/autumn-harvest" }
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest/autumn-harvest" }
 # `metrics` adds the Prometheus recorder. `webhooks` adds webhook receivers.
-autumn-harvest-plugin = { version = "0.6.0", path = "../autumn-harvest/autumn-harvest-plugin", features = ["metrics", "webhooks"] }
-autumn-web = "0.7"
+autumn-harvest-plugin = { version = "0.7.0", path = "../autumn-harvest/autumn-harvest-plugin", features = ["metrics", "webhooks"] }
+autumn-web = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 

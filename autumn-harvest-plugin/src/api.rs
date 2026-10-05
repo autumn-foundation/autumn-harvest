@@ -373,7 +373,8 @@ pub struct HarvestApiState {
     /// The last readiness database result and its time (issue #1812).
     ready_cache: Arc<tokio::sync::Mutex<Option<(tokio::time::Instant, ReadyDatabaseVerdict)>>>,
     /// Default drain deadline offset used when `POST /workers/{id}/drain` omits `deadline_at`.
-    /// Set from `WorkerConfig::shutdown_timeout` at startup; defaults to 30 s.
+    /// Set from `WorkerConfig::shutdown_timeout` at startup. It defaults to
+    /// `DEFAULT_SHUTDOWN_TIMEOUT` (25 s).
     worker_shutdown_timeout: Arc<Mutex<std::time::Duration>>,
     /// Per-shard Postgres URLs used by workflow result LISTEN/NOTIFY waits.
     workflow_result_notification_urls: Arc<Mutex<BTreeMap<ShardId, String>>>,
@@ -477,7 +478,9 @@ impl Default for HarvestApiState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_probes: Arc::new(Mutex::new(None)),
             ready_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
+            worker_shutdown_timeout: Arc::new(Mutex::new(
+                autumn_harvest::builder::DEFAULT_SHUTDOWN_TIMEOUT,
+            )),
             workflow_result_notification_urls: Arc::default(),
             workflow_result_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
             query_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(5))),
@@ -1143,8 +1146,9 @@ impl HarvestApiState {
     }
 
     /// Override the default deadline applied when `POST /workers/{id}/drain` does not
-    /// supply a `deadline_at`. Defaults to 30 s (the `WorkerConfig::shutdown_timeout`
-    /// default). Set this at startup from the actual `WorkerConfig`.
+    /// supply a `deadline_at`. Defaults to the `WorkerConfig::shutdown_timeout`
+    /// default, `DEFAULT_SHUTDOWN_TIMEOUT` (25 s). Set this at startup from the
+    /// actual `WorkerConfig`.
     pub fn set_worker_shutdown_timeout(&self, timeout: std::time::Duration) {
         *self
             .worker_shutdown_timeout
@@ -53201,11 +53205,11 @@ mod tests {
     // -- Drain: AC #2 -- default deadline from shutdown timeout
 
     #[test]
-    fn harvest_api_state_shutdown_timeout_defaults_to_30s() {
+    fn harvest_api_state_shutdown_timeout_defaults_to_the_worker_default() {
         let state = HarvestApiState::new();
         assert_eq!(
             state.worker_shutdown_timeout(),
-            std::time::Duration::from_secs(30)
+            autumn_harvest::builder::DEFAULT_SHUTDOWN_TIMEOUT
         );
     }
 

@@ -23,7 +23,7 @@ toml = { workspace = true }
 
 [dev-dependencies]
 # The corpus proof (guardrails pass) calls the syntactic engine directly.
-autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
 tempfile = "3"
 
 [[bin]]

@@ -100,36 +100,40 @@ async fn set_deadline(_ctx: &WorkflowContext, req: DeadlineRequest) -> Result<St
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .plugin(
-            HarvestPlugin::new()
-                .workflows(vec![
-                    __autumn_workflow_info_document_review()
-                        .with_input_schema_fn(review_input_schema),
-                ])
-                .updates(updates![set_deadline])
-                .worker(WorkerConfig::default())
-                // api_with_auth (not plain `.api(...)`) is required, not
-                // optional, in production: it protects both the management
-                // API and every generated MCP tool route's own HTTP path.
-                // `.secure_mcp(...)` below only gates the `/mcp` JSON-RPC
-                // envelope -- without api_with_auth, a caller could bypass
-                // it entirely by hitting e.g.
-                // `POST /api/harvest/mcp/workflows/document_review/start`
-                // directly. `RequireAuth` here is a stand-in for a real
-                // session/token check -- swap in `RequireApiToken` or a
-                // custom layer for production.
-                .api_with_auth(
-                    "/api/harvest",
-                    autumn_web::auth::RequireAuth::new("user_id"),
-                )
-                // Generate the MCP tool routes for every #[workflow(mcp)].
-                .mcp_tools(),
-        )
-        // Also secure the /mcp JSON-RPC envelope itself (initialize/
-        // tools/list/tools/call dispatch) -- both layers are needed.
-        .secure_mcp(autumn_web::auth::RequireAuth::new("user_id"))
-        .mount_mcp("/mcp")
-        .run()
-        .await;
+    // The `run` future is large in autumn-web 0.8, so it is boxed.
+    // That keeps it off the stack and satisfies `clippy::large_futures`.
+    Box::pin(
+        autumn_web::app()
+            .plugin(
+                HarvestPlugin::new()
+                    .workflows(vec![
+                        __autumn_workflow_info_document_review()
+                            .with_input_schema_fn(review_input_schema),
+                    ])
+                    .updates(updates![set_deadline])
+                    .worker(WorkerConfig::default())
+                    // api_with_auth (not plain `.api(...)`) is required, not
+                    // optional, in production: it protects both the management
+                    // API and every generated MCP tool route's own HTTP path.
+                    // `.secure_mcp(...)` below only gates the `/mcp` JSON-RPC
+                    // envelope -- without api_with_auth, a caller could bypass
+                    // it entirely by hitting e.g.
+                    // `POST /api/harvest/mcp/workflows/document_review/start`
+                    // directly. `RequireAuth` here is a stand-in for a real
+                    // session/token check -- swap in `RequireApiToken` or a
+                    // custom layer for production.
+                    .api_with_auth(
+                        "/api/harvest",
+                        autumn_web::auth::RequireAuth::new("user_id"),
+                    )
+                    // Generate the MCP tool routes for every #[workflow(mcp)].
+                    .mcp_tools(),
+            )
+            // Also secure the /mcp JSON-RPC envelope itself (initialize/
+            // tools/list/tools/call dispatch) -- both layers are needed.
+            .secure_mcp(autumn_web::auth::RequireAuth::new("user_id"))
+            .mount_mcp("/mcp")
+            .run(),
+    )
+    .await;
 }

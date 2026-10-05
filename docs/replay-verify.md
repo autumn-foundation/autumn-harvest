@@ -83,7 +83,7 @@ Add `autumn-harvest` with the `testing` feature to your app or test binary:
 
 ```toml
 [dev-dependencies]
-autumn-harvest = { version = "0.3", features = ["testing"] }
+autumn-harvest = { version = "0.7", features = ["testing"] }
 ```
 
 Then write a binary or test target that registers your workflows and calls `verify_all`:

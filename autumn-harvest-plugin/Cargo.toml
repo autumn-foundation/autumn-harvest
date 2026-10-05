@@ -74,8 +74,8 @@ redis = ["dep:autumn-harvest-redis"]
 
 
 [dependencies]
-autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", features = ["db", "testing"] }
-autumn-web = "0.7"
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-web = "0.8"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -129,7 +129,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 thiserror = { workspace = true }
 # Redis Streams dispatch channel (issue #1312), behind the `redis` feature.
 # Optional so the default build keeps a Postgres-only dependency graph.
-autumn-harvest-redis = { version = "0.6.0", path = "../autumn-harvest-redis", optional = true }
+autumn-harvest-redis = { version = "0.7.0", path = "../autumn-harvest-redis", optional = true }
 
 # ── Broker connectors (issue #944) — all optional, all off by default ──
 # Object-safe async traits for the EventSource / DeadLetterSink seams
@@ -167,12 +167,12 @@ path = "src/bin/harvest_dev.rs"
 required-features = ["dev-runtime"]
 
 [dev-dependencies]
-autumn-web = { version = "0.7", features = ["test-support", "mcp"] }
+autumn-web = { version = "0.8", features = ["test-support", "mcp"] }
 # The dev-runtime lifecycle test drives the running dev runtime over real HTTP
 # (start a workflow, poll its status, fetch the Vantage page). The crate already
 # depends on reqwest for the callback deliverer; the test needs `json` on top.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 # `test-util` for `#[tokio::test(start_paused = true)]`: the shutdown-drain
 # deadline is a 30s wall-clock wait that must be asserted, not slept through.

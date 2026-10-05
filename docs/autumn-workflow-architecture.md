@@ -74,8 +74,8 @@ Workflow orchestration is a heavyweight dependency. Many Autumn users will never
 ```toml
 # Cargo.toml — only when you need workflows
 [dependencies]
-autumn-web = "0.7"
-autumn-harvest = "0.6"
+autumn-web = "0.8"
+autumn-harvest = "0.7"
 ```
 
 The `autumn-harvest-macros` crate is separate from `autumn-macros` because proc-macro crates cannot export non-macro items. Harvest macros generate different companion functions (`__autumn_workflow_info_*`, `__autumn_activity_info_*`) that need their own expansion logic.
@@ -794,12 +794,16 @@ Timed-out activities are marked as `FAILED` with a `HeartbeatTimeout` reason and
 
 ### 7.5 Graceful Shutdown
 
-On SIGTERM/SIGINT:
+On SIGTERM/SIGINT, or on a remote drain (issue #1813):
 
-1. Stop accepting new tasks (drain the poller).
-2. Wait up to `shutdown_timeout` (default: 30 seconds) for in-flight activities to complete.
-3. For activities that don't complete, record a `WorkerShutdown` failure and let the retry policy handle rescheduling.
-4. For workflows, flush the current state to the event history so replay can resume on another worker.
+1. Stop claiming tasks.
+2. Release each claimed task that has not started. It is `PENDING` again at once, with its `attempt` restored.
+3. Wait for in-flight tasks to complete, up to `shutdown_timeout` (default: 25 seconds) or the remote drain deadline.
+4. One join window before the deadline, cancel running activities. The join window is `cancellation_grace_period`, capped at half the drain. Running workflow tasks are not cancelled. `workflow_task_timeout` bounds them.
+5. Release the claim of each cancelled activity whose handler returns a retryable error. The row is `PENDING` again with an error that starts with `worker shutdown:`, so a peer retries it at once.
+6. At the deadline, stop waiting. A handler that ignored the cancel keeps its claim. The worker keeps its lease and the task heartbeat alive until that handler returns, even after `run` returns, so no peer starts a second copy. The claim-epoch fence (#1789) rejects stale writes. If the process exits, orphan reclaim requeues the task.
+
+A claim is released only when no handler for it can still run. Keep `shutdown_timeout` at least 5 seconds below the platform grace period, for example Kubernetes `terminationGracePeriodSeconds` (default: 30 seconds).
 
 ---
 

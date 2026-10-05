@@ -6,8 +6,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = ["db", "testing"] }
-autumn-harvest-plugin = { version = "0.6.0", path = "../../autumn-harvest-plugin", features = ["metrics", "webhooks"] }
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest-plugin = { version = "0.7.0", path = "../../autumn-harvest-plugin", features = ["metrics", "webhooks"] }
 # Issue #1615: no `autumn-web` entry. A unit test in `src/tests.rs` fails if one returns.
 axum = "0.8"
 deadpool = { workspace = true, features = ["rt_tokio_1"] }
@@ -20,7 +20,7 @@ tracing = { workspace = true }
 tracing-subscriber = "0.3"
 
 [dev-dependencies]
-autumn-harvest-cli = { version = "0.6.0", path = "../../autumn-harvest-cli" }
+autumn-harvest-cli = { version = "0.7.0", path = "../../autumn-harvest-cli" }
 diesel = { workspace = true }
 hex = "0.4"
 hmac = "0.12"
