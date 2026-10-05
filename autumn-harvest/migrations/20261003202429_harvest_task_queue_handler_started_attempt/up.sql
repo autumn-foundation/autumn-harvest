@@ -13,7 +13,7 @@
 -- still takes an ACCESS EXCLUSIVE lock on a hot table, so it waits at most
 -- 5 s for that lock. Then the migration fails, and the operator runs it
 -- again. Traffic does not queue behind a blocked ALTER.
-SELECT set_config('lock_timeout', '5s', true);
+SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS handler_started_attempt INT4;
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS timed_out_claims TIMESTAMPTZ[];
