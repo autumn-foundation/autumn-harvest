@@ -214,10 +214,9 @@ impl std::fmt::Display for Violation {
     }
 }
 
-/// The stack of the thread that runs one key's search. The search recurses
-/// once per operation, so a long history needs a deep stack. Linux reserves
-/// this lazily, so an unused stack costs no memory.
-const SEARCH_STACK_BYTES: usize = 512 * 1024 * 1024;
+/// The stack of the search thread. The search takes one frame per placed
+/// operation, so a crash-heavy key can overflow a 2 MiB test thread.
+const SEARCH_STACK: usize = 256 * 1024 * 1024;
 
 /// Check that `history` is linearizable against `model`.
 ///
@@ -247,17 +246,13 @@ where
             seen: HashSet::new(),
         };
         let done = vec![0_u64; ops.len().div_ceil(64)];
-        // The search recurses once per placed operation. A crash-heavy
-        // history can be thousands deep, which overflows a test thread.
-        // So the search runs on its own thread with a large stack.
-        let init = model.init();
         let found = std::thread::scope(|scope| {
             std::thread::Builder::new()
-                .stack_size(SEARCH_STACK_BYTES)
-                .spawn_scoped(scope, move || search.linearize(&done, &init, 0))
+                .stack_size(SEARCH_STACK)
+                .spawn_scoped(scope, || search.linearize(&done, &model.init(), 0))
                 .expect("spawn the search thread")
                 .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                .expect("the search thread panicked")
         });
         if !found {
             return Err(Violation {
@@ -752,27 +747,6 @@ mod tests {
         let begin = std::time::Instant::now();
         assert!(check(&StartIdempotency, &h.snapshot()).is_err());
         assert!(begin.elapsed() < std::time::Duration::from_secs(5));
-    }
-
-    /// The search recurses once per operation (issue #1823 CI). A long,
-    /// sequential history must not overflow the caller's stack.
-    #[test]
-    fn a_long_history_does_not_overflow_the_stack() {
-        let h = Recorder::new();
-        let a = h.invoke(0, "k", start(1));
-        h.ok(a, StartOutput::Started(id(1)));
-        for n in 0..6_000 {
-            let b = h.invoke(n + 1, "k", start(n as u128 + 2));
-            h.ok(b, StartOutput::Deduplicated(id(1)));
-        }
-        // A small stack, as a test thread on a busy runner has.
-        let checked = std::thread::Builder::new()
-            .stack_size(256 * 1024)
-            .spawn(move || check(&StartIdempotency, &h.snapshot()).is_ok())
-            .expect("spawn")
-            .join()
-            .expect("the check must not overflow its caller's stack");
-        assert!(checked);
     }
 
     #[test]

@@ -51,7 +51,7 @@ HA manager.
 
 ### Upgrade notes
 
-See `docs/upgrading/0.7.0.md` § 1.6. In short:
+See `docs/upgrading/0.7.0.md` § 1.7. In short:
 
 - `WorkerConfig::dr_fencing`, `DrConfig::fencing` and
   `WorkerConfigView::dr_fencing` changed type from `bool` to `DrFencing`.

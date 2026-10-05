@@ -3128,6 +3128,194 @@ pub async fn defer_claimed_retry_for_budget(
     Ok(ClaimWrite::Applied)
 }
 
+/// Give back the claim of a task that never started (issue #1813). A stale
+/// claim changes nothing.
+///
+/// A draining worker calls this for a task it claimed but did not start. No
+/// handler ran, so the release restores `attempt`, as
+/// [`crate::queue_pause::release_claim`] does. No writer for this claim
+/// epoch exists, so a later claim cannot match a stale write.
+///
+/// The release keeps `scheduled_at`, so the row is due at once. It keeps
+/// `error`, `crash_strikes` and the capability-miss counters. A task that
+/// never started says nothing about them.
+///
+/// The release also clears a sticky pin, as [`release_worker_sticky_pins`]
+/// does. A pin to the draining worker would hold the row back from its
+/// peers. A session row keeps its pin.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn release_unstarted_claim(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Integer, Interval, Nullable, Text, Timestamptz};
+
+    let update = diesel::update(
+        dsl::harvest_task_queue
+            .find(claim.task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<DateTime<Utc>>),
+        // Undo the claim-time attempt increment. The task did not run.
+        dsl::attempt.eq(sql::<Integer>("GREATEST(attempt - 1, 0)")),
+        dsl::sticky_worker_id.eq(sql::<Nullable<Text>>(
+            "CASE WHEN session_id IS NULL THEN NULL ELSE sticky_worker_id END",
+        )),
+        dsl::sticky_until.eq(sql::<Nullable<Timestamptz>>(
+            "CASE WHEN session_id IS NULL THEN NULL ELSE sticky_until END",
+        )),
+        dsl::sticky_timeout.eq(sql::<Nullable<Interval>>(
+            "CASE WHEN session_id IS NULL THEN NULL ELSE sticky_timeout END",
+        )),
+    ))
+    .into_boxed();
+    let Some((queue_name, priority, task_type, scheduled_at)) = fence(update, Some(claim))
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(ClaimWrite::LeaseLost);
+    };
+    // The UPDATE already committed. A failed wake must not report the
+    // release as unpersisted. The poll loop still finds the row.
+    if let Err(error) = announce_deferred_task(
+        conn,
+        claim.task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        &task_type,
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = %claim.task_id,
+            %error,
+            "failed to announce a released claim; the poll loop still claims it"
+        );
+    }
+    Ok(ClaimWrite::Applied)
+}
+
+/// The claims of the `RUNNING` rows that `worker_id` holds, each with its
+/// `started_at` (issue #1813).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn running_claims_of_worker(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Vec<(TaskClaim, Option<DateTime<Utc>>)>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let rows: Vec<(Uuid, i32, Option<DateTime<Utc>>)> = dsl::harvest_task_queue
+        .filter(dsl::state.eq("RUNNING"))
+        .filter(dsl::worker_id.eq(worker_id))
+        .select((dsl::id, dsl::attempt, dsl::started_at))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|(task_id, attempt, started_at)| {
+            (TaskClaim::new(task_id, worker_id, attempt), started_at)
+        })
+        .collect())
+}
+
+/// Give back a claim that no dispatch body holds (issue #1813). A stale
+/// claim changes nothing.
+///
+/// A drained worker keeps its lease while a handler that ignores the cancel
+/// runs. Orphan reclaim then skips every claim of that worker. A claim whose
+/// release or result write failed would stay `RUNNING`. The lease keeper
+/// gives such a claim back with this write.
+///
+/// The write sets the same columns as orphan reclaim. It keeps `attempt`,
+/// because a handler can have run. It keeps `crash_strikes`, because a
+/// failed write says nothing about the task.
+///
+/// The fence also matches `started_at`. [`release_unstarted_claim`]
+/// restores `attempt`, so a later claim can reuse the same epoch. Each claim
+/// writes a new `started_at`, so that later claim never matches.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn release_abandoned_claim(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    started_at: DateTime<Utc>,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let update = diesel::update(
+        dsl::harvest_task_queue
+            .find(claim.task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::started_at.eq(started_at)),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<DateTime<Utc>>),
+        dsl::sticky_worker_id.eq(None::<String>),
+        dsl::sticky_until.eq(None::<DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<DateTime<Utc>>),
+        dsl::error.eq(None::<String>),
+        dsl::scheduled_at.eq(db_clock_stamp::<diesel::sql_types::Timestamptz>()),
+    ))
+    .into_boxed();
+    let Some((queue_name, priority, task_type, scheduled_at)) = fence(update, Some(claim))
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(ClaimWrite::LeaseLost);
+    };
+    if let Err(error) = announce_deferred_task(
+        conn,
+        claim.task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        &task_type,
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = %claim.task_id,
+            %error,
+            "failed to announce a released claim; the poll loop still claims it"
+        );
+    }
+    Ok(ClaimWrite::Applied)
+}
+
 /// Mark a task as completed with the given output.
 ///
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be

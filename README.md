@@ -57,10 +57,8 @@ child workflows, idempotency, and operating the service — read
 [`docs/getting-started/`](docs/getting-started/).
 
 Upgrading an existing deployment? See the
-[0.5.0 → 0.6.0 upgrade guide](docs/upgrading/0.6.0.md) — the previous
-[0.4.0 → 0.5.0 upgrade guide](docs/upgrading/0.5.0.md) covers the hop before that.
-Unreleased breaking changes since 0.6.0 are in the
-[0.7.0 upgrade guide](docs/upgrading/0.7.0.md).
+[0.6.0 → 0.7.0 upgrade guide](docs/upgrading/0.7.0.md) — the previous
+[0.5.0 → 0.6.0 upgrade guide](docs/upgrading/0.6.0.md) covers the hop before that.
 
 Working on the engine itself? [`docs/architecture.md`](docs/architecture.md) is
 the workspace, design-decision, module and macro reference, and
@@ -1082,7 +1080,7 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.6.0 builds on the Phase 4 surface (see
+Version 0.7.0 builds on the Phase 4 surface (see
 [`CHANGELOG.md`](CHANGELOG.md) for this release's full entry list). The core
 surface is broad: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
@@ -1214,7 +1212,7 @@ replay-safe against recorded production histories using `WorkflowReplayer`
 
 ```toml
 # Cargo.toml — in your app's dev-dependencies
-autumn-harvest = { version = "0.6", features = ["testing"] }
+autumn-harvest = { version = "0.7", features = ["testing"] }
 ```
 
 ```rust

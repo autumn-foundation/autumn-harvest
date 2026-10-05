@@ -874,12 +874,15 @@ async fn verification_rejects_a_tampered_copy_and_leaves_the_source_untouched() 
 
     // Corrupt exactly one stored event on the target. This is the failure mode
     // a hand-rolled copy would produce silently.
-    diesel::sql_query(
-        "UPDATE harvest_events SET event_data = jsonb_set(event_data, '{tampered}', 'true') \
-          WHERE workflow_exec_id = $1 AND event_id = 0",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .execute(&mut target)
+    autumn_harvest::append_only::with_guard_off(&mut target, async |c| {
+        diesel::sql_query(
+            "UPDATE harvest_events SET event_data = jsonb_set(event_data, '{tampered}', 'true') \
+              WHERE workflow_exec_id = $1 AND event_id = 0",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(c)
+        .await
+    })
     .await
     .expect("tamper");
 

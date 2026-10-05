@@ -227,11 +227,12 @@ impl Default for ConnectorRuntimeConfig {
             // An hour covers a 30s visibility timeout against SQS's
             // `maxReceiveCount` maximum of 1000 with room to spare.
             poison_retention: std::time::Duration::from_secs(60 * 60),
-            // Same 30s the engine gives its own worker drain, for the same
-            // reason: long enough that an ordinary in-flight dispatch settles
-            // and gets acked, short enough that a rolling deployment is not
-            // held hostage by one wedged call.
-            shutdown_timeout: std::time::Duration::from_secs(30),
+            // The engine's own worker drain default, for the same reason. It
+            // is long enough that an ordinary in-flight dispatch settles and
+            // gets acked. It is short enough that one wedged call cannot hold
+            // a rolling deployment hostage. It also ends before a Kubernetes
+            // `SIGKILL` (issue #1813).
+            shutdown_timeout: autumn_harvest::builder::DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
 }
