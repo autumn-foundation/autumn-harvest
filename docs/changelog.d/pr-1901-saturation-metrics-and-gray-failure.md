@@ -38,8 +38,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   claim a later owner took before it finalized. A session acquire or release
   counts when it finalizes or fails, but not when it defers for capacity.
   A workflow task counts as a failure when it returns an error or times out.
-  The failure counts after its claim-fenced reset or quarantine. It is left
-  out when that write finds a peer owns the claim. A release is not counted.
+  The failure counts after its claim-fenced reset or quarantine, with its
+  latency taken then. It is left out when that write finds a peer owns the
+  claim. A release is not counted.
   `worker::reset_timed_out_workflow_task` now returns a `ClaimRecovery`.
 - Every liveness heartbeat writes a snapshot to the new table
   `harvest_worker_task_stats` and reads the live peers of its shard. Each
@@ -65,8 +66,10 @@ heartbeat check only. A worker that was alive but sick passed that check.
   `workflow_panic_max_attempts`, `poison_pill_threshold`), and payload policy
   (`max_activity_input_bytes`, `max_workflow_input_bytes`,
   `max_activity_result_bytes`, `max_signal_payload_bytes`,
-  `max_current_details_bytes`, the history policy, the offload threshold and
-  the activity interceptor chain), and the registered codec key ids, which the
+  `max_current_details_bytes`, the history policy, the offload threshold, the
+  activity interceptor chain, and each activity's effective result and input
+  caps, local flag, rate limit, concurrency limit and WASM binding), and the
+  registered codec key ids, which the
   heartbeat reads on every tick because a reload can change them, with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A

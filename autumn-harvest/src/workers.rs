@@ -1130,6 +1130,11 @@ pub struct PayloadPolicy {
     pub offload_threshold: Option<u64>,
     /// The `policy()` of each activity interceptor, in chain order.
     pub activity_interceptors: Vec<String>,
+    /// The execution policy of each registered activity, sorted by name. It
+    /// holds the effective payload caps and whether the activity runs locally.
+    /// It also holds the rate limit, the concurrency limit and any WASM
+    /// binding.
+    pub activities: Vec<(String, serde_json::Value)>,
 }
 
 impl PayloadPolicy {
@@ -1145,6 +1150,7 @@ impl PayloadPolicy {
             "continue_as_new_deadline_fraction": self.continue_as_new_deadline_fraction,
             "offload_threshold": self.offload_threshold,
             "activity_interceptors": self.activity_interceptors,
+            "activities": self.activities,
         })
     }
 }
@@ -3779,7 +3785,11 @@ mod tests {
             },
             PayloadPolicy {
                 activity_interceptors: vec!["a::Retry".to_owned(), "a::Audit".to_owned()],
-                ..base
+                ..base.clone()
+            },
+            PayloadPolicy {
+                activities: vec![("charge".to_owned(), serde_json::json!({"result_cap": 1024}))],
+                ..base.clone()
             },
         ];
         for variant in variants {

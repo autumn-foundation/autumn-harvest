@@ -1237,7 +1237,57 @@ impl HandlerRegistry {
                 .iter()
                 .map(|interceptor| interceptor.policy())
                 .collect(),
+            activities: self.activity_policies(),
         }
+    }
+
+    /// The execution policy of each registered activity, sorted by name, for
+    /// the worker's cohort key (issue #1815).
+    ///
+    /// Each entry holds what the executing worker reads for the activity. That
+    /// is its effective result and input caps and whether it runs locally. It
+    /// is also its rate limit, its concurrency limit and its WASM binding. A
+    /// WASM-bound activity runs a sandboxed guest instead of the native
+    /// handler. The defaults for retries, timeouts and the queue stay out.
+    /// They are stored on the task row at scheduling, so every worker shares
+    /// them.
+    fn activity_policies(&self) -> Vec<(String, serde_json::Value)> {
+        let mut policies: Vec<(String, serde_json::Value)> = self
+            .activities
+            .iter()
+            .map(|(name, info)| {
+                #[cfg(feature = "wasm-activities")]
+                let wasm = self.wasm_activities.get(name).map(|binding| {
+                    serde_json::json!({
+                        "allow_clock": binding.capabilities.allow_clock,
+                        "allow_random": binding.capabilities.allow_random,
+                        "allow_env": binding.capabilities.allow_env,
+                        "memory_bytes": binding.limits.memory_bytes,
+                        "fuel": binding.limits.fuel,
+                        "max_wall_clock_ms": binding.limits.max_wall_clock.as_millis(),
+                    })
+                });
+                #[cfg(not(feature = "wasm-activities"))]
+                let wasm: Option<serde_json::Value> = None;
+                let policy = serde_json::json!({
+                    "result_cap": self.activity_result_cap(name),
+                    "input_cap": self.activity_input_cap(name),
+                    "local": info.is_local,
+                    "rate_limit": [
+                        info.rate_limit_rps,
+                        info.rate_limit_burst,
+                        info.rate_limit_key,
+                        info.rate_limit_key_expr,
+                    ],
+                    "max_concurrent": info.max_concurrent,
+                    "concurrency_key": info.concurrency_key,
+                    "wasm": wasm,
+                });
+                (name.clone(), policy)
+            })
+            .collect();
+        policies.sort_by(|a, b| a.0.cmp(&b.0));
+        policies
     }
 
     /// History-size guardrails applied to workflow contexts run by this registry.
@@ -27567,8 +27617,8 @@ const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> O
 /// A lost claim means a peer owns the task. The stale attempt then stays out
 /// of the window, as in the activity finalization path. A recovery that did
 /// not reach the database still counts, because this worker may still hold
-/// the claim. `elapsed` is taken when the attempt ended, so the recovery I/O
-/// adds no latency.
+/// the claim. `elapsed` is taken after the recovery, because the task is not
+/// done until its claim is released or quarantined.
 fn record_failed_workflow_task(
     window: &crate::worker_outlier::TaskOutcomeWindow,
     recovery: ClaimRecovery,
@@ -33817,9 +33867,8 @@ impl Worker {
                 .await;
                 // Issue #1815: a success counts now. A failure counts after
                 // its claim-fenced recovery, below.
-                let elapsed = dispatched_at.elapsed();
                 if workflow_task_failed(&outcome) == Some(false) {
-                    task_outcomes.record(false, elapsed);
+                    task_outcomes.record(false, dispatched_at.elapsed());
                 }
                 match outcome {
                     Ok(TaskDispatchOutcome::Completed) => {
@@ -33918,7 +33967,11 @@ impl Worker {
                         };
                         #[cfg(not(feature = "db"))]
                         let recovery = ClaimRecovery::Applied;
-                        record_failed_workflow_task(&task_outcomes, recovery, elapsed);
+                        record_failed_workflow_task(
+                            &task_outcomes,
+                            recovery,
+                            dispatched_at.elapsed(),
+                        );
                     }
                     Ok(TaskDispatchOutcome::BodyTimedOut) => {
                         // Release the concurrency slot immediately so other
@@ -34038,7 +34091,11 @@ impl Worker {
                             let _ = decision;
                             ClaimRecovery::Applied
                         };
-                        record_failed_workflow_task(&task_outcomes, recovery, elapsed);
+                        record_failed_workflow_task(
+                            &task_outcomes,
+                            recovery,
+                            dispatched_at.elapsed(),
+                        );
                     }
                 }
             } else {
@@ -34074,14 +34131,13 @@ impl Worker {
                 // An activity records its own attempt in `process_activity_task`.
                 // Issue #1815: a workflow success counts now. A workflow
                 // failure counts after its claim-fenced recovery, below.
-                let elapsed = dispatched_at.elapsed();
                 let workflow_failed = if task_type == "workflow" {
                     workflow_task_failed(&outcome)
                 } else {
                     None
                 };
                 if workflow_failed == Some(false) {
-                    task_outcomes.record(false, elapsed);
+                    task_outcomes.record(false, dispatched_at.elapsed());
                 }
                 if let Err(error) = outcome {
                     tracing::error!(
@@ -34123,7 +34179,11 @@ impl Worker {
                     #[cfg(not(feature = "db"))]
                     let recovery = ClaimRecovery::Applied;
                     if workflow_failed == Some(true) {
-                        record_failed_workflow_task(&task_outcomes, recovery, elapsed);
+                        record_failed_workflow_task(
+                            &task_outcomes,
+                            recovery,
+                            dispatched_at.elapsed(),
+                        );
                     }
                 }
             }
@@ -37557,6 +37617,68 @@ mod tests {
         };
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         assert!(Worker::new(cfg, registry).is_err());
+    }
+
+    /// Issue #1815: workers that register the same activity with different
+    /// execution settings are not peers. A larger per-activity result cap
+    /// accepts results that a smaller one fails.
+    #[test]
+    fn payload_policy_holds_each_activity_execution_policy() {
+        fn act(name: &'static str, max_result_bytes: Option<u64>, is_local: bool) -> ActivityInfo {
+            ActivityInfo {
+                name,
+                module: "test",
+                default_retry_policy: None,
+                default_start_to_close: None,
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_schedule_to_close: None,
+                default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
+                is_local,
+                max_input_bytes: None,
+                max_result_bytes,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                rate_limit_key_expr: None,
+                circuit_breaker: None,
+                requires: None,
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            }
+        }
+        let global = crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+        let policy = |activities| HandlerRegistry::new(vec![], activities).payload_policy();
+        let plain = policy(vec![act("charge", None, false), act("audit", None, false)]);
+        assert_eq!(
+            plain
+                .activities
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .filter(|name| !name.starts_with("__harvest_"))
+                .collect::<Vec<_>>(),
+            vec!["audit", "charge"],
+            "sorted by name, after the built-in session activities"
+        );
+        assert_eq!(
+            plain,
+            policy(vec![act("audit", None, false), act("charge", None, false)]),
+            "registration order does not matter"
+        );
+        assert_ne!(
+            plain,
+            policy(vec![
+                act("charge", Some(global * 4), false),
+                act("audit", None, false)
+            ]),
+            "a larger result cap"
+        );
+        assert_ne!(
+            plain,
+            policy(vec![act("charge", None, true), act("audit", None, false)]),
+            "a local activity"
+        );
     }
 
     #[test]
