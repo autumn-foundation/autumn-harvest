@@ -98,7 +98,8 @@ case reaches a branch.
 
 The test also compares the lifecycle events of each run and the
 dead-letter count. A claim must take the pending task with the earliest
-`scheduled_at`.
+claim-order due time. The check reads `queue::CLAIM_ORDER_DUE_SQL`, so a new
+start sorts 30 seconds later (issue #1824).
 
 The test needs Docker, or `HARVEST_TEST_DATABASE_URL`. Each case truncates
 the engine tables, so with that variable set the test creates a throwaway
@@ -117,8 +118,10 @@ A shrink stops after 20 minutes, so a late failure still prints its
 sequence.
 
 A failure prints the shrunk operation sequence and the first step where the
-database and the model disagree. To keep a counterexample, add it to the
-model self-tests at the end of the file, or as a fixed sequence.
+database and the model disagree. To keep a counterexample, add its sequence
+to `PINNED`. `pinned_counterexamples_replay` replays each pinned sequence
+against the database on every CI run. Put a model-only check in the model
+self-tests at the end of the file.
 
 ---
 
