@@ -341,35 +341,45 @@ pub async fn set_build_policy(
     set_build_policy_with_ramp_id(conn, queue_name, build_id, deployment_name, Uuid::new_v4()).await
 }
 
-/// The `ramp_id` that [`set_build_policy_with_ramp_id`] gives a retained ramp
-/// to `target` (issue #1814).
+/// The `ramp_id` that a ramp write stores for one ramp generation (issue
+/// #1814).
 ///
-/// The id is the first 16 bytes of `sha256("{ramp_id}/{target}")`. The upsert
-/// computes the same value in SQL. So pools with the same target share one
-/// id, and pools with different targets never do.
+/// A fan-out passes one caller id to every pool. Each pool stores this
+/// function of that id, its base build and its target. The id is the first
+/// 16 bytes of `sha256("{ramp_id}/{base}/{target}")`. The writes compute the
+/// same value in SQL.
+///
+/// So pools with the same base and target share one id. A partial fan-out
+/// can leave pools with different bases or targets. Those ramps then get
+/// different ids, as the guard judges them apart. So an abort of one cannot
+/// finish the other, and the report ledger keeps their reports apart.
 #[must_use]
-pub fn retained_ramp_id(ramp_id: Uuid, target: &str) -> Uuid {
+pub fn ramp_generation_id(ramp_id: Uuid, base: &str, target: &str) -> Uuid {
     use sha2::Digest;
 
-    let digest = sha2::Sha256::digest(format!("{ramp_id}/{target}").as_bytes());
+    let digest = sha2::Sha256::digest(format!("{ramp_id}/{base}/{target}").as_bytes());
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Uuid::from_bytes(bytes)
 }
 
-/// The SQL form of [`retained_ramp_id`] for the row in the upsert.
+/// The SQL form of [`ramp_generation_id`]. `{id}`, `{base}` and `{target}`
+/// are SQL expressions.
 #[cfg(feature = "db")]
-const RETAINED_RAMP_ID_SQL: &str = "encode(substring(sha256(convert_to($5::text || '/' || \
-     harvest_build_policies.target_build_id, 'UTF8')) FROM 1 FOR 16), 'hex')::uuid";
+fn ramp_generation_id_sql(id: &str, base: &str, target: &str) -> String {
+    format!(
+        "encode(substring(sha256(convert_to({id}::text || '/' || {base} || '/' || {target}, \
+         'UTF8')) FROM 1 FOR 16), 'hex')::uuid"
+    )
+}
 
 /// [`set_build_policy`] with a caller-chosen `ramp_id` for a retained ramp
 /// (issue #1814).
 ///
-/// A fan-out passes one `ramp_id` to every pool. A retained ramp gets
-/// [`retained_ramp_id`] of that id and its target. So the ramp keeps one
-/// identity across pools. A partial fan-out can leave pools with different
-/// targets. Each target then gets its own id, and an abort of one target
-/// cannot finish the other.
+/// A fan-out passes one `ramp_id` to every pool. A retained ramp stores
+/// [`ramp_generation_id`] of that id, the new base and its target. So the
+/// ramp keeps one identity across pools, and a ramp that diverged on one
+/// pool keeps its own.
 ///
 /// A retained ramp gets the id even when it had none, for example from a
 /// writer from before the `ramp_id` column. A row with no ramp keeps
@@ -390,6 +400,11 @@ pub async fn set_build_policy_with_ramp_id(
     deployment_name: Option<&str>,
     ramp_id: Uuid,
 ) -> HarvestResult<BuildPolicy> {
+    let derived = ramp_generation_id_sql(
+        "$5",
+        "EXCLUDED.build_id",
+        "harvest_build_policies.target_build_id",
+    );
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "INSERT INTO harvest_build_policies (id, queue_name, build_id, deployment_name) \
          VALUES ($1, $2, $3, $4) \
@@ -397,10 +412,10 @@ pub async fn set_build_policy_with_ramp_id(
              SET build_id = EXCLUDED.build_id, \
                  deployment_name = EXCLUDED.deployment_name, \
                  ramp_id = CASE WHEN harvest_build_policies.target_build_id IS NULL THEN NULL \
-                                ELSE {RETAINED_RAMP_ID_SQL} END, \
+                                ELSE {derived} END, \
                  updated_at = NOW() \
              WHERE harvest_build_policies.target_build_id IS NULL \
-                OR harvest_build_policies.ramp_id IS DISTINCT FROM {RETAINED_RAMP_ID_SQL} \
+                OR harvest_build_policies.ramp_id IS DISTINCT FROM {derived} \
                 OR harvest_build_policies.build_id IS DISTINCT FROM EXCLUDED.build_id \
                 OR harvest_build_policies.deployment_name \
                    IS DISTINCT FROM EXCLUDED.deployment_name \
@@ -492,10 +507,11 @@ pub async fn set_build_ramp(
 
 /// [`set_build_ramp`] with a caller-chosen `ramp_id` (issue #1814).
 ///
-/// A fan-out over shard pools passes one `ramp_id` to every pool. The ramp
-/// guard's abort marker records the `ramp_id` that it cleared. A later guard
-/// matches the marker to the ramp by this id, not by database clocks, so it
-/// can finish a partial abort safely.
+/// A fan-out over shard pools passes one `ramp_id` to every pool. Each pool
+/// stores [`ramp_generation_id`] of that id, its base and the target. The
+/// ramp guard's abort marker records the stored id that it cleared. A later
+/// guard matches the marker to the ramp by this id, not by database clocks,
+/// so it can finish a partial abort safely.
 ///
 /// The write is idempotent. A row that already holds this ramp is left as
 /// is, and its step stays. So a retried fan-out, or two logical shards on
@@ -514,11 +530,12 @@ pub async fn set_build_ramp_with_id(
 ) -> HarvestResult<BuildPolicy> {
     validate_ramp_percent(percent)?;
 
+    let derived = ramp_generation_id_sql("$4", "build_id", "$2");
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "UPDATE harvest_build_policies \
-         SET target_build_id = $2, ramp_percent = $3, ramp_id = $4, updated_at = NOW() \
+         SET target_build_id = $2, ramp_percent = $3, ramp_id = {derived}, updated_at = NOW() \
          WHERE queue_name = $1 \
-           AND (ramp_id IS DISTINCT FROM $4 \
+           AND (ramp_id IS DISTINCT FROM {derived} \
                 OR target_build_id IS DISTINCT FROM $2 \
                 OR ramp_percent IS DISTINCT FROM $3) \
          RETURNING {BUILD_POLICY_COLUMNS}"

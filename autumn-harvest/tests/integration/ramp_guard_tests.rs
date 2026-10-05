@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::build_routing::{
-    clear_build_ramp, get_build_policy, ramp_bucket, retained_ramp_id, set_build_policy,
+    clear_build_ramp, get_build_policy, ramp_bucket, ramp_generation_id, set_build_policy,
     set_build_policy_with_ramp_id, set_build_ramp, set_build_ramp_with_id,
 };
 use autumn_harvest::context::empty_shared_state;
@@ -935,6 +935,11 @@ async fn a_blocked_clear_fails_on_the_server_and_changes_nothing() {
 
 /// Set the test ramp on one pool with a given `ramp_id`, as the API fan-out
 /// does on every shard.
+/// The `ramp_id` that [`set_ramp_with_id`] stores for a caller id.
+fn stored(ramp_id: uuid::Uuid) -> uuid::Uuid {
+    ramp_generation_id(ramp_id, BUILD_A, BUILD_B)
+}
+
 async fn set_ramp_with_id(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) {
     set_build_policy(conn, QUEUE, BUILD_A, None)
         .await
@@ -1119,7 +1124,7 @@ async fn the_marker_tells_a_guard_clear_from_an_operator_clear() {
     set_ramp_with_id(&mut conn, operator_id).await;
     clear_build_ramp(&mut conn, QUEUE).await.expect("clear");
     assert!(
-        !ramp_aborted_by_guard(&mut conn, QUEUE, operator_id)
+        !ramp_aborted_by_guard(&mut conn, QUEUE, stored(operator_id))
             .await
             .expect("read marker")
     );
@@ -1134,12 +1139,12 @@ async fn the_marker_tells_a_guard_clear_from_an_operator_clear() {
             .expect("guard clear")
     );
     assert!(
-        ramp_aborted_by_guard(&mut conn, QUEUE, guard_id)
+        ramp_aborted_by_guard(&mut conn, QUEUE, stored(guard_id))
             .await
             .expect("read marker")
     );
     assert!(
-        !ramp_aborted_by_guard(&mut conn, QUEUE, operator_id)
+        !ramp_aborted_by_guard(&mut conn, QUEUE, stored(operator_id))
             .await
             .expect("read marker")
     );
@@ -1177,7 +1182,7 @@ async fn a_newer_abort_keeps_an_older_marker() {
             .expect("clear new ramp")
     );
     assert!(
-        ramp_aborted_by_guard(&mut conn_1, QUEUE, old_id)
+        ramp_aborted_by_guard(&mut conn_1, QUEUE, stored(old_id))
             .await
             .expect("read marker"),
         "the old marker stays"
@@ -1233,7 +1238,7 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
             .expect("clear old ramp")
     );
     // The guard that cleared each ramp also reported it.
-    mark_abort_reported(&mut conn_1, QUEUE, old_id, CLEAR_BOUND)
+    mark_abort_reported(&mut conn_1, QUEUE, stored(old_id), CLEAR_BOUND)
         .await
         .expect("mark old ramp");
     // Many newer ramps on pool 1 are aborted there too.
@@ -1246,7 +1251,7 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
                 .await
                 .expect("clear newer ramp")
         );
-        mark_abort_reported(&mut conn_1, QUEUE, new_id, CLEAR_BOUND)
+        mark_abort_reported(&mut conn_1, QUEUE, stored(new_id), CLEAR_BOUND)
             .await
             .expect("mark newer ramp");
     }
@@ -1269,7 +1274,10 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
     // reported on pool 1, so the next pass only marks pool 2.
     let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
     assert!(aborts.is_empty(), "{aborts:?}");
-    assert_eq!(marker_reported(&mut conn_2, old_id).await, Some(true));
+    assert_eq!(
+        marker_reported(&mut conn_2, stored(old_id)).await,
+        Some(true)
+    );
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no new report");
 
     // Every marker is reported and no pool holds a marked ramp. After the
@@ -1435,7 +1443,7 @@ async fn a_failed_audit_write_keeps_the_marker_unreported() {
     );
     assert!(!ramp_is_active(&mut conn).await, "the clear still happens");
     assert_eq!(
-        marker_reported(&mut conn, ramp_id).await,
+        marker_reported(&mut conn, stored(ramp_id)).await,
         Some(false),
         "no audit row, so the marker stays unreported"
     );
@@ -1461,11 +1469,14 @@ async fn a_recovery_claim_that_did_not_report_is_retried_after_its_lease() {
     tokio::time::sleep(grace + Duration::from_millis(200)).await;
     // A guard claims the recovery, then stops before its report.
     assert!(
-        claim_unreported_abort(&mut conn, QUEUE, ramp_id, grace, CLEAR_BOUND)
+        claim_unreported_abort(&mut conn, QUEUE, stored(ramp_id), grace, CLEAR_BOUND)
             .await
             .expect("claim")
     );
-    assert_eq!(marker_reported(&mut conn, ramp_id).await, Some(false));
+    assert_eq!(
+        marker_reported(&mut conn, stored(ramp_id)).await,
+        Some(false)
+    );
 
     // The lease is fresh, so a pass does not report.
     let config = guard_config().with_report_grace(grace);
@@ -1480,7 +1491,10 @@ async fn a_recovery_claim_that_did_not_report_is_retried_after_its_lease() {
     let aborts = guard_once(&pools, &pool, &config, None).await;
     assert_eq!(aborts.len(), 1, "{aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
-    assert_eq!(marker_reported(&mut conn, ramp_id).await, Some(true));
+    assert_eq!(
+        marker_reported(&mut conn, stored(ramp_id)).await,
+        Some(true)
+    );
 }
 
 /// A base-build change keeps an active ramp. The fan-out gives the ramp one
@@ -1511,7 +1525,7 @@ async fn a_base_change_fan_out_gives_the_ramp_one_new_id() {
     set_build_policy_with_ramp_id(&mut conn_1, QUEUE, BUILD_C, None, new_id)
         .await
         .expect("repeat on pool 1");
-    let want = retained_ramp_id(new_id, BUILD_B);
+    let want = ramp_generation_id(new_id, BUILD_C, BUILD_B);
     assert_eq!(policy_ramp_id(&mut conn_1).await, Some(want));
     assert_eq!(policy_ramp_id(&mut conn_2).await, Some(want));
     assert_ne!(want, old_id);
@@ -1555,8 +1569,8 @@ async fn a_policy_update_keeps_diverged_targets_apart() {
     }
     let id_1 = policy_ramp_id(&mut conn_1).await;
     let id_2 = policy_ramp_id(&mut conn_2).await;
-    assert_eq!(id_1, Some(retained_ramp_id(new_id, BUILD_B)));
-    assert_eq!(id_2, Some(retained_ramp_id(new_id, BUILD_C)));
+    assert_eq!(id_1, Some(ramp_generation_id(new_id, BUILD_A, BUILD_B)));
+    assert_eq!(id_2, Some(ramp_generation_id(new_id, BUILD_A, BUILD_C)));
     assert_ne!(id_1, id_2, "each target keeps its own id");
 
     // The guard aborts the ramp to B on pool 1. The ramp to C stays.
@@ -1573,6 +1587,56 @@ async fn a_policy_update_keeps_diverged_targets_apart() {
         ramp_is_active(&mut conn_2).await,
         "the ramp to C is not finished by the marker of B"
     );
+}
+
+/// A partial policy fan-out can leave pools with different base builds. A
+/// later ramp fan-out then reaches both pools with one caller id. The guard
+/// judges the two ramps as two generations, so each abort must report on
+/// its own.
+#[tokio::test]
+async fn a_ramp_fan_out_keeps_diverged_bases_apart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    // Pool 1 has base build A. Pool 2 has base build C.
+    set_build_policy(&mut conn_1, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base A");
+    set_build_policy(&mut conn_2, QUEUE, BUILD_C, None)
+        .await
+        .expect("set base C");
+    let caller_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_ramp_with_id(conn, QUEUE, BUILD_B, RAMP_PERCENT, caller_id)
+            .await
+            .expect("ramp fan-out");
+    }
+    assert_ne!(
+        policy_ramp_id(&mut conn_1).await,
+        policy_ramp_id(&mut conn_2).await,
+        "each base keeps its own id"
+    );
+
+    // Both ramps are cleared with no report, as by a guard that stopped.
+    for (conn, base) in [(&mut conn_1, BUILD_A), (&mut conn_2, BUILD_C)] {
+        let step = policy_step(conn).await;
+        assert!(
+            abort_ramp(conn, QUEUE, base, BUILD_B, step, CLEAR_BOUND)
+                .await
+                .expect("clear")
+        );
+    }
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert_eq!(aborts.len(), 2, "each abort reports on its own: {aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 2);
 }
 
 /// A recovery claim stays leased while its guard reports, even with a zero
@@ -1592,9 +1656,15 @@ async fn a_zero_grace_still_leases_a_recovery_claim() {
     );
     // Another guard has just claimed the recovery and is still reporting.
     assert!(
-        claim_unreported_abort(&mut conn, QUEUE, ramp_id, Duration::ZERO, CLEAR_BOUND)
-            .await
-            .expect("claim")
+        claim_unreported_abort(
+            &mut conn,
+            QUEUE,
+            stored(ramp_id),
+            Duration::ZERO,
+            CLEAR_BOUND
+        )
+        .await
+        .expect("claim")
     );
 
     let config = guard_config().with_report_grace(Duration::ZERO);
@@ -1615,7 +1685,7 @@ async fn a_repeated_ramp_write_keeps_its_ramp_id() {
     set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id)
         .await
         .expect("repeat the ramp write");
-    assert_eq!(policy_ramp_id(&mut conn).await, Some(ramp_id));
+    assert_eq!(policy_ramp_id(&mut conn).await, Some(stored(ramp_id)));
     assert_eq!(policy_step(&mut conn).await, step, "the step stays");
 }
 
@@ -1650,7 +1720,7 @@ async fn a_policy_update_gives_an_id_less_ramp_an_id() {
     assert!(ramp_is_active(&mut conn).await);
     assert_eq!(
         policy_ramp_id(&mut conn).await,
-        Some(retained_ramp_id(ramp_id, BUILD_B))
+        Some(ramp_generation_id(ramp_id, BUILD_C, BUILD_B))
     );
 }
 
@@ -1670,7 +1740,7 @@ async fn clear_on_both_pools_unreported(
                 .expect("clear")
         );
     }
-    ramp_id
+    stored(ramp_id)
 }
 
 /// A fresh recovery claim on one pool stops recovery of that abort on every
@@ -1768,7 +1838,7 @@ async fn an_abort_in_the_report_ledger_is_not_reported_again() {
     );
     // Another replica reported the abort, then stopped before its mark.
     assert!(
-        record_abort_report(&mut conn, QUEUE, ramp_id)
+        record_abort_report(&mut conn, QUEUE, stored(ramp_id))
             .await
             .expect("record")
     );
@@ -1777,7 +1847,10 @@ async fn an_abort_in_the_report_ledger_is_not_reported_again() {
     let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
-    assert_eq!(marker_reported(&mut conn, ramp_id).await, Some(true));
+    assert_eq!(
+        marker_reported(&mut conn, stored(ramp_id)).await,
+        Some(true)
+    );
 }
 
 /// A guard that finishes a partial abort keeps the abort unreported, so a
@@ -1808,7 +1881,10 @@ async fn finishing_an_unreported_abort_keeps_it_unreported() {
     let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
     assert!(aborts.is_empty(), "{aborts:?}");
     assert!(!ramp_is_active(&mut conn_2).await, "pool 2 is finished");
-    assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(false));
+    assert_eq!(
+        marker_reported(&mut conn_2, stored(ramp_id)).await,
+        Some(false)
+    );
 
     let config = guard_config().with_report_grace(Duration::ZERO);
     let aborts = guard_once(&pools, &pool_1, &config, None).await;
@@ -1842,7 +1918,7 @@ async fn a_reported_marker_outlives_a_late_fan_out_write() {
             .await
             .expect("clear pool 1")
     );
-    mark_abort_reported(&mut conn_1, QUEUE, ramp_id, CLEAR_BOUND)
+    mark_abort_reported(&mut conn_1, QUEUE, stored(ramp_id), CLEAR_BOUND)
         .await
         .expect("mark pool 1");
 
