@@ -651,6 +651,21 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
         drain < SHUTDOWN_TIMEOUT + Duration::from_secs(3),
         "the drain must end at its deadline: took {drain:?}"
     );
+    // The kept lease must not advertise the queues of a worker that no
+    // longer polls. A capability-miss lookup would count it as a peer.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let queues: serde_json::Value = harvest_workers::table
+        .find(&worker_a)
+        .select(harvest_workers::queues)
+        .first(&mut conn)
+        .await
+        .expect("load the drained worker row");
+    assert_eq!(
+        queues,
+        serde_json::json!([]),
+        "the kept lease advertises no queue"
+    );
+
     // A shutdown heartbeat does not re-register a missing row. The keeper
     // must restore it, or orphan reclaim sees no worker. A missing row is an
     // orphan at once, so the peer starts only after the restore.

@@ -435,11 +435,16 @@ pub async fn register_worker_and_clear_stale_miss_evidence(
     .await
 }
 
-/// Refresh only `last_heartbeat_at` for a worker (issue #1813).
+/// Refresh `last_heartbeat_at` for a drained worker and clear its queues
+/// (issue #1813).
 ///
 /// A drained worker calls this while a handler that ignored the cancel still
 /// runs. Orphan reclaim then keeps the claim with that handler. The stamp uses
 /// the database clock, as [`heartbeat_worker`] does.
+///
+/// The worker no longer polls, so the row advertises no queue. Otherwise
+/// [`live_workers_on_queue_query`] would count it as a capable peer, and a
+/// capability miss would keep releasing a task instead of escalating it.
 ///
 /// # Errors
 ///
@@ -449,7 +454,10 @@ pub async fn touch_worker_liveness(
     worker_id: &str,
 ) -> HarvestResult<usize> {
     diesel::update(harvest_workers::table.find(worker_id))
-        .set(harvest_workers::last_heartbeat_at.eq(diesel::dsl::now))
+        .set((
+            harvest_workers::last_heartbeat_at.eq(diesel::dsl::now),
+            harvest_workers::queues.eq(serde_json::json!([])),
+        ))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)
