@@ -73,11 +73,16 @@ pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
 /// Default fraction of [`WorkflowHistoryPolicy::event_hard_cap`] at which the
 /// operator early-warning soft threshold fires (issue #704).
 ///
-/// `0.2` warns a still-running execution at 20% of the hard cap. Under the
-/// default cap that is 10,000 events, the same as Temporal's warning point
-/// (issue #1804). The gap gives an operator time to act before the cap fails
-/// the run.
-pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.2;
+/// `0.2048` warns a still-running execution at 20.48% of the hard cap. Under
+/// the default cap that is 10,240 events, the same as Temporal's warning
+/// point (issue #1804). The gap gives an operator time to act before the cap
+/// fails the run.
+///
+/// The warning sits above the default `continue_as_new` threshold of 10,000.
+/// [`WorkflowContext::should_continue_as_new`] turns true only past that
+/// threshold. A warning at exactly 10,000 would page every run that rotates
+/// on the advisory. The 240-event margin covers the rotating decision.
+pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.2048;
 
 /// Upper clamp for [`WorkflowContext::with_history_bloat_warn_fraction`]
 /// (issue #704, PR #1139 review, P2).
@@ -17471,10 +17476,10 @@ mod tests {
     }
 
     #[test]
-    fn workflow_history_policy_default_warning_lands_at_ten_thousand_events() {
-        // 50,000 * 0.2 = 10,000: the default soft threshold.
+    fn workflow_history_policy_default_warning_lands_at_10240_events() {
+        // 50,000 * 0.2048 = 10,240: the default soft threshold.
         let policy = WorkflowHistoryPolicy::default();
-        assert_eq!(policy.history_bloat_warn_threshold(), Some(10_000));
+        assert_eq!(policy.history_bloat_warn_threshold(), Some(10_240));
         assert_eq!(
             policy
                 .without_event_hard_cap()

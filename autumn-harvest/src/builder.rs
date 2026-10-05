@@ -306,7 +306,7 @@ impl std::fmt::Debug for HarvestBuilder {
 /// threshold (issue #1804).
 ///
 /// A cap at or below the threshold fails runs before `should_continue_as_new`
-/// turns true. A warning point below the threshold pages for healthy runs.
+/// turns true. A warning point at or below the threshold pages healthy runs.
 /// These are warnings, not errors: a small cap is a valid choice in tests.
 fn warn_if_history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) {
     if history_cap_preempts_continue_as_new(policy) {
@@ -320,18 +320,22 @@ fn warn_if_history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) {
         tracing::warn!(
             history_bloat_warn_threshold = ?policy.history_bloat_warn_threshold(),
             continue_as_new_threshold = policy.continue_as_new_threshold(),
-            "the history-bloat warning fires below history_continue_as_new_threshold; \
+            "the history-bloat warning fires at or below history_continue_as_new_threshold; \
              healthy runs warn before should_continue_as_new turns true"
         );
     }
 }
 
-/// `true` when the history-bloat warning fires below the soft threshold
-/// (issue #1804). Under the defaults both sit at 10,000, which is fine.
+/// `true` when the history-bloat warning fires at or below the soft threshold
+/// (issue #1804).
+///
+/// A tie counts. `should_continue_as_new` turns true only past the threshold,
+/// so a warning at the threshold pages a run that has not yet been told to
+/// rotate. Under the defaults the warning sits at 10,240, above 10,000.
 fn history_warning_precedes_continue_as_new(policy: WorkflowHistoryPolicy) -> bool {
     policy
         .history_bloat_warn_threshold()
-        .is_some_and(|threshold| threshold < policy.continue_as_new_threshold())
+        .is_some_and(|threshold| threshold <= policy.continue_as_new_threshold())
 }
 
 /// `true` when the event hard cap fires before the soft threshold can.
@@ -2244,7 +2248,7 @@ impl HarvestBuilder {
     ///
     /// Defaults to
     /// [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`](crate::context::DEFAULT_HISTORY_BLOAT_WARN_FRACTION)
-    /// (`0.2`).
+    /// (`0.2048`, so 10,240 events under the default cap).
     #[must_use]
     pub const fn history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
         self.history_policy = self
@@ -5475,11 +5479,15 @@ mod tests {
     }
 
     #[test]
-    fn history_warning_precedes_continue_as_new_only_below_the_threshold() {
+    fn history_warning_precedes_continue_as_new_at_or_below_the_threshold() {
         let policy = WorkflowHistoryPolicy::default();
-        // Defaults: the warning and the advisory both sit at 10,000.
+        // Defaults: the warning at 10,240 sits above the 10,000 threshold.
         assert!(!history_warning_precedes_continue_as_new(policy));
-        // Cap 20,000 at 0.2 warns at 4,000, below the 10,000 threshold.
+        // A tie precedes. The advisory turns true only past the threshold.
+        assert!(history_warning_precedes_continue_as_new(
+            policy.with_history_bloat_warn_fraction(0.2)
+        ));
+        // Cap 20,000 warns at 4,096, below the 10,000 threshold.
         assert!(history_warning_precedes_continue_as_new(
             policy.with_event_hard_cap(20_000)
         ));

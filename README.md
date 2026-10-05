@@ -274,11 +274,11 @@ event variant. The byte measure is `pg_column_size(event_data)`, the
 same measure as the tenant `max_history_bytes` quota. The Postgres worker
 enforces both caps. The SQLite backend does not.
 
-`harvest.workflow.history_bloat` fires once per run at 20% of the event cap,
-so at `10_000` events by default. The worker also logs a warning. Set
+`harvest.workflow.history_bloat` fires once per run at 20.48% of the event
+cap, so at `10_240` events by default. The worker also logs a warning. Set
 `history_bloat_warn_fraction(..)` to move the threshold. Keep the warning
-point at or above `history_continue_as_new_threshold`, or healthy runs warn
-before the advisory turns true. `try_build` logs a warning when they do.
+point above `history_continue_as_new_threshold`, or healthy runs warn before
+the advisory turns true. `try_build` logs a warning when they do.
 
 To remove a cap, call `history_event_hard_cap_unlimited()` or
 `history_byte_hard_cap_unlimited()`. With no event cap there is no

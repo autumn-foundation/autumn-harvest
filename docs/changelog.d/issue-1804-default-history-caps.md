@@ -8,13 +8,13 @@ without bound. The only default was the advisory `should_continue_as_new` at
 |---|---|---|
 | `WorkflowHistoryPolicy::event_hard_cap` | `None` | `Some(50_000)` |
 | `WorkflowHistoryPolicy::byte_hard_cap` (new) | — | `Some(50 MiB)` |
-| `DEFAULT_HISTORY_BLOAT_WARN_FRACTION` | `0.75` | `0.2` |
+| `DEFAULT_HISTORY_BLOAT_WARN_FRACTION` | `0.75` | `0.2048` |
 
 - A run at the event cap fails and moves to the DLQ with the existing typed
   `HistoryCapExceeded { count, cap, workflow_type }` reason.
 - A run at the byte cap fails the same way with the new typed
   `DeadLetterReason::HistoryBytesCapExceeded { bytes, cap, workflow_type }`.
-- `harvest.workflow.history_bloat` now fires at 10,000 events by default.
+- `harvest.workflow.history_bloat` now fires at 10,240 events by default.
   The worker also logs a `tracing::warn!` when it fires.
 - New overrides: `history_byte_hard_cap(n)`,
   `history_event_hard_cap_unlimited()` and
@@ -28,7 +28,11 @@ without bound. The only default was the advisory `should_continue_as_new` at
 Design decisions:
 
 - The defaults follow Temporal: warn at 10,240 events, terminate at 51,200.
-  The warning stays a fraction of the cap, so `0.2` puts it at 10,000.
+  The warning stays a fraction of the cap, so `0.2048` puts it at 10,240.
+- The warning must sit above the 10,000-event `continue_as_new` threshold.
+  `should_continue_as_new` turns true only past that threshold. A warning at
+  exactly 10,000 would page every run that rotates on the advisory. The
+  240-event margin covers the rotating decision.
 - The byte measure is `pg_column_size(event_data)`, the same measure as the
   tenant `max_history_bytes` quota.
 - The worker measures the stored bytes once, at the start of each decision.
@@ -54,7 +58,7 @@ Design decisions:
   it is low, the warning fires one decision later.
 - `try_build` logs a warning when the event cap is at or below
   `history_continue_as_new_threshold`. The advisory can then never fire
-  before the cap. It also warns when the warning point is below the
+  before the cap. It also warns when the warning point is at or below the
   threshold, because healthy runs then page. The README and
   `examples/long_running.rs` now use caps that avoid both cases.
 - The warn-threshold formula moves from `worker.rs` to
@@ -79,8 +83,8 @@ against Postgres:
 
 - Under the default policy, a run at 50,000 events fails with
   `HistoryCapExceeded { count: 50_000, cap: 50_000 }` and emits the warning.
-- Under the default policy, a run at 10,000 events emits
-  `harvest.workflow.history_bloat` once and stays `RUNNING`. A run at 9,999
+- Under the default policy, a run at 10,240 events emits
+  `harvest.workflow.history_bloat` once and stays `RUNNING`. A run at 10,239
   events does not.
 - Under the default policy, a run at 50 MiB fails with
   `HistoryBytesCapExceeded`.

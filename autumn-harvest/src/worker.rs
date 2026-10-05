@@ -35792,16 +35792,16 @@ mod tests {
     }
 
     #[test]
-    fn history_bloat_threshold_crossed_default_policy_warns_at_ten_thousand() {
-        // Issue #1804: the default policy warns at 10,000 events.
+    fn history_bloat_threshold_crossed_default_policy_warns_at_10240() {
+        // Issue #1804: the default policy warns at 10,240 events.
         let policy = WorkflowHistoryPolicy::default();
         let cap = policy.event_hard_cap().expect("default event cap");
         let fraction = policy.history_bloat_warn_fraction();
         assert!(!history_bloat_threshold_crossed(
-            9_999, cap, fraction, false
+            10_239, cap, fraction, false
         ));
         assert!(history_bloat_threshold_crossed(
-            10_000, cap, fraction, false
+            10_240, cap, fraction, false
         ));
     }
 

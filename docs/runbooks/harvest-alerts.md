@@ -1565,8 +1565,8 @@ reported via the `harvest.workflow.history_oversized` gauge). Unless the cap
 is unlimited,
 the same still-`RUNNING` execution that would eventually hit it is instead
 warned once — the first time its recorded history crosses a configurable
-fraction of that cap (`history_bloat_warn_fraction`, default **20%**, so
-10,000 events under the default cap; `0` disables the signal entirely). The counter increments once per crossing
+fraction of that cap (`history_bloat_warn_fraction`, default **20.48%**, so
+10,240 events under the default cap; `0` disables the signal entirely). The counter increments once per crossing
 per execution (delivery is at-least-once — see the last triage step below);
 the run itself is completely unaffected and keeps executing normally. A
 single decision cycle can also grow history from below the soft threshold
@@ -1588,7 +1588,7 @@ window to act *before* that happens.
    `history_event_count`:
    `harvest workflow list --history-bloat-min-events <threshold>` (or
    `GET /api/harvest/workflows?history_bloat_min_events=<threshold>`). Start
-   with a threshold near the configured hard cap's 20% soft mark and lower it
+   with a threshold near the configured hard cap's 20.48% soft mark and lower it
    if you need to see the full ranked population; every returned row is
    guaranteed non-terminal (`RUNNING`/`PAUSED`), sorted by history size
    descending. This is a DIFFERENT query parameter from the unrelated,

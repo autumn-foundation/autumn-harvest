@@ -4,8 +4,9 @@
 //!
 //! - Under the default policy, a run at 50,000 events fails with the typed
 //!   `HistoryCapExceeded` reason.
-//! - Under the default policy, the early warning fires at 10,000 events and
-//!   not at 9,999.
+//! - Under the default policy, the early warning fires at 10,240 events and
+//!   not at 10,239. That is above the `continue_as_new` threshold of 10,000,
+//!   so a run that rotates on the advisory never warns.
 //! - Under the default policy, a run at 50 MiB of stored history fails with
 //!   the typed `HistoryBytesCapExceeded` reason.
 //! - The byte sum is exact on the warm cache path and on the cold path.
@@ -675,18 +676,18 @@ async fn default_event_cap_fails_a_run_at_fifty_thousand_events() {
 }
 
 /// AC2 (RED before #1804): with no cap configured, the early-warning metric
-/// fires once a still-running history reaches 10,000 events. Before the
+/// fires once a still-running history reaches 10,240 events. Before the
 /// default cap, nothing fired.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn default_warning_fires_at_ten_thousand_events() {
+async fn default_warning_fires_at_10240_events() {
     let (database_url, _container) = setup_db().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
         .await
         .expect("connect");
 
     let exec_id = seed_execution(&mut conn, GROWER).await;
-    // WorkflowStarted + 9,999 padding = 10,000 durable events.
-    pad_history(&mut conn, exec_id, 9_999).await;
+    // WorkflowStarted + 10,239 padding = 10,240 durable events.
+    pad_history(&mut conn, exec_id, 10_239).await;
     enqueue_workflow_task(&mut conn, exec_id).await;
 
     let metrics = Arc::new(RecordingMetrics::default());
@@ -711,17 +712,18 @@ async fn default_warning_fires_at_ten_thousand_events() {
     );
 }
 
-/// The boundary below AC2: 9,999 events do not warn.
+/// The boundary below AC2: 10,239 events do not warn. A run past the
+/// 10,000-event `continue_as_new` threshold has room to rotate first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn default_warning_does_not_fire_at_9999_events() {
+async fn default_warning_does_not_fire_at_10239_events() {
     let (database_url, _container) = setup_db().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
         .await
         .expect("connect");
 
     let exec_id = seed_execution(&mut conn, GROWER).await;
-    // WorkflowStarted + 9,998 padding = 9,999 durable events.
-    pad_history(&mut conn, exec_id, 9_998).await;
+    // WorkflowStarted + 10,238 padding = 10,239 durable events.
+    pad_history(&mut conn, exec_id, 10_238).await;
     enqueue_workflow_task(&mut conn, exec_id).await;
 
     let metrics = Arc::new(RecordingMetrics::default());
@@ -974,19 +976,28 @@ async fn byte_cap_rechecks_a_stale_warm_mark_before_failing() {
     // The warm mark now counts about 40 KiB for this signal.
     send_grow(&mut conn, exec_id, incompressible_payload(40 * 1024), 1).await;
 
-    // Shrink that row in place, as a rotation sweep could.
+    // Shrink that row in place, as a rotation sweep could. The append-only
+    // guard (issue #1817) needs the `codec_rotation` sanction for the write.
     let small = serde_json::to_value(WorkflowEvent::SignalReceived {
         signal_name: "grow".into(),
         payload: serde_json::json!({}),
     })
     .expect("serialize small signal");
-    diesel::sql_query(
-        "UPDATE harvest_events SET event_data = $2 \
-         WHERE workflow_exec_id = $1 AND event_type = 'SignalReceived'",
-    )
-    .bind::<SqlUuid, _>(exec_id.as_uuid())
-    .bind::<Jsonb, _>(small)
-    .execute(&mut conn)
+    conn.transaction::<_, diesel::result::Error, _>(async |c| {
+        diesel::sql_query(
+            "SELECT set_config('harvest.sanctioned_event_rewrite', 'codec_rotation', true)",
+        )
+        .execute(c)
+        .await?;
+        diesel::sql_query(
+            "UPDATE harvest_events SET event_data = $2 \
+             WHERE workflow_exec_id = $1 AND event_type = 'SignalReceived'",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .bind::<Jsonb, _>(small)
+        .execute(c)
+        .await
+    })
     .await
     .expect("shrink the stored signal");
 
