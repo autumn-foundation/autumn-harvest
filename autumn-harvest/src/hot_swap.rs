@@ -517,6 +517,7 @@ pub fn sign_module_binding(
     if key.len() < MIN_SIGNING_KEY_BYTES {
         return Err(HotSwapError::SigningKeyTooShort { actual: key.len() });
     }
+    #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length")]
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC-SHA256 takes any key length");
     mac.update(MODULE_SIGNATURE_DOMAIN);
@@ -1949,6 +1950,7 @@ pub fn module_workflow_handler(
         let cycle_started = Instant::now();
 
         for step in 0..MAX_DECIDE_STEPS {
+            #[expect(clippy::expect_used, reason = "a constant bounds `step`")]
             let step_index = u32::try_from(step)
                 .expect("step is bounded by MAX_DECIDE_STEPS, far below u32::MAX");
             let request = DecideRequest {

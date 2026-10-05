@@ -234,5 +234,10 @@ rather than admitting a new one:
 Gating these would halt in-flight work mid-flight, the opposite of the gate's
 "halt **new** starts while in-flight work drains" contract.
 
+The claim order uses a similar split (issue #1824). The first task of a
+retry, continue-as-new, child or reset fork does not yield at claim. A
+typed-client handle start differs: the gate exempts it, but its first task
+yields like any fresh start. See [`claim-order.md`](claim-order.md).
+
 Gating starts from *outside* the plugin process, auto-lifting/scheduling gates,
 and rate-limited recovery replay are also out of scope (issue #618).

@@ -1580,6 +1580,18 @@ cd autumn-harvest && diesel migration run
 
 The `testing` feature in `autumn-harvest/Cargo.toml` gates `WorkflowContext::new_test()` and `ActivityContext::new_test()` for use outside `#[cfg(test)]` blocks (e.g., in integration test binaries).
 
+### Panic policy (issue #1821)
+
+Every replica runs the same scanners and serves the same requests. One bad row can therefore stop the same scanner loop on every replica, and the loop stays stopped. A panic in `Drop` during unwinding aborts the process.
+
+- `autumn-harvest` and `autumn-harvest-plugin` set `clippy::expect_used` and `clippy::unwrap_used` to `warn` in `lib.rs`. CI denies warnings.
+- `clippy.toml` exempts test code. Clippy does not see `#[cfg(all(test, ...))]` as test code. Use two `cfg` attributes instead. A `#[test]` function is test code either way.
+- Return a typed error for a value that comes from a row or a request.
+- Recover a poisoned `Mutex` with `PoisonError::into_inner` only when no critical section can leave the value half-written.
+- Never panic in `Drop`. A panic during unwinding aborts the process.
+- Mark a true invariant, or a documented startup or test-only panic, with `#[expect(clippy::expect_used, reason = "...")]` on the smallest item.
+- `context` and `testing` are whole-module exceptions. `lib.rs` gives the reason on each `mod` item.
+
 ---
 
 ## Adding New Workflow Types or Activities

@@ -1550,12 +1550,6 @@ impl ClaimedTaskKind {
     }
 }
 
-fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
-    id.to_string()
-        .parse()
-        .expect("database UUIDs must round-trip into ExecutionId")
-}
-
 const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
     match command {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
@@ -3289,6 +3283,10 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
 /// gets handled, is a documented no-op the caller already handles, or is
 /// provably unreachable and panics if it ever arrives.
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::expect_used,
+    reason = "callers check for `RunLocalActivity` first"
+)]
 fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCommandBatch {
     // Positional TimerStarted/TimerCancelled plan for a co-batched
     // CancelTimer or ArmTimer{for_await:false} (issue #1247). Pure, so it
@@ -11314,7 +11312,7 @@ async fn persist_all_started_child_workflows(
         }
     }
 
-    let parent_exec_id = execution_id_from_uuid(parent_execution.id);
+    let parent_exec_id = ExecutionId::from_uuid(parent_execution.id);
     let queue_name = parent_execution.queue_name.clone();
     let children = children.to_vec();
     // Pre-compute position-tagged pre-suspension events (markers + detached-spawns) and
@@ -12686,7 +12684,7 @@ async fn persist_child_timeout_race(
         });
     }
 
-    let parent_exec_id = execution_id_from_uuid(parent_execution.id);
+    let parent_exec_id = ExecutionId::from_uuid(parent_execution.id);
     let child_id = child.child_id;
     let telemetry = registry.telemetry().clone();
     let execute_span = execute_span.clone();
@@ -13027,7 +13025,7 @@ async fn persist_mixed_suspension_batch(
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
 ) -> HarvestResult<()> {
-    let exec_id = execution_id_from_uuid(parent_execution.id);
+    let exec_id = ExecutionId::from_uuid(parent_execution.id);
 
     // Two `StartTimer`s for one id would arm two durable rows and record two
     // `TimerStarted` events for one logical timer. Reject before anything is
@@ -13547,31 +13545,21 @@ fn merge_wake_events(
     let mut signals = pending_signals.into_iter().peekable();
 
     loop {
-        match (timers.peek(), signals.peek()) {
-            (Some((_, fires_at)), Some((_, _, received_at))) => {
-                if received_at < fires_at {
-                    let (signal_name, payload, _) = signals.next().expect("peeked");
-                    events.push(WorkflowEvent::SignalReceived {
-                        signal_name,
-                        payload,
-                    });
-                } else {
-                    let (timer_id, _) = timers.next().expect("peeked");
-                    events.push(WorkflowEvent::TimerFired { timer_id });
-                }
-            }
-            (Some(_), None) => {
-                let (timer_id, _) = timers.next().expect("peeked");
-                events.push(WorkflowEvent::TimerFired { timer_id });
-            }
-            (None, Some(_)) => {
-                let (signal_name, payload, _) = signals.next().expect("peeked");
+        let signal_first = match (timers.peek(), signals.peek()) {
+            (Some((_, fires_at)), Some((_, _, received_at))) => received_at < fires_at,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (None, None) => break,
+        };
+        if signal_first {
+            if let Some((signal_name, payload, _)) = signals.next() {
                 events.push(WorkflowEvent::SignalReceived {
                     signal_name,
                     payload,
                 });
             }
-            (None, None) => break,
+        } else if let Some((timer_id, _)) = timers.next() {
+            events.push(WorkflowEvent::TimerFired { timer_id });
         }
     }
 
@@ -13871,7 +13859,7 @@ pub async fn preload_failure_history(
     let Some(exec_uuid) = task.workflow_exec_id else {
         return PreloadedFailureHistory::NoExecution;
     };
-    let exec_id = execution_id_from_uuid(exec_uuid);
+    let exec_id = ExecutionId::from_uuid(exec_uuid);
     // Undecoded on purpose. This reads `next_event_id` -- id arithmetic over
     // the row set -- and never looks at a payload field, so it is not a replay
     // path and needs no codec. Decoding here would be worse than useless: with
@@ -14862,7 +14850,7 @@ async fn create_detached_child_executions(
             )?;
             crate::cross_shard_child::record_cross_shard_child(
                 conn,
-                execution_id_from_uuid(parent_execution.id),
+                ExecutionId::from_uuid(parent_execution.id),
                 *child_id,
                 workflow_name,
                 Some(*parent_close_policy),
@@ -15481,7 +15469,7 @@ pub async fn write_activity_result_for_task(
             task.id
         )));
     };
-    let exec_id = execution_id_from_uuid(exec_uuid);
+    let exec_id = ExecutionId::from_uuid(exec_uuid);
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
     handle_activity_result(
         conn,
@@ -16490,7 +16478,7 @@ async fn process_activity_task(
         let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         return fail_task_only(&mut conn, task.id, "activity task missing activity_name").await;
     };
-    let exec_id = execution_id_from_uuid(exec_uuid);
+    let exec_id = ExecutionId::from_uuid(exec_uuid);
 
     // Worker sessions (issue #606): intercept the two reserved internal
     // activity names before any of the normal handler-dispatch machinery
@@ -19172,7 +19160,7 @@ async fn prepare_workflow_task_with_cache(
         fail_task_only(conn, task.id, &error.to_string()).await?;
         return Err(error);
     };
-    let exec_id = execution_id_from_uuid(exec_uuid);
+    let exec_id = ExecutionId::from_uuid(exec_uuid);
 
     // Only probe the cache when sticky routing is enabled (lease_ttl > 0).
     // With sticky_timeout == 0 the cache is permanently disabled: no lookups,
@@ -19319,7 +19307,7 @@ async fn reject_child_continue_as_new(
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    let Some(parent_exec_id) = execution.parent_id.map(execution_id_from_uuid) else {
+    let Some(parent_exec_id) = execution.parent_id.map(ExecutionId::from_uuid) else {
         return Ok(());
     };
 
@@ -20685,6 +20673,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
         // `encode_payload`. The patch places it in the encoded row before the
         // INSERT. No UPDATE of `harvest_events` follows, so this path adds no
         // in-place writer to the append-only log.
+        #[expect(clippy::expect_used, reason = "both values come from one parse")]
         let carried_raw = carried_lcr_ref.as_ref().map(|_| {
             raw_carryover.clone().expect(
                 "carried_lcr_ref is Some only when raw_carryover parsed as an offload envelope",
@@ -20822,7 +20811,7 @@ async fn persist_workflow_outcome(
     // outcome arm ignores this.
     continue_as_new_verdict: Option<ContinueAsNewVerdict>,
 ) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
-    let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
+    let parent_exec_id = execution.parent_id.map(ExecutionId::from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
     // do NOT wake their parent on completion or failure.
     let is_detached_child = execution.parent_close_policy.is_some();
@@ -21996,6 +21985,7 @@ fn resolve_retry_attempts<T, E>(attempts: Vec<Result<T, E>>) -> Result<T, E> {
 /// the first success, else surface the last failure) as a lazy loop --
 /// see that function's doc comment for why this is hand-rolled rather than
 /// calling it directly.
+#[expect(clippy::expect_used, reason = "the retry loop runs at least once")]
 async fn count_history_events_with_retries(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -22200,7 +22190,7 @@ async fn fail_workflow_for_history_cap(
         exec_id,
         next_event_id,
         worker_id,
-        execution.parent_id.map(execution_id_from_uuid),
+        execution.parent_id.map(ExecutionId::from_uuid),
         reason,
         Some(telemetry.metrics.as_ref()),
         registry.payload_codecs(),
@@ -23052,6 +23042,12 @@ async fn process_workflow_task(
                         event_count,
                     } => {
                         history_events.extend(events);
+                        let hard_cap =
+                            registry.history_policy().event_hard_cap().ok_or_else(|| {
+                                HarvestError::Config(
+                                    "HistoryCapReached requires a configured hard cap".to_owned(),
+                                )
+                            })?;
                         // Issue #1247: no emit_update_result_metrics call
                         // here — run_local_activity_inline already emitted
                         // any update-result metrics for this batch, right
@@ -23068,10 +23064,7 @@ async fn process_workflow_task(
                             worker_id,
                             started_at,
                             event_count,
-                            registry
-                                .history_policy()
-                                .event_hard_cap()
-                                .expect("HistoryCapReached requires a configured hard cap"),
+                            hard_cap,
                         )
                         .await?;
                         for start in deferred {
@@ -29434,6 +29427,10 @@ impl Worker {
                             // shard is guaranteed by the missing-shard guard at
                             // run() entry, so this never falls back to the default
                             // pool under the wrong shard label (issue #522 review).
+                            #[expect(
+                                clippy::expect_used,
+                                reason = "`run` checks every shard pool first"
+                            )]
                             let shard_pool = sharded
                                 .exact_pool_for(*shard)
                                 .expect("assigned shard pool presence verified at run() entry")
@@ -29705,6 +29702,10 @@ impl Worker {
         // So the bound always applies. A timed-out connect falls back to
         // polling on that shard. A connect error already takes the same
         // fallback.
+        #[expect(
+            clippy::expect_used,
+            reason = "`multi_shard = true` always gives a bound"
+        )]
         let connect_bound = shard_acquire_bound(true, self.config.poll_interval)
             .expect("multi_shard=true always yields Some bound");
 
@@ -33722,7 +33723,7 @@ pub async fn quarantine_workflow_task_timeout(
                         .await
                         .map_err(crate::error::database_error)?;
 
-                        let exec_id = execution_id_from_uuid(exec_uuid);
+                        let exec_id = ExecutionId::from_uuid(exec_uuid);
                         let history =
                             crate::store::load_history_with_codecs(conn, exec_id, codecs).await?;
                         crate::store::append_events_with_codecs(
@@ -33776,7 +33777,7 @@ pub async fn quarantine_workflow_task_timeout(
                         if parent_close_policy_opt.is_none()
                             && let Some(parent_uuid) = parent_id_opt
                         {
-                            let parent_exec_id = execution_id_from_uuid(parent_uuid);
+                            let parent_exec_id = ExecutionId::from_uuid(parent_uuid);
                             let _ = wake_parent_for_child_failure(
                                 conn,
                                 parent_exec_id,
@@ -33858,7 +33859,7 @@ pub async fn quarantine_workflow_task_timeout(
                     metrics.record_canary_failure(q, u16::try_from(shard_id).unwrap_or(0));
                 }
                 if let Some(exec_uuid) = exec_id_opt {
-                    let exec_id = execution_id_from_uuid(exec_uuid);
+                    let exec_id = ExecutionId::from_uuid(exec_uuid);
                     check_and_report_unfinished_handlers_for_worker(
                         &mut conn,
                         exec_id,
@@ -34130,6 +34131,10 @@ async fn log_claim_reset_outcome(
 /// chaos `Kill` path. The inner `HarvestResult<()>` is `process_workflow_task`'s
 /// own result on every non-panic path.
 #[cfg(feature = "chaos")]
+#[expect(
+    clippy::expect_used,
+    reason = "chaos test driver, not a production path"
+)]
 pub async fn chaos_drive_one_workflow_task(
     db_url: &str,
     registry: Arc<HandlerRegistry>,
@@ -34191,6 +34196,10 @@ pub async fn chaos_drive_one_workflow_task(
 /// the hold's chaos point, so the caller's race assertion would
 /// otherwise pass vacuously.
 #[cfg(feature = "chaos")]
+#[expect(
+    clippy::expect_used,
+    reason = "chaos test driver, not a production path"
+)]
 pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
     db_url: &str,
     registry: Arc<HandlerRegistry>,
@@ -43781,6 +43790,7 @@ mod tests {
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
             timer_fires_at: None,
+            new_start: false,
         }
     }
 
