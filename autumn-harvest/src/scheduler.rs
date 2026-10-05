@@ -1252,38 +1252,49 @@ pub async fn tick_once_sharded(
     .await
 }
 
-/// Whether this scheduler pass may write to `shard` (issue #1823).
+/// The fence a scheduler shard pass holds (issue #1823).
+#[cfg(feature = "db")]
+type PassFence = Option<crate::replication::FencePassGuard>;
+#[cfg(not(feature = "db"))]
+type PassFence = ();
+
+/// Open the fence for one scheduler shard pass, or `None` to skip the shard
+/// (issue #1823).
 ///
-/// A single pool names its shard through the default pin. A held shard may be an unpromoted standby. A fenced shard belongs to
-/// another region. The schedule writes do not pass the persist assert, so
-/// the pass checks first. It is a preflight, as the admin API check is. A
-/// start that a fire issues still asserts the fence in its own transaction.
-async fn scheduler_may_write(
-    conn: &mut AsyncPgConnection,
-    shard: ShardId,
-    single_pool: bool,
-) -> bool {
+/// A single pool names its shard through the default pin. A held shard may
+/// be an unpromoted standby, so it is skipped. A fenced shard belongs to
+/// another region, so it is skipped and logged. Otherwise the returned
+/// guard holds a commit-order barrier until the pass ends: a bump cannot
+/// commit while the pass writes. See [`crate::replication::FencePassGuard`].
+async fn scheduler_fence(pool: &DbPool, shard: ShardId, single_pool: bool) -> Option<PassFence> {
     let fence_key = if single_pool {
         ShardId::UNENCODED
     } else {
         shard
     };
     if crate::replication::shard_writes_held(Some(fence_key)) {
-        return false;
+        return None;
     }
     #[cfg(feature = "db")]
-    if let Err(error) = crate::replication::assert_fence(conn, fence_key).await {
-        tracing::error!(
-            shard_id = shard.as_i32(),
-            error = %error,
-            "scheduler skips a fenced shard; restart this process against the region that \
-             holds authority"
-        );
-        return false;
+    {
+        match crate::replication::begin_fenced_pass(pool, fence_key).await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::error!(
+                    shard_id = shard.as_i32(),
+                    error = %error,
+                    "scheduler skips a fenced shard; restart this process against the region \
+                     that holds authority"
+                );
+                None
+            }
+        }
     }
     #[cfg(not(feature = "db"))]
-    let _ = (conn, shard);
-    true
+    {
+        let _ = pool;
+        Some(())
+    }
 }
 
 /// [`tick_once_sharded`], with a caller-owned per-schedule registration backoff
@@ -1355,13 +1366,14 @@ pub async fn tick_once_sharded_with_backoff(
 
     let single_pool = pool.len() == 1;
     for (shard, shard_pool) in pool.iter_shards() {
+        // Held until this shard's pass ends. See `scheduler_fence`.
+        let Some(_fence) = scheduler_fence(shard_pool, shard, single_pool).await else {
+            continue;
+        };
         let mut conn = shard_pool
             .get()
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
-        if !scheduler_may_write(&mut conn, shard, single_pool).await {
-            continue;
-        }
 
         // Issue #1157: on a converged shard this pass is read-only — no
         // transaction, no advisory lock, no UPDATE. Only a schedule that

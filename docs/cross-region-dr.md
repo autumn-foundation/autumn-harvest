@@ -200,8 +200,8 @@ The log line says which rule it broke, and what to change:
 - `Disabled` on a DR database.
 - A fenced process that cannot name the shard it serves.
 - A fenced process whose shard number differs from the row in the database.
-  A shard database holds its own row only. One exception: a worker on a
-  single database may share it with workers for other logical shards. It
+  A shard database holds its own row only. One exception: a process on a
+  single database may share it with processes for other logical shards. It
   logs a warning and provisions its own row beside theirs.
 - A fenced process on a DR **standby**: a database with a DR subscription, or
   a server in recovery. No Harvest process writes to a standby. The runbook
@@ -320,12 +320,18 @@ Admin writes go through the same check as worker writes (issue #1823).
   a subscription, whatever its name.
   The partition commands may run on a logical standby: logical replication
   carries no DDL, so the partitioned layout must be built on both sides.
-- **In-process partition maintenance.** The retention janitor runs
-  `assert_fence` on each shard before it creates or drops partitions.
-- **The scheduler.** Each scheduler pass runs `assert_fence` on each shard
-  before it writes `harvest_schedules`. A fenced or held shard gets no
-  write, and the log names it. Each workflow start that a fire issues also
-  asserts the fence in its own transaction.
+- **In-process partition maintenance.** Each pass on a shard holds a fence
+  barrier for its whole run, across its several transactions.
+- **The scheduler.** Each scheduler pass on a shard holds the same barrier
+  while it writes `harvest_schedules` and fires. A fenced or held shard gets
+  no write, and the log names it.
+
+The barrier is a transaction on its own connection. It takes an advisory
+lock in shared mode and checks the generation. `harvest dr fence` takes that
+lock in exclusive mode before it bumps, so the bump waits for a pass in
+flight. A pass that starts after the bump sees the new generation and stops.
+The bump waits at most 5 seconds. A pass that runs longer makes the bump
+fail with a lock timeout. Run `harvest dr fence` again.
 
 These direct-database commands are exempt, by design:
 

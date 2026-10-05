@@ -2988,26 +2988,107 @@ async fn auto_mode_provisions_the_row_on_a_slot_only_dr_database() {
     assert_eq!(row.expect("read"), Some(ShardGeneration::INITIAL));
 }
 
-/// A database whose row names another shard is misconfigured. Pinning would
-/// add a second row that `harvest dr fence` never bumps.
+/// In a sharded pool, a database whose row names another shard is
+/// misconfigured: two DSNs are swapped. Pinning would add a second row that
+/// `harvest dr fence` never bumps.
 #[tokio::test]
 async fn a_process_that_names_the_wrong_shard_refuses_to_start() {
     let _serial = registry_guard().await;
-    let (url, _db) = require_db!("wrongshard");
-    let mut conn = connect(&url).await;
-    ensure_generation_row(&mut conn, ShardId::new(7))
+    let (url_a, _db_a) = require_db!("wrongshard_a");
+    let (url_b, _db_b) = require_db!("wrongshard_b");
+    let mut conn_b = connect(&url_b).await;
+    ensure_generation_row(&mut conn_b, ShardId::new(7))
         .await
         .unwrap();
-    let pool = dr_pool(&url);
-    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
-    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool).await;
-    let row = current_generation(&mut conn, ShardId::new(0)).await;
+    let pool_a = dr_pool(&url_a);
+    let pool_b = dr_pool(&url_b);
+    let targets = Some((
+        vec![(ShardId::new(0), pool_a.clone()), (ShardId::new(1), pool_b)],
+        ShardId::new(0),
+    ));
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool_a).await;
+    let row = current_generation(&mut conn_b, ShardId::new(1)).await;
     let Err(error) = refused else {
         panic!("a shard mismatch must refuse to start");
     };
     assert!(error.to_string().contains("names shard"), "{error}");
     assert_eq!(row.expect("read"), None, "no second row is provisioned");
     assert!(!FenceRegistry::is_enabled());
+}
+
+/// Runners may split the logical shards of one database (issue #1823). A
+/// second runner finds the first runner's row there and still pins.
+#[tokio::test]
+async fn split_runners_on_one_database_both_pin() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("splitrunners");
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .unwrap();
+    }
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(1), pool.clone())], ShardId::new(1)));
+    let pinned = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool).await;
+    if let Err(error) = pinned {
+        panic!("a runner for another logical shard on this database must pin: {error}");
+    }
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(1)),
+        Some(ShardGeneration::INITIAL)
+    );
+}
+
+/// A fenced pass is a commit-order barrier (issue #1823). A bump waits for
+/// the open pass, and a pass that starts after the bump is refused.
+#[tokio::test]
+async fn a_bump_waits_for_an_open_fenced_pass() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("passbarrier");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass(&pool, ShardId::new(0))
+        .await
+        .expect("an unfenced shard opens a pass")
+        .expect("a pinned shard gets a guard");
+
+    let bump_url = url.clone();
+    let bump = tokio::spawn(async move {
+        let mut conn = connect(&bump_url).await;
+        bump_generation(&mut conn, ShardId::new(0), "failover", "test").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let waited = !bump.is_finished();
+    // The pass keeps writing while the bump waits. Its own fence checks
+    // must not queue behind the bump, or the pass and the bump deadlock.
+    let mut pass_conn = connect(&url).await;
+    let pass_check = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        autumn_harvest::replication::assert_fence(&mut pass_conn, ShardId::new(0)),
+    )
+    .await;
+    drop(guard);
+    let bumped = bump.await.expect("bump task").expect("bump commits");
+    let after = autumn_harvest::replication::begin_fenced_pass(&pool, ShardId::new(0)).await;
+
+    assert!(waited, "a bump must wait for the open pass");
+    assert!(
+        matches!(pass_check, Ok(Ok(()))),
+        "the pass's own fence check must not wait behind the bump"
+    );
+    assert!(bumped > pinned);
+    assert!(
+        matches!(
+            after,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a pass after the bump is refused"
+    );
 }
 
 /// `Enabled` with no shard identity reads the shard from a single row, and

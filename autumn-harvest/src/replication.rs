@@ -899,22 +899,27 @@ impl FenceRegistry {
     ///
     /// The default shard conflicts with one already pinned.
     pub fn hold(shards: &[ShardId], default_shard: ShardId) -> Result<(), PublishConflict> {
-        let held: Vec<ShardId> = shards
-            .iter()
-            .copied()
-            .filter(|shard| matches!(Self::expected(*shard), None | Some(HELD)))
-            .collect();
-        let pins: Vec<(ShardId, ShardGeneration)> =
-            held.iter().map(|shard| (*shard, HELD)).collect();
-        Self::publish(&pins, default_shard)?;
+        // One write lock covers the check, the sentinel and the holder count.
+        // A release between two locks could drop the sentinel before the new
+        // holder was counted, and leave an unprobed shard unfenced.
         let mut guard = PINNED
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pinned = guard.get_or_insert_with(Pinned::default);
-        for shard in held {
+        if let Some(existing) = pinned.default_shard
+            && existing != default_shard
+        {
+            let conflict = DefaultShardConflict {
+                pinned: existing.as_i32(),
+                attempted: default_shard.as_i32(),
+            };
+            drop(guard);
+            return Err(conflict.into());
+        }
+        pinned.default_shard = Some(default_shard);
+        for shard in shards {
             let key = shard.as_i32();
-            // A release can run between the publish and this lock. Restore
-            // the sentinel it removed, so a counted holder always has a pin.
+            // A shard this process already pinned keeps its real pin.
             let generation = *pinned.generations.entry(key).or_insert(HELD);
             if generation == HELD {
                 *pinned.holders.entry(key).or_insert(0) += 1;
@@ -1332,6 +1337,14 @@ mod db {
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
+                // Wait for every fenced pass in flight (issue #1823). A pass
+                // holds this lock shared, so its writes commit before the
+                // bump. The wait comes before the table lock, so a pass's
+                // own `FOR SHARE` checks never queue behind this bump.
+                diesel::sql_query(FENCE_PASS_LOCK_EXCLUSIVE)
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
                 diesel::sql_query("LOCK TABLE harvest_shard_generation IN ACCESS EXCLUSIVE MODE")
                     .execute(conn)
                     .await
@@ -1362,6 +1375,68 @@ mod db {
                     shard.as_i32()
                 ))
             })
+    }
+
+    /// Take the pass lock shared, for a fenced pass (issue #1823).
+    const FENCE_PASS_LOCK_SHARED: &str =
+        "SELECT pg_advisory_xact_lock_shared(hashtext('harvest:dr_fence_pass:v1'))";
+    /// Take the pass lock exclusive, for a bump (issue #1823).
+    const FENCE_PASS_LOCK_EXCLUSIVE: &str =
+        "SELECT pg_advisory_xact_lock(hashtext('harvest:dr_fence_pass:v1'))";
+    /// How long a pass waits to open its fence connection.
+    const FENCE_PASS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A commit-order barrier for a pass of several writes (issue #1823).
+    ///
+    /// A scheduler pass or a partition-maintenance pass writes in many
+    /// statements and transactions. A check before the pass is not a
+    /// barrier: a bump can commit between the check and a write. This guard
+    /// holds a transaction open on its own connection, with the pass lock
+    /// shared and the generation checked. [`bump_generation`] takes the
+    /// pass lock exclusive, so it cannot commit while the pass runs. A pass
+    /// that starts after the bump sees the new generation and stops.
+    ///
+    /// The connection is not from the pool, so the guard never starves the
+    /// pass of a connection. Dropping the guard closes the connection. The
+    /// server then ends the transaction and frees the lock, even when the
+    /// pass is cancelled.
+    pub struct FencePassGuard {
+        _conn: AsyncPgConnection,
+    }
+
+    /// Open a [`FencePassGuard`] for `shard`, or `None` when this process
+    /// pins no generation for it (issue #1823).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::ShardFenced`] when the shard is at
+    /// another generation. [`crate::error::HarvestError::Database`] when
+    /// the connection or a query fails.
+    pub async fn begin_fenced_pass(
+        pool: &crate::worker::DbPool,
+        shard: ShardId,
+    ) -> HarvestResult<Option<FencePassGuard>> {
+        use deadpool::managed::Manager as _;
+        use diesel_async::SimpleAsyncConnection as _;
+        let Some(pinned) = FenceRegistry::expected(shard) else {
+            return Ok(None);
+        };
+        let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+        let mut conn = tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
+            .await
+            .map_err(|_| {
+                crate::error::HarvestError::Database(
+                    "timed out opening the DR fence connection".to_string(),
+                )
+            })?
+            .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+        conn.batch_execute("BEGIN").await.map_err(database_error)?;
+        diesel::sql_query(FENCE_PASS_LOCK_SHARED)
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)?;
+        assert_generation(&mut conn, resolved, pinned).await?;
+        Ok(Some(FencePassGuard { _conn: conn }))
     }
 
     /// Assert that this process still holds write authority for `shard`.
@@ -1851,12 +1926,11 @@ mod db {
         // Logical shards that share one pool share one database. A row for
         // any of them is then expected there.
         //
-        // A worker on one database may share it with workers for other
+        // A process on one database may share it with processes for other
         // logical shards. Their rows are expected there, so it only warns.
-        let single_database = worker.is_some()
-            && targets
-                .iter()
-                .all(|(_, pool)| std::ptr::eq(pool.manager(), fallback_pool.manager()));
+        let single_database = targets
+            .iter()
+            .all(|(_, pool)| std::ptr::eq(pool.manager(), fallback_pool.manager()));
         for ((shard, pool), markers) in targets.iter().zip(&probed) {
             let Some(markers) = markers else { continue };
             if single_database {
@@ -1870,7 +1944,7 @@ mod db {
                             .iter()
                             .map(|s| s.as_i32())
                             .collect::<Vec<_>>(),
-                        "this database holds the rows of other logical shards; this worker \
+                        "this database holds the rows of other logical shards; this process \
                          provisions its own row beside them"
                     );
                 }
@@ -2712,9 +2786,10 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    advance_sequences_after_promotion, assert_admin_write_authority, assert_fence, bump_generation,
-    current_generation, ensure_generation_row, measure_rpo, pin_process_fence, pin_worker_fence,
-    probe_dr_markers, query_replication_status, record_replication_heartbeat, resolve_held,
+    FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority, assert_fence,
+    begin_fenced_pass, bump_generation, current_generation, ensure_generation_row, measure_rpo,
+    pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
+    record_replication_heartbeat, resolve_held,
 };
 
 #[cfg(test)]
@@ -3314,6 +3389,34 @@ mod tests {
             assert_eq!(
                 FenceRegistry::binding(ShardId::new(4)),
                 Some((ShardId::new(4), ShardGeneration(2)))
+            );
+        }
+        FenceRegistry::clear();
+    }
+
+    /// A second hold that races the first holder's release keeps the shard
+    /// held (issue #1823). The sentinel and the holder count change under
+    /// one lock, so the shard is never left unpinned between them.
+    #[test]
+    fn a_hold_racing_a_release_keeps_the_shard_held() {
+        let _serial = registry_guard();
+        for round in 0..2_000 {
+            FenceRegistry::clear();
+            FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("first holder");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let release = {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    FenceRegistry::release_held(ShardId::new(3));
+                })
+            };
+            barrier.wait();
+            FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("second holder");
+            release.join().expect("release thread");
+            assert!(
+                FenceRegistry::is_held(ShardId::new(3)),
+                "round {round}: the second holder keeps the shard held"
             );
         }
         FenceRegistry::clear();

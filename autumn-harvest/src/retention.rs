@@ -1405,30 +1405,34 @@ async fn run_terminal_task_pass(
     }
 }
 
-/// Whether this process has lost write authority on `shard` (issue #1823).
+/// Open the fence for one partition-maintenance pass, or `None` to skip the
+/// shard (issue #1823).
 ///
 /// A fenced process must not create or drop partitions on a shard another
-/// region owns. `harvest partition maintain` makes the same check. With no
-/// pin, the check issues no statement. A fenced shard is reported as failed.
+/// region owns. The guard holds a commit-order barrier for the whole pass,
+/// across its several transactions. With no pin, it opens no connection. A
+/// fenced shard is reported as failed.
 #[cfg(feature = "db")]
-async fn partition_pass_is_fenced(
-    conn: &mut diesel_async::AsyncPgConnection,
+async fn partition_pass_fence(
+    pool: &crate::worker::DbPool,
     shard: crate::types::ShardId,
     monitor_task: &RetentionMonitor,
-) -> bool {
-    let Err(error) = crate::replication::assert_fence(conn, shard).await else {
-        return false;
-    };
-    tracing::warn!(
-        shard = %shard,
-        error = %error,
-        "harvest event-partition maintenance skipped: this process is fenced"
-    );
-    monitor_task.update_partitions(
-        shard,
-        crate::partition::MaintenanceOutcome::failed(error.to_string()),
-    );
-    true
+) -> Option<Option<crate::replication::FencePassGuard>> {
+    match crate::replication::begin_fenced_pass(pool, shard).await {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            tracing::warn!(
+                shard = %shard,
+                error = %error,
+                "harvest event-partition maintenance skipped: this process is fenced"
+            );
+            monitor_task.update_partitions(
+                shard,
+                crate::partition::MaintenanceOutcome::failed(error.to_string()),
+            );
+            None
+        }
+    }
 }
 
 /// One pass of engine-automated partition maintenance (issue #958, AC8):
@@ -1521,9 +1525,11 @@ async fn run_partition_maintenance_pass(
                 }
             },
         };
-        if partition_pass_is_fenced(&mut conn, shard, monitor_task).await {
+        // Held until this shard's pass ends, so a bump cannot commit while
+        // the pass writes. See `crate::replication::FencePassGuard`.
+        let Some(_fence) = partition_pass_fence(pool, shard, monitor_task).await else {
             continue;
-        }
+        };
         // Review finding: a standalone probe used to run here, before
         // calling `maintain` below. That told an unpartitioned shard
         // apart from one that ran and did nothing (issue #1270 item 6).
