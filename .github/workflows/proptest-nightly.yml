@@ -76,11 +76,15 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      LIFECYCLE_RESULT: ${{ needs.lifecycle.result }}
     steps:
       - name: Open or update the alert issue
         run: |
           title="Proptest nightly: a scheduled run failed"
-          body="The deep property run failed: ${RUN_URL}. Add each shrunk lifecycle sequence to PINNED in lifecycle_model_props.rs (docs/testing/property-and-fuzz.md)."
+          body="The deep property run failed: ${RUN_URL}"
+          if [ "$LIFECYCLE_RESULT" = "failure" ]; then
+            body="${body}. Add each shrunk lifecycle sequence to PINNED in lifecycle_model_props.rs (docs/testing/property-and-fuzz.md)."
+          fi
           issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title \"$title\"" --json number,title \
             --jq "map(select(.title == \"$title\")) | .[0].number // empty")"

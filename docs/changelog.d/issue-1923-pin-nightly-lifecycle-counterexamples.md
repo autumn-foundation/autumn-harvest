@@ -19,8 +19,9 @@ replay share one setup helper, `on_own_database`.
 `docs/testing/property-and-fuzz.md` and the #1829 fragment now state the
 claim-order check, not `scheduled_at` order. The docs name `PINNED` as the
 place for a new counterexample. A model comment that still said a requeued
-orphan sorts behind a fresh start now states the #1824 order. The nightly
-alert issue now tells the reader to pin each shrunk sequence.
+orphan sorts behind a fresh start now states the #1824 order. When the
+lifecycle job fails, the nightly alert issue tells the reader to pin each
+shrunk sequence.
 
 No engine code changes. There is no new `WorkflowEvent` variant and no
 migration.
