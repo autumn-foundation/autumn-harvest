@@ -689,18 +689,28 @@ these free-form strings in `harvest_events.event_data`:
 
 - `error` in `WorkflowFailed`, `ActivityFailed`, `ActivityFailedExternally`,
   `LocalActivityFailed`, `LocalActivityExhausted`, `ChildWorkflowFailed` and
-  `UpdateFailed`;
-- `last_error` in `WorkflowStarted`;
+  `UpdateFailed`.
+- `last_error` in `WorkflowStarted`.
 - `reason` in `WorkflowCancelled`, `WorkflowResetFork`,
-  `WorkflowResetTerminated`, `WorkflowExecutionPaused` and `WorkflowRedriven`;
+  `WorkflowResetTerminated`, `WorkflowExecutionPaused` and `WorkflowRedriven`.
 - `message` in `ExternalAwaitFailed`.
+- `error_type` and `reason_code`, which name a failure class.
 
-The `error` columns of `harvest_workflow_executions`, `harvest_task_queue`
-and `harvest_dead_letters` are also in clear. Erasure
-(issue #495) keeps operational error text on purpose. A validation message
-often quotes the bad value, for example an email or an SSN. Keep PII out of
-error strings. Put it in `details`, which the codec encrypts. The
-[audit export](./audit-export.md) ships the clear text.
+The engine also writes the `error` columns of `harvest_workflow_executions`,
+`harvest_task_queue` and `harvest_dead_letters` as plain text. The dead-letter
+`failure_signature` derives from the error text. The history export puts the
+`WorkflowFailed` error text in a diagram note. A completion callback sends the
+error text to its URL.
+
+Erasure (issue #495) does not erase error text. Operators need it to diagnose
+failures. A validation message often quotes the bad value, for example an email
+address or a social security number.
+
+Keep PII out of error strings. Only `WorkflowFailed`, `ActivityFailed`,
+`ChildWorkflowFailed` and `ExternalAwaitFailed` carry a `details` field, which
+the codec encrypts. Set it with `WorkflowFailure::with_details` or
+`ActivityFailure::with_details`. A plain `Err(String)` sets no `details`. The
+other variants have no encrypted field for failure data.
 
 Event types, ids, timestamps and workflow names also stay in clear. Do not put
 PII in a memo, a search attribute, a workflow id or a workflow name. If these
