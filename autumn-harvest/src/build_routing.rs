@@ -346,8 +346,12 @@ pub async fn set_build_policy(
 ///
 /// A fan-out passes one caller id to every pool. Each pool stores this
 /// function of that id, its base build and its target. The id is the first
-/// 16 bytes of `sha256("{ramp_id}/{base}/{target}")`. The writes compute the
-/// same value in SQL.
+/// 16 bytes of `sha256("{ramp_id}/{len(base)}:{base}/{len(target)}:{target}")`,
+/// where `len` is the UTF-8 byte length. The writes compute the same value in
+/// SQL.
+///
+/// Build ids are free text. The length prefixes make the encoding one-to-one,
+/// so a `/` in a build id cannot make two pairs collide.
 ///
 /// So pools with the same base and target share one id. A partial fan-out
 /// can leave pools with different bases or targets. Those ramps then get
@@ -357,7 +361,9 @@ pub async fn set_build_policy(
 pub fn ramp_generation_id(ramp_id: Uuid, base: &str, target: &str) -> Uuid {
     use sha2::Digest;
 
-    let digest = sha2::Sha256::digest(format!("{ramp_id}/{base}/{target}").as_bytes());
+    let digest = sha2::Sha256::digest(
+        format!("{ramp_id}/{}:{base}/{}:{target}", base.len(), target.len()).as_bytes(),
+    );
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Uuid::from_bytes(bytes)
@@ -368,7 +374,9 @@ pub fn ramp_generation_id(ramp_id: Uuid, base: &str, target: &str) -> Uuid {
 #[cfg(feature = "db")]
 fn ramp_generation_id_sql(id: &str, base: &str, target: &str) -> String {
     format!(
-        "encode(substring(sha256(convert_to({id}::text || '/' || {base} || '/' || {target}, \
+        "encode(substring(sha256(convert_to({id}::text \
+         || '/' || octet_length(convert_to({base}, 'UTF8')) || ':' || {base} \
+         || '/' || octet_length(convert_to({target}, 'UTF8')) || ':' || {target}, \
          'UTF8')) FROM 1 FOR 16), 'hex')::uuid"
     )
 }

@@ -39,8 +39,10 @@ Design decisions:
   `ramp_id` when an `UPDATE` changes a ramp without a new id, so a replica
   from before the migration cannot reuse an old id. A base-build change
   gives an active ramp a fresh id. A fan-out stores one id per base and
-  target. Ramp and policy
-  writes with an id are idempotent, so a retry cannot split the identity. After
+  target. The id hash prefixes each build id with its byte length. Ramp and policy
+  writes with an id are idempotent. A retry with the same `Idempotency-Key`
+  header gets the same id, so it cannot split the identity. A recovery claim
+  that fails on one pool tries the next marker pool. After
   a restart, the guard matches markers to ramps by id and base build, not by
   clocks, to finish a partial clear. A clear has a server-side timeout, so it cannot commit late. After a
   cancel, a pass starts no new clear.

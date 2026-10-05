@@ -791,7 +791,9 @@ re-declaring `target_build_id`); `clear` removes it entirely.
 > `HarvestPlugin::ramp_guard(RampGuardConfig::new())`. The target build can
 > fail or ND-block more runs than the base build. The guard then clears the
 > ramp with no operator action and writes a `build_routing.ramp.auto_abort`
-> audit row.
+> audit row. Send an `Idempotency-Key` header with each ramp request, and
+> resend the same key when you retry a `207` response. Every shard then
+> keeps one ramp id, so the guard judges one ramp.
 > See [`docs/operations/build-ramp-guard.md`](../operations/build-ramp-guard.md).
 
 **Step 4 — Promote to full cutover.**

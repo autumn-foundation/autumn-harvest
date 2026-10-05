@@ -1379,11 +1379,23 @@ async fn mark_reported_on_pool(
     }
 }
 
+/// The result of one recovery claim on one pool.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimOutcome {
+    /// This guard took the claim.
+    Claimed,
+    /// The claim did not apply. Another guard holds a fresh claim, or the
+    /// marker is reported or gone.
+    Refused,
+    /// The claim failed or timed out. Another pool can still take it.
+    Failed,
+}
+
 /// Claim the recovery of the unreported abort of `ramp_id` on one pool,
-/// within `bound`. Returns `true` when this call took the claim.
+/// within `bound`.
 ///
-/// A failure logs a warning and returns `false`, so the guard does not
-/// report. A later pass tries again.
+/// A failure logs a warning and returns [`ClaimOutcome::Failed`].
 #[cfg(feature = "db")]
 async fn claim_on_pool(
     pool: &crate::worker::DbPool,
@@ -1392,7 +1404,7 @@ async fn claim_on_pool(
     ramp_id: uuid::Uuid,
     lease: Duration,
     bound: Duration,
-) -> bool {
+) -> ClaimOutcome {
     let claim = async {
         let mut conn = pool.get().await.map_err(|e| e.to_string())?;
         claim_unreported_abort(&mut conn, queue, ramp_id, lease, bound)
@@ -1400,14 +1412,15 @@ async fn claim_on_pool(
             .map_err(|e| e.to_string())
     };
     match tokio::time::timeout(bound.saturating_mul(2), claim).await {
-        Ok(Ok(claimed)) => claimed,
+        Ok(Ok(true)) => ClaimOutcome::Claimed,
+        Ok(Ok(false)) => ClaimOutcome::Refused,
         Ok(Err(error)) => {
             tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard recovery claim failed");
-            false
+            ClaimOutcome::Failed
         }
         Err(_) => {
             tracing::warn!(queue = %queue, pool = index, "ramp guard recovery claim timed out");
-            false
+            ClaimOutcome::Failed
         }
     }
 }
@@ -2109,9 +2122,12 @@ async fn mark_reported(
 
 /// Report a finished abort that no guard reported.
 ///
-/// The guard claims the abort first, on the first pool that holds an
-/// unreported marker. The claim is a lease of `lease`. Only the guard that
-/// took the claim reports. The report has reason
+/// The guard claims the abort first. It tries the pools that hold an
+/// unreported marker, in order. A claim that fails or times out moves to the
+/// next pool, so one pool that rejects writes cannot block the report. A
+/// refused claim stops the attempt, because another guard holds the abort.
+/// The claim is a lease of `lease`. Only the guard that took the claim
+/// reports. The report has reason
 /// [`RampAbortReason::Unreported`] and no rates, because the verdict is
 /// gone. The report ledger makes the report exactly-once. After a committed
 /// report, or when the ledger already held it, the guard marks every marker
@@ -2128,9 +2144,24 @@ async fn report_unreported(
     bound: Duration,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<RampAbort> {
-    let &first = lost.pools.first()?;
-    let pool = pools.get(first)?;
-    if !claim_on_pool(pool, first, &lost.queue, lost.ramp_id, lease, bound).await {
+    let mut claimed = false;
+    for &index in &lost.pools {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let Some(pool) = pools.get(index) else {
+            continue;
+        };
+        match claim_on_pool(pool, index, &lost.queue, lost.ramp_id, lease, bound).await {
+            ClaimOutcome::Claimed => {
+                claimed = true;
+                break;
+            }
+            ClaimOutcome::Refused => return None,
+            ClaimOutcome::Failed => {}
+        }
+    }
+    if !claimed {
         return None;
     }
     let abort = RampAbort {

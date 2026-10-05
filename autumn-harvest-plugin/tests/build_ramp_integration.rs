@@ -10,7 +10,7 @@
 //! compile-checked only here (`cargo test --no-run` / `cargo check --tests`);
 //! they exercise a real Postgres instance in CI.
 
-use autumn_harvest::build_routing::set_build_policy;
+use autumn_harvest::build_routing::{set_build_policy, set_build_ramp};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
@@ -106,6 +106,30 @@ async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, 
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
+        .await
+        .expect("POST request failed");
+    let status = response.status();
+    let json = read_json_response(response).await;
+    (status, json)
+}
+
+/// POST `body` with an optional `Idempotency-Key` header.
+async fn post_json_with_key(
+    app: &HarvestApiApp,
+    uri: &str,
+    body: Value,
+    key: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(key) = key {
+        request = request.header("Idempotency-Key", key);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .expect("POST request failed");
     let status = response.status();
@@ -266,4 +290,111 @@ async fn set_ramp_records_audit_row() {
         !records.is_empty(),
         "expected an audit record for build_routing.ramp.set"
     );
+}
+
+/// The `ramp_id` stored for the `default` queue.
+async fn stored_ramp_id(pool: &DbPool) -> Option<uuid::Uuid> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        ramp_id: Option<uuid::Uuid>,
+    }
+    let mut conn = pool.get().await.expect("get conn");
+    diesel::sql_query("SELECT ramp_id FROM harvest_build_policies WHERE queue_name = 'default'")
+        .get_result::<Row>(&mut conn)
+        .await
+        .expect("read ramp_id")
+        .ramp_id
+}
+
+/// A client retries a ramp after a partial fan-out with the same
+/// `Idempotency-Key`. Every shard then stores the same `ramp_id`, so the ramp
+/// guard sees one ramp generation (issue #1814). Two databases stand in for
+/// the shard of the first request and the shard of the retry.
+#[tokio::test]
+async fn a_retried_ramp_with_one_idempotency_key_gets_one_ramp_id_on_every_shard() {
+    let (url_a, _container_a) = setup_test_database_url().await;
+    let (url_b, _container_b) = setup_test_database_url().await;
+    let mut apps = Vec::new();
+    let mut pools = Vec::new();
+    for url in [&url_a, &url_b] {
+        let pool = build_test_pool(url);
+        let mut conn = pool.get().await.expect("get conn");
+        set_build_policy(&mut conn, "default", "base-v1", None)
+            .await
+            .expect("seed base policy");
+        drop(conn);
+        pools.push(pool.clone());
+        apps.push(build_ramp_app(pool));
+    }
+    let ramp = |percent: i32| json!({ "queue_name": "default", "target_build_id": "canary-v2", "ramp_percent": percent });
+
+    let mut keyed = Vec::new();
+    for (app, pool) in apps.iter().zip(&pools) {
+        let (status, body) = post_json_with_key(
+            app,
+            "/admin/build-routing/ramp",
+            ramp(25),
+            Some("ramp-1814"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        keyed.push(stored_ramp_id(pool).await);
+    }
+    assert!(keyed[0].is_some(), "a ramp has an id: {keyed:?}");
+    assert_eq!(keyed[0], keyed[1], "one key gives one ramp id");
+
+    // With no key, each request is a new operation with its own id.
+    let mut unkeyed = Vec::new();
+    for (app, pool) in apps.iter().zip(&pools) {
+        let (status, body) =
+            post_json_with_key(app, "/admin/build-routing/ramp", ramp(50), None).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        unkeyed.push(stored_ramp_id(pool).await);
+    }
+    assert!(unkeyed[0].is_some(), "a ramp has an id: {unkeyed:?}");
+    assert_ne!(unkeyed[0], unkeyed[1], "no key gives a new id per request");
+}
+
+/// A policy update keeps an active ramp. A retry of a partial policy fan-out
+/// with the same `Idempotency-Key` gives that ramp one `ramp_id` on every
+/// shard (issue #1814).
+#[tokio::test]
+async fn a_retried_policy_update_with_one_idempotency_key_keeps_one_ramp_id() {
+    let (url_a, _container_a) = setup_test_database_url().await;
+    let (url_b, _container_b) = setup_test_database_url().await;
+    let mut apps = Vec::new();
+    let mut pools = Vec::new();
+    for url in [&url_a, &url_b] {
+        let pool = build_test_pool(url);
+        let mut conn = pool.get().await.expect("get conn");
+        set_build_policy(&mut conn, "default", "base-v1", None)
+            .await
+            .expect("seed base policy");
+        set_build_ramp(&mut conn, "default", "canary-v2", 25)
+            .await
+            .expect("seed ramp");
+        drop(conn);
+        pools.push(pool.clone());
+        apps.push(build_ramp_app(pool));
+    }
+    let policy = json!({ "queue_name": "default", "build_id": "base-v3" });
+
+    let mut ids = Vec::new();
+    for (app, pool) in apps.iter().zip(&pools) {
+        let (status, body) = post_json_with_key(
+            app,
+            "/admin/build-routing/policies",
+            policy.clone(),
+            Some("policy-1814"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["target_build_id"], "canary-v2", "the ramp stays");
+        ids.push(stored_ramp_id(pool).await);
+    }
+    assert!(ids[0].is_some(), "a retained ramp has an id: {ids:?}");
+    assert_eq!(ids[0], ids[1], "one key gives one ramp id");
 }

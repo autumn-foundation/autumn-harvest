@@ -1379,6 +1379,48 @@ async fn policy_ramp_id(conn: &mut AsyncPgConnection) -> Option<uuid::Uuid> {
         .ramp_id
 }
 
+/// Build ids are free text, so a `/` in one cannot shift the split between
+/// base and target. Two pairs with the same joined text get different ids.
+#[test]
+fn a_slash_in_a_build_id_cannot_collide_two_generations() {
+    let id = uuid::Uuid::new_v4();
+    assert_ne!(
+        ramp_generation_id(id, "a/b", "c"),
+        ramp_generation_id(id, "a", "b/c")
+    );
+}
+
+/// The SQL writers store the same id as [`ramp_generation_id`], also for
+/// build ids with a `/` or multi-byte text.
+#[tokio::test]
+async fn the_stored_ramp_id_matches_the_rust_derivation() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let (base, target) = ("base/ü", "target/ç");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_build_policy(&mut conn, QUEUE, base, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp_with_id(&mut conn, QUEUE, target, RAMP_PERCENT, ramp_id)
+        .await
+        .expect("set ramp");
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(ramp_id, base, target)),
+        "ramp write"
+    );
+
+    let new_base = "base/ä";
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, new_base, None, ramp_id)
+        .await
+        .expect("set policy");
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(ramp_id, new_base, target)),
+        "policy write"
+    );
+}
+
 /// A writer from before the `ramp_id` column changes a ramp but keeps the
 /// old `ramp_id`. The database clears that id, so an old abort marker cannot
 /// match the new ramp.
@@ -1826,6 +1868,47 @@ async fn a_fresh_claim_on_one_pool_stops_recovery_on_every_pool() {
     assert!(aborts.is_empty(), "the claim holds fleet-wide: {aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0);
     assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(false));
+}
+
+/// A recovery claim that fails on one pool moves to the next marker pool.
+/// Pool 1 stays readable, but a row lock blocks the claim there. The abort is
+/// still reported once, through pool 2.
+#[tokio::test]
+async fn a_failed_recovery_claim_tries_the_next_marker_pool() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut locker = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect locker");
+    let ramp_id = clear_on_both_pools_unreported(&mut conn_1, &mut conn_2).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock pool 1 policy row");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_2, &config, None).await;
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert_eq!(aborts.len(), 1, "pool 2 takes the claim: {aborts:?}");
+    assert_eq!(aborts[0].reason, RampAbortReason::Unreported);
+    assert_eq!(auto_abort_audit_rows(&mut conn_2).await, 1);
+    assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(true));
 }
 
 /// A reported marker on one pool means that the abort was reported. A pass

@@ -230,8 +230,10 @@ The guard fails safe: when it cannot read, it does not abort.
   judges it as usual.
 - A ramp fan-out and a policy fan-out each pass one caller id to every
   pool. Each pool stores an id derived from that caller id, its base build
-  and its target (`build_routing::ramp_generation_id`). So pools with the
-  same base and target share one identity. A partial fan-out can leave
+  and its target (`build_routing::ramp_generation_id`). The hash input
+  prefixes each build id with its byte length, so a `/` in a build id cannot
+  make two pairs share an id. So pools with the same base and target share
+  one identity. A partial fan-out can leave
   pools with different bases or targets. Those ramps then get different
   ids, as the guard judges them apart. An abort of one cannot finish the
   other, and the report ledger reports each abort.
@@ -239,16 +241,23 @@ The guard fails safe: when it cannot read, it does not abort.
   starts a new step. It gives the ramp a fresh `ramp_id`, so no old marker
   matches it.
 - Each ramp write and each policy write with a ramp id is idempotent. A row
-  that already holds the same write is left as is, and its step stays. So a
-  retried fan-out, or two logical shards on one pool, cannot split the ramp
-  identity.
+  that already holds the same write is left as is, and its step stays. So
+  two logical shards on one pool cannot split the ramp identity.
+- A request with an `Idempotency-Key` header gets a caller id derived from
+  the route, the queue and the key. Retry a partial fan-out (`207`) with the
+  same key. Every pool then stores the same `ramp_id`, and the guard judges
+  one generation. A retry without a key gets a new caller id. The pools that
+  the first request reached keep the old id, so the ramp splits into two
+  generations. Use a new key for each new ramp.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported, older than `report_grace`, and whose ramp no
   pool holds. The pass looks at all markers of the abort on all pools. A
   claim younger than the lease on any pool holds the whole abort back. It
   claims the abort with a lease, and only the guard that took the claim
-  reports. The lease covers every write that the claimer can
+  reports. It tries the marker pools in order. A claim that fails or times
+  out moves to the next pool. A claim that another guard holds stops the
+  attempt. The lease covers every write that the claimer can
   still make: one claim, one audit row and one mark per pool. It is at least
   `report_grace`. With one pool and a bound of 30 s, the lease is 150 s. The claim leaves the marker
   unreported. That guard reports the abort with reason `unreported`, no
