@@ -698,9 +698,11 @@ these free-form strings in `harvest_events.event_data`:
 
 The engine also writes the `error` columns of `harvest_workflow_executions`,
 `harvest_task_queue` and `harvest_dead_letters` as plain text. The dead-letter
-`failure_signature` derives from the error text. The history export puts the
-`WorkflowFailed` error text in a diagram note. A completion callback sends the
-error text to its URL.
+`failure_signature` derives from the error text. The history export keeps
+every failure string above in clear, in both the full and the redacted JSON
+mode. The redacted mode summarizes payload and token fields only. The Mermaid
+diagram also prints some error text. A completion callback sends the error text
+to its URL.
 
 Erasure (issue #495) does not erase error text. Operators need it to diagnose
 failures. A validation message often quotes the bad value, for example an email
