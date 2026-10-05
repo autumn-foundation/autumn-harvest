@@ -639,6 +639,10 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 struct Pinned {
     generations: BTreeMap<i32, ShardGeneration>,
     default_shard: Option<ShardId>,
+    /// How many holders each held shard has (issue #1823). Two workers in one
+    /// process can hold the same shard. The sentinel goes only when the last
+    /// one releases it.
+    holders: BTreeMap<i32, usize>,
 }
 
 /// A [`FenceRegistry::publish`] rejected because the shard is already pinned at
@@ -877,21 +881,35 @@ impl FenceRegistry {
     ///
     /// A worker holds a shard it could not probe at startup. The claim gate
     /// then selects nothing on it, and the persist assert fails closed. A
-    /// shard this process already pinned keeps its pin.
+    /// shard this process already pinned keeps its pin. Each call adds one
+    /// holder to each held shard; [`Self::release_held`] removes one.
     ///
     /// # Errors
     ///
     /// The default shard conflicts with one already pinned.
     pub fn hold(shards: &[ShardId], default_shard: ShardId) -> Result<(), PublishConflict> {
-        let pins: Vec<(ShardId, ShardGeneration)> = shards
+        let held: Vec<ShardId> = shards
             .iter()
-            .filter(|shard| Self::expected(**shard).is_none())
-            .map(|shard| (*shard, HELD))
+            .copied()
+            .filter(|shard| matches!(Self::expected(*shard), None | Some(HELD)))
             .collect();
-        Self::publish(&pins, default_shard)
+        let pins: Vec<(ShardId, ShardGeneration)> =
+            held.iter().map(|shard| (*shard, HELD)).collect();
+        Self::publish(&pins, default_shard)?;
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pinned) = guard.as_mut() {
+            for shard in held {
+                *pinned.holders.entry(shard.as_i32()).or_insert(0) += 1;
+            }
+        }
+        drop(guard);
+        Ok(())
     }
 
-    /// Release a held shard, so it runs unfenced (issue #1823).
+    /// Remove one holder from a held shard (issue #1823). When the last
+    /// holder goes, the shard runs unfenced.
     ///
     /// Only a sentinel pin is removed. A real pin is fixed for the life of the
     /// process, so this never touches one.
@@ -900,8 +918,16 @@ impl FenceRegistry {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let empty = guard.as_mut().is_none_or(|pinned| {
-            if pinned.generations.get(&shard.as_i32()) == Some(&HELD) {
-                pinned.generations.remove(&shard.as_i32());
+            let key = shard.as_i32();
+            let remaining = pinned.holders.get_mut(&key).map_or(0, |count| {
+                *count = count.saturating_sub(1);
+                *count
+            });
+            if remaining == 0 {
+                pinned.holders.remove(&key);
+                if pinned.generations.get(&key) == Some(&HELD) {
+                    pinned.generations.remove(&key);
+                }
             }
             pinned.generations.is_empty()
         });
@@ -3108,6 +3134,14 @@ mod tests {
             FenceRegistry::binding(ShardId::UNENCODED),
             Some((ShardId::new(3), HELD)),
             "pre-sharding ids resolve to the held default shard"
+        );
+
+        // A second holder keeps the shard held until it releases too.
+        FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("second holder");
+        FenceRegistry::release_held(ShardId::new(3));
+        assert!(
+            FenceRegistry::is_held(ShardId::new(3)),
+            "one holder remains"
         );
 
         FenceRegistry::release_held(ShardId::new(3));

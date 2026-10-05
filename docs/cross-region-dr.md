@@ -333,10 +333,11 @@ Three limits, stated plainly:
   cannot be read, every admin write on the node answers `503`. That fails
   closed. A node that has lost authority on one shard has lost it on the
   failover the runbook performs for all shards.
-- `--expect-generation` takes one value for every `--shard` in a command.
-  After the runbook, all shards share one generation. Shards at different
-  generations need separate commands. The CLI probes with the default
-  `harvest_dr` prefix. With a custom prefix, always pass the flag.
+- `--expect-generation N` covers every `--shard` in a command. After the
+  runbook, all shards share one generation. Shards at different generations
+  take `--expect-generation <ID>=<N>`, once per shard. A per-shard value
+  overrides `N`. The CLI probes with the default `harvest_dr` prefix. With a
+  custom prefix, always pass the flag.
 
 ### Invariants
 

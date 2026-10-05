@@ -30469,31 +30469,48 @@ impl Worker {
         &self,
         held: Vec<(crate::types::ShardId, DbPool)>,
     ) -> Option<AbortOnDrop> {
+        /// Releases this worker's remaining holds when the task ends or is
+        /// aborted, so a stopped worker leaves no hold behind. A shard found
+        /// to carry a DR marker leaves this list and stays held.
+        struct HeldShards(Vec<(crate::types::ShardId, DbPool)>);
+        impl Drop for HeldShards {
+            fn drop(&mut self) {
+                for (shard, _) in &self.0 {
+                    crate::replication::FenceRegistry::release_held(*shard);
+                }
+            }
+        }
+
         if held.is_empty() {
             return None;
         }
         let shutdown = self.shutdown.clone();
         let worker_id = self.config.worker_id.clone();
         let slot_prefix = self.config.dr.slot_prefix.clone();
+        // Built before the spawn, so a task aborted before its first poll
+        // still drops the guard and releases the holds.
+        let mut held = HeldShards(held);
         Some(AbortOnDrop::new(tokio::spawn(async move {
-            let mut held = held;
             let mut delay = Duration::from_secs(1);
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => return,
                     () = tokio::time::sleep(delay) => {}
                 }
-                if let Err(error) = crate::replication::resolve_held(&mut held, &slot_prefix).await
+                if let Err(error) =
+                    crate::replication::resolve_held(&mut held.0, &slot_prefix).await
                 {
                     tracing::error!(
                         worker_id = %worker_id,
                         error = %error,
                         "stopping: a held shard needs a DR pin"
                     );
+                    // The process must restart and pin, so the holds stay.
+                    held.0.clear();
                     shutdown.cancel();
                     return;
                 }
-                if held.is_empty() {
+                if held.0.is_empty() {
                     return;
                 }
                 delay = (delay * 2).min(Duration::from_secs(10));

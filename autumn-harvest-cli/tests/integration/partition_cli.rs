@@ -171,7 +171,7 @@ fn every_partition_write_accepts_the_expected_generation() {
     ] {
         let rendered = parse(args).expect("the flag parses");
         assert!(
-            rendered.contains("expect_generation: Some(3)"),
+            rendered.contains("ExpectGeneration { shard: None, generation: 3 }"),
             "{rendered}"
         );
     }
@@ -183,5 +183,47 @@ fn every_partition_write_accepts_the_expected_generation() {
         "postgres://h/s0",
     ])
     .expect("the flag is optional at parse time");
-    assert!(rendered.contains("expect_generation: None"), "{rendered}");
+    assert!(rendered.contains("expect_generation: []"), "{rendered}");
+}
+
+/// Generations are per shard, so the flag takes `<ID>=<N>` too, once per
+/// shard (issue #1823).
+#[test]
+fn the_expected_generation_can_name_each_shard() {
+    let rendered = parse(&[
+        "harvest",
+        "shard",
+        "rebalance",
+        "--shard",
+        "0=postgres://h/s0",
+        "--shard",
+        "1=postgres://h/s1",
+        "--from",
+        "0",
+        "--to",
+        "1",
+        "--expect-generation",
+        "0=4",
+        "--expect-generation",
+        "1=7",
+    ])
+    .expect("per-shard values parse");
+    assert!(
+        rendered.contains("ExpectGeneration { shard: Some(0), generation: 4 }")
+            && rendered.contains("ExpectGeneration { shard: Some(1), generation: 7 }"),
+        "{rendered}"
+    );
+    assert!(
+        parse(&[
+            "harvest",
+            "partition",
+            "maintain",
+            "--shard",
+            "postgres://h/s0",
+            "--expect-generation",
+            "x=1",
+        ])
+        .is_err(),
+        "a malformed value is rejected at parse time"
+    );
 }

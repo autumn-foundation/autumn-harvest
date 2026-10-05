@@ -2547,12 +2547,16 @@ async fn test_runner_startup_fails_on_sync_failure() {
     )
     .await;
 
-    // Verify it failed to start
+    // Verify it failed to start. Since issue #1823 the DR fence probe runs
+    // first, before any write, so an unreachable database now refuses there.
+    // Trigger sync never runs against a database the runner cannot probe.
     assert!(result.is_err());
     let err_str = result.err().unwrap().to_string();
     assert!(
         err_str.contains("Failed to get DB connection")
             || err_str.contains("sync completion triggers")
+            || err_str.contains("cross-region DR fencing could not be resolved"),
+        "{err_str}"
     );
 }
 

@@ -330,11 +330,12 @@ pub enum PartitionCommand {
         /// The DR generation that holds write authority (issue #1823).
         ///
         /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. The command
-        /// refuses a shard at any other generation, so a stale DSN to a
-        /// demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "N")]
-        expect_generation: Option<i64>,
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
 
         /// Convert even when a logical-replication publication covers
         /// `harvest_events` without `publish_via_partition_root`.
@@ -373,11 +374,12 @@ pub enum PartitionCommand {
         /// The DR generation that holds write authority (issue #1823).
         ///
         /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. The command
-        /// refuses a shard at any other generation, so a stale DSN to a
-        /// demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "N")]
-        expect_generation: Option<i64>,
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
 
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
@@ -401,11 +403,12 @@ pub enum PartitionCommand {
         /// The DR generation that holds write authority (issue #1823).
         ///
         /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. The command
-        /// refuses a shard at any other generation, so a stale DSN to a
-        /// demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "N")]
-        expect_generation: Option<i64>,
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
 
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
@@ -1973,12 +1976,13 @@ enum ShardCommand {
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
         /// The DR generation that holds write authority (issue #1823).
         ///
-        /// Required when any `--shard` database carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. The command
-        /// refuses a shard at any other generation, so a stale DSN writes
-        /// nothing.
-        #[arg(long = "expect-generation", value_name = "N")]
-        expect_generation: Option<i64>,
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -2001,12 +2005,13 @@ enum ShardCommand {
         limit: i64,
         /// The DR generation that holds write authority (issue #1823).
         ///
-        /// Required when any `--shard` database carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. The command
-        /// refuses a shard at any other generation, so a stale DSN writes
-        /// nothing.
-        #[arg(long = "expect-generation", value_name = "N")]
-        expect_generation: Option<i64>,
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -2043,12 +2048,13 @@ enum ShardCommand {
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
         /// The DR generation that holds write authority (issue #1823).
         ///
-        /// Required when any `--shard` database carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. The command
-        /// refuses a shard at any other generation, so a stale DSN writes
-        /// nothing.
-        #[arg(long = "expect-generation", value_name = "N")]
-        expect_generation: Option<i64>,
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
         /// Print the raw JSON count instead of a human summary.
         #[arg(long)]
         json: bool,
@@ -5999,6 +6005,109 @@ async fn dr_connect_read_only(
 
 // ── `harvest partition` (issue #958) ───────────────────────────────────────
 
+/// One `--expect-generation` value: `N` for every shard, or `<ID>=<N>` for
+/// one shard (issue #1823).
+///
+/// Generations are per shard. After a partial or independent fence, the two
+/// shards of a rebalance can hold different valid generations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectGeneration {
+    /// The shard this value covers, or `None` for every shard.
+    pub shard: Option<i32>,
+    /// The generation that holds write authority there.
+    pub generation: i64,
+}
+
+/// Parse one `--expect-generation` value.
+fn parse_expect_generation(raw: &str) -> Result<ExpectGeneration, String> {
+    let number = |text: &str, what: &str| {
+        text.trim()
+            .parse::<i64>()
+            .map_err(|_| format!("--expect-generation: `{text}` is not a valid {what}"))
+    };
+    match raw.split_once('=') {
+        Some((shard, generation)) => {
+            Ok(ExpectGeneration {
+                shard: Some(i32::try_from(number(shard, "shard id")?).map_err(|_| {
+                    format!("--expect-generation: shard id `{shard}` is out of range")
+                })?),
+                generation: number(generation, "generation")?,
+            })
+        }
+        None => Ok(ExpectGeneration {
+            shard: None,
+            generation: number(raw, "generation")?,
+        }),
+    }
+}
+
+/// The generation stated for `shard`. A per-shard value overrides `N`.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] when the values name the same scope twice.
+fn expected_generation_for(
+    values: &[ExpectGeneration],
+    shard: i32,
+) -> Result<Option<i64>, CliError> {
+    let pick = |scope: Option<i32>| -> Result<Option<i64>, CliError> {
+        let mut found = values.iter().filter(|v| v.shard == scope);
+        let first = found.next().map(|v| v.generation);
+        if found.next().is_some() {
+            return Err(CliError::InvalidInput(format!(
+                "--expect-generation names {} more than once",
+                scope.map_or_else(|| "every shard".to_string(), |s| format!("shard {s}"))
+            )));
+        }
+        Ok(first)
+    };
+    let all = pick(None)?;
+    Ok(pick(Some(shard))?.or(all))
+}
+
+#[cfg(test)]
+mod expect_generation_tests {
+    use super::{ExpectGeneration, expected_generation_for, parse_expect_generation};
+
+    #[test]
+    fn a_per_shard_value_overrides_the_value_for_every_shard() {
+        let values = [
+            parse_expect_generation("5").unwrap(),
+            parse_expect_generation("1=7").unwrap(),
+        ];
+        assert_eq!(expected_generation_for(&values, 1).unwrap(), Some(7));
+        assert_eq!(expected_generation_for(&values, 0).unwrap(), Some(5));
+        assert_eq!(expected_generation_for(&[], 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_scope_named_twice_is_rejected() {
+        let twice = [
+            ExpectGeneration {
+                shard: Some(1),
+                generation: 2,
+            },
+            ExpectGeneration {
+                shard: Some(1),
+                generation: 3,
+            },
+        ];
+        assert!(expected_generation_for(&twice, 1).is_err());
+        let bare_twice = [
+            parse_expect_generation("2").unwrap(),
+            parse_expect_generation("3").unwrap(),
+        ];
+        assert!(expected_generation_for(&bare_twice, 0).is_err());
+    }
+
+    #[test]
+    fn malformed_values_are_rejected() {
+        assert!(parse_expect_generation("x").is_err());
+        assert!(parse_expect_generation("1=x").is_err());
+        assert!(parse_expect_generation("99999999999=1").is_err());
+    }
+}
+
 /// Refuse a direct-database write on a shard without write authority
 /// (issue #1823).
 ///
@@ -6009,21 +6118,23 @@ async fn dr_connect_read_only(
 async fn direct_write_authority(
     conn: &mut autumn_harvest::diesel_async::AsyncPgConnection,
     shard_id: i32,
-    expect_generation: Option<i64>,
+    expect_generation: &[ExpectGeneration],
     kind: autumn_harvest::replication::AdminWrite,
 ) -> Result<(), String> {
+    let expected =
+        expected_generation_for(expect_generation, shard_id).map_err(|e| e.to_string())?;
     autumn_harvest::replication::assert_admin_write_authority(
         conn,
         autumn_harvest::types::ShardId::new(shard_id),
-        expect_generation.map(autumn_harvest::replication::ShardGeneration::new),
+        expected.map(autumn_harvest::replication::ShardGeneration::new),
         autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX,
         kind,
     )
     .await
     .map_err(|error| match error {
         autumn_harvest::HarvestError::Config(_) => format!(
-            "{error} Pass --expect-generation <N>, where N is the generation `harvest dr \
-             status` reports on the promoted primary."
+            "{error} Pass --expect-generation <N> (or <ID>=<N> per shard), where N is the \
+             generation `harvest dr status` reports on the promoted primary."
         ),
         other => other.to_string(),
     })
@@ -6034,7 +6145,7 @@ async fn direct_write_authority(
 /// authority.
 async fn shard_pool_write_authority(
     pool: &autumn_harvest::shard::ShardedDbPool,
-    expect_generation: Option<i64>,
+    expect_generation: &[ExpectGeneration],
 ) -> Result<(), CliError> {
     for (shard, shard_pool) in pool.iter_shards() {
         let mut conn = shard_pool
@@ -6242,7 +6353,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
             };
             opts.validate()
                 .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-            run_partition_enable(shards, &opts, *expect_generation, *format).await
+            run_partition_enable(shards, &opts, expect_generation, *format).await
         }
         PartitionCommand::Maintain {
             shards,
@@ -6255,7 +6366,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
                 shards,
                 *lookahead_cohorts,
                 *max_drops,
-                *expect_generation,
+                expect_generation,
                 *format,
             )
             .await
@@ -6274,7 +6385,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
                         .to_string(),
                 ));
             }
-            run_partition_disable(shards, *expect_generation, *format).await
+            run_partition_disable(shards, expect_generation, *format).await
         }
     }
 }
@@ -6334,7 +6445,7 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
 async fn run_partition_enable(
     shards: &[String],
     opts: &autumn_harvest::partition::EnableOptions,
-    expect_generation: Option<i64>,
+    expect_generation: &[ExpectGeneration],
     format: DrFormat,
 ) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
@@ -6382,7 +6493,7 @@ async fn run_partition_maintain(
     shards: &[String],
     lookahead_cohorts: u32,
     max_drops: usize,
-    expect_generation: Option<i64>,
+    expect_generation: &[ExpectGeneration],
     format: DrFormat,
 ) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
@@ -6448,7 +6559,7 @@ async fn run_partition_maintain(
 
 async fn run_partition_disable(
     shards: &[String],
-    expect_generation: Option<i64>,
+    expect_generation: &[ExpectGeneration],
     format: DrFormat,
 ) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
@@ -10296,7 +10407,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             }
             let pool = build_pool(&targets)?;
             if !*dry_run {
-                shard_pool_write_authority(&pool, *expect_generation).await?;
+                shard_pool_write_authority(&pool, expect_generation).await?;
             }
             let after = after_created_at
                 .zip(*after_execution_id)
@@ -10335,7 +10446,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            shard_pool_write_authority(&pool, *expect_generation).await?;
+            shard_pool_write_authority(&pool, expect_generation).await?;
             let outcomes = autumn_harvest::shard_rebalance::resume_incomplete_migrations(
                 &pool,
                 ShardId::new(*from),
@@ -10373,7 +10484,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            shard_pool_write_authority(&pool, *expect_generation).await?;
+            shard_pool_write_authority(&pool, expect_generation).await?;
             let after = after_migrated_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
