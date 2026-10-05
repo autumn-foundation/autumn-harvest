@@ -1827,7 +1827,7 @@ pub async fn enforce_activity_timeout_for_test(
     enforce_activity_timeout(
         conn,
         task,
-        execution_id_from_uuid(exec_uuid),
+        ExecutionId::from_uuid(exec_uuid),
         reason,
         circuit_breakers,
         &crate::telemetry::NoOpMetrics,
