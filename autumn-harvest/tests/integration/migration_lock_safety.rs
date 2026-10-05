@@ -272,6 +272,9 @@ struct History {
     /// schema. DDL on the parent recurses to its children, so it locks the hot
     /// child too.
     hot_parents: BTreeSet<String>,
+    /// Each partition or inheritance link, as (parent, child) without schemas.
+    /// `relink` derives `partitions` and `hot_parents` from these links.
+    links: BTreeSet<(String, String)>,
     /// Each table that a migration created with `PARTITION BY`, without its
     /// schema. Postgres runs no `CONCURRENTLY` index DDL on such a table.
     partitioned: BTreeSet<String>,
@@ -312,10 +315,38 @@ impl History {
     /// The partition manager creates `harvest_events` partitions at run time,
     /// so no migration names them. Their names come from `partition.rs`.
     fn is_hot(&self, table: &str) -> bool {
+        self.is_hot_itself(table) || self.hot_parents.contains(base(table))
+    }
+
+    /// Recompute the tables that a link makes hot, in any learning order.
+    ///
+    /// Hotness flows down from a hot table to each child, which shares its
+    /// scans. It flows up from any hot table to each ancestor, whose DDL
+    /// recurses to it. A table that is hot only as a parent passes nothing
+    /// down, because its own traffic is cold.
+    fn relink(&mut self) {
+        loop {
+            let before = self.partitions.len() + self.hot_parents.len();
+            for (parent, child) in self.links.clone() {
+                if self.is_hot_itself(&parent) {
+                    self.partitions.insert(child.clone());
+                }
+                if self.is_hot(&child) {
+                    self.hot_parents.insert(parent);
+                }
+            }
+            if self.partitions.len() + self.hot_parents.len() == before {
+                break;
+            }
+        }
+    }
+
+    /// Whether `table` takes hot traffic itself: a listed table, or a
+    /// partition or child of one.
+    fn is_hot_itself(&self, table: &str) -> bool {
         let name = base(table);
         HOT_TABLES.contains(&name)
             || self.partitions.contains(name)
-            || self.hot_parents.contains(name)
             || name.starts_with(PARTITION_PREFIX)
             || name == LEGACY_PARTITION
     }
@@ -3759,11 +3790,30 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
         .entry(base(&new).to_string())
         .or_default()
         .extend(keys);
-    for names in [&mut history.partitions, &mut history.partitioned] {
+    for names in [
+        &mut history.partitions,
+        &mut history.partitioned,
+        &mut history.hot_parents,
+    ] {
         if names.contains(base(&old)) {
             names.insert(base(&new).to_string());
         }
     }
+    // Each link of the old name now ties the new name too.
+    let rename = |name: &String| {
+        if name == base(&old) {
+            base(&new).to_string()
+        } else {
+            name.clone()
+        }
+    };
+    let renamed: Vec<(String, String)> = history
+        .links
+        .iter()
+        .map(|(parent, child)| (rename(parent), rename(child)))
+        .collect();
+    history.links.extend(renamed);
+    history.relink();
     // An index on the old name now sits on the new one. A foreign key that
     // pointed at the old name now points at the new one.
     for tables in history
@@ -3969,7 +4019,8 @@ fn references(s: &Stmts, k: usize, history: &mut History) -> Option<Raw> {
     Some(Raw::lock(s.starts[k], "REFERENCES", Some(target)))
 }
 
-/// Remember `child` as hot when its `parent` is hot.
+/// Remember the link from `parent` to `child`, and recompute which tables it
+/// makes hot.
 ///
 /// The lint learns it even from a branch that may not run. A wrong guess only
 /// makes a later lock stricter. The history only grows, so a detach or a drop
@@ -3978,12 +4029,10 @@ fn learn_partition(history: &mut History, parent: Option<&str>, child: Option<&s
     let (Some(parent), Some(child)) = (parent, child) else {
         return;
     };
-    if history.is_hot(parent) {
-        history.partitions.insert(base(child).to_string());
-    }
-    if history.is_hot(child) {
-        history.hot_parents.insert(base(parent).to_string());
-    }
+    history
+        .links
+        .insert((base(parent).to_string(), base(child).to_string()));
+    history.relink();
 }
 
 /// Learn the parent and child that an `ATTACH PARTITION`, `INHERIT` or
@@ -7761,6 +7810,46 @@ fn an_inheritance_link_to_a_hot_table_is_hot() {
     let lock = "ALTER TABLE scratch_child ADD COLUMN z INT;";
     let findings = lint_with_history(&[create], lock, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn hotness_follows_whole_inheritance_chains() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    let link = |sql: &str| format!("{set}{sql}");
+    // Each case links a chain top-down, then alters a table that the chain
+    // ties to `harvest_events`.
+    let cases = [
+        (
+            vec![
+                link("ALTER TABLE parent_t INHERIT grandparent_t;"),
+                link("ALTER TABLE harvest_events INHERIT parent_t;"),
+            ],
+            "ALTER TABLE grandparent_t ADD COLUMN x INT;",
+        ),
+        (
+            vec![
+                "CREATE TABLE grandchild_t (z INT) INHERITS (child_t);".to_string(),
+                link("ALTER TABLE child_t INHERIT harvest_events;"),
+            ],
+            "ALTER TABLE grandchild_t ADD COLUMN x INT;",
+        ),
+        (
+            vec![
+                link("ALTER TABLE harvest_events INHERIT cold_parent;"),
+                link("ALTER TABLE cold_parent RENAME TO renamed_parent;"),
+            ],
+            "ALTER TABLE renamed_parent ADD COLUMN x INT;",
+        ),
+    ];
+    for (history, lock) in cases {
+        let history: Vec<&str> = history.iter().map(String::as_str).collect();
+        let findings = lint_with_history(&history, lock, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{history:?}\n{lock}\n{findings:?}"
+        );
+    }
 }
 
 #[test]

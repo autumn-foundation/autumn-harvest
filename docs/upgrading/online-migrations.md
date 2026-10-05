@@ -49,8 +49,9 @@ A partition of a hot table is hot too, because it takes the live writes of its
 parent. An inheritance child of a hot table is hot for the same reason. A
 parent of a hot table is hot too, because its DDL recurses to the child. The
 lint learns each link from `PARTITION OF`, `ATTACH PARTITION`, `INHERIT` or
-`INHERITS` in an earlier migration. A detach or a drop does not make a table
-cold again. The
+`INHERITS` in an earlier migration. Hotness follows a whole chain of links, in
+any order the links were made, and a rename keeps it. A detach or a drop does
+not make a table cold again. The
 partition manager creates `harvest_events_p_*` and `harvest_events_legacy` at
 run time, so the lint treats those names as hot.
 
