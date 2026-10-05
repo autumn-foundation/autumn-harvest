@@ -1143,6 +1143,10 @@ pub struct PayloadPolicy {
     /// limits, activity allowlist and queue-override permission. A refusal or
     /// an exhausted limit fails the workflow.
     pub module_host: serde_json::Value,
+    /// The policy of each registered workflow, sorted by name: its effective
+    /// input cap and whether it is a unified DAG. The worker enforces the cap,
+    /// and a continue-as-new into a DAG is refused.
+    pub workflows: Vec<(String, serde_json::Value)>,
 }
 
 impl PayloadPolicy {
@@ -1161,6 +1165,7 @@ impl PayloadPolicy {
             "activities": self.activities,
             "local_activity_defaults": self.local_activity_defaults,
             "module_host": self.module_host,
+            "workflows": self.workflows,
         })
     }
 }
@@ -3778,6 +3783,10 @@ mod tests {
             },
             PayloadPolicy {
                 module_host: serde_json::json!({"allow_queue_override": true}),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                workflows: vec![("order".to_owned(), serde_json::json!({"dag": true}))],
                 ..base
             },
         ]

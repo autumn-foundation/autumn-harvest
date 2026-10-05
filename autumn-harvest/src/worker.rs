@@ -1252,7 +1252,35 @@ impl HandlerRegistry {
                 .map_or(serde_json::Value::Null, module_host_policy),
             #[cfg(not(feature = "hot-code-swap"))]
             module_host: serde_json::Value::Null,
+            workflows: self.workflow_policies(),
         }
+    }
+
+    /// The policy of each registered workflow, sorted by name, for the
+    /// worker's cohort key (issue #1815).
+    ///
+    /// Each entry holds the effective input cap, which the worker applies when
+    /// it builds a task context and resolves a continue-as-new input. It also
+    /// holds whether the workflow is a unified DAG. A continue-as-new into a
+    /// DAG is refused. Deadlines and start-time policies stay out: they shape
+    /// a later run, not the task that this worker runs.
+    fn workflow_policies(&self) -> Vec<(String, serde_json::Value)> {
+        let mut policies: Vec<(String, serde_json::Value)> = self
+            .workflows
+            .iter()
+            .map(|(name, info)| {
+                let policy = serde_json::json!({
+                    "input_cap": resolve_cross_type_max_input_bytes(
+                        info,
+                        self.max_workflow_input_bytes,
+                    ),
+                    "dag": self.dag_workflow_names.contains(name),
+                });
+                (name.clone(), policy)
+            })
+            .collect();
+        policies.sort_by(|a, b| a.0.cmp(&b.0));
+        policies
     }
 
     /// The execution policy of each registered activity, sorted by name, for
@@ -37531,6 +37559,51 @@ mod tests {
         );
         // worker_id should be a valid UUID
         assert!(uuid::Uuid::parse_str(&runtime_cfg.worker_id).is_ok());
+    }
+
+    /// Issue #1815: the worker applies each workflow's input cap, and it
+    /// refuses a continue-as-new into a DAG. Workers that differ in either
+    /// are not peers.
+    #[test]
+    fn payload_policy_holds_each_workflow_policy() {
+        fn wf(max_input_bytes: Option<u64>) -> WorkflowInfo {
+            WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: "order",
+                module: "test",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            }
+        }
+        let plain = HandlerRegistry::new(vec![wf(None)], vec![]).payload_policy();
+        let larger_cap = HandlerRegistry::new(vec![wf(Some(u64::MAX))], vec![]).payload_policy();
+        let dag = HandlerRegistry::new(vec![wf(None)], vec![])
+            .with_dag_workflow_names(["order"])
+            .payload_policy();
+        assert_ne!(plain, larger_cap, "a larger per-workflow input cap");
+        assert_ne!(plain, dag, "the same workflow registered as a DAG");
+        assert_eq!(
+            plain,
+            HandlerRegistry::new(vec![wf(None)], vec![]).payload_policy()
+        );
     }
 
     #[test]
