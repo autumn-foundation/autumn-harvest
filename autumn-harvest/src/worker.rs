@@ -25479,8 +25479,9 @@ async fn release_capability_miss(
             // round-36 P2). See `release_task_for_capability_miss`.
             let released = queue::release_task_for_capability_miss(
                 conn,
-                task.id,
-                worker_id,
+                // A stuck-running requeue keeps `crash_strikes`, so only
+                // `attempt` tells this claim from a later one (issue #1917).
+                &queue::TaskClaim::new(task.id, worker_id, task.attempt),
                 delay,
                 missing.phase,
                 // The claim epoch this dispatch holds. A poison-pill requeue
