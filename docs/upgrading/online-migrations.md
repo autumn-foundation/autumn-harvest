@@ -32,6 +32,8 @@ A waiting `ACCESS EXCLUSIVE` lock on any of them stalls the fleet.
   transactions, in the application database.
 
 A table that the same migration creates is not hot after its `CREATE TABLE`.
+That holds only for statements that run in the migration. A routine body runs
+later, when other sessions may use the table, so its locks still count.
 No session can hold a lock on it yet. The exemption needs a create that surely
 runs: not `IF NOT EXISTS`, not inside a branch, and not in a function body.
 A temporary table never counts, because a commit or the session end can drop

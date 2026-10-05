@@ -3232,11 +3232,14 @@ fn resolve(
                 history.forget_table(table);
             }
         }
+        // A new table is exempt only for locks that run now. A routine body
+        // runs later, when other sessions may use the table.
         let hot = table.as_deref().is_none_or(|t| {
             history.is_hot(t)
-                && new_tables
-                    .get(t)
-                    .is_none_or(|(from, to)| raw.at < *from || raw.at > *to)
+                && (!toks[raw.at].runs
+                    || new_tables
+                        .get(t)
+                        .is_none_or(|(from, to)| raw.at < *from || raw.at > *to))
         });
         hits.push(Hit {
             at: raw.at,
@@ -7850,6 +7853,21 @@ fn hotness_follows_whole_inheritance_chains() {
             "{history:?}\n{lock}\n{findings:?}"
         );
     }
+}
+
+#[test]
+fn a_new_table_exempts_only_locks_that_run_now() {
+    let create = "CREATE TABLE harvest_events (id BIGINT);\n";
+    let lock = "ALTER TABLE harvest_events ADD COLUMN x INT;";
+    // A `DO` body runs in the migration, while the table is still new.
+    let sql = format!("{create}DO $$\nBEGIN\n    {lock}\nEND $$;");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    // A routine body runs later, when other sessions may use the table.
+    let sql = format!(
+        "{create}CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    {lock}\nEND $$;"
+    );
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 #[test]
