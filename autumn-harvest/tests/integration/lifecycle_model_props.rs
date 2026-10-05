@@ -73,6 +73,9 @@ const WORKER_STALE_SECS: i64 = 60;
 const SKEW_MS: i64 = 5_000;
 /// Due times closer than this are a tie for the claim order.
 const TIE_MS: i64 = 250;
+/// The claim-order delay of a new start, `NEW_START_HANDICAP_SECS` in
+/// `queue.rs`, in milliseconds (issue #1824).
+const HANDICAP_MS: i64 = 1_000 * autumn_harvest::queue::NEW_START_HANDICAP_SECS as i64;
 
 // ── Operations ──────────────────────────────────────────────────────────────
 
@@ -284,9 +287,23 @@ struct Task {
     attempt: i32,
     strikes: i32,
     wake_requested: bool,
-    /// The `scheduled_at` of the task, in milliseconds on the case clock. A
-    /// claim takes the task that is due first.
+    /// The `scheduled_at` of the task, in milliseconds on the case clock.
     due: i64,
+    /// The task is the first task of a started run (issue #1824).
+    new_start: bool,
+}
+
+impl Task {
+    /// The claim-order due time. A claim takes the task with the lowest
+    /// value. A new start that no worker claimed yet sorts
+    /// [`HANDICAP_MS`] later.
+    const fn claim_due(&self) -> i64 {
+        if self.new_start && self.attempt == 0 {
+            self.due + HANDICAP_MS
+        } else {
+            self.due
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +385,7 @@ impl Model {
                 strikes: 0,
                 wake_requested: false,
                 due,
+                new_start: true,
             },
             signals: 0,
             events: vec!["WorkflowStarted"],
@@ -423,7 +441,7 @@ impl Model {
             .iter()
             .enumerate()
             .filter(|(_, r)| r.task.state == TaskState::Pending)
-            .map(|(i, r)| (r.task.due, i))
+            .map(|(i, r)| (r.task.claim_due(), i))
             .min();
         let Some((_, run)) = best else {
             return Res::Claimed(None);
@@ -440,10 +458,10 @@ impl Model {
             .runs
             .iter()
             .filter(|r| r.task.state == TaskState::Pending)
-            .map(|r| r.task.due)
+            .map(|r| r.task.claim_due())
             .min();
         let task = &self.runs[run].task;
-        task.state == TaskState::Pending && min.is_some_and(|m| task.due <= m + TIE_MS)
+        task.state == TaskState::Pending && min.is_some_and(|m| task.claim_due() <= m + TIE_MS)
     }
 
     fn apply_claim(&mut self, worker: usize, run: usize) {
@@ -570,8 +588,8 @@ impl Model {
     /// strike. At the threshold the task goes to the dead-letter queue and
     /// its run fails. Below it the task is pending again.
     fn reclaim(&mut self) -> Res {
-        // The requeue stamps `clock_timestamp()` with no backdate. A requeued
-        // orphan therefore sorts behind a fresh start of the next 5 seconds.
+        // The requeue stamps `clock_timestamp()` with no backdate. The orphan
+        // keeps its attempt, so it is a continuation and outranks a new start.
         let due = self.now;
         let (mut requeued, mut quarantined) = (0, 0);
         for run in 0..self.runs.len() {
@@ -941,7 +959,8 @@ fn apply_model(model: &mut Model, op: Op, db: &Res) -> Res {
     }
 }
 
-/// The pending tasks of `queue` that are due, with their `scheduled_at`.
+/// The pending tasks of `queue` that are due, with their claim-order due
+/// time (`CLAIM_ORDER_DUE_SQL`).
 async fn due_tasks(
     conn: &mut AsyncPgConnection,
     queue: &str,
@@ -953,10 +972,11 @@ async fn due_tasks(
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
         scheduled_at: chrono::DateTime<chrono::Utc>,
     }
-    diesel::sql_query(
-        "SELECT id, scheduled_at FROM harvest_task_queue \
+    diesel::sql_query(format!(
+        "SELECT id, {} AS scheduled_at FROM harvest_task_queue \
          WHERE queue_name = $1 AND state = 'PENDING' AND scheduled_at <= NOW()",
-    )
+        autumn_harvest::queue::CLAIM_ORDER_DUE_SQL
+    ))
     .bind::<Text, _>(queue)
     .load::<Row>(conn)
     .await
@@ -1465,11 +1485,11 @@ fn a_wake_during_a_claim_is_not_lost() {
     assert_eq!(m.runs[0].task.state, TaskState::Pending);
 }
 
-/// A fresh enqueue backdates `scheduled_at` by the skew allowance. An orphan
-/// requeue does not. A claim therefore takes a start made just after a
-/// reclaim first.
+/// A requeued orphan is a continuation. A new start sorts 30 seconds later,
+/// so a claim takes the orphan before a start made just after the reclaim
+/// (issue #1824).
 #[test]
-fn a_requeued_orphan_sorts_behind_a_fresh_start() {
+fn a_requeued_orphan_sorts_ahead_of_a_fresh_start() {
     let mut m = Model::new();
     let _ = m.start(0, Policy::AllowDuplicate);
     m.alive[0] = false;
@@ -1477,8 +1497,8 @@ fn a_requeued_orphan_sorts_behind_a_fresh_start() {
     let _ = m.reclaim();
     m.now = 100;
     let _ = m.start(1, Policy::AllowDuplicate);
-    assert!(!m.claim_is_valid(0), "the orphan is due 5 seconds later");
-    assert_eq!(m.claim(1), Res::Claimed(Some(1)));
+    assert!(!m.claim_is_valid(1), "the new start sorts 30 seconds later");
+    assert_eq!(m.claim(1), Res::Claimed(Some(0)));
 }
 
 /// Two strikes send an orphan to the dead-letter queue and fail its run.
