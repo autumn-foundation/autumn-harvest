@@ -30,6 +30,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - Each worker keeps a rolling window of its task outcomes. The window holds
   at most 1024 samples, from the last 5 minutes or two heartbeat intervals,
   whichever is longer. A slow heartbeat then still publishes every outcome.
+  When a codec key reload moves the worker into a new cohort, the window
+  starts empty, so outcomes from the old cohort do not flag it.
 - A failed activity attempt counts as a failure. So does an attempt that an
   open circuit breaker rejects, because the breaker belongs to the worker.
   An activity that succeeds but does not finalize also counts as a failure.

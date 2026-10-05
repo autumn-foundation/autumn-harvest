@@ -1416,17 +1416,17 @@ pub enum SnapshotWrite {
     Foreign,
 }
 
-/// Capture `window` and give it the next snapshot sequence, as one step
-/// (issue #1815).
+/// Capture `window` for `cohort` and give it the next snapshot sequence, as
+/// one step (issue #1815).
 ///
 /// Two heartbeats of one worker then cannot pair an older window with a newer
-/// sequence.
-pub fn capture_task_stats(window: &TaskOutcomeWindow) -> (WorkerTaskStats, i64) {
+/// sequence. A new `cohort` starts the window empty.
+pub fn capture_task_stats(window: &TaskOutcomeWindow, cohort: &str) -> (WorkerTaskStats, i64) {
     static CAPTURE: Mutex<()> = Mutex::new(());
     let _capture = CAPTURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    (window.snapshot(), next_snapshot_seq())
+    (window.snapshot_in_cohort(cohort), next_snapshot_seq())
 }
 
 /// Write one worker's task stats snapshot with sequence `seq` (issue #1815).
@@ -1703,7 +1703,7 @@ pub async fn run_outlier_tick(
     // first write then moves the counter above it, and a fresh capture follows.
     let cohort = probe.cohort_key();
     for _ in 0..2 {
-        let (own, seq) = capture_task_stats(&probe.window);
+        let (own, seq) = capture_task_stats(&probe.window, &cohort);
         if write_task_stats_snapshot(conn, worker_id, &cohort, &own, seq).await?
             != SnapshotWrite::Foreign
         {
@@ -3970,6 +3970,32 @@ mod tests {
             ..probe
         };
         assert_eq!(without.cohort_key(), without.cohort);
+    }
+
+    /// Issue #1815: samples taken under the old codec keys do not reach the
+    /// new cohort, so they cannot flag the worker among its new peers.
+    #[test]
+    fn a_codec_key_change_restarts_the_outcome_window() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        };
+        for _ in 0..30 {
+            probe
+                .window
+                .record(true, std::time::Duration::from_millis(40));
+        }
+        let (old, _) = super::capture_task_stats(&probe.window, &probe.cohort_key());
+        assert_eq!(old.failures, 30);
+
+        codecs
+            .register_key("k1", std::sync::Arc::new(IdentityCodec))
+            .expect("register a key");
+        let (new, _) = super::capture_task_stats(&probe.window, &probe.cohort_key());
+        assert_eq!(new, crate::worker_outlier::WorkerTaskStats::default());
     }
 
     /// Issue #1815: a worker decodes history only with the codecs it has

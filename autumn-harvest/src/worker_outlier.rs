@@ -100,6 +100,8 @@ struct Sample {
 #[derive(Debug)]
 pub struct TaskOutcomeWindow {
     samples: Mutex<VecDeque<Sample>>,
+    // The cohort of the last snapshot. A new cohort clears the samples.
+    cohort: Mutex<Option<String>>,
     capacity: usize,
     max_age: Duration,
 }
@@ -122,6 +124,7 @@ impl TaskOutcomeWindow {
     pub fn new(capacity: usize, max_age: Duration) -> Self {
         Self {
             samples: Mutex::new(VecDeque::new()),
+            cohort: Mutex::new(None),
             capacity: capacity.max(1),
             max_age,
         }
@@ -179,6 +182,28 @@ impl TaskOutcomeWindow {
             p99_latency_ms: nearest_rank_p99(&latencies)
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         }
+    }
+
+    /// Snapshot the window for the worker's current `cohort` (issue #1815).
+    ///
+    /// A codec key reload can move a running worker into a new cohort. Its old
+    /// samples describe the old policy, so the window drops them. The worker is
+    /// then judged only after it records enough samples in the new cohort.
+    #[must_use]
+    pub fn snapshot_in_cohort(&self, cohort: &str) -> WorkerTaskStats {
+        let mut current = self
+            .cohort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_deref() != Some(cohort) {
+            // The first cohort keeps the samples recorded before the first tick.
+            if current.is_some() {
+                self.lock().clear();
+            }
+            *current = Some(cohort.to_owned());
+        }
+        drop(current);
+        self.snapshot()
     }
 
     /// A poisoned lock still holds valid samples, so the window keeps them.
@@ -457,6 +482,22 @@ mod tests {
 
     /// Issue #1815: a worker exactly on the failure-ratio boundary is
     /// flagged. In floating point, 0.3 - 0.1 falls just short of 0.2.
+    #[test]
+    fn a_new_cohort_starts_from_an_empty_window() {
+        let window = TaskOutcomeWindow::default();
+        for _ in 0..30 {
+            window.record(true, Duration::from_millis(40));
+        }
+        // The first cohort adopts the samples recorded before it.
+        assert_eq!(window.snapshot_in_cohort("old").tasks, 30);
+        assert_eq!(window.snapshot_in_cohort("old").tasks, 30);
+        // Samples from the old cohort do not carry into the new one.
+        assert_eq!(window.snapshot_in_cohort("new"), WorkerTaskStats::default());
+        window.record(false, Duration::from_millis(40));
+        let fresh = window.snapshot_in_cohort("new");
+        assert_eq!((fresh.tasks, fresh.failures), (1, 0));
+    }
+
     #[test]
     fn a_worker_exactly_on_the_failure_margin_is_flagged() {
         let config = OutlierConfig::default();
