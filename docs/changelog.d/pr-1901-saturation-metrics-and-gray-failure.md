@@ -77,7 +77,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   activity's own retry and start-to-close defaults, the registry's
   local-activity defaults and retry-after ceiling, the hot-code-swap
   module-host policy, and each workflow's effective input cap and DAG
-  classification), and the registered codec key ids, which the
+  classification), the registered payload codec ids and default codec, and
+  the registered codec key ids, which the
   heartbeat reads on every tick because a reload can change them, with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A

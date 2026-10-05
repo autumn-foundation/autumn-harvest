@@ -837,6 +837,21 @@ impl PayloadCodecs {
         self.default = codec;
     }
 
+    /// The id of the default codec, which encodes new payloads (issue #1815).
+    #[must_use]
+    pub fn default_codec_id(&self) -> &'static str {
+        self.default.codec_id()
+    }
+
+    /// Every registered codec id, sorted (issue #1815).
+    ///
+    /// The default codec is always one of them. Keyed codecs are not. See
+    /// [`PayloadCodecs::registered_key_ids`] for those.
+    #[must_use]
+    pub fn codec_ids(&self) -> Vec<&'static str> {
+        self.codecs.keys().copied().collect()
+    }
+
     // ── Key rotation (issue #948) ────────────────────────────────────────
 
     fn keys_read(&self) -> RwLockReadGuard<'_, KeyRegistry> {

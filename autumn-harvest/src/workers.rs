@@ -749,6 +749,16 @@ impl OutlierProbe {
         };
         match serde_json::from_str::<serde_json::Value>(&self.cohort) {
             Ok(serde_json::Value::Object(mut key)) => {
+                // A worker decodes only the codecs it has registered. One
+                // without a peer's codec fails that peer's history.
+                key.insert(
+                    "codec_ids".to_owned(),
+                    serde_json::json!(codecs.codec_ids()),
+                );
+                key.insert(
+                    "default_codec_id".to_owned(),
+                    serde_json::json!(codecs.default_codec_id()),
+                );
                 key.insert(
                     "codec_key_ids".to_owned(),
                     serde_json::json!(codecs.registered_key_ids()),
@@ -3883,6 +3893,58 @@ mod tests {
             ..probe
         };
         assert_eq!(without.cohort_key(), without.cohort);
+    }
+
+    /// Issue #1815: a worker decodes history only with the codecs it has
+    /// registered. Workers that differ in their codecs, or in the default
+    /// codec, are therefore in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_ordinary_codecs() {
+        use crate::payload_codec::{CodecError, PayloadCodec, PayloadCodecs};
+        struct Rot;
+        impl PayloadCodec for Rot {
+            fn codec_id(&self) -> &'static str {
+                "rot"
+            }
+            fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+                Ok(raw.to_vec())
+            }
+            fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+                Ok(encoded.to_vec())
+            }
+        }
+        let key_for = |codecs: PayloadCodecs| {
+            super::OutlierProbe {
+                codecs: Some(codecs),
+                cohort: r#"{"queues":["a"]}"#.to_owned(),
+                ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+            }
+            .cohort_key()
+        };
+        let plain = key_for(PayloadCodecs::default());
+        assert!(plain.contains("\"codec_ids\":[\"identity\"]"), "{plain}");
+        assert!(
+            plain.contains("\"default_codec_id\":\"identity\""),
+            "{plain}"
+        );
+
+        let mut registered = PayloadCodecs::default();
+        registered.register(std::sync::Arc::new(Rot));
+        let registered = key_for(registered);
+        assert_ne!(plain, registered, "a registered codec changes the key");
+        assert!(
+            registered.contains("\"codec_ids\":[\"identity\",\"rot\"]"),
+            "{registered}"
+        );
+
+        let mut defaulted = PayloadCodecs::default();
+        defaulted.set_default(std::sync::Arc::new(Rot));
+        let defaulted = key_for(defaulted);
+        assert_ne!(registered, defaulted, "the default codec changes the key");
+        assert!(
+            defaulted.contains("\"default_codec_id\":\"rot\""),
+            "{defaulted}"
+        );
     }
 
     /// Issue #1815: under load, the claim gate gives each worker a task mix
