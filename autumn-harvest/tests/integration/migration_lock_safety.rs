@@ -1879,7 +1879,10 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             // SQL the lint cannot read may lock anything, and may also clear
             // the bound for what comes after it.
             Some("execute") if dynamic_execute(&s, k) => {
-                if let Some(raw) = unreadable_execute(&s, k) {
+                let shadowed = shadowed_format(&s, k, path_change, &path_bodies);
+                let raw = unreadable_execute(&s, k)
+                    .or_else(|| shadowed.then(|| Raw::lock(k, UNREADABLE_EXECUTE, None)));
+                if let Some(raw) = raw {
                     raws.push(raw);
                     let list = if tok.runs {
                         &mut timeouts
@@ -4076,27 +4079,54 @@ fn unreadable_execute(s: &Stmts, k: usize) -> Option<Raw> {
     let toks = s.toks;
     let depth = toks[k].depth;
     let end = s.end(k);
-    let formatted = s.is(k + 1, "format") && s.is_punct(k + 2, '(');
-    let literal = if formatted { k + 3 } else { k + 1 };
+    let open = format_paren(s, k);
+    let literal = open.map_or(k + 1, |open| open + 1);
     let constant = toks.get(literal).is_some_and(|t| t.depth > depth);
     // The first token after the SQL, at the depth of the statement.
     let after_literal = (literal..end).find(|&j| toks[j].depth == depth);
     // The template of `format()` must be the literal alone, so a `,` or the
     // closing `)` follows it. A composed template such as `'a' || 'b'` is
     // unreadable.
-    let rest = if formatted {
-        closing_paren(s, k + 2)
-            .filter(|&close| after_literal.is_some_and(|j| j == close || s.is_punct(j, ',')))
-            .map(|close| close + 1)
-    } else {
-        after_literal.or(Some(end))
-    };
+    let rest = open.map_or_else(
+        || after_literal.or(Some(end)),
+        |open| {
+            closing_paren(s, open)
+                .filter(|&close| after_literal.is_some_and(|j| j == close || s.is_punct(j, ',')))
+                .map(|close| close + 1)
+        },
+    );
     // `FOR ... IN EXECUTE` ends with the `LOOP` of its body.
     let tail_ok = rest.is_some_and(|j| {
         j >= end || s.keyword(j, "into") || s.keyword(j, "using") || s.keyword(j, "loop")
     });
     let text_placeholder = (k + 1..end).any(|j| toks[j].depth > depth && s.is(j, "%s"));
     (!constant || !tail_ok || text_placeholder).then(|| Raw::lock(k, UNREADABLE_EXECUTE, None))
+}
+
+/// The opening parenthesis of a `format(` or `pg_catalog.format(` call that
+/// follows the `EXECUTE` at `k`.
+fn format_paren(s: &Stmts, k: usize) -> Option<usize> {
+    let qualified = s.is(k + 1, "pg_catalog") && s.is_punct(k + 2, '.');
+    let name = if qualified { k + 3 } else { k + 1 };
+    (s.is(name, "format") && s.is_punct(name + 1, '(')).then_some(name + 1)
+}
+
+/// Whether the `EXECUTE` at `k` calls an unqualified `format` that may not be
+/// the built-in.
+///
+/// Postgres searches `pg_catalog` first unless the path names it later. So
+/// only a path change, or a routine with its own `search_path`, may put
+/// another `format` first. The template then tells nothing about the SQL.
+fn shadowed_format(
+    s: &Stmts,
+    k: usize,
+    path_change: Option<usize>,
+    path_bodies: &[(usize, usize)],
+) -> bool {
+    let unqualified = s.is(k + 1, "format") && s.is_punct(k + 2, '(');
+    let changed = path_change.is_some_and(|c| c <= k)
+        || path_bodies.iter().any(|&(from, to)| from <= k && k < to);
+    unqualified && changed
 }
 
 /// The `lock_timeout` change at `k`, as `analyse` records it.
@@ -7122,7 +7152,18 @@ fn an_execute_expression_clears_before_its_sql_runs() {
                'ALTER TABLE harvest_events ADD COLUMN x INT /* %L */', \
                set_config('lock_timeout', '0', true));\nEND $$;";
     let findings = lint_with_history(&[], sql, true);
-    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.contains("ALTER TABLE locks harvest_events")),
+        "{findings:?}"
+    );
+    // The lint cannot read that `set_config` name, so it may change the path.
+    // The unqualified `format` then fails closed as well.
+    assert!(
+        findings.iter().all(|f| f.rule == Rule::LockTimeout),
+        "{findings:?}"
+    );
 }
 
 #[test]
@@ -7329,6 +7370,34 @@ fn the_language_clause_follows_the_routine_signature() {
     let sql = format!(
         "CREATE FUNCTION g(language text) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\n{set}SELECT g('x');"
     );
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+}
+
+#[test]
+fn an_unqualified_format_after_a_path_change_is_unreadable() {
+    let execute = |name: &str| {
+        format!(
+            "DO $$\nBEGIN\n    EXECUTE {name}('ALTER TABLE public.scratch_t ADD COLUMN x INT');\nEND $$;"
+        )
+    };
+    let path = "SET search_path = tenant, pg_catalog;\nSET LOCAL lock_timeout = '5s';\n";
+    // Another schema on the path may hold a function named `format`.
+    let routine = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql \
+                   SET search_path = tenant, pg_catalog AS $$\nBEGIN\n    \
+                   EXECUTE format('ALTER TABLE public.scratch_t ADD COLUMN x INT');\nEND $$;\n\
+                   SET LOCAL lock_timeout = '5s';\nSELECT f();";
+    for sql in [format!("{path}{}", execute("format")), routine.to_string()] {
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            findings.iter().any(|f| f.detail.contains("cannot read")),
+            "{sql}\n{findings:?}"
+        );
+    }
+    // The built-in, named by its schema, stays readable.
+    let sql = format!("{path}{}", execute("pg_catalog.format"));
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
+    // Without a path change, `pg_catalog` comes first.
+    let sql = format!("SET LOCAL lock_timeout = '5s';\n{}", execute("format"));
     assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 

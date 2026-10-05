@@ -347,6 +347,9 @@ rule in its file, so a digest pins the SQL of each listed migration as well.
   such an `EXECUTE` counts as a lock on an unknown table. So does a template
   with `%s` anywhere in its text, even in a comment or a quoted name. So does
   a `%L` value that a `DO`, `EXECUTE` or function body runs as code.
+  After a `search_path` change, or in a routine with its own `search_path`,
+  an unqualified `format` may be another schema's function. It counts the same
+  way. Write `pg_catalog.format` there.
 - The lint scans a `DO` body, a function body and the SQL that `EXECUTE` runs
   as code, in any quote form. That includes `FOR ... IN EXECUTE`,
   `RETURN QUERY EXECUTE` and `OPEN ... FOR EXECUTE`. Any other string is data.
