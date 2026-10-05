@@ -19,8 +19,8 @@ use autumn_harvest::build_routing::{
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::ramp_guard::{
-    RampAbortReason, RampGuardConfig, abort_ramp, claim_unreported_abort, guard_once,
-    mark_abort_reported, ramp_aborted_by_guard, record_abort_report, run_ramp_guard,
+    MIN_MARKER_RETENTION, RampAbortReason, RampGuardConfig, abort_ramp, claim_unreported_abort,
+    guard_once, mark_abort_reported, ramp_aborted_by_guard, record_abort_report, run_ramp_guard,
 };
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::{
@@ -939,7 +939,7 @@ async fn a_blocked_clear_fails_on_the_server_and_changes_nothing() {
 /// does on every shard.
 /// The `ramp_id` that [`set_ramp_with_id`] stores for a caller id.
 fn stored(ramp_id: uuid::Uuid) -> uuid::Uuid {
-    ramp_generation_id(ramp_id, BUILD_A, BUILD_B)
+    ramp_generation_id(ramp_id, QUEUE, BUILD_A, BUILD_B)
 }
 
 async fn set_ramp_with_id(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) {
@@ -1291,9 +1291,18 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
     );
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no new report");
 
-    // Every marker is reported and no pool holds a marked ramp. After the
-    // report grace, here zero, the next pass prunes every marker.
+    // Every marker is reported and no pool holds a marked ramp. A zero
+    // report grace still keeps them for the marker retention, so a late
+    // fan-out write can still meet a marker.
     let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn_1).await, 13, "retained");
+
+    // After the retention, the next pass prunes every marker.
+    let past = MIN_MARKER_RETENTION + Duration::from_secs(60);
+    age_markers(&mut conn_1, past).await;
+    age_markers(&mut conn_2, past).await;
     let aborts = guard_once(&pools, &pool_1, &config, None).await;
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(
@@ -1336,11 +1345,36 @@ async fn an_unreported_abort_is_reported_once_from_its_marker() {
     assert_eq!(aborts[0].target_build_id, BUILD_B);
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
 
-    // The next pass reports nothing more and prunes the marker.
+    // The next pass reports nothing more. A zero grace still keeps the
+    // reported marker for the marker retention.
     let aborts = guard_once(&pools, &pool, &config, None).await;
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 1, "reported once");
+    assert_eq!(abort_marker_count(&mut conn).await, 1, "retained");
+
+    // After the retention, a pass prunes the marker.
+    age_markers(&mut conn, MIN_MARKER_RETENTION + Duration::from_secs(60)).await;
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(abort_marker_count(&mut conn).await, 0);
+}
+
+/// Move every abort marker of the test queue back by `by`, as if that much
+/// time had passed.
+async fn age_markers(conn: &mut AsyncPgConnection, by: Duration) {
+    let ms = i64::try_from(by.as_millis()).expect("age in ms");
+    diesel::sql_query(
+        "UPDATE harvest_build_policies SET ramp_aborted = COALESCE(( \
+           SELECT jsonb_agg(jsonb_set(m, '{at}', to_jsonb((m ->> 'at')::bigint - $2)) \
+                            ORDER BY ord) \
+           FROM jsonb_array_elements(ramp_aborted) WITH ORDINALITY AS e(m, ord)), '[]'::jsonb) \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<BigInt, _>(ms)
+    .execute(conn)
+    .await
+    .expect("age markers");
 }
 
 /// The `reported` flag of the abort marker of `ramp_id` on one pool.
@@ -1366,17 +1400,43 @@ async fn marker_reported(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) -> O
 
 /// The `ramp_id` of the test queue on one pool.
 async fn policy_ramp_id(conn: &mut AsyncPgConnection) -> Option<uuid::Uuid> {
+    queue_ramp_id(conn, QUEUE).await
+}
+
+/// The `ramp_id` of `queue` on one pool.
+async fn queue_ramp_id(conn: &mut AsyncPgConnection, queue: &str) -> Option<uuid::Uuid> {
     #[derive(QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
         ramp_id: Option<uuid::Uuid>,
     }
     diesel::sql_query("SELECT ramp_id FROM harvest_build_policies WHERE queue_name = $1")
-        .bind::<Text, _>(QUEUE)
+        .bind::<Text, _>(queue)
         .get_result::<Row>(conn)
         .await
         .expect("read ramp_id")
         .ramp_id
+}
+
+/// One caller id on two queues gives two ramp ids. The report ledger keys
+/// on `ramp_id`, so a shared id would drop the report of the second abort.
+#[tokio::test]
+async fn one_caller_id_on_two_queues_gives_two_ramp_ids() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    let mut stored_ids = Vec::new();
+    for queue in [QUEUE, "other-queue"] {
+        set_build_policy(&mut conn, queue, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        set_build_ramp_with_id(&mut conn, queue, BUILD_B, RAMP_PERCENT, ramp_id)
+            .await
+            .expect("set ramp");
+        stored_ids.push(queue_ramp_id(&mut conn, queue).await);
+    }
+    assert!(stored_ids[0].is_some(), "{stored_ids:?}");
+    assert_ne!(stored_ids[0], stored_ids[1], "each queue has its own id");
 }
 
 /// Build ids are free text, so a `/` in one cannot shift the split between
@@ -1385,8 +1445,8 @@ async fn policy_ramp_id(conn: &mut AsyncPgConnection) -> Option<uuid::Uuid> {
 fn a_slash_in_a_build_id_cannot_collide_two_generations() {
     let id = uuid::Uuid::new_v4();
     assert_ne!(
-        ramp_generation_id(id, "a/b", "c"),
-        ramp_generation_id(id, "a", "b/c")
+        ramp_generation_id(id, QUEUE, "a/b", "c"),
+        ramp_generation_id(id, QUEUE, "a", "b/c")
     );
 }
 
@@ -1406,7 +1466,7 @@ async fn the_stored_ramp_id_matches_the_rust_derivation() {
         .expect("set ramp");
     assert_eq!(
         policy_ramp_id(&mut conn).await,
-        Some(ramp_generation_id(ramp_id, base, target)),
+        Some(ramp_generation_id(ramp_id, QUEUE, base, target)),
         "ramp write"
     );
 
@@ -1416,7 +1476,7 @@ async fn the_stored_ramp_id_matches_the_rust_derivation() {
         .expect("set policy");
     assert_eq!(
         policy_ramp_id(&mut conn).await,
-        Some(ramp_generation_id(ramp_id, new_base, target)),
+        Some(ramp_generation_id(ramp_id, QUEUE, new_base, target)),
         "policy write"
     );
 }
@@ -1581,7 +1641,7 @@ async fn a_base_change_fan_out_gives_the_ramp_one_new_id() {
     set_build_policy_with_ramp_id(&mut conn_1, QUEUE, BUILD_C, None, new_id)
         .await
         .expect("repeat on pool 1");
-    let want = ramp_generation_id(new_id, BUILD_C, BUILD_B);
+    let want = ramp_generation_id(new_id, QUEUE, BUILD_C, BUILD_B);
     assert_eq!(policy_ramp_id(&mut conn_1).await, Some(want));
     assert_eq!(policy_ramp_id(&mut conn_2).await, Some(want));
     assert_ne!(want, old_id);
@@ -1625,8 +1685,14 @@ async fn a_policy_update_keeps_diverged_targets_apart() {
     }
     let id_1 = policy_ramp_id(&mut conn_1).await;
     let id_2 = policy_ramp_id(&mut conn_2).await;
-    assert_eq!(id_1, Some(ramp_generation_id(new_id, BUILD_A, BUILD_B)));
-    assert_eq!(id_2, Some(ramp_generation_id(new_id, BUILD_A, BUILD_C)));
+    assert_eq!(
+        id_1,
+        Some(ramp_generation_id(new_id, QUEUE, BUILD_A, BUILD_B))
+    );
+    assert_eq!(
+        id_2,
+        Some(ramp_generation_id(new_id, QUEUE, BUILD_A, BUILD_C))
+    );
     assert_ne!(id_1, id_2, "each target keeps its own id");
 
     // The guard aborts the ramp to B on pool 1. The ramp to C stays.
@@ -1817,7 +1883,7 @@ async fn a_policy_update_gives_an_id_less_ramp_an_id() {
     assert!(ramp_is_active(&mut conn).await);
     assert_eq!(
         policy_ramp_id(&mut conn).await,
-        Some(ramp_generation_id(ramp_id, BUILD_C, BUILD_B))
+        Some(ramp_generation_id(ramp_id, QUEUE, BUILD_C, BUILD_B))
     );
 }
 

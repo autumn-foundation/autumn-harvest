@@ -38,8 +38,9 @@ Design decisions:
   removes a reported marker once no pool holds its ramp. A trigger clears
   `ramp_id` when an `UPDATE` changes a ramp without a new id, so a replica
   from before the migration cannot reuse an old id. A base-build change
-  gives an active ramp a fresh id. A fan-out stores one id per base and
-  target. The id hash prefixes each build id with its byte length. Ramp and policy
+  gives an active ramp a fresh id. A fan-out stores one id per queue, base
+  and target. The id hash prefixes each name with its byte length. Reported
+  markers stay for at least 10 minutes, even with a zero report grace. Ramp and policy
   writes with an id are idempotent. A retry with the same `Idempotency-Key`
   header gets the same id, so it cannot split the identity. A recovery claim
   that fails on one pool tries the next marker pool. After

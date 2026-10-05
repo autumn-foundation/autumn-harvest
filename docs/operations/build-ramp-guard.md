@@ -229,11 +229,12 @@ The guard fails safe: when it cannot read, it does not abort.
   upgrade. Such a ramp has no id, so no old marker can clear it. The guard
   judges it as usual.
 - A ramp fan-out and a policy fan-out each pass one caller id to every
-  pool. Each pool stores an id derived from that caller id, its base build
-  and its target (`build_routing::ramp_generation_id`). The hash input
-  prefixes each build id with its byte length, so a `/` in a build id cannot
-  make two pairs share an id. So pools with the same base and target share
-  one identity. A partial fan-out can leave
+  pool. Each pool stores an id derived from that caller id, the queue, its
+  base build and its target (`build_routing::ramp_generation_id`). The hash
+  input prefixes the queue and each build id with its byte length, so a `/`
+  in a name cannot make two inputs share an id. One caller id on two queues
+  gives two ids, so the report ledger keeps a report for each. So pools with
+  the same base and target share one identity. A partial fan-out can leave
   pools with different bases or targets. Those ramps then get different
   ids, as the guard judges them apart. An abort of one cannot finish the
   other, and the report ledger reports each abort.
@@ -267,10 +268,12 @@ The guard fails safe: when it cannot read, it does not abort.
 - When some markers of an abort are reported, a guard reported it and
   stopped while it marked them. A pass marks the rest and reports nothing.
   A pass removes the markers of an abort only when all are reported and
-  older than `report_grace`. A ramp fan-out that is still in flight can
-  write the same `ramp_id` to a later pool. Within the grace, the markers
-  still finish that late ramp. A fan-out write that is later than the grace
-  makes a ramp with no marker, which the guard judges as usual.
+  older than the retention. The retention is `report_grace`, and at least
+  `MIN_MARKER_RETENTION` (10 minutes), so a zero grace still keeps them. A
+  ramp fan-out that is still in flight can write the same `ramp_id` to a
+  later pool. Within the retention, the markers still finish that late
+  ramp. A fan-out write that is later than the retention makes a ramp with
+  no marker, which the guard judges as usual.
 - A guard that reported but could not mark any of its markers causes a
   second report after the grace. A failed audit write also makes the counter count
   the abort twice. An extra report is better than an abort with none.

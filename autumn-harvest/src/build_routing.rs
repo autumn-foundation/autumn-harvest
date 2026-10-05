@@ -345,36 +345,46 @@ pub async fn set_build_policy(
 /// #1814).
 ///
 /// A fan-out passes one caller id to every pool. Each pool stores this
-/// function of that id, its base build and its target. The id is the first
-/// 16 bytes of `sha256("{ramp_id}/{len(base)}:{base}/{len(target)}:{target}")`,
+/// function of that id, the queue, its base build and its target. The id is
+/// the first 16 bytes of the SHA-256 of
+/// `{ramp_id}/{len(queue)}:{queue}/{len(base)}:{base}/{len(target)}:{target}`,
 /// where `len` is the UTF-8 byte length. The writes compute the same value in
 /// SQL.
 ///
-/// Build ids are free text. The length prefixes make the encoding one-to-one,
-/// so a `/` in a build id cannot make two pairs collide.
+/// Queue names and build ids are free text. The length prefixes make the
+/// encoding one-to-one, so a `/` in a name cannot make two inputs collide.
+/// The queue is part of the input, so one caller id on two queues gives two
+/// ids. The report ledger keys on the id, so each queue keeps its report.
 ///
 /// So pools with the same base and target share one id. A partial fan-out
 /// can leave pools with different bases or targets. Those ramps then get
 /// different ids, as the guard judges them apart. So an abort of one cannot
 /// finish the other, and the report ledger keeps their reports apart.
 #[must_use]
-pub fn ramp_generation_id(ramp_id: Uuid, base: &str, target: &str) -> Uuid {
+pub fn ramp_generation_id(ramp_id: Uuid, queue: &str, base: &str, target: &str) -> Uuid {
     use sha2::Digest;
 
     let digest = sha2::Sha256::digest(
-        format!("{ramp_id}/{}:{base}/{}:{target}", base.len(), target.len()).as_bytes(),
+        format!(
+            "{ramp_id}/{}:{queue}/{}:{base}/{}:{target}",
+            queue.len(),
+            base.len(),
+            target.len()
+        )
+        .as_bytes(),
     );
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Uuid::from_bytes(bytes)
 }
 
-/// The SQL form of [`ramp_generation_id`]. `{id}`, `{base}` and `{target}`
-/// are SQL expressions.
+/// The SQL form of [`ramp_generation_id`]. `{id}`, `{queue}`, `{base}` and
+/// `{target}` are SQL expressions.
 #[cfg(feature = "db")]
-fn ramp_generation_id_sql(id: &str, base: &str, target: &str) -> String {
+fn ramp_generation_id_sql(id: &str, queue: &str, base: &str, target: &str) -> String {
     format!(
         "encode(substring(sha256(convert_to({id}::text \
+         || '/' || octet_length(convert_to({queue}, 'UTF8')) || ':' || {queue} \
          || '/' || octet_length(convert_to({base}, 'UTF8')) || ':' || {base} \
          || '/' || octet_length(convert_to({target}, 'UTF8')) || ':' || {target}, \
          'UTF8')) FROM 1 FOR 16), 'hex')::uuid"
@@ -410,6 +420,7 @@ pub async fn set_build_policy_with_ramp_id(
 ) -> HarvestResult<BuildPolicy> {
     let derived = ramp_generation_id_sql(
         "$5",
+        "EXCLUDED.queue_name",
         "EXCLUDED.build_id",
         "harvest_build_policies.target_build_id",
     );
@@ -538,7 +549,7 @@ pub async fn set_build_ramp_with_id(
 ) -> HarvestResult<BuildPolicy> {
     validate_ramp_percent(percent)?;
 
-    let derived = ramp_generation_id_sql("$4", "build_id", "$2");
+    let derived = ramp_generation_id_sql("$4", "$1", "build_id", "$2");
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "UPDATE harvest_build_policies \
          SET target_build_id = $2, ramp_percent = $3, ramp_id = {derived}, updated_at = NOW() \

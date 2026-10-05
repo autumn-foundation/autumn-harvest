@@ -30,6 +30,12 @@ pub const DEFAULT_MAX_ND_BLOCK_RATE_INCREASE: f64 = 0.05;
 pub const DEFAULT_REPORT_GRACE: Duration = Duration::from_secs(10 * 60);
 /// Maximum report grace.
 pub const MAX_REPORT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Minimum age of a reported marker before a pass removes it.
+///
+/// A ramp fan-out that is still in flight can write the marked `ramp_id` to
+/// a later pool. The marker must still be there to finish that late ramp.
+/// The report grace can be zero, so this floor keeps the fence positive.
+pub const MIN_MARKER_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 /// The settings of the ramp guard.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -954,8 +960,9 @@ async fn read_pool_ramps(
 /// no pool can still hold that ramp. The read groups the finished markers
 /// of one abort over all pools:
 ///
-/// - When every marker is reported and older than `report_grace`, the
-///   markers can go. The grace lets them finish a late fan-out write.
+/// - When every marker is reported and older than both `report_grace` and
+///   [`MIN_MARKER_RETENTION`], the markers can go. The wait lets them finish
+///   a late fan-out write.
 /// - When some are reported, a guard reported the abort and stopped while
 ///   it marked them. The rest only need the mark.
 /// - When none is reported, the abort is due for recovery once a marker is
@@ -1051,6 +1058,8 @@ fn classify_finished_markers(
 ) -> MarkerWork {
     let grace_ms = i64::try_from(report_grace.as_millis()).unwrap_or(i64::MAX);
     let lease_ms = i64::try_from(claim_lease.as_millis()).unwrap_or(i64::MAX);
+    let retain_ms =
+        i64::try_from(report_grace.max(MIN_MARKER_RETENTION).as_millis()).unwrap_or(i64::MAX);
     // Group the finished markers per abort, in pool order.
     let mut groups: std::collections::BTreeMap<(String, uuid::Uuid), Vec<(usize, StoredMarker)>> =
         std::collections::BTreeMap::new();
@@ -1074,8 +1083,9 @@ fn classify_finished_markers(
         if reported == entries.len() {
             // A ramp fan-out that is still in flight can write this
             // `ramp_id` to a later pool. The markers therefore stay for the
-            // report grace, so they can still finish such a late ramp.
-            if entries.iter().all(|(_, marker)| marker.age_ms >= grace_ms) {
+            // report grace, and at least for `MIN_MARKER_RETENTION`, so they
+            // can still finish such a late ramp.
+            if entries.iter().all(|(_, marker)| marker.age_ms >= retain_ms) {
                 for (index, _) in entries {
                     finished
                         .entry((index, queue.clone()))
