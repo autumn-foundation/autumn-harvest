@@ -186,6 +186,8 @@ with a `SET search_path` clause, ends the bound.
 It may reach a routine in another schema. A session change
 outlives its file, so the rule holds for every later migration too. A
 top-level `SET LOCAL` change ends with its transaction, so it does not.
+A call of a routine whose body makes a session change counts as a session
+change too.
 
 A change in the expression of an `EXECUTE` takes effect before the SQL runs.
 A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`, `EXIT` or

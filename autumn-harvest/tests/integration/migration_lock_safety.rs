@@ -309,6 +309,10 @@ struct History {
     /// Each routine whose body may change `search_path`, without its schema.
     /// A call of such a routine in a later migration changes the path too.
     path_routines: BTreeSet<String>,
+    /// Each routine whose body may change the session `search_path`, without
+    /// its schema. A call of such a routine carries the change into later
+    /// migrations, as a session `SET` does.
+    session_path_routines: BTreeSet<String>,
 }
 
 impl History {
@@ -2413,6 +2417,7 @@ fn alter_routine_history(s: &Stmts, k: usize, clears: bool, history: &mut Histor
             &mut history.foreign_routines,
             &mut history.locking_routines,
             &mut history.path_routines,
+            &mut history.session_path_routines,
         ] {
             if set.contains(&old) {
                 set.insert(new.to_string());
@@ -3100,8 +3105,8 @@ fn path_change(s: &Stmts, opaque: &[usize], history: &mut History) -> Option<usi
         .min();
     let hidden = opaque.first().map(|&k| s.end(k));
     // Only a session change that runs now carries into history. A local
-    // change ends with its transaction. A routine body runs only when called,
-    // and that call counts as code the lint cannot read in its own file.
+    // change ends with its transaction. A routine body runs only when called.
+    // `path_routine_call` carries a running call of a session-changing routine.
     let session = (0..s.toks.len()).any(|k| s.starts[k] == k && running_path_change(s, k, false));
     history.search_path_changed |= session;
     let local = text.into_iter().chain(hidden).min();
@@ -3149,11 +3154,20 @@ fn opaque_at(s: &Stmts, k: usize, routines: &[Routine], bases: &BTreeSet<&str>) 
 /// in an uncalled routine body does not count. Unless `local` is set, nor does
 /// a `SET LOCAL` or a plain `set_config` with a literal `true` scope.
 fn running_path_change(s: &Stmts, k: usize, local: bool) -> bool {
+    s.toks[k].runs && path_change_at(s, k, local, true)
+}
+
+/// Whether the statement at `k` holds a `search_path` change.
+///
+/// Unless `local` is set, a `SET LOCAL` or a `set_config` with a literal
+/// `true` scope does not count. With `running` set, only a setter that runs
+/// now counts.
+fn path_change_at(s: &Stmts, k: usize, local: bool, running: bool) -> bool {
     let scope = usize::from(s.keyword(k + 1, "local") || s.keyword(k + 1, "session"));
     let set = s.keyword(k, "set") && path_setting(s, k + 1 + scope);
     let reset = s.keyword(k, "reset") && (path_setting(s, k + 1) || s.keyword(k + 1, "all"));
     if set || reset {
-        return s.toks[k].runs && (local || !(set && s.keyword(k + 1, "local")));
+        return local || !(set && s.keyword(k + 1, "local"));
     }
     let literal = |j: usize| s.word(j).or_else(|| s.string(j));
     let is_local = |j: usize| {
@@ -3162,7 +3176,8 @@ fn running_path_change(s: &Stmts, k: usize, local: bool) -> bool {
             && s.is_punct(j + 5, ',')
             && literal(j + 6).is_some_and(pg_true)
     };
-    (k..s.end(k)).any(|j| path_call(s, j) && s.toks[j].runs && (local || !is_local(j)))
+    (k..s.end(k))
+        .any(|j| path_call(s, j) && (!running || s.toks[j].runs) && (local || !is_local(j)))
 }
 
 /// The end of the first running call of a routine whose body may change
@@ -3170,12 +3185,14 @@ fn running_path_change(s: &Stmts, k: usize, local: bool) -> bool {
 ///
 /// A routine that calls such a routine may change the path too. The set grows
 /// until no routine joins it, as for clearing and locking routines. The
-/// history keeps the set for later migrations.
+/// history keeps the set for later migrations. A running call of a routine
+/// that may change the session path carries the change into history.
 fn path_routine_call(s: &Stmts, history: &mut History) -> Option<usize> {
     let routines = file_routines(s);
     let bodies = routine_bodies(s);
     let own = |r: &Routine, j: usize| owns(s, &bodies, r.at, j);
     let inherited = history.path_routines.clone();
+    let inherited_session = history.session_path_routines.clone();
     let all: BTreeSet<&str> = routines
         .iter()
         .map(|r| base(&r.name))
@@ -3195,33 +3212,50 @@ fn path_routine_call(s: &Stmts, history: &mut History) -> Option<usize> {
     let changes = |j: usize| {
         (s.starts[j] == j && changes_search_path(s, j)) || opaque_at(s, j, &routines, &watched)
     };
-    let mut names: BTreeSet<&str> = routines
-        .iter()
-        .filter(|r| (r.at..s.toks.len()).any(|j| own(r, j) && changes(j)))
-        .map(|r| base(&r.name))
-        .chain(inherited.iter().map(String::as_str))
-        .collect();
-    loop {
-        let before = names.len();
-        for r in &routines {
-            let calls = (r.at..s.toks.len()).any(|j| {
-                own(r, j) && call_target(s, j, &all).is_some_and(|c| names.contains(base(&c.name)))
-            });
-            if calls {
-                names.insert(base(&r.name));
+    // A routine that calls a routine in the set joins it.
+    let close = |mut names: BTreeSet<String>| {
+        loop {
+            let before = names.len();
+            for r in &routines {
+                let calls = (r.at..s.toks.len()).any(|j| {
+                    own(r, j)
+                        && call_target(s, j, &all).is_some_and(|c| names.contains(base(&c.name)))
+                });
+                if calls {
+                    names.insert(base(&r.name).to_string());
+                }
+            }
+            if names.len() == before {
+                return names;
             }
         }
-        if names.len() == before {
-            break;
-        }
-    }
-    history
-        .path_routines
-        .extend(names.iter().map(ToString::to_string));
-    (0..s.toks.len())
+    };
+    let changed_by = |change: &dyn Fn(usize) -> bool, known: &BTreeSet<String>| {
+        let own_change = routines
+            .iter()
+            .filter(|r| (r.at..s.toks.len()).any(|j| own(r, j) && change(j)))
+            .map(|r| base(&r.name).to_string());
+        close(own_change.chain(known.iter().cloned()).collect())
+    };
+    let names = changed_by(&changes, &inherited);
+    // Only a readable session change outlives the migration. Code that the
+    // lint cannot read keeps its doubt in its own file.
+    let session_change = |j: usize| s.starts[j] == j && path_change_at(s, j, false, false);
+    let session = changed_by(&session_change, &inherited_session);
+    let names_view: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    let end = (0..s.toks.len())
         .filter(|&k| s.toks[k].runs)
-        .find(|&k| call_target(s, k, &names).is_some())
-        .map(|k| s.end(k))
+        .find(|&k| call_target(s, k, &names_view).is_some())
+        .map(|k| s.end(k));
+    // A `CALL` of any name is a target, so the callee must be in the set.
+    let session_view: BTreeSet<&str> = session.iter().map(String::as_str).collect();
+    history.search_path_changed |= (0..s.toks.len()).any(|k| {
+        s.toks[k].runs
+            && call_target(s, k, &session_view).is_some_and(|c| session.contains(base(&c.name)))
+    });
+    history.path_routines.extend(names);
+    history.session_path_routines.extend(session);
+    end
 }
 
 /// Whether the token at `k` is a `set_config` call that may name
@@ -8381,6 +8415,31 @@ fn a_path_routine_from_an_earlier_migration_changes_the_path() {
         let findings = lint_with_history(&history, drop, true);
         assert!(!findings.is_empty(), "{history:?}\n{findings:?}");
     }
+}
+
+#[test]
+fn a_session_path_change_in_a_routine_carries_into_later_migrations() {
+    let index = "CREATE INDEX idx ON scratch_t (x);";
+    let drop = "DROP INDEX idx;";
+    let session = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                   PERFORM set_config('search_path', 'tenant', false);\nEND $$;";
+    let local = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 PERFORM set_config('search_path', 'tenant', true);\nEND $$;";
+    let outer = "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                 PERFORM f();\nEND $$;";
+    // Without a call, the routine changes nothing.
+    assert_eq!(lint_with_history(&[index, session], drop, true), []);
+    // A session value outlives the migration that calls the routine.
+    for history in [
+        vec![index, session, "SELECT f();"],
+        vec![index, session, outer, "SELECT g();"],
+    ] {
+        let findings = lint_with_history(&history, drop, true);
+        assert!(!findings.is_empty(), "{history:?}\n{findings:?}");
+    }
+    // A local value ends with the transaction of the call.
+    let history = [index, local, "SELECT f();"];
+    assert_eq!(lint_with_history(&history, drop, true), [], "{history:?}");
 }
 
 #[test]
