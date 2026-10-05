@@ -17,9 +17,11 @@ issue.
 
 The model found one undocumented ordering rule. A fresh enqueue and a wake
 backdate `scheduled_at` by `IMMEDIATE_SCHEDULE_SKEW_SECS` (5 s). An orphan
-requeue stamps `clock_timestamp()`. A claim therefore takes any start made
-in the next 5 seconds before the requeued orphan. The model encodes this, and
-`a_requeued_orphan_sorts_behind_a_fresh_start` pins it.
+requeue stamps `clock_timestamp()`. A claim therefore took any start made
+in the next 5 seconds before the requeued orphan. Issue #1824 then changed
+the claim order: a new start sorts 30 seconds later, and a requeued orphan
+is a continuation. The model now follows that order, and
+`a_requeued_orphan_sorts_ahead_of_a_fresh_start` pins it.
 
 **Crash-history checks.** `tests/integration/history_checker.rs` is a
 Porcupine-style linearizability checker with Jepsen `ok`, `fail` and `info`
