@@ -2343,13 +2343,11 @@ fn call_clears(
     // Whether every earlier `CREATE` that may match the call keeps the bound.
     // The lint does not compare parameter types, so any overload with the
     // same name and arity may be the one that runs.
+    let path_bodies = path_bodies(s);
     let keeps = |call: &Routine, clearing: &BTreeSet<usize>| {
         let mut matches = (0..routines.len()).filter(|&i| reaches(s, &routines[i], call));
         let first = matches.next();
-        // After a `search_path` change, an unqualified name may reach a
-        // routine in another schema.
-        let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c <= call.at);
-        !unplaced
+        !unplaced_call(call, path_change, &path_bodies)
             && !inherited.contains(base(&call.name))
             && first.is_some()
             && first
@@ -2397,7 +2395,7 @@ fn call_clears(
         }
         // A `CALL` that no earlier `CREATE` here matches, or a call of a
         // locking routine from an earlier migration, may take any lock.
-        let unplaced = !call.name.contains('.') && path_change.is_some_and(|c| c <= call.at);
+        let unplaced = unplaced_call(call, path_change, &path_bodies);
         let resolved = !unplaced && routines.iter().any(|r| reaches(s, r, call));
         let unread = s.keyword(call.at, "call") || inherited_locking.contains(callee);
         let self_bounded = !unplaced && reaches_self_bounded(call, raws, history);
@@ -2429,6 +2427,22 @@ fn call_clears(
     // `timeout_in_force` reads the changes in token order.
     timeouts.sort_by_key(|(k, _)| *k);
     body_timeouts.sort_by_key(|(k, _)| *k);
+}
+
+/// Whether an unqualified `call` may reach a routine in another schema.
+///
+/// That holds after a `search_path` change. It also holds in the body of a
+/// routine with its own `SET search_path` clause, which applies on each call.
+fn unplaced_call(
+    call: &Routine,
+    path_change: Option<usize>,
+    path_bodies: &[(usize, usize)],
+) -> bool {
+    !call.name.contains('.')
+        && (path_change.is_some_and(|c| c <= call.at)
+            || path_bodies
+                .iter()
+                .any(|&(from, to)| from <= call.at && call.at < to))
 }
 
 /// Whether `call` may reach the routine `r` that this file creates earlier.
@@ -7433,6 +7447,31 @@ fn a_rolled_back_definition_is_not_known() {
     );
     let findings = lint_with_history(&[], &sql, false);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}\n{findings:?}");
+}
+
+#[test]
+fn a_routine_search_path_unplaces_its_unqualified_calls() {
+    let defs = |schema: &str| {
+        format!(
+            "CREATE PROCEDURE {schema}p() LANGUAGE plpgsql AS $$\nBEGIN\n    NULL;\nEND $$;\n\
+             CREATE PROCEDURE w() LANGUAGE plpgsql SET search_path = other, public \
+             SET lock_timeout = '5s' AS $$\nBEGIN\n    CALL {schema}p();\n    \
+             ALTER TABLE harvest_events ADD COLUMN y INT;\nEND $$;"
+        )
+    };
+    // `other.p` may clear the bound before `w` locks.
+    let unqualified = defs("");
+    let findings = lint_with_history(&[], &unqualified, true);
+    assert!(
+        rules(&findings).contains(&Rule::LockTimeout),
+        "{findings:?}"
+    );
+    let findings = lint_with_history(&[&unqualified], "CALL w();", true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // A call with a schema reaches the known routine.
+    let qualified = defs("public.");
+    assert_eq!(lint_with_history(&[], &qualified, true), []);
+    assert_eq!(lint_with_history(&[&qualified], "CALL w();", true), []);
 }
 
 #[test]

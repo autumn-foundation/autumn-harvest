@@ -157,7 +157,8 @@ reaches such a routine, and later calls gain nothing from it.
 After a `search_path` change, only `pg_catalog.set_config` sets a bound,
 because another schema may hold a `set_config` that shadows the built-in. The
 same holds in the body of a routine with a `SET search_path` clause. An
-unqualified call after such a change also ends the bound. A session change
+unqualified call after such a change, or in such a body, also ends the bound.
+It may reach a routine in another schema. A session change
 outlives its file, so the rule holds for every later migration too. A
 top-level `SET LOCAL` change ends with its transaction, so it does not.
 
