@@ -117,7 +117,9 @@ SET lock_timeout` does not change the current session. Inside a `DO` block,
 `PERFORM pg_catalog.set_config('lock_timeout', '5s', true)` also counts. It
 must be a bare `SELECT` or `PERFORM` of the call, with the `pg_catalog`
 schema. The connection may start with a `search_path` that lists another
-schema before `pg_catalog`, so an unqualified call may reach a user function. A query with a filter may never call
+schema before `pg_catalog`, so an unqualified call may reach a user function.
+The bound starts after the call, so it does not cover a lock that one of its
+arguments takes. A query with a filter may never call
 the function, so it does not count. A `set_config` in a schema other than
 `pg_catalog` is a user function, so it ends the bound. The same call in a
 function body does not count for the migration, because the body runs only

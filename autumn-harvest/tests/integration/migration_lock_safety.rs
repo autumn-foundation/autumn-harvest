@@ -3856,10 +3856,17 @@ fn recorded_change(
 ///
 /// PL/pgSQL evaluates the expression of an `EXECUTE` before it runs the SQL.
 /// So a change in the expression takes effect at the `EXECUTE` token, before
-/// the locks of the SQL.
+/// the locks of the SQL. Elsewhere, Postgres evaluates the arguments of a
+/// `set_config` call first. So its change takes effect at the closing
+/// parenthesis, after any lock that an argument takes.
 fn execute_at(s: &Stmts, k: usize) -> usize {
     (s.starts[k]..k)
         .find(|&j| dynamic_execute(s, j))
+        .or_else(|| {
+            (s.is(k, "set_config") && s.is_punct(k + 1, '('))
+                .then(|| closing_paren(s, k + 1))
+                .flatten()
+        })
         .unwrap_or(k)
 }
 
@@ -7680,6 +7687,18 @@ fn a_variadic_routine_accepts_any_number_of_trailing_arguments() {
         [],
         "{earlier}"
     );
+}
+
+#[test]
+fn a_set_config_bound_applies_after_its_arguments() {
+    let earlier = "CREATE FUNCTION legacy_f() RETURNS boolean LANGUAGE plpgsql AS $$\nBEGIN\n    \
+                   ALTER TABLE harvest_events ADD COLUMN y INT;\n    RETURN true;\nEND $$;";
+    // Postgres evaluates `legacy_f()` before `set_config` sets the bound.
+    let sql = "SELECT pg_catalog.set_config('lock_timeout', '5s', legacy_f());";
+    let findings = lint_with_history(&[earlier], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    let sql = "SELECT pg_catalog.set_config('lock_timeout', '5s', true);\nSELECT legacy_f();";
+    assert_eq!(lint_with_history(&[earlier], sql, true), [], "{sql}");
 }
 
 #[test]
