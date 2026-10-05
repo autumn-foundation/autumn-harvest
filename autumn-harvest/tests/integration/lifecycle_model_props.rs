@@ -1389,6 +1389,114 @@ fn lifecycle_matches_the_reference_model() {
     );
 }
 
+// ── Pinned counterexamples ──────────────────────────────────────────────────
+
+/// Shrunk counterexamples from the deep nightly pass. Each one replays
+/// against the database on every CI run, so a model drift fails a pull
+/// request and not only the nightly.
+const PINNED: &[(&str, &[Op])] = &[
+    // Issue #1923: a worker re-claims its own requeued orphan. The orphan
+    // is a continuation, so it sorts ahead of the fresh start of slot 1.
+    (
+        "#1923 re-claim of an own orphan",
+        &[
+            Op::Start {
+                slot: 0,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::Start {
+                slot: 1,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::KillWorker { worker: 0 },
+            Op::Claim { worker: 0 },
+            Op::Reclaim,
+            Op::ReviveWorker { worker: 0 },
+            Op::Claim { worker: 0 },
+            Op::Heartbeat {
+                worker: 0,
+                claim: 1,
+            },
+            Op::Complete {
+                worker: 0,
+                claim: 1,
+            },
+            Op::Complete {
+                worker: 0,
+                claim: 0,
+            },
+        ],
+    ),
+    // Issue #1923: an orphan is requeued, claimed again and quarantined.
+    (
+        "#1923 orphan to the dead-letter queue",
+        &[
+            Op::Start {
+                slot: 0,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::Start {
+                slot: 1,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::KillWorker { worker: 0 },
+            Op::Claim { worker: 0 },
+            Op::Reclaim,
+            Op::Claim { worker: 0 },
+            Op::Reclaim,
+            Op::ReviveWorker { worker: 0 },
+        ],
+    ),
+    // Issue #1923: another worker claims the requeued orphan. The old
+    // claim is then stale.
+    (
+        "#1923 claim lost to a reclaim",
+        &[
+            Op::Start {
+                slot: 2,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::Start {
+                slot: 0,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::Claim { worker: 0 },
+            Op::KillWorker { worker: 0 },
+            Op::Reclaim,
+            Op::ReviveWorker { worker: 0 },
+            Op::Claim { worker: 1 },
+            Op::Heartbeat {
+                worker: 0,
+                claim: 0,
+            },
+            Op::Complete {
+                worker: 0,
+                claim: 0,
+            },
+        ],
+    ),
+];
+
+/// Each pinned counterexample replays clean against the database.
+#[test]
+fn pinned_counterexamples_replay() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let _enter = rt.enter();
+    let (url, _container, _db) = rt.block_on(database());
+    let mut conn = rt
+        .block_on(AsyncPgConnection::establish(&url))
+        .expect("connect");
+    let mut seen = BTreeSet::new();
+    for (name, ops) in PINNED {
+        if let Err(e) = rt.block_on(run_case(&mut conn, ops, &mut seen)) {
+            panic!("{name}: {e}");
+        }
+    }
+}
+
 // ── Model self-tests (no database) ──────────────────────────────────────────
 
 /// After a reclaim and a new claim, the old claim is stale. The fence then
