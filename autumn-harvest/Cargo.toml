@@ -110,7 +110,30 @@ chrono-tz = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-lru = "0.18.2"
+# pinned because: rehearsed 2.2 -> 3.0 (Ballast, 2026-10-05) to collapse the
+# duplicate croner instance against autumn-web's own `^3.0` (deny.toml's
+# [bans] comment flagged this as the one dedup both sides are in reach for).
+# API port was mechanical (`Cron::new(expr).with_seconds_optional().parse()`
+# -> `expr.parse::<Cron>()`; `Seconds::Optional` is 3.0's parser default, so
+# behavior matches) and `cargo check -p autumn-harvest --all-features` was
+# clean. But `cargo test -p autumn-harvest --lib --all-features` was NOT:
+# three scheduler cron-window tests failed under 3.0.1 that pass under 2.2 --
+# `catchup_run_plan_window_cron_jump_starts_at_cutoff` returned only 2 of 3
+# expected hourly slots, the last landing at `22:00:00.999999999Z` instead of
+# `22:00:00Z` (a one-nanosecond-short miss on the inclusive cutoff boundary),
+# and `plan_backfill_timestamps_7_day_hourly_cron_within_default_limit` /
+# `..._hourly_cron_inclusive_bounds` under/over-counted by one slot the same
+# way. `find_next_occurrence`'s public signature is unchanged 2.2 -> 3.0.1,
+# but `find_occurrence`'s internal boundary handling (now routed through a
+# `Direction`-generic search, `src/lib.rs`'s private `find_occurrence`) picks
+# up or drops an occurrence right at the window cutoff -- our own
+# `window_eligible_slots` (issue #484 / Codex #3069) leans on exact inclusive-
+# boundary semantics for catchup/backfill planning, so this is reachable, not
+# cosmetic. Not root-caused further; the point of the rehearsal is that we
+# don't have to be. Revisit: a croner release whose changelog explicitly
+# calls out inclusive-boundary/occurrence-count fixes relative to 3.0.1, or a
+# contributed repro that pins the exact internal change -- rehearse again
+# from there, starting with scheduler.rs's three failing tests as the check.
 croner = "2.2"
 seahash = "4.1"
 rand = { workspace = true }

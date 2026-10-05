@@ -252,13 +252,21 @@ ignore = true
 [bans]
 # `warn`, not `deny`: as of this baseline there are 33 duplicated crate names
 # in the graph (see the harness PR's ledger report for the full list and
-# which party's version constraint causes each). The large majority are
-# driven by external hires (autumn-web, testcontainers, redis, diesel_migrations)
+# which party's version constraint causes each); Ballast's 2026-10-05 run
+# counted 43 (`cargo deny check bans`), tracking this workspace's growth
+# (codec rotation, formal/Kani, loom/Shuttle, chaos tooling) rather than any
+# single regression. The large majority are driven by external hires
+# (autumn-web, testcontainers, redis, diesel_migrations)
 # whose own transitive versions we don't control from this manifest; treating
 # every one as a hard failure would block CI on constraints this repo can't
 # resolve unilaterally. `croner` is the one duplicate where BOTH sides are in
-# reach (our own direct `croner = "2.2"` vs. autumn-web's `^3.0`) — a
-# candidate for a dedicated dedup PR, not bundled into this harness.
+# reach (our own direct `croner = "2.2"` vs. autumn-web's `^3.0`) — rehearsed
+# by Ballast on 2026-10-05: the API port (`Cron::new(..).with_seconds_optional()
+# .parse()` -> `.parse::<Cron>()`) is mechanical, but three scheduler
+# cron-window tests fail under 3.0.1 (inclusive-boundary occurrence counting
+# differs from 2.2 at exact window cutoffs). Pinned at 2.2 with the rehearsal
+# recorded next to the dependency in autumn-harvest/Cargo.toml; not a
+# candidate for a dedup PR until that boundary behavior is accounted for.
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
