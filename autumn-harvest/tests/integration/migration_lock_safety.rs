@@ -2214,7 +2214,25 @@ fn plain_literal_backslash_lines(sql: &str) -> BTreeSet<usize> {
                 i += 1;
             }
             b'-' if at(i, b"--") => skip_to(&mut i, &mut line, b"\n"),
-            b'/' if at(i, b"/*") => skip_to(&mut i, &mut line, b"*/"),
+            // Block comments nest in Postgres.
+            b'/' if at(i, b"/*") => {
+                let mut nesting = 0_usize;
+                while i < b.len() {
+                    if at(i, b"/*") {
+                        nesting += 1;
+                        i += 2;
+                    } else if at(i, b"*/") {
+                        nesting -= 1;
+                        i += 2;
+                        if nesting == 0 {
+                            break;
+                        }
+                    } else {
+                        line += usize::from(b[i] == b'\n');
+                        i += 1;
+                    }
+                }
+            }
             b'"' => {
                 i += 1;
                 skip_to(&mut i, &mut line, b"\"");
@@ -6839,6 +6857,22 @@ fn a_literal_continues_across_a_line_comment() {
             "{findings:?}"
         );
     }
+}
+
+#[test]
+fn a_nested_comment_does_not_hide_a_backslash() {
+    // Block comments nest, so the quote sits inside the comment.
+    let body = "/* outer /* inner */ ' */ DO 'BEGIN ALTER TABLE harvest_event\\163 ADD COLUMN x INT; END';";
+    let sql = format!("SET LOCAL lock_timeout = '5s';\n{body}");
+    let findings = lint_with_history(&[], &sql, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.detail.contains("standard_conforming_strings")),
+        "{findings:?}"
+    );
+    let sql = format!("SET standard_conforming_strings = on;\n{body}");
+    assert_eq!(lint_with_history(&[], &sql, true), [], "{sql}");
 }
 
 #[test]
