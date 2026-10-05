@@ -126,10 +126,14 @@ mod external_completion_tests;
 mod external_outbox_scan_tests;
 mod fanout_tests;
 mod force_fail_tests;
+mod formal_models_coverage;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
 mod history_ceiling_claim_tests;
+mod history_checker;
+#[cfg(feature = "db")]
+mod history_crash_tests;
 mod host_clock_skew_tests;
 mod hot_code_swap_docs;
 #[cfg(all(feature = "hot-code-swap", feature = "testing"))]
@@ -138,6 +142,8 @@ mod hot_code_swap_tests;
 mod idempotency_tests;
 mod integration_e2e;
 mod legal_hold_tests;
+#[cfg(feature = "db")]
+mod lifecycle_model_props;
 mod lineage_store_tests;
 mod macros_activity;
 mod macros_collect;
@@ -260,6 +266,7 @@ mod signal_tests;
 #[cfg(feature = "db")]
 mod signal_with_start_tests;
 mod sla_breach_tests;
+mod slo_pack_docs;
 mod slot_tuner_tests;
 mod sqlite_feasibility_docs;
 #[cfg(feature = "db")]
@@ -278,6 +285,8 @@ mod terminal_write_ownership_tests;
 mod throttle_bucket_prelock_batch_perf;
 #[cfg(feature = "db")]
 mod throttle_tests;
+#[cfg(feature = "db")]
+mod throwaway_db;
 #[cfg(feature = "db")]
 mod transactional_activity_tests;
 #[cfg(feature = "db")]

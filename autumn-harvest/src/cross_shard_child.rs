@@ -1121,6 +1121,7 @@ async fn apply_action(
             Ok(false)
         }
         CrossShardChildAction::ApplyCloseCascade => {
+            #[expect(clippy::expect_used, reason = "the action exists only with a policy")]
             let policy = observation
                 .parent_close_policy
                 .expect("ApplyCloseCascade is only decided for a detached child");

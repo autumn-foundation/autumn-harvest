@@ -69,6 +69,9 @@ endpoint never emits (e.g. `harvest_workflow_terminal_total`,
 `harvest_schedule_fire_attempts_total`, `harvest_no_active_workers`). If you
 want the full starter alert pack to work, use the `metrics-rs` adapter
 escape hatch below, which bridges every `MetricsRecorder` method.
+The optional SLO burn-rate pack (`docs/alerts/slo.md`) also needs that
+adapter. It reads the task-timeout counter, the canary counters, and
+histogram buckets.
 
 **Trade-off:** `autumn_web::actuator::MetricsSource`'s `MetricKind` only
 supports `Counter`/`Gauge` (no histogram variant), so `harvest.workflow.duration`
