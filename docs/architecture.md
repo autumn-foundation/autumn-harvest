@@ -180,7 +180,7 @@ An activity attempt owns its task row only through its claim. The claim is the p
 
 *Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral, the retry-budget deferral and the drain release of a task that never started (issue #1813). Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
 
-The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs only on a worker without the handler. That worker never runs the activity, so it never issues an owner write for it.
+The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue #1917). On an activity row it runs only on a worker without the handler, before the activity starts.
 
 *Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write and claim check uses it, in its own statement:
 
@@ -191,6 +191,7 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 - `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
 - `claim_still_held_for_update`. The workflow-task terminal guard takes `claim_held` and adds `crash_strikes = $c` (issue #1806). The stuck-running requeue keeps `crash_strikes`, so only `attempt` tells a same-worker re-claim apart.
 - `release_suspended_workflow_claim` and `release_terminal_workflow_claim`. The ambiguous-claim release adds `attempt = $a` to its `crash_strikes` guard (issue #1806). Without it, a stale release could free a later claim of the same worker.
+- `release_task_for_capability_miss`. A workflow cycle reaches it after its handler starts. Its guard adds `attempt = $a` to `crash_strikes` for the same reason (issue #1917).
 - `claim_held_for_update_skip_locked`. For an activity row, `fail_task_and_execution_with_history` takes it before its `claim_still_held_for_update` guard. A later claim of the same worker returns `Ok` without a write. Any other miss returns `TerminalWriteClaimAmbiguous`, as the guard does.
 
 *Lease lost.* A path that gets `ClaimLock::Lost` appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. After `Held`, a `LeaseLost` write is a bug, and `require_applied` rolls the transaction back. A fenced write outside the lock returns `LeaseLost` when it matches 0 rows. The heartbeat flusher, the cancellation observer and `check_durable_cancellation` stop the activity.
