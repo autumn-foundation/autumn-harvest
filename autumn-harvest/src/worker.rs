@@ -22646,6 +22646,10 @@ async fn process_workflow_task(
     // reset commits, so a later capability miss can decide on the counters the
     // row actually holds without re-reading them. See `frontier_miss_state`.
     frontier_reset_committed: &std::sync::atomic::AtomicBool,
+    // Issue #1815: set when this dispatch failed the workflow task and re-pended
+    // it, after a deadlock or a contained panic. The run stays RUNNING, but the
+    // task failed, so the worker's outcome window counts it as a failure.
+    requeued_after_failure: &std::sync::atomic::AtomicBool,
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -24072,9 +24076,10 @@ async fn process_workflow_task(
         let Some(claim) = queue::TaskClaim::of(task) else {
             return Ok(());
         };
-        if !queue::requeue_claimed_workflow_task_after_deadlock(conn, &claim, backoff, error)
-            .await?
+        if queue::requeue_claimed_workflow_task_after_deadlock(conn, &claim, backoff, error).await?
         {
+            requeued_after_failure.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
             tracing::debug!(
                 execution_id = %prepared.exec_id,
                 task_id = %task.id,
@@ -24130,8 +24135,12 @@ async fn process_workflow_task(
                 drop(execute_span);
                 // Discard the panicked cycle's pending commands (R5) and re-pend
                 // the task with backoff. State stays RUNNING; no event appended.
-                return queue::requeue_workflow_task_after_panic(conn, task.id, backoff, error)
-                    .await;
+                let requeued =
+                    queue::requeue_workflow_task_after_panic(conn, task.id, backoff, error).await;
+                if requeued.is_ok() {
+                    requeued_after_failure.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return requeued;
             }
             PanicRetryDecision::Terminal => {
                 // Budget exhausted (or disabled): clear the strike entry and
@@ -25045,6 +25054,27 @@ enum TaskDispatchOutcome {
     /// `process_task`, wrapped around the decision cycle alone — see
     /// [`run_under_workflow_body_budget`] (issue #804, Codex round-25 P1).
     BodyTimedOut,
+    /// The cycle failed the workflow task and re-pended it, after a deadlock
+    /// or a contained handler panic (issue #1815). The run stays `RUNNING`.
+    /// The re-pend already ran, so the dispatch site only counts the failure.
+    RequeuedAfterFailure,
+}
+
+/// The outcome of a dispatch whose cycle returned `Ok` (issue #1815).
+///
+/// A cycle that re-pended a failed task still returns `Ok`, because the run
+/// stays `RUNNING`. The flag tells that case apart from a normal conclusion.
+fn completed_outcome(
+    requeued_after_failure: &std::sync::atomic::AtomicBool,
+) -> TaskDispatchOutcome {
+    if std::sync::atomic::AtomicBool::load(
+        requeued_after_failure,
+        std::sync::atomic::Ordering::Relaxed,
+    ) {
+        TaskDispatchOutcome::RequeuedAfterFailure
+    } else {
+        TaskDispatchOutcome::Completed
+    }
 }
 
 /// Run the workflow decision cycle under its issue #494 wall-clock budget.
@@ -25225,6 +25255,8 @@ async fn process_task(
     // resolve a frontier inline, so it stays clear on that path and their
     // claim-time snapshot is trivially current.
     let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+    // Issue #1815: the workflow path sets this when it re-pends a failed task.
+    let requeued_after_failure = std::sync::atomic::AtomicBool::new(false);
 
     let (mut conn, outcome) = match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
@@ -25254,6 +25286,7 @@ async fn process_task(
                     &workflow_deadlock_strikes,
                     workflow_task_deadline,
                     &frontier_reset_committed,
+                    &requeued_after_failure,
                 ))
                 .await;
                 Ok::<_, HarvestError>((conn, outcome))
@@ -25314,7 +25347,7 @@ async fn process_task(
     // schedule-activity enqueue). `fail_execution_on_error` passes the typed
     // variant through un-failed precisely so it lands here.
     let Err(error) = &outcome else {
-        return outcome.map(|()| TaskDispatchOutcome::Completed);
+        return Ok(completed_outcome(&requeued_after_failure));
     };
     // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
     // claim is intercepted HERE -- after `run_under_workflow_body_budget`
@@ -27670,7 +27703,8 @@ pub enum ClaimRecovery {
 const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> Option<bool> {
     match outcome {
         Ok(TaskDispatchOutcome::Completed) => Some(false),
-        Ok(TaskDispatchOutcome::BodyTimedOut) | Err(_) => Some(true),
+        Ok(TaskDispatchOutcome::BodyTimedOut | TaskDispatchOutcome::RequeuedAfterFailure)
+        | Err(_) => Some(true),
         Ok(TaskDispatchOutcome::Released { .. }) => None,
     }
 }
@@ -33954,6 +33988,23 @@ impl Worker {
                                 .remove(&exec_id);
                         }
                     }
+                    Ok(TaskDispatchOutcome::RequeuedAfterFailure) => {
+                        // Issue #1815: a deadlock or a contained panic failed
+                        // the task, and the cycle already re-pended it. It is
+                        // not a timeout, so the timeout strike clears, as for
+                        // a clean error.
+                        if let Some(exec_id) = exec_id_for_timeout {
+                            timeout_strikes
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&exec_id);
+                        }
+                        record_failed_workflow_task(
+                            &task_outcomes,
+                            ClaimRecovery::Applied,
+                            dispatched_at.elapsed(),
+                        );
+                    }
                     Ok(TaskDispatchOutcome::Released {
                         clears_timeout_strike,
                     }) => {
@@ -34210,6 +34261,14 @@ impl Worker {
                 };
                 if workflow_failed == Some(false) {
                     task_outcomes.record(false, dispatched_at.elapsed());
+                }
+                // Issue #1815: a re-pended failure already ran its recovery.
+                if matches!(outcome, Ok(TaskDispatchOutcome::RequeuedAfterFailure)) {
+                    record_failed_workflow_task(
+                        &task_outcomes,
+                        ClaimRecovery::Applied,
+                        dispatched_at.elapsed(),
+                    );
                 }
                 if let Err(error) = outcome {
                     tracing::error!(
@@ -35122,6 +35181,7 @@ pub async fn chaos_drive_one_workflow_task(
         >::new()));
         let workflow_deadlock_strikes = Arc::new(DeadlockStrikes::default());
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+        let requeued_after_failure = std::sync::atomic::AtomicBool::new(false);
         // Boxed for the same reason as the production call site
         // (clippy::large_futures).
         Box::pin(process_workflow_task(
@@ -35139,6 +35199,7 @@ pub async fn chaos_drive_one_workflow_task(
             &workflow_deadlock_strikes,
             None,
             &frontier_reset_committed,
+            &requeued_after_failure,
         ))
         .await
     })
@@ -35188,6 +35249,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
         >::new()));
         let workflow_deadlock_strikes = Arc::new(DeadlockStrikes::default());
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+        let requeued_after_failure = std::sync::atomic::AtomicBool::new(false);
         // Boxed for the same reason as `chaos_drive_one_workflow_task`
         // (clippy::large_futures).
         let mut cycle = Box::pin(process_workflow_task(
@@ -35205,6 +35267,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             &workflow_deadlock_strikes,
             None,
             &frontier_reset_committed,
+            &requeued_after_failure,
         ));
         let cancelled_at_hold = tokio::select! {
             () = hold.reached() => true,
@@ -42492,6 +42555,11 @@ mod tests {
         assert_eq!(
             workflow_task_failed(&Ok(TaskDispatchOutcome::BodyTimedOut)),
             Some(true)
+        );
+        assert_eq!(
+            workflow_task_failed(&Ok(TaskDispatchOutcome::RequeuedAfterFailure)),
+            Some(true),
+            "a deadlock or a contained panic that re-pends the task is a failure"
         );
         assert_eq!(
             workflow_task_failed(&Ok(TaskDispatchOutcome::Released {

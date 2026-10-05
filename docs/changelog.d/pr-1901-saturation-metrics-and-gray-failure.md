@@ -38,6 +38,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   claim a later owner took before it finalized. A session acquire or release
   counts when it finalizes or fails, but not when it defers for capacity.
   A workflow task counts as a failure when it returns an error or times out.
+  So does a cycle that deadlocks, or panics within its retry budget, and so
+  re-pends the task while the run stays `RUNNING`.
   The failure counts after its claim-fenced reset or quarantine, with its
   latency taken then. It is left out when that write finds a peer owns the
   claim. A release is not counted.
