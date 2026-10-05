@@ -5834,10 +5834,18 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
     // The key carries this checker's scope when the scope is not just the
     // lease shard. Checkers on one pool with different shard assignments then
     // each lead their own scope, instead of one leaving the others unscanned.
+    // It also carries the routing mode, because a sharded pass and a local
+    // pass do different work with one scope.
+    let routing = if sharded_pool.is_some() {
+        crate::scanner_lease::LeaseRouting::Sharded
+    } else {
+        crate::scanner_lease::LeaseRouting::Local
+    };
     let lease_key = crate::scanner_lease::lease_scanner_key(
         crate::scanner_health::Scanner::Timeout,
         lease_shard,
         &shard_assignments,
+        routing,
     );
     let lease = coordination
         .holder

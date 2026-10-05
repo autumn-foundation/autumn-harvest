@@ -176,6 +176,8 @@ struct Spec<'a> {
     codecs: PayloadCodecs,
     /// The shards this checker scans. Defaults to `[shard]`.
     scope: Vec<ShardId>,
+    /// The sharded pool, if any. Defaults to `None`.
+    sharded_pool: Option<autumn_harvest::ShardedDbPool>,
 }
 
 impl<'a> Spec<'a> {
@@ -188,6 +190,7 @@ impl<'a> Spec<'a> {
             batch: timeout::DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
             codecs: PayloadCodecs::default(),
             scope: vec![shard],
+            sharded_pool: None,
         }
     }
 }
@@ -205,7 +208,7 @@ fn spawn_checker(pool: &DbPool, spec: Spec<'_>) -> Checker {
         spec.interval,
         telemetry,
         Duration::from_secs(5),
-        None,
+        spec.sharded_pool,
         spec.scope,
         Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
         None,
@@ -1071,6 +1074,47 @@ async fn checkers_with_different_scopes_each_lead() {
     assert!(
         leader.iter().all(|n| *n > 0),
         "each scope must have its own leader, got {leader:?}"
+    );
+}
+
+/// A sharded checker and a local checker do different work with the same
+/// scope, so each leads its own lease. With an empty scope, the sharded pass
+/// fires no event batches, but the local pass fires this database's batches.
+/// A shared lease could leave the local checker on standby indefinitely.
+#[tokio::test]
+async fn sharded_and_local_checkers_with_one_scope_each_lead() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    warm_pool(&pool).await;
+    let shard = ShardId::new(17_961);
+    let interval = Duration::from_millis(100);
+    let sharded = autumn_harvest::ShardedDbPool::single(pool.clone());
+
+    let checkers: Vec<Checker> = [("sharded", Some(sharded)), ("local", None)]
+        .into_iter()
+        .map(|(holder, sharded_pool)| {
+            let mut spec = Spec::new(shard, holder, interval, Duration::from_secs(5));
+            spec.scope = Vec::new();
+            spec.sharded_pool = sharded_pool;
+            spawn_checker(&pool, spec)
+        })
+        .collect();
+    wait_for("10 ticks on every checker", Duration::from_secs(30), || {
+        checkers.iter().all(|c| c.metrics.ticks() >= 10)
+    })
+    .await;
+    let standby: Vec<usize> = checkers.iter().map(|c| c.metrics.role("standby")).collect();
+    let leader: Vec<usize> = checkers.iter().map(|c| c.metrics.role("leader")).collect();
+    stop_all(checkers).await;
+
+    assert_eq!(
+        standby,
+        [0, 0],
+        "neither checker may stand by for the other"
+    );
+    assert!(
+        leader.iter().all(|n| *n > 0),
+        "each routing mode must have its own leader, got {leader:?}"
     );
 }
 

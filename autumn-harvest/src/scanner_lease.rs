@@ -307,14 +307,30 @@ pub fn effective_lease_ttl(ttl: Duration, interval: Duration, jitter: f64) -> Du
         .min(LEASE_TTL_HARD_CAP)
 }
 
+/// How a checker reaches the shards in its scope (issue #1795).
+///
+/// The routing mode changes the work of a pass, not only where it runs. So
+/// two checkers share a lease only when both scope and routing match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseRouting {
+    /// No sharded pool. Every sub-pass uses the checker's own database.
+    Local,
+    /// A sharded pool. Sub-passes reach each scoped shard through it, and
+    /// deliveries resolve their target shard.
+    Sharded,
+}
+
 /// The `scanner` column of a checker's lease row.
 ///
-/// A checker that scans exactly its lease shard uses the bare scanner name.
-/// Any other scope adds its sorted shard ids, for example `timeout:1,2`. A
-/// long list becomes `timeout:sha256:<hex>`, so the key stays short. An
-/// empty scope has its own key, `timeout:none`. Its pass is not the pass of
-/// any listed scope: with a sharded pool, it fires no event batches. Two
-/// checkers then share a lease only when they scan the same shards. This
+/// The key starts with the scanner name. A sharded checker adds `:sharded`.
+/// The two modes do different work with one scope. With an empty scope, a
+/// sharded pass fires no event batches, but a local pass fires them all.
+///
+/// A checker that scans exactly its lease shard uses that prefix alone. Any
+/// other scope adds its sorted shard ids, for example `timeout:1,2`. A long
+/// list becomes `timeout:sha256:<hex>`, so the key stays short. An empty
+/// scope adds `none`, for example `timeout:sharded:none`. Two checkers then
+/// share a lease only when they scan the same shards in the same mode. This
 /// matters when workers share one pool but have different shard assignments.
 /// A shared lease there would leave the standbys' shards unscanned.
 #[must_use]
@@ -322,30 +338,35 @@ pub fn lease_scanner_key(
     scanner: crate::scanner_health::Scanner,
     lease_shard: crate::types::ShardId,
     scope: &[crate::types::ShardId],
+    routing: LeaseRouting,
 ) -> String {
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
 
-    // No shard list can produce `none`, so an empty scope shares no lease
-    // with a listed one.
+    // No shard list can produce `sharded` or `none`, so neither marker makes
+    // two different keys equal.
+    let prefix = match routing {
+        LeaseRouting::Local => scanner.as_str().to_owned(),
+        LeaseRouting::Sharded => format!("{}:sharded", scanner.as_str()),
+    };
     if scope.is_empty() {
-        return format!("{}:none", scanner.as_str());
+        return format!("{prefix}:none");
     }
     let mut ids: Vec<i32> = scope.iter().map(|s| s.as_i32()).collect();
     ids.sort_unstable();
     ids.dedup();
     if ids == [lease_shard.as_i32()] {
-        return scanner.as_str().to_owned();
+        return prefix;
     }
     let ids: Vec<String> = ids.iter().map(i32::to_string).collect();
     let ids = ids.join(",");
     if ids.len() <= MAX_READABLE_SCOPE {
-        return format!("{}:{ids}", scanner.as_str());
+        return format!("{prefix}:{ids}");
     }
     // A long list could pass the index row limit, and then every lease
     // insert fails. A digest keeps the key short and still one per scope.
     let digest = Sha256::digest(ids.as_bytes());
-    let mut key = format!("{}:sha256:", scanner.as_str());
+    let mut key = format!("{prefix}:sha256:");
     for byte in digest {
         let _ = write!(key, "{byte:02x}");
     }
@@ -547,6 +568,7 @@ mod db {
 
 #[cfg(test)]
 mod tests {
+    use super::LeaseRouting::{Local, Sharded};
     use super::*;
 
     const BASE: Duration = Duration::from_secs(1);
@@ -684,21 +706,21 @@ mod tests {
         use crate::types::ShardId;
         let s = |n| ShardId::new(n);
         assert_eq!(
-            lease_scanner_key(Scanner::Timeout, s(0), &[s(0)]),
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(0)], Local),
             "timeout"
         );
         assert_eq!(
-            lease_scanner_key(Scanner::Timeout, s(3), &[s(3)]),
+            lease_scanner_key(Scanner::Timeout, s(3), &[s(3)], Local),
             "timeout"
         );
         assert_eq!(
-            lease_scanner_key(Scanner::Timeout, s(0), &[s(2), s(1), s(2)]),
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(2), s(1), s(2)], Local),
             "timeout:1,2",
             "sorted and deduplicated, so the same set gives the same key"
         );
         assert_ne!(
-            lease_scanner_key(Scanner::Timeout, s(0), &[s(1)]),
-            lease_scanner_key(Scanner::Timeout, s(0), &[s(2)]),
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(1)], Local),
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(2)], Local),
             "different scopes must not share a lease"
         );
     }
@@ -708,19 +730,19 @@ mod tests {
         use crate::scanner_health::Scanner;
         use crate::types::ShardId;
         let scope = |from: i32| (from..from + 1000).map(ShardId::new).collect::<Vec<_>>();
-        let key = lease_scanner_key(Scanner::Timeout, ShardId::new(0), &scope(1));
+        let key = lease_scanner_key(Scanner::Timeout, ShardId::new(0), &scope(1), Local);
         // The primary key index holds at most about 2.7 kB per row.
         assert!(key.len() <= 128, "{} bytes", key.len());
         // Distinct scopes keep distinct keys, and one scope keeps one key.
         assert_ne!(
             key,
-            lease_scanner_key(Scanner::Timeout, ShardId::new(0), &scope(2))
+            lease_scanner_key(Scanner::Timeout, ShardId::new(0), &scope(2), Local)
         );
         let mut reversed = scope(1);
         reversed.reverse();
         assert_eq!(
             key,
-            lease_scanner_key(Scanner::Timeout, ShardId::new(0), &reversed)
+            lease_scanner_key(Scanner::Timeout, ShardId::new(0), &reversed, Local)
         );
     }
 
@@ -731,17 +753,52 @@ mod tests {
         let s = |n| ShardId::new(n);
         // With a sharded pool, an empty scope skips the event batches that a
         // shard-0 scope fires. So the two must not share a lease.
-        for lease_shard in [s(0), s(5)] {
-            let empty = lease_scanner_key(Scanner::Timeout, lease_shard, &[]);
-            for scope in [vec![s(0)], vec![s(5)], vec![s(0), s(5)]] {
-                assert_ne!(
-                    empty,
-                    lease_scanner_key(Scanner::Timeout, lease_shard, &scope),
-                    "an empty scope and {scope:?} do different work"
-                );
+        for routing in [Local, Sharded] {
+            for lease_shard in [s(0), s(5)] {
+                let empty = lease_scanner_key(Scanner::Timeout, lease_shard, &[], routing);
+                for scope in [vec![s(0)], vec![s(5)], vec![s(0), s(5)]] {
+                    assert_ne!(
+                        empty,
+                        lease_scanner_key(Scanner::Timeout, lease_shard, &scope, routing),
+                        "an empty scope and {scope:?} do different work"
+                    );
+                }
             }
-            assert_eq!(empty, "timeout:none");
         }
+        assert_eq!(
+            lease_scanner_key(Scanner::Timeout, s(0), &[], Local),
+            "timeout:none"
+        );
+        assert_eq!(
+            lease_scanner_key(Scanner::Timeout, s(0), &[], Sharded),
+            "timeout:sharded:none"
+        );
+    }
+
+    /// A sharded and a local checker do different work with one scope. With
+    /// an empty scope, only the local pass fires event batches.
+    #[test]
+    fn routing_modes_never_share_a_key() {
+        use crate::scanner_health::Scanner;
+        use crate::types::ShardId;
+        let s = |n| ShardId::new(n);
+        let long: Vec<ShardId> = (1..1000).map(ShardId::new).collect();
+        for scope in [vec![], vec![s(0)], vec![s(1), s(2)], long] {
+            assert_ne!(
+                lease_scanner_key(Scanner::Timeout, s(0), &scope, Local),
+                lease_scanner_key(Scanner::Timeout, s(0), &scope, Sharded),
+                "scope {:?} must have one key per routing mode",
+                scope.len()
+            );
+        }
+        assert_eq!(
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(0)], Sharded),
+            "timeout:sharded"
+        );
+        assert_eq!(
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(1), s(2)], Sharded),
+            "timeout:sharded:1,2"
+        );
     }
 
     #[test]
