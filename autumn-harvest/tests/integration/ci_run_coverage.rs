@@ -1591,3 +1591,118 @@ fn chaos_workflow_runs_the_chaos_suite_nightly() {
         workflow_run_commands(&doc)
     );
 }
+
+/// The total cases that ungated jobs of `doc` run for a step that contains
+/// `target`. A job counts `PROPTEST_CASES` once per entry of its `shard`
+/// matrix. A gated job or step counts nothing. A step that sets its own
+/// `PROPTEST_CASES`, or drops the default `db` feature, counts nothing
+/// either (issue #1829).
+fn deep_cases(doc: &serde_yaml::Value, target: &str) -> u64 {
+    let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
+        return 0;
+    };
+    jobs.values()
+        .filter(|job| ungated(job))
+        .filter(|job| {
+            job.get("steps")
+                .and_then(serde_yaml::Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .filter(|step| ungated(step))
+                .filter(|step| {
+                    step.get("env")
+                        .and_then(|env| env.get("PROPTEST_CASES"))
+                        .is_none()
+                })
+                .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+                .any(|run| {
+                    let run = run.trim();
+                    run.starts_with("cargo test ")
+                        && run.contains(target)
+                        && !run.contains("--no-default-features")
+                        && !SHELL_OPERATORS.iter().any(|op| run.contains(op))
+                        && !run
+                            .split_whitespace()
+                            .any(|word| NO_FULL_RUN_FLAGS.iter().any(|f| word.starts_with(f)))
+                })
+        })
+        .map(|job| {
+            let cases = job
+                .get("env")
+                .and_then(|env| env.get("PROPTEST_CASES"))
+                .and_then(serde_yaml::Value::as_str)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let shards = job
+                .get("strategy")
+                .and_then(|s| s.get("matrix"))
+                .and_then(|m| m.get("shard"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .map_or(1, |s| s.len() as u64);
+            cases * shards
+        })
+        .sum()
+}
+
+/// The nightly deep pass runs the property suites and the stateful
+/// lifecycle model with at least 100000 cases each (issue #1829).
+#[test]
+fn proptest_nightly_runs_both_deep_passes() {
+    const DEEP: u64 = 100_000;
+    let doc = parse_workflow(".github/workflows/proptest-nightly.yml");
+    assert!(
+        !workflow_crons(&doc).is_empty(),
+        "proptest-nightly.yml must have an `on.schedule` cron"
+    );
+    for target in [
+        "--test property",
+        "--test integration lifecycle_model_props:: ",
+    ] {
+        let cases = deep_cases(&doc, target);
+        assert!(
+            cases >= DEEP,
+            "the nightly runs `{target}` for {cases} cases; it must run at least {DEEP}"
+        );
+    }
+}
+
+/// Self-test: a gate, a missing case count or a flag that runs nothing does
+/// not count toward the deep pass.
+#[test]
+fn deep_case_count_rejects_gated_and_empty_runs() {
+    let workflow = |job_extra: &str, run: &str| {
+        let text = format!(
+            "jobs:\n  deep:\n    runs-on: x\n{job_extra}    strategy:\n      matrix:\n        \
+             shard: [1, 2]\n    steps:\n      - run: '{run}'\n"
+        );
+        parse_workflow_text(&text).expect("synthetic workflow must parse")
+    };
+    let env = "    env:\n      PROPTEST_CASES: \"50000\"\n";
+    let run = "cargo test -p autumn-harvest --test property";
+    assert_eq!(deep_cases(&workflow(env, run), "--test property"), 100_000);
+    assert_eq!(deep_cases(&workflow("", run), "--test property"), 0);
+    let gated = format!("{env}    if: false\n");
+    assert_eq!(deep_cases(&workflow(&gated, run), "--test property"), 0);
+    let empty = format!("{run} --no-run");
+    assert_eq!(deep_cases(&workflow(env, &empty), "--test property"), 0);
+    // `--no-default-features` drops the `db` feature, so the db suites
+    // compile out and run nothing.
+    let no_db = format!("{run} --no-default-features");
+    assert_eq!(deep_cases(&workflow(env, &no_db), "--test property"), 0);
+    let joined = format!("{run} && true");
+    assert_eq!(deep_cases(&workflow(env, &joined), "--test property"), 0);
+    // A step `if` or a step `env` that lowers the case count must not count.
+    let step = |extra: &str| {
+        let text = format!(
+            "jobs:\n  deep:\n    runs-on: x\n{env}    steps:\n      - run: '{run}'\n{extra}"
+        );
+        parse_workflow_text(&text).expect("synthetic workflow must parse")
+    };
+    assert_eq!(deep_cases(&step(""), "--test property"), 50_000);
+    assert_eq!(
+        deep_cases(&step("        if: false\n"), "--test property"),
+        0
+    );
+    let lowered = "        env:\n          PROPTEST_CASES: \"1\"\n";
+    assert_eq!(deep_cases(&step(lowered), "--test property"), 0);
+}

@@ -4323,6 +4323,7 @@ pub mod db {
             required_capabilities: None,
             context_headers: None,
             session_id: None,
+            new_start: false,
         }
     }
 

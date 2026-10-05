@@ -56,7 +56,7 @@ autumn-harvest/          <- workspace root
       replay_tests.rs    <- replay engine integration tests
       build_routing_tests.rs <- build-id routing unit + integration tests
       sticky_routing_tests.rs <- sticky routing unit + integration tests (issue #235)
-      scheduler_ha_tests.rs <- HA scheduler claim exclusivity tests (issue #350)
+      scheduler_ha_tests.rs <- HA scheduler claim exclusivity tests (issues #350, #1820)
       macros_*.rs        <- proc-macro integration tests
   autumn-harvest-macros/ <- proc-macro crate
     src/
@@ -178,7 +178,7 @@ An activity attempt owns its task row only through its claim. The claim is the p
 
 *Invariant.* A task-row write takes effect only while its claim is current. So only the current claim writes the terminal event and the terminal row state.
 
-*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release and the rate-limit deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
+*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral and the retry-budget deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
 
 The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs only on a worker without the handler. That worker never runs the activity, so it never issues an owner write for it.
 
@@ -196,7 +196,7 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 
 *Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
 
-A formal model of this protocol is tracked in issue #1819.
+*Model.* `formal/tla/ActivityClaim.tla` models this protocol (issue #1819). TLC checks the invariant over every interleaving of a bounded model (3 workers, 5 claims). With the fence off, it reproduces the #1789 bug. See [`formal-methods.md`](testing/formal-methods.md).
 
 **10. Suspension readiness (issue #1797)**
 
@@ -332,6 +332,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees. Issue #1788: `engine_pool` / `with_engine_timeouts` set deadpool timeouts and per-role (`DbRole`) Postgres session timeouts; `acquire` is a bounded acquire that returns `HarvestError::PoolAcquireTimeout`. See [`docs/operations/postgres-timeouts.md`](operations/postgres-timeouts.md). |
 | `erase.rs` | 3.30 | Targeted PII erasure (issue #495): `ERASURE_TOMBSTONE_KEY`, `erasure_tombstone()`, `tombstone_payload_fields(event_value)` (pure, no-DB), `is_terminal_state(state)`, `EraseOutcome`/`SkippedChild`/`EraseFailure`; DB-gated `erase_workflow_payloads(conn, exec_id, reason)`. **Sanctioned in-place mutation exception** to the append-only invariant (alongside heartbeat checkpoints): only `data` field contents are mutated, never event structure. Terminal-only, irreversible, idempotent, cascades to terminal children on the same shard. |
 | `payload_codec.rs` | 3.40 | Payload encryption/compression boundary at the event-write path (`PayloadCodec` trait, `PayloadCodecs` registry, `IdentityCodec`; see [ADR-0003](adr/0003-payload-codec-event-boundary.md)). Key rotation (issue #948): `register_key`/`set_active_key`/`active_key_id`/`retire_key_local`, `CODEC_LEGACY_KEY_ID`. The `_harvest_codec_envelope` shape (`codec_envelope_parts`): a genuinely rotated key still writes the flat version-2 shape unchanged; only `encode_payload`'s collision-escape guard (issue #1253, `CODEC_ENVELOPE_VERSION_NESTED`) writes the new nested shape, deliberately un-gated (see that method's doc for why nesting a keyed write instead would reopen a rollout hazard). Decode reads all three shapes. `advertise_codec_capability` (issue #1244) merges this build's `CODEC_ENVELOPE_VERSION_KEYED` support into a worker's `harvest_workers.labels`, consumed by `codec_rotation::activate_codec_key`'s reader-capability handshake — unchanged by issue #1253. |
+| `aead_codec.rs` | 3.x | Production AES-256-GCM payload codec (issue #1825). `AeadCodec`: `codec_id` `aes-256-gcm`, a random 96-bit nonce, and an authenticated header with the format version and key id. Also `DataKey` (zeroized on drop), the `KeyProvider` trait and `EnvKeyProvider`/`FileKeyProvider`/`KmsKeyProvider`. The plugin crate's `aws-kms` feature adds `aws_kms::AwsKms`, which implements `KmsDecrypt`, so the core crate has no cloud dependency. `AeadCodec::register_with` and `HarvestBuilder::aead_payload_codec_key` register one codec per key id, so the issue #948 sweep rotates it. See [`docs/security-posture.md`](security-posture.md#payload-encryption-at-rest-issue-1825). |
 | `codec_rotation.rs` | 3.40 | Lazy re-encryption sweep for payload-codec key rotation (issue #948): `sweep_codec_reencryption`/`sweep_codec_reencryption_once` (folded into `timeout::enforce_timeouts_once`, shard-local, batched via `harvest_codec_rotation_cursor`), `load_shard_rotation_progress` (census), `retire_codec_key` (fail-closed retirement gate). **Sanctioned in-place mutation exception #3** — see CLAUDE.md's Engine Invariants. Issue #1244 adds the two structural fleet-wide preconditions #948 left to operator discipline: `activate_codec_key` (refuses while any live worker cannot read the keyed envelope; durably records the key lifecycle in `harvest_codec_key_state`) and `refresh_active_codec_key` (bounded-staleness refresh, folded into the same scanner tick beside the sweep). `retire_codec_key`'s `FleetWriteFence::NotConfirmed` path now reads that durable table instead of trusting an operator attestation alone; `ConfirmedByOperator` remains as a single-process-embedder escape hatch. See [`docs/operations/codec-key-rotation.md`](operations/codec-key-rotation.md). |
 | `payload_store.rs` | 3.37 | Large-payload claim-check offloading (issue #524): `PayloadStore` async trait (embedder-supplied backend, no cloud client in core), `PayloadOffloader` (`offload_event_value`/`inflate_event_value`/`extract_offload_ref`/`refs_in_event_value`), reference-envelope + sha256 checksum helpers. Composes after `PayloadCodec`; no new `WorkflowEvent` variant. Store seam in `store.rs` (`append_events_offloaded`/`load_history_inflated`); GC via `harvest_payload_refs` (migration `20260627000001`). |
 | `completion_callback.rs` | 3.46 | Durable completion callbacks (issue #605): `validate_target_url`/`SsrfPolicy`/`HostAllowlist`/`SsrfRejection` (pure SSRF guard, HTTPS-only + allowlist-required by default), HMAC-SHA256 envelope signing (`build_envelope`/`sign`/`CallbackSecret`), `EventFilter`/`CallbackTarget`/`resolve_all_targets`/`resolve_effective_targets` (pure config resolution), boxed-future `CompletionCallbackDeliverer` trait (no HTTP client in core, mirrors `PayloadStore`/`HistoryArchiver`), `classify_outcome`/`OutcomeAction` (pure retry/backoff/dead-letter decision), `enqueue_completion_deliveries` (folded into `completion_trigger::evaluate_triggers_for_execution`'s existing terminal transaction), `fire_due_completion_deliveries` (two-transaction scanner folded into `timeout::enforce_timeouts_once`), `list_deliveries_for_execution`/`redrive_delivery` (management API), `GLOBAL_CALLBACK_CONFIG` static. New table `harvest_completion_deliveries` (migration `20260705000000`) plus `completion_callbacks jsonb NULL` on `harvest_workflow_executions`. No new `WorkflowEvent` variant, no replay impact. See [`docs/completion-callbacks.md`](completion-callbacks.md) (and the related [`docs/completion-triggers.md`](completion-triggers.md), which starts a *new* workflow on completion rather than calling out to a webhook). |
@@ -1579,6 +1580,18 @@ cd autumn-harvest && diesel migration run
 
 The `testing` feature in `autumn-harvest/Cargo.toml` gates `WorkflowContext::new_test()` and `ActivityContext::new_test()` for use outside `#[cfg(test)]` blocks (e.g., in integration test binaries).
 
+### Panic policy (issue #1821)
+
+Every replica runs the same scanners and serves the same requests. One bad row can therefore stop the same scanner loop on every replica, and the loop stays stopped. A panic in `Drop` during unwinding aborts the process.
+
+- `autumn-harvest` and `autumn-harvest-plugin` set `clippy::expect_used` and `clippy::unwrap_used` to `warn` in `lib.rs`. CI denies warnings.
+- `clippy.toml` exempts test code. Clippy does not see `#[cfg(all(test, ...))]` as test code. Use two `cfg` attributes instead. A `#[test]` function is test code either way.
+- Return a typed error for a value that comes from a row or a request.
+- Recover a poisoned `Mutex` with `PoisonError::into_inner` only when no critical section can leave the value half-written.
+- Never panic in `Drop`. A panic during unwinding aborts the process.
+- Mark a true invariant, or a documented startup or test-only panic, with `#[expect(clippy::expect_used, reason = "...")]` on the smallest item.
+- `context` and `testing` are whole-module exceptions. `lib.rs` gives the reason on each `mod` item.
+
 ---
 
 ## Adding New Workflow Types or Activities
@@ -1713,6 +1726,9 @@ randomized- and model-checking-based testing layers:
   `heartbeat.rs` (issue #1800).
 * [`docs/testing/concurrency-model-checking.md`](testing/concurrency-model-checking.md)
   — the evaluation of loom / Shuttle / Turmoil behind the adoptions above.
+* [`docs/testing/formal-methods.md`](testing/formal-methods.md) — TLA+
+  models of the core protocols and Kani proofs of the pure kernels
+  (issue #1819).
 
 ---
 

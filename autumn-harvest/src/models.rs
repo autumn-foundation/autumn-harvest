@@ -578,6 +578,10 @@ pub struct TaskQueueItem {
     /// owns this row, or once a different wake reason repends it.
     #[serde(default)]
     pub timer_fires_at: Option<DateTime<Utc>>,
+    /// `true` on the first workflow task of a freshly admitted run (issue
+    /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
+    #[serde(default)]
+    pub new_start: bool,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -619,6 +623,9 @@ pub struct NewTaskQueueItem<'a> {
     /// Worker session this activity belongs to (issue #606). `None` for an
     /// ordinary activity dispatch.
     pub session_id: Option<Uuid>,
+    /// `true` on the first workflow task of a freshly admitted run (issue
+    /// #1824).
+    pub new_start: bool,
 }
 
 /// Database representation of a rate limit bucket.

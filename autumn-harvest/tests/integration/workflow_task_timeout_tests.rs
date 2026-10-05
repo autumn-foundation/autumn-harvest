@@ -65,9 +65,17 @@ struct ReasonRow {
 struct RecordingMetrics {
     task_timeouts: Mutex<Vec<(String, String)>>,
     terminal: Mutex<Vec<(String, String, String)>>,
+    canary_failures: Mutex<Vec<(String, u16)>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
+    fn record_canary_failure(&self, queue: &str, shard: u16) {
+        self.canary_failures
+            .lock()
+            .unwrap()
+            .push((queue.to_owned(), shard));
+    }
+
     fn record_workflow_task_timeout(&self, workflow_name: &str, queue: &str) {
         self.task_timeouts
             .lock()
@@ -156,13 +164,24 @@ async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
 
 /// Insert a RUNNING workflow execution and return its UUID.
 async fn insert_running_workflow(conn: &mut AsyncPgConnection) -> Uuid {
+    insert_running_workflow_named(conn, "timeout_wf", 0).await
+}
+
+/// Insert a RUNNING execution of `workflow_name` on `shard_id`.
+async fn insert_running_workflow_named(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    shard_id: i32,
+) -> Uuid {
     let id = Uuid::new_v4();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, shard_id, state, input, queue_name) \
-         VALUES ($1, 'timeout_wf', 'wf-timeout-1', 0, 'RUNNING', '{}'::jsonb, 'default')",
+         VALUES ($1, $2, 'wf-timeout-1', $3, 'RUNNING', '{}'::jsonb, 'default')",
     )
     .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .bind::<diesel::sql_types::Int4, _>(shard_id)
     .execute(conn)
     .await
     .expect("insert execution");
@@ -442,6 +461,97 @@ async fn quarantine_writes_dlq_and_fails_execution() {
     assert!(
         has_terminal,
         "record_workflow_terminal should be called with (timeout_wf, default)"
+    );
+}
+
+/// A quarantined canary probe is a canary failure (issue #1816).
+///
+/// The quarantine path skips the business terminal for a probe. The
+/// workflow-task SLO leaves out probe timeouts. So without a canary failure,
+/// no SLO sees the failed probe.
+#[tokio::test]
+async fn quarantine_of_a_canary_probe_records_a_canary_failure() {
+    let (mut conn, pool, _container) = setup().await;
+
+    let probe = format!(
+        "{}__default",
+        autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX
+    );
+    let exec_id = insert_running_workflow_named(&mut conn, &probe, 2).await;
+    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
+
+    let metrics = RecordingMetrics::default();
+    let quarantined = quarantine_workflow_task_timeout(
+        &pool,
+        task_id,
+        Some(exec_id),
+        "worker-1",
+        1,
+        3,
+        1,
+        &probe,
+        "default",
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+
+    assert!(quarantined, "the quarantine must commit");
+    assert_eq!(execution_state(&mut conn, exec_id).await, "FAILED");
+    assert_eq!(
+        *metrics.canary_failures.lock().unwrap(),
+        vec![("default".to_owned(), 2)],
+        "one canary failure on the probe's queue and shard"
+    );
+    assert!(
+        metrics.terminal.lock().unwrap().is_empty(),
+        "a probe never records a business terminal"
+    );
+}
+
+/// The caller's labels can be the `unknown` and `default` fallbacks.
+/// The quarantine reads the execution row, so it must use its name and queue.
+#[tokio::test]
+async fn quarantine_finds_a_canary_probe_behind_an_unknown_label() {
+    let (mut conn, pool, _container) = setup().await;
+
+    let probe = format!(
+        "{}__default",
+        autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX
+    );
+    let exec_id = insert_running_workflow_named(&mut conn, &probe, 1).await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET queue_name = 'email' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .execute(&mut conn)
+        .await
+        .expect("put the probe on the email queue");
+    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
+
+    let metrics = RecordingMetrics::default();
+    let quarantined = quarantine_workflow_task_timeout(
+        &pool,
+        task_id,
+        Some(exec_id),
+        "worker-1",
+        1,
+        3,
+        1,
+        "unknown",
+        "default",
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+
+    assert!(quarantined, "the quarantine must commit");
+    assert_eq!(
+        *metrics.canary_failures.lock().unwrap(),
+        vec![("email".to_owned(), 1)],
+        "the execution row names the probe and its queue"
+    );
+    assert!(
+        metrics.terminal.lock().unwrap().is_empty(),
+        "a probe never records a business terminal"
     );
 }
 

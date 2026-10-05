@@ -167,14 +167,11 @@ impl EphemeralPostgres {
         // sockets` — which reads like anything but "your path is too long".
         // The process id plus 32 bits of randomness is ample for a directory
         // that lives for minutes.
+        let bytes = Uuid::new_v4().into_bytes();
+        let random = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let session_dir = root.join(format!(
-            "{SESSION_DIR_PREFIX}{}-{:08x}",
+            "{SESSION_DIR_PREFIX}{}-{random:08x}",
             std::process::id(),
-            u32::from_be_bytes(
-                Uuid::new_v4().as_bytes()[..4]
-                    .try_into()
-                    .expect("4 bytes of a UUID")
-            )
         ));
         let data_dir = session_dir.join("data");
         std::fs::create_dir_all(&session_dir).map_err(|source| DevError::SessionDir {

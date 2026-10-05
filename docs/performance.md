@@ -1232,6 +1232,42 @@ numbering in the thousands or more should expect the candidate-side gate's
 cost to grow with that cardinality and are not covered by this fix's
 evidence.
 
+## The continuation band and the expired-run gate (issue #1824)
+
+Issue #1824 adds two things to the claim statement. See
+[`operations/claim-order.md`](operations/claim-order.md).
+
+- **The order term.** The last sort key is now `scheduled_at` plus a
+  30-second handicap for a new start, not plain `scheduled_at`.
+- **The expired-run gate.** A `MATERIALIZED` set of expired `RUNNING` runs,
+  and a `NOT EXISTS` test against it in `candidate`.
+
+Measured on Postgres 16 with JIT off. The backlog was 20k `PENDING` rows in
+one queue, of mixed types, at two priorities, with 25% new starts. Each
+figure is the median of 12 runs.
+
+| Case | Before | After | Order term only | Gate only |
+|---|---|---|---|---|
+| 0 expired runs | 36.5 ms | 54.7 ms | 55.4 ms | 36.8 ms |
+| 200 expired runs at the head | 37.5 ms | 52.1 ms | 52.3 ms | 34.6 ms |
+| 5k expired runs | 33.3 ms | 34.9 ms | 56.6 ms | 26.4 ms |
+
+- **The gate costs about nothing.** It runs as a hashed subplan, once per
+  claim. A `BitmapOr` of `idx_harvest_executions_deadline` and
+  `idx_harvest_executions_chain_deadline` reads the set. Rows that the gate
+  removes also shrink the sort.
+- **The order term costs about 18 ms at this depth.** The plan shape does not
+  change: an index scan on `idx_harvest_tq_poll`, then a sort. Before, the
+  sort keys followed the index order, so the sort input was almost sorted.
+  The term breaks that for the new-start rows.
+- **A cheaper term was tried and rejected.** A boolean "young new start" key
+  ahead of plain `scheduled_at` gives the same 30-second bound. In an
+  isolated sort test at the same depth, it took about 17 ms against 13 ms for
+  the chosen term and 10.5 ms before.
+
+No index can remove the sort. The sticky `CASE` key already forces it. See
+[any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+
 ## Enqueue throughput
 
 8 concurrent writers enqueueing into an already-populated queue:

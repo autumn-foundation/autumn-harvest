@@ -1,5 +1,10 @@
 //! Durable workflow orchestration engine core.
 
+// Issue #1821: one bad row can stop the same scanner loop on every replica.
+// Non-test code returns an error instead. Each remaining site carries an
+// `expect` attribute with its reason. Whole-module exceptions are on `mod` items.
+#![warn(clippy::expect_used, clippy::unwrap_used)]
+
 /// Embedded migrations for the harvest engine schema.
 ///
 /// Downstream crates (such as `autumn-harvest-plugin`) should consume this
@@ -196,6 +201,8 @@ pub fn test_partitioned_layout_requested() -> bool {
 pub mod activity_pause;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
+/// AES-256-GCM payload codec and data-key providers (issue #1825).
+pub mod aead_codec;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Pure token-secret helpers shared by the mint route and the CLI (issue #942).
@@ -249,6 +256,14 @@ pub mod completion_callback;
 pub mod completion_trigger;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
+// Issue #1821 exempts this module. Each workflow poll runs under
+// `catch_unwind`, so a panic here fails one workflow task, and replay builds a
+// new context. Recovery from a poisoned lock can keep partial replay state.
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "a panic fails one workflow task and replay recovers it"
+)]
 pub mod context;
 pub mod critical_path;
 /// Cross-shard child workflow placement (issue #956).
@@ -452,6 +467,11 @@ pub mod telemetry;
 pub mod test_generator;
 /// Replay test harness for verifying workflow determinism pre-deploy.
 #[cfg(any(test, feature = "testing"))]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test harness code, not a production path"
+)]
 pub mod testing;
 /// Workflow-start throttle — pace admissions, defer the excess (issue #607).
 pub mod throttle;
