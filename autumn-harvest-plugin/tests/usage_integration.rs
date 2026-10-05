@@ -250,13 +250,16 @@ async fn seed_activity_event(
         .execute(&mut conn)
         .await
         .expect("insert event");
-    diesel::update(
-        dsl::harvest_events
-            .filter(dsl::workflow_exec_id.eq(exec_id))
-            .filter(dsl::event_id.eq(event_id)),
-    )
-    .set(dsl::timestamp.eq(timestamp))
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::update(
+            dsl::harvest_events
+                .filter(dsl::workflow_exec_id.eq(exec_id))
+                .filter(dsl::event_id.eq(event_id)),
+        )
+        .set(dsl::timestamp.eq(timestamp))
+        .execute(c)
+        .await
+    })
     .await
     .expect("force event timestamp");
 }
@@ -338,13 +341,16 @@ async fn seed_terminal_event(
         .execute(&mut conn)
         .await
         .expect("insert event");
-    diesel::update(
-        dsl::harvest_events
-            .filter(dsl::workflow_exec_id.eq(exec_id))
-            .filter(dsl::event_id.eq(event_id)),
-    )
-    .set(dsl::timestamp.eq(timestamp))
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::update(
+            dsl::harvest_events
+                .filter(dsl::workflow_exec_id.eq(exec_id))
+                .filter(dsl::event_id.eq(event_id)),
+        )
+        .set(dsl::timestamp.eq(timestamp))
+        .execute(c)
+        .await
+    })
     .await
     .expect("force event timestamp");
 }

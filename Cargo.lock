@@ -286,7 +286,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "autumn-harvest"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-plugin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-redis"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-sqlite"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-verify"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "clap",
@@ -470,23 +470,67 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d31acef53e1a927937ea56b2820f2db113d90c7cebcb2061a5850af3d946f88"
+checksum = "5a3e7c520467060e49472145f26c81388a9d74f4c076f8815463adf2de53d415"
 dependencies = [
+ "autumn-macros-support",
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "serde",
+ "serde_json",
+ "syn 3.0.6",
+]
+
+[[package]]
+name = "autumn-macros-model"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a35d3458a90ed26451b55dfe48424cd83108f9bd460532a14688af8f80093b64"
+dependencies = [
+ "autumn-macros-support",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
+name = "autumn-macros-repository"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b359e9e916676841d802b0866b2cff6069c0970c75117a47bfd2abed40d354b"
+dependencies = [
+ "autumn-macros-support",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
+name = "autumn-macros-support"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c35064db60e14a58d551bd5b24634af2673ec1e6a38e436fd60d5ffaaa14fec"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]
 name = "autumn-web"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be9699fb1820106108ac4a023754f797bc2095e6689313dcb2b689d76f090cdc"
+checksum = "dfbd187026fa013fb2dd22e8eafc88be9ec474ce337abd61a22d9f8843ffe4b6"
 dependencies = [
  "aes-gcm",
  "autumn-macros",
+ "autumn-macros-model",
+ "autumn-macros-repository",
  "axum",
  "base64 0.23.1",
  "bcrypt",
@@ -517,23 +561,26 @@ dependencies = [
  "moka",
  "multer",
  "nix 0.31.3",
+ "p256",
  "percent-encoding",
  "pin-project-lite",
+ "pq-src",
  "pq-sys",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "reqwest",
  "rust_decimal",
  "rustls",
  "rustls-pki-types",
  "scoped-futures",
  "secrecy",
+ "semver",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
  "serde_yaml",
- "sha1",
+ "sha1 0.11.0",
  "sha2 0.10.9",
  "subtle",
  "testcontainers",
@@ -554,6 +601,7 @@ dependencies = [
  "uuid",
  "validator",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]
@@ -937,7 +985,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sha1",
+ "sha1 0.10.6",
  "sync_wrapper",
  "tokio",
  "tokio-tungstenite",
@@ -1041,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "billing-autumn-web"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -1313,6 +1361,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "card-validate"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "655fa70596e2a38372c0c0c4449ec0166ad9cc43d91558bbecc1a6f38bf9eb91"
+dependencies = [
+ "lazy_static",
+ "regex",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1475,7 +1533,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claude-agent-daemon"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
@@ -2979,7 +3037,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-boundary"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -2990,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-clean"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -3001,7 +3059,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-helpers"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "harvest-verify-corpus-helpers-deep",
  "rand 0.8.6",
@@ -3011,11 +3069,11 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-helpers-deep"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "harvest-verify-corpus-seeded"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -3651,9 +3709,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "10.4.0"
+version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
+checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -4784,9 +4842,9 @@ dependencies = [
 
 [[package]]
 name = "pq-src"
-version = "0.3.11+libpq-18.3"
+version = "0.3.13+libpq-18.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fb5bfbe0c3445d371dd8acf7d6c912ece8baf2f61f7c571af85a1d7687c2d0f"
+checksum = "e70bbe4cdadd409f38beac5496e6b2d3f8a6a2881dc2705add79dfc9905b683c"
 dependencies = [
  "cc",
 ]
@@ -4976,7 +5034,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quickstart"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -5118,6 +5176,16 @@ checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -5457,6 +5525,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http 1.4.0",
@@ -5791,7 +5860,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saga-choreography"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -6101,6 +6170,17 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.2",
 ]
 
 [[package]]
@@ -6425,7 +6505,7 @@ dependencies = [
 
 [[package]]
 name = "standalone-runner"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-cli",
@@ -6546,6 +6626,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6613,7 +6704,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -6972,13 +7063,12 @@ dependencies = [
 
 [[package]]
 name = "tokio-postgres-rustls"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27d684bad428a0f2481f42241f821db42c54e2dc81d8c00db8536c506b0a0144"
+checksum = "4c2ad44aa0ae96db89c4742212ed41645b2f597311ff6e1945542a4d9fadc2fb"
 dependencies = [
- "const-oid 0.9.6",
- "ring",
  "rustls",
+ "sha2 0.11.0",
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
@@ -7331,7 +7421,7 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.4",
- "sha1",
+ "sha1 0.10.6",
  "thiserror 2.0.18",
 ]
 
@@ -7517,12 +7607,12 @@ dependencies = [
 
 [[package]]
 name = "validator"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43fb22e1a008ece370ce08a3e9e4447a910e92621bb49b85d6e48a45397e7cfa"
+checksum = "c3d68c6633c483df6780cc5277a417c7c2d1bceee2649d06c8ab6b0fd2dd3c81"
 dependencies = [
+ "card-validate",
  "idna",
- "once_cell",
  "regex",
  "serde",
  "serde_derive",
