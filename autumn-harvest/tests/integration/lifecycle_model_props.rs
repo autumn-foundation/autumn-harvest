@@ -284,9 +284,25 @@ struct Task {
     attempt: i32,
     strikes: i32,
     wake_requested: bool,
-    /// The `scheduled_at` of the task, in milliseconds on the case clock. A
-    /// claim takes the task that is due first.
+    /// The `scheduled_at` of the task, in milliseconds on the case clock.
+    /// The claim sorts on [`Task::claim_due`], not on this value.
     due: i64,
+}
+
+impl Task {
+    /// The claim-order due time, as `queue::CLAIM_ORDER_DUE_SQL` computes it.
+    ///
+    /// Every run of this model starts through the workflow start path, so its
+    /// task is a new start while `attempt` is 0. A new start sorts as if it
+    /// were due `NEW_START_HANDICAP_SECS` later (issue #1824). A claim
+    /// increments `attempt`. An orphan requeue, a park and a wake keep it.
+    fn claim_due(&self) -> i64 {
+        if self.attempt == 0 {
+            self.due + i64::from(autumn_harvest::queue::NEW_START_HANDICAP_SECS) * 1000
+        } else {
+            self.due
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,7 +439,7 @@ impl Model {
             .iter()
             .enumerate()
             .filter(|(_, r)| r.task.state == TaskState::Pending)
-            .map(|(i, r)| (r.task.due, i))
+            .map(|(i, r)| (r.task.claim_due(), i))
             .min();
         let Some((_, run)) = best else {
             return Res::Claimed(None);
@@ -432,7 +448,8 @@ impl Model {
         Res::Claimed(Some(run))
     }
 
-    /// A valid claim takes a pending task that is due first. Two due times
+    /// A valid claim takes a pending task with the first claim-order due time
+    /// ([`Task::claim_due`]). Two due times
     /// closer than [`TIE_MS`] are a tie, because the model clock and the
     /// database clock read at slightly different moments.
     fn claim_is_valid(&self, run: usize) -> bool {
@@ -440,10 +457,10 @@ impl Model {
             .runs
             .iter()
             .filter(|r| r.task.state == TaskState::Pending)
-            .map(|r| r.task.due)
+            .map(|r| r.task.claim_due())
             .min();
         let task = &self.runs[run].task;
-        task.state == TaskState::Pending && min.is_some_and(|m| task.due <= m + TIE_MS)
+        task.state == TaskState::Pending && min.is_some_and(|m| task.claim_due() <= m + TIE_MS)
     }
 
     fn apply_claim(&mut self, worker: usize, run: usize) {
@@ -570,8 +587,8 @@ impl Model {
     /// strike. At the threshold the task goes to the dead-letter queue and
     /// its run fails. Below it the task is pending again.
     fn reclaim(&mut self) -> Res {
-        // The requeue stamps `clock_timestamp()` with no backdate. A requeued
-        // orphan therefore sorts behind a fresh start of the next 5 seconds.
+        // The requeue stamps `clock_timestamp()` with no backdate. The orphan
+        // keeps its `attempt`, so it sorts as a continuation (issue #1824).
         let due = self.now;
         let (mut requeued, mut quarantined) = (0, 0);
         for run in 0..self.runs.len() {
@@ -1469,11 +1486,11 @@ fn a_wake_during_a_claim_is_not_lost() {
     assert_eq!(m.runs[0].task.state, TaskState::Pending);
 }
 
-/// A fresh enqueue backdates `scheduled_at` by the skew allowance. An orphan
-/// requeue does not. A claim therefore takes a start made just after a
-/// reclaim first.
+/// A requeued orphan keeps its `attempt`, so it is a continuation. A start
+/// made just after the reclaim is a new start and yields to it, although its
+/// backdated `scheduled_at` is earlier (issue #1824).
 #[test]
-fn a_requeued_orphan_sorts_behind_a_fresh_start() {
+fn a_requeued_orphan_sorts_ahead_of_a_fresh_start() {
     let mut m = Model::new();
     let _ = m.start(0, Policy::AllowDuplicate);
     m.alive[0] = false;
@@ -1481,8 +1498,8 @@ fn a_requeued_orphan_sorts_behind_a_fresh_start() {
     let _ = m.reclaim();
     m.now = 100;
     let _ = m.start(1, Policy::AllowDuplicate);
-    assert!(!m.claim_is_valid(0), "the orphan is due 5 seconds later");
-    assert_eq!(m.claim(1), Res::Claimed(Some(1)));
+    assert!(!m.claim_is_valid(1), "the new start sorts 30 seconds later");
+    assert_eq!(m.claim(1), Res::Claimed(Some(0)));
 }
 
 /// Two strikes send an orphan to the dead-letter queue and fail its run.
