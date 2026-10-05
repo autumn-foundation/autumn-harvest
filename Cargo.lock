@@ -36,6 +36,7 @@ dependencies = [
  "cfg-if",
  "cipher 0.4.4",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -50,6 +51,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -286,6 +288,8 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 name = "autumn-harvest"
 version = "0.6.0"
 dependencies = [
+ "aes",
+ "aes-gcm",
  "async-trait",
  "autumn-harvest-macros",
  "base64 0.22.1",
@@ -298,11 +302,13 @@ dependencies = [
  "diesel-async",
  "diesel_migrations",
  "futures",
+ "ghash",
  "hmac 0.12.1",
  "loom",
  "lru 0.18.4",
  "metrics",
  "percent-encoding",
+ "polyval",
  "proc-macro2",
  "proptest",
  "rand 0.8.6",
@@ -333,6 +339,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wat",
+ "zeroize",
 ]
 
 [[package]]
@@ -376,6 +383,7 @@ dependencies = [
  "autumn-harvest-redis",
  "autumn-web",
  "aws-config",
+ "aws-sdk-kms",
  "aws-sdk-sqs",
  "chrono",
  "chrono-tz",
@@ -630,6 +638,30 @@ dependencies = [
  "pin-project-lite",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aws-sdk-kms"
+version = "1.99.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa37c3e267142899d18cb1617258c93ed7a78873e9adff0221838b0e621188be"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]
@@ -2883,6 +2915,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -4647,6 +4680,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]

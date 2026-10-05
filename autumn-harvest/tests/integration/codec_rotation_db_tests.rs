@@ -32,6 +32,9 @@
 //!   covered in the plugin crate's `codec_rotation_admin_integration.rs`.
 //! - **AC8** (composition with offload / erasure) —
 //!   [`offload_envelopes_and_tombstones_survive_a_sweep_untouched`].
+//! - **Issue #1825** (the production AES-256-GCM codec rotates and replays
+//!   byte-identically) — [`replay_fidelity_is_byte_identical_across_a_sweep`]
+//!   runs once with the XOR fixture codec and once with `AeadCodec`.
 //! - **Issue #1251** (a sweep batch cannot commit a row under a key retired
 //!   mid-batch) —
 //!   [`a_batch_pinned_to_a_key_blocks_its_retirement_through_a_double_rotation`].
@@ -72,6 +75,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_harvest::aead_codec::{AeadCodec, DataKey};
 use autumn_harvest::codec_rotation::{
     FleetWriteFence, activate_codec_key, load_shard_rotation_progress,
     load_shard_rotation_progress_against, refresh_active_codec_key, retire_codec_key,
@@ -287,6 +291,20 @@ fn two_key_registry() -> PayloadCodecs {
     codecs
         .register_key("k2", Arc::new(XorCodec(0x22)))
         .expect("register k2");
+    codecs.set_active_key("k1").expect("activate k1");
+    codecs
+}
+
+/// As [`two_key_registry`], with AES-256-GCM codecs (issue #1825).
+fn two_aead_key_registry() -> PayloadCodecs {
+    let codecs = PayloadCodecs::default();
+    for (key_id, byte) in [("k1", 0x11), ("k2", 0x22)] {
+        let key = DataKey::from_bytes(&[byte; 32]).expect("data key");
+        AeadCodec::new(key_id, &key)
+            .expect("aead codec")
+            .register_with(&codecs)
+            .expect("register");
+    }
     codecs.set_active_key("k1").expect("activate k1");
     codecs
 }
@@ -729,11 +747,21 @@ async fn flipping_the_active_key_starts_a_fresh_pass() {
 
 // ── AC5: the fidelity proof behind sanctioned exception #3 ───────────────────
 
+/// Runs the fidelity proof with the XOR fixture codec and with the
+/// production AES-256-GCM codec (issue #1825).
 #[tokio::test]
 async fn replay_fidelity_is_byte_identical_across_a_sweep() {
+    assert_replay_fidelity_across_a_sweep("xor", two_key_registry()).await;
+    assert_replay_fidelity_across_a_sweep("aes-256-gcm", two_aead_key_registry()).await;
+}
+
+/// Replay a fixture history, sweep it from `k1` onto `k2`, and replay again.
+///
+/// `codec_id` names the codec that `codecs` holds. The stored rows must carry
+/// it, so the run cannot pass on another codec.
+async fn assert_replay_fidelity_across_a_sweep(codec_id: &str, codecs: PayloadCodecs) {
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
-    let codecs = two_key_registry();
     let exec_id = insert_execution(&mut conn, "fidelity_workflow").await;
     append_under_key(
         &mut conn,
@@ -760,8 +788,9 @@ async fn replay_fidelity_is_byte_identical_across_a_sweep() {
         .await;
     assert!(
         matches!(report_before.status, ReplayStatus::ReplaySucceeded),
-        "pre-sweep replay must succeed:\n{report_before}"
+        "{codec_id}: pre-sweep replay must succeed:\n{report_before}"
     );
+    assert_stored_fields(&mut conn, exec_id, codec_id, "k1").await;
 
     codecs.set_active_key("k2").expect("flip");
     assert_eq!(
@@ -769,8 +798,9 @@ async fn replay_fidelity_is_byte_identical_across_a_sweep() {
             .await
             .expect("sweep"),
         2,
-        "the sweep really did rewrite the stored bytes"
+        "{codec_id}: the sweep really did rewrite the stored bytes"
     );
+    assert_stored_fields(&mut conn, exec_id, codec_id, "k2").await;
 
     let after = store::load_history_with_codecs(&mut conn, exec_id, &codecs)
         .await
@@ -778,7 +808,7 @@ async fn replay_fidelity_is_byte_identical_across_a_sweep() {
     let after_json = serde_json::to_string(&after.events).expect("serialize after");
     assert_eq!(
         before_json, after_json,
-        "the DECODED history must be byte-identical across the in-place mutation"
+        "{codec_id}: the DECODED history must be byte-identical across the in-place mutation"
     );
 
     let report_after = WorkflowReplayer::new()
@@ -789,8 +819,29 @@ async fn replay_fidelity_is_byte_identical_across_a_sweep() {
         .await;
     assert!(
         matches!(report_after.status, ReplayStatus::ReplaySucceeded),
-        "post-sweep replay must succeed:\n{report_after}"
+        "{codec_id}: post-sweep replay must succeed:\n{report_after}"
     );
+}
+
+/// Assert that both stored payload fields use `codec_id` under `kid`.
+async fn assert_stored_fields(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    codec_id: &str,
+    kid: &str,
+) {
+    let rows = raw_event_data(conn, exec_id).await;
+    for (row, field) in rows.iter().zip(["input", "output"]) {
+        assert_eq!(
+            row["data"][field]["codec_id"], codec_id,
+            "{codec_id}: {field}"
+        );
+        assert_eq!(
+            kid_of(row, field).as_deref(),
+            Some(kid),
+            "{codec_id}: {field}"
+        );
+    }
 }
 
 // ── issue #1243: the production start path must honor a builder-configured

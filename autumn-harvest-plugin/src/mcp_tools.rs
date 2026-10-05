@@ -911,6 +911,7 @@ fn build_tool_route(
             },
         ),
         ToolKind::Update => {
+            #[expect(clippy::expect_used, reason = "an update spec always names its update")]
             let update: &'static str = leak(
                 spec.update
                     .clone()

@@ -926,6 +926,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub fn sign(secret: &CallbackSecret, body: &[u8]) -> String {
     use std::fmt::Write as _;
 
+    #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length")]
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(body);

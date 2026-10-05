@@ -2893,11 +2893,18 @@ mod db {
                 // already has the task from the original transaction.
                 // Gating here never loses legitimate work.
                 if activated > 0 {
+                    // `jsonb_populate_record` over a NULL base turns a missing
+                    // key into NULL, and the column DEFAULT does not apply.
+                    // A row staged before a NOT NULL column existed, or by a
+                    // source shard without it, has no such key. So the
+                    // statement merges a default under the staged keys first.
+                    // A future NOT NULL column needs its own default here.
                     if let Some(task) = staged_task {
                         diesel::sql_query(
                             "INSERT INTO harvest_task_queue \
                              SELECT * FROM jsonb_populate_record( \
-                                 NULL::harvest_task_queue, $1::jsonb) \
+                                 NULL::harvest_task_queue, \
+                                 '{\"new_start\": false}'::jsonb || $1::jsonb) \
                              ON CONFLICT (id) DO NOTHING",
                         )
                         .bind::<Jsonb, _>(&task)

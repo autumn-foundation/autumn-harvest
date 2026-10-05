@@ -3,7 +3,8 @@
 This note records an honest evaluation of three model-checking / simulation
 tools for harvest, and the resulting adoption decisions. The companions
 [`loom.md`](loom.md) and [`shuttle.md`](shuttle.md) document the two tools in
-use.
+use. [`formal-methods.md`](formal-methods.md) covers the TLA+ models of the
+Postgres-coordinated protocols and the Kani proofs (issue #1819).
 
 The single most important framing fact, repeated throughout: **the large
 majority of harvest's concurrency is coordinated through Postgres** — `SELECT

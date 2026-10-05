@@ -394,6 +394,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
       - name: Clippy autumn-harvest-plugin (sqs feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
+      - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features aws-kms -- -D warnings
       # Issue #1312: the runtime wiring for the Redis dispatch channel is
       # `cfg`d out of the default build, so only this step compiles it.
       - name: Clippy autumn-harvest-plugin (redis feature)
@@ -490,6 +492,29 @@ jobs:
       # the same trailing-`::` YAML reason as above.
       - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
+
+      # Issue #1816: the SLO burn-rate pack lives under `docs/`, so a PR
+      # that edits only the pack skips the `test` matrix. These guards pin
+      # what promtool cannot see. Quoted for the trailing-`::` reason above.
+      - name: Run docs/alerts SLO pack guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration slo_pack_docs::"
+
+      # Issue #1816: load and unit-test the SLO burn-rate rules. The pinned
+      # tarball and its checksum keep a new promtool release from reddening
+      # lint, and a tampered download fails the checksum.
+      - name: SLO burn-rate rules (promtool check and test)
+        env:
+          PROMETHEUS_VERSION: "3.5.0"
+          PROMETHEUS_SHA256: "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a"
+        run: |
+          set -euo pipefail
+          name="prometheus-${PROMETHEUS_VERSION}.linux-amd64"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/$name.tar.gz" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/$name.tar.gz"
+          echo "${PROMETHEUS_SHA256}  ${RUNNER_TEMP}/$name.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/$name.tar.gz" -C "${RUNNER_TEMP}" --strip-components=1 "$name/promtool"
+          "${RUNNER_TEMP}/promtool" check rules docs/alerts/slo-pack-v0.1.0.rules.yml
+          "${RUNNER_TEMP}/promtool" test rules docs/alerts/slo-pack-v0.1.0.test.yml
 
       # Issue #1202: same reasoning as the two steps above, for
       # docs/testing/chaos.md's worked local-iteration example. It lives
@@ -953,6 +978,11 @@ jobs:
       - name: Run plugin lib tests (redis feature, issue #1312)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features redis --lib
+      # Issue #1825. The AWS KMS binding for the AEAD codec key provider runs
+      # against a local fake KMS endpoint, so it needs no AWS account.
+      - name: Run plugin lib tests (aws-kms feature, issue #1825)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
@@ -1911,6 +1941,46 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run Shuttle models (random and PCT schedulers)
         run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
+
+  # TLA+ models of the core protocols (issue #1819). The runner checks each
+  # row of formal/tla/models.txt. A `violation:` row is a counter-example, and
+  # it must fail on its named invariant. See docs/testing/formal-methods.md.
+  formal-models:
+    name: TLA+ models
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # A full run takes about 40 seconds. The runner image has Java.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Model-check every manifest row with TLC
+        run: scripts/check-formal-models.sh
+
+  # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
+  # verifies fewer proofs than the source holds, or when a cover check fails.
+  kani:
+    name: Kani proofs
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+      - name: Run Kani proofs
+        run: scripts/check-kani-proofs.sh
 
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every

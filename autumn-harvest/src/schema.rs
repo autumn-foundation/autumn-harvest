@@ -319,6 +319,10 @@ diesel::table! {
         /// `NULL` when no timer owns this row, or once a different wake
         /// reason repends it.
         timer_fires_at -> Nullable<Timestamptz>,
+        /// `TRUE` on the first workflow task of a freshly admitted run
+        /// (issue #1824). Set only by the workflow start path. The claim
+        /// order reads it while `attempt = 0`.
+        new_start -> Bool,
     }
 }
 

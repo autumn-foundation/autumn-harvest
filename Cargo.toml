@@ -82,7 +82,8 @@ proptest = "1.11.0"
 # `autumn-harvest/src/loom_sync.rs` under normal (`-D warnings`) builds.
 # `shuttle` is the same kind of cfg for the Shuttle target
 # (autumn-harvest/tests/shuttle_models.rs, issue #1800).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)'] }
+# `kani` is set by `cargo kani` for the proof harnesses (issue #1819).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(kani)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
