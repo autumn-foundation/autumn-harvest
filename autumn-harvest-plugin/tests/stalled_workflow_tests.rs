@@ -142,12 +142,15 @@ async fn seed_stalled_workflow(
 
     // Backdate the WorkflowStarted event that was just appended.
     let backdated_ts = Utc::now() - Duration::hours(hours_ago);
-    diesel::update(harvest_events::table)
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .set(harvest_events::timestamp.eq(backdated_ts))
-        .execute(&mut conn)
-        .await
-        .expect("backdate event");
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::update(harvest_events::table)
+            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+            .set(harvest_events::timestamp.eq(backdated_ts))
+            .execute(c)
+            .await
+    })
+    .await
+    .expect("backdate event");
 
     exec_id
 }
@@ -209,12 +212,15 @@ async fn touch_workflow(database_url: &str, exec_id: ExecutionId) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect");
-    diesel::sql_query(
-        "UPDATE harvest_events SET timestamp = NOW() \
-         WHERE workflow_exec_id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::sql_query(
+            "UPDATE harvest_events SET timestamp = NOW() \
+             WHERE workflow_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(c)
+        .await
+    })
     .await
     .expect("touch event timestamp");
 }

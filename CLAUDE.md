@@ -132,10 +132,44 @@ invariant. That is not accurate: `record_heartbeat` updates
 `harvest_task_queue.last_heartbeat_at` / `heartbeat_details` — an in-place
 mutation of the **task queue** row, not of the event log. The `#2` / `#3`
 numbering above is kept because the issues and their PRs use it, but there are
-two `harvest_events` writers, not three.
+two `event_data` writers, not three.
 
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
+
+**Enforcement (issue #1817).** The database enforces the outer rule. The
+`harvest_events_append_only_trg` trigger runs `BEFORE UPDATE` on every row:
+
+- `event_data` changes only when the transaction sets
+  `harvest.sanctioned_event_rewrite` to `erase` or `codec_rotation`. Each
+  writer sets it through `append_only::sanction` and clears it after the write.
+- The `type` key inside `event_data` never changes.
+- No other column changes, `cohort` included. The check compares whole rows,
+  so a new column is guarded by default.
+
+The trigger checks who rewrites `event_data`. It does not check what a writer
+changes under `data`. Each exception's scope guarantee is still proven by its
+own tests, as listed above.
+
+**`cohort` is guarded too.** Retention relies on it. The sweeper's fast drop
+gate assumes that no row's cohort predates its execution. A row moved into an
+older cohort can be dropped while its run is still live. Its one writer, `partition::disable_partitioning`, resets it to
+the inert `-infinity` on the new flat table before the guard is reinstalled.
+That order is load-bearing.
+
+The partition layout changes rebuild `harvest_events` with `LIKE`, which copies
+no triggers. `enable_sql`, `migration_plan_steps` and `disable_partitioning`
+reinstall the guard, and `operator_triggers` exempts it by its exact shape. A
+new layout path must do the same.
+
+A test fixture that must rewrite a row calls `append_only::with_guard_off`. It
+turns off every trigger for one transaction and needs a superuser. Production
+code must not call it. The guard stops mistakes. It is not a security
+boundary. DELETE and TRUNCATE are not guarded: retention and partition reclaim
+need them.
+
+A new sanctioned writer needs a new `EventRewrite` variant, a migration that
+adds its value to the trigger, and an entry in the list above.
 
 ## Project Documentation
 
