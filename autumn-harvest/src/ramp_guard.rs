@@ -412,7 +412,7 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
 /// `id` is the `ramp_id`. A ramp with no `ramp_id` gets the report id
 /// instead, so its report stays recoverable. A newer abort keeps the older
 /// markers. The new marker is always unreported. Only a committed report
-/// marks it.
+/// marks it. The UPDATE returns the `id` of the new marker as `marker_id`.
 #[must_use]
 pub const fn abort_ramp_query() -> &'static str {
     "UPDATE harvest_build_policies \
@@ -423,7 +423,8 @@ pub const fn abort_ramp_query() -> &'static str {
                  || ramp_aborted, \
          ramp_id = NULL, target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
      WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
-       AND updated_at = $4"
+       AND updated_at = $4 \
+     RETURNING (ramp_aborted -> 0 ->> 'id')::uuid AS marker_id"
 }
 
 /// SQL that removes finished abort markers from one policy row.
@@ -606,8 +607,8 @@ pub async fn record_abort_report(
 ///
 /// The clear is a compare-and-swap. `step` is the policy row's `updated_at`
 /// that the verdict used. A ramp that an operator moved to another target,
-/// another base build or a new step stays. Returns `true` when this call
-/// cleared the ramp.
+/// another base build or a new step stays. Returns the id of the new abort
+/// marker when this call cleared the ramp, and `None` when it did not.
 ///
 /// The clear runs in one transaction with `lock_timeout` and
 /// `statement_timeout` set to `bound`. A clear that waits too long therefore
@@ -620,8 +621,8 @@ pub async fn record_abort_report(
 /// the clear at `bound`.
 ///
 /// The marker of this clear is unreported. The caller reports the abort and
-/// then calls [`mark_abort_reported`]. A ramp with no `ramp_id` gets a fresh
-/// report id for its marker.
+/// then calls [`mark_abort_reported`] with the returned id. The id is the
+/// `ramp_id`. A ramp with no `ramp_id` gets a fresh report id instead.
 #[cfg(feature = "db")]
 pub async fn abort_ramp(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -630,7 +631,7 @@ pub async fn abort_ramp(
     target: &str,
     step: chrono::DateTime<chrono::Utc>,
     bound: Duration,
-) -> crate::error::HarvestResult<bool> {
+) -> crate::error::HarvestResult<Option<uuid::Uuid>> {
     clear_ramp(conn, queue, base, target, step, bound, uuid::Uuid::new_v4()).await
 }
 
@@ -645,29 +646,39 @@ async fn clear_ramp(
     step: chrono::DateTime<chrono::Utc>,
     bound: Duration,
     report_id: uuid::Uuid,
-) -> crate::error::HarvestResult<bool> {
+) -> crate::error::HarvestResult<Option<uuid::Uuid>> {
+    use diesel::OptionalExtension;
     use diesel::sql_types::{Text, Timestamptz};
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
+    #[derive(diesel::QueryableByName)]
+    struct Cleared {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        marker_id: uuid::Uuid,
+    }
+
     let timeout_ms = bound.as_millis().max(1);
-    conn.transaction(async |conn| -> crate::error::HarvestResult<bool> {
-        for setting in ["lock_timeout", "statement_timeout"] {
-            diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
-                .execute(conn)
+    conn.transaction(
+        async |conn| -> crate::error::HarvestResult<Option<uuid::Uuid>> {
+            for setting in ["lock_timeout", "statement_timeout"] {
+                diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            let cleared: Option<Cleared> = diesel::sql_query(abort_ramp_query())
+                .bind::<Text, _>(queue)
+                .bind::<Text, _>(base)
+                .bind::<Text, _>(target)
+                .bind::<Timestamptz, _>(step)
+                .bind::<diesel::sql_types::Uuid, _>(report_id)
+                .get_result(conn)
                 .await
+                .optional()
                 .map_err(crate::error::database_error)?;
-        }
-        let changed = diesel::sql_query(abort_ramp_query())
-            .bind::<Text, _>(queue)
-            .bind::<Text, _>(base)
-            .bind::<Text, _>(target)
-            .bind::<Timestamptz, _>(step)
-            .bind::<diesel::sql_types::Uuid, _>(report_id)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-        Ok(changed > 0)
-    })
+            Ok(cleared.map(|row| row.marker_id))
+        },
+    )
     .await
 }
 
@@ -1245,8 +1256,9 @@ pub async fn ramp_aborted_by_guard(
 /// a client timeout means that the server did not answer at all.
 ///
 /// When the row changed first, the marker tells a guard clear (`Lost`) from
-/// an operator change (`Moved`). A ramp with no `ramp_id`, or a failed
-/// marker read, gives `Changed`.
+/// an operator change (`Moved`). The marker read has its own timeout of
+/// `bound`. A ramp with no `ramp_id`, or a marker read that fails or times
+/// out, gives `Changed`. The miss is known, so it is never ambiguous.
 #[cfg(feature = "db")]
 async fn clear_on_pool(
     pool: &crate::worker::DbPool,
@@ -1270,34 +1282,67 @@ async fn clear_on_pool(
             return ClearOutcome::Failed;
         }
     };
-    let clear = async {
-        if clear_ramp(&mut conn, queue, base, target, step, bound, report_id)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            return Ok::<_, String>(ClearOutcome::Cleared);
-        }
-        let Some(ramp_id) = ramp_id else {
-            return Ok(ClearOutcome::Changed);
-        };
-        Ok(
-            match ramp_aborted_by_guard(&mut conn, queue, ramp_id).await {
-                Ok(true) => ClearOutcome::Lost,
-                Ok(false) => ClearOutcome::Moved,
-                Err(_) => ClearOutcome::Changed,
-            },
-        )
-    };
-    match tokio::time::timeout(bound.saturating_mul(2), clear).await {
-        Ok(Ok(outcome)) => outcome,
+    // The client waits twice as long as the server bound for the clear, so
+    // only a clear with no answer at all is ambiguous.
+    let cas = match tokio::time::timeout(
+        bound.saturating_mul(2),
+        clear_ramp(&mut conn, queue, base, target, step, bound, report_id),
+    )
+    .await
+    {
+        Ok(Ok(marker_id)) => Step::Done(marker_id.is_some()),
         Ok(Err(error)) => {
             tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard clear failed");
-            ClearOutcome::Failed
+            Step::Failed
         }
         Err(_) => {
             tracing::warn!(queue = %queue, pool = index, "ramp guard clear timed out; outcome unknown");
-            ClearOutcome::Ambiguous
+            Step::TimedOut
         }
+    };
+    // The marker read runs only after a known miss, under its own timeout.
+    let lookup = match (&cas, ramp_id) {
+        (Step::Done(false), Some(ramp_id)) => Some(
+            match tokio::time::timeout(bound, ramp_aborted_by_guard(&mut conn, queue, ramp_id))
+                .await
+            {
+                Ok(Ok(marked)) => Step::Done(marked),
+                Ok(Err(_)) => Step::Failed,
+                Err(_) => Step::TimedOut,
+            },
+        ),
+        _ => None,
+    };
+    clear_outcome(cas, lookup)
+}
+
+/// The result of one step of a clear on one pool.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step<T> {
+    /// The server answered.
+    Done(T),
+    /// The server answered with an error.
+    Failed,
+    /// The client gave up before the server answered.
+    TimedOut,
+}
+
+/// The outcome of a clear from its compare-and-swap and its marker read.
+///
+/// `lookup` is `None` when no marker read ran: the clear did not miss, or the
+/// ramp has no `ramp_id`. Only a compare-and-swap with no answer is
+/// ambiguous. A marker read runs after a known miss, so its failure or
+/// timeout gives `Changed`.
+#[cfg(feature = "db")]
+const fn clear_outcome(cas: Step<bool>, lookup: Option<Step<bool>>) -> ClearOutcome {
+    match (cas, lookup) {
+        (Step::TimedOut, _) => ClearOutcome::Ambiguous,
+        (Step::Failed, _) => ClearOutcome::Failed,
+        (Step::Done(true), _) => ClearOutcome::Cleared,
+        (Step::Done(false), Some(Step::Done(true))) => ClearOutcome::Lost,
+        (Step::Done(false), Some(Step::Done(false))) => ClearOutcome::Moved,
+        (Step::Done(false), None | Some(Step::Failed | Step::TimedOut)) => ClearOutcome::Changed,
     }
 }
 
@@ -2378,6 +2423,33 @@ mod tests {
     fn stats_plus_adds_every_count() {
         let sum = stats(1, 2, 3, 4).plus(stats(10, 20, 30, 40));
         assert_eq!(sum, stats(11, 22, 33, 44));
+    }
+
+    #[test]
+    fn only_a_clear_with_no_answer_is_ambiguous() {
+        use super::Step::{Done, Failed, TimedOut};
+        assert_eq!(clear_outcome(TimedOut, None), ClearOutcome::Ambiguous);
+        assert_eq!(clear_outcome(Failed, None), ClearOutcome::Failed);
+        assert_eq!(clear_outcome(Done(true), None), ClearOutcome::Cleared);
+        assert_eq!(clear_outcome(Done(false), None), ClearOutcome::Changed);
+        assert_eq!(
+            clear_outcome(Done(false), Some(Done(true))),
+            ClearOutcome::Lost
+        );
+        assert_eq!(
+            clear_outcome(Done(false), Some(Done(false))),
+            ClearOutcome::Moved
+        );
+        assert_eq!(
+            clear_outcome(Done(false), Some(Failed)),
+            ClearOutcome::Changed
+        );
+        // The miss is known, so a slow marker read cannot make it ambiguous.
+        // A retry would count an ambiguous miss as this guard's clear.
+        assert_eq!(
+            clear_outcome(Done(false), Some(TimedOut)),
+            ClearOutcome::Changed
+        );
     }
 
     #[test]
