@@ -325,8 +325,8 @@ impl From<BuildPolicyRow> for BuildPolicy {
 ///
 /// A policy update keeps an active ramp, but it starts a new ramp step. So
 /// it gives the ramp a fresh `ramp_id` (issue #1814). A fan-out over shard
-/// pools uses [`set_build_policy_with_ramp_id`] to write one id to every
-/// pool. An old ramp guard abort marker does not match the new id.
+/// pools uses [`set_build_policy_with_ramp_id`] to give every pool with the
+/// same target one id. An old ramp guard abort marker does not match it.
 ///
 /// # Errors
 ///
@@ -341,13 +341,39 @@ pub async fn set_build_policy(
     set_build_policy_with_ramp_id(conn, queue_name, build_id, deployment_name, Uuid::new_v4()).await
 }
 
+/// The `ramp_id` that [`set_build_policy_with_ramp_id`] gives a retained ramp
+/// to `target` (issue #1814).
+///
+/// The id is the first 16 bytes of `sha256("{ramp_id}/{target}")`. The upsert
+/// computes the same value in SQL. So pools with the same target share one
+/// id, and pools with different targets never do.
+#[must_use]
+pub fn retained_ramp_id(ramp_id: Uuid, target: &str) -> Uuid {
+    use sha2::Digest;
+
+    let digest = sha2::Sha256::digest(format!("{ramp_id}/{target}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// The SQL form of [`retained_ramp_id`] for the row in the upsert.
+#[cfg(feature = "db")]
+const RETAINED_RAMP_ID_SQL: &str = "encode(substring(sha256(convert_to($5::text || '/' || \
+     harvest_build_policies.target_build_id, 'UTF8')) FROM 1 FOR 16), 'hex')::uuid";
+
 /// [`set_build_policy`] with a caller-chosen `ramp_id` for a retained ramp
 /// (issue #1814).
 ///
-/// A fan-out passes one `ramp_id` to every pool, so a retained ramp keeps one
-/// identity across pools. A retained ramp gets the id even when it had none,
-/// for example from a writer from before the `ramp_id` column. A row with no
-/// ramp keeps `ramp_id` NULL.
+/// A fan-out passes one `ramp_id` to every pool. A retained ramp gets
+/// [`retained_ramp_id`] of that id and its target. So the ramp keeps one
+/// identity across pools. A partial fan-out can leave pools with different
+/// targets. Each target then gets its own id, and an abort of one target
+/// cannot finish the other.
+///
+/// A retained ramp gets the id even when it had none, for example from a
+/// writer from before the `ramp_id` column. A row with no ramp keeps
+/// `ramp_id` NULL.
 ///
 /// The write is idempotent. A row that already holds this `ramp_id`, build
 /// and deployment is left as is, and its step stays. So a retried fan-out, or
@@ -371,9 +397,10 @@ pub async fn set_build_policy_with_ramp_id(
              SET build_id = EXCLUDED.build_id, \
                  deployment_name = EXCLUDED.deployment_name, \
                  ramp_id = CASE WHEN harvest_build_policies.target_build_id IS NULL THEN NULL \
-                                ELSE $5 END, \
+                                ELSE {RETAINED_RAMP_ID_SQL} END, \
                  updated_at = NOW() \
-             WHERE harvest_build_policies.ramp_id IS DISTINCT FROM $5 \
+             WHERE harvest_build_policies.target_build_id IS NULL \
+                OR harvest_build_policies.ramp_id IS DISTINCT FROM {RETAINED_RAMP_ID_SQL} \
                 OR harvest_build_policies.build_id IS DISTINCT FROM EXCLUDED.build_id \
                 OR harvest_build_policies.deployment_name \
                    IS DISTINCT FROM EXCLUDED.deployment_name \

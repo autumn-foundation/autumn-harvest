@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::build_routing::{
-    clear_build_ramp, get_build_policy, ramp_bucket, set_build_policy,
+    clear_build_ramp, get_build_policy, ramp_bucket, retained_ramp_id, set_build_policy,
     set_build_policy_with_ramp_id, set_build_ramp, set_build_ramp_with_id,
 };
 use autumn_harvest::context::empty_shared_state;
@@ -1511,9 +1511,68 @@ async fn a_base_change_fan_out_gives_the_ramp_one_new_id() {
     set_build_policy_with_ramp_id(&mut conn_1, QUEUE, BUILD_C, None, new_id)
         .await
         .expect("repeat on pool 1");
-    assert_eq!(policy_ramp_id(&mut conn_1).await, Some(new_id));
-    assert_eq!(policy_ramp_id(&mut conn_2).await, Some(new_id));
-    assert_ne!(new_id, old_id);
+    let want = retained_ramp_id(new_id, BUILD_B);
+    assert_eq!(policy_ramp_id(&mut conn_1).await, Some(want));
+    assert_eq!(policy_ramp_id(&mut conn_2).await, Some(want));
+    assert_ne!(want, old_id);
+}
+
+/// A partial fan-out can leave two pools with different targets. A later
+/// policy update keeps both ramps. Each target must keep its own `ramp_id`,
+/// so an abort of one target cannot finish the other.
+#[tokio::test]
+async fn a_policy_update_keeps_diverged_targets_apart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    // Pool 1 ramps to build B. Pool 2 ramps to build C.
+    set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+    set_build_policy(&mut conn_2, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp_with_id(
+        &mut conn_2,
+        QUEUE,
+        BUILD_C,
+        RAMP_PERCENT,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .expect("set ramp");
+
+    // One policy update reaches both pools with one caller id.
+    let new_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_policy_with_ramp_id(conn, QUEUE, BUILD_A, Some("deploy"), new_id)
+            .await
+            .expect("policy update");
+    }
+    let id_1 = policy_ramp_id(&mut conn_1).await;
+    let id_2 = policy_ramp_id(&mut conn_2).await;
+    assert_eq!(id_1, Some(retained_ramp_id(new_id, BUILD_B)));
+    assert_eq!(id_2, Some(retained_ramp_id(new_id, BUILD_C)));
+    assert_ne!(id_1, id_2, "each target keeps its own id");
+
+    // The guard aborts the ramp to B on pool 1. The ramp to C stays.
+    let step_1 = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+    );
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "the ramp to C is not finished by the marker of B"
+    );
 }
 
 /// A recovery claim stays leased while its guard reports, even with a zero
@@ -1589,7 +1648,10 @@ async fn a_policy_update_gives_an_id_less_ramp_an_id() {
         .await
         .expect("set new base");
     assert!(ramp_is_active(&mut conn).await);
-    assert_eq!(policy_ramp_id(&mut conn).await, Some(ramp_id));
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(retained_ramp_id(ramp_id, BUILD_B))
+    );
 }
 
 /// Clear the test ramp on both pools with unreported markers for one id, as

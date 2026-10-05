@@ -230,8 +230,11 @@ The guard fails safe: when it cannot read, it does not abort.
   judges it as usual.
 - A base-build change through `set_build_policy` keeps an active ramp and
   starts a new step. It gives the ramp a fresh `ramp_id`. The API fan-out
-  writes one id to every pool, so the ramp keeps one identity. No old marker
-  matches it.
+  passes one id to every pool. Each pool derives the ramp id from that id
+  and its own target (`build_routing::retained_ramp_id`). So pools with the
+  same target share one identity. A partial fan-out can leave pools with
+  different targets. Those targets then get different ids, so an abort of
+  one cannot finish the other. No old marker matches the new id.
 - Each ramp write and each policy write with a ramp id is idempotent. A row
   that already holds the same write is left as is, and its step stays. So a
   retried fan-out, or two logical shards on one pool, cannot split the ramp
