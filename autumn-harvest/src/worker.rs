@@ -34347,6 +34347,20 @@ pub fn dr_fence_targets(
     fallback_pool: &DbPool,
 ) -> Option<(Vec<(crate::types::ShardId, DbPool)>, crate::types::ShardId)> {
     if let Some(sp) = config.sharded_pool.as_ref() {
+        // A runner given one plain pool wraps it as shard 0. Its logical
+        // assignments then all live in that one database, so pin those
+        // (issue #1823).
+        if sp.len() == 1
+            && let Some(first) = <[crate::types::ShardId]>::first(&config.shard_assignments)
+            && let Some((_, pool)) = sp.iter_shards().next()
+        {
+            let targets = config
+                .shard_assignments
+                .iter()
+                .map(|shard| (*shard, pool.clone()))
+                .collect();
+            return Some((targets, *first));
+        }
         let targets: Vec<(crate::types::ShardId, DbPool)> = sp
             .iter_shards()
             .map(|(id, pool)| (id, pool.clone()))

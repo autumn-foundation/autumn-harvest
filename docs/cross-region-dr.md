@@ -351,7 +351,10 @@ too. A bump therefore cannot commit while any of them writes.
 Three limits, stated plainly:
 
 - A barrier opens one extra connection per shard. On a DR node every admin
-  write, scheduler pass and partition pass pays that cost.
+  write, scheduler pass and partition pass pays that cost. The barrier pings
+  that connection each second. If the session ends, the server frees the
+  lock. A scheduler pass then stops before it fires. A write already in
+  flight can still race a bump for up to one second.
 - The check reads every pinned shard on each admin write. If one shard
   cannot be read, every admin write on the node answers `503`. That fails
   closed. A node that has lost authority on one shard has lost it on the

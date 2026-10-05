@@ -2953,6 +2953,56 @@ async fn a_fenced_pass_outlives_an_idle_transaction_timeout() {
     assert!(waited, "the idle timeout must not free the pass lock");
 }
 
+/// A runner given one plain pool wraps it as shard 0 (issue #1823). Its
+/// configured logical shard must still be the one it pins.
+#[tokio::test]
+async fn a_single_pool_wrapper_pins_the_configured_shard() {
+    let (url, _db) = require_db!("singlewrap");
+    let pool = dr_pool(&url);
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(1)]),
+    );
+    config.sharded_pool = Some(autumn_harvest::shard::ShardedDbPool::single(pool.clone()));
+    let (targets, default_shard) = autumn_harvest::worker::dr_fence_targets(&config, &pool)
+        .expect("a configured shard gives targets");
+    let shards: Vec<ShardId> = targets.into_iter().map(|(shard, _)| shard).collect();
+    assert_eq!(shards, vec![ShardId::new(1)]);
+    assert_eq!(default_shard, ShardId::new(1));
+}
+
+/// A fence guard notices when its session ends (issue #1823). The server
+/// then frees the pass lock, so the pass must stop writing.
+#[tokio::test]
+async fn a_fence_guard_reports_a_lost_session() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("guardlost");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass(&pool, ShardId::new(0))
+        .await
+        .expect("open the pass")
+        .expect("a pinned shard gets a guard");
+    assert!(!guard.is_lost(), "a fresh guard holds its lock");
+
+    diesel::sql_query(format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("terminate the guard backend");
+    eventually(
+        "the guard to report its lost session",
+        std::time::Duration::from_secs(10),
+        || async { guard.is_lost() },
+    )
+    .await;
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

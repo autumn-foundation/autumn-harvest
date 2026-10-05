@@ -1383,6 +1383,9 @@ mod db {
     /// Take the pass lock exclusive, for a bump (issue #1823).
     const FENCE_PASS_LOCK_EXCLUSIVE: &str =
         "SELECT pg_advisory_xact_lock(hashtext('harvest:dr_fence_pass:v1'))";
+    /// How often a fence guard pings its session (issue #1823). The ping
+    /// keeps an idle proxy from closing it, and finds a lost session.
+    const FENCE_PASS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
     /// How long a pass waits to open its fence connection.
     const FENCE_PASS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1401,7 +1404,30 @@ mod db {
     /// server then ends the transaction and frees the lock, even when the
     /// pass is cancelled.
     pub struct FencePassGuard {
-        _conn: AsyncPgConnection,
+        lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        keepalive: tokio::task::JoinHandle<()>,
+    }
+
+    impl FencePassGuard {
+        /// Whether the guard's session has ended (issue #1823).
+        ///
+        /// The server then frees the pass lock, so a bump can commit. A pass
+        /// checks this before it writes, and stops when it is set. A pass
+        /// already mid-write when the session ends can still race a bump,
+        /// for at most one keepalive interval.
+        #[must_use]
+        pub fn is_lost(&self) -> bool {
+            // UFCS: diesel's blanket `RunQueryDsl::load` shadows this method.
+            std::sync::atomic::AtomicBool::load(&self.lost, std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    impl Drop for FencePassGuard {
+        fn drop(&mut self) {
+            // The task owns the connection. Aborting it closes the
+            // connection, and the server then frees the pass lock.
+            self.keepalive.abort();
+        }
     }
 
     /// Open a [`FencePassGuard`] for `shard`, or `None` when this process
@@ -1467,6 +1493,7 @@ mod db {
         conn.batch_execute(
             "SET LOCAL idle_in_transaction_session_timeout = 0; \
              SET LOCAL statement_timeout = 0; \
+             SET LOCAL application_name = 'harvest_dr_fence_pass'; \
              DO $$ BEGIN \
                IF current_setting('server_version_num')::int >= 170000 THEN \
                  PERFORM set_config('transaction_timeout', '0', true); \
@@ -1480,7 +1507,26 @@ mod db {
             .await
             .map_err(database_error)?;
         assert_generation(&mut conn, shard, expected).await?;
-        Ok(FencePassGuard { _conn: conn })
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&lost);
+        let keepalive = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FENCE_PASS_KEEPALIVE).await;
+                if diesel::sql_query("SELECT 1")
+                    .execute(&mut conn)
+                    .await
+                    .is_err()
+                {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                    tracing::error!(
+                        shard_id = shard.as_i32(),
+                        "the DR fence guard lost its session; its pass stops writing"
+                    );
+                    return;
+                }
+            }
+        });
+        Ok(FencePassGuard { lost, keepalive })
     }
 
     /// Assert that this process still holds write authority for `shard`.

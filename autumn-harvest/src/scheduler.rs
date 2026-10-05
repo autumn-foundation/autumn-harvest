@@ -1258,6 +1258,19 @@ type PassFence = Option<crate::replication::FencePassGuard>;
 #[cfg(not(feature = "db"))]
 type PassFence = ();
 
+/// Whether this shard pass lost its fence barrier (issue #1823). The pass
+/// then stops before it fires. The guard already logged the lost session.
+#[cfg(feature = "db")]
+fn pass_fence_lost(fence: &PassFence) -> bool {
+    fence
+        .as_ref()
+        .is_some_and(crate::replication::FencePassGuard::is_lost)
+}
+#[cfg(not(feature = "db"))]
+const fn pass_fence_lost(_fence: &PassFence) -> bool {
+    false
+}
+
 /// Open the fence for one scheduler shard pass, or `None` to skip the shard
 /// (issue #1823).
 ///
@@ -1367,7 +1380,7 @@ pub async fn tick_once_sharded_with_backoff(
     let single_pool = pool.len() == 1;
     for (shard, shard_pool) in pool.iter_shards() {
         // Held until this shard's pass ends. See `scheduler_fence`.
-        let Some(_fence) = scheduler_fence(shard_pool, shard, single_pool).await else {
+        let Some(fence) = scheduler_fence(shard_pool, shard, single_pool).await else {
             continue;
         };
         let mut conn = shard_pool
@@ -1402,6 +1415,9 @@ pub async fn tick_once_sharded_with_backoff(
                  stale schedule rows left behind by a routing change could not be \
                  collected, and firing them here would duplicate the owning shard's run"
             );
+            continue;
+        }
+        if pass_fence_lost(&fence) {
             continue;
         }
 
