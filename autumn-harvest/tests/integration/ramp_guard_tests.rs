@@ -19,8 +19,9 @@ use autumn_harvest::build_routing::{
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::ramp_guard::{
-    MIN_MARKER_RETENTION, RampAbortReason, RampGuardConfig, abort_ramp, claim_unreported_abort,
-    guard_once, mark_abort_reported, ramp_aborted_by_guard, record_abort_report, run_ramp_guard,
+    MIN_MARKER_RETENTION, RampAbortReason, RampGuard, RampGuardConfig, abort_ramp,
+    claim_unreported_abort, guard_once, mark_abort_reported, ramp_aborted_by_guard,
+    record_abort_report, run_ramp_guard,
 };
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::{
@@ -854,6 +855,61 @@ async fn ramps_with_different_ids_are_judged_apart() {
     assert!(aborts.is_empty(), "the counts do not merge: {aborts:?}");
     assert!(ramp_is_active(&mut conn_1).await);
     assert!(ramp_is_active(&mut conn_2).await);
+}
+
+/// A pending clear of an old generation does not block a newer generation
+/// with the same builds. Pool 1 stays readable, but a row lock makes its
+/// clear fail on every pass. A new ramp on pool 2 still gets judged and
+/// cleared.
+#[tokio::test]
+async fn a_pending_clear_blocks_only_its_own_generation() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut locker = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect locker");
+    set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock pool 1 policy row");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let mut guard = RampGuard::new(guard_config());
+    let aborts = guard.pass(&pools, &pool_2, None, &never).await;
+    assert!(aborts.is_empty(), "the clear failed: {aborts:?}");
+    assert_eq!(guard.pending_clears(), 1, "the old clear is pending");
+
+    // A new generation with the same builds goes live on pool 2.
+    set_ramp_with_id(&mut conn_2, uuid::Uuid::new_v4()).await;
+    seed_healthy_base(&mut conn_2, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_2, true, "FAILED", false).await;
+    }
+    let aborts = guard.pass(&pools, &pool_2, None, &never).await;
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert_eq!(aborts.len(), 1, "the new generation is judged: {aborts:?}");
+    assert!(!ramp_is_active(&mut conn_2).await, "and cleared");
 }
 
 /// With the base build promoted to the target, the ramp is not a ramp.

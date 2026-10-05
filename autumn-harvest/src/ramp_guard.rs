@@ -1661,8 +1661,10 @@ struct PendingAbort {
 #[derive(Debug)]
 pub struct RampGuard {
     config: RampGuardConfig,
-    /// Aborted ramps with a pool that did not clear.
-    pending: std::collections::BTreeMap<RampKey, PendingAbort>,
+    /// Aborted ramp generations with a pool that did not clear. The key is
+    /// the whole generation, so a pending clear blocks only its own
+    /// generation. A newer ramp with the same builds is still judged.
+    pending: std::collections::BTreeMap<GenerationKey, PendingAbort>,
 }
 
 #[cfg(feature = "db")]
@@ -1752,9 +1754,9 @@ impl RampGuard {
 
         for (generation, ramp) in ramps {
             let key = &generation.0;
-            // A pending clear blocks every generation of its key until the
-            // retry ends, so one key never has two pending entries.
-            if self.pending.contains_key(key) {
+            // A pending clear blocks its own generation until the retry
+            // ends, so one generation never has two pending entries.
+            if self.pending.contains_key(&generation) {
                 continue;
             }
             if ramp.abort_marked {
@@ -1903,7 +1905,7 @@ impl RampGuard {
         if !failed.is_empty() {
             let unreported = (decision == Disposition::Defer).then(|| abort.clone());
             self.pending.insert(
-                key.clone(),
+                (key.clone(), ramp_id),
                 PendingAbort {
                     ramp_id,
                     report_id,
@@ -1987,7 +1989,7 @@ impl RampGuard {
         }
         if !failed.is_empty() {
             self.pending.insert(
-                key.clone(),
+                (key.clone(), *ramp_id),
                 PendingAbort {
                     ramp_id: *ramp_id,
                     report_id,
@@ -2014,7 +2016,7 @@ impl RampGuard {
     ) -> Vec<RampAbort> {
         let mut reported = Vec::new();
         let pending = std::mem::take(&mut self.pending);
-        for (key, entry) in pending {
+        for ((key, generation_id), entry) in pending {
             let mut outcomes = Vec::with_capacity(entry.steps.len());
             let mut still_failed: Vec<PendingStep> = Vec::new();
             for (index, step, was_ambiguous) in entry.steps {
@@ -2089,7 +2091,7 @@ impl RampGuard {
             }
             if !still_failed.is_empty() {
                 self.pending.insert(
-                    key,
+                    (key, generation_id),
                     PendingAbort {
                         ramp_id: entry.ramp_id,
                         report_id: entry.report_id,

@@ -196,6 +196,8 @@ The guard fails safe: when it cannot read, it does not abort.
 - A clear that fails on one pool stays pending. The next pass of the same
   guard retries it with no new verdict. The audit row of such an abort has
   status `failed` and names the pending pools by index.
+  A pending clear blocks only its own ramp generation. A newer ramp with
+  the same builds is still judged on its own counts.
 - When no clear of a pass succeeds, the guard reports nothing yet. It reports
   the abort when a retry clears a pool.
 - A failed audit write logs a warning and does not undo the clear.
