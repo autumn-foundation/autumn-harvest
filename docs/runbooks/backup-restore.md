@@ -405,7 +405,7 @@ below, so the verifying binary must ask for the feature explicitly:
 ```toml
 # Cargo.toml of the binary that runs the drill
 [dependencies]
-autumn-harvest = { version = "0.5", features = ["db", "testing"] }
+autumn-harvest = { version = "0.7", features = ["db", "testing"] }
 ```
 
 `testing` pulls in no extra runtime dependency and is safe in a drill binary;

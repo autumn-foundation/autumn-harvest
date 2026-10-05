@@ -75,7 +75,7 @@ hot-code-swap = ["wasm-activities"]
 chaos = ["db"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.6.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.7.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -128,7 +128,7 @@ percent-encoding = { version = "2", optional = true }
 # `default-features = false` keeps `aws-lc-rs` out of the build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
-tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 # 0.24.6 is the first non-yanked 0.24.x release; pin the floor for the same
 # reason as tokio-postgres above (a downstream lockfile shouldn't be able to
 # freshly resolve the yanked 0.24.5).

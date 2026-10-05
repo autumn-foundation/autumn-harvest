@@ -72,8 +72,8 @@ management API, worker sessions, retention, or sharding.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.4", default-features = false }
-autumn-harvest-sqlite = "0.4"
+autumn-harvest = { version = "0.7", default-features = false }
+autumn-harvest-sqlite = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
