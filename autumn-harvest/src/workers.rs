@@ -1128,6 +1128,9 @@ pub struct PayloadPolicy {
     pub continue_as_new_deadline_fraction: f64,
     /// The payload offloader's threshold. `None` without an offloader.
     pub offload_threshold: Option<u64>,
+    /// The payload offloader's store id. `None` without an offloader. Replay
+    /// rejects an envelope that another store wrote.
+    pub offload_store_id: Option<String>,
     /// The `policy()` of each activity interceptor, in chain order.
     pub activity_interceptors: Vec<String>,
     /// The execution policy of each registered activity, sorted by name. It
@@ -1161,6 +1164,7 @@ impl PayloadPolicy {
             "event_hard_cap": self.event_hard_cap,
             "continue_as_new_deadline_fraction": self.continue_as_new_deadline_fraction,
             "offload_threshold": self.offload_threshold,
+            "offload_store_id": self.offload_store_id,
             "activity_interceptors": self.activity_interceptors,
             "activities": self.activities,
             "local_activity_defaults": self.local_activity_defaults,
@@ -3763,6 +3767,10 @@ mod tests {
             },
             PayloadPolicy {
                 offload_threshold: Some(1),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                offload_store_id: Some("s3-west".to_owned()),
                 ..base.clone()
             },
             PayloadPolicy {

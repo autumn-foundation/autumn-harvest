@@ -1232,6 +1232,10 @@ impl HandlerRegistry {
                 .payload_offloader
                 .as_ref()
                 .map(|offloader| offloader.threshold()),
+            offload_store_id: self
+                .payload_offloader
+                .as_ref()
+                .map(|offloader| offloader.store_id().to_owned()),
             activity_interceptors: self
                 .activity_interceptors
                 .iter()

@@ -68,7 +68,7 @@ heartbeat check only. A worker that was alive but sick passed that check.
   `workflow_panic_max_attempts`, `poison_pill_threshold`), and payload policy
   (`max_activity_input_bytes`, `max_workflow_input_bytes`,
   `max_activity_result_bytes`, `max_signal_payload_bytes`,
-  `max_current_details_bytes`, the history policy, the offload threshold, the
+  `max_current_details_bytes`, the history policy, the offload threshold and store id, the
   activity interceptor chain, and each activity's effective result and input
   caps, local flag, rate limit, concurrency limit and WASM binding, a local
   activity's own retry and start-to-close defaults, the registry's
