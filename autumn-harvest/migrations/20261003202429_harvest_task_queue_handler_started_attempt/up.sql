@@ -20,7 +20,7 @@
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS handler_started_attempt INT4;
-ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS timed_out_claims TIMESTAMPTZ[];
+ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS timed_out_claims TEXT[];
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS handler_started_at TIMESTAMPTZ;
 
 COMMENT ON COLUMN harvest_task_queue.handler_started_attempt IS
@@ -32,8 +32,9 @@ COMMENT ON COLUMN harvest_task_queue.handler_started_at IS
     '#1809). Written with handler_started_attempt. A timeout enforcer '
     'measures the attempt duration from it.';
 COMMENT ON COLUMN harvest_task_queue.timed_out_claims IS
-    'The started_at of each claim that the timeout enforcer timed out after '
-    'its handler started, newest last (issue #1809). The worker that held a '
-    'claim takes its own started_at out of here to tell a timeout from any '
-    'other lost claim. Each entry used one attempt, so there are at most '
-    'max_attempts entries.';
+    'One entry per claim that the timeout enforcer timed out after its '
+    'handler started, newest last (issue #1809). An entry is the claim''s '
+    'attempt and started_at, as "<attempt>@<started_at in UTC, microseconds>". '
+    'The worker that held a claim takes its own entry out of here to tell a '
+    'timeout from any other lost claim. Each entry used one attempt, so there '
+    'are at most max_attempts entries.';

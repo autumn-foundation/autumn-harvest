@@ -2234,7 +2234,13 @@ async fn enforce_activity_timeout(
                             queue::ClaimWrite::Applied => {
                                 let started_attempt =
                                     task.started_at.filter(|_| locked.handler_started);
-                                record_timed_out_claim(conn, task.id, started_attempt).await?;
+                                record_timed_out_claim(
+                                    conn,
+                                    task.id,
+                                    task.attempt,
+                                    started_attempt,
+                                )
+                                .await?;
                                 outcome(true, started_attempt)
                             }
                             queue::ClaimWrite::LeaseLost => None,
@@ -2273,7 +2279,8 @@ async fn enforce_activity_timeout(
                 );
             }
             queue::fail_task(conn, task.id, &error).await?;
-            record_timed_out_claim(conn, task.id, locked.current_started_claim).await?;
+            record_timed_out_claim(conn, task.id, locked.attempt, locked.current_started_claim)
+                .await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(outcome(false, locked.current_started_claim))
         }),
@@ -2360,10 +2367,11 @@ async fn enforce_activity_timeout(
 async fn record_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
+    attempt: i32,
     started_at: Option<chrono::DateTime<Utc>>,
 ) -> HarvestResult<()> {
     match started_at {
-        Some(started_at) => queue::record_timed_out_claim(conn, task_id, started_at).await,
+        Some(started_at) => queue::record_timed_out_claim(conn, task_id, attempt, started_at).await,
         None => Ok(()),
     }
 }

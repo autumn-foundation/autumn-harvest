@@ -124,8 +124,9 @@ including an error.
   counts.
 - Breaker state is per process. The enforcing process counts a timeout in
   its breaker. The process that ran the attempt finds its claim lost and
-  reads the row. The enforcer appends the timed-out claim's `started_at` to
-  `timed_out_claims`, when the handler started. The owner removes its own
+  reads the row. The enforcer appends an entry for the timed-out claim to
+  `timed_out_claims`, when the handler started. The entry names the claim
+  by `attempt` and `started_at`. The owner removes its own
   entry as it reads it, so the list holds only unsettled owners. The list
   has no cap, because a cap could drop the entry of a live owner. Each
   entry used one attempt, so a row holds at most `max_attempts` entries.

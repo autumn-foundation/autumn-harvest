@@ -3054,17 +3054,36 @@ pub(crate) async fn later_claim_shares_strikes(
         .map_err(crate::error::database_error)
 }
 
-/// Record that the timeout enforcer timed out the claim that started at
-/// `started_at` (issue #1809).
+/// The `timed_out_claims` entry of the claim `(attempt, started_at)` (issue
+/// #1809).
+///
+/// The entry names the claim by both values, as the breaker's `ClaimKey`
+/// does. Some claim paths stamp `started_at` with `NOW()`, the start of
+/// their transaction. Two claims of one task can then share `started_at`,
+/// but each claim has its own `attempt`.
+///
+/// The format is `<attempt>@<started_at>`, with `started_at` in UTC at
+/// microsecond precision, the precision of `TIMESTAMPTZ`.
+#[doc(hidden)]
+#[must_use]
+pub fn timed_out_claim_key(attempt: i32, started_at: DateTime<Utc>) -> String {
+    format!(
+        "{attempt}@{}",
+        started_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    )
+}
+
+/// Record that the timeout enforcer timed out the claim `(attempt,
+/// started_at)` (issue #1809).
 ///
 /// The enforcer calls this inside its transaction, after its write applied.
-/// The epoch stays until the owner of the claim takes it with
+/// The entry stays until the owner of the claim takes it with
 /// [`take_timed_out_claim`]. A worker whose handler outlives several retries
 /// can then still find its own claim.
 ///
-/// The list has no cap, because a cap could drop the epoch of a live owner.
+/// The list has no cap, because a cap could drop the entry of a live owner.
 /// Each timed-out claim used one attempt, and the enforcer never lowers
-/// `attempt`. So a row holds at most `max_attempts` epochs. Only an owner
+/// `attempt`. So a row holds at most `max_attempts` entries. Only an owner
 /// that never settles, such as a crashed process, leaves one behind.
 ///
 /// # Errors
@@ -3073,6 +3092,7 @@ pub(crate) async fn later_claim_shares_strikes(
 pub(crate) async fn record_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
+    attempt: i32,
     started_at: DateTime<Utc>,
 ) -> HarvestResult<()> {
     diesel::sql_query(
@@ -3081,15 +3101,15 @@ pub(crate) async fn record_timed_out_claim(
          WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+    .bind::<diesel::sql_types::Text, _>(timed_out_claim_key(attempt, started_at))
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
     Ok(())
 }
 
-/// Whether the timeout enforcer timed out the claim of `task_id` that started
-/// at `started_at`, and remove that record (issue #1809).
+/// Whether the timeout enforcer timed out the claim `(attempt, started_at)`
+/// of `task_id`, and remove that record (issue #1809).
 ///
 /// Only the owner of the claim calls this, once, after it loses the claim.
 /// The removal keeps the list to owners that have not settled. Any other
@@ -3102,6 +3122,7 @@ pub(crate) async fn record_timed_out_claim(
 pub(crate) async fn take_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
+    attempt: i32,
     started_at: DateTime<Utc>,
 ) -> HarvestResult<bool> {
     diesel::sql_query(
@@ -3110,7 +3131,7 @@ pub(crate) async fn take_timed_out_claim(
          WHERE id = $1 AND $2 = ANY(timed_out_claims)",
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+    .bind::<diesel::sql_types::Text, _>(timed_out_claim_key(attempt, started_at))
     .execute(conn)
     .await
     .map(|rows| rows > 0)

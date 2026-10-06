@@ -661,7 +661,9 @@ async fn a_timeout_before_the_drain_release_settles_the_attempt() {
            IF NEW.queue_name = '{queue}' AND OLD.state = 'RUNNING' \
               AND NEW.error LIKE 'worker shutdown%' THEN \
              UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, \
-               timed_out_claims = array_append(COALESCE(timed_out_claims, '{{}}'), OLD.started_at) \
+               timed_out_claims = array_append(COALESCE(timed_out_claims, '{{}}'), \
+                 OLD.attempt || '@' || to_char(OLD.started_at AT TIME ZONE 'UTC', \
+                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')) \
                WHERE id = OLD.id; \
              RETURN NULL; \
            END IF; \
@@ -684,7 +686,7 @@ async fn a_timeout_before_the_drain_release_settles_the_attempt() {
         .await
         .expect("drop the trigger");
 
-    let claims: Option<Vec<Option<chrono::DateTime<Utc>>>> = harvest_task_queue::table
+    let claims: Option<Vec<Option<String>>> = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
         .filter(harvest_task_queue::task_type.eq("activity"))
         .select(harvest_task_queue::timed_out_claims)

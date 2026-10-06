@@ -68,8 +68,9 @@ nullable columns to `harvest_task_queue`. The start transaction writes the
 claim's `attempt` to `handler_started_attempt`, under the claim lock, and the
 start time to `handler_started_at`. The timeout enforcer measures a timed-out
 attempt from that start time, as the worker does. The timeout
-enforcer appends the timed-out claim's `started_at` to `timed_out_claims`,
-when the handler started. The claim's owner removes that entry as it reads it.
+enforcer appends an entry for the timed-out claim to `timed_out_claims`,
+when the handler started. The entry names the claim by `attempt` and
+`started_at`. The claim's owner removes that entry as it reads it.
 No new
 `WorkflowEvent` variant and no new `harvest_events` mutator. A retried
 timeout appends no event, so replay is unaffected.

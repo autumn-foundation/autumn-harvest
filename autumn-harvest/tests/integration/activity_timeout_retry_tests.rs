@@ -362,6 +362,13 @@ async fn secs_until_scheduled(conn: &mut AsyncPgConnection, task_id: Uuid) -> f6
     .secs
 }
 
+/// The `timed_out_claims` entry that names `claim`.
+fn record(claim: &TaskQueueItem) -> Option<String> {
+    claim
+        .started_at
+        .map(|started_at| queue::timed_out_claim_key(claim.attempt, started_at))
+}
+
 async fn task_row(conn: &mut AsyncPgConnection, task_id: Uuid) -> TaskQueueItem {
     harvest_task_queue::table
         .find(task_id)
@@ -721,7 +728,7 @@ async fn schedule_to_close_counts_the_current_claim_once_in_process() {
     assert_eq!(row.state, "FAILED");
     assert_eq!(
         row.timed_out_claims,
-        Some(vec![second.started_at]),
+        Some(vec![record(&second)]),
         "the record names the claim that was timed out"
     );
     assert_eq!(
@@ -754,7 +761,7 @@ async fn schedule_to_close_counts_a_remote_current_claim() {
     enforce_schedule_to_close(&mut conn, &stale, &enforcer).await;
     assert_eq!(breaker_state(&enforcer, activity), ("closed", 1));
     let row = task_row(&mut conn, task_id).await;
-    assert_eq!(row.timed_out_claims, Some(vec![second.started_at]));
+    assert_eq!(row.timed_out_claims, Some(vec![record(&second)]));
 
     // The owner's process counts it from the record.
     let owner = trip_on(activity, 2);
@@ -990,7 +997,7 @@ async fn started_timeout_feeds_the_breaker() {
     let row = task_row(&mut conn, task_id).await;
     assert_eq!(
         row.timed_out_claims,
-        Some(vec![row.started_at]),
+        Some(vec![record(&row)]),
         "the owner of the claim reads this record to count the timeout"
     );
 }
@@ -1253,7 +1260,7 @@ async fn a_failed_result_write_honours_the_timeout_record() {
     enforce(&mut conn, None).await;
     assert_eq!(
         task_row(&mut conn, task_id).await.timed_out_claims,
-        Some(vec![held.started_at]),
+        Some(vec![record(&held)]),
         "the enforcer records the timed-out claim"
     );
 
@@ -1277,6 +1284,52 @@ async fn a_failed_result_write_honours_the_timeout_record() {
     );
 }
 
+/// A timeout record names its claim by `attempt` and `started_at`. A claim
+/// stamped with `NOW()` takes the start time of its transaction, so two
+/// claims of one task can share `started_at`. The owner of a later attempt
+/// with the same `started_at` must not take the record of an earlier one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timeout_record_names_the_attempt_as_well_as_the_start() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+    let queue = unique("t1809-key");
+    let activity = "t1809_key";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+
+    let claimed = claim(&mut conn, &queue, "w-key").await;
+    start(&mut conn, &claimed, exec_id, activity).await;
+    age_claim(&mut conn, task_id).await;
+    let held = task_row(&mut conn, task_id).await;
+    enforce(&mut conn, None).await;
+    let records = |row: &TaskQueueItem| row.timed_out_claims.as_ref().map(Vec::len);
+    assert_eq!(records(&task_row(&mut conn, task_id).await), Some(1));
+
+    // A later claim with the same start time loses its claim to something
+    // that is not a timeout.
+    let mut later = held.clone();
+    later.attempt = held.attempt + 1;
+    let settled = autumn_harvest::worker::settle_result_write_for_test(&pool, &later, None).await;
+    assert_eq!(
+        settled,
+        (None, false),
+        "the record of another attempt says nothing about this claim"
+    );
+    assert_eq!(
+        records(&task_row(&mut conn, task_id).await),
+        Some(1),
+        "the record stays for its own owner"
+    );
+
+    let settled = autumn_harvest::worker::settle_result_write_for_test(&pool, &held, None).await;
+    assert_eq!(settled, (Some(false), true), "the owner finds its record");
+    assert_eq!(records(&task_row(&mut conn, task_id).await), Some(0));
+}
+
 /// The terminal-task janitor keeps a row whose timed-out-claim record its
 /// owner has not taken yet (issue #1809). The owner reads the record after
 /// its cancellation grace, which can outlast the janitor's shortest window.
@@ -1298,7 +1351,7 @@ async fn terminal_task_gc_keeps_a_row_with_an_outstanding_timeout_record() {
     enforce(&mut conn, None).await;
     let row = task_row(&mut conn, task_id).await;
     assert_eq!(row.state, "FAILED", "the only attempt times out for good");
-    assert_eq!(row.timed_out_claims, Some(vec![row.started_at]));
+    assert_eq!(row.timed_out_claims, Some(vec![record(&row)]));
 
     set_task(
         &mut conn,

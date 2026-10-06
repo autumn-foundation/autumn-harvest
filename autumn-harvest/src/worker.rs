@@ -16942,7 +16942,7 @@ async fn take_timed_out_claim_once(
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> HarvestResult<bool> {
     let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-    queue::take_timed_out_claim(&mut conn, task.id, started_at).await
+    queue::take_timed_out_claim(&mut conn, task.id, task.attempt, started_at).await
 }
 
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
