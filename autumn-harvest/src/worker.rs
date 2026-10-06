@@ -5747,6 +5747,77 @@ async fn reconcile_lost_start(
     }
 }
 
+/// Whether a WASM start marker whose connection was lost committed (issue
+/// #1809).
+///
+/// The commit can land before the connection drops. The marker then says
+/// that the handler started, so the guest must run. Otherwise a later
+/// timeout would count a guest that never ran. The read repeats on a
+/// transient error, as [`reconcile_lost_start`] does.
+///
+/// `Ok(true)` means the claim is current and its start is recorded.
+async fn reconcile_lost_marker(pool: &DbPool, claim: &queue::TaskClaim) -> HarvestResult<bool> {
+    let spacing = crate::pool::retry_spacing(pool);
+    let mut attempt = 1;
+    loop {
+        let started = tokio::time::Instant::now();
+        let read = async {
+            let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+            queue::claim_handler_started(&mut conn, claim).await
+        }
+        .await;
+        match read {
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_transient_db_error(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %claim.task_id,
+                    attempt,
+                    error = %error,
+                    "could not read a lost wasm start marker; trying again"
+                );
+                tokio::time::sleep_until(started + spacing).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Whether a WASM start marker that lost its connection committed (issue
+/// #1809). A failed read answers `false`, so the guest does not start. The
+/// marker then may stay. A later timeout of this claim then counts as
+/// started, which needs both a lost commit and a failed read.
+#[cfg(feature = "wasm-activities")]
+async fn lost_marker_committed(pool: &DbPool, claim: &queue::TaskClaim) -> bool {
+    match reconcile_lost_marker(pool, claim).await {
+        Ok(committed) => committed,
+        Err(error) => {
+            tracing::warn!(
+                task_id = %claim.task_id,
+                error = %error,
+                "could not check whether a lost wasm start marker committed"
+            );
+            false
+        }
+    }
+}
+
+/// Test entry point for [`reconcile_lost_marker`].
+///
+/// # Errors
+///
+/// The read error.
+#[doc(hidden)]
+pub async fn reconcile_lost_marker_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+) -> HarvestResult<bool> {
+    let claim = claim_of_task(task)?;
+    reconcile_lost_marker(pool, &claim).await
+}
+
 /// One read for [`reconcile_lost_start`].
 ///
 /// This claim wrote the start only if an `ActivityStarted` from this worker
@@ -16819,7 +16890,8 @@ impl Drop for CircuitProbeGuard<'_> {
 
 /// The metrics of one activity attempt (issues #528, #1809). They record
 /// when this drops, so every exit counts the attempt once. An attempt whose
-/// claim a timeout took is counted by the timeout enforcer instead.
+/// claim a timeout took, or will take, is counted by the timeout enforcer
+/// instead (see [`settle_attempt`]).
 struct AttemptMetrics<'a> {
     metrics: &'a dyn crate::telemetry::MetricsRecorder,
     activity_name: &'a str,
@@ -16862,18 +16934,6 @@ impl Drop for AttemptMetrics<'_> {
     }
 }
 
-/// Whether the claim of `task` was lost to the timeout enforcer (issue
-/// #1809). The enforcer records the `started_at` of the claim it timed out.
-/// Any other loss is not a timeout.
-///
-/// The read also removes the record, so call it once per lost claim. Call it
-/// even when the activity has no breaker policy. Otherwise the record stays
-/// on the row until the row goes.
-///
-/// A failed write leaves the record, so a retry is safe. Each try takes a new
-/// connection, with a bounded acquire (issue #1788). If every try fails, the
-/// answer is unknown. The loss then counts as no timeout here, and a warning
-/// says so. The enforcing process counted the timeout in its own breaker.
 /// Settle the outcome of a result write against the claim's timeout record
 /// (issue #1809).
 ///
@@ -16911,6 +16971,85 @@ pub async fn settle_result_write_for_test(
     settle_result_write(pool, task, applied).await
 }
 
+/// The settled outcome of one attempt's result write (issue #1809).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledAttempt {
+    /// The settled answer of the write, as [`settle_result_write`] gives it.
+    pub applied: Option<bool>,
+    /// A timeout took the claim. The breaker counts it as a timeout.
+    pub lost_to_timeout: bool,
+    /// The timeout enforcer counts the attempt metrics, so the worker does
+    /// not.
+    pub enforcer_counts: bool,
+}
+
+/// Settle a result write, and decide who counts the attempt metrics (issue
+/// #1809).
+///
+/// The enforcer counts a timed-out attempt. A write that failed before it
+/// knew its outcome can leave the claim held. The enforcer then times that
+/// claim out later and counts the attempt. So the worker must not count it
+/// too.
+///
+/// The worker reads whether the claim is held before it reads the timeout
+/// record. A claim held at that read either still runs, or a timeout ended it
+/// since then and left a record. The enforcer counts both. A claim lost
+/// before that read leaves the worker to count, unless the record names it.
+///
+/// When the worker dies first, an orphan reclaim can end the claim instead.
+/// Then no path counts the attempt. That undercounts by one and never counts
+/// twice. A failed read counts as a lost claim, as before.
+async fn settle_attempt(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    applied: Option<bool>,
+) -> SettledAttempt {
+    let held = applied.is_none() && claim_still_held(pool, task).await;
+    let (applied, lost_to_timeout) = settle_result_write(pool, task, applied).await;
+    SettledAttempt {
+        applied,
+        lost_to_timeout,
+        enforcer_counts: lost_to_timeout || held,
+    }
+}
+
+/// Test entry point for [`settle_attempt`].
+#[doc(hidden)]
+pub async fn settle_attempt_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    applied: Option<bool>,
+) -> SettledAttempt {
+    settle_attempt(pool, task, applied).await
+}
+
+/// Whether the claim of `task` is still current, read once with a bounded
+/// acquire (issue #1809). A failed read answers `false`.
+async fn claim_still_held(pool: &DbPool, task: &TaskQueueItem) -> bool {
+    let Some(claim) = queue::TaskClaim::of(task) else {
+        return false;
+    };
+    let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
+        return false;
+    };
+    queue::claim_is_current(&mut conn, &claim)
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether the claim of `task` was lost to the timeout enforcer (issue
+/// #1809). The enforcer records the claim that it timed out. Any other loss
+/// is not a timeout.
+///
+/// The read also removes the record, so call it once per lost claim. Call it
+/// even when the activity has no breaker policy. Otherwise the record stays
+/// on the row until the row goes.
+///
+/// A failed write leaves the record, so a retry is safe. Each try takes a new
+/// connection, with a bounded acquire (issue #1788). If every try fails, the
+/// answer is unknown. The loss then counts as no timeout here, and a warning
+/// says so. The enforcing process counted the timeout in its own breaker.
 async fn claim_lost_to_timeout(pool: &DbPool, task: &TaskQueueItem) -> bool {
     let Some(started_at) = task.started_at else {
         return false;
@@ -18363,6 +18502,10 @@ async fn process_activity_task(
                     // timeout of the guest would feed no breaker. The guest
                     // does not start then either. The attempt fails as a
                     // retry, and the cancel keeps it out of the breaker.
+                    //
+                    // A lost connection can hide a committed write. A new
+                    // connection then reads the marker. When it committed,
+                    // the guest runs, as after an applied write.
                     if matches!(dispatch, crate::wasm_store::WasmDispatch::Invoke(_)) {
                         match queue::mark_claim_handler_started(&mut conn, &activity_claim).await {
                             Ok(queue::ClaimWrite::Applied) => dispatch,
@@ -18384,21 +18527,36 @@ async fn process_activity_task(
                             }
                             Err(error) => {
                                 use crate::failure::IntoActivityErrorString as _;
-                                tracing::warn!(
-                                    task_id = %task.id,
-                                    error = %error,
-                                    "could not record the wasm handler start; the guest does not start"
-                                );
-                                refund_after_start_error(pool, Some(conn), own_debit, &error).await;
-                                own_debit_returned.set(true);
-                                cancel.cancel();
-                                crate::wasm_store::WasmDispatch::Fail(
-                                    crate::failure::ActivityFailure::retryable(
-                                        "ActivityStartNotRecorded",
-                                        format!("could not record the wasm handler start: {error}"),
+                                // A dead connection holds a pool slot, and the
+                                // read needs one.
+                                let lost = crate::pool::is_connection_lost(&error);
+                                let conn = if lost {
+                                    drop(conn);
+                                    None
+                                } else {
+                                    Some(conn)
+                                };
+                                if lost && lost_marker_committed(pool, &activity_claim).await {
+                                    dispatch
+                                } else {
+                                    tracing::warn!(
+                                        task_id = %task.id,
+                                        error = %error,
+                                        "could not record the wasm handler start; the guest does not start"
+                                    );
+                                    refund_after_start_error(pool, conn, own_debit, &error).await;
+                                    own_debit_returned.set(true);
+                                    cancel.cancel();
+                                    crate::wasm_store::WasmDispatch::Fail(
+                                        crate::failure::ActivityFailure::retryable(
+                                            "ActivityStartNotRecorded",
+                                            format!(
+                                                "could not record the wasm handler start: {error}"
+                                            ),
+                                        )
+                                        .into_error_payload(),
                                     )
-                                    .into_error_payload(),
-                                )
+                                }
                             }
                         }
                     } else {
@@ -18823,19 +18981,19 @@ async fn process_activity_task(
         let breakers = &circuit_breakers;
         let telemetry = &telemetry;
         async move {
-            let (_, lost_to_timeout) = settle_result_write(pool, task, applied).await;
+            let settled = settle_attempt(pool, task, applied).await;
             if let Some(token) = circuit_token
                 && breakers.on_claim_lost(
                     activity_name,
                     token,
                     claim_key,
-                    lost_to_timeout && breakers.has_policy(activity_name),
+                    settled.lost_to_timeout && breakers.has_policy(activity_name),
                     std::time::Instant::now(),
                 ) == Some(crate::circuit_breaker::CircuitTransition::Tripped)
             {
                 telemetry.metrics.record_circuit_tripped(activity_name);
             }
-            lost_to_timeout
+            settled.enforcer_counts
         }
     };
     if drained
@@ -18883,13 +19041,15 @@ async fn process_activity_task(
     if drained && circuit_outcome.is_none() {
         attempt_metrics.counted_by_enforcer = settle_drained(applied).await;
     }
+    let mut lost_to_timeout = false;
     if circuit_outcome.is_some() {
-        (applied, attempt_metrics.counted_by_enforcer) =
-            settle_result_write(pool, task, applied).await;
+        let settled = settle_attempt(pool, task, applied).await;
+        applied = settled.applied;
+        lost_to_timeout = settled.lost_to_timeout;
+        attempt_metrics.counted_by_enforcer = settled.enforcer_counts;
     }
-    let lost_to_timeout = applied == Some(false)
-        && attempt_metrics.counted_by_enforcer
-        && circuit_breakers.has_policy(activity_name);
+    let lost_to_timeout =
+        applied == Some(false) && lost_to_timeout && circuit_breakers.has_policy(activity_name);
     report_outcome(applied, lost_to_timeout);
     finalized.map(|_| ())
 }

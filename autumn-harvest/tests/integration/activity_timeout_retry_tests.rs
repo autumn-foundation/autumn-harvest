@@ -1330,6 +1330,106 @@ async fn a_timeout_record_names_the_attempt_as_well_as_the_start() {
     assert_eq!(records(&task_row(&mut conn, task_id).await), Some(0));
 }
 
+/// A result write that fails before it knows its outcome can leave the claim
+/// held. The timeout enforcer then times the claim out later and counts the
+/// attempt metrics. So the worker leaves the count to the enforcer, and the
+/// attempt counts once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_write_on_a_held_claim_leaves_the_count_to_the_enforcer() {
+    use autumn_harvest::worker::{SettledAttempt, settle_attempt_for_test};
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+    let queue = unique("t1809-held");
+    let activity = "t1809_held";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+    let claimed = claim(&mut conn, &queue, "w-held").await;
+    start(&mut conn, &claimed, exec_id, activity).await;
+    let held = task_row(&mut conn, task_id).await;
+
+    assert_eq!(
+        settle_attempt_for_test(&pool, &held, None).await,
+        SettledAttempt {
+            applied: None,
+            lost_to_timeout: false,
+            enforcer_counts: true,
+        },
+        "the claim is still held, so the enforcer ends it and counts it"
+    );
+
+    // A claim of another attempt is not held. Without a record, the worker
+    // counts its own attempt.
+    let mut stale = held.clone();
+    stale.attempt = held.attempt + 1;
+    assert_eq!(
+        settle_attempt_for_test(&pool, &stale, None).await,
+        SettledAttempt {
+            applied: None,
+            lost_to_timeout: false,
+            enforcer_counts: false,
+        }
+    );
+
+    // Aging moves `started_at`, so read the claim as the worker holds it.
+    age_claim(&mut conn, task_id).await;
+    let held = task_row(&mut conn, task_id).await;
+    enforce(&mut conn, None).await;
+    assert_eq!(
+        settle_attempt_for_test(&pool, &held, None).await,
+        SettledAttempt {
+            applied: Some(false),
+            lost_to_timeout: true,
+            enforcer_counts: true,
+        },
+        "the enforcer took the claim and counted the attempt"
+    );
+}
+
+/// A WASM start marker can commit just before its connection drops. The
+/// worker then reads the marker on a new connection. A committed marker means
+/// the handler started, so the guest must run. A later timeout would
+/// otherwise count a guest that never ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_start_marker_is_read_back() {
+    use autumn_harvest::worker::reconcile_lost_marker_for_test;
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+    let queue = unique("t1809-marker");
+    let activity = "t1809_marker";
+    let (exec_id, task_id) =
+        seed_activity(&mut conn, &queue, activity, 3, Timeouts::default()).await;
+    let claimed = claim(&mut conn, &queue, "w-marker").await;
+    assert!(
+        !reconcile_lost_marker_for_test(&pool, &claimed)
+            .await
+            .expect("read"),
+        "no marker committed, so the guest does not start"
+    );
+
+    start(&mut conn, &claimed, exec_id, activity).await;
+    let held = task_row(&mut conn, task_id).await;
+    assert!(
+        reconcile_lost_marker_for_test(&pool, &held)
+            .await
+            .expect("read"),
+        "the marker committed, so the guest runs"
+    );
+
+    let mut stale = held.clone();
+    stale.attempt = held.attempt + 1;
+    assert!(
+        !reconcile_lost_marker_for_test(&pool, &stale)
+            .await
+            .expect("read"),
+        "a marker of another claim does not start this one"
+    );
+}
+
 /// The terminal-task janitor keeps a row whose timed-out-claim record its
 /// owner has not taken yet (issue #1809). The owner reads the record after
 /// its cancellation grace, which can outlast the janitor's shortest window.

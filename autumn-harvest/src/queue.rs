@@ -3174,6 +3174,33 @@ pub(crate) async fn mark_claim_handler_started(
     Ok(claim_write(updated == 1))
 }
 
+/// Whether `claim` is current and its handler start is recorded, read
+/// without a lock (issue #1809).
+///
+/// It tells whether a start marker whose connection was lost committed.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn claim_handler_started(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row = dsl::harvest_task_queue
+        .find(claim.task_id)
+        .select((
+            claim_held(&claim.worker_id, claim.attempt),
+            dsl::handler_started_attempt,
+        ))
+        .first::<(Option<bool>, Option<i32>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.is_some_and(|(held, started)| held == Some(true) && started == Some(claim.attempt)))
+}
+
 /// Complete the task that `claim` holds. A stale claim changes nothing.
 ///
 /// # Errors
