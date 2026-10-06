@@ -15685,8 +15685,34 @@ enum TimeoutCheck {
     NotTimedOut,
     /// The attempt ran past its deadline.
     TimedOut,
+    /// The attempt ran past the deadline that it read at the claim. A
+    /// resume can move `schedule_to_close_at`, so read the current one.
+    RecheckDeadline,
     /// The timeout scanner may have taken the claim. Read the task row.
     ReadRow,
+}
+
+/// Where an attempt ended against the deadline that it read at the claim
+/// (issue #1836).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptEnd {
+    /// The attempt ended before its deadline.
+    InTime,
+    /// The attempt ended past a deadline that cannot move.
+    PastFixed,
+    /// The attempt ended past a deadline that a resume can move. Only
+    /// `schedule_to_close_at` moves.
+    PastMovable,
+}
+
+impl AttemptEnd {
+    const fn new(past_deadline: bool, deadline_may_move: bool) -> Self {
+        match (past_deadline, deadline_may_move) {
+            (false, _) => Self::InTime,
+            (true, false) => Self::PastFixed,
+            (true, true) => Self::PastMovable,
+        }
+    }
 }
 
 /// Decide what to check for a timeout of one attempt (issue #1836).
@@ -15695,21 +15721,23 @@ enum TimeoutCheck {
 ///   did not time out.
 /// - An attempt that ends after its deadline timed out, even when the
 ///   handler returned before the cancel observer saw the lost claim.
+/// - A resume after a pause can move `schedule_to_close_at` forward. So
+///   when the deadline can move, a late attempt reads the current one.
 /// - When the claim may be lost, the task row tells. The timeout scanner
 ///   writes its timeout error there.
 const fn timeout_check(
     committed_transactionally: bool,
-    past_deadline: bool,
+    end: AttemptEnd,
     claim_may_be_lost: bool,
 ) -> TimeoutCheck {
     if committed_transactionally {
-        TimeoutCheck::NotTimedOut
-    } else if past_deadline {
-        TimeoutCheck::TimedOut
-    } else if claim_may_be_lost {
-        TimeoutCheck::ReadRow
-    } else {
-        TimeoutCheck::NotTimedOut
+        return TimeoutCheck::NotTimedOut;
+    }
+    match end {
+        AttemptEnd::PastMovable => TimeoutCheck::RecheckDeadline,
+        AttemptEnd::PastFixed => TimeoutCheck::TimedOut,
+        AttemptEnd::InTime if claim_may_be_lost => TimeoutCheck::ReadRow,
+        AttemptEnd::InTime => TimeoutCheck::NotTimedOut,
     }
 }
 
@@ -15727,27 +15755,63 @@ const fn claim_may_be_lost(was_cancelled: bool, has_heartbeat_timeout: bool) -> 
 
 /// Whether an attempt timed out (issue #1836). See [`timeout_check`].
 ///
-/// For [`TimeoutCheck::ReadRow`], the function reads the task row. `None`
-/// means the read failed, so the answer is unknown and the attempt gives no
-/// sample.
+/// For [`TimeoutCheck::ReadRow`] and [`TimeoutCheck::RecheckDeadline`],
+/// the function reads the task row. `None` means the read failed, so the
+/// answer is unknown and the attempt gives no sample.
+///
+/// `past_deadline` tells whether the attempt ended past the deadline that
+/// a given `schedule_to_close_at` sets.
 async fn attempt_timed_out(
     pool: &DbPool,
     claim: &queue::TaskClaim,
     activity_name: &str,
     check: TimeoutCheck,
+    past_deadline: impl FnOnce(Option<chrono::DateTime<chrono::Utc>>) -> bool,
 ) -> Option<bool> {
-    match check {
-        TimeoutCheck::NotTimedOut => return Some(false),
-        TimeoutCheck::TimedOut => return Some(true),
-        TimeoutCheck::ReadRow => {}
+    if let TimeoutCheck::NotTimedOut | TimeoutCheck::TimedOut = check {
+        return Some(check == TimeoutCheck::TimedOut);
     }
     let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
         return None;
     };
+    if check == TimeoutCheck::RecheckDeadline {
+        return timed_out_from_deadline(
+            queue::task_deadline_for_claim(&mut conn, claim).await,
+            activity_name,
+            past_deadline,
+        );
+    }
     timed_out_from_row(
         queue::task_status_for_claim(&mut conn, claim).await,
         activity_name,
     )
+}
+
+/// Read a timeout from the current deadline of one late attempt (issue
+/// #1836).
+///
+/// - The scanner's timeout error on a lost claim is a timeout.
+/// - Otherwise the current `schedule_to_close_at` decides. A resume can
+///   have moved it past the end of the attempt.
+/// - A missing row gives no new evidence, so the late end stays a timeout.
+/// - A failed read is unknown.
+fn timed_out_from_deadline(
+    read: HarvestResult<Option<queue::TaskDeadline>>,
+    activity_name: &str,
+    past_deadline: impl FnOnce(Option<chrono::DateTime<chrono::Utc>>) -> bool,
+) -> Option<bool> {
+    match read {
+        Err(_) => None,
+        Ok(None) => Some(true),
+        Ok(Some(row)) => {
+            let scanner_timeout = !row.claim_held
+                && row
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| is_attempt_timeout_error(error, activity_name));
+            Some(scanner_timeout || past_deadline(row.schedule_to_close_at))
+        }
+    }
 }
 
 /// Read a timeout from the task row of one attempt (issue #1836).
@@ -15971,6 +16035,59 @@ mod adaptive_limit_gate_tests {
         assert_eq!(timed_out_from_row(Ok(None), "charge_card"), Some(false));
     }
 
+    /// A late attempt reads the current deadline. A deadline that a resume
+    /// moved past the end of the attempt makes it an answer.
+    #[test]
+    fn a_moved_deadline_decides_a_late_attempt() {
+        use super::timed_out_from_deadline;
+        use crate::error::HarvestError;
+        use crate::queue::TaskDeadline;
+        let moved = chrono::Utc::now();
+        let row = |error: Option<&str>, claim_held, schedule_to_close_at| {
+            Ok(Some(TaskDeadline {
+                error: error.map(str::to_owned),
+                claim_held,
+                schedule_to_close_at,
+            }))
+        };
+        let in_time = |at: Option<_>| at != Some(moved);
+        // The moved deadline is past the end of the attempt.
+        assert_eq!(
+            timed_out_from_deadline(row(None, true, Some(moved)), "charge_card", in_time),
+            Some(false)
+        );
+        // The deadline did not move.
+        assert_eq!(
+            timed_out_from_deadline(row(None, true, None), "charge_card", in_time),
+            Some(true)
+        );
+        // The scanner timed the attempt out.
+        assert_eq!(
+            timed_out_from_deadline(
+                row(
+                    Some("timeout: ScheduleToClose for charge_card"),
+                    false,
+                    Some(moved)
+                ),
+                "charge_card",
+                in_time
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            timed_out_from_deadline(
+                Err(HarvestError::Config("down".into())),
+                "charge_card",
+                in_time
+            ),
+            None
+        );
+        assert_eq!(
+            timed_out_from_deadline(Ok(None), "charge_card", in_time),
+            Some(true)
+        );
+    }
+
     /// The by-id claim's own exclusion list tells whether saturation caused
     /// a miss. Current limiter state can change after the claim.
     #[test]
@@ -15985,14 +16102,33 @@ mod adaptive_limit_gate_tests {
     /// The timeout decision table (issue #1836).
     #[test]
     fn the_timeout_decision_follows_the_evidence() {
-        use super::{TimeoutCheck, timeout_check};
+        use super::{AttemptEnd, TimeoutCheck, timeout_check};
         // A sealed transactional success held its claim, so it never timed
         // out, whatever the clock says.
-        assert_eq!(timeout_check(true, true, true), TimeoutCheck::NotTimedOut);
-        assert_eq!(timeout_check(false, true, false), TimeoutCheck::TimedOut);
-        assert_eq!(timeout_check(false, false, true), TimeoutCheck::ReadRow);
         assert_eq!(
-            timeout_check(false, false, false),
+            timeout_check(true, AttemptEnd::new(true, true), true),
+            TimeoutCheck::NotTimedOut
+        );
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(true, false), false),
+            TimeoutCheck::TimedOut
+        );
+        // A resume can move a schedule-to-close deadline, so a late attempt
+        // reads the current one.
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(true, true), false),
+            TimeoutCheck::RecheckDeadline
+        );
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(true, true), true),
+            TimeoutCheck::RecheckDeadline
+        );
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(false, true), true),
+            TimeoutCheck::ReadRow
+        );
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(false, true), false),
             TimeoutCheck::NotTimedOut
         );
     }
@@ -18092,14 +18228,29 @@ async fn process_activity_task(
     // and free the slot. See `limit_sample_outcome` for which attempts give
     // no sample.
     if let Some(permit) = limit_permit.take() {
+        let elapsed = dispatched_at.elapsed();
         let check = timeout_check(
             committed_transactionally,
-            past_attempt_deadline(attempt_deadline, task.started_at, dispatched_at.elapsed()),
+            AttemptEnd::new(
+                past_attempt_deadline(attempt_deadline, task.started_at, elapsed),
+                task.schedule_to_close_at.is_some(),
+            ),
             claim_may_be_lost(was_cancelled, task.heartbeat_timeout.is_some()),
         );
+        let past_deadline = |schedule_to_close_at| {
+            past_attempt_deadline(
+                crate::context::attempt_deadline(
+                    task.started_at,
+                    task.start_to_close,
+                    schedule_to_close_at,
+                ),
+                task.started_at,
+                elapsed,
+            )
+        };
         let error_type = failure_info.as_ref().map(|(et, _, _)| et.as_str());
         // An unknown timeout answer gives no sample.
-        let outcome = attempt_timed_out(pool, &activity_claim, activity_name, check)
+        let outcome = attempt_timed_out(pool, &activity_claim, activity_name, check, past_deadline)
             .await
             .and_then(|timed_out| limit_sample_outcome(circuit_outcome, error_type, timed_out));
         match outcome {

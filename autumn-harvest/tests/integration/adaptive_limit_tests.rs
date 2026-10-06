@@ -842,6 +842,87 @@ async fn answers_after_the_deadline_cut_the_cap() {
     handle.await.expect("worker joins");
 }
 
+/// A resume after a pause moves `schedule_to_close_at` forward while an
+/// attempt runs. An answer before the moved deadline is not a timeout, so
+/// it must not cut the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_before_a_moved_deadline_do_not_cut_the_cap() {
+    const ACTIVITY: &str = "al_moved";
+    const RUNS: usize = 4;
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("al-moved");
+    let mut activity = act_info(ACTIVITY, late_call);
+    activity.default_schedule_to_close = Some(Duration::from_millis(300));
+    let config = AdaptiveLimitConfig::disabled()
+        .with_activity(ACTIVITY, Some(AdaptiveLimitPolicy::default()));
+    let (worker, registry) = build_worker(
+        &format!("{queue}-worker"),
+        &queue,
+        vec![activity],
+        Arc::new(LimitMetrics::default()),
+        Some(config),
+        HashMap::new(),
+    );
+    // This task stands in for the resume shift. It moves the deadline of
+    // each claimed attempt 5 s forward, after the worker read it.
+    let shift_sql = format!(
+        "UPDATE harvest_task_queue \
+         SET schedule_to_close_at = schedule_to_close_at + INTERVAL '5 seconds' \
+         WHERE queue_name = '{queue}' AND activity_name = '{ACTIVITY}' \
+         AND state = 'RUNNING' AND schedule_to_close_at < NOW() + INTERVAL '2 seconds'"
+    );
+    let shift_url = url.clone();
+    let shifter = tokio::spawn(async move {
+        let mut conn = connect(&shift_url).await;
+        loop {
+            conn.batch_execute(&shift_sql)
+                .await
+                .expect("shift the deadline");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+    // One window at the start cap. Every attempt starts at once, so no
+    // pending row outlives its 300 ms deadline.
+    let mut ids = Vec::new();
+    for _ in 0..RUNS {
+        ids.push(seed_workflow(&mut conn, &queue, ACTIVITY).await.as_uuid());
+    }
+    let open_runs = || {
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq_any(ids.clone()))
+            .filter(harvest_workflow_executions::state.ne("COMPLETED"))
+            .count()
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while open_runs()
+            .get_result::<i64>(&mut conn)
+            .await
+            .expect("count open runs")
+            > 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every run completes before its moved deadline");
+    shifter.abort();
+    worker.shutdown();
+    handle.await.expect("worker joins");
+    let state = registry
+        .adaptive_limits()
+        .snapshot(ACTIVITY)
+        .expect("the limit tracks the type");
+    assert!(
+        state.baseline.is_some(),
+        "the answers set a baseline: {state:?}"
+    );
+    assert!(state.limit >= 4, "answers in time cut the cap: {state:?}");
+}
+
 /// A freed adaptive slot must wake the idle poll loop. Otherwise a worker
 /// whose backlog holds only a saturated type waits one full poll interval
 /// after each batch, and the cap stays idle.

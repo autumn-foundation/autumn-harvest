@@ -2937,6 +2937,52 @@ pub(crate) async fn task_status_for_claim(
     Ok(row.map(|(state, error, held)| (state, error, held == Some(true))))
 }
 
+/// A task row's `error`, whether `claim` is current, and the current
+/// `schedule_to_close_at`, read without a lock (issue #1836).
+///
+/// A resume after a pause moves `schedule_to_close_at` forward while an
+/// attempt runs. This read gives the moved value.
+///
+/// Returns `None` when the row does not exist.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn task_deadline_for_claim(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<Option<TaskDeadline>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row = dsl::harvest_task_queue
+        .find(claim.task_id)
+        .select((
+            dsl::error,
+            claim_held(&claim.worker_id, claim.attempt),
+            dsl::schedule_to_close_at,
+        ))
+        .first::<(Option<String>, Option<bool>, Option<DateTime<Utc>>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.map(|(error, held, schedule_to_close_at)| TaskDeadline {
+        error,
+        claim_held: held == Some(true),
+        schedule_to_close_at,
+    }))
+}
+
+/// The row state that [`task_deadline_for_claim`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskDeadline {
+    /// The row's `error`.
+    pub(crate) error: Option<String>,
+    /// Whether the claim is current.
+    pub(crate) claim_held: bool,
+    /// The row's current `schedule_to_close_at`.
+    pub(crate) schedule_to_close_at: Option<DateTime<Utc>>,
+}
+
 /// Whether `claim` is current, read without a lock.
 ///
 /// # Errors

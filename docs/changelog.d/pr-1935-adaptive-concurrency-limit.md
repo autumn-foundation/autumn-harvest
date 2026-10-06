@@ -81,6 +81,8 @@ No new `WorkflowEvent` variant, no migration, no schema change.
     read the timeout error from the task row.
   - Answers that arrive 20 ms after a 300 ms deadline cut the cap. Before
     the deadline check covered uncancelled attempts, they grew it.
+  - Answers before a deadline that a resume moved do not cut the cap. Before
+    the worker read the moved deadline, the cap fell from 4 to 3.
   - A freed slot wakes the idle poll loop. With a 1 s poll interval, 20
     fast runs at a cap of 2 took 5.8 s before and about 1 to 2 s after, as
     without a cap.
