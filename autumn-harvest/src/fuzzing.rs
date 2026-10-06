@@ -1584,8 +1584,8 @@ const fn child_outcome(event: &WorkflowEvent) -> Option<(ExecutionId, Outcome)> 
 /// fail-fast caller goes on at the first failure, while items still run.
 ///
 /// A sibling command in the same `join!` is not the next command. It is a
-/// schedule before the first outcome of the group, or a schedule right
-/// after the outcome of another sibling. Its own events are passed over.
+/// command before the first outcome of the group, or a command right after
+/// the outcome of another sibling. Its own events are passed over.
 fn settles_after_failure<K: Copy + Eq + std::hash::Hash>(
     rest: &[WorkflowEvent],
     group: &HashSet<K>,
@@ -1610,6 +1610,8 @@ fn settles_after_failure<K: Copy + Eq + std::hash::Hash>(
                 sibling_turn = false;
             }
             None if matches!(event, WorkflowEvent::SignalReceived { .. }) => {}
+            // An immediate command in a sibling's turn is that sibling's.
+            None if sibling_turn && is_immediate_command(event) => {}
             _ => match (pending_key(event), settled_key(event), progress_key(event)) {
                 (Some(key), _, _) if sibling_turn => {
                     siblings.insert(key);

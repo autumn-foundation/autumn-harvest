@@ -511,6 +511,10 @@ fn a_collect_all_fan_out_is_told_from_a_fail_fast_one() {
             "join(fan out collect, audit); report; complete",
         ),
         (
+            "baseline-collect-all-beside-side-effect.json",
+            "join(fan out collect, side effect trace); report; complete",
+        ),
+        (
             "baseline-windowed-fail-fast-then-activity.json",
             "fan out window 2 fail fast; notify; complete",
         ),
