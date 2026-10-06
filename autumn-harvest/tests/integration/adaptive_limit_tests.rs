@@ -256,6 +256,16 @@ fn late_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) ->
     })
 }
 
+/// Answers in 1.2 s, after a 1 s schedule-to-close budget.
+fn overdue_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
+    let (running, _) = Running::start(ctx.activity_type());
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        drop(running);
+        Ok(input)
+    })
+}
+
 /// Answers in 20 ms.
 fn fast_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
     let (running, _) = Running::start(ctx.activity_type());
@@ -851,8 +861,10 @@ async fn answers_before_a_moved_deadline_do_not_cut_the_cap() {
     const RUNS: usize = 4;
     let (url, _container) = setup_db().await;
     let queue = unique_queue("al-moved");
-    let mut activity = act_info(ACTIVITY, late_call);
-    activity.default_schedule_to_close = Some(Duration::from_millis(300));
+    // The 1 s budget leaves room for a slow claim. The 1.2 s answer still
+    // ends past the deadline that the worker reads at the claim.
+    let mut activity = act_info(ACTIVITY, overdue_call);
+    activity.default_schedule_to_close = Some(Duration::from_secs(1));
     let config = AdaptiveLimitConfig::disabled()
         .with_activity(ACTIVITY, Some(AdaptiveLimitPolicy::default()));
     let (worker, registry) = build_worker(
@@ -885,8 +897,7 @@ async fn answers_before_a_moved_deadline_do_not_cut_the_cap() {
     let mut conn = connect(&url).await;
     let runner = Arc::clone(&worker);
     let handle = tokio::spawn(async move { runner.run(&pool).await });
-    // One window at the start cap. Every attempt starts at once, so no
-    // pending row outlives its 300 ms deadline.
+    // One window at the start cap. Every attempt starts at once.
     let mut ids = Vec::new();
     for _ in 0..RUNS {
         ids.push(seed_workflow(&mut conn, &queue, ACTIVITY).await.as_uuid());
