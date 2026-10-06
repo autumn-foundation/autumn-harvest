@@ -55,7 +55,7 @@ module counts at the audited revision, recomputed by CI:
 | Mechanism | Reach | Portable? |
 |---|---|---|
 | `diesel` query layer | 65 modules | Query construction is mechanical; the *type* layer is not. |
-| `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
+| `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 16 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 16 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 45 modules | Case by case — the SQL must be read, not inferred from the ORM. |
@@ -70,7 +70,7 @@ Plus **122 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**65 of the 127 core modules** exhibit at least one mechanism — a shade over
+**65 of the 129 core modules** exhibit at least one mechanism — a shade over
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
