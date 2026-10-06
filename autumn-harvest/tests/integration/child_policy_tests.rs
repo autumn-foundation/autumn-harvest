@@ -1509,7 +1509,9 @@ async fn history_cap_failure_cascades_detached_children() {
         ],
         vec![],
     )
-    .with_history_policy(WorkflowHistoryPolicy::default().with_event_hard_cap(3));
+    // Decision 1 counts 3 with its reserved boundary (issue #1833). The
+    // signal decision loads 4 rows and reaches the cap.
+    .with_history_policy(WorkflowHistoryPolicy::default().with_event_hard_cap(4));
     let registry = Arc::new(registry);
 
     let mut conn = AsyncPgConnection::establish(&url)
