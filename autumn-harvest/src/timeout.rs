@@ -1551,6 +1551,20 @@ fn pause_suppresses_timeout_enforcement(
     }
 }
 
+/// The retry delay for an activity attempt that timed out (issue #1870).
+///
+/// `None` means the timeout is terminal.
+fn activity_timeout_retry_delay(
+    _task: &TaskQueueItem,
+    _reason: &TimeoutReason,
+    _error: &str,
+    _row_schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    _now: chrono::DateTime<Utc>,
+    _execution_paused: bool,
+) -> Option<chrono::Duration> {
+    None
+}
+
 /// Pure verdict for the locked re-read of an external-task row inside
 /// [`enforce_external_task_timeouts`]'s per-task transaction (issue #609
 /// post-review hardening, third bot-review round). `true` means "the row is
@@ -1813,6 +1827,41 @@ async fn commit_workflow_execution_timeout(
             Ok((true, deferred, closed_children, pending_cancel_metrics))
         },
     )))
+    .await
+}
+
+/// Enforce `reason` on an activity task from a scan snapshot.
+///
+/// Tests use it to replay a stale snapshot (issue #1870). It feeds no circuit
+/// breaker and records no metrics.
+///
+/// # Errors
+///
+/// [`HarvestError::Config`] when `task` has no execution id. Otherwise see
+/// `enforce_activity_timeout`.
+#[doc(hidden)]
+pub async fn enforce_activity_timeout_for_task(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    reason: &TimeoutReason,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    let Some(exec_uuid) = task.workflow_exec_id else {
+        return Err(HarvestError::Config(format!(
+            "task {} has no execution id",
+            task.id
+        )));
+    };
+    let metrics = crate::telemetry::NoOpMetrics;
+    enforce_activity_timeout(
+        conn,
+        task,
+        ExecutionId::from_uuid(exec_uuid),
+        reason,
+        None,
+        &metrics,
+        codecs,
+    )
     .await
 }
 
@@ -6420,6 +6469,154 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 
 #[cfg(test)]
 mod tests {
+    // ── retry of a timed-out activity attempt (issue #1870) ──────────────
+
+    fn running_activity(attempt: i32, max_attempts: i32) -> TaskQueueItem {
+        TaskQueueItem {
+            id: uuid::Uuid::nil(),
+            queue_name: "default".to_owned(),
+            task_type: "activity".to_owned(),
+            workflow_exec_id: None,
+            activity_name: Some("charge".to_owned()),
+            activity_id: None,
+            input: serde_json::Value::Null,
+            state: "RUNNING".to_owned(),
+            priority: 0,
+            worker_id: None,
+            attempt,
+            max_attempts,
+            scheduled_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            last_heartbeat_at: None,
+            heartbeat_details: None,
+            heartbeat_timeout: None,
+            start_to_close: None,
+            schedule_to_start: None,
+            retry_policy: None,
+            output: None,
+            error: None,
+            sticky_worker_id: None,
+            sticky_until: None,
+            sticky_timeout: None,
+            trace_context: None,
+            concurrency_key: None,
+            concurrency_cap: None,
+            required_build_id: None,
+            rate_limit_key: None,
+            crash_strikes: 0,
+            schedule_to_close_at: None,
+            required_capabilities: None,
+            context_headers: None,
+            created_at: None,
+            wake_requested: false,
+            session_id: None,
+            capability_misses: 0,
+            capability_miss_workers: Vec::new(),
+            capability_miss_handler: None,
+            timer_fires_at: None,
+            new_start: false,
+        }
+    }
+
+    /// A task with a fixed retry policy and no jitter, so the delay is exact.
+    fn with_fixed_policy(attempt: i32, max_attempts: u32, interval: Duration) -> TaskQueueItem {
+        let mut policy = crate::policy::RetryPolicy::fixed(max_attempts, interval);
+        policy.jitter = crate::policy::JitterPolicy::None;
+        let mut task = running_activity(attempt, i32::try_from(max_attempts).unwrap());
+        task.retry_policy = Some(serde_json::to_value(policy).unwrap());
+        task
+    }
+
+    fn retry_delay(
+        task: &TaskQueueItem,
+        reason: &TimeoutReason,
+        deadline: Option<chrono::DateTime<Utc>>,
+        paused: bool,
+    ) -> Option<chrono::Duration> {
+        let error = timeout_error("charge", reason);
+        activity_timeout_retry_delay(task, reason, &error, deadline, Utc::now(), paused)
+    }
+
+    #[test]
+    fn a_timed_out_attempt_with_attempts_left_is_retried_per_policy() {
+        let task = with_fixed_policy(1, 3, Duration::from_millis(200));
+        for reason in [TimeoutReason::StartToClose, TimeoutReason::Heartbeat] {
+            assert_eq!(
+                retry_delay(&task, &reason, None, false),
+                Some(chrono::Duration::milliseconds(200)),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timed_out_last_attempt_is_terminal() {
+        let task = with_fixed_policy(3, 3, Duration::from_millis(200));
+        for reason in [TimeoutReason::StartToClose, TimeoutReason::Heartbeat] {
+            assert_eq!(retry_delay(&task, &reason, None, false), None, "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_queue_or_total_deadline_timeout_is_never_retried() {
+        let task = with_fixed_policy(1, 3, Duration::from_millis(200));
+        for reason in [
+            TimeoutReason::ScheduleToStart,
+            TimeoutReason::ScheduleToClose,
+        ] {
+            assert_eq!(retry_delay(&task, &reason, None, false), None, "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_task_without_a_policy_retries_up_to_max_attempts() {
+        let reason = TimeoutReason::StartToClose;
+        let delay = retry_delay(&running_activity(1, 3), &reason, None, false)
+            .expect("attempt 1 of 3 must retry");
+        assert!(
+            delay >= chrono::Duration::zero() && delay <= chrono::Duration::seconds(1),
+            "the fallback delay is a jittered 1s: {delay}"
+        );
+        assert_eq!(
+            retry_delay(&running_activity(1, 1), &reason, None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_retry_that_cannot_start_before_schedule_to_close_is_terminal() {
+        let task = with_fixed_policy(1, 3, Duration::from_secs(60));
+        let deadline = Some(Utc::now() + chrono::Duration::seconds(30));
+        let reason = TimeoutReason::StartToClose;
+        assert_eq!(retry_delay(&task, &reason, deadline, false), None);
+        // A pause stops the deadline clock (issue #609), so the retry goes on.
+        assert_eq!(
+            retry_delay(&task, &reason, deadline, true),
+            Some(chrono::Duration::seconds(60))
+        );
+    }
+
+    #[test]
+    fn a_retry_that_starts_before_schedule_to_close_goes_on() {
+        let task = with_fixed_policy(1, 3, Duration::from_secs(1));
+        let deadline = Some(Utc::now() + chrono::Duration::hours(1));
+        assert_eq!(
+            retry_delay(&task, &TimeoutReason::StartToClose, deadline, false),
+            Some(chrono::Duration::seconds(1))
+        );
+    }
+
+    #[test]
+    fn a_task_with_an_invalid_policy_times_out_terminally() {
+        let mut task = running_activity(1, 3);
+        task.retry_policy = Some(serde_json::json!({"max_attempts": "three"}));
+        assert_eq!(
+            retry_delay(&task, &TimeoutReason::StartToClose, None, false),
+            None
+        );
+    }
+
     // ── workflow task timeout against the locked execution state ─────────
 
     #[test]
