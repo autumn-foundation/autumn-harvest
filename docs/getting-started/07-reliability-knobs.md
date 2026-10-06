@@ -38,8 +38,10 @@ defaults to `DEFAULT_ACTIVITY_START_TO_CLOSE` (10 minutes, issue #1808). A hung
 activity thus cannot hold a worker slot forever. The floor skips an activity
 that declares a `schedule_to_close` or a `heartbeat_timeout`, because each
 already bounds a running attempt. The `schedule_to_close` scanner skips a
-paused execution, so a hung attempt there waits for the resume. A timeout fails the activity call with no
-retry. Give a long activity its own `start_to_close`, or raise the floor. Call
+paused execution, so a hung attempt there waits for the resume. A timeout
+follows the retry policy, as a retryable error does (issue #1870). Only the
+last attempt fails the activity call. Give a long activity its own
+`start_to_close`, or raise the floor. Call
 `without_default_activity_start_to_close()` to remove it. At build time,
 `HarvestBuilder::try_build` logs one warning that names each regular activity
 type that the floor governs.
