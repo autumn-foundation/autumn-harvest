@@ -28,7 +28,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-EVENT_ROW_CELL = "`event.rs`"
+# The module cell names event.rs, perhaps with a path, emphasis or a link.
+EVENT_ROW_CELL_RE = re.compile(r"(?:^|/)event\.rs$")
 # A count beside "variant", in either order, with only separators between:
 # "41 variants", "49 Variants", "Variants: 49", "variants — 1,050".
 COUNT_RE = re.compile(
@@ -112,19 +113,28 @@ def line_of(text, offset):
 
 
 TICK_RUN_RE = re.compile(r"`+")
+# A line that ends a paragraph: blank, or the start of an HTML comment block,
+# a heading or a fence.
+PARAGRAPH_END_RE = re.compile(r"\s*$| {0,3}(?:<!--|#{1,6}(?:\s|$)|`{3,}|~{3,})")
 
 
-def mask_code_spans(line, open_run):
+def closer_re(run):
+    return re.compile(rf"(?<!`)`{{{run}}}(?!`)")
+
+
+def mask_code_spans(line, open_run, rest):
     """Blank code-span text so its delimiters cannot open a comment.
 
     A code span can continue onto the next line of a paragraph. open_run is
-    the backtick run of a span still open from the last line, or 0. Return
-    the masked line and the run still open at its end.
+    the backtick run of a span still open from the last line, or 0. rest is
+    the remaining text of the paragraph. A run with no closer there is a
+    literal backtick, as in CommonMark. Return the masked line and the run
+    still open at its end.
     """
     out, i = list(line), 0
     while i < len(line):
         if open_run:
-            close = re.compile(rf"(?<!`)`{{{open_run}}}(?!`)").search(line, i)
+            close = closer_re(open_run).search(line, i)
             end = close.end() if close else len(line)
             out[i:end] = " " * (end - i)
             if not close:
@@ -134,9 +144,13 @@ def mask_code_spans(line, open_run):
             tick = TICK_RUN_RE.search(line, i)
             if not tick:
                 break
-            i, open_run = tick.start(), len(tick.group())
-            out[i : tick.end()] = " " * open_run
-            i = tick.end()
+            run = len(tick.group())
+            if not (closer_re(run).search(line, tick.end()) or closer_re(run).search(rest)):
+                # No closer in the paragraph: a literal backtick run.
+                i = tick.end()
+                continue
+            out[tick.start() : tick.end()] = " " * run
+            i, open_run = tick.end(), run
     return "".join(out), open_run
 
 
@@ -171,8 +185,9 @@ def markdown_lines(text):
     fence can show a three-backtick block inside it. HTML comment text is not
     rendered, so it is blanked. A line keeps its number.
     """
+    lines = text.splitlines()
     fence, in_comment, open_run = None, False, 0
-    for n, line in enumerate(text.splitlines(), 1):
+    for n, line in enumerate(lines, 1):
         marker = FENCE_RE.fullmatch(line)
         if fence is not None:
             if (
@@ -190,7 +205,12 @@ def markdown_lines(text):
         if is_opener and not in_comment and not open_run:
             fence = marker.group(1)
             continue
-        masked, open_run = mask_code_spans(line, open_run)
+        rest = []
+        for later in lines[n:]:
+            if PARAGRAPH_END_RE.match(later):
+                break
+            rest.append(later)
+        masked, open_run = mask_code_spans(line, open_run, "\n".join(rest))
         visible, in_comment = strip_html_comments(line, masked, in_comment)
         yield n, visible
 
@@ -237,15 +257,21 @@ def markdown_tables(text):
         yield table
 
 
+def plain_markdown(text):
+    """Return text without link syntax, emphasis or code marks."""
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    return re.sub(r"[`*_~]", "", text).strip()
+
+
 def event_row_count_findings(path, text):
     """Return a message for each variant count in an `event.rs` row."""
     found = []
     for table in markdown_tables(text):
         for n, cells in table:
-            if cells[0] != EVENT_ROW_CELL:
+            if not EVENT_ROW_CELL_RE.search(plain_markdown(cells[0])):
                 continue
             # Emphasis and code marks do not change a rendered count.
-            plain = re.sub(r"[`*_~]", "", " | ".join(cells))
+            plain = plain_markdown(" | ".join(cells))
             for m in COUNT_RE.finditer(plain):
                 found.append(
                     f"{path}:{n}: the `event.rs` row states \"{m.group()}\". "
@@ -379,6 +405,15 @@ def self_test():
     # An unclosed tick is reset at the blank line, so a later comment still hides.
     lone = "A lone ` tick.\n\n<!--\n| M | P |\n|---|---|\n| `event.rs` | 9 variants |\n-->\n"
     assert event_row_count_findings("x.md", lone) == []
+    # An unmatched tick in the same paragraph as a comment stays literal.
+    literal = "A lone ` tick.\n<!--\n| M | P |\n|---|---|\n| `event.rs` | 9 variants |\n-->\n"
+    assert event_row_count_findings("x.md", literal) == []
+    labels = (
+        "| M | P |\n|---|---|\n| event.rs | 49 variants |\n| **event.rs** | 49 variants |\n"
+        "| [`event.rs`](../src/event.rs) | 49 variants |\n| `src/event.rs` | 49 variants |\n"
+        "| `replay_event.rs` | 49 variants |\n"
+    )
+    assert [m.split(":")[1] for m in event_row_count_findings("x.md", labels)] == ["3", "4", "5", "6"]
     formatted = (
         "| M | P |\n|---|---|\n| `event.rs` | Variants: **49** |\n"
         "| `event.rs` | `50` variants |\n| `event.rs` | `last_error` field |\n"
