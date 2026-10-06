@@ -1,4 +1,4 @@
-//! Per-activity circuit breaker that fast-fails dispatch during downstream
+//! Per-activity circuit breaker that stops dispatch during downstream
 //! outages (issue #369).
 //!
 //! When a downstream service an activity depends on goes hard-down, harvest's
@@ -10,9 +10,12 @@
 //! A [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy) attached to
 //! an activity lets the worker track that activity's recent failures and
 //! **trip open** once they cross a threshold within a rolling window. While the
-//! breaker is open, new dispatches short-circuit with a non-retryable
-//! `"CircuitOpen"` failure instead of running the doomed work; workflows that
-//! handle the failure (Saga compensation, branching) see it within seconds.
+//! breaker is open, new dispatches short-circuit instead of running the doomed
+//! work. The policy's `open_mode` decides how (issue #1809). In `Defer` mode,
+//! the default, the task goes back to `PENDING` until the next probe. In
+//! `FailFast` mode, it fails with a non-retryable `"CircuitOpen"` failure;
+//! workflows that handle the failure (Saga compensation, branching) see it
+//! within seconds.
 //!
 //! ## State model
 //!
@@ -30,11 +33,12 @@
 //! ## Scope and durability
 //!
 //! State is tracked **in-process and per-shard** (`Mutex<HashMap>`). It never
-//! touches the workflow event log: a short-circuited attempt records an
-//! ordinary `ActivityFailed` event with a typed `"CircuitOpen"` payload, so the
-//! append-only contract and deterministic replay are both unaffected. Each
-//! shard / worker process tracks its own breaker; an outage that hits every
-//! shard trips each independently, matching the per-shard ACID model.
+//! touches the workflow event log. A deferral appends no event. A fail-fast
+//! short circuit records an ordinary `ActivityFailed` event with a typed
+//! `"CircuitOpen"` payload. So the append-only contract and deterministic
+//! replay are both unaffected. Each shard / worker process tracks its own
+//! breaker. An outage that hits every shard trips each independently,
+//! matching the per-shard ACID model.
 
 // Each public method intentionally holds the state lock for its whole body: it
 // reads and mutates the same `BreakerState` and returns a value derived from
@@ -53,6 +57,7 @@ use crate::loom_sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::policy::CircuitBreakerPolicy;
 
@@ -61,7 +66,7 @@ use crate::policy::CircuitBreakerPolicy;
 pub enum CircuitPhase {
     /// Normal operation: dispatches proceed unchanged.
     Closed,
-    /// Tripped: dispatches fast-fail until the cooldown elapses.
+    /// Tripped: dispatches short-circuit until the cooldown elapses.
     Open,
     /// Cooldown elapsed: a single probe dispatch is admitted.
     HalfOpen,
@@ -100,6 +105,65 @@ impl DispatchToken {
     pub const fn is_probe(self) -> bool {
         self.is_probe
     }
+}
+
+/// One claim of a task: the queue row and the attempt that the claim wrote.
+///
+/// A worker registers each claim it dispatches with
+/// [`CircuitBreakerRegistry::begin_claim`]. The timeout enforcer marks a
+/// claim when it times out (issue #1809). The result of a marked claim does
+/// not move the breaker, because the enforcer already counted that attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClaimKey {
+    /// The task queue row.
+    pub task_id: Uuid,
+    /// The row's `attempt` value that the claim wrote.
+    pub attempt: i32,
+    /// The claim's `started_at` epoch. A deferral lowers `attempt`, so the
+    /// epoch keeps two claims of one row apart.
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+/// A claim that this process dispatched and that has not reported yet, or
+/// a claim that an enforcer here marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InFlightClaim {
+    /// The token of its dispatch. A confirmed timeout releases a probe slot
+    /// with it, before the handler returns.
+    ///
+    /// `None` until this process registers the claim. An enforcer can mark a
+    /// claim before its worker registers it, or mark a claim of another
+    /// process. The entry then holds the mark, so a later registration
+    /// still sees it.
+    token: Option<DispatchToken>,
+    /// The breaker generation when the entry was made. A confirm with no
+    /// token is fenced by it, so a reset after the mark counts nothing.
+    generation: u64,
+    state: ClaimState,
+}
+
+/// Where a claim of this process stands against the timeout enforcer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimState {
+    /// No enforcement touches the claim.
+    Running,
+    /// Enforcers are deciding, this many of them. Two scanners can race on
+    /// one claim. A result that arrives now waits for their decision.
+    Provisional(u32),
+    /// The result that arrived while enforcers were deciding, and how many
+    /// still decide.
+    Held(AttemptOutcome, DispatchToken, u32),
+    /// The enforcer timed the claim out. A later result does not count.
+    TimedOut,
+    /// The worker found the claim lost to a timeout while enforcers here were
+    /// still deciding, this many of them. A confirm settles it as their
+    /// timeout. When the last one rolls back, another process enforced it,
+    /// and it counts here then.
+    LostPending(u32),
+    /// The worker ended the claim with no result while enforcers here were
+    /// still deciding, this many of them. The entry keeps the dispatch
+    /// token, so a confirm still counts through the generation fence.
+    Ended(u32),
 }
 
 /// Outcome of consulting the breaker before dispatching an activity attempt.
@@ -173,6 +237,9 @@ pub struct CircuitSnapshot {
     pub window_secs: f64,
     /// Configured cooldown, in seconds.
     pub cooldown_secs: f64,
+    /// What a dispatch does while the breaker is open: `"defer"` or
+    /// `"fail_fast"` (issue #1809).
+    pub open_mode: crate::policy::CircuitOpenMode,
 }
 
 #[derive(Debug)]
@@ -194,6 +261,12 @@ struct BreakerState {
     /// (trip / close / force-open / force-close). A result whose dispatch token
     /// carries an older generation is a stale straggler and is fenced out.
     generation: u64,
+    /// Claims that this process dispatched and that have not reported yet,
+    /// each with its timed-out mark (issue #1809). A worker holds at most its
+    /// concurrency limit of claims, so the map stays small. Every exit of a
+    /// dispatch removes its entry, so no mark can expire while its claim can
+    /// still report.
+    in_flight_claims: HashMap<ClaimKey, InFlightClaim>,
 }
 
 impl Default for BreakerState {
@@ -206,6 +279,7 @@ impl Default for BreakerState {
             probe_in_flight: false,
             forced_open: false,
             generation: 0,
+            in_flight_claims: HashMap::new(),
         }
     }
 }
@@ -410,76 +484,306 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
+        apply_result(st, policy, outcome, token, now)
+    }
 
-        if st.forced_open {
-            // Operator-pinned: ignore organic results until force-closed.
+    /// Record the outcome of a dispatched attempt that holds `claim`.
+    ///
+    /// This is [`on_result`](Self::on_result) with one more fence. When the
+    /// timeout enforcer already timed out `claim`, the result does not move
+    /// the breaker (issue #1809). The enforcer counted that attempt, and a late
+    /// success must not clear the failure window. A timed-out probe releases
+    /// its slot as [`on_cancelled`](Self::on_cancelled) does. The check and the
+    /// update run under one lock, so they cannot race the enforcer. The claim
+    /// leaves the in-flight set.
+    pub fn on_claim_result(
+        &self,
+        activity_name: &str,
+        outcome: AttemptOutcome,
+        token: DispatchToken,
+        claim: ClaimKey,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        let &policy = self.policies.get(activity_name)?;
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+        match st.in_flight_claims.get(&claim).map(|entry| entry.state) {
+            Some(ClaimState::Provisional(deciding)) => {
+                if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                    entry.state = ClaimState::Held(outcome, token, deciding);
+                }
+                None
+            }
+            Some(ClaimState::TimedOut) => {
+                st.in_flight_claims.remove(&claim);
+                apply_cancelled(st, token, now);
+                None
+            }
+            _ => {
+                st.in_flight_claims.remove(&claim);
+                apply_result(st, policy, outcome, token, now)
+            }
+        }
+    }
+
+    /// Record that `claim` wrote no outcome, because another path settled the
+    /// attempt first (issue #1809). The result does not count.
+    ///
+    /// - A loss that was not a timeout (a cancellation, an operator action,
+    ///   an orphan reclaim) only releases the claim's probe slot.
+    /// - A timeout that an enforcer in this process confirmed is settled by
+    ///   that enforcer. This only releases the probe slot. While an enforcer
+    ///   here is still deciding, the loss waits for its decision.
+    /// - A timeout that no enforcer here marked was enforced by another
+    ///   process. Breaker state is per process, so it counts here as a
+    ///   failure. A failed probe re-opens the breaker. A closed breaker adds
+    ///   the failure to its window.
+    ///
+    /// Returns [`CircuitTransition::Tripped`] when a counted timeout opens the
+    /// breaker.
+    pub fn on_claim_lost(
+        &self,
+        activity_name: &str,
+        token: DispatchToken,
+        claim: ClaimKey,
+        lost_to_timeout: bool,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        let &policy = self.policies.get(activity_name)?;
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+        let state = st.in_flight_claims.get(&claim).map(|entry| entry.state);
+        if lost_to_timeout
+            && let Some(ClaimState::Provisional(deciding) | ClaimState::Held(_, _, deciding)) =
+                state
+        {
+            // An enforcer here is still deciding. Keep the loss until it
+            // confirms the timeout, or the last one rolls back.
+            if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                entry.state = ClaimState::LostPending(deciding);
+            }
             return None;
         }
-
-        // Generation fence: an attempt dispatched before the breaker's last
-        // state-resetting transition (trip / close / force-open / force-close)
-        // is stale and must not move the breaker. This subsumes the half-open
-        // straggler case AND the "pre-force-close failure re-trips the reset"
-        // case in one check.
-        if token.generation != st.generation {
+        if let Some(ClaimState::Provisional(deciding) | ClaimState::Held(_, _, deciding)) = state {
+            // Not a timeout as far as this worker knows, but an enforcer
+            // here is still deciding. Its verdict wins, so the entry keeps
+            // the token for a fenced count.
+            if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                entry.state = ClaimState::Ended(deciding);
+            }
+            apply_cancelled(st, token, now);
             return None;
         }
+        st.in_flight_claims.remove(&claim);
+        if !lost_to_timeout || state == Some(ClaimState::TimedOut) {
+            apply_cancelled(st, token, now);
+            return None;
+        }
+        count_remote_timeout(st, policy, token, now)
+    }
 
-        match st.phase {
-            CircuitPhase::Closed => match outcome {
-                // A success clears the rolling failure window.
-                AttemptOutcome::Success => {
-                    st.failures.clear();
-                    None
-                }
-                // A non-retryable (permanent per-request) error is excluded from
-                // trip counts entirely: it is neither downstream sickness nor
-                // proof of health, so it leaves the rolling window untouched.
-                AttemptOutcome::NonRetryableFailure => None,
-                AttemptOutcome::RetryableFailure => {
-                    st.failures.push_back(now);
-                    st.prune(now, policy.window);
-                    if st.failures.len() >= policy.failure_threshold as usize {
-                        st.trip(now);
-                        Some(CircuitTransition::Tripped)
-                    } else {
-                        None
-                    }
-                }
-            },
-            CircuitPhase::HalfOpen => {
-                // Only the admitted probe decides the half-open outcome. A
-                // same-generation non-probe (shouldn't normally happen, but be
-                // defensive) must not close the breaker early or restart cooldown.
-                if !token.is_probe {
-                    return None;
-                }
-                match outcome {
-                    // The probe reached the downstream and it answered: recovered.
-                    AttemptOutcome::Success => {
-                        st.close();
-                        Some(CircuitTransition::Closed)
-                    }
-                    // The probe failed transiently: the downstream is still down.
-                    AttemptOutcome::RetryableFailure => {
-                        st.trip(now);
-                        Some(CircuitTransition::Tripped)
-                    }
-                    // A non-retryable per-request error (e.g. bad input) does NOT
-                    // prove the downstream recovered — the error may have been
-                    // produced before the dependency was even touched. Treat the
-                    // probe as inconclusive: release the probe slot and re-arm the
-                    // cooldown so a fresh probe is admitted later, but emit no
-                    // transition (it is neither a recovery nor a downstream trip).
-                    AttemptOutcome::NonRetryableFailure => {
-                        st.trip(now);
-                        None
-                    }
+    /// Register `claim` as dispatched by this process (issue #1809).
+    ///
+    /// Call [`end_claim`](Self::end_claim) or a claim-aware report on every
+    /// exit of the dispatch.
+    ///
+    /// An enforcer may have marked the claim already. The claim then keeps
+    /// that mark, so its loss or result waits for the enforcer. Otherwise
+    /// the owner could count the timeout, and the enforcer count it again.
+    pub fn begin_claim(&self, activity_name: &str, claim: ClaimKey, token: DispatchToken) {
+        if !self.policies.contains_key(activity_name) {
+            return;
+        }
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+        st.in_flight_claims
+            .entry(claim)
+            .and_modify(|entry| entry.token = Some(token))
+            .or_insert(InFlightClaim {
+                token: Some(token),
+                generation: token.generation,
+                state: ClaimState::Running,
+            });
+    }
+
+    /// Remove `claim` from the in-flight set without a result (issue #1809).
+    /// A claim that already reported is not there, so this is then a no-op.
+    /// A held result stays, because the enforcer still settles it.
+    ///
+    /// While an enforcer here still decides, the entry stays as
+    /// [`ClaimState::Ended`]. Its token then still fences a confirm by
+    /// generation. The last rollback removes it.
+    pub fn end_claim(&self, activity_name: &str, claim: ClaimKey) {
+        if !self.policies.contains_key(activity_name) {
+            return;
+        }
+        let mut states = self.lock();
+        let Some(st) = states.get_mut(activity_name) else {
+            return;
+        };
+        match st.in_flight_claims.get(&claim).map(|entry| entry.state) {
+            Some(ClaimState::Held(..) | ClaimState::LostPending(_) | ClaimState::Ended(_))
+            | None => {}
+            Some(ClaimState::Provisional(deciding)) => {
+                if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                    entry.state = ClaimState::Ended(deciding);
                 }
             }
-            // A result arriving while fully open (no probe admitted) is a
-            // stale straggler; leave the breaker untouched.
-            CircuitPhase::Open => None,
+            Some(ClaimState::Running | ClaimState::TimedOut) => {
+                st.in_flight_claims.remove(&claim);
+            }
+        }
+    }
+
+    /// Mark `claim` provisionally, before the enforcer decides on it (issue
+    /// #1809).
+    ///
+    /// A result that arrives now is held. Each enforcer that marks then calls
+    /// [`confirm_claim_timed_out`](Self::confirm_claim_timed_out) or
+    /// [`unmark_claim_timed_out`](Self::unmark_claim_timed_out) once. One
+    /// confirm wins over any number of rollbacks, in any order.
+    ///
+    /// A claim that this process has not registered gets an entry with no
+    /// token. Its worker may register it before the enforcer decides, and
+    /// then keeps the mark. The confirm or the last rollback removes an entry
+    /// that no worker registered.
+    pub fn mark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
+        if !self.policies.contains_key(activity_name) {
+            return;
+        }
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+        let generation = st.generation;
+        let entry = st.in_flight_claims.entry(claim).or_insert(InFlightClaim {
+            token: None,
+            generation,
+            state: ClaimState::Running,
+        });
+        entry.state = match entry.state {
+            ClaimState::Running => ClaimState::Provisional(1),
+            ClaimState::Provisional(deciding) => {
+                ClaimState::Provisional(deciding.saturating_add(1))
+            }
+            ClaimState::Held(outcome, token, deciding) => {
+                ClaimState::Held(outcome, token, deciding.saturating_add(1))
+            }
+            ClaimState::TimedOut => ClaimState::TimedOut,
+            ClaimState::LostPending(deciding) => {
+                ClaimState::LostPending(deciding.saturating_add(1))
+            }
+            ClaimState::Ended(deciding) => ClaimState::Ended(deciding.saturating_add(1)),
+        };
+    }
+
+    /// The enforcer timed `claim` out (issue #1809). The claim's probe slot,
+    /// if it holds one, is released now, so a stuck handler cannot keep the
+    /// breaker half-open. A held result is dropped. A later result does not
+    /// count. A timed-out probe is a failed probe, so this returns
+    /// [`CircuitTransition::Tripped`] when it re-opens the breaker.
+    ///
+    /// With `count_failure`, the timeout also counts as a failure, under the
+    /// same lock. A claim of this process counts through its dispatch token,
+    /// so a token from before a trip or a reset counts nothing. A claim that
+    /// no worker here registered has no token. It counts as an external
+    /// failure, fenced by the generation at its mark.
+    ///
+    /// A claim whose handler started was registered before the enforcer read
+    /// that fact. So an entry with no token here belongs to another process,
+    /// and this removes it.
+    pub fn confirm_claim_timed_out(
+        &self,
+        activity_name: &str,
+        claim: ClaimKey,
+        count_failure: bool,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        let &policy = self.policies.get(activity_name)?;
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+        // Every enforcer marks before it confirms, and every path keeps a
+        // marked entry until its enforcers decide. So a missing entry has
+        // no generation to fence by, and counts nothing.
+        let entry = st.in_flight_claims.get(&claim).copied()?;
+        match (entry.state, entry.token) {
+            (ClaimState::TimedOut, _) => return None,
+            (ClaimState::Running | ClaimState::Provisional(_), Some(_)) => {
+                if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
+                    entry.state = ClaimState::TimedOut;
+                }
+            }
+            _ => {
+                st.in_flight_claims.remove(&claim);
+            }
+        }
+        if entry
+            .token
+            .is_some_and(|token| apply_cancelled(st, token, now))
+        {
+            return Some(CircuitTransition::Tripped);
+        }
+        let generation = entry
+            .token
+            .map_or(entry.generation, |token| token.generation);
+        if !count_failure || generation != st.generation {
+            return None;
+        }
+        apply_external_failure(st, policy, now)
+    }
+
+    /// The enforcer did not time `claim` out after all (issue #1809). A held
+    /// result now counts as usual. Returns its transition, if any.
+    pub fn unmark_claim_timed_out(
+        &self,
+        activity_name: &str,
+        claim: ClaimKey,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        let &policy = self.policies.get(activity_name)?;
+        let mut states = self.lock();
+        let st = states.get_mut(activity_name)?;
+        let entry = st.in_flight_claims.get_mut(&claim)?;
+        match entry.state {
+            ClaimState::Held(outcome, token, deciding) if deciding > 1 => {
+                entry.state = ClaimState::Held(outcome, token, deciding - 1);
+                None
+            }
+            ClaimState::Held(outcome, token, _) => {
+                st.in_flight_claims.remove(&claim);
+                apply_result(st, policy, outcome, token, now)
+            }
+            ClaimState::Provisional(deciding) if deciding > 1 => {
+                entry.state = ClaimState::Provisional(deciding - 1);
+                None
+            }
+            ClaimState::Provisional(_) if entry.token.is_none() => {
+                // No worker here registered the claim.
+                st.in_flight_claims.remove(&claim);
+                None
+            }
+            ClaimState::Provisional(_) => {
+                entry.state = ClaimState::Running;
+                None
+            }
+            ClaimState::LostPending(deciding) if deciding > 1 => {
+                entry.state = ClaimState::LostPending(deciding - 1);
+                None
+            }
+            ClaimState::LostPending(_) => {
+                // No enforcer here timed it out, so another process did.
+                let token = entry.token;
+                st.in_flight_claims.remove(&claim);
+                token.and_then(|token| count_remote_timeout(st, policy, token, now))
+            }
+            ClaimState::Ended(deciding) if deciding > 1 => {
+                entry.state = ClaimState::Ended(deciding - 1);
+                None
+            }
+            ClaimState::Ended(_) => {
+                // The worker reported nothing, and no timeout counts.
+                st.in_flight_claims.remove(&claim);
+                None
+            }
+            ClaimState::Running | ClaimState::TimedOut => None,
         }
     }
 
@@ -505,20 +809,7 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-
-        // Only count while closed and not operator-pinned. While open/half-open
-        // the cooldown/probe machinery already governs recovery.
-        if st.forced_open || st.phase != CircuitPhase::Closed {
-            return None;
-        }
-        st.failures.push_back(now);
-        st.prune(now, policy.window);
-        if st.failures.len() >= policy.failure_threshold as usize {
-            st.trip(now);
-            Some(CircuitTransition::Tripped)
-        } else {
-            None
-        }
+        apply_external_failure(st, policy, now)
     }
 
     /// Release breaker accounting for a dispatch that was **cancelled** mid-flight
@@ -544,15 +835,7 @@ impl CircuitBreakerRegistry {
         }
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-
-        if st.forced_open || token.generation != st.generation {
-            return;
-        }
-        // Only the in-flight half-open probe needs releasing; everything else
-        // (closed-state cancellation, fully-open straggler) is a no-op.
-        if token.is_probe && st.phase == CircuitPhase::HalfOpen && st.probe_in_flight {
-            st.trip(now);
-        }
+        apply_cancelled(st, token, now);
     }
 
     /// Operator action: pin the breaker open for manual incident response.
@@ -656,6 +939,7 @@ impl CircuitBreakerRegistry {
             failure_threshold: policy.failure_threshold,
             window_secs: policy.window.as_secs_f64(),
             cooldown_secs: policy.cooldown.as_secs_f64(),
+            open_mode: policy.open_mode,
         }
     }
 }
@@ -669,6 +953,142 @@ impl Default for CircuitBreakerRegistry {
 // ---------------------------------------------------------------------------
 // Tests (red phase: written before the implementation above existed)
 // ---------------------------------------------------------------------------
+
+/// Apply one attempt outcome to an activity's breaker state.
+fn apply_result(
+    st: &mut BreakerState,
+    policy: CircuitBreakerPolicy,
+    outcome: AttemptOutcome,
+    token: DispatchToken,
+    now: Instant,
+) -> Option<CircuitTransition> {
+    if st.forced_open {
+        // Operator-pinned: ignore organic results until force-closed.
+        return None;
+    }
+
+    // Generation fence: an attempt dispatched before the breaker's last
+    // state-resetting transition (trip / close / force-open / force-close)
+    // is stale and must not move the breaker. This subsumes the half-open
+    // straggler case AND the "pre-force-close failure re-trips the reset"
+    // case in one check.
+    if token.generation != st.generation {
+        return None;
+    }
+
+    match st.phase {
+        CircuitPhase::Closed => match outcome {
+            // A success clears the rolling failure window.
+            AttemptOutcome::Success => {
+                st.failures.clear();
+                None
+            }
+            // A non-retryable (permanent per-request) error is excluded from
+            // trip counts entirely: it is neither downstream sickness nor
+            // proof of health, so it leaves the rolling window untouched.
+            AttemptOutcome::NonRetryableFailure => None,
+            AttemptOutcome::RetryableFailure => {
+                st.failures.push_back(now);
+                st.prune(now, policy.window);
+                if st.failures.len() >= policy.failure_threshold as usize {
+                    st.trip(now);
+                    Some(CircuitTransition::Tripped)
+                } else {
+                    None
+                }
+            }
+        },
+        CircuitPhase::HalfOpen => {
+            // Only the admitted probe decides the half-open outcome. A
+            // same-generation non-probe (shouldn't normally happen, but be
+            // defensive) must not close the breaker early or restart cooldown.
+            if !token.is_probe {
+                return None;
+            }
+            match outcome {
+                // The probe reached the downstream and it answered: recovered.
+                AttemptOutcome::Success => {
+                    st.close();
+                    Some(CircuitTransition::Closed)
+                }
+                // The probe failed transiently: the downstream is still down.
+                AttemptOutcome::RetryableFailure => {
+                    st.trip(now);
+                    Some(CircuitTransition::Tripped)
+                }
+                // A non-retryable per-request error (e.g. bad input) does NOT
+                // prove the downstream recovered — the error may have been
+                // produced before the dependency was even touched. Treat the
+                // probe as inconclusive: release the probe slot and re-arm the
+                // cooldown so a fresh probe is admitted later, but emit no
+                // transition (it is neither a recovery nor a downstream trip).
+                AttemptOutcome::NonRetryableFailure => {
+                    st.trip(now);
+                    None
+                }
+            }
+        }
+        // A result arriving while fully open (no probe admitted) is a
+        // stale straggler; leave the breaker untouched.
+        CircuitPhase::Open => None,
+    }
+}
+
+/// Count a timeout that another process enforced on a claim of this one
+/// (issue #1809). A failed probe re-opens the breaker. Otherwise a closed
+/// breaker adds the failure to its window.
+fn count_remote_timeout(
+    st: &mut BreakerState,
+    policy: CircuitBreakerPolicy,
+    token: DispatchToken,
+    now: Instant,
+) -> Option<CircuitTransition> {
+    if apply_cancelled(st, token, now) {
+        return Some(CircuitTransition::Tripped);
+    }
+    // Generation fence: a claim dispatched before a trip or a reset counts
+    // nothing, as a stale handler result does.
+    if token.generation != st.generation {
+        return None;
+    }
+    apply_external_failure(st, policy, now)
+}
+
+/// Count one out-of-band failure, such as an enforced timeout.
+fn apply_external_failure(
+    st: &mut BreakerState,
+    policy: CircuitBreakerPolicy,
+    now: Instant,
+) -> Option<CircuitTransition> {
+    // Only count while closed and not operator-pinned. While open/half-open
+    // the cooldown/probe machinery already governs recovery.
+    if st.forced_open || st.phase != CircuitPhase::Closed {
+        return None;
+    }
+    st.failures.push_back(now);
+    st.prune(now, policy.window);
+    if st.failures.len() >= policy.failure_threshold as usize {
+        st.trip(now);
+        Some(CircuitTransition::Tripped)
+    } else {
+        None
+    }
+}
+
+/// Release the breaker accounting of a cancelled or timed-out dispatch.
+/// Returns whether it released a probe and re-opened the breaker.
+fn apply_cancelled(st: &mut BreakerState, token: DispatchToken, now: Instant) -> bool {
+    if st.forced_open || token.generation != st.generation {
+        return false;
+    }
+    // Only the in-flight half-open probe needs releasing; everything else
+    // (closed-state cancellation, fully-open straggler) is a no-op.
+    if token.is_probe && st.phase == CircuitPhase::HalfOpen && st.probe_in_flight {
+        st.trip(now);
+        return true;
+    }
+    false
+}
 
 #[cfg(test)]
 mod tests {
@@ -739,6 +1159,448 @@ mod tests {
         );
         assert!(reg.snapshot("anything", now).is_none());
         assert!(reg.is_empty());
+    }
+
+    /// A token for claims whose probe role does not matter to the test.
+    const TOKEN: DispatchToken = DispatchToken {
+        generation: 0,
+        is_probe: false,
+    };
+
+    fn claim(attempt: i32) -> ClaimKey {
+        ClaimKey {
+            task_id: Uuid::from_u128(1809),
+            attempt,
+            started_at: None,
+        }
+    }
+
+    fn rolling(reg: &CircuitBreakerRegistry, now: Instant) -> u32 {
+        reg.snapshot("send_email", now)
+            .expect("tracked")
+            .rolling_failure_count
+    }
+
+    /// Issue #1809: the enforcer marks the claim, then counts the timeout. A
+    /// late success of that claim must not clear the counted failure.
+    #[test]
+    fn late_success_of_a_timed_out_claim_keeps_the_failure() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), TOKEN);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
+        let _ = reg.on_external_failure("send_email", t0);
+        assert_eq!(rolling(&reg, t0), 1);
+
+        let late = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        assert_eq!(late, None);
+        assert_eq!(rolling(&reg, t0), 1, "the late success is fenced");
+
+        // The mark is used up. Another claim of the same task still counts.
+        let next = dispatch(&reg, t0);
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, next, claim(2), t0);
+        assert_eq!(rolling(&reg, t0), 0);
+    }
+
+    /// A result that lands before the mark counts as usual. The timeout then
+    /// counts too, so no order loses the timeout.
+    #[test]
+    fn result_before_the_mark_counts_and_the_timeout_still_counts() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), TOKEN);
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
+        let _ = reg.on_external_failure("send_email", t0);
+        assert_eq!(rolling(&reg, t0), 1);
+    }
+
+    /// A timed-out probe releases its slot, so a later probe can run.
+    #[test]
+    fn timed_out_probe_releases_its_slot() {
+        let reg = registry();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        let probe = dispatch(&reg, t1);
+        assert!(probe.is_probe());
+        reg.begin_claim("send_email", claim(1), probe);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), false, t1),
+            Some(CircuitTransition::Tripped),
+            "a timed-out probe re-trips the breaker"
+        );
+        // The handler has not returned. The confirm alone frees the slot.
+        assert_eq!(
+            reg.snapshot("send_email", t1).expect("tracked").state,
+            "open"
+        );
+        let t2 = t1 + Duration::from_secs(61);
+        assert!(dispatch(&reg, t2).is_probe(), "a fresh probe is admitted");
+        let late = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t2);
+        assert_eq!(late, None, "a timed-out probe does not close the breaker");
+    }
+
+    /// The enforcer marks before its transaction and unmarks when the
+    /// transaction does not time the claim out. The result then counts.
+    #[test]
+    fn unmarked_claim_counts_again() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), TOKEN);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        assert_eq!(
+            rolling(&reg, t0),
+            0,
+            "the success counts and clears the window"
+        );
+    }
+
+    /// A result that arrives while the enforcer decides is held. A no-op
+    /// enforcement then applies it, so a successful probe still closes the
+    /// breaker.
+    #[test]
+    fn held_result_counts_when_the_enforcer_does_nothing() {
+        let reg = registry();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        let probe = dispatch(&reg, t1);
+        reg.begin_claim("send_email", claim(1), TOKEN);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let held = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t1);
+        assert_eq!(held, None, "the result waits for the enforcer");
+        reg.end_claim("send_email", claim(1));
+        let applied = reg.unmark_claim_timed_out("send_email", claim(1), t1);
+        assert_eq!(applied, Some(CircuitTransition::Closed));
+    }
+
+    /// A held result is dropped when the enforcer times the claim out.
+    #[test]
+    fn held_result_is_dropped_when_the_enforcer_acts() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), TOKEN);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
+        assert_eq!(
+            rolling(&reg, t0),
+            1,
+            "the late success does not clear the window"
+        );
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// Two enforcers race on one claim. One times it out and the other does
+    /// nothing. In either order, the late result stays fenced.
+    #[test]
+    fn racing_enforcers_keep_the_fence_in_either_order() {
+        for rollback_first in [true, false] {
+            let reg = registry();
+            let t0 = Instant::now();
+            fail(&reg, t0);
+            let token = dispatch(&reg, t0);
+            reg.begin_claim("send_email", claim(1), TOKEN);
+            reg.mark_claim_timed_out("send_email", claim(1));
+            reg.mark_claim_timed_out("send_email", claim(1));
+            if rollback_first {
+                let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+                let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
+            } else {
+                let _ = reg.confirm_claim_timed_out("send_email", claim(1), false, t0);
+                let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+            }
+            let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+            assert_eq!(rolling(&reg, t0), 1, "rollback first: {rollback_first}");
+        }
+    }
+
+    /// A result held during two rollbacks counts once, after the last one.
+    #[test]
+    fn held_result_waits_for_every_racing_enforcer() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), TOKEN);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+        assert_eq!(rolling(&reg, t0), 1, "one enforcer still decides");
+        let _ = reg.unmark_claim_timed_out("send_email", claim(1), t0);
+        assert_eq!(rolling(&reg, t0), 0, "the held success counts now");
+    }
+
+    /// A lost claim never counts its own result (issue #1809). Only a timeout
+    /// that no enforcer here marked counts, because another process enforced
+    /// it and breaker state is per process.
+    #[test]
+    fn a_lost_claim_counts_only_a_timeout_enforced_elsewhere() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+
+        // Not a timeout: an operator action, say. Nothing counts.
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), token);
+        assert_eq!(
+            reg.on_claim_lost("send_email", token, claim(1), false, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 1);
+
+        // A timeout that an enforcer here confirmed: that enforcer counts it.
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(2), token);
+        reg.mark_claim_timed_out("send_email", claim(2));
+        let _ = reg.confirm_claim_timed_out("send_email", claim(2), false, t0);
+        assert_eq!(
+            reg.on_claim_lost("send_email", token, claim(2), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 1, "the local enforcer counts it");
+
+        // A timeout enforced elsewhere counts here, and trips at threshold.
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(3), token);
+        assert_eq!(
+            reg.on_claim_lost("send_email", token, claim(3), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 2);
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(4), token);
+        assert_eq!(
+            reg.on_claim_lost("send_email", token, claim(4), true, t0),
+            Some(CircuitTransition::Tripped)
+        );
+
+        // A probe lost to a timeout enforced elsewhere is a failed probe.
+        let t1 = t0 + Duration::from_secs(61);
+        let probe = dispatch(&reg, t1);
+        reg.begin_claim("send_email", claim(5), probe);
+        assert_eq!(
+            reg.on_claim_lost("send_email", probe, claim(5), true, t1),
+            Some(CircuitTransition::Tripped)
+        );
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// A timeout of a claim dispatched before a reset counts nothing, in the
+    /// enforcer and in the owner (issue #1809).
+    #[test]
+    fn a_timeout_from_before_a_reset_counts_nothing() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let stale = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), stale);
+        reg.begin_claim("send_email", claim(2), stale);
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        reg.force_close("send_email");
+
+        reg.mark_claim_timed_out("send_email", claim(1));
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), true, t0),
+            None
+        );
+        assert_eq!(
+            reg.on_claim_lost("send_email", stale, claim(2), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0, "the reset fences both counts");
+
+        // A fresh claim's timeout counts.
+        let fresh = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(3), fresh);
+        reg.mark_claim_timed_out("send_email", claim(3));
+        let _ = reg.confirm_claim_timed_out("send_email", claim(3), true, t0);
+        assert_eq!(rolling(&reg, t0), 1);
+    }
+
+    /// A worker can end its claim with no result while an enforcer decides.
+    /// The entry keeps the token, so the generation fence still holds
+    /// (issue #1809).
+    #[test]
+    fn an_ended_claim_keeps_its_fence_until_the_enforcer_decides() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let stale = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), stale);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        reg.end_claim("send_email", claim(1));
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        reg.force_close("send_email");
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0, "the reset fences the ended claim");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // A current claim still counts, and a rollback leaves nothing.
+        let fresh = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(2), fresh);
+        reg.mark_claim_timed_out("send_email", claim(2));
+        reg.end_claim("send_email", claim(2));
+        let _ = reg.confirm_claim_timed_out("send_email", claim(2), true, t0);
+        assert_eq!(rolling(&reg, t0), 1);
+        reg.begin_claim("send_email", claim(3), fresh);
+        reg.mark_claim_timed_out("send_email", claim(3));
+        reg.end_claim("send_email", claim(3));
+        assert_eq!(reg.unmark_claim_timed_out("send_email", claim(3), t0), None);
+        assert_eq!(rolling(&reg, t0), 1);
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// A mark on another process's claim records the generation. A reset
+    /// before the confirm fences that count too (issue #1809).
+    #[test]
+    fn an_unregistered_mark_is_fenced_by_a_reset() {
+        let reg = registry();
+        let t0 = Instant::now();
+        reg.mark_claim_timed_out("send_email", claim(1));
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        reg.force_close("send_email");
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0, "the reset fences the remote count");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // A claim that is not marked counts nothing at all.
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(2), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0);
+    }
+
+    /// A worker that sees no timeout while an enforcer here still decides
+    /// keeps the token. The enforcer's verdict counts once, fenced by
+    /// generation (issue #1809).
+    #[test]
+    fn a_loss_seen_as_no_timeout_still_waits_for_the_enforcer() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), token);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        assert_eq!(
+            reg.on_claim_lost("send_email", token, claim(1), false, t0),
+            None
+        );
+        let _ = reg.confirm_claim_timed_out("send_email", claim(1), true, t0);
+        assert_eq!(rolling(&reg, t0), 1, "the enforcer's verdict counts once");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        let stale = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(2), stale);
+        reg.mark_claim_timed_out("send_email", claim(2));
+        assert_eq!(
+            reg.on_claim_lost("send_email", stale, claim(2), false, t0),
+            None
+        );
+        for _ in 0..2 {
+            fail(&reg, t0);
+        }
+        reg.force_close("send_email");
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(2), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 0, "the reset fences the stale claim");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// A mark on a claim that no worker here registered leaves nothing behind
+    /// once its enforcer decides (issue #1809).
+    #[test]
+    fn an_unregistered_mark_leaves_nothing_behind() {
+        let reg = registry();
+        let t0 = Instant::now();
+        reg.mark_claim_timed_out("send_email", claim(8));
+        assert_eq!(reg.unmark_claim_timed_out("send_email", claim(8), t0), None);
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // A claim of another process: the confirm counts it once.
+        reg.mark_claim_timed_out("send_email", claim(9));
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(9), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 1);
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // An ended claim waits for its enforcer, then leaves nothing.
+        reg.begin_claim("send_email", claim(1), TOKEN);
+        reg.mark_claim_timed_out("send_email", claim(1));
+        reg.end_claim("send_email", claim(1));
+        assert!(!reg.lock()["send_email"].in_flight_claims.is_empty());
+        assert_eq!(reg.unmark_claim_timed_out("send_email", claim(1), t0), None);
+        let states = reg.lock();
+        assert!(states["send_email"].in_flight_claims.is_empty());
+    }
+
+    /// An enforcer can mark a claim before its worker registers it. The
+    /// worker keeps the mark, so its loss waits for the enforcer, and the
+    /// timeout counts once (issue #1809).
+    #[test]
+    fn a_claim_registered_after_its_mark_counts_its_timeout_once() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+
+        reg.mark_claim_timed_out("send_email", claim(1));
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(1), token);
+        assert_eq!(
+            reg.on_claim_lost("send_email", token, claim(1), true, t0),
+            None,
+            "the loss waits for the enforcer that marked the claim"
+        );
+        assert_eq!(rolling(&reg, t0), 1);
+        assert_eq!(
+            reg.confirm_claim_timed_out("send_email", claim(1), true, t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 2, "one timeout, one failure");
+        assert!(reg.lock()["send_email"].in_flight_claims.is_empty());
+
+        // A late result of such a claim waits for the enforcer too.
+        reg.mark_claim_timed_out("send_email", claim(2));
+        let token = dispatch(&reg, t0);
+        reg.begin_claim("send_email", claim(2), token);
+        assert_eq!(
+            reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(2), t0),
+            None
+        );
+        assert_eq!(rolling(&reg, t0), 2, "the success is held");
+        assert_eq!(reg.unmark_claim_timed_out("send_email", claim(2), t0), None);
+        assert_eq!(rolling(&reg, t0), 0, "no timeout, so the success counts");
     }
 
     #[test]

@@ -3054,6 +3054,153 @@ pub(crate) async fn later_claim_shares_strikes(
         .map_err(crate::error::database_error)
 }
 
+/// The `timed_out_claims` entry of the claim `(attempt, started_at)` (issue
+/// #1809).
+///
+/// The entry names the claim by both values, as the breaker's `ClaimKey`
+/// does. Some claim paths stamp `started_at` with `NOW()`, the start of
+/// their transaction. Two claims of one task can then share `started_at`,
+/// but each claim has its own `attempt`.
+///
+/// The format is `<attempt>@<started_at>`, with `started_at` in UTC at
+/// microsecond precision, the precision of `TIMESTAMPTZ`.
+#[doc(hidden)]
+#[must_use]
+pub fn timed_out_claim_key(attempt: i32, started_at: DateTime<Utc>) -> String {
+    format!(
+        "{attempt}@{}",
+        started_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    )
+}
+
+/// Record that the timeout enforcer timed out the claim `(attempt,
+/// started_at)` (issue #1809).
+///
+/// The enforcer calls this inside its transaction, after its write applied.
+/// The entry stays until the owner of the claim takes it with
+/// [`take_timed_out_claim`]. A worker whose handler outlives several retries
+/// can then still find its own claim.
+///
+/// The list has no cap, because a cap could drop the entry of a live owner.
+/// Each timed-out claim used one attempt, and the enforcer never lowers
+/// `attempt`. So a row holds at most `max_attempts` entries. Only an owner
+/// that never settles, such as a crashed process, leaves one behind.
+///
+/// # Errors
+///
+/// Returns a database error if the update fails.
+pub(crate) async fn record_timed_out_claim(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    attempt: i32,
+    started_at: DateTime<Utc>,
+) -> HarvestResult<()> {
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET timed_out_claims = array_append(timed_out_claims, $2) \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Text, _>(timed_out_claim_key(attempt, started_at))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Whether the timeout enforcer timed out the claim `(attempt, started_at)`
+/// of `task_id`, and remove that record (issue #1809).
+///
+/// Only the owner of the claim calls this, once, after it loses the claim.
+/// The removal keeps the list to owners that have not settled. Any other
+/// loss of the claim is not a timeout.
+///
+/// # Errors
+///
+/// Returns a database error if the update fails. The record then stays, and
+/// the answer is unknown.
+pub(crate) async fn take_timed_out_claim(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    attempt: i32,
+    started_at: DateTime<Utc>,
+) -> HarvestResult<bool> {
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET timed_out_claims = array_remove(timed_out_claims, $2) \
+         WHERE id = $1 AND $2 = ANY(timed_out_claims)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Text, _>(timed_out_claim_key(attempt, started_at))
+    .execute(conn)
+    .await
+    .map(|rows| rows > 0)
+    .map_err(crate::error::database_error)
+}
+
+/// Record that the handler of `claim` started (issue #1809).
+///
+/// The write sets `handler_started_attempt` to the claim's `attempt`. The
+/// timeout enforcer feeds the circuit breaker only when the two are equal.
+/// It also sets `handler_started_at`, from which the enforcer measures the
+/// attempt duration. `clock_timestamp()`, not `NOW()`: the start transaction
+/// can wait on the execution row lock first.
+/// Call it in the transaction that appends `ActivityStarted`, after
+/// [`lock_claim_for_update`] returns [`ClaimLock::Held`]. A WASM activity
+/// calls it after its module resolves instead. The claim fence then makes it
+/// wait for a timeout in flight, and change nothing after one.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub(crate) async fn mark_claim_handler_started(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
+        .set((
+            dsl::handler_started_attempt.eq(claim.attempt),
+            dsl::handler_started_at.eq(diesel::dsl::sql::<
+                diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+            >("clock_timestamp()")),
+        ))
+        .into_boxed();
+    let updated = fence(update, Some(claim))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(claim_write(updated == 1))
+}
+
+/// Whether `claim` is current and its handler start is recorded, read
+/// without a lock (issue #1809).
+///
+/// It tells whether a start marker whose connection was lost committed.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn claim_handler_started(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row = dsl::harvest_task_queue
+        .find(claim.task_id)
+        .select((
+            claim_held(&claim.worker_id, claim.attempt),
+            dsl::handler_started_attempt,
+        ))
+        .first::<(Option<bool>, Option<i32>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.is_some_and(|(held, started)| held == Some(true) && started == Some(claim.attempt)))
+}
+
 /// Complete the task that `claim` holds. A stale claim changes nothing.
 ///
 /// # Errors
@@ -3096,9 +3243,40 @@ pub async fn requeue_claimed_task_for_retry(
     delay: Duration,
     previous_error: &str,
 ) -> HarvestResult<ClaimWrite> {
-    requeue_for_retry_inner(conn, claim.task_id, Some(claim), delay, previous_error)
+    requeue_for_retry_inner(conn, claim.task_id, Some(claim), delay, previous_error, 0)
         .await
         .map(claim_write)
+}
+
+/// Requeue a timed-out attempt of `claim` for retry (issue #1809). A stale
+/// claim changes nothing.
+///
+/// The write is [`requeue_claimed_task_for_retry`], but it sets
+/// `crash_strikes` to the caller's value, not 0. A timeout does not prove that
+/// the attempt ended without a crash. A reset would let a task that crashes
+/// workers escape poison-pill quarantine (issue #367). The caller reads the
+/// value under the row lock of the same transaction.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub(crate) async fn requeue_claimed_task_after_timeout(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+    previous_error: &str,
+    crash_strikes: i32,
+) -> HarvestResult<ClaimWrite> {
+    requeue_for_retry_inner(
+        conn,
+        claim.task_id,
+        Some(claim),
+        delay,
+        previous_error,
+        crash_strikes,
+    )
+    .await
+    .map(claim_write)
 }
 
 /// Defer the rate-limited task that `claim` holds. A stale claim changes
@@ -3137,6 +3315,35 @@ pub async fn defer_claimed_rate_limited_task(
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn defer_claimed_retry_for_budget(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+) -> HarvestResult<ClaimWrite> {
+    defer_claimed_task(conn, claim, delay).await
+}
+
+/// Defer the task that `claim` holds because its circuit breaker is open
+/// (issue #1809). A stale claim changes nothing.
+///
+/// It uses the same write as the retry-budget deferral. An open breaker, like
+/// an empty bucket, says nothing about this task, so the deferral uses no
+/// attempt.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_claimed_task_for_open_circuit(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+) -> HarvestResult<ClaimWrite> {
+    defer_claimed_task(conn, claim, delay).await
+}
+
+/// Put the task that `claim` holds back to `PENDING` for `delay`, on the
+/// database clock. The write undoes the claim-time `attempt` increment and
+/// keeps `error` and `crash_strikes`. It appends no event.
+async fn defer_claimed_task(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
     delay: Duration,
@@ -3194,7 +3401,7 @@ pub async fn defer_claimed_retry_for_budget(
         tracing::warn!(
             task_id = %claim.task_id,
             %error,
-            "failed to announce a retry-budget deferral; the poll loop still claims it"
+            "failed to announce a deferred task; the poll loop still claims it"
         );
     }
     Ok(ClaimWrite::Applied)
@@ -3933,7 +4140,7 @@ pub async fn requeue_for_retry(
     delay: Duration,
     previous_error: &str,
 ) -> HarvestResult<()> {
-    if !requeue_for_retry_inner(conn, task_id, None, delay, previous_error).await? {
+    if !requeue_for_retry_inner(conn, task_id, None, delay, previous_error, 0).await? {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {task_id} is not running"
         )));
@@ -3947,12 +4154,14 @@ async fn requeue_for_retry_inner(
     claim: Option<&TaskClaim>,
     delay: Duration,
     previous_error: &str,
+    crash_strikes: i32,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::{Double, Timestamptz};
 
-    let changeset = PendingRequeueChangeset::new(previous_error.to_string());
+    let mut changeset = PendingRequeueChangeset::new(previous_error.to_string());
+    changeset.crash_strikes = crash_strikes;
 
     let update = diesel::update(
         dsl::harvest_task_queue
@@ -7234,6 +7443,13 @@ const TERMINAL_TASK_CURSOR: &str = "AND (t.completed_at, t.id) > ($3, $4) ";
 /// - **Dead letter.** A terminal `workflow` row also stays while a dead
 ///   letter exists for its execution. A DLQ redrive can move a `FAILED`
 ///   execution back to `RUNNING`, and the supersede scan then needs the row.
+/// - **Timeout record.** A row stays while `timed_out_claims` holds an entry
+///   (issue #1809). Its owner takes the entry after its cancellation grace,
+///   which can outlast the shortest window. Without it, the owner misses a
+///   timeout that another process enforced. An owner that crashed never
+///   takes its entry, so the row goes 7 days after the cutoff. The grace is
+///   at most [`crate::worker::MAX_CANCELLATION_GRACE_PERIOD`], so a live
+///   owner always takes its entry first.
 #[must_use]
 fn terminal_task_predicates() -> String {
     let terminal = crate::erase::sql_literal_list(TERMINAL_TASK_STATES);
@@ -7241,6 +7457,8 @@ fn terminal_task_predicates() -> String {
     format!(
         "t.state IN ({terminal}) \
          AND t.completed_at < $1 \
+         AND (COALESCE(cardinality(t.timed_out_claims), 0) = 0 \
+              OR t.completed_at < $1 - INTERVAL '7 days') \
          AND (t.task_type = 'activity' OR ( \
              NOT EXISTS ( \
                  SELECT 1 FROM harvest_workflow_executions e \

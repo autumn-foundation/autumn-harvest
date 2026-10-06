@@ -148,6 +148,13 @@ pub fn labels_to_clear<S: std::hash::BuildHasher>(
     previous.difference(current).cloned().collect()
 }
 
+/// The longest cancellation grace a worker accepts (issue #1809).
+///
+/// A timed-out owner takes its timeout record after the grace ends. The
+/// terminal-task janitor keeps a row with an untaken record for at least 7
+/// days. A grace within this bound always ends first.
+pub const MAX_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Validated, runtime-ready worker configuration.
 ///
 /// Built from [`WorkerConfig`] (the user-facing builder) via `From`, which
@@ -323,12 +330,20 @@ impl WorkerRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Config`] if `queues` is empty.
+    /// Returns [`HarvestError::Config`] if `queues` is empty, or if
+    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
                 "worker must poll at least one queue".into(),
             ));
+        }
+        if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
+            return Err(HarvestError::Config(format!(
+                "cancellation_grace_period of {}s exceeds the maximum of {}s",
+                self.cancellation_grace_period.as_secs(),
+                MAX_CANCELLATION_GRACE_PERIOD.as_secs()
+            )));
         }
         // Warn when queue_weights contains keys that are not in the queues list.
         // Those entries are silently ignored by effective_queue_weights, which
@@ -4050,7 +4065,19 @@ async fn persist_external_signal_inline(
     // deliver it, and append the terminal first, leaving the inline path to
     // append the same terminal at a now-stale `next_event_id` — a history write
     // conflict that fails the caller even though delivery succeeded (issue #492).
-    let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = Box::pin(conn
+    // Issue #1822: two workflows that signal each other in one cycle lock
+    // their own row, then the row of the peer. Postgres aborts one side with
+    // `40P01`. The retry runs the whole transaction again. A conflict after
+    // the last retry passes through `fail_execution_on_error`, so the task
+    // runs again and the workflow does not fail. Follow-up work runs after the
+    // commit, below. A completion-trigger counter inside an inline cancel can
+    // count twice.
+    let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = Box::pin(crate::tx_retry::run_with_conflict_retry(
+        conn,
+        crate::tx_retry::SITE_PERSIST,
+        metrics,
+        crate::tx_retry::TxRetryPolicy::DEFAULT,
+        async |conn| Box::pin(conn
         .transaction::<InlinePersistResult, HarvestError, _>(async |conn| {
             // For await-bearing batches, take the awaiter row `FOR UPDATE`
             // lock and read the TRUE `next_event_id` under it. Whichever of
@@ -4091,7 +4118,7 @@ async fn persist_external_signal_inline(
             let multi_shard_deployment =
                 crate::external_target_location::deployment_is_multi_shard();
 
-            for item in items {
+            for item in items.iter().cloned() {
                 match item {
                     SignalBatchItem::Marker(event) => {
                         store::append_events_with_codecs(conn, exec_id, std::slice::from_ref(&event), next, codecs)
@@ -4492,8 +4519,9 @@ async fn persist_external_signal_inline(
             }
 
             Ok((new_events, next, deferred_starts, cancel_metrics, deferred_checks))
-        }))
-        .await?;
+        })).await,
+    ))
+    .await?;
 
     // The inline batch is durably committed: now spawn trigger/cascade follow-up
     // starts and record terminal metrics for any targets cancelled above.
@@ -5486,6 +5514,31 @@ fn next_retry_delay(
     chrono_duration_from_std(delay, "retry delay").map(Some)
 }
 
+/// The delay before the retry of a timed-out attempt (issue #1809).
+///
+/// The timeout enforcer calls it for a start-to-close or heartbeat timeout.
+/// The rules are those of a handler failure in [`next_retry_delay`]: the
+/// attempt cap, backoff, jitter and `non_retryable_errors` apply. A timeout
+/// carries no `retry_after` hint, so the ceiling is unused.
+///
+/// `None` means the timeout is terminal. A retry policy that does not parse
+/// is terminal too. The worker fails the execution in that case, but the
+/// enforcer only fails the activity, which the workflow can handle.
+pub(crate) fn timeout_retry_delay(task: &TaskQueueItem, error: &str) -> Option<chrono::Duration> {
+    let policy = configured_retry_policy(task)
+        .inspect_err(|e| {
+            tracing::warn!(
+                task_id = %task.id,
+                error = %e,
+                "retry policy does not parse; the activity timeout is terminal"
+            );
+        })
+        .ok()?;
+    next_retry_delay(task, error, policy.as_ref(), Duration::ZERO)
+        .ok()
+        .flatten()
+}
+
 /// Local-activity counterpart to [`next_retry_delay`] (issue #744, Codex
 /// review on PR #1140): resolve the sleep duration for a non-terminal
 /// local-activity retry attempt, honoring `ActivityFailure::retry_after`
@@ -5893,6 +5946,77 @@ async fn reconcile_lost_start(
     }
 }
 
+/// Whether a WASM start marker whose connection was lost committed (issue
+/// #1809).
+///
+/// The commit can land before the connection drops. The marker then says
+/// that the handler started, so the guest must run. Otherwise a later
+/// timeout would count a guest that never ran. The read repeats on a
+/// transient error, as [`reconcile_lost_start`] does.
+///
+/// `Ok(true)` means the claim is current and its start is recorded.
+async fn reconcile_lost_marker(pool: &DbPool, claim: &queue::TaskClaim) -> HarvestResult<bool> {
+    let spacing = crate::pool::retry_spacing(pool);
+    let mut attempt = 1;
+    loop {
+        let started = tokio::time::Instant::now();
+        let read = async {
+            let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+            queue::claim_handler_started(&mut conn, claim).await
+        }
+        .await;
+        match read {
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_transient_db_error(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %claim.task_id,
+                    attempt,
+                    error = %error,
+                    "could not read a lost wasm start marker; trying again"
+                );
+                tokio::time::sleep_until(started + spacing).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Whether a WASM start marker that lost its connection committed (issue
+/// #1809). A failed read answers `false`, so the guest does not start. The
+/// marker then may stay. A later timeout of this claim then counts as
+/// started, which needs both a lost commit and a failed read.
+#[cfg(feature = "wasm-activities")]
+async fn lost_marker_committed(pool: &DbPool, claim: &queue::TaskClaim) -> bool {
+    match reconcile_lost_marker(pool, claim).await {
+        Ok(committed) => committed,
+        Err(error) => {
+            tracing::warn!(
+                task_id = %claim.task_id,
+                error = %error,
+                "could not check whether a lost wasm start marker committed"
+            );
+            false
+        }
+    }
+}
+
+/// Test entry point for [`reconcile_lost_marker`].
+///
+/// # Errors
+///
+/// The read error.
+#[doc(hidden)]
+pub async fn reconcile_lost_marker_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+) -> HarvestResult<bool> {
+    let claim = claim_of_task(task)?;
+    reconcile_lost_marker(pool, &claim).await
+}
+
 /// One read for [`reconcile_lost_start`].
 ///
 /// This claim wrote the start only if an `ActivityStarted` from this worker
@@ -5967,6 +6091,11 @@ async fn read_lost_start(
 /// A lost connection hides whether the start committed. If it did, the
 /// handler must run. A release would add a second start. Returns the
 /// connection when it is still usable.
+///
+/// `handler_runs` is passed to `append_activity_started_if_pending`. The start
+/// marker commits in the same transaction as the start, so a reconciled start
+/// also has its marker (issue #1809).
+#[allow(clippy::too_many_arguments)]
 async fn append_start_or_reconcile(
     pool: &DbPool,
     mut conn: crate::pool::PooledConn,
@@ -5975,6 +6104,7 @@ async fn append_start_or_reconcile(
     activity_name: &str,
     worker_id: &str,
     codecs: &crate::payload_codec::PayloadCodecs,
+    handler_runs: bool,
 ) -> (
     HarvestResult<Option<StartedActivity>>,
     Option<crate::pool::PooledConn>,
@@ -5986,6 +6116,7 @@ async fn append_start_or_reconcile(
         activity_name,
         worker_id,
         codecs,
+        handler_runs,
     )
     .await;
     match started {
@@ -6035,6 +6166,7 @@ pub async fn append_start_for_test(
         activity_name,
         worker_id,
         &crate::payload_codec::PayloadCodecs::default(),
+        true,
     )
     .await;
     started.map(|started| started.is_some())
@@ -6068,6 +6200,9 @@ async fn append_activity_started_if_pending(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Whether the handler runs after this start (issue #1809). A fail-fast
+    // short circuit appends `ActivityStarted` but calls no handler.
+    handler_runs: bool,
 ) -> HarvestResult<Option<StartedActivity>> {
     Box::pin(
         conn.transaction::<Option<StartedActivity>, HarvestError, _>(async |conn| {
@@ -6082,6 +6217,15 @@ async fn append_activity_started_if_pending(
             // start an attempt that a later claim now holds.
             if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
                 return Ok(None);
+            }
+            // This claim starts its handler now (issue #1809). Only such an
+            // attempt can time out against the downstream, so only its
+            // timeout feeds the circuit breaker. A fail-fast short circuit
+            // calls no handler, so it sets no marker.
+            if handler_runs {
+                queue::mark_claim_handler_started(conn, &claim_of_task(task)?)
+                    .await?
+                    .require_applied(task.id)?;
             }
 
             let started_event = WorkflowEvent::ActivityStarted {
@@ -6122,7 +6266,7 @@ pub async fn append_activity_started_for_test(
     worker_id: &str,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<Option<ActivityExecId>> {
-    append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs)
+    append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs, true)
         .await
         .map(|started| started.map(|s| s.activity_id))
 }
@@ -15374,8 +15518,9 @@ pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) 
 /// before the next retry attempt could start (issue #378).
 ///
 /// Pure so both the claim-time snapshot check and the in-transaction fresh
-/// re-check (issue #609 post-review hardening) share one decision rule.
-fn deadline_would_be_exceeded(
+/// re-check (issue #609 post-review hardening) share one decision rule. The
+/// timeout enforcer uses it too (issue #1809).
+pub(crate) fn deadline_would_be_exceeded(
     deadline: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
     retry_delay: chrono::Duration,
@@ -15453,6 +15598,10 @@ enum ScheduleToCloseTimeoutOutcome {
     /// The timeout was recorded — or the task was concurrently resolved by
     /// another writer — so the caller must not requeue.
     Handled,
+    /// A later claim holds the row (issue #1789), so this claim wrote nothing.
+    /// The caller reports a lost lease and must not requeue. The attempt has
+    /// no outcome of its own to report (issues #1809, #1815).
+    ClaimLost,
     /// The row-current deadline is no longer exceeded: a pause/resume cycle
     /// that completed while this attempt was in flight shifted
     /// `schedule_to_close_at` forward by the pause span (issue #609, AC5).
@@ -15467,9 +15616,6 @@ enum ScheduleToCloseTimeoutOutcome {
     /// `PENDING` row is frozen by the claim gate and its deadline is shifted
     /// forward by the pause span on resume.
     ExecutionPaused,
-    /// A peer holds the claim (issues #1789, #1815). Nothing was written, so
-    /// the caller reports a lost lease and does not requeue.
-    ClaimLost,
 }
 
 /// Pure decision rule for the re-check
@@ -16736,23 +16882,27 @@ const DRAIN_BEFORE_START_ERROR: &str = "the handler never started";
 /// matches a later claim. The release skips the retry delay and the attempt
 /// cap, as orphan reclaim does. A deploy must not fail an activity. A lost
 /// claim is a no-op. An applied release counts one enqueued retry in the
-/// metrics, as the normal retry path does. When the handler was never
-/// polled, the release also refunds the attempt's rate-limit debit.
+/// metrics, as the normal retry path does. With `refund_debit`, the release
+/// also refunds the attempt's rate-limit debit: the handler was never
+/// polled, and the debit is still out.
+///
+/// Returns whether the release applied under this claim (issue #1809).
 async fn release_drained_activity(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     payload: &str,
     activity_name: &str,
     metrics: &dyn crate::telemetry::MetricsRecorder,
-    handler_started: bool,
-) -> HarvestResult<()> {
+    refund_debit: bool,
+) -> HarvestResult<bool> {
     let claim = claim_of_task(task)?;
     let message = crate::failure::parse_error_payload_full(payload).message;
     let error = format!("{WORKER_SHUTDOWN_ERROR}: {message}");
     let write =
         queue::requeue_claimed_task_for_retry(conn, &claim, chrono::Duration::zero(), &error)
             .await?;
-    if write == queue::ClaimWrite::Applied {
+    let applied = write == queue::ClaimWrite::Applied;
+    if applied {
         // The release enqueues a retry, as the normal retry path does.
         metrics.record_activity_retried(activity_name, &task.queue_name);
         tracing::info!(
@@ -16765,7 +16915,7 @@ async fn release_drained_activity(
     }
     // No handler call used the rate-limit token, so give it back. As for an
     // unstarted claim, the refund does not depend on the release.
-    if !handler_started
+    if refund_debit
         && let Some(key) = task.rate_limit_key.as_deref()
         && let Err(error) = queue::refund_rate_limit_token(conn, key).await
     {
@@ -16776,7 +16926,7 @@ async fn release_drained_activity(
             "failed to refund the rate-limit token of an attempt that never started"
         );
     }
-    Ok(())
+    Ok(applied)
 }
 
 /// How a running activity's handler ended (issue #1813).
@@ -16900,6 +17050,288 @@ async fn execute_activity_future_with_cancellation(
     }
     .instrument(span)
     .await
+}
+
+/// Releases an admitted half-open probe unless the attempt reports its result
+/// (issue #1809).
+///
+/// `on_dispatch` sets `probe_in_flight`. Only `on_result` or `on_cancelled`
+/// clears it. An early return that calls neither leaves the breaker half-open
+/// for good. Every later dispatch then short-circuits, and in defer mode the
+/// work waits forever. The drop calls `on_cancelled`, which re-arms the
+/// cooldown. A repeat call after an explicit release is a no-op, because the
+/// release bumps the breaker generation.
+struct CircuitProbeGuard<'a> {
+    breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
+    activity_name: &'a str,
+    token: Option<crate::circuit_breaker::DispatchToken>,
+    claim: crate::circuit_breaker::ClaimKey,
+}
+
+impl<'a> CircuitProbeGuard<'a> {
+    /// Also registers the claim as in flight, so the timeout enforcer can
+    /// mark it (issue #1809). The drop ends the claim on every exit.
+    fn new(
+        breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
+        activity_name: &'a str,
+        token: Option<crate::circuit_breaker::DispatchToken>,
+        claim: crate::circuit_breaker::ClaimKey,
+    ) -> Self {
+        if let Some(token) = token {
+            breakers.begin_claim(activity_name, claim, token);
+        }
+        Self {
+            breakers,
+            activity_name,
+            token,
+            claim,
+        }
+    }
+
+    /// The attempt now reports its own outcome to the breaker.
+    const fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for CircuitProbeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.breakers
+                .on_cancelled(self.activity_name, token, std::time::Instant::now());
+        }
+        // A claim that reported is already gone, so this is then a no-op.
+        self.breakers.end_claim(self.activity_name, self.claim);
+    }
+}
+
+/// The metrics of one activity attempt (issues #528, #1809). They record
+/// when this drops, so every exit counts the attempt once. An attempt whose
+/// claim a timeout took, or will take, is counted by the timeout enforcer
+/// instead (see [`settle_attempt`]).
+struct AttemptMetrics<'a> {
+    metrics: &'a dyn crate::telemetry::MetricsRecorder,
+    activity_name: &'a str,
+    queue: &'a str,
+    duration_secs: f64,
+    status: ActivityStatus,
+    /// The error type and the non-retryable flag of a failed attempt.
+    failure: Option<(String, bool)>,
+    counted_by_enforcer: bool,
+}
+
+impl Drop for AttemptMetrics<'_> {
+    fn drop(&mut self) {
+        if self.counted_by_enforcer {
+            return;
+        }
+        self.metrics.record_activity_completed_with_error_type(
+            self.activity_name,
+            self.queue,
+            self.duration_secs,
+            self.status,
+            self.failure
+                .as_ref()
+                .map(|(error_type, _)| error_type.as_str()),
+        );
+        // AC1 (issue #528): single-family attempt counter for success-rate
+        // SLOs. Fires for both outcomes so `completed / (completed + failed)`
+        // is one metric family, the activity-level mirror of
+        // harvest.workflow.terminal.
+        self.metrics
+            .record_activity_attempt(self.activity_name, self.queue, self.status);
+        if let Some((error_type, non_retryable)) = self.failure.as_ref() {
+            // `workflow.type` is empty here: looking it up costs an extra
+            // `harvest_workflow_executions` query per failure. The
+            // `MetricsRecorder` trait docs allow an empty string when the
+            // workflow type is unknown at the call site.
+            self.metrics
+                .record_activity_failed(self.activity_name, "", error_type, *non_retryable);
+        }
+    }
+}
+
+/// Settle the outcome of a result write against the claim's timeout record
+/// (issue #1809).
+///
+/// `applied` is the answer of the write: `Some(false)` when another path
+/// settled the attempt first, and `None` when it failed before ownership was
+/// known. Unless the write applied, the record is read and taken. A record
+/// means that a timeout took this claim. The enforcer then counted the
+/// attempt. Both writes are claim-fenced, so this write did not apply.
+///
+/// Returns the settled `applied` and whether a timeout took the claim.
+async fn settle_result_write(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    applied: Option<bool>,
+) -> (Option<bool>, bool) {
+    if applied == Some(true) {
+        return (applied, false);
+    }
+    let lost_to_timeout = claim_lost_to_timeout(pool, task).await;
+    let settled = if lost_to_timeout {
+        Some(false)
+    } else {
+        applied
+    };
+    (settled, lost_to_timeout)
+}
+
+/// Test entry point for [`settle_result_write`].
+#[doc(hidden)]
+pub async fn settle_result_write_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    applied: Option<bool>,
+) -> (Option<bool>, bool) {
+    settle_result_write(pool, task, applied).await
+}
+
+/// The settled outcome of one attempt's result write (issue #1809).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledAttempt {
+    /// The settled answer of the write, as [`settle_result_write`] gives it.
+    pub applied: Option<bool>,
+    /// A timeout took the claim. The breaker counts it as a timeout.
+    pub lost_to_timeout: bool,
+    /// The timeout enforcer counts the attempt metrics, so the worker does
+    /// not.
+    pub enforcer_counts: bool,
+}
+
+/// Settle a result write, and decide who counts the attempt metrics (issue
+/// #1809).
+///
+/// The enforcer counts a timed-out attempt. A write that failed before it
+/// knew its outcome can leave the claim held. The enforcer then times that
+/// claim out later and counts the attempt. So the worker must not count it
+/// too.
+///
+/// The worker reads whether the claim is held before it reads the timeout
+/// record. A claim held at that read either still runs, or a timeout ended it
+/// since then and left a record. The enforcer counts both. A claim lost
+/// before that read leaves the worker to count, unless the record names it.
+///
+/// When the worker dies first, an orphan reclaim can end the claim instead.
+/// Then no path counts the attempt. That undercounts by one and never counts
+/// twice. A failed read counts as a lost claim, as before.
+async fn settle_attempt(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    applied: Option<bool>,
+) -> SettledAttempt {
+    let held = applied.is_none() && claim_still_held(pool, task).await;
+    let (applied, lost_to_timeout) = settle_result_write(pool, task, applied).await;
+    SettledAttempt {
+        applied,
+        lost_to_timeout,
+        enforcer_counts: lost_to_timeout || held,
+    }
+}
+
+/// Test entry point for [`settle_attempt`].
+#[doc(hidden)]
+pub async fn settle_attempt_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    applied: Option<bool>,
+) -> SettledAttempt {
+    settle_attempt(pool, task, applied).await
+}
+
+/// Whether the claim of `task` is still current, read once with a bounded
+/// acquire (issue #1809). A failed read answers `false`.
+async fn claim_still_held(pool: &DbPool, task: &TaskQueueItem) -> bool {
+    let Some(claim) = queue::TaskClaim::of(task) else {
+        return false;
+    };
+    let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
+        return false;
+    };
+    queue::claim_is_current(&mut conn, &claim)
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether the claim of `task` was lost to the timeout enforcer (issue
+/// #1809). The enforcer records the claim that it timed out. Any other loss
+/// is not a timeout.
+///
+/// The read also removes the record, so call it once per lost claim. Call it
+/// even when the activity has no breaker policy. Otherwise the record stays
+/// on the row until the row goes.
+///
+/// A failed write leaves the record, so a retry is safe. Each try takes a new
+/// connection, with a bounded acquire (issue #1788). If every try fails, the
+/// answer is unknown. The loss then counts as no timeout here, and a warning
+/// says so. The enforcing process counted the timeout in its own breaker.
+async fn claim_lost_to_timeout(pool: &DbPool, task: &TaskQueueItem) -> bool {
+    let Some(started_at) = task.started_at else {
+        return false;
+    };
+    let mut error = match take_timed_out_claim_once(pool, task, started_at).await {
+        Ok(hit) => return hit,
+        Err(error) => error,
+    };
+    for backoff in [Duration::from_millis(50), Duration::from_millis(250)] {
+        tokio::time::sleep(backoff).await;
+        match take_timed_out_claim_once(pool, task, started_at).await {
+            Ok(hit) => return hit,
+            Err(retry_error) => error = retry_error,
+        }
+    }
+    tracing::warn!(
+        task_id = %task.id,
+        error = %error,
+        "could not read the timed-out claim record; the lost claim does not count \
+         against the circuit breaker in this process"
+    );
+    false
+}
+
+/// One try for [`claim_lost_to_timeout`], on a new connection.
+async fn take_timed_out_claim_once(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> HarvestResult<bool> {
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+    queue::take_timed_out_claim(&mut conn, task.id, task.attempt, started_at).await
+}
+
+/// Lower clamp on an open-circuit deferral, so a probe that is due at once
+/// cannot spin the claim loop hot (issue #1809).
+const CIRCUIT_DEFER_MIN: Duration = Duration::from_millis(100);
+/// Upper clamp on an open-circuit deferral (issue #1809). A forced-open
+/// breaker, or a probe in flight, reports no time until the next probe. The
+/// task then checks again at least this often, so it runs soon after a
+/// recovery.
+const CIRCUIT_DEFER_MAX: Duration = Duration::from_secs(30);
+/// Lower bound on a deferral when no probe is scheduled (issue #1809). A
+/// forced-open breaker, or a probe in flight, reports no probe time. The
+/// cooldown then says nothing about when work can run, so a short one must not
+/// set a short poll. Without this bound, a large backlog under a forced-open
+/// breaker is rewritten about ten times a second.
+const CIRCUIT_DEFER_UNSCHEDULED: Duration = Duration::from_secs(5);
+
+/// The delay of a task that an open breaker defers (issue #1809).
+///
+/// The base is the time until the next probe. With no such time, the base is
+/// the cooldown, but at least `CIRCUIT_DEFER_UNSCHEDULED`. The base is clamped
+/// to `[CIRCUIT_DEFER_MIN, CIRCUIT_DEFER_MAX]`. Jitter adds up to a quarter of
+/// the base, so the deferred tasks do not all wake at the same instant.
+fn circuit_defer_delay(
+    retry_after: Option<Duration>,
+    cooldown: Duration,
+    task: &TaskQueueItem,
+) -> chrono::Duration {
+    let base = retry_after
+        .unwrap_or_else(|| cooldown.max(CIRCUIT_DEFER_UNSCHEDULED))
+        .clamp(CIRCUIT_DEFER_MIN, CIRCUIT_DEFER_MAX);
+    let jitter = crate::policy::full_jitter(base / 4, retry_stream_seed(task), task_attempt(task));
+    chrono::Duration::from_std(base + jitter).unwrap_or(chrono::Duration::seconds(1))
 }
 
 /// Fallback defer delay when a rate-limited circuit-breaker activity has no
@@ -17738,6 +18170,38 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::Allow { token } => Some(token),
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
+    // Releases a half-open probe on every early return, `?` included (issue
+    // #1809). In defer mode a leaked probe would defer this activity forever.
+    let claim_key = crate::circuit_breaker::ClaimKey {
+        task_id: task.id,
+        attempt: task.attempt,
+        started_at: task.started_at,
+    };
+    let mut probe_guard =
+        CircuitProbeGuard::new(&circuit_breakers, activity_name, circuit_token, claim_key);
+
+    // Defer mode (issue #1809): an open breaker puts the task back to
+    // PENDING until the next probe. The deferral runs before
+    // ActivityStarted, so it appends no event. A short circuit admits no
+    // probe and reserves no rate-limit token, so there is nothing to undo.
+    if let crate::circuit_breaker::DispatchDecision::ShortCircuit { retry_after, .. } =
+        dispatch_decision
+        && let Some(policy) = activity.circuit_breaker
+        && policy.open_mode == crate::policy::CircuitOpenMode::Defer
+    {
+        let delay = circuit_defer_delay(retry_after, policy.cooldown, task);
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+        match queue::defer_claimed_task_for_open_circuit(&mut conn, &claim_of_task(task)?, delay)
+            .await?
+        {
+            queue::ClaimWrite::Applied => registry
+                .telemetry()
+                .metrics
+                .record_circuit_deferred(activity_name),
+            queue::ClaimWrite::LeaseLost => log_lease_lost(task, "open-circuit deferral"),
+        }
+        return Ok(());
+    }
 
     // Adaptive limit (issue #1836). The claim skips a type at its cap, so
     // this gate catches only a claim that raced past the cap. It runs before
@@ -17914,13 +18378,32 @@ async fn process_activity_task(
         } else {
             (None, None)
         };
+    // The token this dispatch holds (issue #1809): the dispatch debit of a
+    // tracked activity, or the claim debit of an untracked one. Only this
+    // dispatch refunds it, and at most once, so no other path can credit
+    // the same debit again.
+    let own_debit: Option<&str> = debited_key.or_else(|| {
+        task.rate_limit_key
+            .as_deref()
+            .filter(|_| activity.circuit_breaker.is_none())
+    });
+    let own_debit_returned = std::cell::Cell::new(false);
 
     // Setup phase: append ActivityStarted, then drop the connection so the pool
     // slot is free before the handler runs (prevents a deadlock when
     // `run_transactional` needs a second slot while max_size connections are held
     // by concurrent activity tasks). Appended AFTER the rate-limit reservation so
-    // a deferred task never records a start it did not run; serves both the
-    // short-circuit path (start + CircuitOpen failure) and the real-call path.
+    // a deferred task never records a start it did not run. It serves the
+    // fail-fast short-circuit path (start + CircuitOpen failure) and the
+    // real-call path.
+    // A WASM guest starts only after its module resolves, which can wait on
+    // a pool checkout and a fetch (issue #1809). Its start marker is written
+    // then, so a timeout during that local setup does not feed the breaker.
+    #[cfg(feature = "wasm-activities")]
+    let wasm_bound =
+        registry.wasm_binding(activity_name).is_some() && registry.wasm_store().is_some();
+    #[cfg(not(feature = "wasm-activities"))]
+    let wasm_bound = false;
     let started = {
         let conn = match reserved_conn.take() {
             Some(conn) => conn,
@@ -17942,6 +18425,8 @@ async fn process_activity_task(
             activity_name,
             worker_id,
             registry.payload_codecs(),
+            // A short circuit admitted no dispatch token and runs no handler.
+            circuit_token.is_some() && !wasm_bound,
         )
         .await;
         // A transient failure (issue #1788) has not run the handler and wrote
@@ -17993,9 +18478,7 @@ async fn process_activity_task(
             if let Some(token) = circuit_token {
                 circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
             }
-            if circuit_token.is_some()
-                && activity.circuit_breaker.is_some()
-                && let Some(key) = task.rate_limit_key.as_deref()
+            if let Some(key) = own_debit
                 && let Some(conn) = conn.as_mut()
                 && let Err(error) = queue::refund_rate_limit_token(conn, key).await
             {
@@ -18267,61 +18750,138 @@ async fn process_activity_task(
     // RUNNING and can retry) rather than a raw `?` that would strand it. A
     // non-WASM activity takes the native path below byte-for-byte unchanged.
     #[cfg(feature = "wasm-activities")]
-    let wasm_dispatch: Option<crate::wasm_store::WasmDispatch> =
-        match (registry.wasm_binding(activity_name), registry.wasm_store()) {
-            (Some(binding), Some(store)) => {
-                Some(match crate::pool::acquire_within_pool_bound(pool).await {
-                    Ok(mut conn) => {
-                        crate::wasm_store::resolve_wasm_dispatch(
-                            &mut conn,
-                            store,
-                            binding,
-                            activity_name,
-                            wasm_effective_deadline(
-                                task.start_to_close,
-                                activity.default_start_to_close,
-                            ),
-                            // Thread the task cancellation token so a cancelled guest
-                            // is cooperatively interrupted (issue #965 review) within
-                            // ~1 epoch tick, instead of holding a blocking-pool thread
-                            // until its wall-clock ceiling.
-                            Some(cancel.clone()),
-                            // Thread the start-to-close anchor so `invoke` charges the
-                            // whole pre-guest interval — resolution (this checkout +
-                            // active-hash lookup + cold-cache byte fetch) plus compile
-                            // — against the guest deadline, not just compile (issue
-                            // #965 review round 7). `attempt_clock_start` was captured
-                            // above, just before this dispatch resolution began, so it
-                            // APPROXIMATES the start-to-close anchor (issue #965
-                            // review round 10 — it does not equal it). The
-                            // authoritative anchor is `task.started_at`, set at claim,
-                            // and `ActivityStarted` is appended earlier still, so the
-                            // setup between them is not charged to the guest. Under
-                            // pool contention the guest's budget therefore starts
-                            // slightly later than the timeout scanner's. That is
-                            // safe-direction — the scanner fires first, the guest's own
-                            // epoch ceiling still bounds it, and a late result lands on
-                            // an already-terminal task — and it matches native
-                            // activities, which are equally unaware of `started_at`.
-                            attempt_clock_start,
-                        )
-                        .await
-                        // `conn` is dropped at the end of this arm, before the guest runs.
+    let wasm_dispatch: Option<crate::wasm_store::WasmDispatch> = match (
+        registry.wasm_binding(activity_name),
+        registry.wasm_store(),
+    ) {
+        (Some(binding), Some(store)) => {
+            Some(match crate::pool::acquire_within_pool_bound(pool).await {
+                Ok(mut conn) => {
+                    let dispatch = crate::wasm_store::resolve_wasm_dispatch(
+                        &mut conn,
+                        store,
+                        binding,
+                        activity_name,
+                        wasm_effective_deadline(
+                            task.start_to_close,
+                            activity.default_start_to_close,
+                        ),
+                        // Thread the task cancellation token so a cancelled guest
+                        // is cooperatively interrupted (issue #965 review) within
+                        // ~1 epoch tick, instead of holding a blocking-pool thread
+                        // until its wall-clock ceiling.
+                        Some(cancel.clone()),
+                        // Thread the start-to-close anchor so `invoke` charges the
+                        // whole pre-guest interval — resolution (this checkout +
+                        // active-hash lookup + cold-cache byte fetch) plus compile
+                        // — against the guest deadline, not just compile (issue
+                        // #965 review round 7). `attempt_clock_start` was captured
+                        // above, just before this dispatch resolution began, so it
+                        // APPROXIMATES the start-to-close anchor (issue #965
+                        // review round 10 — it does not equal it). The
+                        // authoritative anchor is `task.started_at`, set at claim,
+                        // and `ActivityStarted` is appended earlier still, so the
+                        // setup between them is not charged to the guest. Under
+                        // pool contention the guest's budget therefore starts
+                        // slightly later than the timeout scanner's. That is
+                        // safe-direction — the scanner fires first, the guest's own
+                        // epoch ceiling still bounds it, and a late result lands on
+                        // an already-terminal task — and it matches native
+                        // activities, which are equally unaware of `started_at`.
+                        attempt_clock_start,
+                    )
+                    .await;
+                    // The guest runs next, so its handler starts now (issue
+                    // #1809). The write is fenced by the claim, so it waits for
+                    // a timeout in flight and then changes nothing. A failed
+                    // write only keeps a timeout of this attempt out of the
+                    // breaker.
+                    //
+                    // A lost claim means a timeout or another path already
+                    // settled this attempt, and a retry may own the task. The
+                    // guest then must not start. The attempt ends as a lost
+                    // claim, and every write it tries is fenced.
+                    //
+                    // A failed write leaves the start unrecorded, so a later
+                    // timeout of the guest would feed no breaker. The guest
+                    // does not start then either. The attempt fails as a
+                    // retry, and the cancel keeps it out of the breaker.
+                    //
+                    // A lost connection can hide a committed write. A new
+                    // connection then reads the marker. When it committed,
+                    // the guest runs, as after an applied write.
+                    if matches!(dispatch, crate::wasm_store::WasmDispatch::Invoke(_)) {
+                        match queue::mark_claim_handler_started(&mut conn, &activity_claim).await {
+                            Ok(queue::ClaimWrite::Applied) => dispatch,
+                            Ok(queue::ClaimWrite::LeaseLost) => {
+                                use crate::failure::IntoActivityErrorString as _;
+                                log_lease_lost(task, "wasm handler start marker");
+                                // The guest never runs, so this dispatch's
+                                // debit goes back.
+                                refund_debited_token(&mut conn, own_debit).await;
+                                own_debit_returned.set(true);
+                                cancel.cancel();
+                                crate::wasm_store::WasmDispatch::Fail(
+                                    crate::failure::ActivityFailure::retryable(
+                                        "ClaimLost",
+                                        "the claim was lost before the wasm guest started",
+                                    )
+                                    .into_error_payload(),
+                                )
+                            }
+                            Err(error) => {
+                                use crate::failure::IntoActivityErrorString as _;
+                                // A dead connection holds a pool slot, and the
+                                // read needs one.
+                                let lost = crate::pool::is_connection_lost(&error);
+                                let conn = if lost {
+                                    drop(conn);
+                                    None
+                                } else {
+                                    Some(conn)
+                                };
+                                if lost && lost_marker_committed(pool, &activity_claim).await {
+                                    dispatch
+                                } else {
+                                    tracing::warn!(
+                                        task_id = %task.id,
+                                        error = %error,
+                                        "could not record the wasm handler start; the guest does not start"
+                                    );
+                                    refund_after_start_error(pool, conn, own_debit, &error).await;
+                                    own_debit_returned.set(true);
+                                    cancel.cancel();
+                                    crate::wasm_store::WasmDispatch::Fail(
+                                        crate::failure::ActivityFailure::retryable(
+                                            "ActivityStartNotRecorded",
+                                            format!(
+                                                "could not record the wasm handler start: {error}"
+                                            ),
+                                        )
+                                        .into_error_payload(),
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        dispatch
                     }
-                    Err(e) => {
-                        use crate::failure::IntoActivityErrorString as _;
-                        crate::wasm_store::WasmDispatch::Fail(
+                    // `conn` is dropped at the end of this arm, before the guest runs.
+                }
+                Err(e) => {
+                    use crate::failure::IntoActivityErrorString as _;
+                    crate::wasm_store::WasmDispatch::Fail(
                         crate::failure::ActivityFailure::wasm_module_lookup_failed(format!(
                             "failed to acquire a database connection to resolve the wasm module \
                              for activity '{activity_name}': {e}"
                         ))
                         .into_error_payload(),
                     )
-                    }
-                })
-            }
-            _ => None,
-        };
+                }
+            })
+        }
+        _ => None,
+    };
 
     // A `map_or_else` here would nest the ~50-line WASM-invoke terminal closure
     // inside a closure argument, which is markedly harder to read than the match.
@@ -18520,29 +19080,20 @@ async fn process_activity_task(
             .err()
             .map(|payload| parse_error_payload(payload))
     };
-    telemetry.metrics.record_activity_completed_with_error_type(
+    // The attempt metrics record when this guard drops, after the outcome is
+    // known (issue #1809). A claim lost to a timeout skips them: the timeout
+    // enforcer counted that attempt as failed.
+    let mut attempt_metrics = AttemptMetrics {
+        metrics: telemetry.metrics.as_ref(),
         activity_name,
-        &task.queue_name,
+        queue: &task.queue_name,
         duration_secs,
         status,
-        failure_info.as_ref().map(|(et, _, _)| et.as_str()),
-    );
-    // AC1 (issue #528): single-family attempt counter for success-rate SLOs.
-    // Fires for both outcomes so `completed / (completed + failed)` is one
-    // metric family — the activity-level mirror of harvest.workflow.terminal.
-    telemetry
-        .metrics
-        .record_activity_attempt(activity_name, &task.queue_name, status);
-    if let Some((error_type, non_retryable, _)) = failure_info.as_ref() {
-        // `workflow.type` is intentionally empty here: looking it up requires
-        // an extra `harvest_workflow_executions` query per failure, and the
-        // `MetricsRecorder` trait docs explicitly allow an empty string when
-        // the workflow type is unknown at the call site. Plumbing it through
-        // is tracked as a follow-up.
-        telemetry
-            .metrics
-            .record_activity_failed(activity_name, "", error_type, *non_retryable);
-    }
+        failure: failure_info
+            .as_ref()
+            .map(|(error_type, non_retryable, _)| (error_type.clone(), *non_retryable)),
+        counted_by_enforcer: false,
+    };
     heartbeat_stop.cancel();
     drop(activity_future);
 
@@ -18591,9 +19142,30 @@ async fn process_activity_task(
     // its slot must still be released via `on_cancelled`, or the breaker would
     // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
     // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
+    probe_guard.disarm();
     let circuit_outcome = if was_cancelled {
-        if let Some(token) = circuit_token {
-            circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+        // A drained run still holds its claim here. It settles after its own
+        // write instead, because a timeout can take the claim before it.
+        if let Some(token) = circuit_token
+            && !drained
+        {
+            // The claim watcher cancels on any lost claim (issue #1809). Only a
+            // timeout counts against the downstream. `on_claim_lost` counts
+            // one that another process enforced, and releases the slot of any
+            // other loss.
+            attempt_metrics.counted_by_enforcer = claim_lost_to_timeout(pool, task).await;
+            let lost_to_timeout =
+                attempt_metrics.counted_by_enforcer && circuit_breakers.has_policy(activity_name);
+            if circuit_breakers.on_claim_lost(
+                activity_name,
+                token,
+                claim_key,
+                lost_to_timeout,
+                std::time::Instant::now(),
+            ) == Some(crate::circuit_breaker::CircuitTransition::Tripped)
+            {
+                telemetry.metrics.record_circuit_tripped(activity_name);
+            }
         }
         None
     } else if committed_transactionally {
@@ -18646,21 +19218,56 @@ async fn process_activity_task(
     }
     // `circuit_token` is always `Some` here: the short-circuit path returned
     // early above, so reaching this point means the attempt was dispatched.
-    if let Some(transition) = circuit_token
-        .zip(circuit_outcome)
-        .and_then(|(token, outcome)| {
-            circuit_breakers.on_result(activity_name, outcome, token, std::time::Instant::now())
-        })
-    {
-        match transition {
-            crate::circuit_breaker::CircuitTransition::Tripped => {
-                telemetry.metrics.record_circuit_tripped(activity_name);
-            }
-            crate::circuit_breaker::CircuitTransition::Closed => {
-                telemetry.metrics.record_circuit_closed(activity_name);
+    //
+    // A timeout can requeue the attempt before its handler returns (issue
+    // #1809). The enforcer then marks the claim and counts the timeout. A
+    // late result of that claim must not count again, and a late success must
+    // not clear the failure window. `on_claim_result` checks the mark under
+    // the breaker lock, so the check cannot race the enforcer.
+    //
+    // The report runs after the claim-fenced finalization, and counts only
+    // when this claim wrote the outcome. A timeout enforced first, in this
+    // process or another one, leaves this claim nothing to write. The outcome
+    // is then dropped and only a probe slot is released. Breaker state is per
+    // process, so this write is the one signal every process shares. A
+    // finalization that wins leaves the enforcer nothing to do, so the
+    // attempt counts once.
+    //
+    // `applied` is `Some(true)` when this claim wrote the outcome, and
+    // `Some(false)` when another path settled the attempt first. `None` means
+    // the write failed before ownership was known: a probe slot is released,
+    // and nothing counts as an outcome or a trip.
+    let report_outcome = |applied: Option<bool>, lost_to_timeout: bool| {
+        let now = std::time::Instant::now();
+        if let Some(transition) = circuit_token
+            .zip(circuit_outcome)
+            .and_then(|(token, outcome)| match applied {
+                Some(true) => {
+                    circuit_breakers.on_claim_result(activity_name, outcome, token, claim_key, now)
+                }
+                Some(false) => circuit_breakers.on_claim_lost(
+                    activity_name,
+                    token,
+                    claim_key,
+                    lost_to_timeout,
+                    now,
+                ),
+                None => {
+                    circuit_breakers.on_cancelled(activity_name, token, now);
+                    None
+                }
+            })
+        {
+            match transition {
+                crate::circuit_breaker::CircuitTransition::Tripped => {
+                    telemetry.metrics.record_circuit_tripped(activity_name);
+                }
+                crate::circuit_breaker::CircuitTransition::Closed => {
+                    telemetry.metrics.record_circuit_closed(activity_name);
+                }
             }
         }
-    }
+    };
 
     // Issue #680: a self-committed transactional activity has already sealed its
     // `ActivityCompleted` + task-COMPLETED atomically, so there is nothing left
@@ -18684,6 +19291,7 @@ async fn process_activity_task(
             );
         }
         record_outcome(&Ok(queue::ClaimWrite::Applied));
+        report_outcome(Some(true), false);
         return Ok(());
     }
 
@@ -18698,20 +19306,49 @@ async fn process_activity_task(
     // for an immediate retry (issue #1813). A non-retryable error takes the
     // normal path below. A handler that never started always goes back: a
     // retry policy must not fail an activity that never ran.
+    //
+    // A drained run settles its breaker entry after its own write (issue
+    // #1809). Only that write tells whether a timeout took the claim first.
+    let settle_drained = |applied: Option<bool>| {
+        let breakers = &circuit_breakers;
+        let telemetry = &telemetry;
+        async move {
+            let settled = settle_attempt(pool, task, applied).await;
+            if let Some(token) = circuit_token
+                && breakers.on_claim_lost(
+                    activity_name,
+                    token,
+                    claim_key,
+                    settled.lost_to_timeout && breakers.has_policy(activity_name),
+                    std::time::Instant::now(),
+                ) == Some(crate::circuit_breaker::CircuitTransition::Tripped)
+            {
+                telemetry.metrics.record_circuit_tripped(activity_name);
+            }
+            settled.enforcer_counts
+        }
+    };
     if drained
         && let Err(payload) = &activity_result
         && (!started || !failure_is_non_retryable(payload, retry_policy.as_ref()))
     {
-        let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
-        return release_drained_activity(
-            &mut conn,
-            task,
-            payload,
-            activity_name,
-            registry.telemetry().metrics.as_ref(),
-            started,
-        )
-        .await;
+        let released =
+            match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
+                Ok(mut conn) => {
+                    release_drained_activity(
+                        &mut conn,
+                        task,
+                        payload,
+                        activity_name,
+                        registry.telemetry().metrics.as_ref(),
+                        !started && !own_debit_returned.get(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+        attempt_metrics.counted_by_enforcer = settle_drained(released.as_ref().ok().copied()).await;
+        return released.map(|_| ());
     }
     let attempt = ActivityAttempt {
         task,
@@ -18729,6 +19366,27 @@ async fn process_activity_task(
     )
     .await;
     record_outcome(&finalized);
+    // A failed write still releases an admitted probe, without a trip. A
+    // lost claim counts only when a timeout took it (see `on_claim_lost`).
+    let mut applied = finalized
+        .as_ref()
+        .ok()
+        .map(|write| *write == queue::ClaimWrite::Applied);
+    // A cancelled attempt took its record above, and reports no outcome. A
+    // drained one takes it now, after its write.
+    if drained && circuit_outcome.is_none() {
+        attempt_metrics.counted_by_enforcer = settle_drained(applied).await;
+    }
+    let mut lost_to_timeout = false;
+    if circuit_outcome.is_some() {
+        let settled = settle_attempt(pool, task, applied).await;
+        applied = settled.applied;
+        lost_to_timeout = settled.lost_to_timeout;
+        attempt_metrics.counted_by_enforcer = settled.enforcer_counts;
+    }
+    let lost_to_timeout =
+        applied == Some(false) && lost_to_timeout && circuit_breakers.has_policy(activity_name);
+    report_outcome(applied, lost_to_timeout);
     finalized.map(|_| ())
 }
 
@@ -18851,6 +19509,11 @@ struct ActivityAttempt<'a> {
 /// `activity_result` is already cap-normalized: an oversized `Ok` is a
 /// non-retryable `Err`. So the cap passed to `handle_activity_result` is 0,
 /// which skips a second check.
+///
+/// Returns `true` when this claim wrote the result, as `handle_activity_result`
+/// does (issue #1809). A repeat that finds an earlier try already committed
+/// returns `false`. The breaker then sees a lost claim and only releases a
+/// probe slot. So a repeat can drop one breaker count, but it never adds one.
 async fn write_activity_result(
     pool: &DbPool,
     registry: &HandlerRegistry,
@@ -20237,6 +20900,13 @@ pub async fn fail_execution_on_error<T>(
     // `WorkflowFailed` -- turning a blameless "no decision, release and let
     // the same owner retry" into a real terminal failure.
     if error.terminal_write_claim_ambiguous().is_some() {
+        return Err(error);
+    }
+    // Issue #1822: Postgres aborted the write to break a deadlock or a
+    // serialization conflict. The workload made no error, so pass it
+    // through. The dispatcher resets the task, and the cycle runs again.
+    // This also covers a conflict that outlasts the retries of a wired site.
+    if crate::tx_retry::classify_conflict(&error).is_some() {
         return Err(error);
     }
     fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await?;
@@ -26300,6 +26970,18 @@ async fn process_workflow_task(
             // un-failed); a suspended/simple-terminal persist failure
             // (including this one) propagates so the caller can act on it.
             //
+            // Issue #1822: a deadlock or serialization abort rolled the whole
+            // cycle back. Return the error on every path. The dispatcher then
+            // resets the task to `PENDING`, and replay derives the same decision
+            // again. The persist closure records metrics before it commits, so
+            // an in-place re-run would count them twice.
+            if let Some(conflict) = crate::tx_retry::classify_conflict(&error) {
+                registry.telemetry().metrics.record_db_transaction_retry(
+                    crate::tx_retry::SITE_WORKFLOW_TASK,
+                    conflict.as_str(),
+                );
+                return Err(error);
+            }
             // Issue #946, Codex round-3/round-4 review: `persist_terminal_
             // outcome_commands` calls `create_detached_child_executions`
             // directly, so a `QuotaExceeded` from a detached child's target
@@ -34231,18 +34913,22 @@ impl Worker {
         let circuit_breakers = self.registry.circuit_breakers();
         let exclusions = self.claim_exclusions();
         let claim_started = std::time::Instant::now();
-        let claimed = queue::claim_task_by_id_on_shard(
-            &mut conn,
-            lease.task_id,
-            &self.config.queues,
-            &self.config.worker_id,
-            &self.config.build_id,
-            self.config.priority_aging_secs,
-            circuit_breakers.tracked_activity_names(),
-            &exclusions,
-            shard,
-        )
-        .await;
+        let claimed = self
+            .claim_with_conflict_retry(&mut conn, async |conn| {
+                queue::claim_task_by_id_on_shard(
+                    conn,
+                    lease.task_id,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    self.config.priority_aging_secs,
+                    circuit_breakers.tracked_activity_names(),
+                    &exclusions,
+                    shard,
+                )
+                .await
+            })
+            .await;
         self.record_db_op(DbOp::Claim, shard, claim_started);
 
         match claimed {
@@ -35284,6 +35970,34 @@ impl Worker {
         );
     }
 
+    /// Run one claim transaction and run it again after a conflict abort.
+    ///
+    /// Each claim function opens and commits its own transaction. A
+    /// rolled-back claim leaves its row `PENDING`, so a re-run is safe.
+    /// See [`crate::tx_retry`] (issue #1822).
+    async fn claim_with_conflict_retry<F>(
+        &self,
+        conn: &mut AsyncPgConnection,
+        claim: F,
+    ) -> HarvestResult<Option<TaskQueueItem>>
+    where
+        for<'r> F: AsyncFnMut(&'r mut AsyncPgConnection) -> HarvestResult<Option<TaskQueueItem>>
+            + crate::tx_retry::TxAttempt<
+                &'r mut AsyncPgConnection,
+                HarvestResult<Option<TaskQueueItem>>,
+                Fut: Send,
+            > + Send,
+    {
+        crate::tx_retry::run_with_conflict_retry(
+            conn,
+            crate::tx_retry::SITE_CLAIM,
+            &*self.registry.telemetry().metrics,
+            crate::tx_retry::TxRetryPolicy::DEFAULT,
+            claim,
+        )
+        .await
+    }
+
     /// The activity names that a claim must skip: the names with unmet
     /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
@@ -35392,18 +36106,22 @@ impl Worker {
                 // (typically highest-weight) queue never pays for the rest.
                 let single_queue = [(*queue_name).to_owned()];
                 let claim_started = std::time::Instant::now();
-                let claimed = queue::claim_task_of_kind_on_shard(
-                    &mut conn,
-                    &single_queue,
-                    &self.config.worker_id,
-                    &self.config.build_id,
-                    self.config.priority_aging_secs,
-                    circuit_breaker_activities,
-                    &exclusions,
-                    shard,
-                    kind,
-                )
-                .await;
+                let claimed = self
+                    .claim_with_conflict_retry(&mut conn, async |conn| {
+                        queue::claim_task_of_kind_on_shard(
+                            conn,
+                            &single_queue,
+                            &self.config.worker_id,
+                            &self.config.build_id,
+                            self.config.priority_aging_secs,
+                            circuit_breaker_activities,
+                            &exclusions,
+                            shard,
+                            kind,
+                        )
+                        .await
+                    })
+                    .await;
                 self.record_db_op(DbOp::Claim, shard, claim_started);
                 match claimed {
                     Ok(Some(task)) => {
@@ -35438,18 +36156,22 @@ impl Worker {
 
         // --- Default (unweighted) path: original single ANY($2) query ---
         let claim_started = std::time::Instant::now();
-        let claimed = queue::claim_task_of_kind_on_shard(
-            &mut conn,
-            &self.config.queues,
-            &self.config.worker_id,
-            &self.config.build_id,
-            self.config.priority_aging_secs,
-            circuit_breaker_activities,
-            &exclusions,
-            shard,
-            kind,
-        )
-        .await;
+        let claimed = self
+            .claim_with_conflict_retry(&mut conn, async |conn| {
+                queue::claim_task_of_kind_on_shard(
+                    conn,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    self.config.priority_aging_secs,
+                    circuit_breaker_activities,
+                    &exclusions,
+                    shard,
+                    kind,
+                )
+                .await
+            })
+            .await;
         self.record_db_op(DbOp::Claim, shard, claim_started);
         match claimed {
             Ok(Some(task)) => {
@@ -37020,11 +37742,16 @@ async fn quarantine_workflow_task_timeout_outcome(
 /// a session timeout (issue #1788) no scanner would then find it, and the
 /// orphan reclaimer skips a live worker. Release it too. The handler may
 /// already have run, so the activity can run again. That is the
-/// at-least-once contract a crash gives as well. Another database error is
-/// not released: it may repeat, and a release would skip the retry policy.
+/// at-least-once contract a crash gives as well. A deadlock or serialization
+/// abort is released for the same reason (issue #1822). Postgres rolled the
+/// write back, and `fail_execution_on_error` passes the error through. Another
+/// database error is not released: it may repeat, and a release would skip
+/// the retry policy.
 fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
     task_type == "workflow"
-        || (task_type == "activity" && crate::pool::is_transient_db_error(error))
+        || (task_type == "activity"
+            && (crate::pool::is_transient_db_error(error)
+                || crate::tx_retry::classify_conflict(error).is_some()))
 }
 
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
@@ -38987,6 +39714,23 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
+    /// The cancellation grace has an upper bound (issue #1809). A timed-out
+    /// owner takes its timeout record after the grace. The terminal-task
+    /// janitor keeps that record for at least 7 days, so a longer grace could
+    /// lose it.
+    #[test]
+    fn runtime_config_validate_bounds_the_cancellation_grace() {
+        let mut cfg = default_runtime_config();
+        cfg.cancellation_grace_period = MAX_CANCELLATION_GRACE_PERIOD;
+        assert!(cfg.validate().is_ok());
+        cfg.cancellation_grace_period = MAX_CANCELLATION_GRACE_PERIOD + Duration::from_secs(1);
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cancellation_grace_period"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn runtime_config_validate_rejects_zero_max_slots() {
         let mut cfg = default_runtime_config();
@@ -40589,6 +41333,22 @@ mod tests {
         assert!(!releases_claim_after_error("activity", &other));
         assert!(releases_claim_after_error("workflow", &timeout));
         assert!(releases_claim_after_error("workflow", &other));
+    }
+
+    /// A conflict abort releases an activity claim (issue #1822).
+    ///
+    /// `fail_execution_on_error` passes a conflict through without failing
+    /// the task. Postgres rolled the write back. Without a release, an
+    /// activity with no deadline would stay `RUNNING` under a live worker.
+    #[test]
+    fn a_conflict_abort_releases_an_activity_claim() {
+        let deadlock = crate::error::HarvestError::Database("deadlock detected".into());
+        let serialization = crate::error::HarvestError::Database(
+            "could not serialize access due to concurrent update".into(),
+        );
+        assert!(releases_claim_after_error("activity", &deadlock));
+        assert!(releases_claim_after_error("activity", &serialization));
+        assert!(releases_claim_after_error("workflow", &deadlock));
     }
 
     /// A setup error after `on_dispatch` admitted the half-open probe must
@@ -47883,8 +48643,79 @@ mod tests {
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
             timer_fires_at: None,
+            handler_started_attempt: None,
+            timed_out_claims: None,
+            handler_started_at: None,
             new_start: false,
         }
+    }
+
+    // ── Timeout retries and open-circuit deferral (issue #1809) ────────
+
+    #[test]
+    fn timeout_retry_delay_retries_under_the_attempt_cap() {
+        let mut task = retry_after_test_task(1, 3);
+        task.retry_policy =
+            Some(serde_json::to_value(RetryPolicy::fixed(3, Duration::from_secs(2))).unwrap());
+        let delay = timeout_retry_delay(&task, "timeout: StartToClose for call_api")
+            .expect("attempt 1 of 3 retries");
+        assert!(delay > chrono::Duration::zero());
+        assert!(delay <= chrono::Duration::seconds(2));
+    }
+
+    #[test]
+    fn timeout_retry_delay_is_terminal_at_the_attempt_cap() {
+        let mut task = retry_after_test_task(3, 3);
+        task.retry_policy =
+            Some(serde_json::to_value(RetryPolicy::fixed(3, Duration::from_secs(2))).unwrap());
+        assert_eq!(
+            timeout_retry_delay(&task, "timeout: StartToClose for call_api"),
+            None
+        );
+    }
+
+    #[test]
+    fn timeout_retry_delay_honours_non_retryable_errors() {
+        let error = "timeout: Heartbeat for call_api";
+        let mut policy = RetryPolicy::fixed(3, Duration::from_secs(2));
+        policy.non_retryable_errors = vec![error.to_owned()];
+        let mut task = retry_after_test_task(1, 3);
+        task.retry_policy = Some(serde_json::to_value(policy).unwrap());
+        assert_eq!(timeout_retry_delay(&task, error), None);
+    }
+
+    #[test]
+    fn timeout_retry_delay_is_terminal_for_a_policy_that_does_not_parse() {
+        let mut task = retry_after_test_task(1, 3);
+        task.retry_policy = Some(serde_json::json!({ "max_attempts": "many" }));
+        assert_eq!(
+            timeout_retry_delay(&task, "timeout: StartToClose for call_api"),
+            None
+        );
+    }
+
+    #[test]
+    fn circuit_defer_delay_never_spins_hot() {
+        let task = retry_after_test_task(1, 3);
+        let delay = circuit_defer_delay(Some(Duration::from_millis(1)), Duration::ZERO, &task);
+        assert!(delay >= chrono::Duration::from_std(CIRCUIT_DEFER_MIN).unwrap());
+    }
+
+    #[test]
+    fn circuit_defer_delay_backs_off_when_no_probe_is_scheduled() {
+        // A forced-open breaker, or a probe in flight, reports no probe time.
+        // A short cooldown must not then set a short poll.
+        let task = retry_after_test_task(1, 3);
+        let floor = chrono::Duration::from_std(CIRCUIT_DEFER_UNSCHEDULED).unwrap();
+        for cooldown in [
+            Duration::ZERO,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        ] {
+            assert!(circuit_defer_delay(None, cooldown, &task) >= floor);
+        }
+        let max = chrono::Duration::from_std(CIRCUIT_DEFER_MAX + CIRCUIT_DEFER_MAX / 4).unwrap();
+        assert!(circuit_defer_delay(None, Duration::from_secs(3600), &task) <= max);
     }
 
     #[test]
