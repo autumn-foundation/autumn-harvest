@@ -307,6 +307,7 @@ mod scanner {
             let locked: Option<uuid::Uuid> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
+                .skip_locked()
                 .select(dsl::id)
                 .first(conn)
                 .await
@@ -394,6 +395,7 @@ mod scanner {
             let current: Option<StuckRowState> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
+                .skip_locked()
                 .select((
                     dsl::state,
                     dsl::worker_id,
@@ -736,6 +738,7 @@ mod scanner {
                     let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
                         .find(task_id)
                         .for_update()
+                        .skip_locked()
                         .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
                         .first(conn)
                         .await
@@ -871,6 +874,29 @@ mod scanner {
         Ok(acted)
     }
 
+    /// Turn a session timeout on one row into a skip (issue #1876).
+    ///
+    /// A row lock held by another session can time out a nested lock, for
+    /// example on the owning execution. Postgres cancels only that statement,
+    /// so the pass continues on the same connection. The next pass retries
+    /// the row. Any other error ends the pass.
+    fn skip_on_session_timeout(
+        outcome: HarvestResult<bool>,
+        task: &TaskQueueItem,
+    ) -> HarvestResult<bool> {
+        match outcome {
+            Err(e) if crate::pool::is_session_timeout(&e) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "orphan reclaim skipped a locked task; the next pass retries it"
+                );
+                Ok(false)
+            }
+            other => other,
+        }
+    }
+
     /// Reclaim `RUNNING` tasks orphaned by a dead worker, then (issue #1459)
     /// tasks stuck long past their budget regardless of worker liveness.
     ///
@@ -923,7 +949,7 @@ mod scanner {
             let new_strikes = task.crash_strikes.saturating_add(1);
             match quarantine_decision(new_strikes, threshold) {
                 ReclaimAction::Quarantine => {
-                    if quarantine_orphan(
+                    let outcome = quarantine_orphan(
                         conn,
                         &task,
                         new_strikes,
@@ -931,13 +957,14 @@ mod scanner {
                         metrics,
                         codecs,
                     )
-                    .await?
-                    {
+                    .await;
+                    if skip_on_session_timeout(outcome, &task)? {
                         summary.quarantined += 1;
                     }
                 }
                 ReclaimAction::Requeue => {
-                    if requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await? {
+                    let outcome = requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await;
+                    if skip_on_session_timeout(outcome, &task)? {
                         summary.requeued += 1;
                         // Dispatch hint (issue #1312). The orphan is `PENDING`
                         // again and its inner transaction has committed, so the
@@ -956,7 +983,8 @@ mod scanner {
                 .await
                 .map_err(crate::error::database_error)?;
             for task in stuck {
-                if requeue_stuck_task(conn, &task, stuck_running_secs).await? {
+                let outcome = requeue_stuck_task(conn, &task, stuck_running_secs).await;
+                if skip_on_session_timeout(outcome, &task)? {
                     summary.stuck_requeued += 1;
                     crate::queue::record_pending_hints(conn, &[task.id]).await;
                 }
