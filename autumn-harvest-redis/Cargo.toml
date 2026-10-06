@@ -1,6 +1,6 @@
 [package]
 name = "autumn-harvest-redis"
-description = "Redis Streams task queue adapter for autumn-harvest"
+description = "Redis Streams dispatch channel and standalone task queue for autumn-harvest"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

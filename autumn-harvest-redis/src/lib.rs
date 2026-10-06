@@ -1,25 +1,27 @@
-//! Redis Streams task queue adapter for `autumn-harvest`.
+//! Redis dispatch channel and standalone task queue for `autumn-harvest`.
 //!
-//! This crate provides a high-throughput "escape hatch" for the
-//! `autumn-harvest` workflow engine. The default Postgres-backed queue (using
-//! `SELECT ... FOR UPDATE SKIP LOCKED`) is operationally simple but its
-//! measured claim throughput (`docs/performance.md`) falls well short of the
-//! "ten thousand task claims per second" figure once cited here — see
-//! `docs/assays/0001-redis-adapter-throughput-ceiling.md` for this crate's own
-//! measured standalone throughput and how it compares. Moving the ephemeral
-//! task queue onto Redis Streams raises that ceiling substantially, while
-//! leaving Postgres as the sole source of truth for workflow state and event
-//! history.
+//! The crate has two parts. The worker uses only the first.
+//!
+//! - [`RedisDispatch`] is a dispatch channel for the worker (issue #1312). A
+//!   stream entry carries a task reference only. Postgres keeps every
+//!   `harvest_task_queue` row and stays the source of truth. See *Worker
+//!   integration* below.
+//! - [`RedisTaskQueue`] is a standalone task queue on Redis Streams. The
+//!   worker does not use it. See *Standalone adapter* below.
+//!
+//! The default Postgres queue claims with `SELECT ... FOR UPDATE SKIP LOCKED`.
+//! It is simple to operate, but its claim throughput has a ceiling
+//! (`docs/performance.md`). For the measured throughput of the standalone
+//! adapter, see `docs/assays/0001-redis-adapter-throughput-ceiling.md`.
 //!
 //! ## Scope
 //!
-//! - **In scope**: enqueue, claim, complete, fail, retry-with-delay, heartbeat,
-//!   and visibility-timeout based recovery for the task queue.
-//! - **Out of scope**: workflow state, event history, signals, timers,
-//!   schedules, the DAG runtime. These continue to live on Postgres exactly as
-//!   they do today.
+//! - **The standalone adapter**: enqueue, claim, complete, fail,
+//!   retry-with-delay, heartbeat, and recovery after a visibility timeout.
+//! - **Out of scope for both parts**: workflow state, event history, signals,
+//!   timers, schedules and the DAG runtime. These stay on Postgres.
 //!
-//! ## Usage sketch
+//! ## Standalone usage sketch
 //!
 //! ```no_run
 //! use std::time::Duration;
