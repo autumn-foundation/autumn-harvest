@@ -51,10 +51,30 @@ pub struct CachedWorkflowState {
     pub next_event_id: i32,
 }
 
-/// One cache entry: the event snapshot, and the resident workflow if any.
+/// Stored history bytes for events with `event_id < through` (issue #1804).
+///
+/// The worker keeps this mark with the cache entry. On a cache hit it sums
+/// only the events at or after `through`. This keeps the byte check off the
+/// full history on the warm path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryBytesMark {
+    /// Sum of `pg_column_size(event_data)` below `through`.
+    pub(crate) bytes: u64,
+    /// First event id that `bytes` does not include.
+    pub(crate) through: i32,
+    /// Incremental sums since the last full sum. The worker re-sums the
+    /// full history when this reaches its interval.
+    pub(crate) warm_steps: u32,
+}
+
+/// One cache entry: the event snapshot, the resident workflow if any, and
+/// the stored-history byte mark if any.
 struct CacheEntry {
     state: CachedWorkflowState,
     resident: Option<ResidentWorkflow>,
+    // Only the `db` worker reads the mark.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    history_bytes: Option<HistoryBytesMark>,
 }
 
 /// The entries that [`WorkflowCache::close`] removed (issue #1798).
@@ -164,6 +184,18 @@ impl WorkflowCache {
         state: CachedWorkflowState,
         resident: Option<ResidentWorkflow>,
     ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
+        self.insert_resident_with_history_bytes(exec_id, state, resident, None)
+    }
+
+    /// [`Self::insert_resident`] that also stores the stored-history byte
+    /// mark of the snapshot (issue #1804).
+    pub(crate) fn insert_resident_with_history_bytes(
+        &mut self,
+        exec_id: Uuid,
+        state: CachedWorkflowState,
+        resident: Option<ResidentWorkflow>,
+        history_bytes: Option<HistoryBytesMark>,
+    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
         let resident = resident.filter(|_| self.resident_enabled);
         if self
             .inner
@@ -173,7 +205,14 @@ impl WorkflowCache {
             return Some((state, resident));
         }
         self.inner
-            .push(exec_id, CacheEntry { state, resident })
+            .push(
+                exec_id,
+                CacheEntry {
+                    state,
+                    resident,
+                    history_bytes,
+                },
+            )
             .map(|(_, entry)| (entry.state, entry.resident))
     }
 
@@ -187,9 +226,24 @@ impl WorkflowCache {
         &mut self,
         exec_id: &Uuid,
     ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
+        self.take_with_history_bytes(exec_id)
+            .map(|(state, resident, _)| (state, resident))
+    }
+
+    /// [`Self::take`] that also returns the stored-history byte mark of the
+    /// entry (issue #1804).
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
+    pub(crate) fn take_with_history_bytes(
+        &mut self,
+        exec_id: &Uuid,
+    ) -> Option<(
+        CachedWorkflowState,
+        Option<ResidentWorkflow>,
+        Option<HistoryBytesMark>,
+    )> {
         self.inner
             .pop(exec_id)
-            .map(|entry| (entry.state, entry.resident))
+            .map(|entry| (entry.state, entry.resident, entry.history_bytes))
     }
 
     /// Closes the cache when the worker stops (issue #1798).
@@ -349,6 +403,30 @@ mod tests {
             10
         );
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn cache_keeps_history_bytes_mark_with_its_entry() {
+        // Issue #1804: the byte mark lives and dies with its entry.
+        let mut cache = WorkflowCache::new(5);
+        let id = Uuid::new_v4();
+        let mark = HistoryBytesMark {
+            bytes: 1_234,
+            through: 7,
+            warm_steps: 0,
+        };
+
+        let _ = cache.insert_resident_with_history_bytes(id, make_state(7), None, Some(mark));
+        let (_, _, taken) = cache.take_with_history_bytes(&id).expect("entry");
+        assert_eq!(taken, Some(mark), "the take returns the mark");
+        assert!(
+            cache.take_with_history_bytes(&id).is_none(),
+            "the take removes the entry"
+        );
+
+        cache.insert(id, make_state(8));
+        let (_, _, taken) = cache.take_with_history_bytes(&id).expect("entry");
+        assert_eq!(taken, None, "a plain insert stores no mark");
     }
 
     #[test]
