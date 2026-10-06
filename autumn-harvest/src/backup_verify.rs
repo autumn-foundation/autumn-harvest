@@ -1906,6 +1906,8 @@ mod probes {
         // in two cohorts both commit. ADR 0004 records the decision to detect
         // this, not to prevent it. The flat layout's constraint makes the
         // state impossible, so the probe runs on the partitioned layout only.
+        // Orphan rows of a retained execution wait for the partition sweeper.
+        // No run can replay them, so the probe skips them.
         if layout.is_some_and(|l| l.is_partitioned()) {
             dangling.push((
                 FindingClass::DuplicateEventId,
@@ -1913,7 +1915,9 @@ mod probes {
                     "SELECT DISTINCT dup.workflow_exec_id AS id FROM ( \
                          SELECT ev.workflow_exec_id FROM harvest_events ev \
                           GROUP BY ev.workflow_exec_id, ev.event_id \
-                         HAVING COUNT(*) > 1) dup",
+                         HAVING COUNT(*) > 1) dup \
+                      WHERE EXISTS (SELECT 1 FROM harvest_workflow_executions e \
+                                     WHERE e.id = dup.workflow_exec_id)",
                     "sub.id::text",
                     limit,
                 ),

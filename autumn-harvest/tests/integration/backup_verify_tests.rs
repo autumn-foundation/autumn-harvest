@@ -3253,4 +3253,17 @@ async fn detects_a_duplicate_event_id_on_the_partitioned_layout() {
     );
     assert_eq!(report.status, VerifyStatus::Incoherent);
     assert_eq!(report.exit_code(), 1, "a duplicate history fails the drill");
+
+    // Retention deletes the execution and leaves its rows for the partition
+    // sweeper. No run can replay an orphan history, so it is not reported.
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("retain the execution");
+    let retained = verify_restore(&one_shard(&url), &opts(), &WorkflowReplayer::new()).await;
+    assert!(
+        !retained.detected(FindingClass::DuplicateEventId),
+        "orphan rows of a retained execution are not a finding: {retained:#?}"
+    );
 }

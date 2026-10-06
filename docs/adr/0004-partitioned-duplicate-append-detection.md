@@ -43,6 +43,8 @@ Issue #1839 asks for one of two choices: fix it, or detect it.
 severity `incoherent`. The probe runs on the partitioned layout only. On the
 flat layout the unique constraint makes a duplicate impossible. When the
 layout is unknown, the probe does not run and the shard is `undetermined`.
+The probe skips the orphan rows of a retained execution. The partition
+sweeper reclaims them, and no run can replay them.
 
 ## Consequences
 
