@@ -1793,8 +1793,8 @@ randomized- and model-checking-based testing layers, and CI run coverage:
   deterministic simulation of the activity claim protocol, with a Postgres
   differential test (issue #1830).
 * [`docs/testing/ci-db-suite-allowlist.md`](testing/ci-db-suite-allowlist.md)
-  — the DB suites that CI does not run from the manifest, each with an owner
-  or a reason (issue #1799).
+  — the DB suites that CI does not run from the manifest, each with a
+  reason, and an owner for debt (issue #1799).
 
 ---
 

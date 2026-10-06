@@ -1,9 +1,10 @@
 ## Fix — wire the remaining DB suites into CI and track the rest (issue #1799)
 
 49 more DB suites now have `linux` manifest rows: 27 core suites and 22 plugin
-suites. Before this change, CI compiled them but never ran them. Three core
+suites. Before this change, CI compiled them but never ran them. Four core
 rows need `testing`: `replay_canary_tests`, `scheduled_time_tests` and
-`scheduler_carryover_tests`.
+`scheduler_carryover_tests` are gated on it, and one
+`transactional_activity_tests` test is too.
 
 Four suites failed against Docker Postgres. Each failure was in the test, not
 in the engine:
@@ -24,6 +25,13 @@ entries run elsewhere or by hand by design. Two are debt, tracked in #1959.
 
 New page `docs/testing/ci-db-suite-allowlist.md` lists each entry with an
 owner or a "won't wire" reason. A new guard test compares it with
-`ALLOWLIST`, so the two cannot drift.
+`ALLOWLIST`, so the two cannot drift. A reason that the guard does not list
+as "by design" counts as debt and needs an owner.
+
+Tests: every wired suite passed locally against Docker Postgres with
+`--test-threads=1`. The four fixed suites: `child_policy_tests` 19/19,
+`scheduled_time_tests` 4/4, `dag_retry_integration` 12/12 and
+`schedule_update_integration` 15/15. The `ci_run_coverage` and
+`migration_hygiene` guards pass.
 
 No migration, no route change, and no `harvest_events` change.

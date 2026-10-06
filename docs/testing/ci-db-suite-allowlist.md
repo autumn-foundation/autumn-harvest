@@ -22,8 +22,8 @@ compares this table with `ALLOWLIST`. Change both in the same commit.
   its row here, and lower `ALLOWLIST_MAX_LEN` by one.
 - To add an entry, raise `ALLOWLIST_MAX_LEN` and add a row here, in the same
   change. Give the reason in both places.
-- A debt entry needs an owner. Its reason in the code must be in
-  `DEBT_REASONS`.
+- A debt entry needs an owner. A reason that `BY_DESIGN_REASONS` does not
+  list is debt, so the guard asks for an owner.
 
 ## Table
 
@@ -35,5 +35,5 @@ compares this table with `ALLOWLIST`. Change both in the same commit.
 | `plugin:connector_kafka_broker` | won't wire | Runs in CI from its own Linux step in `ci.yml` (issue #944). The step installs `librdkafka` build dependencies first. |
 | `plugin:mcp_tools_integration` | @madmax983 (#1959) | All tests are `#[ignore]`d, and the manifest row is `compileonly`. |
 | `plugin:outbox_start_relay_perf` | won't wire | Manual `pg_stat_statements` evidence (issue #1620). Run it by hand, as `docs/performance-outbox-start-relay.md` tells. |
-| `plugin:webhook_durable_integration` | @madmax983 (#1959) | All tests are `#[ignore]`d, and no row enables `webhooks`. The test hangs on a current-thread runtime. |
+| `plugin:webhook_durable_integration` | @madmax983 (#1959) | All tests are `#[ignore]`d, and no row enables `webhooks`. On a current-thread runtime the test hangs, as `webhook_receiver_integration` did before its fix. |
 <!-- allowlist-tracking:end -->

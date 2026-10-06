@@ -164,7 +164,8 @@ fn is_db_harness_only(source: &str) -> bool {
 // Issue #1799 wired every suite that passes against Docker Postgres. What is
 // left is either debt with an owner, or a suite that CI does not run by
 // design. `docs/testing/ci-db-suite-allowlist.md` lists each entry with its
-// owner. A debt reason must be in `DEBT_REASONS`.
+// owner. A reason that `BY_DESIGN_REASONS` does not list is debt. An entry
+// that a covering row makes stale must go.
 // This guard PROVED it bites: during development `nd_block_tests` was left
 // out and the guard failed naming it (the TDD red step).
 
@@ -768,8 +769,9 @@ fn claim_bench_support_is_classified_as_a_harness_not_a_suite() {
 
 /// Core suites that issue #1799 wired, with the features each row needs.
 ///
-/// The first five are the resilience suites the issue names. The rest are
-/// the second batch. Each must have a covering row and no allowlist entry.
+/// The first four are resilience suites the issue names. The fifth,
+/// `erase_payloads_integration`, is in [`ISSUE_1799_PLUGIN`]. The other 27
+/// are the second batch. Each must have a covering row and no allowlist entry.
 const ISSUE_1799_CORE: &[(&str, &[&str])] = &[
     ("scheduler_ha_tests", &[]),
     ("poison_pill_tests", &[]),
@@ -799,7 +801,7 @@ const ISSUE_1799_CORE: &[(&str, &[&str])] = &[
     ("sticky_routing_tests", &[]),
     ("telemetry_span_tests", &[]),
     ("throttle_tests", &[]),
-    ("transactional_activity_tests", &[]),
+    ("transactional_activity_tests", &["testing"]),
     ("typed_stubs_tests", &[]),
     ("updt_with_start_tests", &[]),
 ];
@@ -831,8 +833,9 @@ const ISSUE_1799_PLUGIN: &[&str] = &[
     "workflow_result_integration",
 ];
 
-/// The suites that issue #1799 wired must keep a covering row. Removing one
-/// would put it back on the allowlist and raise the cap, which review sees.
+/// The suites that issue #1799 wired must keep a covering row. Removing a row
+/// fails this test. To move a suite back to the allowlist, also edit this
+/// list, so review sees it.
 #[test]
 fn issue_1799_suites_have_covering_rows() {
     let rows = parse_manifest();
@@ -1149,16 +1152,18 @@ const TRACKING_DOC: &str = include_str!("../../../docs/testing/ci-db-suite-allow
 /// The owner value of a suite that CI does not run by design.
 const WONT_WIRE: &str = "won't wire";
 
-/// Reasons that mark an entry as debt to wire. Every other reason marks a
-/// suite that CI does not run by design.
-const DEBT_REASONS: &[&str] = &[
-    ALLOWLIST_MCP_IGNORED_REASON,
-    ALLOWLIST_WEBHOOKS_IGNORED_REASON,
+/// Reasons that mark a suite that CI does not run by design. Every other
+/// reason is debt, so a new reason needs an owner until it is listed here.
+const BY_DESIGN_REASONS: &[&str] = &[
+    ALLOWLIST_EVIDENCE_HARNESS_REASON,
+    ALLOWLIST_CHAOS_REASON,
+    ALLOWLIST_KAFKA_BROKER_REASON,
+    ALLOWLIST_PERF_EVIDENCE_REASON,
 ];
 
 /// True when an allowlist entry with `reason` is debt that needs an owner.
 fn entry_is_debt(reason: &str) -> bool {
-    DEBT_REASONS.contains(&reason)
+    !BY_DESIGN_REASONS.contains(&reason)
 }
 
 /// One table row: the suite key, the owner and the reason.
@@ -1178,6 +1183,7 @@ fn parse_tracking_table(doc: &str) -> Vec<TrackingRow> {
         .expect("the tracking doc must have an end marker");
     doc[begin..end]
         .lines()
+        .map(str::trim)
         .filter(|l| l.starts_with("| `"))
         .map(|l| {
             let cols: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
@@ -1192,10 +1198,22 @@ fn parse_tracking_table(doc: &str) -> Vec<TrackingRow> {
 }
 
 /// True when `owner` names a person (`@login`) or a tracking issue (`#123`).
+/// A cell that says [`WONT_WIRE`] names no owner.
 fn names_an_owner(owner: &str) -> bool {
-    owner
-        .split_whitespace()
-        .any(|w| w.starts_with('@') || w.starts_with('#'))
+    let is_login = |w: &str| {
+        w.strip_prefix('@').is_some_and(|l| {
+            !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    };
+    let is_issue = |w: &str| {
+        w.strip_prefix('#')
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    !owner.contains(WONT_WIRE)
+        && owner
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| matches!(c, '(' | ')' | ',')))
+            .any(|w| is_login(w) || is_issue(w))
 }
 
 /// Issue #1799 asks for a table of the remaining suites. Each row has an
@@ -1265,7 +1283,7 @@ fn names_an_owner_needs_a_login_or_an_issue_number() {
 }
 
 /// A new reason is debt until it is listed as by design. A forgotten list
-/// edit then asks for an owner, not for "won't wire".
+/// edit then asks for an owner, not for [`WONT_WIRE`].
 #[test]
 fn a_new_reason_counts_as_debt() {
     assert!(entry_is_debt("a reason that no list names"));

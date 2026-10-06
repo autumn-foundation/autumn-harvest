@@ -41,8 +41,10 @@ use uuid::Uuid;
 
 /// The full schema, without `harvest_start_throttle`.
 ///
-/// The tick probes `to_regclass('harvest_start_throttle')` and reads a missing
-/// table as "no pending throttled starts". The drop keeps that path under test.
+/// The tick and `GET /admin/schedules` probe
+/// `to_regclass('harvest_start_throttle')` and read a missing table as "no
+/// pending throttled starts". The drop keeps that path under test. Other
+/// throttle paths need the table, but this suite does not reach them.
 /// The hand-rolled bundle this replaces drifted (issue #1799): it had no
 /// `quota_key` column, so the worker never claimed a task.
 fn init_sql() -> String {
@@ -65,6 +67,15 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    // The `to_regclass` path is under test only while the table is absent.
+    let mut conn = connect(&url).await;
+    let present: bool = diesel::select(diesel::dsl::sql::<diesel::sql_types::Bool>(
+        "to_regclass('harvest_start_throttle') IS NOT NULL",
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("probe harvest_start_throttle");
+    assert!(!present, "init_sql must drop harvest_start_throttle");
     (url, container)
 }
 
