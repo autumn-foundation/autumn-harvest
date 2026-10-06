@@ -470,6 +470,10 @@ async fn upsert_build_policy_with_ramp_id(
                  ramp_id = CASE WHEN harvest_build_policies.target_build_id IS NULL THEN NULL \
                                 WHEN {aborted} THEN NULL \
                                 ELSE {derived} END, \
+                 ramp_caller_id = CASE \
+                                WHEN harvest_build_policies.target_build_id IS NULL THEN NULL \
+                                WHEN {aborted} THEN NULL \
+                                ELSE $5 END, \
                  updated_at = NOW() \
              WHERE harvest_build_policies.target_build_id IS NULL \
                 OR harvest_build_policies.ramp_id IS DISTINCT FROM {derived} \
@@ -621,12 +625,14 @@ async fn update_build_ramp_with_id(
     let aborted = generation_aborted_sql(&derived);
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "UPDATE harvest_build_policies \
-         SET target_build_id = $2, ramp_percent = $3, ramp_id = {derived}, updated_at = NOW() \
+         SET target_build_id = $2, ramp_percent = $3, ramp_id = {derived}, \
+             ramp_caller_id = $4, updated_at = NOW() \
          WHERE queue_name = $1 \
            AND (ramp_id IS DISTINCT FROM {derived} \
                 OR target_build_id IS DISTINCT FROM $2 \
                 OR ramp_percent IS DISTINCT FROM $3) \
            AND NOT {aborted} \
+           AND NOT EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x WHERE x.ramp_id = $4) \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
@@ -649,7 +655,7 @@ async fn update_build_ramp_with_id(
         ))
     })?;
     let stored = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
-    if ramp_generation_aborted(conn, queue_name, &[stored]).await? {
+    if ramp_generation_aborted(conn, queue_name, &[stored, ramp_id]).await? {
         return Err(aborted_generation_error(queue_name, target_build_id));
     }
     Ok(policy)
@@ -685,55 +691,65 @@ pub async fn lock_ramp_generations(
     Ok(())
 }
 
-/// The `ramp_id` that the row of `queue_name` holds, locked for the write.
+/// The ids of the ramp of `queue_name`, locked for the write: the stored
+/// `ramp_id` and the `ramp_caller_id` of the request that set it.
 #[cfg(feature = "db")]
 async fn current_ramp_id(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
-) -> HarvestResult<Option<Uuid>> {
+) -> HarvestResult<[Option<Uuid>; 2]> {
     use diesel::OptionalExtension;
+    use diesel::sql_types::{Nullable, Uuid as SqlUuid};
 
     #[derive(diesel::QueryableByName)]
     struct Row {
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        #[diesel(sql_type = Nullable<SqlUuid>)]
         ramp_id: Option<Uuid>,
+        #[diesel(sql_type = Nullable<SqlUuid>)]
+        ramp_caller_id: Option<Uuid>,
     }
     let row: Option<Row> = diesel::sql_query(
-        "SELECT ramp_id FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE",
+        "SELECT ramp_id, ramp_caller_id FROM harvest_build_policies \
+         WHERE queue_name = $1 FOR UPDATE",
     )
     .bind::<diesel::sql_types::Text, _>(queue_name)
     .get_result(conn)
     .await
     .optional()
     .map_err(database_error)?;
-    Ok(row.and_then(|row| row.ramp_id))
+    Ok(row.map_or([None, None], |row| [row.ramp_id, row.ramp_caller_id]))
 }
 
-/// Record `old` as retired when a write replaced it with `new` (issue
-/// #1814). A later write of `old` is then refused, so a stale retry of the
-/// request that set it cannot undo the change.
+/// Record each id of `old` as retired when a write replaced it (issue
+/// #1814). `old` and `new` hold the stored `ramp_id` and the
+/// `ramp_caller_id`. A later write of a retired id is refused, so a stale
+/// retry of the request that set it cannot undo the change. The caller id
+/// does not depend on the base, so a retry is refused after a base change
+/// too.
 #[cfg(feature = "db")]
 async fn retire_replaced_ramp_id(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
-    old: Option<Uuid>,
-    new: Option<Uuid>,
+    old: [Option<Uuid>; 2],
+    new: [Option<Uuid>; 2],
 ) -> HarvestResult<()> {
-    let Some(old) = old else {
-        return Ok(());
-    };
-    if new == Some(old) {
-        return Ok(());
+    for (old, new) in old.into_iter().zip(new) {
+        let Some(old) = old else {
+            continue;
+        };
+        if new == Some(old) {
+            continue;
+        }
+        diesel::sql_query(
+            "INSERT INTO harvest_ramp_retired_ids (ramp_id, queue_name) VALUES ($1, $2) \
+             ON CONFLICT (ramp_id) DO NOTHING",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(old)
+        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
     }
-    diesel::sql_query(
-        "INSERT INTO harvest_ramp_retired_ids (ramp_id, queue_name) VALUES ($1, $2) \
-         ON CONFLICT (ramp_id) DO NOTHING",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(old)
-    .bind::<diesel::sql_types::Text, _>(queue_name)
-    .execute(conn)
-    .await
-    .map_err(database_error)?;
     Ok(())
 }
 
@@ -837,7 +853,7 @@ pub async fn clear_build_ramp(
         let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
             "UPDATE harvest_build_policies \
              SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, \
-                 updated_at = NOW() \
+                 ramp_caller_id = NULL, updated_at = NOW() \
              WHERE queue_name = $1 \
              RETURNING {BUILD_POLICY_COLUMNS}"
         ))
@@ -845,7 +861,7 @@ pub async fn clear_build_ramp(
         .load(conn)
         .await
         .map_err(database_error)?;
-        retire_replaced_ramp_id(conn, queue_name, old, None).await?;
+        retire_replaced_ramp_id(conn, queue_name, old, [None, None]).await?;
         Ok(rows.into_iter().next().map(BuildPolicy::from))
     })
     .await

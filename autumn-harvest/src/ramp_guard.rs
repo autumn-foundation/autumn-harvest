@@ -427,7 +427,8 @@ pub const fn abort_ramp_query() -> &'static str {
                  'reported', false, \
                  'at', (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)) \
                  || ramp_aborted, \
-         ramp_id = NULL, target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
+         ramp_id = NULL, ramp_caller_id = NULL, target_build_id = NULL, ramp_percent = NULL, \
+         updated_at = NOW() \
      WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
        AND updated_at = $4 \
      RETURNING (ramp_aborted -> 0 ->> 'id')::uuid AS marker_id"
@@ -1249,7 +1250,7 @@ async fn record_abort_tombstones(
             let cleared = diesel::sql_query(
                 "UPDATE harvest_build_policies \
                  SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, \
-                     updated_at = NOW() \
+                     ramp_caller_id = NULL, updated_at = NOW() \
                  WHERE queue_name = $1 AND ramp_id = ANY($2::uuid[])",
             )
             .bind::<Text, _>(queue)

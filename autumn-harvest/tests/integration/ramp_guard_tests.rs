@@ -2123,6 +2123,37 @@ async fn a_ramp_write_does_not_restore_a_superseded_ramp() {
     assert_eq!(policy.ramp_percent, Some(50), "the operator ramp stays");
 }
 
+/// A base change re-ids a kept ramp (issue #1814). A late retry of the
+/// first ramp request then derives another stored id from the new base.
+/// The writer retires the request's own id too, so the retry is still
+/// refused and cannot overwrite a newer ramp.
+#[tokio::test]
+async fn a_ramp_retry_after_a_base_change_is_refused() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let first = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, first).await;
+    // A policy fan-out moves the base and keeps the ramp.
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, uuid::Uuid::new_v4())
+        .await
+        .expect("base change");
+    // The operator then sets a newer ramp.
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, 50, uuid::Uuid::new_v4())
+        .await
+        .expect("operator ramp");
+
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, first).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "a retry after a base change is refused: {retry:?}"
+    );
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert_eq!(policy.ramp_percent, Some(50), "the operator ramp stays");
+}
+
 /// A guard can stop after its clear commits and before its report. A later
 /// pass reports that abort once, from the marker, after the report grace.
 #[tokio::test]

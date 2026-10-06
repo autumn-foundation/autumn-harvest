@@ -295,6 +295,11 @@ The guard fails safe: when it cannot read, it does not abort.
   the `ramp_id` that they remove in `harvest_ramp_retired_ids`, on that
   pool. A late retry of the request that set that id gets `409 Conflict`,
   by the same checks as an aborted id.
+- The pool also keeps the request's own id in
+  `harvest_build_policies.ramp_caller_id`. The stored `ramp_id` mixes in
+  the base build, so a base change alone gives a new stored id. The
+  writer retires the old request id too, so a retry after a base change
+  is refused all the same.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported, older than `report_grace`, and whose ramp no

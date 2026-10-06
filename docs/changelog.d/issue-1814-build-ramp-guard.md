@@ -63,7 +63,8 @@ clears a stale `ramp_id`. Migration
 `harvest_ramp_abort_reports`, which makes each abort report exactly-once.
 Migration `20261006141121_harvest_ramp_retired_ids` adds
 `harvest_ramp_retired_ids`, which records the `ramp_id` that a ramp write or
-a manual clear removes. None migrates data, adds a `WorkflowEvent` variant or affects replay.
+a manual clear removes, and the column `harvest_build_policies.ramp_caller_id`.
+None migrates data, adds a `WorkflowEvent` variant or affects replay.
 
 `build_id` label: five families now carry the build of the worker that ran
 the task. They are `harvest.workflow.terminal`, `harvest.activity.attempts`,

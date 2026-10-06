@@ -48165,7 +48165,7 @@ async fn refuse_aborted_ramp(
             continue;
         };
         let generation = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
-        if ramp_generation_aborted(&mut conn, queue_name, &[generation])
+        if ramp_generation_aborted(&mut conn, queue_name, &[generation, ramp_id])
             .await
             .map_err(|e| unchecked(shard_id, &e))?
         {
@@ -48173,6 +48173,7 @@ async fn refuse_aborted_ramp(
         }
         generations.push(generation);
     }
+    generations.push(ramp_id);
     let mut conn = acquire_conn(pool.default_pool())
         .await
         .map_err(axum::response::IntoResponse::into_response)?;
