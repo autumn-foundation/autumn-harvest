@@ -268,6 +268,9 @@ async fn insert_event_rows(
 /// one, and the boundary must not change its `last_event_type`. So the
 /// `event_count` of that notification does not count the boundary.
 ///
+/// `running_cap` is the event hard cap when the run stays running. The
+/// boundary is skipped when it would bring the history to that cap.
+///
 /// Returns `true` when it appended the boundary.
 ///
 /// # Errors
@@ -278,11 +281,21 @@ pub(crate) async fn append_decision_boundary(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     decision_start: i32,
+    running_cap: Option<u64>,
     boundary: &WorkflowEvent,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     let next_id = next_event_id_for(conn, exec_id).await?;
     if next_id <= decision_start {
+        return Ok(false);
+    }
+    // A boundary never brings a running history to its hard cap. The cap
+    // check counts rows before persistence, so it cannot foresee every row.
+    // A grant after a busy mutex frees is one example. Such a row can leave
+    // room for the decision but not for its boundary. That decision then
+    // has no boundary.
+    let after = u64::try_from(next_id).unwrap_or(0).saturating_add(1);
+    if running_cap.is_some_and(|cap| after >= cap) {
         return Ok(false);
     }
     let rows = events_to_insert_rows_from_with_codecs(

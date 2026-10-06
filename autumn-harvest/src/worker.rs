@@ -19759,12 +19759,14 @@ async fn mutex_acquire_would_grant(
 /// follows only when a row exists at or past `decision_start`. A decision
 /// that writes none gets no boundary, even when another writer appended
 /// meanwhile.
+#[allow(clippy::too_many_arguments)]
 async fn record_decision_boundary(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     exec_id: ExecutionId,
     decision_start: i32,
     appends: bool,
+    stays_running: bool,
     worker_id: &str,
     build_id: &str,
 ) -> HarvestResult<()> {
@@ -19775,10 +19777,15 @@ async fn record_decision_boundary(
         build_id: crate::types::BuildId::new(build_id),
         worker_id: crate::types::WorkerId::new(worker_id),
     };
+    let running_cap = registry
+        .history_policy()
+        .event_hard_cap()
+        .filter(|_| stays_running);
     store::append_decision_boundary(
         conn,
         exec_id,
         decision_start,
+        running_cap,
         &boundary,
         registry.payload_codecs(),
     )
@@ -24883,6 +24890,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         decision_start_event_id,
                         next_event_id > decision_start_event_id,
+                        true,
                         worker_id,
                         build_id,
                     )
@@ -25601,6 +25609,7 @@ async fn process_workflow_task(
                     prepared.exec_id,
                     decision_start_event_id,
                     inline_appends,
+                    true,
                     worker_id,
                     build_id,
                 )
@@ -25686,6 +25695,7 @@ async fn process_workflow_task(
                 prepared.exec_id,
                 boundary_floor,
                 decision_appends,
+                stays_running,
                 worker_id,
                 build_id,
             )

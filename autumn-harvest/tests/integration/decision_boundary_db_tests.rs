@@ -131,6 +131,39 @@ async fn boundary_mutex_plain(
     Ok(serde_json::json!("acquired"))
 }
 
+/// The database a run writes a foreign row through, and whether it did so.
+static LATE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LATE_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Appends one row as another writer on its first run, then takes the free
+/// mutex in `key`.
+///
+/// The cap check counts the loaded history only. The foreign row lands
+/// after that count. The grant takes its event id at write time, so it
+/// lands after the foreign row instead of colliding with it.
+#[workflow]
+async fn boundary_late_row(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if let Some(url) = LATE_URL.get()
+        && !LATE_SENT.swap(true, Ordering::SeqCst)
+    {
+        let mut conn = connect(url).await;
+        let foreign = WorkflowEvent::DecisionCommitted {
+            build_id: autumn_harvest::types::BuildId::new(BUILD_ID),
+            worker_id: autumn_harvest::types::WorkerId::new(FOREIGN_WORKER),
+        };
+        store::append_events(&mut conn, ctx.info().execution_id, &[foreign], 1)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let key = input["key"].as_str().unwrap_or("k").to_string();
+    let guard = ctx.mutex(key).acquire().await.map_err(|e| e.to_string())?;
+    guard.release();
+    Ok(serde_json::json!("done"))
+}
+
 /// The database the run pauses itself through, and whether it did so.
 static PAUSE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PAUSE_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -211,6 +244,7 @@ fn registry(policy: WorkflowHistoryPolicy, decisions: Arc<DecisionCount>) -> Arc
                 boundary_mutex_waiter_info(),
                 boundary_pause_inline_info(),
                 boundary_mutex_plain_info(),
+                boundary_late_row_info(),
             ],
             activities![boundary_step],
             autumn_harvest::context::empty_shared_state(),
@@ -660,6 +694,49 @@ async fn a_granted_acquire_reserves_its_boundary_against_the_cap() {
         !type_names(&events).contains(&"MutexGranted"),
         "the cap must fail the run before the grant: {:?}",
         type_names(&events)
+    );
+}
+
+#[tokio::test]
+async fn a_boundary_never_brings_a_running_history_to_the_cap() {
+    // The cap check counts 1 loaded event, the grant and its boundary, so 3
+    // under cap 4. A foreign row then lands before persistence, and the
+    // grant follows it. A boundary would make 4 rows while the run still
+    // runs. The boundary write sees the real count and skips the boundary.
+    // Without that, the next decision loads 4 rows and the cap fails it.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("laterow");
+    let key = format!("k1833-{}", Uuid::new_v4().simple());
+    let policy = boundaries_on().with_event_hard_cap(4);
+    let running = Running::start(&queue, &pool, policy);
+    LATE_URL.set(url.clone()).expect("one test sets the URL");
+    let mut conn = connect(&url).await;
+    let exec_id = seed(
+        &mut conn,
+        "boundary_late_row",
+        &queue,
+        serde_json::json!({ "key": key }),
+    )
+    .await;
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+    running.stop().await;
+
+    let events = history(&url, exec_id).await;
+    let names = type_names(&events);
+    let grant = names
+        .iter()
+        .position(|name| *name == "MutexGranted")
+        .expect("the acquire was granted");
+    assert_eq!(
+        names[..=grant],
+        ["WorkflowStarted", "DecisionCommitted", "MutexGranted"]
+    );
+    assert_ne!(
+        names.get(grant + 1),
+        Some(&"DecisionCommitted"),
+        "the grant decision must skip its boundary: {names:?}"
     );
 }
 

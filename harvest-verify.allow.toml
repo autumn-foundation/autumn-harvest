@@ -75,3 +75,15 @@ decision persists, the window that \
 engine hook can place a pause there. The static flag makes the pause fire \
 once, and a paused run does not replay again in the test. Remove this entry \
 if the engine gains a test hook between replay and persist."""
+
+[[allow]]
+workflow = "integration::decision_boundary_db_tests::boundary_late_row"
+justification = """\
+A test fixture for issue #1833, nondeterministic on purpose. Its first run \
+appends one history row through a side connection, then takes a free \
+mutex. The row lands after the cap check counted the history. That is the case \
+`a_boundary_never_brings_a_running_history_to_the_cap` covers: the boundary \
+write must see the real count. No engine hook can place a write there. The \
+static flag makes the write fire once, and the row is a boundary, which \
+replay skips. Remove this entry if the engine gains a test hook between \
+replay and persist."""
