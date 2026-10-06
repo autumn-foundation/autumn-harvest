@@ -869,13 +869,11 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         let op = match event {
             _ if superseded.contains(&(index - 1)) => continue,
             WorkflowEvent::MarkerRecorded { name, details } if name.starts_with("fan_out:") => {
+                // The count comes from the input. Padding allocates that many
+                // items, so a huge count would exhaust memory in the harness.
                 let count = details.as_u64().and_then(|n| usize::try_from(n).ok());
-                Some(mirror_fan_out(
-                    history,
-                    index,
-                    count.unwrap_or(0),
-                    &mut claimed,
-                ))
+                let count = count.unwrap_or(0).min(MAX_FAN_OUT_ITEMS);
+                Some(mirror_fan_out(history, index, count, &mut claimed))
             }
             _ if claimed.remove(&(index - 1)) => continue,
             _ if silenced.remove(&(index - 1)) => None,
@@ -1218,6 +1216,10 @@ const UNSEEN_SIGNAL: &str = "__fuzz_unseen_signal";
 /// The most branches a mirrored race gets, whatever its marker claims.
 const MAX_RACE_BRANCHES: usize = 64;
 
+/// The most items a mirrored fan-out gets, whatever its marker claims. A
+/// larger count replays as a count mismatch, which costs coverage only.
+const MAX_FAN_OUT_ITEMS: usize = 1024;
+
 /// The activity or child that a race branch started.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Branch {
@@ -1277,7 +1279,11 @@ fn mirror_race<'h>(
     for (index, event) in history.iter().enumerate().skip(start) {
         let claim = in_run && commands.len() < count;
         match event {
-            WorkflowEvent::TimerStarted { timer_id, .. } if claim => {
+            // Only a timer that this race started is a branch. Another timer
+            // can be a sibling in the same `join!`.
+            WorkflowEvent::TimerStarted { timer_id, .. }
+                if claim && timer_id.as_str().starts_with(timer_prefix.as_str()) =>
+            {
                 taken.race_timers.insert(timer_id.as_str());
                 let fixed = timer_id.as_str().strip_prefix(timer_prefix.as_str());
                 let fixed = fixed.and_then(|i| i.parse::<usize>().ok());
