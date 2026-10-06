@@ -15,7 +15,8 @@ gaps, a missing head and a missing or invalid checkpoint. The exporter
 extends only a checkpoint that its key accepts. A missing or invalid
 checkpoint stops the chain until an operator calls
 `audit_chain::reanchor_shard_chain`. It starts a new chain after the sequenced
-rows and never changes a sequenced row. `HarvestBuilder::audit_export_chain_accept_key`
+rows and never changes a sequenced row. The chain stays off in a database
+that two logical shards export, because they share the `export_seq` space. `HarvestBuilder::audit_export_chain_accept_key`
 adds a key for a two-step rotation. With a retention cutoff, a gap goes to
 `retention_gaps` only when the keyed `chain_newest_before` after it is old.
 Exported records carry `chain_prev`, `chain_newest_before` and `chain_hash`.

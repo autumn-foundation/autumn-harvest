@@ -1011,3 +1011,24 @@ async fn reanchoring_never_changes_a_sequenced_row() {
         .expect("rewind");
     assert_eq!(export_tick(&mut conn, Some(&key())).await, before);
 }
+
+#[tokio::test]
+async fn the_chain_stays_off_in_a_database_two_shards_export() {
+    let (mut conn, _c) = fresh_db().await;
+    ensure_cursor_row(&mut conn, SHARD + 1)
+        .await
+        .expect("a second shard's cursor");
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    let chained = count(
+        &mut conn,
+        "SELECT count(*) AS n FROM harvest_audit_log WHERE chain_hash IS NOT NULL",
+    )
+    .await;
+    assert_eq!(chained, 0, "two cursors share the export_seq space");
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(report.findings, vec![ChainFinding::SharedDatabase]);
+}

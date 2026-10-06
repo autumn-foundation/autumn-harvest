@@ -2407,10 +2407,8 @@ pub async fn claim_shard_chained(
                 Some(key) if last_assigned_seq > cursor.last_assigned_seq => {
                     // Extend only a checkpoint the key accepts. Otherwise a
                     // writer could move the head and have it re-signed.
-                    if let Some(anchor) =
-                        crate::audit_chain::chain_anchor(conn, &cursor, key).await?
-                    {
-                        crate::audit_chain::stamp_chain(
+                    match crate::audit_chain::chain_anchor(conn, &cursor, key).await? {
+                        Ok(anchor) => crate::audit_chain::stamp_chain(
                             conn,
                             shard_id,
                             key.secret(),
@@ -2419,15 +2417,24 @@ pub async fn claim_shard_chained(
                             &anchor,
                         )
                         .await?
-                        .map(|stamped| (key, stamped, anchor.start_seq))
-                    } else {
-                        tracing::error!(
-                            shard_id,
-                            "the audit chain checkpoint is missing or does not verify; new \
-                             rows stay unchained until an operator calls \
-                             audit_chain::reanchor_shard_chain"
-                        );
-                        None
+                        .map(|stamped| (key, stamped, anchor.start_seq)),
+                        Err(crate::audit_chain::ChainRefusal::Checkpoint) => {
+                            tracing::error!(
+                                shard_id,
+                                "the audit chain checkpoint is missing or does not verify; \
+                                 new rows stay unchained until an operator calls \
+                                 audit_chain::reanchor_shard_chain"
+                            );
+                            None
+                        }
+                        Err(crate::audit_chain::ChainRefusal::SharedDatabase) => {
+                            tracing::error!(
+                                shard_id,
+                                "the audit chain is off: another shard's live export cursor \
+                                 shares this database, so the two share the export_seq space"
+                            );
+                            None
+                        }
                     }
                 }
                 _ => None,

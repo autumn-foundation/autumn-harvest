@@ -73,6 +73,9 @@ that the exporter sequences.
   within the hour. Only the SIEM copy detects these cases.
 - Each sequenced row is written twice: once for `export_seq`, once for the
   chain columns. Only a deployment with a chain key pays this cost.
+- The chain needs one exporting shard per database. Two logical shards on
+  one database share the `export_seq` space, so the exporter turns the chain
+  off there.
 - Every exporter must hold the same key. Set it after a rolling upgrade
   ends. Rotate in two steps with an accept key.
 - A re-anchor starts a new chain after the sequenced rows. It never changes

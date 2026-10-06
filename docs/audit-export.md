@@ -302,6 +302,8 @@ short queries, so it holds no long snapshot. It returns a `ChainReport`:
 | `HeadMismatch` | The newest chained row is not the checkpoint head. The newest rows were deleted, or their links were removed. |
 | `CheckpointMissing` | Chained rows exist, but the cursor has no signed checkpoint. Someone rebuilt or edited the cursor. The exporter stops the chain until you re-anchor. |
 | `CheckpointInvalid` | The checkpoint MAC does not verify, or only some checkpoint columns are set. Someone edited the cursor, or you passed the wrong key. |
+| `KnownLinkUnverifiable` | Retention purged the `known_head` row and its successor. Nothing can prove the link. Refresh `known_head` on every run. |
+| `SharedDatabase` | Another shard's live export cursor is in this database. Two cursors share the `export_seq` space, so the chain is off here. |
 | `CursorBehindCheckpoint` | The checkpoint head is past the cursor's `last_assigned_seq`. Someone lowered the cursor. Retention never does. |
 | `RolledBack` | The chain ends before the `known_head`. Someone restored an older state of the table and the cursor. |
 | `KnownLinkMismatch` | The row at the `known_head` sequence has another link, or, after retention purged that row, its successor does not name it. Someone replaced the chain after a rollback. |
@@ -377,6 +379,9 @@ The canonical encoding always uses six digits. Then check that the HMAC of
   those rows within the hour anyway. Only the SIEM copy detects these cases.
 - Without a `known_head`, the verifier cannot detect a restored older state
   of the table and the cursor.
+- The chain needs one exporting shard per database. When two logical shards
+  share a database, as in a pre-split staging rollout, the exporter does not
+  stamp the chain, and the verifier reports `SharedDatabase`.
 - After a re-anchor, the verifier does not check the rows before the new
   start. It hides any change to them. Compare with the SIEM copy before you
   re-anchor.

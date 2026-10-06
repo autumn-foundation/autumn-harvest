@@ -370,6 +370,16 @@ pub enum ChainFinding {
         /// The `seq` of the known head.
         seq: i64,
     },
+    /// Retention purged the known head's row and its successor. Nothing can
+    /// prove the link. Refresh the known head on every run.
+    KnownLinkUnverifiable {
+        /// The `seq` of the known head.
+        seq: i64,
+    },
+    /// Another shard's live export cursor is in this database. Two cursors
+    /// share the `export_seq` space, so the exporter does not stamp the
+    /// chain here.
+    SharedDatabase,
     /// The checkpoint head is past the cursor's `last_assigned_seq`. Someone
     /// lowered the cursor. Retention never does.
     CursorBehindCheckpoint {
@@ -429,6 +439,8 @@ pub struct ChainVerifier<'k> {
     known_head: Option<KnownLink>,
     /// `true` after the row at the known head's `seq`.
     known_seen: bool,
+    /// `true` after the row just after the known head's `seq`.
+    successor_seen: bool,
 }
 
 /// The verifier state for the previous row.
@@ -460,6 +472,7 @@ impl<'k> ChainVerifier<'k> {
             previous: None,
             known_head: None,
             known_seen: false,
+            successor_seen: false,
         }
     }
 
@@ -523,8 +536,11 @@ impl<'k> ChainVerifier<'k> {
             let mismatch = if seq == known.seq {
                 self.known_seen = true;
                 row.hash != Some(known.hash)
+            } else if seq == known.seq + 1 {
+                self.successor_seen = true;
+                !self.known_seen && row.prev != Some(known.hash)
             } else {
-                seq == known.seq + 1 && !self.known_seen && row.prev != Some(known.hash)
+                false
             };
             if mismatch {
                 self.report
@@ -619,13 +635,18 @@ impl<'k> ChainVerifier<'k> {
             self.check_head(checkpoint);
         }
         let head_seq = checkpoint.map(|c| c.head_seq).or(self.report.last_seq);
-        if let Some(known) = self.known_head
-            && head_seq.is_none_or(|head| head < known.seq)
-        {
-            self.report.findings.push(ChainFinding::RolledBack {
-                known_seq: known.seq,
-                head_seq,
-            });
+        if let Some(known) = self.known_head {
+            if head_seq.is_none_or(|head| head < known.seq) {
+                self.report.findings.push(ChainFinding::RolledBack {
+                    known_seq: known.seq,
+                    head_seq,
+                });
+            } else if !self.known_seen && !self.successor_seen {
+                // Retention purged both rows that could prove the link.
+                self.report
+                    .findings
+                    .push(ChainFinding::KnownLinkUnverifiable { seq: known.seq });
+            }
         }
         self.report
     }
@@ -738,23 +759,72 @@ pub(crate) async fn chain_anchor(
     conn: &mut diesel_async::AsyncPgConnection,
     cursor: &crate::models::AuditExportCursor,
     key: &AuditChainKey,
-) -> crate::error::HarvestResult<Option<ChainAnchor>> {
+) -> crate::error::HarvestResult<Result<ChainAnchor, ChainRefusal>> {
+    if other_live_cursor(conn, cursor.shard_id).await? {
+        return Ok(Err(ChainRefusal::SharedDatabase));
+    }
     if let Some((checkpoint, mac)) = stored_checkpoint(cursor) {
         let valid = key.accepts(&checkpoint, cursor.shard_id, &mac)
             && checkpoint.head_seq == cursor.last_assigned_seq;
         // An empty re-anchored chain starts like a new one: genesis, and no
         // newest time before the first link.
         let empty = checkpoint.head_seq < checkpoint.start_seq;
-        return Ok(valid.then_some(ChainAnchor {
-            head: (!empty).then_some(checkpoint.head),
-            start_seq: Some(checkpoint.start_seq),
-            newest_at: (!empty).then_some(checkpoint.newest_at),
-        }));
+        return Ok(valid
+            .then_some(ChainAnchor {
+                head: (!empty).then_some(checkpoint.head),
+                start_seq: Some(checkpoint.start_seq),
+                newest_at: (!empty).then_some(checkpoint.newest_at),
+            })
+            .ok_or(ChainRefusal::Checkpoint));
     }
     if has_checkpoint_column(cursor) || any_chained_row(conn, cursor.last_assigned_seq).await? {
-        return Ok(None);
+        return Ok(Err(ChainRefusal::Checkpoint));
     }
-    Ok(Some(ChainAnchor::default()))
+    Ok(Ok(ChainAnchor::default()))
+}
+
+/// Why the exporter does not stamp the chain on this tick.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainRefusal {
+    /// The checkpoint is missing, does not verify or lags.
+    Checkpoint,
+    /// Another shard's live cursor shares this database.
+    SharedDatabase,
+}
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct OtherCursor {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    present: bool,
+}
+
+/// `true` when another shard's live export cursor is in this database.
+///
+/// Two logical shards on one database share the `export_seq` space. A
+/// per-shard chain cannot be correct there.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+async fn other_live_cursor(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+) -> crate::error::HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    let row: OtherCursor = diesel::sql_query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM harvest_audit_export_cursor \
+             WHERE shard_id <> $1 AND retired_at IS NULL \
+         ) AS present",
+    )
+    .bind::<diesel::sql_types::Integer, _>(shard_id)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(row.present)
 }
 
 /// Write `checkpoint` and its MAC under the active key to the cursor.
@@ -1023,6 +1093,9 @@ pub async fn verify_shard_chain_with(
     }
 
     let mut report = verifier.finish(checkpoint.as_ref());
+    if other_live_cursor(conn, shard_id).await? {
+        report.findings.insert(0, ChainFinding::SharedDatabase);
+    }
     // Retention never lowers the cursor. So a head past it is an edit, not a
     // purged tail.
     if let Some(checkpoint) = checkpoint
@@ -1490,6 +1563,40 @@ mod tests {
             verifier.push(row);
         }
         assert_eq!(verifier.finish(cp_ok.as_ref()).findings, Vec::new());
+    }
+
+    #[test]
+    fn a_known_head_with_no_surviving_neighbour_is_unverifiable() {
+        let day = 86_400;
+        let original = chain_at(&[(1, 0), (2, day), (3, 2 * day), (4, 3 * day)]);
+        let known = KnownLink {
+            seq: 2,
+            hash: original[1].hash.unwrap_or(GENESIS),
+        };
+        let mut records: Vec<AuditExportRecord> =
+            original.iter().map(|row| row.record.clone()).collect();
+        records[1].actor = "mallory".into();
+        let branch = chain_records(records);
+        let key = key();
+        let run = |rows: &[&ChainRow], cp: Option<ChainCheckpoint>| {
+            let mut verifier = ChainVerifier::new(&key)
+                .with_start_seq(Some(1))
+                .with_retention_cutoff(Some(at(10 * day)))
+                .with_known_head(Some(known));
+            for row in rows {
+                verifier.push(row);
+            }
+            verifier.finish(cp.as_ref()).findings
+        };
+        // Retention purged seq 2 and 3. Nothing proves or refutes the link.
+        assert_eq!(
+            run(&[&branch[0], &branch[3]], checkpoint(&branch)),
+            vec![ChainFinding::KnownLinkUnverifiable { seq: 2 }]
+        );
+        assert_eq!(
+            run(&[&original[0], &original[3]], checkpoint(&original)),
+            vec![ChainFinding::KnownLinkUnverifiable { seq: 2 }]
+        );
     }
 
     #[test]
