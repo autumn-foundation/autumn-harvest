@@ -18,6 +18,9 @@ Now `timeout::enforce_activity_timeout` uses the retry rules of a retryable
   `ActivityTimedOut { ScheduleToClose }` at once, as a worker retry does. A
   paused execution skips this check, because a pause stops that clock
   (issue #609).
+- A retry needs an open run, `RUNNING` or `PAUSED`. A timeout after the run
+  has ended, or during a shard move, stays terminal. No handler runs again
+  for a sealed run.
 - `ScheduleToStart` and `ScheduleToClose` timeouts stay terminal.
 - A retry policy that does not parse makes the timeout terminal.
 

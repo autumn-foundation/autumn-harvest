@@ -1577,6 +1577,9 @@ enum TimeoutVerdict {
 /// - A policy that does not parse, a delay that does not convert, or a policy
 ///   that marks the error non-retryable makes the timeout terminal. An error
 ///   here would make the sweeper try the same row on each pass.
+/// - A retry needs an open run, `RUNNING` or `PAUSED`. Any other state is
+///   terminal, so no attempt starts after the run ends. A new state is
+///   terminal until it is added here.
 /// - A retry that cannot start before `schedule_to_close_at` records a
 ///   `ScheduleToClose` timeout, as the worker does. Otherwise the row would
 ///   wait in the queue for the deadline scanner.
@@ -1588,7 +1591,7 @@ fn timeout_verdict(
     error: &str,
     row_schedule_to_close_at: Option<chrono::DateTime<Utc>>,
     now: chrono::DateTime<Utc>,
-    execution_paused: bool,
+    execution_state: &str,
 ) -> TimeoutVerdict {
     let terminal = || TimeoutVerdict::Terminal(reason.clone());
     if !matches!(
@@ -1597,6 +1600,11 @@ fn timeout_verdict(
     ) {
         return terminal();
     }
+    let execution_paused = match execution_state {
+        "RUNNING" => false,
+        "PAUSED" => true,
+        _ => return terminal(),
+    };
     let Ok(policy) = crate::worker::configured_retry_policy(task) else {
         return terminal();
     };
@@ -2194,7 +2202,7 @@ async fn enforce_activity_timeout(
                 &error,
                 row_schedule_to_close_at,
                 now,
-                execution.state == "PAUSED",
+                &execution.state,
             ) {
                 TimeoutVerdict::Retry(delay) => {
                     queue::requeue_timed_out_task(conn, task.id, delay, &error).await?;
@@ -6641,8 +6649,35 @@ mod tests {
         deadline: Option<chrono::DateTime<Utc>>,
         paused: bool,
     ) -> TimeoutVerdict {
+        let state = if paused { "PAUSED" } else { "RUNNING" };
+        verdict_in(task, reason, deadline, state)
+    }
+
+    fn verdict_in(
+        task: &TaskQueueItem,
+        reason: &TimeoutReason,
+        deadline: Option<chrono::DateTime<Utc>>,
+        execution_state: &str,
+    ) -> TimeoutVerdict {
         let error = timeout_error("charge", reason);
-        timeout_verdict(task, reason, &error, deadline, Utc::now(), paused)
+        timeout_verdict(task, reason, &error, deadline, Utc::now(), execution_state)
+    }
+
+    #[test]
+    fn a_timeout_never_retries_once_the_run_is_not_open() {
+        let task = with_fixed_policy(1, 3, Duration::from_millis(200));
+        let reason = TimeoutReason::StartToClose;
+        for state in crate::erase::TERMINAL_STATES
+            .iter()
+            .copied()
+            .chain(["MIGRATING"])
+        {
+            assert_eq!(
+                verdict_in(&task, &reason, None, state),
+                TimeoutVerdict::Terminal(reason.clone()),
+                "{state}"
+            );
+        }
     }
 
     #[test]

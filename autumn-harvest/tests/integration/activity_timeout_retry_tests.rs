@@ -821,3 +821,46 @@ async fn a_stale_snapshot_does_not_time_out_the_next_attempt() {
     assert_eq!(outcomes(&mut conn, exec_id).await, (Vec::new(), 0));
     assert_eq!(execution_state(&mut conn, exec_id).await, "RUNNING");
 }
+
+/// A timeout after the run has ended starts no new attempt.
+///
+/// A workflow can fail while one of its activities still runs. A retry
+/// would then run the handler again for a sealed run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_after_the_run_ends_starts_no_new_attempt() {
+    let (url, _container) = setup_db().await;
+    let activity = "act_1870_sealed_run";
+    let queue = &unique_queue("sealed");
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, queue, activity).await;
+    let bounds = Bounds {
+        start_to_close: Some(LIMIT),
+        ..Bounds::default()
+    };
+    let info = activity_info(
+        activity,
+        hang_always,
+        Some(exact_policy(3, Duration::from_millis(50))),
+        bounds,
+    );
+    let worker = Running::spawn(&url, queue, info);
+
+    let first = wait_for_attempt(&mut conn, exec_id, activity, 1).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("FAILED"))
+        .execute(&mut conn)
+        .await
+        .expect("end the run");
+    backdate(&mut conn, first.id, PAST_LIMIT_SECS).await;
+    sweep(&mut conn).await;
+
+    // Give a requeued task time to be claimed again.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let task = activity_task(&mut conn, exec_id).await;
+    worker.stop().await;
+    assert!(
+        !started(activity, 2),
+        "no attempt may start after the run ends"
+    );
+    assert_eq!((task.state.as_str(), task.attempt), ("FAILED", 1));
+}
