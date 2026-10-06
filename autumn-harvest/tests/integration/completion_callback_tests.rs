@@ -955,10 +955,12 @@ async fn callback_dead_letter_count(conn: &mut AsyncPgConnection, exec_id: Execu
 /// Enqueue one delivery for a fresh terminal execution.
 async fn enqueue_one_delivery(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
+    // A unique workflow id, so one test can enqueue several deliveries.
+    let workflow_id = format!("wf-{}", exec_id.as_uuid());
     insert_terminal_execution(
         conn,
         exec_id,
-        "wf-1",
+        &workflow_id,
         "COMPLETED",
         Some("{}"),
         None,
@@ -1033,12 +1035,68 @@ async fn scanner_honours_retry_after_on_429() {
     let rows = load_deliveries(&mut conn, exec_id).await;
     assert_eq!(rows[0].state, "PENDING", "a 429 is retried");
     assert_eq!(rows[0].last_status, Some(429));
+    // Postgres keeps microseconds, so allow 1 ms for the truncation.
     assert!(
-        rows[0].next_attempt_at >= before + chrono::Duration::seconds(10),
+        rows[0].next_attempt_at
+            >= before + chrono::Duration::seconds(10) - chrono::Duration::milliseconds(1),
         "next attempt {} must be 10 s or more after {before}",
         rows[0].next_attempt_at
     );
     assert_eq!(callback_dead_letter_count(&mut conn, exec_id).await, 0);
+
+    // The retry is not due yet, so the next tick sends nothing.
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("second scanner tick");
+    assert_eq!(deliverer.call_count(), 1, "no retry before Retry-After");
+}
+
+// Issue #1832: a bulk replay of callback dead letters spreads the next
+// attempts, so they do not all reach the receiver at one instant.
+#[tokio::test]
+async fn bulk_replay_spreads_callback_dead_letters() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(400)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(5, Duration::from_millis(1)),
+    );
+    let mut exec_ids = Vec::new();
+    for _ in 0..3 {
+        exec_ids.push(enqueue_one_delivery(&mut conn).await);
+    }
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+    for exec_id in &exec_ids {
+        assert_eq!(callback_dead_letter_count(&mut conn, *exec_id).await, 1);
+    }
+
+    let before = chrono::Utc::now();
+    let filter = autumn_harvest::dlq::BulkDlqFilter {
+        queue_name: Some("completion-callback".to_string()),
+        limit: Some(10),
+        spread_secs: Some(60),
+        ..Default::default()
+    };
+    let result = autumn_harvest::dlq::bulk_replay_dead_letters(&mut conn, &filter, None)
+        .await
+        .expect("bulk replay");
+    assert_eq!(result.acted_on, 3, "{:?}", result.failures);
+
+    // Three rows get the slots [0, 20), [20, 40) and [40, 60) seconds.
+    let mut latest = before;
+    for exec_id in &exec_ids {
+        let rows = load_deliveries(&mut conn, *exec_id).await;
+        assert_eq!(rows[0].state, "PENDING");
+        latest = latest.max(rows[0].next_attempt_at);
+    }
+    assert!(
+        latest >= before + chrono::Duration::seconds(30),
+        "the last delivery must wait in the last slot, got {latest} after {before}"
+    );
 }
 
 // Regression (issue #921 review, Codex P2): `target_url` is only ever

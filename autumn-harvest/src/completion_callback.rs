@@ -1501,6 +1501,7 @@ pub trait CompletionCallbackDeliverer: Send + Sync + 'static {
 /// Parse a `Retry-After` header value into a delay from `now` (issue #1832).
 ///
 /// The value is delta-seconds or an HTTP-date (RFC 9110 section 10.2.3).
+/// All three HTTP-date forms are read: IMF-fixdate, RFC 850 and asctime.
 /// A date in the past gives a zero delay. Any other value gives `None`.
 #[must_use]
 pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<std::time::Duration> {
@@ -1510,12 +1511,21 @@ pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<std::time::D
         let secs = value.parse::<u64>().unwrap_or(u64::MAX);
         return Some(std::time::Duration::from_secs(secs));
     }
-    let at = DateTime::parse_from_rfc2822(value).ok()?;
-    Some(
-        (at.with_timezone(&Utc) - now)
-            .to_std()
-            .unwrap_or(std::time::Duration::ZERO),
-    )
+    let at = parse_http_date(value)?;
+    Some((at - now).to_std().unwrap_or(std::time::Duration::ZERO))
+}
+
+/// Parse an HTTP-date in any of its three forms (RFC 9110 section 5.6.7).
+fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(at) = DateTime::parse_from_rfc2822(value) {
+        return Some(at.with_timezone(&Utc));
+    }
+    // RFC 850, for example `Sunday, 06-Nov-94 08:49:37 GMT`, and asctime,
+    // for example `Sun Nov  6 08:49:37 1994`. Both are always in GMT.
+    ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]
+        .iter()
+        .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+        .map(|naive| naive.and_utc())
 }
 
 #[cfg(test)]
@@ -1574,6 +1584,25 @@ mod deliverer_trait_tests {
         assert_eq!(
             parse_retry_after("Thu, 01 Jan 2026 00:00:30 GMT", now()),
             Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_the_obsolete_date_forms() {
+        // RFC 9110 section 5.6.7: a recipient must accept RFC 850 and asctime.
+        let thirty = Some(std::time::Duration::from_secs(30));
+        assert_eq!(
+            parse_retry_after("Thursday, 01-Jan-26 00:00:30 GMT", now()),
+            thirty
+        );
+        assert_eq!(parse_retry_after("Thu Jan  1 00:00:30 2026", now()), thirty);
+    }
+
+    #[test]
+    fn parse_retry_after_saturates_an_overflowing_number() {
+        assert_eq!(
+            parse_retry_after("99999999999999999999", now()),
+            Some(std::time::Duration::from_secs(u64::MAX))
         );
     }
 
@@ -1651,7 +1680,9 @@ fn delivery_stream_seed(delivery_id: Uuid) -> u64 {
 /// silently ignored and every delivery would back off in perfect lockstep.
 ///
 /// A permanent 4xx dead-letters at once. A `Retry-After` hint sets the
-/// minimum backoff, clamped to `retry_policy.max_interval` (issue #1832).
+/// minimum backoff, clamped to
+/// [`DEFAULT_RETRY_AFTER_CEILING`](crate::builder::DEFAULT_RETRY_AFTER_CEILING)
+/// (issue #1832).
 #[must_use]
 pub fn classify_outcome(
     outcome: &DeliveryAttempt,
@@ -1675,10 +1706,11 @@ pub fn classify_outcome(
     }
 
     let mut delay = crate::policy::compute_retry_delay_with_seed(retry_policy, attempt, seed);
-    // `Retry-After` is a floor, never a cap. The policy ceiling bounds it,
-    // so a receiver cannot park a delivery for an unbounded time.
+    // `Retry-After` is a floor, never a cap. The engine's `Retry-After`
+    // ceiling (issue #744) bounds it. So a receiver cannot delay a delivery
+    // past 15 minutes per retry.
     if let Some(retry_after) = outcome.retry_after {
-        delay = delay.max(retry_after.min(retry_policy.max_interval));
+        delay = delay.max(retry_after.min(crate::builder::DEFAULT_RETRY_AFTER_CEILING));
     }
     let next_attempt_at =
         now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(0));
@@ -1921,12 +1953,25 @@ mod classify_outcome_tests {
     }
 
     #[test]
-    fn retry_after_is_clamped_to_the_policy_ceiling() {
-        // `test_policy` caps a retry at 300 s.
+    fn retry_after_is_clamped_to_the_retry_after_ceiling() {
         let outcome =
             DeliveryAttempt::success(503).with_retry_after(StdDuration::from_secs(86_400));
         let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
-        assert_eq!(backoff_delay(&action), StdDuration::from_secs(300));
+        assert_eq!(
+            backoff_delay(&action),
+            crate::builder::DEFAULT_RETRY_AFTER_CEILING
+        );
+    }
+
+    #[test]
+    fn retry_after_wins_over_a_fixed_policy_interval() {
+        // A fixed policy has `max_interval == initial_interval`. The hint
+        // must still apply, so the ceiling is not `max_interval`.
+        let policy = RetryPolicy::fixed(5, StdDuration::from_secs(2))
+            .with_jitter(crate::policy::JitterPolicy::None);
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &policy, 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(10));
     }
 
     #[test]
@@ -3334,6 +3379,24 @@ pub async fn redrive_delivery(
     exec_id: crate::types::ExecutionId,
     delivery_id: Uuid,
 ) -> crate::error::HarvestResult<DeliveryRedriveOutcome> {
+    redrive_delivery_at(conn, exec_id, delivery_id, None).await
+}
+
+/// [`redrive_delivery`] with a time for the next attempt (issue #1832).
+///
+/// A bulk DLQ redrive spreads its deliveries with `not_before`, so they do
+/// not all reach one receiver at one instant. `None` makes the delivery due
+/// at once.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn redrive_delivery_at(
+    conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    delivery_id: Uuid,
+    not_before: Option<DateTime<Utc>>,
+) -> crate::error::HarvestResult<DeliveryRedriveOutcome> {
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
@@ -3377,7 +3440,7 @@ pub async fn redrive_delivery(
             .set((
                 dsl::state.eq("PENDING"),
                 dsl::max_attempts.eq(extended_max_attempts),
-                dsl::next_attempt_at.eq(Utc::now()),
+                dsl::next_attempt_at.eq(not_before.unwrap_or_else(Utc::now)),
                 dsl::last_status.eq(None::<i32>),
                 dsl::last_error.eq(None::<String>),
                 dsl::updated_at.eq(Utc::now()),

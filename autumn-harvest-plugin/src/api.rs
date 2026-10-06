@@ -7071,6 +7071,7 @@ pub const fn management_api_request_fields()
                 "shard_id",
                 "limit",
                 "dry_run",
+                "spread_secs",
             ]),
         ),
         (
@@ -7091,7 +7092,6 @@ pub const fn management_api_request_fields()
                 "shard_id",
                 "limit",
                 "dry_run",
-                "spread_secs",
             ]),
         ),
         ("POST", "/dead-letters/{id}/replay", Some(&[])),
@@ -33236,6 +33236,46 @@ async fn bulk_discard_dead_letters_handler(
     }
 }
 
+/// The `spread_secs` each shard gets in a DLQ fan-out (issue #1832).
+///
+/// The default window scales with the rows in one call. Each shard sees only
+/// its own rows. So with N shards, each shard gets a shorter window, and the
+/// shards together start tasks N times faster than one shard. A call that
+/// spans more than one shard therefore gives every shard the window of the
+/// whole row budget, rounded up to whole seconds. An explicit value is kept.
+fn fan_out_spread_secs(spread_secs: Option<u64>, budget: u32, shards: usize) -> Option<u64> {
+    if spread_secs.is_some() || shards <= 1 {
+        return spread_secs;
+    }
+    let window = dlq::redrive_spread_window(None, usize::try_from(budget).unwrap_or(usize::MAX));
+    Some(window.as_secs() + u64::from(window.subsec_nanos() > 0))
+}
+
+#[cfg(test)]
+mod fan_out_spread_secs_tests {
+    use super::fan_out_spread_secs;
+
+    #[test]
+    fn one_shard_keeps_the_per_call_default() {
+        assert_eq!(fan_out_spread_secs(None, 1000, 1), None);
+    }
+
+    #[test]
+    fn many_shards_share_the_window_of_the_whole_budget() {
+        // Two shards of 500 rows must not each get a 30 s window.
+        assert_eq!(fan_out_spread_secs(None, 1000, 2), Some(60));
+        // 100 rows: 6 s. 1 row: 60 ms, rounded up to 1 s.
+        assert_eq!(fan_out_spread_secs(None, 100, 4), Some(6));
+        assert_eq!(fan_out_spread_secs(None, 1, 4), Some(1));
+    }
+
+    #[test]
+    fn an_explicit_value_is_kept() {
+        assert_eq!(fan_out_spread_secs(Some(0), 1000, 4), Some(0));
+        assert_eq!(fan_out_spread_secs(Some(90), 1000, 4), Some(90));
+    }
+}
+
 async fn bulk_replay_from_shards(
     api_state: &HarvestApiState,
     selector: &DlqBulkSelector,
@@ -33257,6 +33297,11 @@ async fn bulk_replay_from_shards(
     // conversions below are infallible in practice.
     let mut remaining: u32 =
         u32::try_from(selector.filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+    let shards = pool
+        .iter_shards()
+        .filter(|(shard_id, _)| selector.shard_id.is_none_or(|w| w == shard_id.as_i32()))
+        .count();
+    let spread_secs = fan_out_spread_secs(selector.filter.spread_secs, remaining, shards);
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if selector
@@ -33281,6 +33326,7 @@ async fn bulk_replay_from_shards(
 
         let mut shard_selector = selector.clone();
         shard_selector.filter.limit = Some(remaining);
+        shard_selector.filter.spread_secs = spread_secs;
         let shard_result =
             bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector, registry).await?;
         // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
@@ -33414,6 +33460,11 @@ async fn redrive_from_shards(
     // Enforce `max` as a global cap across all shards, not per-shard.
     let mut remaining: u32 =
         u32::try_from(request.filter.effective_max()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+    let shards = pool
+        .iter_shards()
+        .filter(|(shard_id, _)| request.shard_id.is_none_or(|w| w == shard_id.as_i32()))
+        .count();
+    let spread_secs = fan_out_spread_secs(request.filter.spread_secs, remaining, shards);
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if request
@@ -33438,6 +33489,7 @@ async fn redrive_from_shards(
 
         let mut shard_filter = request.filter.clone();
         shard_filter.max = Some(remaining);
+        shard_filter.spread_secs = spread_secs;
         let shard_result =
             dlq::redrive_dead_letters(&mut conn, &shard_filter, registry, reason, metrics.as_ref())
                 .await?;

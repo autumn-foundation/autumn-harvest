@@ -228,10 +228,13 @@ async fn spawn_black_hole() -> (String, tokio::task::JoinHandle<()>) {
         .await
         .expect("black hole should bind");
     let addr = listener.local_addr().expect("black hole should have addr");
+    // Keep each accepted socket open, and never answer.
     let task = tokio::spawn(async move {
-        let mut held = Vec::new();
         while let Ok((socket, _)) = listener.accept().await {
-            held.push(socket);
+            tokio::spawn(async move {
+                let _open = socket;
+                std::future::pending::<()>().await;
+            });
         }
     });
     (format!("http://{addr}/api/harvest"), task)
@@ -268,17 +271,23 @@ async fn execute_fails_within_the_timeout_on_a_black_hole_endpoint() {
     );
 }
 
-#[tokio::test]
-async fn timeout_error_names_the_flag() {
+#[test]
+fn timeout_errors_name_what_to_check() {
     let message = CliError::Timeout { seconds: 7 }.to_string();
     assert!(message.contains("7 s"), "{message}");
     assert!(message.contains("--http-timeout-secs"), "{message}");
+    let message = CliError::ConnectTimeout { seconds: 10 }.to_string();
+    assert!(message.contains("10 s"), "{message}");
+    assert!(message.contains("--base-url"), "{message}");
 }
 
 #[test]
 fn http_timeout_defaults_to_thirty_seconds_and_rejects_zero() {
-    let cli = Cli::try_parse_from(["harvest", "health"]).expect("CLI args should parse");
-    assert_eq!(cli.http_timeout(), std::time::Duration::from_secs(30));
+    // An exported HARVEST_HTTP_TIMEOUT_SECS changes the default.
+    if std::env::var_os("HARVEST_HTTP_TIMEOUT_SECS").is_none() {
+        let cli = Cli::try_parse_from(["harvest", "health"]).expect("CLI args should parse");
+        assert_eq!(cli.http_timeout(), std::time::Duration::from_secs(30));
+    }
     assert!(
         Cli::try_parse_from(["harvest", "--http-timeout-secs", "0", "health"]).is_err(),
         "a zero timeout would fail every request"
@@ -364,5 +373,42 @@ async fn events_tail_stream_may_outlast_the_timeout() {
     assert!(
         outcome.is_ok(),
         "a 1.8 s stream must survive a 1 s timeout: {outcome:?}"
+    );
+}
+
+fn request_timeout_of(command: &[&str]) -> std::time::Duration {
+    let mut line = vec!["harvest", "--http-timeout-secs", "30"];
+    line.extend_from_slice(command);
+    Cli::try_parse_from(line)
+        .expect("CLI args should parse")
+        .request_timeout()
+}
+
+// A command that waits on the server by design gets a longer timeout.
+#[test]
+fn request_timeout_outlasts_a_server_side_wait() {
+    let id = "00000000-0000-0000-0000-000000000001";
+    assert_eq!(
+        request_timeout_of(&["health"]),
+        std::time::Duration::from_secs(30)
+    );
+    // `update --wait completed --timeout-secs 60` waits 60 s on the server.
+    assert_eq!(
+        request_timeout_of(&["workflow", "update", id, "approve", "--timeout-secs", "60"]),
+        std::time::Duration::from_secs(70)
+    );
+    // `--wait admitted` returns at once, so the base timeout applies.
+    assert_eq!(
+        request_timeout_of(&["workflow", "update", id, "approve", "--wait", "admitted"]),
+        std::time::Duration::from_secs(30)
+    );
+    // A bulk DLQ write acts on up to 1000 rows. A dry run reads only.
+    assert_eq!(
+        request_timeout_of(&["dlq", "redrive", "--queue", "q"]),
+        std::time::Duration::from_secs(300)
+    );
+    assert_eq!(
+        request_timeout_of(&["dlq", "redrive", "--queue", "q", "--dry-run"]),
+        std::time::Duration::from_secs(30)
     );
 }

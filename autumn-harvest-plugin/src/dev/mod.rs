@@ -1217,14 +1217,16 @@ const HEALTH_PROBE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::f
 ///
 /// Each probe ends within [`HEALTH_PROBE_TIMEOUT`]. Without it, a server
 /// that accepts but never answers holds the loop past its deadline.
+#[expect(
+    clippy::expect_used,
+    reason = "only a TLS backend that cannot start fails here, and `Client::new` panics on that too"
+)]
 fn health_probe_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(HEALTH_PROBE_TIMEOUT)
         .connect_timeout(HEALTH_PROBE_CONNECT_TIMEOUT)
         .build()
-        // Only a TLS backend that cannot start fails here. The probe then
-        // keeps the unbounded client, and the old behaviour.
-        .unwrap_or_default()
+        .expect("a reqwest client with two timeouts must build")
 }
 
 #[cfg(test)]
@@ -1241,10 +1243,13 @@ mod health_probe_client_tests {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
+        // Keep each accepted socket open, and never answer.
         let black_hole = tokio::spawn(async move {
-            let mut held = Vec::new();
             while let Ok((socket, _)) = listener.accept().await {
-                held.push(socket);
+                tokio::spawn(async move {
+                    let _open = socket;
+                    std::future::pending::<()>().await;
+                });
             }
         });
 

@@ -27,7 +27,7 @@ pub const MAX_BULK_LIMIT: u32 = 1000;
 
 /// Default spread window for a full [`MAX_BULK_LIMIT`] redrive (issue #1832).
 ///
-/// A smaller batch gets a pro-rated window. See [`redrive_spread_window`].
+/// A smaller batch gets a smaller window. See [`redrive_spread_window`].
 pub const DEFAULT_REDRIVE_SPREAD: std::time::Duration = std::time::Duration::from_secs(60);
 /// Upper bound on an operator-set redrive spread, in seconds.
 pub const MAX_REDRIVE_SPREAD_SECS: u64 = 3600;
@@ -255,20 +255,20 @@ pub struct RedriveResult {
 /// (issue #1832).
 ///
 /// `Some(secs)` sets the window, capped at [`MAX_REDRIVE_SPREAD_SECS`].
-/// `Some(0)` makes every task due at once. `None` pro-rates
+/// `Some(0)` makes every task due at once. `None` scales
 /// [`DEFAULT_REDRIVE_SPREAD`] by `rows / MAX_BULK_LIMIT`. So a full batch
 /// spreads over 60 s, and one row waits at most 60 ms.
 #[must_use]
 pub fn redrive_spread_window(spread_secs: Option<u64>, rows: usize) -> std::time::Duration {
-    match spread_secs {
-        Some(secs) => std::time::Duration::from_secs(secs.min(MAX_REDRIVE_SPREAD_SECS)),
-        None => {
+    spread_secs.map_or_else(
+        || {
             let rows = u32::try_from(rows)
                 .unwrap_or(MAX_BULK_LIMIT)
                 .min(MAX_BULK_LIMIT);
             DEFAULT_REDRIVE_SPREAD * rows / MAX_BULK_LIMIT
-        }
-    }
+        },
+        |secs| std::time::Duration::from_secs(secs.min(MAX_REDRIVE_SPREAD_SECS)),
+    )
 }
 
 /// The offset of row `index` of `count` inside `window` (issue #1832).
@@ -449,6 +449,7 @@ async fn redrive_callback_dead_letter(
     dead_letter_id: Uuid,
     workflow_exec_id: Option<Uuid>,
     original_task_id: Uuid,
+    not_before: Option<DateTime<Utc>>,
 ) -> HarvestResult<Uuid> {
     let exec_id = workflow_exec_id
         .map(crate::types::ExecutionId::from_uuid)
@@ -458,7 +459,14 @@ async fn redrive_callback_dead_letter(
             ))
         })?;
 
-    match crate::completion_callback::redrive_delivery(conn, exec_id, original_task_id).await? {
+    match crate::completion_callback::redrive_delivery_at(
+        conn,
+        exec_id,
+        original_task_id,
+        not_before,
+    )
+    .await?
+    {
         crate::completion_callback::DeliveryRedriveOutcome::Redriven => Ok(original_task_id),
         crate::completion_callback::DeliveryRedriveOutcome::NotFound => Err(
             HarvestError::NotFound(format!("dead-letter {dead_letter_id}")),
@@ -470,6 +478,25 @@ async fn redrive_callback_dead_letter(
             )))
         }
     }
+}
+
+/// The enqueue parameters that put `entry` back on its queue.
+///
+/// Set `max_attempts` to the recorded attempt count, with a minimum of one.
+/// `not_before` sets `scheduled_at`. `None` keeps the immediate default.
+fn requeue_params(
+    entry: DeadLetter,
+    task_type: TaskType,
+    not_before: Option<DateTime<Utc>>,
+) -> EnqueueParams {
+    let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
+    params.workflow_exec_id = entry.workflow_exec_id;
+    params.activity_name = entry.activity_name;
+    params.max_attempts = entry.attempts.max(1);
+    if let Some(at) = not_before {
+        params.scheduled_at = at;
+    }
+    params
 }
 
 fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult<TaskType> {
@@ -654,8 +681,8 @@ pub async fn replay_dead_letter(
 
 /// [`replay_dead_letter`] with a `scheduled_at` for the new task (issue #1832).
 ///
-/// `None` makes the task due at once. A completion-callback entry ignores
-/// `not_before`, because its delivery row keeps its own schedule.
+/// `None` makes the task due at once. For a completion-callback entry,
+/// `not_before` sets the next delivery attempt instead.
 ///
 /// # Errors
 ///
@@ -698,19 +725,14 @@ pub async fn replay_dead_letter_at(
                     dead_letter_id,
                     entry.workflow_exec_id,
                     entry.original_task_id,
+                    not_before,
                 )
                 .await;
             }
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
-            params.workflow_exec_id = entry.workflow_exec_id;
-            params.activity_name = entry.activity_name;
-            params.max_attempts = entry.attempts.max(1);
-            if let Some(at) = not_before {
-                params.scheduled_at = at;
-            }
+            let mut params = requeue_params(entry, task_type, not_before);
 
             // Restore required_build_id and concurrency policy from the owning
             // execution so the replayed task is subject to the same constraints.
@@ -1256,8 +1278,8 @@ pub async fn redrive_dead_letter(
 
 /// [`redrive_dead_letter`] with a `scheduled_at` for the new task (issue #1832).
 ///
-/// `None` makes the task due at once. A completion-callback entry ignores
-/// `not_before`, because its delivery row keeps its own schedule.
+/// `None` makes the task due at once. For a completion-callback entry,
+/// `not_before` sets the next delivery attempt instead.
 ///
 /// # Errors
 ///
@@ -1298,6 +1320,7 @@ pub async fn redrive_dead_letter_at(
                     dead_letter_id,
                     entry.workflow_exec_id,
                     entry.original_task_id,
+                    not_before,
                 )
                 .await
                 {
@@ -1309,16 +1332,9 @@ pub async fn redrive_dead_letter_at(
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            let mut params =
-                EnqueueParams::new(entry.queue_name.clone(), task_type, entry.input.clone());
-            params.workflow_exec_id = entry.workflow_exec_id;
-            params.activity_name = entry.activity_name.clone();
-            params.max_attempts = entry.attempts.max(1);
-            if let Some(at) = not_before {
-                params.scheduled_at = at;
-            }
+            let mut params = requeue_params(entry, task_type, not_before);
 
-            if let Some(exec_uuid) = entry.workflow_exec_id {
+            if let Some(exec_uuid) = params.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
                 let row: Option<(Option<String>, String, String)> =
                     exec_dsl::harvest_workflow_executions

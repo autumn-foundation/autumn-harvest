@@ -627,7 +627,7 @@ async fn db_clock(conn: &mut AsyncPgConnection) -> chrono::DateTime<chrono::Utc>
         .now
 }
 
-/// Assert that 1000 tasks spread across a 60 s window that starts at `t0`.
+/// Assert that `rows` tasks spread across a 60 s window that starts at `t0`.
 fn assert_spread_across_window(stats: &SpreadStats, rows: i64) {
     assert_eq!(stats.n, rows, "every row is re-enqueued");
     assert_eq!(stats.distinct_at, rows, "no two tasks share an instant");
@@ -672,7 +672,12 @@ async fn bulk_redrive_of_1000_tasks_spreads_scheduled_at_across_the_window() {
     let result = redrive_dead_letters(&mut conn, &filter, None, None, &metrics)
         .await
         .expect("bulk redrive");
-    assert_eq!(result.redriven, 1000, "{:?}", result.failures.iter().next());
+    assert_eq!(
+        result.redriven,
+        1000,
+        "{:?}",
+        <[_]>::first(&result.failures)
+    );
 
     let stats = spread_stats(&mut conn, "spreadq", t0, 60.0).await;
     assert_spread_across_window(&stats, 1000);
@@ -716,7 +721,12 @@ async fn bulk_replay_of_1000_tasks_spreads_scheduled_at_across_the_window() {
     let result = bulk_replay_dead_letters(&mut conn, &filter, None)
         .await
         .expect("bulk replay");
-    assert_eq!(result.acted_on, 1000, "{:?}", result.failures.iter().next());
+    assert_eq!(
+        result.acted_on,
+        1000,
+        "{:?}",
+        <[_]>::first(&result.failures)
+    );
 
     let stats = spread_stats(&mut conn, "replayq", t0, 60.0).await;
     assert_spread_across_window(&stats, 1000);
