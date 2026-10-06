@@ -50,24 +50,46 @@ REBALANCING = (
     r"\s+is\s+(out\s+of\s+scope|not\s+supported)"
 )
 
-# (path, pattern, the fact that makes the claim false)
+
+
+def harvest_scope(text):
+    """Keep only the text about harvest in a multi-vendor page.
+
+    Harvest's own table rows and each `##` section that names harvest stay.
+    Every other line is blanked, so a claim about a competitor never matches.
+    Blank lines keep the line numbers of the findings.
+    """
+    kept, in_section = [], False
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            in_section = "harvest" in line.lower()
+        keep = in_section or line.startswith("| **autumn-harvest** |")
+        kept.append(line if keep else "")
+    return "\n".join(kept)
+
+
+# (path, pattern, the fact that makes the claim false[, scope]). A scope
+# function selects the text that the pattern checks.
 STALE_CLAIMS = [
     (
         "docs/comparison.md",
         r"(?i)\bplanned\b[^\n]{0,120}?#954\b",
         "cross-region DR shipped (issue #954), see docs/cross-region-dr.md",
+        harvest_scope,
     ),
     (
         "docs/comparison.md",
         r"(?i)\bno\s+(built-in\s+)?(multi|cross)-region\s+(DR|replication)"
         r"\s+or\s+(replication|failover)\b",
         "cross-region DR shipped (issue #954), see docs/cross-region-dr.md",
+        harvest_scope,
     ),
     (
         "docs/comparison.md",
         r"(?i)\bno\s+cross-shard\s+workflows\b"
         r"|\bcross-shard\s+workflows\s+(are\s+)?(explicitly\s+)?out\s+of\s+scope",
         "cross-shard child placement shipped (issue #956)",
+        harvest_scope,
     ),
     (
         "docs/architecture.md",
@@ -240,11 +262,13 @@ def release_notes_findings(notes, cargo_toml):
 def stale_claim_findings(read, claims):
     """read(path) returns the text, or None for a missing file."""
     found = []
-    for path, pattern, fact in claims:
+    for path, pattern, fact, *scope in claims:
         text = read(path)
         if text is None:
             found.append(f"{path}: missing. Move or drop its STALE_CLAIMS entry.")
             continue
+        if scope:
+            text = scope[0](text)
         for m in re.finditer(pattern, text):
             found.append(f"{path}:{line_of(text, m.start())}: stale claim. Fact: {fact}.")
     return found
@@ -385,8 +409,22 @@ def self_test():
     assert [m.split(":")[0] for m in found] == ["d.md", "f.md", "i.md", "gone.md"], found
     assert "shipped" in found[0] and "missing" in found[3], found
 
+    page = (
+        "# Comparing autumn-harvest\n\n## Dimension-by-dimension\n\n"
+        "| **autumn-harvest** | There is no built-in multi-region replication or failover. |\n"
+        "| DBOS | DBOS has no cross-region replication or failover. |\n\n"
+        "## Where harvest is behind\n\n"
+        "- No multi-region DR or replication.\n\n"
+        "## Choose something else if\n\n"
+        "Pick X: harvest has no cross-region replication or failover.\n"
+    )
+    found = stale_claim_findings(
+        {"p.md": page}.get, [("p.md", region, "shipped", harvest_scope)]
+    )
+    assert [m.split(":")[1] for m in found] == ["5", "10"], found
+
     # Every real pattern compiles.
-    for _, pattern, _ in STALE_CLAIMS:
+    for _, pattern, *_ in STALE_CLAIMS:
         re.compile(pattern)
 
     print("doc-claim-drift self-test: OK")
