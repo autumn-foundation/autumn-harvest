@@ -132,8 +132,16 @@ self-tests at the end of the file.
 
 ### Requirements
 
-- A **nightly** toolchain (libFuzzer needs `-Z` flags): `rustup toolchain install nightly`
+- The **pinned nightly** toolchain (libFuzzer needs `-Z` flags):
+  `rustup toolchain install nightly-2026-08-14`
 - **cargo-fuzz**: `cargo install cargo-fuzz`
+
+The pin is `env.FUZZ_TOOLCHAIN` in `.github/workflows/fuzz-nightly.yml`.
+The 1.100 nightlies that were tested (2026-09-01 and later) fail to build the
+`db` feature: E0275 or a recursion-limit error in the diesel transaction
+futures. Move the pin forward, in the workflow and in
+`fuzz/smoke.sh`, once a newer nightly compiles the crate. The guard
+`fuzz_toolchain_pins_agree` keeps the two pins equal.
 
 The harness lives in `fuzz/` — a crate deliberately **excluded** from the root
 workspace (root `Cargo.toml` `[workspace] exclude`, and its own empty
@@ -199,19 +207,19 @@ the issue number in its name.
 
 ```bash
 # Build all targets (nightly + libFuzzer):
-cd fuzz && cargo +nightly fuzz build
+cd fuzz && cargo +nightly-2026-08-14 fuzz build
 
 # Run one target (Ctrl-C to stop; grows a corpus under fuzz/corpus/<target>/):
-cargo +nightly fuzz run fuzz_det_check_source
+cargo +nightly-2026-08-14 fuzz run fuzz_det_check_source
 
 # Run with the committed seeds as a second, read-only corpus:
-cargo +nightly fuzz run fuzz_replay corpus/fuzz_replay seeds/fuzz_replay
+cargo +nightly-2026-08-14 fuzz run fuzz_replay corpus/fuzz_replay seeds/fuzz_replay
 
 # Reproduce a crash input from a CI artifact:
-cargo +nightly fuzz run fuzz_replay path/to/crash-<hash>
+cargo +nightly-2026-08-14 fuzz run fuzz_replay path/to/crash-<hash>
 
 # Time-boxed run of one target:
-cargo +nightly fuzz run fuzz_det_check_source -- -max_total_time=300
+cargo +nightly-2026-08-14 fuzz run fuzz_det_check_source -- -max_total_time=300
 
 # Quick smoke of every target (~15s each) — the manual/local helper:
 ./fuzz/smoke.sh

@@ -119,7 +119,7 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
             let mut z = state;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            (z ^ (z >> 31)) as u8
+            (z ^ (z >> 31)).to_le_bytes()[0]
         })
         .collect()
 }

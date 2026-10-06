@@ -323,7 +323,7 @@ pub fn check_case(case: &ReplayCase) -> Verdict {
 ///
 /// Storage keeps JSON text, and serde does not keep every value through it.
 /// `Some(Value::Null)` reads back as `None`. A float can lose its last digit,
-/// because serde_json parses floats without `float_roundtrip`. The oracle
+/// because `serde_json` parses floats without `float_roundtrip`. The oracle
 /// compares against this form, so it reports only a change that the
 /// pipeline makes.
 fn normalize(history: &[WorkflowEvent]) -> Option<Vec<WorkflowEvent>> {
@@ -593,9 +593,12 @@ impl PayloadStore for MemStore {
     }
 
     fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
-        let mut blobs = self.blobs.lock().expect("the blob map is not poisoned");
-        let key = format!("blob-{}", blobs.len());
-        blobs.insert(key.clone(), bytes.to_vec());
+        let key = {
+            let mut blobs = self.blobs.lock().expect("the blob map is not poisoned");
+            let key = format!("blob-{}", blobs.len());
+            blobs.insert(key.clone(), bytes.to_vec());
+            key
+        };
         Box::pin(async move { Ok(key) })
     }
 

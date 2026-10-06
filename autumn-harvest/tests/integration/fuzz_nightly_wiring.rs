@@ -3,7 +3,8 @@
 //! `fuzz-nightly.yml` must fuzz every target on a cron. It must restore the
 //! corpus before the run and save it after the run, also after a crash. A
 //! failed scheduled run must open an issue. The target lists in
-//! `fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow must agree.
+//! `fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow must agree, and so
+//! must the nightly toolchain that the two files pin.
 
 use std::collections::BTreeSet;
 
@@ -38,6 +39,15 @@ fn smoke_targets(script: &str) -> BTreeSet<String> {
     let body = &script[start + "TARGETS=(".len()..];
     let end = body.find(')').expect("the TARGETS array closes");
     body[..end].split_whitespace().map(str::to_string).collect()
+}
+
+/// The default of `TOOLCHAIN="${FUZZ_TOOLCHAIN:-<pin>}"` in `fuzz/smoke.sh`.
+fn smoke_toolchain(script: &str) -> &str {
+    let start = script
+        .find("${FUZZ_TOOLCHAIN:-")
+        .expect("smoke.sh defaults FUZZ_TOOLCHAIN");
+    let rest = &script[start + "${FUZZ_TOOLCHAIN:-".len()..];
+    &rest[..rest.find('}').expect("the default closes")]
 }
 
 /// The `matrix.target` list of a job.
@@ -87,7 +97,7 @@ fn persists_the_corpus(job: &serde_yaml::Value) -> bool {
     });
     let fuzz = position(&|s| {
         let run = str_at(s, &["run"]);
-        run.contains("cargo +nightly fuzz run") && run.contains("corpus/") && run.contains("seeds/")
+        run.contains(" fuzz run ") && run.contains("corpus/") && run.contains("seeds/")
     });
     let save = position(&|s| {
         str_at(s, &["uses"]).starts_with("actions/cache/save@")
@@ -133,6 +143,31 @@ fn fuzz_target_lists_agree() {
         cargo,
         "{NIGHTLY} must fuzz every fuzz/Cargo.toml [[bin]]"
     );
+}
+
+/// The workflow and `smoke.sh` fuzz with one dated nightly. A newer nightly
+/// can fail to compile the crate, so the pin must be a date.
+#[test]
+fn fuzz_toolchain_pins_agree() {
+    let doc = parse_workflow(NIGHTLY);
+    let pinned = str_at(&doc, &["env", "FUZZ_TOOLCHAIN"]);
+    let dated = pinned
+        .strip_prefix("nightly-")
+        .is_some_and(|d| d.len() == 10 && d.chars().all(|c| c.is_ascii_digit() || c == '-'));
+    assert!(
+        dated,
+        "{NIGHTLY} must pin `env.FUZZ_TOOLCHAIN: nightly-YYYY-MM-DD`; found {pinned:?}"
+    );
+    assert_eq!(
+        smoke_toolchain(FUZZ_SMOKE_SH),
+        pinned,
+        "fuzz/smoke.sh must default to the nightly that {NIGHTLY} pins"
+    );
+    let installs = steps(&doc["jobs"]["fuzz"]).iter().any(|s| {
+        str_at(s, &["uses"]).starts_with("dtolnay/rust-toolchain@")
+            && str_at(s, &["with", "toolchain"]) == "${{ env.FUZZ_TOOLCHAIN }}"
+    });
+    assert!(installs, "the `fuzz` job must install `env.FUZZ_TOOLCHAIN`");
 }
 
 #[test]
@@ -207,7 +242,8 @@ fn target_parsers_read_the_file_shapes() {
         cargo_targets(toml),
         BTreeSet::from(["a".to_string(), "b".to_string()])
     );
-    let script = "TARGETS=(\n  a\n  b\n)\n";
+    let script = "TARGETS=(\n  a\n  b\n)\nTOOLCHAIN=\"${FUZZ_TOOLCHAIN:-nightly-2026-01-02}\"\n";
+    assert_eq!(smoke_toolchain(script), "nightly-2026-01-02");
     assert_eq!(
         smoke_targets(script),
         BTreeSet::from(["a".to_string(), "b".to_string()])

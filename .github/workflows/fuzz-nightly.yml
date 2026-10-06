@@ -44,6 +44,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The 1.100 nightlies that were tested (2026-09-01 and later) fail to build
+  # the `db` feature: E0275 or a recursion-limit error in the diesel
+  # transaction futures. Move this pin forward once a newer nightly builds
+  # the crate. `fuzz/smoke.sh` has the same default.
+  FUZZ_TOOLCHAIN: nightly-2026-08-14
 
 jobs:
   fuzz:
@@ -64,7 +69,9 @@ jobs:
       SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
@@ -87,7 +94,7 @@ jobs:
           echo "corpus size before: $(find "corpus/${TARGET}" -type f | wc -l)"
           dirs=("corpus/${TARGET}")
           if [ -d "seeds/${TARGET}" ]; then dirs+=("seeds/${TARGET}"); fi
-          cargo +nightly fuzz run "${TARGET}" "${dirs[@]}" -- \
+          cargo +"${FUZZ_TOOLCHAIN}" fuzz run "${TARGET}" "${dirs[@]}" -- \
             -max_total_time="${SECONDS_PER_TARGET}" -timeout=30
       - name: Minimize the corpus
         if: always() && steps.fuzz.outcome != 'skipped'
@@ -95,7 +102,7 @@ jobs:
         continue-on-error: true
         working-directory: fuzz
         run: |
-          cargo +nightly fuzz cmin "${TARGET}" "corpus/${TARGET}"
+          cargo +"${FUZZ_TOOLCHAIN}" fuzz cmin "${TARGET}" "corpus/${TARGET}"
           echo "corpus size after: $(find "corpus/${TARGET}" -type f | wc -l)"
       - name: Save the corpus
         if: always() && hashFiles(format('fuzz/corpus/{0}/**', matrix.target)) != ''
@@ -126,7 +133,7 @@ jobs:
       - name: Open or update the alert issue
         run: |
           title="Fuzz nightly: a scheduled run failed"
-          body="The nightly fuzz run failed: ${RUN_URL}. Download the fuzz-artifacts-<target> artifact and reproduce with \`cargo +nightly fuzz run <target> <input>\` (docs/testing/property-and-fuzz.md). Add the input to fuzz/seeds/<target>/ with the fix."
+          body="The nightly fuzz run failed: ${RUN_URL}. Download the fuzz-artifacts-<target> artifact and reproduce with \`cargo +${FUZZ_TOOLCHAIN} fuzz run <target> <input>\` (docs/testing/property-and-fuzz.md). Add the input to fuzz/seeds/<target>/ with the fix."
           issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title \"$title\"" --json number,title \
             --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
