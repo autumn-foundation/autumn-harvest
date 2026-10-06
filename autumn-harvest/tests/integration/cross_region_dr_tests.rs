@@ -88,7 +88,9 @@ impl autumn_harvest::payload_codec::PayloadCodec for DrXorCodec {
 struct NoOpMetrics;
 impl autumn_harvest::telemetry::MetricsRecorder for NoOpMetrics {}
 
-async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
+/// Serializes every test in this crate that pins the process-global
+/// `FenceRegistry`. `shard_rebalance_db_tests` takes it too (issue #1839).
+pub async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
     REGISTRY_SERIAL.lock().await
 }
 

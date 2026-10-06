@@ -163,6 +163,7 @@ curl -s .../admin/config | jq -S '.shard_topology'
 {
   "default_shard": 0,
   "readable_shards": [0, 1],
+  "reserved_shards": [],
   "residency_map": { "eu": 0, "us": 1 },
   "shard_forwards": {},
   "writable_shards": [0, 1]
@@ -248,11 +249,11 @@ So pinning the **root** of a workflow tree confines the whole tree.
 
 - **`(workflow_name, workflow_id)` uniqueness is per-shard.** A pin moves a run off its hash-derived shard, so a *later, unpinned* start of the same `workflow_id` would route elsewhere and could create a duplicate. When the caller omits `workflow_id`, Harvest mints one that hashes to the pinned shard, closing the hole automatically. When the caller supplies an **explicit** `workflow_id`, be consistent: either always pin it or never pin it. (This is the same consistency requirement idempotency-key routing already documents.)
 - **Placement is resolved before idempotency-key replay.** A retry of a keyed start must carry the same placement as the original delivery. A *committed* keyed replay still returns its original `200` even if the pinned shard has since been drained — the replay creates no new work, so it is validated against `readable_shards` only.
-- **Only the HTTP start route and the CLI carry placement.** `POST /workflows/{name}/signal-with-start` and `/update-with-start` have no `shard_id` / `residency_key` field, and the in-process SDK start APIs (`StartWorkflowParams`, the typed client stubs) carry none either — all of them route by hash. An entity workflow created through the documented signal-with-start pattern therefore **cannot** be pinned today. If a residency-bound workflow must be reachable that way, start it explicitly first (pinned) and let signal-with-start attach to the existing run. `WorkflowHandleClient::resolve_shard_placement` resolves and validates a placement for pre-flight tooling, but does not itself place anything.
+- **Only the HTTP start route and the CLI carry placement.** `POST /workflows/{name}/signal-with-start` and `/update-with-start` have no `shard_id` / `residency_key` field, and the in-process SDK start APIs (`StartWorkflowParams`, the typed client stubs) carry none either — all of them route by hash. The one exception: a caller that builds `StartWorkflowParams` itself can pin by minting its `exec_id` with `ExecutionId::new_for_shard` (see [Tenant cells](#tenant-cells-issue-1837)). An entity workflow created through the documented signal-with-start pattern therefore **cannot** be pinned today. If a residency-bound workflow must be reachable that way, start it explicitly first (pinned) and let signal-with-start attach to the existing run. `WorkflowHandleClient::resolve_shard_placement` resolves and validates a placement for pre-flight tooling, but does not itself place anything.
 - **Deferred starts cannot be pinned.** Debounce (#499) and batch (#518) admit a start without creating an execution, so there is nothing to place at request time; combining either with `shard_id` / `residency_key` is a `400` rather than a silently discarded pin. A throttled start (#607) *is* pinned — it defers the same concrete placement to its scanner.
 - **Rollout ordering.** Placement is enforced by the node handling the start. During a rolling deploy, a pinned request that lands on a pre-#697 node is accepted and hashed, silently ignoring the pin. Upgrade the whole fleet before you begin sending pinned starts, and treat the first pinned start as the cutover point.
 - **Residency keys are an operator-declared, low-cardinality set.** The map is held in memory on every node and validated at boot; it is sized for regions/jurisdictions (single digits to dozens), not per-tenant keys. For per-tenant placement, map the tenant to a region in your own application layer and pass the region as the key.
-- **Out of scope**: migrating a *running* workflow between shards, per-shard worker assignment, and inferring residency from payload contents. A quiescent workflow can move; see [Shard rebalancing](#shard-rebalancing--migrating-quiescent-workflows-issue-964). [`cross-region-dr.md`](cross-region-dr.md) covers cross-region replication and failover (issue #954). Harvest never reads your payload to decide placement — the caller states it explicitly.
+- **Out of scope**: migrating a *running* workflow between shards, and inferring residency from payload contents. A quiescent workflow can move; see [Shard rebalancing](#shard-rebalancing--migrating-quiescent-workflows-issue-964). [`cross-region-dr.md`](cross-region-dr.md) covers cross-region replication and failover (issue #954). Per-shard worker assignment is supported; see [Tenant cells](#tenant-cells-issue-1837). Harvest never reads your payload to decide placement — the caller states it explicitly.
 
 ### Business-key addressing finds a pinned run wherever it is (issue #1146)
 
@@ -408,6 +409,109 @@ If you need approximate cross-shard fair-share rather than a hard global cap, th
 When a worker crashes and its heartbeat times out, the `timeout.rs` scanner transitions the claimed task back to `PENDING` state. The concurrency cap check counts only `RUNNING` rows, so the slot is immediately available for another worker to claim. No operator intervention is required.
 
 This is handled entirely within the shard where the task lives — no cross-shard coordination is needed for crash recovery.
+
+---
+
+## Tenant cells (issue #1837)
+
+A cell is one shard and one worker pool for one tenant. A flood in a cell
+does not reach tenants outside it. The cell has its own database
+connections, scanners, NOTIFY channel and worker slots. Key-based quotas
+cannot isolate those resources. [ADR 0004](adr/0004-tenant-isolation-cells.md)
+records the decision and its limits.
+
+### Build a cell
+
+1. Reserve the cell shard on the router of **every** replica.
+   `with_reserved_shards` keeps unpinned starts off the shard.
+2. Map a cell residency key to the shard. Name the cell, not the tenant.
+3. Give each pool explicit shard assignments.
+
+```rust
+use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::types::ShardId;
+use autumn_harvest::WorkerConfig;
+
+let shared = ShardId::new(0);
+let cell_a = ShardId::new(1);
+let router = ShardRouter::new(vec![shared, cell_a], vec![shared, cell_a], shared)
+    .with_residency_map([("cell-a".to_string(), cell_a)])
+    .with_reserved_shards([cell_a]);
+
+// Shared processes serve every unreserved shard.
+let shared_pool = WorkerConfig::default().with_shard_assignments([shared]);
+// Cell processes serve the cell shard only.
+let cell_pool = WorkerConfig::default().with_shard_assignments([cell_a]);
+```
+
+Pass the router to `HarvestRunnerResources::with_shard_router`. The
+`HarvestPlugin` boot path is single shard, so it cannot host a cell.
+
+4. Start the tenant's work with the cell key. The application keeps the
+   tenant-to-cell map.
+
+```bash
+curl -X POST .../workflows/import_orders/start \
+  -d '{"workflow_id": "acme-42", "input": {}, "residency_key": "cell-a"}'
+```
+
+An in-process start resolves the shard first:
+
+```rust
+use autumn_harvest::shard::ShardPlacement;
+use autumn_harvest::types::ExecutionId;
+
+let placement = ShardPlacement::residency_key("cell-a");
+let shard = router.resolve_placement(&placement, "import_orders", "acme-42")?;
+let exec_id = ExecutionId::new_for_shard(shard);
+// Pass exec_id in StartWorkflowParams on that shard's connection.
+```
+
+### Rules
+
+- **Unpinned placement never picks a reserved shard.** That covers
+  `ShardPlacement::Auto`, idempotency-key routing, DAG pinning and
+  `ChildPlacement::Distributed`. A pin by `shard_id` or `residency_key`
+  still reaches it.
+- **Only keys that hashed to the reserved shard move.** They re-hash among
+  the other writable shards. Other keys keep their shard.
+- **Reserve a fresh shard.** A business key already on the shard hashes
+  elsewhere after the reservation. This is the same effect as a drain.
+- **The runner refuses an auto pool.** It does not start a worker without
+  explicit shard assignments when the router reserves shards. An auto pool
+  covers every pool shard, cells included. An API-only process passes.
+- **Children stay in the cell** by default. `Distributed` children leave
+  it. A child pinned by `Shard` or `ResidencyKey` can enter any cell.
+- **Some start paths cannot reach a cell.** These carry no pin:
+  signal-with-start, update-with-start, debounce, batch, webhooks, broker
+  connectors, the MCP start tool, the outbox, completion triggers, workflow
+  schedules and the typed stubs.
+- **The default shard stays shared.** Schedules and unencoded ids land on
+  it. The router panics at boot if you reserve it.
+- **At least one writable shard stays unreserved.** The router panics at
+  boot otherwise.
+- **Some loops still visit every shard.** The schedule ticker and the
+  retention janitor run over every pool shard in each process. The
+  liveness canary probes each writable shard, cells included.
+- **Upgrade the fleet first.** A pre-#1837 replica cannot reserve a shard.
+  It hashes shared tenants into the cell. Add the cell shard to the
+  writable set in the same deploy that reserves it.
+
+### Verify a cell
+
+- `GET /api/harvest/admin/config` reports `shard_topology.reserved_shards`.
+  Diff it across replicas. A replica that does not reserve the cell hashes
+  shared tenants into it.
+- `GET /api/harvest/admin/shards/health` shows a live worker on each cell
+  shard.
+- `harvest.queue.schedule_to_start{queue}` measures each tenant when each
+  tenant has its own queue.
+
+### Proof
+
+`tenant_cell_isolation_tests.rs` floods tenant A in a cell. Tenant B's worst
+schedule-to-start stays under 3 s. A control run on one shared shard pushes
+it above 3 s.
 
 ---
 
@@ -667,6 +771,8 @@ outstanding:
 
 Only `VERIFIED → COMMITTED` changes who is authoritative, and it is a single
 statement on one database. Run `harvest shard rebalance-resume` after any crash.
+A worker also settles a `COMMITTED` row on its own. See
+[automatic resume](#automatic-resume-after-a-stalled-cutover-issue-1839).
 
 **Why the cutover re-checks the history and not only quiescence.** Verification
 proves the copy matches the source *as of the copy*. On the end-to-end path the
@@ -687,6 +793,46 @@ current history rather than wedged.
 > instant, and claimability follows within one resume step. Closing it entirely
 > would need a two-phase commit across two databases, which the sharding design
 > rules out.
+
+### Automatic resume after a stalled cutover (issue #1839)
+
+The worker closes the gap above without an operator. Each worker runs one
+rebalance-resume scanner per assigned shard, when a `ShardedDbPool` is
+configured.
+
+- A pass finds each `COMMITTED` record whose `updated_at` is older than
+  `ScannerConfig::rebalance_stall_after`. The default is 30 s, and the floor
+  is 5 s. The pass activates the target, as `rebalance-resume` does, and moves
+  the record to `DONE`.
+- Passes run every `ScannerConfig::rebalance_resume_interval` (default 5 s),
+  with the scanner jitter. The run is claimable again at most one grace
+  period plus one interval after the crash.
+- Each settled record writes one `shard.rebalance.auto_resume` audit row on the
+  source shard: actor `system`, source `cli`, route
+  `background.rebalance_resume_scanner <from> -> <to>`. The audit table accepts
+  only the sources `api`, `cli` and `ui`. So `cli` is the nearest value, not
+  the real origin. The actor and the route mark the row as automatic.
+- The scanner never touches a record before the cutover. There the source is
+  still claimable, so no liveness gap exists. A cutover is the operator's
+  decision, so use `harvest shard rebalance-resume` for those records.
+- Each statement claims one record and sets its `updated_at`. So many replicas
+  can run the scanner, and one settlement writes one audit row. Only an
+  activation that outlasts the grace period can be claimed twice. Activation
+  is idempotent, so the cost is a second audit row. A record that
+  another driver settles first gets no audit row from the scanner. After a
+  claim, `updated_at` no longer shows the time of the cutover.
+- A replica claims only records whose target shard is in its pool.
+- When the target is down, the step fails. The record stays `COMMITTED`, its
+  `attempts` and `last_error` record the failure, and the worker logs an
+  error. The next try comes one grace period later.
+- When the DR fence is enabled (`replication::FenceRegistry`), the claim and
+  the activation check it first.
+- Set `ScannerConfig::rebalance_resume_enabled` to `false` to turn the scanner
+  off. Then only `harvest shard rebalance-resume` settles a stalled record.
+
+The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
+`harvest.scanner.tick`. `GET /admin/config` shows `rebalance_resume_enabled`,
+`rebalance_resume_interval_ms` and `rebalance_stall_after_ms`.
 
 ### What migrates, and what does not (the dedupe scopes)
 
@@ -792,7 +938,8 @@ harvest shard rebalance \
   --shard 1=postgres://.../harvest_shard1 \
   --from 0 --to 1 --limit 100 --actor alice@example.com
 
-# After any crash or interruption.
+# After any crash or interruption. A worker settles a record past the
+# cutover on its own; this command also handles the earlier phases.
 harvest shard rebalance-resume \
   --shard 0=... --shard 1=... --from 0
 ```
@@ -803,6 +950,11 @@ serving the API has no reason to hold a pool for both. Possession of both DSNs i
 the admin gate, and every non-dry-run attempt writes a
 `shard.rebalance.migrate` row to the source shard's `harvest_audit_log` naming
 the actor, the execution, and the outcome.
+
+A worker with a `ShardedDbPool` also writes to two shards: its
+rebalance-resume scanner finishes a cutover that an operator already committed
+(see [automatic resume](#automatic-resume-after-a-stalled-cutover-issue-1839)).
+It never starts a migration and never commits a cutover.
 
 **Run the migration before deploying the binary.** `db_conn_for_execution` now
 performs a forwarding lookup on multi-shard deployments, so a node running the

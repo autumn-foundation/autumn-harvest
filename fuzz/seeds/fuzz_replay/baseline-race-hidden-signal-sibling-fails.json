@@ -1,0 +1,69 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": null,
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "MarkerRecorded",
+      "data": {
+        "name": "race:1",
+        "details": 2
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000301",
+        "name": "fetch",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000302",
+        "name": "audit",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000301",
+        "output": 1
+      }
+    },
+    {
+      "type": "MarkerRecorded",
+      "data": {
+        "name": "race_winner:1",
+        "details": 0
+      }
+    },
+    {
+      "type": "ActivityFailed",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000302",
+        "error": "audit store down",
+        "attempt": 1,
+        "error_type": "Error",
+        "non_retryable": true
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": null
+      }
+    }
+  ]
+}
