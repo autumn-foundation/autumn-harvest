@@ -1720,9 +1720,10 @@ struct ScheduledActivityCommand {
     /// `build_activity_enqueue_plan` writes it to `harvest_task_queue.session_id`
     /// when `session_worker_id` is also set.
     session_id: Option<crate::types::SessionId>,
-    /// The session's host worker id (issue #606). When it is `Some`, the
-    /// enqueued task row is hard-pinned to this worker. `None` for a
-    /// non-session activity.
+    /// The session's host worker id (issue #606). When it is `Some`,
+    /// `build_activity_enqueue_plan` hard-pins the task row to this worker
+    /// through `sticky_worker_id` and `sticky_until`. `None` for a non-session
+    /// activity.
     session_worker_id: Option<String>,
     /// Per-call `schedule_to_start` override (issue #606), used only by the
     /// internal session-acquire dispatch. `None` for every ordinary

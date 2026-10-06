@@ -59,7 +59,8 @@ def tracked_paths():
         check=True,
         capture_output=True,
     ).stdout
-    return [p for p in out.decode("utf-8").split("\0") if p]
+    # Git stores path bytes. A path that is not UTF-8 must still reach a report.
+    return [p for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
 def read_head(path):
@@ -76,7 +77,7 @@ def run():
     paths = tracked_paths()
     found = findings(paths, read_head, ALLOWED)
     for message in found:
-        print(message)
+        print(message.encode("utf-8", "backslashreplace").decode("utf-8"))
     print(f"tracked-artifacts: {len(paths)} files, {len(found)} findings")
     if found:
         print(

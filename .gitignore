@@ -34,7 +34,7 @@ clients/typescript/*.tgz
 formal/tla/*_TTrace_*
 formal/tla/states/
 
-# Patch leftovers (issue #1831). docs/audits/tracked-artifacts.py fails CI on
-# a tracked one, and on a tracked binary.
+# Patch leftovers (issue #1831). CI fails on a tracked one
+# (docs/audits/tracked-artifacts.py).
 *.orig
 *.rej

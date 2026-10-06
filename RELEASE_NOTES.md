@@ -1,7 +1,6 @@
 # Release notes
 
-[`CHANGELOG.md`](CHANGELOG.md) is the release history. It has an entry for
-each version.
+[`CHANGELOG.md`](CHANGELOG.md) is the release history.
 
 The release workflow (`.github/workflows/release.yml`) uses git-cliff to write
 the notes for each GitHub Release. It writes them to this file in the release

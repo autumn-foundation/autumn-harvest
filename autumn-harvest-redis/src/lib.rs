@@ -1,4 +1,4 @@
-//! Redis dispatch channel and standalone task queue for `autumn-harvest`.
+//! Redis Streams dispatch channel and standalone task queue for `autumn-harvest`.
 //!
 //! The crate has two parts. The worker uses only the first.
 //!
@@ -11,12 +11,16 @@
 //!
 //! The default Postgres queue claims with `SELECT ... FOR UPDATE SKIP LOCKED`.
 //! It is simple to operate, but its claim throughput has a ceiling
-//! (`docs/performance.md`). For the measured throughput of the standalone
-//! adapter, see `docs/assays/0001-redis-adapter-throughput-ceiling.md`.
+//! (`docs/performance.md`). The dispatch channel takes read load off that
+//! claim path, and Postgres stays the source of truth. For the measured
+//! throughput of the standalone adapter, see
+//! `docs/assays/0001-redis-adapter-throughput-ceiling.md`.
 //!
 //! ## Scope
 //!
-//! - **The standalone adapter**: enqueue, claim, complete, fail,
+//! - **In scope, dispatch channel**: publish, read, ack and release task
+//!   references.
+//! - **In scope, standalone adapter**: enqueue, claim, complete, fail,
 //!   retry-with-delay, heartbeat, and recovery after a visibility timeout.
 //! - **Out of scope for both parts**: workflow state, event history, signals,
 //!   timers, schedules and the DAG runtime. These stay on Postgres.

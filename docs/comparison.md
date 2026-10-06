@@ -10,9 +10,9 @@ sitting, without cross-referencing five vendors' marketing pages.
 It is deliberately not a sales page. Every harvest capability claimed as
 _shipped_ links to the phase entry or GitHub issue that landed it, so any cell is
 falsifiable against the repository. Planned work is labelled **planned** and
-cites an open issue. And harvest's genuine gaps — no non-Rust SDK, no automatic
-regional failover, no managed cloud — get their own section named plainly, because a comparison that
-hides its author's weaknesses is not worth reading.
+cites an open issue. Harvest's genuine gaps get their own section: no non-Rust
+SDK, no automatic regional failover, no managed cloud. A comparison that hides
+its author's weaknesses is not worth reading.
 
 > **Competitor facts accurate as of 2026-07-14.** Competitor rows are sourced
 > from each vendor's public documentation (linked inline) and phrased neutrally.
@@ -294,8 +294,9 @@ where one exists.
   transaction. A child can run on another shard only when its spawn opts in
   ([cross-shard child placement](sharding.md#cross-shard-child-placement-issue-956),
   [#956](https://github.com/autumn-foundation/autumn-harvest/issues/956)). Its start
-  and its terminal wake then cross the boundary at least once, one scanner tick
-  away. An operator can move quiescent workflows between shards
+  and its terminal wake are each one scanner tick away, or longer after a failed
+  attempt. Delivery is at least once with dedupe, so the parent sees one terminal
+  event. An operator can move quiescent workflows between shards
   ([shard rebalancing](sharding.md#shard-rebalancing--migrating-quiescent-workflows-issue-964),
   [#964](https://github.com/autumn-foundation/autumn-harvest/issues/964)), but not
   running ones.
