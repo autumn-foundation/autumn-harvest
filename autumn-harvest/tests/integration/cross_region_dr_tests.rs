@@ -3549,6 +3549,46 @@ async fn a_row_freeze_blocks_new_rows_and_refuses_unguarded_ones() {
     );
 }
 
+/// A new shard row waits for every fenced pass already running on its
+/// database (issue #1823). The running pass guards only the rows it saw, so
+/// a row provisioned mid-pass would have no barrier.
+#[tokio::test]
+async fn provisioning_a_row_waits_for_a_running_pass() {
+    let (url, _db) = require_db!("provisionwait");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let provision = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        ensure_generation_row(&mut conn, ShardId::new(1)),
+    )
+    .await;
+    assert!(provision.is_err(), "a new row waits for the running pass");
+    drop(guard);
+    drop(conn);
+
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .expect("the row lands once the pass ends");
+    // An existing row never waits: a restart re-provisions every time.
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let again = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        ensure_generation_row(&mut conn, ShardId::new(1)),
+    )
+    .await;
+    drop(guard);
+    assert!(matches!(again, Ok(Ok(_))), "an existing row does not wait");
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

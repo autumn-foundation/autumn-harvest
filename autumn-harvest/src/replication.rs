@@ -664,6 +664,8 @@ struct Pinned {
     /// later pin would apply to that worker's database too, so a fenced
     /// worker then refuses to start.
     unfenced_worker: bool,
+    /// Whether a worker in this process reserved fenced mode (issue #1823).
+    fenced_worker: bool,
     /// Whether this process found one of its pins superseded (issue #1823).
     /// Shutdown then skips its database bookkeeping. Another region owns
     /// those rows now.
@@ -1116,25 +1118,50 @@ impl FenceRegistry {
         found
     }
 
-    /// Record that a worker in this process started unfenced (issue #1823).
-    /// This sets no pin and does not turn the fence on.
-    pub fn mark_unfenced() {
+    /// Reserve fenced or unfenced mode for a starting worker (issue #1823).
+    ///
+    /// The registry is process-wide, so one process cannot run fenced and
+    /// unfenced workers side by side. The check and the reservation happen
+    /// under one write lock, so two workers that start at once cannot both
+    /// pass the check. A reservation stays for the life of the process.
+    ///
+    /// # Errors
+    ///
+    /// A message for the operator when the process already runs a worker in
+    /// the other mode.
+    pub fn reserve_mode(fenced: bool) -> Result<(), String> {
         let mut guard = PINNED
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get_or_insert_with(Pinned::default).unfenced_worker = true;
+        let pinned = guard.get_or_insert_with(Pinned::default);
+        let refusal = if fenced && pinned.unfenced_worker {
+            Some(
+                "this process already runs a worker whose databases carry no DR marker. The \
+                 fence registry is process-wide, so pinning DR shards now would check that \
+                 worker's writes against another database. Run this worker in its own \
+                 process, or set DrFencing::Enabled on both.",
+            )
+        } else if !fenced
+            && (pinned.fenced_worker || pinned.generations.values().any(|pin| *pin != HELD))
+        {
+            Some(
+                "this process already pins DR shard generations, but this worker's databases \
+                 carry no DR marker. The fence registry is process-wide, so the worker would \
+                 check its writes against another database's pins. Run it in its own process, \
+                 or set DrFencing::Enabled to fence its databases too.",
+            )
+        } else {
+            None
+        };
+        if refusal.is_none() {
+            if fenced {
+                pinned.fenced_worker = true;
+            } else {
+                pinned.unfenced_worker = true;
+            }
+        }
         drop(guard);
-    }
-
-    /// Whether a worker in this process started unfenced (issue #1823).
-    #[must_use]
-    pub fn has_unfenced_worker() -> bool {
-        let guard = PINNED
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let found = guard.as_ref().is_some_and(|pinned| pinned.unfenced_worker);
-        drop(guard);
-        found
+        refusal.map_or(Ok(()), |message| Err(message.to_string()))
     }
 
     /// Record that `shards` share one database (issue #1823).
@@ -1376,16 +1403,33 @@ mod db {
         conn: &mut AsyncPgConnection,
         shard: ShardId,
     ) -> HarvestResult<ShardGeneration> {
-        let inserted: Vec<GenerationRow> = diesel::sql_query(
-            "INSERT INTO harvest_shard_generation (shard_id, generation, fenced_reason) \
-             VALUES ($1, 0, 'provisioned') \
-             ON CONFLICT (shard_id) DO NOTHING \
-             RETURNING generation",
+        // An existing row needs no write. A restart therefore never waits.
+        if let Some(existing) = current_generation(conn, shard).await? {
+            return Ok(existing);
+        }
+        // A new row waits for every fenced pass already running on this
+        // database (issue #1823). See `PROVISION_LOCK_KEY`.
+        let shard_id = shard.as_i32();
+        let inserted: Vec<GenerationRow> = Box::pin(
+            conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+                diesel::sql_query(FENCE_PASS_LOCK_EXCLUSIVE)
+                    .bind::<BigInt, _>(PROVISION_LOCK_KEY)
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                diesel::sql_query(
+                    "INSERT INTO harvest_shard_generation (shard_id, generation, fenced_reason) \
+                     VALUES ($1, 0, 'provisioned') \
+                     ON CONFLICT (shard_id) DO NOTHING \
+                     RETURNING generation",
+                )
+                .bind::<Integer, _>(shard_id)
+                .load(conn)
+                .await
+                .map_err(database_error)
+            }),
         )
-        .bind::<Integer, _>(shard.as_i32())
-        .load(conn)
-        .await
-        .map_err(database_error)?;
+        .await?;
         if let Some(row) = inserted.into_iter().next() {
             return Ok(ShardGeneration(row.generation));
         }
@@ -1514,6 +1558,16 @@ mod db {
     pub(super) const fn fence_pass_lock_key(shard_id: i32) -> i64 {
         (1823_i64 << 32) | (shard_id as u32 as i64)
     }
+
+    /// The single-argument advisory key that serializes a new generation row
+    /// with the fenced passes on its database (issue #1823).
+    ///
+    /// Every pass guard takes it shared. Provisioning a new row takes it
+    /// exclusive, so the row waits for every pass already running. A pass
+    /// guards only the rows it saw, so a row provisioned mid-pass would have
+    /// no barrier. The high word differs from [`fence_pass_lock_key`] and the
+    /// heartbeat key, so no shard id can collide with it.
+    pub(super) const PROVISION_LOCK_KEY: i64 = 18_230_i64 << 32;
     /// The error a pass gets when its fence guard loses its session.
     const FENCE_PASS_LOST: &str = "the DR fence session ended, so the pass stopped. A fence \
                                    bump can commit after that point. Run the pass again.";
@@ -1574,8 +1628,16 @@ mod db {
     /// drops `pass`, and the pass stops before its next write. With no
     /// guard, the pass runs to its end.
     ///
-    /// A dropped pass can leave a transaction open. Close its connection,
-    /// so that the server rolls the transaction back. Do not reuse it.
+    /// A dropped pass can leave a transaction open on a pooled connection.
+    /// The pool discards a connection in a transaction state, so the server
+    /// rolls that transaction back.
+    ///
+    /// Known limit: dropping `pass` does not cancel a statement the server
+    /// already runs. An autocommit statement sent before the loss is seen
+    /// can still commit after a bump. The loss is seen within one keepalive
+    /// interval, so the window is that interval plus that statement's run
+    /// time. History appends do not depend on this guard: each asserts the
+    /// fence in its own transaction.
     ///
     /// # Errors
     ///
@@ -1830,6 +1892,13 @@ mod db {
         begin_guard_transaction(&mut conn).await?;
         diesel::sql_query(FENCE_PASS_LOCK_SHARED)
             .bind::<BigInt, _>(fence_pass_lock_key(shard.as_i32()))
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)?;
+        // A new row on this database waits for this pass. See
+        // `PROVISION_LOCK_KEY`.
+        diesel::sql_query(FENCE_PASS_LOCK_SHARED)
+            .bind::<BigInt, _>(PROVISION_LOCK_KEY)
             .execute(&mut conn)
             .await
             .map_err(database_error)?;
@@ -2431,30 +2500,10 @@ mod db {
             .resolve(dr_configured)
             .map_err(crate::error::HarvestError::Config)?;
         // This process already fences another database. The registry is
-        // process-wide, so an unfenced worker here would resolve its shards
-        // through those pins. Run it in its own process instead.
-        if !fence && FenceRegistry::has_real_pin() {
-            return Err(crate::error::HarvestError::Config(
-                "this process already pins DR shard generations, but this worker's databases \
-                 carry no DR marker. The fence registry is process-wide, so the worker would \
-                 check its writes against another database's pins. Run it in its own process, \
-                 or set DrFencing::Enabled to fence its databases too."
-                    .to_string(),
-            ));
-        }
-        // The reverse order: an unfenced worker already runs here. A pin
-        // published now would apply to that worker's database too.
-        if fence && FenceRegistry::has_unfenced_worker() {
-            return Err(crate::error::HarvestError::Config(
-                "this process already runs a worker whose databases carry no DR marker. The \
-                 fence registry is process-wide, so pinning DR shards now would check that \
-                 worker's writes against another database. Run this worker in its own \
-                 process, or set DrFencing::Enabled on both."
-                    .to_string(),
-            ));
-        }
+        // process-wide, so one process cannot mix fenced and unfenced workers.
+        // The check and the reservation are one atomic step.
+        FenceRegistry::reserve_mode(fence).map_err(crate::error::HarvestError::Config)?;
         if !fence {
-            FenceRegistry::mark_unfenced();
             if !held.is_empty() {
                 let default_shard = targets
                     .as_ref()
@@ -4129,6 +4178,24 @@ mod tests {
 
         FenceRegistry::clear();
         assert!(!FenceRegistry::is_enabled());
+    }
+
+    /// A process reserves one mode, fenced or unfenced, atomically (issue
+    /// #1823). The other mode is refused until the registry is cleared.
+    #[test]
+    fn a_process_reserves_one_fence_mode() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        assert!(FenceRegistry::reserve_mode(true).is_ok());
+        assert!(
+            FenceRegistry::reserve_mode(true).is_ok(),
+            "same mode is fine"
+        );
+        assert!(FenceRegistry::reserve_mode(false).is_err());
+        FenceRegistry::clear();
+        assert!(FenceRegistry::reserve_mode(false).is_ok());
+        assert!(FenceRegistry::reserve_mode(true).is_err());
+        FenceRegistry::clear();
     }
 
     /// A fenced-out process skips its shutdown writes (issue #1823). The flag

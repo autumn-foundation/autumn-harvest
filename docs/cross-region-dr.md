@@ -388,8 +388,10 @@ Three limits, stated plainly:
   that connection each second. If the session ends, the server frees the
   lock. The pass then stops: a scheduler pass before it fires, a partition
   pass or a rebalance at once, with an error. An admin write or a webhook
-  answers `503`. A write already in flight can still race a bump for up to
-  one second.
+  answers `503`. A statement the server already runs is not cancelled. It
+  can still commit after a bump, within one second plus its own run time.
+  History appends are not exposed: each checks the fence in its own
+  transaction.
 - The check reads every shard of the storage pool, and every pinned shard
   colocated with one, on each admin write. If one cannot be read, every
   admin write on the node answers `503`. That fails closed. A node that has
