@@ -552,6 +552,7 @@ impl AdaptiveLimitRegistry {
 
     /// The wake that fires when an activity type leaves its cap. The worker
     /// shares it as its capacity wake.
+    #[cfg(feature = "db")]
     #[must_use]
     pub(crate) fn slot_freed_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.slot_freed)
@@ -1034,7 +1035,7 @@ mod tests {
     fn a_freed_slot_notifies_the_worker() {
         use futures::FutureExt as _;
         let reg = registry(AdaptiveLimitPolicy::new(1, 1));
-        let freed = reg.slot_freed_notify();
+        let freed = Arc::clone(&reg.slot_freed);
         let held = permit(&reg, A);
         assert!(
             freed.notified().now_or_never().is_none(),
