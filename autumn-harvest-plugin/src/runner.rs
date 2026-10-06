@@ -2568,6 +2568,33 @@ mod tests {
         );
     }
 
+    // Issue #1837: a shared auto-assigned pool must not drain a cell shard.
+
+    fn cell_router() -> ShardRouter {
+        three_shard_router().with_reserved_shards([ShardId::new(1)])
+    }
+
+    #[test]
+    fn auto_assignment_is_refused_when_the_router_reserves_shards() {
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&cell_router(), &[]),
+            vec![1],
+            "an auto pool would drain the reserved shard",
+        );
+    }
+
+    #[test]
+    fn explicit_assignment_is_accepted_with_reserved_shards() {
+        let router = cell_router();
+        assert!(reserved_shards_under_auto_assignment(&router, &[ShardId::new(0)]).is_empty());
+        assert!(reserved_shards_under_auto_assignment(&router, &[ShardId::new(1)]).is_empty());
+    }
+
+    #[test]
+    fn auto_assignment_is_accepted_without_reserved_shards() {
+        assert!(reserved_shards_under_auto_assignment(&three_shard_router(), &[]).is_empty());
+    }
+
     // ---------------------------------------------------------------------
     // Issue #1128: the standalone boot-time orphaned-workflow-type gate.
     // ---------------------------------------------------------------------

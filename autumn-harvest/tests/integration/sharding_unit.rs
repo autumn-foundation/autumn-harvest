@@ -98,3 +98,108 @@ fn outbox_retry_picks_same_shard_for_same_workflow_key() {
         assert_eq!(router.pick_for_new_workflow("onboarding", "user-42"), first);
     }
 }
+
+// ── Reserved (cell) shards, issue #1837 ─────────────────────────────────────
+
+/// Three writable shards. Shard 1 is reserved for one tenant cell.
+fn cell_router() -> ShardRouter {
+    let all = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+    ShardRouter::new(all.clone(), all, ShardId::new(0))
+        .with_residency_map([("cell-a".to_string(), ShardId::new(1))])
+        .with_reserved_shards([ShardId::new(1)])
+}
+
+#[test]
+fn auto_placement_never_picks_a_reserved_shard() {
+    let router = cell_router();
+    for i in 0..2_000 {
+        let id = format!("tenant-b-{i}");
+        assert_ne!(router.pick_for_new_workflow("wf", &id), ShardId::new(1));
+        assert_ne!(router.pick_for_idempotency_key("wf", &id), ShardId::new(1));
+        assert_ne!(router.pick_for_dag(&id), ShardId::new(1));
+    }
+}
+
+#[test]
+fn a_pin_still_reaches_a_reserved_shard() {
+    use autumn_harvest::shard::ShardPlacement;
+    let router = cell_router();
+    let by_key = ShardPlacement::residency_key("cell-a");
+    assert_eq!(
+        router.resolve_placement(&by_key, "wf", "a-1"),
+        Ok(ShardId::new(1))
+    );
+    let by_shard = ShardPlacement::Shard(ShardId::new(1));
+    assert_eq!(
+        router.resolve_placement(&by_shard, "wf", "a-2"),
+        Ok(ShardId::new(1))
+    );
+    assert!(router.is_writable(ShardId::new(1)));
+}
+
+/// Only keys that hashed to the reserved shard move. All other keys keep
+/// their shard, so a reservation does not reshuffle shared tenants.
+#[test]
+fn reserving_a_shard_moves_only_the_keys_that_hashed_to_it() {
+    let all = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+    let plain = ShardRouter::new(all.clone(), all, ShardId::new(0));
+    let cells = cell_router();
+    let mut moved = 0;
+    for i in 0..2_000 {
+        let id = format!("k-{i}");
+        let before = plain.pick_for_new_workflow("wf", &id);
+        let after = cells.pick_for_new_workflow("wf", &id);
+        if before == ShardId::new(1) {
+            moved += 1;
+        } else {
+            assert_eq!(before, after, "key {id} moved off a shared shard");
+        }
+    }
+    assert!(moved > 0, "the reserved shard received no keys before");
+}
+
+#[test]
+fn no_reservation_leaves_placement_byte_identical() {
+    let all = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+    let plain = ShardRouter::new(all.clone(), all, ShardId::new(0));
+    let empty = plain.clone().with_reserved_shards([]);
+    assert!(empty.reserved_shards().is_empty());
+    for i in 0..500 {
+        let id = format!("k-{i}");
+        assert_eq!(
+            plain.pick_for_new_workflow("wf", &id),
+            empty.pick_for_new_workflow("wf", &id)
+        );
+    }
+}
+
+#[test]
+fn reserved_shards_are_sorted_and_deduplicated() {
+    let all = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+    let router = ShardRouter::new(all.clone(), all, ShardId::new(0)).with_reserved_shards([
+        ShardId::new(2),
+        ShardId::new(1),
+        ShardId::new(2),
+    ]);
+    assert_eq!(
+        router.reserved_shards(),
+        &[ShardId::new(1), ShardId::new(2)]
+    );
+    assert!(router.is_reserved(ShardId::new(2)));
+    assert!(!router.is_reserved(ShardId::new(0)));
+}
+
+#[test]
+#[should_panic(expected = "reserved shard 9 is not in the readable set")]
+fn reserving_an_unknown_shard_panics_at_boot() {
+    let all = vec![ShardId::new(0), ShardId::new(1)];
+    let _ = ShardRouter::new(all.clone(), all, ShardId::new(0))
+        .with_reserved_shards([ShardId::new(9)]);
+}
+
+#[test]
+#[should_panic(expected = "leaves no writable shard for unpinned starts")]
+fn reserving_every_writable_shard_panics_at_boot() {
+    let all = vec![ShardId::new(0), ShardId::new(1)];
+    let _ = ShardRouter::new(all.clone(), all.clone(), ShardId::new(0)).with_reserved_shards(all);
+}
