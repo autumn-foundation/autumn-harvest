@@ -129,6 +129,11 @@ constraint name, so callers cannot tell the layouts apart from the error.
 > conflicting in-flight appends *and* a cohort boundary falling between their
 > insert instants — microseconds per cohort, against a split-brain that is
 > itself rare.
+>
+> **Decision (issue #1839): detect, do not prevent.** `harvest backup verify`
+> reports such a pair as `duplicate_event_id`, an **Incoherent** finding. The
+> probe runs on the partitioned layout only. See
+> [ADR 0004](adr/0004-partitioned-duplicate-append-detection.md).
 
 **2. Past partitions are sealed.** A cohort's range is a window of wall clock
 that has already closed, and the `DEFAULT` can only produce a cohort at or after

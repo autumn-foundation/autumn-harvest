@@ -346,7 +346,8 @@ event, an `ActivityCompleted`.
   workflow.
 - #1876: Postgres keeps the open transaction of a partitioned worker until
   TCP keepalive ends the session. That transaction keeps its row locks.
-  Orphan reclaim blocks on such a lock, so no orphan is reclaimed.
+  Orphan reclaim blocked on such a lock, so no orphan was reclaimed. The
+  #1876 fix makes reclaim skip a locked row and reclaim the other rows.
 - #1879: the heartbeat period was the interval plus the tick latency. When a
   tick took longer than one interval, a live worker looked dead. False
   reclaims then counted crash strikes and quarantined healthy work. The fix
@@ -368,8 +369,10 @@ Each test works around a bug only where the bug applies:
   instance claimed. Each accepted `FAILED` must have the exact history: one
   activity terminal event, a `StartToClose` timeout, and one terminal event,
   a `WorkflowFailed` for the timeout.
-- For #1876, the partition test sets `idle_in_transaction_session_timeout =
-  5s` on the server to end the session.
+- The partition test sets `idle_in_transaction_session_timeout = 5s` on the
+  server. This setting is no longer a #1876 workaround. A row that the
+  cut-off session locks stays locked until the session ends. The 5 s limit
+  ends that session within the test budget, so the setting stays.
 
 When a fix for a bug merges, remove its workaround.
 

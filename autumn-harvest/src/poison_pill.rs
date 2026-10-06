@@ -27,6 +27,13 @@
 //! own reset call fails to reach the database in time. The worker-liveness
 //! pass above never catches that case, since the worker itself never died.
 //! See [`stuck_running_tasks_query`].
+//!
+//! Neither pass waits on a task row that another session locks (issue
+//! #1876). A partitioned worker can keep its transaction, and its row locks,
+//! open on the server. Each pass skips such a row and retries it on the next
+//! pass. A quarantine also locks the owning execution and its open tasks.
+//! Those locks still wait, up to the session `lock_timeout`. A timeout or a
+//! deadlock on one row skips that row, not the pass.
 
 /// What to do with an orphaned `RUNNING` task whose claiming worker has died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,11 +274,11 @@ pub const fn stuck_running_tasks_query() -> &'static str {
 /// separate round trips into one.
 ///
 /// Runs *after* the caller already holds the row lock. That lock comes
-/// from a plain `SELECT ... FOR UPDATE` naming only `harvest_task_queue`,
-/// in [`requeue_orphan`]. This statement then combines the row-state
-/// re-check and the worker-liveness re-check into a single `UPDATE ...
-/// WHERE ... RETURNING`. It replaces what used to be a dedicated liveness
-/// `SELECT` followed by the `UPDATE`.
+/// from a `SELECT ... FOR UPDATE SKIP LOCKED` naming only
+/// `harvest_task_queue`, in [`requeue_orphan`]. This statement then
+/// combines the row-state re-check and the worker-liveness re-check into a
+/// single `UPDATE ... WHERE ... RETURNING`. It replaces what used to be a
+/// dedicated liveness `SELECT` followed by the `UPDATE`.
 ///
 /// **This statement must never be the first one to touch the row in its
 /// transaction.** An `UPDATE`'s own row lock only guarantees a fresh read
@@ -287,13 +294,13 @@ pub const fn stuck_running_tasks_query() -> &'static str {
 /// committing the resurrection mid-wait (see this PR's review history for
 /// the reproduction).
 ///
-/// The caller's preceding `SELECT ... FOR UPDATE` absorbs that wait
-/// instead. By the time *this* statement runs, the row lock is already
-/// ours, so this statement can never itself block. A fresh top-level
-/// statement in `READ COMMITTED` always starts with a snapshot as of its
-/// own start. That start is after the caller's wait, if any, resolved.
-/// That is what makes the liveness check here as fresh as the dedicated
-/// `SELECT` it replaces, not merely close to it.
+/// The caller's preceding `SELECT ... FOR UPDATE SKIP LOCKED` takes the
+/// lock first. It never waits. It skips a row that another session holds
+/// (issue #1876). By the time *this* statement runs, the row lock is
+/// already ours, so this statement can never itself block. A fresh
+/// top-level statement in `READ COMMITTED` always starts with a snapshot
+/// as of its own start. That is what makes the liveness check here as
+/// fresh as the dedicated `SELECT` it replaces, not merely close to it.
 ///
 /// `$1` = task id, `$2` = claiming worker id, `$3` = the crash-strike
 /// count the caller observed at scan time. `$4` = the new crash-strike
@@ -452,10 +459,13 @@ mod scanner {
             // `harvest_task_queue`. This is what makes the combined
             // statement below safe. See `requeue_orphan_stmt`'s doc
             // comment: the liveness re-check cannot share a statement
-            // with the row's own lock acquisition.
+            // with the row's own lock acquisition. `SKIP LOCKED` returns
+            // no row while another session holds the lock. The next pass
+            // retries the orphan (issue #1876).
             let locked: Option<uuid::Uuid> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
+                .skip_locked()
                 .select(dsl::id)
                 .first(conn)
                 .await
@@ -473,10 +483,10 @@ mod scanner {
             //
             // `now` is read here, in Rust, rather than via SQL `NOW()`.
             // Postgres fixes `NOW()` at the transaction's start, not the
-            // statement's. A statement issued after the lock above had to
-            // wait would still see the pre-wait time. Reading it here
-            // matches the pre-fix code, which computed `Utc::now()` at
-            // this same point -- after the row lock, not before it.
+            // statement's. A lock wait before this point would make `NOW()`
+            // stale. `SKIP LOCKED` removes that wait, but this read does not
+            // depend on it. It matches the pre-fix code, which computed
+            // `Utc::now()` at this same point -- after the row lock.
             let now = Utc::now();
             let updated: Option<IdRow> = diesel::sql_query(super::requeue_orphan_stmt())
                 .bind::<diesel::sql_types::Uuid, _>(task_id)
@@ -540,9 +550,12 @@ mod scanner {
             // the pre-scan snapshot. A reset or a fresh re-claim between the
             // scan and here always changes it. Re-checking its age here is
             // what stops this from undoing a legitimate new attempt.
+            // `SKIP LOCKED` skips the row while another session holds it.
+            // The next pass retries it (issue #1876).
             let current: Option<StuckRowState> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
+                .skip_locked()
                 .select((
                     dsl::state,
                     dsl::worker_id,
@@ -895,12 +908,15 @@ mod scanner {
                     // `worker_still_dead` below is deliberately a separate,
                     // later statement instead. It runs only once this lock is
                     // already ours, so it is guaranteed a fresh snapshot.
+                    // `SKIP LOCKED` skips the row while another session
+                    // holds it. The next pass retries it (issue #1876).
                     // Issue #1879: `attempt` and `started_at` fence the claim
                     // too. A reset keeps `crash_strikes`, and the same worker
                     // can claim the row again between the scan and this lock.
                     let current: Option<LockedClaim> = dsl::harvest_task_queue
                         .find(task_id)
                         .for_update()
+                        .skip_locked()
                         .select((
                             dsl::state,
                             dsl::worker_id,
@@ -1044,6 +1060,41 @@ mod scanner {
         Ok(acted)
     }
 
+    /// Whether `error` ends the work on one row but leaves the pass able to
+    /// continue (issue #1876).
+    ///
+    /// A `lock_timeout` or `statement_timeout` cancels one statement, for
+    /// example a lock on the owning execution. A deadlock (SQLSTATE 40P01)
+    /// aborts one transaction. `SKIP LOCKED` makes it possible: two
+    /// reclaimers can each lock a sibling orphan of one execution. In each
+    /// case the per-row transaction rolls back, and the connection stays
+    /// usable.
+    ///
+    /// Like [`crate::pool::is_session_timeout`], the check reads the English
+    /// message text.
+    pub(super) fn is_row_conflict(error: &HarvestError) -> bool {
+        crate::pool::is_session_timeout(error)
+            || matches!(error, HarvestError::Database(msg) if msg.contains("deadlock detected"))
+    }
+
+    /// Turn a row conflict into a skip (issue #1876).
+    fn skip_on_row_conflict(
+        outcome: HarvestResult<bool>,
+        task: &TaskQueueItem,
+    ) -> HarvestResult<bool> {
+        match outcome {
+            Err(e) if is_row_conflict(&e) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "orphan reclaim skipped a task after a row conflict; the next pass retries it"
+                );
+                Ok(false)
+            }
+            other => other,
+        }
+    }
+
     /// Reclaim `RUNNING` tasks orphaned by a dead worker, then (issue #1459)
     /// tasks stuck long past their budget regardless of worker liveness.
     ///
@@ -1063,13 +1114,18 @@ mod scanner {
     /// touches `crash_strikes` and never quarantines — being stuck this way
     /// says nothing about the task itself.
     ///
+    /// A task row that another session locks is skipped. A timeout or a
+    /// deadlock on one row skips that row too. The next pass retries a
+    /// skipped row (issue #1876).
+    ///
     /// This sweep quarantines an orphan on first sight. A late heartbeat can
     /// then quarantine a live worker's task (issue #1879). In a reclaim loop,
     /// use [`reclaim_orphaned_tasks_witnessed`] instead.
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Database`] on query failure.
+    /// Returns [`HarvestError::Database`] on query failure, except for a
+    /// skipped row.
     pub async fn reclaim_orphaned_tasks(
         conn: &mut AsyncPgConnection,
         threshold: i32,
@@ -1229,21 +1285,18 @@ mod scanner {
                     if wait {
                         summary.held += 1;
                         held.insert(task.id);
-                    } else if quarantine_orphan(
-                        conn,
-                        &task,
-                        new_strikes,
-                        dead_secs,
-                        metrics,
-                        codecs,
-                    )
-                    .await?
-                    {
+                        continue;
+                    }
+                    let outcome =
+                        quarantine_orphan(conn, &task, new_strikes, dead_secs, metrics, codecs)
+                            .await;
+                    if skip_on_row_conflict(outcome, &task)? {
                         summary.quarantined += 1;
                     }
                 }
                 ReclaimAction::Requeue => {
-                    if requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await? {
+                    let outcome = requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await;
+                    if skip_on_row_conflict(outcome, &task)? {
                         summary.requeued += 1;
                         // Dispatch hint (issue #1312). The orphan is `PENDING`
                         // again and its inner transaction has committed, so the
@@ -1262,7 +1315,8 @@ mod scanner {
                 .await
                 .map_err(crate::error::database_error)?;
             for task in stuck.into_iter().filter(|task| !held.contains(&task.id)) {
-                if requeue_stuck_task(conn, &task, stuck_running_secs).await? {
+                let outcome = requeue_stuck_task(conn, &task, stuck_running_secs).await;
+                if skip_on_row_conflict(outcome, &task)? {
                     summary.stuck_requeued += 1;
                     crate::queue::record_pending_hints(conn, &[task.id]).await;
                 }
@@ -1424,6 +1478,38 @@ mod scanner {
             // registered and correctly ages into `Wedged`.
             crate::scanner_health::deregister_scanner(owner);
         })
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod scanner_tests {
+    use super::scanner::is_row_conflict;
+    use crate::error::HarvestError;
+
+    fn db(msg: &str) -> HarvestError {
+        HarvestError::Database(msg.to_owned())
+    }
+
+    /// Issue #1876: these errors end one row's work, so the pass skips the row.
+    #[test]
+    fn a_timeout_or_deadlock_on_one_row_is_a_row_conflict() {
+        assert!(is_row_conflict(&db(
+            "canceling statement due to lock timeout"
+        )));
+        assert!(is_row_conflict(&db(
+            "canceling statement due to statement timeout"
+        )));
+        assert!(is_row_conflict(&db("deadlock detected")));
+    }
+
+    /// Any other error ends the pass, so the poll loop reports it.
+    #[test]
+    fn other_errors_are_not_a_row_conflict() {
+        assert!(!is_row_conflict(&db("connection closed")));
+        assert!(!is_row_conflict(&db(
+            "canceling statement due to user request"
+        )));
+        assert!(!is_row_conflict(&HarvestError::Config("bad".to_owned())));
     }
 }
 
