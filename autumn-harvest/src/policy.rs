@@ -382,7 +382,7 @@ pub struct CircuitBreakerPolicy {
 
 /// What a dispatch does while its circuit breaker is open (issue #1809).
 ///
-/// `docs/adr/0004-activity-timeout-retry-and-open-circuit.md` records why
+/// `docs/adr/0005-activity-timeout-retry-and-open-circuit.md` records why
 /// [`Defer`](Self::Defer) is the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

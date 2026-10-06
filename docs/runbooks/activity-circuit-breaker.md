@@ -16,7 +16,7 @@ policy's `open_mode` sets what a dispatch does while the breaker is open
   `CircuitOpen` error within seconds. Workflows that handle failure (Saga
   compensation, branching) reach their recovery path quickly.
 
-[ADR 0004](../adr/0004-activity-timeout-retry-and-open-circuit.md) records why
+[ADR 0005](../adr/0005-activity-timeout-retry-and-open-circuit.md) records why
 defer is the default: a fail-fast breaker turns overload into permanent
 failure.
 

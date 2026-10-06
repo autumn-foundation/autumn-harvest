@@ -1,7 +1,7 @@
 #![cfg(feature = "db")]
 //! Activity timeout retries and the open circuit (issue #1809).
 //!
-//! `docs/adr/0004-activity-timeout-retry-and-open-circuit.md` records the
+//! `docs/adr/0005-activity-timeout-retry-and-open-circuit.md` records the
 //! decision. These tests hold the code to it:
 //!
 //! - A start-to-close or heartbeat timeout retries per the retry policy.
@@ -426,7 +426,7 @@ async fn workflow_task_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId)
 // Timeout retries
 // ---------------------------------------------------------------------------
 
-/// ADR 0004 §1: a start-to-close timeout retries per the retry policy. With
+/// ADR 0005 §1: a start-to-close timeout retries per the retry policy. With
 /// `max_attempts = 3`, attempts 1 and 2 go back to `PENDING` and append no
 /// event. Attempt 3 appends `ActivityTimedOut { StartToClose }` and fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -494,7 +494,7 @@ async fn start_to_close_timeout_retries_until_max_attempts() {
     }
 }
 
-/// ADR 0004 §1: a heartbeat timeout retries like a start-to-close timeout.
+/// ADR 0005 §1: a heartbeat timeout retries like a start-to-close timeout.
 /// The retry keeps the heartbeat details and the crash strikes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_timeout_retries_and_keeps_heartbeat_details() {
@@ -773,7 +773,7 @@ async fn schedule_to_close_counts_a_remote_current_claim() {
     assert_eq!(breaker_state(&owner, activity), ("closed", 1));
 }
 
-/// ADR 0004 §1: no retry starts after `schedule_to_close`. The task fails
+/// ADR 0005 §1: no retry starts after `schedule_to_close`. The task fails
 /// with its own timeout type.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_retry_stops_at_the_schedule_to_close_deadline() {
@@ -807,7 +807,7 @@ async fn timeout_retry_stops_at_the_schedule_to_close_deadline() {
     );
 }
 
-/// ADR 0004 §1: a pause stops the `schedule_to_close` clock, so the deadline
+/// ADR 0005 §1: a pause stops the `schedule_to_close` clock, so the deadline
 /// does not stop the retry of a paused execution.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paused_execution_retries_past_the_deadline() {
@@ -845,7 +845,7 @@ async fn paused_execution_retries_past_the_deadline() {
     );
 }
 
-/// ADR 0004 §1: schedule-to-start is not retried, and a task that never left
+/// ADR 0005 §1: schedule-to-start is not retried, and a task that never left
 /// the queue never feeds the breaker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn schedule_to_start_timeout_stays_terminal() {
@@ -873,7 +873,7 @@ async fn schedule_to_start_timeout_stays_terminal() {
     assert_eq!(breaker_state(&breakers, activity), ("closed", 0));
 }
 
-/// ADR 0004 §2: a `PENDING` task that passes `schedule_to_close` in the queue
+/// ADR 0005 §2: a `PENDING` task that passes `schedule_to_close` in the queue
 /// never feeds the breaker, even after an earlier attempt started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_schedule_to_close_timeout_does_not_feed_the_breaker() {
@@ -934,7 +934,7 @@ fn breaker_state(breakers: &CircuitBreakerRegistry, activity: &str) -> (&'static
     (snapshot.state, snapshot.rolling_failure_count)
 }
 
-/// ADR 0004 §2: a timeout of a claimed task whose handler never started
+/// ADR 0005 §2: a timeout of a claimed task whose handler never started
 /// does not change breaker state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unstarted_timeout_leaves_the_breaker_unchanged() {
@@ -967,7 +967,7 @@ async fn unstarted_timeout_leaves_the_breaker_unchanged() {
     );
 }
 
-/// ADR 0004 §2: a timeout of an attempt whose handler started still counts.
+/// ADR 0005 §2: a timeout of an attempt whose handler started still counts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn started_timeout_feeds_the_breaker() {
     let (url, _container) = setup_db().await;
@@ -1277,7 +1277,7 @@ async fn a_failed_result_write_honours_the_timeout_record() {
     );
 }
 
-/// ADR 0004 §2, on the retry path: a retried timeout of a started attempt
+/// ADR 0005 §2, on the retry path: a retried timeout of a started attempt
 /// feeds the breaker. A later claim is a new attempt, so the start of an
 /// earlier attempt does not mark it started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1538,7 +1538,7 @@ async fn activity_row_state(
     })
 }
 
-/// ADR 0004 §3: an open breaker defers work and does not fail it. When the
+/// ADR 0005 §3: an open breaker defers work and does not fail it. When the
 /// breaker closes, the deferred activity runs and the workflow completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_breaker_defers_work_by_default() {
@@ -1620,7 +1620,7 @@ async fn open_breaker_defers_work_by_default() {
     handle.await.expect("worker joins");
 }
 
-/// ADR 0004 §3: a breaker that tripped on its own defers work until its
+/// ADR 0005 §3: a breaker that tripped on its own defers work until its
 /// cooldown admits a probe. The deferred task runs as that probe, succeeds
 /// and closes the breaker. No operator action is needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1787,7 +1787,7 @@ async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
     );
 }
 
-/// ADR 0004 §3: `FailFast` keeps the old behaviour. The open breaker fails
+/// ADR 0005 §3: `FailFast` keeps the old behaviour. The open breaker fails
 /// the attempt with a non-retryable `CircuitOpen`, so the workflow fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fail_fast_mode_fails_the_attempt() {

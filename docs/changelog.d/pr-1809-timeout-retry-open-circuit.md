@@ -5,7 +5,7 @@ and heartbeat timeouts retry per policy. Every timeout of a `RUNNING` task
 also fed the circuit breaker, even when the handler never started. An open
 breaker then failed later work with a non-retryable `CircuitOpen`. Overload
 could thus become permanent failure (#1785).
-[ADR 0004](../adr/0004-activity-timeout-retry-and-open-circuit.md) records the
+[ADR 0005](../adr/0005-activity-timeout-retry-and-open-circuit.md) records the
 decision.
 
 **Behavior changes.**
@@ -51,7 +51,7 @@ decision.
 - New counter `harvest.activity.circuit.deferred` (`activity.name`), on the
   starter dashboard. `GET /admin/circuits` reports `open_mode`.
 - Stall diagnosis says that an open breaker defers by default.
-- Docs: ADR 0004; the circuit-breaker, triage, alert and containment
+- Docs: ADR 0005; the circuit-breaker, triage, alert and containment
   runbooks; Chapter 7; the design doc; `architecture.md` §9; `telemetry.md`;
   the 0.7.0 upgrade guide (§1.2, §1.7 and §1.8); the 0.5.0 migration table; the
   SQLite crate docs, which now state that SQLite keeps terminal timeouts.

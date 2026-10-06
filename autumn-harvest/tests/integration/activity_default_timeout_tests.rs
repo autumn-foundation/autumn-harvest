@@ -467,7 +467,7 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
     .expect("timeout sweep");
 
     // The timeout ends the attempt. It retries per the retry policy (issue
-    // #1809, ADR 0004). The default policy allows 3 attempts, so the run
+    // #1809, ADR 0005). The default policy allows 3 attempts, so the run
     // does not fail, and no event is appended yet.
     let row: TaskQueueItem = harvest_task_queue::table
         .find(task.id)

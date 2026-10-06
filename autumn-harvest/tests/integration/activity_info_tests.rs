@@ -1322,7 +1322,7 @@ async fn checkpointing_activity_loses_zero_completed_work() {
     // --- Negative control: same work, no deadline guard. ---
     //
     // Without the guard the attempt is killed by the `start_to_close` scanner.
-    // The control allows one attempt, so the timeout is terminal (ADR 0004,
+    // The control allows one attempt, so the timeout is terminal (ADR 0005,
     // issue #1809), and the run fails with strictly fewer than TOTAL_ITEMS
     // processed. This is what makes the guarded result above
     // attributable to `ctx.is_expiring_within` rather than to luck.

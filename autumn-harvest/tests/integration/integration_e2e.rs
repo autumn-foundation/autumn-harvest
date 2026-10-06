@@ -3402,7 +3402,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 vec![ActivityInfo {
                     name: "slow_activity",
                     module: "integration_e2e",
-                    // One attempt keeps the timeout terminal (ADR 0004,
+                    // One attempt keeps the timeout terminal (ADR 0005,
                     // issue #1809). The default policy would retry it.
                     default_retry_policy: Some(autumn_harvest::RetryPolicy::fixed(
                         1,

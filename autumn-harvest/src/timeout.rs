@@ -64,7 +64,7 @@ impl std::fmt::Display for TimeoutReason {
 impl TimeoutReason {
     /// Whether this timeout retries per the retry policy (issue #1809).
     ///
-    /// ADR 0004 records the rule. A start-to-close or heartbeat timeout ends
+    /// ADR 0005 records the rule. A start-to-close or heartbeat timeout ends
     /// one attempt, and the next attempt can succeed. A schedule-to-start
     /// retry goes back to the same starved queue. Schedule-to-close is the
     /// deadline for all attempts.
@@ -2199,7 +2199,7 @@ async fn enforce_activity_timeout(
                     handler_elapsed_secs: locked.current_handler_elapsed_secs,
                 })
             };
-            // Timeout retry (issue #1809, ADR 0004). A start-to-close or
+            // Timeout retry (issue #1809, ADR 0005). A start-to-close or
             // heartbeat timeout retries per the retry policy, as a handler
             // failure does. The check above confirmed the scanned claim, and
             // the requeue is fenced by it too. It appends no event: the
@@ -6798,7 +6798,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 
 #[cfg(test)]
 mod tests {
-    // ── Timeout retry rule (issue #1809, ADR 0004) ───────────────────────
+    // ── Timeout retry rule (issue #1809, ADR 0005) ───────────────────────
 
     /// A confirmed timeout releases a probe slot either way. Only a probe whose
     /// handler started records the trip (issue #1809). An unstarted probe

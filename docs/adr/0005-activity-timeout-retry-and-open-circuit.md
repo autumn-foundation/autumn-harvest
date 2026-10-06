@@ -1,4 +1,4 @@
-# ADR 0004: Activity timeout retries and the open circuit
+# ADR 0005: Activity timeout retries and the open circuit
 
 ## Status
 

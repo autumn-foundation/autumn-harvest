@@ -57,7 +57,7 @@ quote = "1"
 proc-macro2 = "1"
 
 # Redis
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "streams", "script"] }
+redis = { version = "0.32", default-features = false, features = ["tokio-comp", "connection-manager", "streams", "script", "tokio-rustls-comp"] }
 
 # SQLite (embedded, single-writer edge backend — bundled builds SQLite from
 # source so no system libsqlite3 and no Docker are required for tests).

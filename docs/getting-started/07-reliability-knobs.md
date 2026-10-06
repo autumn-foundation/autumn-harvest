@@ -115,7 +115,7 @@ retry starts after `schedule_to_close`. When the deadline stops the retry, the
 event keeps the attempt's own type (`StartToClose` or `Heartbeat`), not
 `ScheduleToClose`. A `schedule_to_start` or
 `schedule_to_close` timeout is terminal.
-[ADR 0004](../adr/0004-activity-timeout-retry-and-open-circuit.md) records the
+[ADR 0005](../adr/0005-activity-timeout-retry-and-open-circuit.md) records the
 rule. To keep a timeout terminal, set `max_attempts = 1`. Set `start_to_close`
 together with `schedule_to_close`. A `schedule_to_close` alone removes the
 10-minute default, so a hung attempt is never retried. A timed-out attempt
