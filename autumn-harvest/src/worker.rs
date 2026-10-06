@@ -17667,15 +17667,18 @@ async fn process_activity_task(
     // finalization. A failed finalization counts as a failure, so a worker
     // that loses its writes cannot report a clean ratio. A cancelled attempt
     // is skipped, as in the circuit breaker.
-    let record_outcome = |finalized: Option<queue::ClaimWrite>, error: Option<&HarvestError>| {
-        if let Some(failed) = activity_attempt_outcome(status, was_cancelled, finalized) {
+    // Takes the whole result, so a transient error always reaches the
+    // deferral rule.
+    let record_outcome = |finalized: &HarvestResult<queue::ClaimWrite>| {
+        let write = finalize_write_for_outcome(finalized);
+        if let Some(failed) = activity_attempt_outcome(status, was_cancelled, write) {
             // Through finalization: a slow persist path is part of the attempt.
             record_activity_outcome(
                 task_outcomes,
                 deferred_failure,
                 outlier_clock,
                 failed,
-                error,
+                finalized.as_ref().err(),
             );
         }
     };
@@ -17740,8 +17743,9 @@ async fn process_activity_task(
         {
             Ok(policy) => policy,
             Err(error) => {
-                record_outcome(None, None);
-                return Err(error);
+                let failed = Err(error);
+                record_outcome(&failed);
+                return failed.map(|_| ());
             }
         }
     };
@@ -17820,7 +17824,7 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
-        record_outcome(Some(queue::ClaimWrite::Applied), None);
+        record_outcome(&Ok(queue::ClaimWrite::Applied));
         return Ok(());
     }
 
@@ -17865,10 +17869,7 @@ async fn process_activity_task(
         &activity_result,
     )
     .await;
-    record_outcome(
-        finalize_write_for_outcome(&finalized),
-        finalized.as_ref().err(),
-    );
+    record_outcome(&finalized);
     finalized.map(|_| ())
 }
 

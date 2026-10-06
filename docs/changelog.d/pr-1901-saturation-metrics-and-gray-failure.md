@@ -64,6 +64,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   that keeps its id always writes above the rows of its previous process.
 - Two workers in one process share the gauge, so it reports the OR of their
   verdicts.
+- The build id is the only code identity in the cohort key. Workers without
+  one share a cohort across code versions that register the same names, so
+  set `build_id` for a rolling deployment.
 - The peers are the live `Active` workers that poll the same queues with the
   same `queue_weights`, on the same build with the same labels and the same
   slots per task kind (or the same slot-tuner band and tuner policy),

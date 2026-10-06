@@ -3399,7 +3399,10 @@ the gauge reads `1` when either worker is an outlier.
 
 The peers are the live, `Active` workers that poll the same queues with the
 same `queue_weights`, on the same build with the same labels, and with the
-same `max_concurrent_workflows` and `max_concurrent_activities`. A worker with
+same `max_concurrent_workflows` and `max_concurrent_activities`. The build id is the
+only code identity in the key. Workers without one share a cohort across code
+versions that register the same names, so set `build_id` for a rolling
+deployment. A worker with
 a slot tuner is keyed on the tuner's band, its initial target per kind and
 the tuner's `policy()` instead, because the tuner sizes its slots from there. Session capacity counts
 too, because session member activities are pinned to the session's host. So do
