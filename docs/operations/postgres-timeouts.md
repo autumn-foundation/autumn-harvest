@@ -100,10 +100,15 @@ runs again on a new connection. A task that still fails goes back to the queue.
 
 A worker cut off by a network partition can keep its transaction open on the
 server. That session keeps its row locks until
-`idle_in_transaction_session_timeout` or TCP keepalive ends it. Orphan reclaim
-skips a task row that another session locks, and retries it on the next pass
-(issue #1876). A session timeout on one row skips that row, not the pass. So
-the timeout bounds the delay for the locked row only.
+`idle_in_transaction_session_timeout` or TCP keepalive ends it. TCP keepalive
+takes about two hours by default. Orphan reclaim skips a task row that another
+session locks, and retries it on the next pass (issue #1876). So
+`idle_in_transaction_session_timeout` delays only the locked row. Set it on
+every pool, or on the database role for pools that Harvest does not configure.
+
+A quarantine also locks the owning execution and its open tasks. Those locks
+still wait, up to `lock_timeout`. A timeout or a deadlock on one row skips that
+row, not the pass. A zero `lock_timeout` removes that limit.
 
 `ShardedDbPool::from_dsns`, which `harvest shard rebalance` uses, builds
 `Maintenance` pools.

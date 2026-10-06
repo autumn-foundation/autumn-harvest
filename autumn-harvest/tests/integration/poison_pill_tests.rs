@@ -976,6 +976,7 @@ async fn lock_timeout_on_one_orphan_does_not_end_the_pass() {
     let blocked = insert_running_task(&mut conn, Some(locked_exec), "dead-worker-x", 2).await;
     let free = insert_running_task(&mut conn, Some(free_exec), "dead-worker-x", 2).await;
     let mut zombie = hold_row_lock(&container, "harvest_workflow_executions", locked_exec).await;
+    // A short stand-in for the 30 s `lock_timeout` of `DbRole::Scanner`.
     conn.batch_execute("SET lock_timeout = '200ms'")
         .await
         .expect("set lock_timeout");
@@ -1003,4 +1004,36 @@ async fn lock_timeout_on_one_orphan_does_not_end_the_pass() {
     );
     assert_eq!(task_state(&mut conn, blocked).await.0, "FAILED");
     assert_eq!(workflow_state(&mut conn, locked_exec).await, "FAILED");
+}
+
+/// A quarantine fails every open task of its execution. A sibling task that
+/// another session locks must skip the orphan, not stall or end the pass.
+#[tokio::test]
+async fn locked_sibling_skips_the_quarantine_of_its_execution() {
+    let (mut conn, container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-locked-sibling").await;
+    let orphan = insert_running_task(&mut conn, Some(exec_id), "dead-worker-s", 2).await;
+    let sibling = insert_running_task(&mut conn, Some(exec_id), "dead-worker-s", 2).await;
+    let mut zombie = hold_row_lock(&container, "harvest_task_queue", sibling).await;
+    // A short stand-in for the 30 s `lock_timeout` of `DbRole::Scanner`.
+    conn.batch_execute("SET lock_timeout = '200ms'")
+        .await
+        .expect("set lock_timeout");
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(summary.quarantined, 0, "the sibling lock skips the orphan");
+    assert_eq!(task_state(&mut conn, orphan).await.0, "RUNNING");
+    assert_eq!(task_state(&mut conn, sibling).await.0, "RUNNING");
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
+    assert_eq!(dead_letter_count(&mut conn).await, 0);
+
+    zombie.batch_execute("ROLLBACK").await.expect("release");
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(summary.quarantined, 1, "one quarantine fails the execution");
+    assert_eq!(task_state(&mut conn, orphan).await.0, "FAILED");
+    assert_eq!(task_state(&mut conn, sibling).await.0, "FAILED");
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");
 }

@@ -27,7 +27,9 @@
 //! Neither pass waits on a task row that another session locks (issue
 //! #1876). A partitioned worker can keep its transaction, and its row locks,
 //! open on the server. Each pass skips such a row and retries it on the next
-//! pass. A session timeout on a nested lock skips the row too.
+//! pass. A quarantine also locks the owning execution and its open tasks.
+//! Those locks still wait, up to the session `lock_timeout`. A timeout or a
+//! deadlock on one row skips that row, not the pass.
 
 /// What to do with an orphaned `RUNNING` task whose claiming worker has died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,9 +334,10 @@ mod scanner {
             //
             // `now` is read here, in Rust, rather than via SQL `NOW()`.
             // Postgres fixes `NOW()` at the transaction's start, not the
-            // statement's. Reading it here matches the pre-fix code, which
-            // computed `Utc::now()` at this same point -- after the row
-            // lock, not before it.
+            // statement's. A lock wait before this point would make `NOW()`
+            // stale. `SKIP LOCKED` removes that wait, but this read does not
+            // depend on it. It matches the pre-fix code, which computed
+            // `Utc::now()` at this same point -- after the row lock.
             let now = Utc::now();
             let updated: Option<IdRow> = diesel::sql_query(super::requeue_orphan_stmt())
                 .bind::<diesel::sql_types::Uuid, _>(task_id)
@@ -884,22 +887,34 @@ mod scanner {
         Ok(acted)
     }
 
-    /// Turn a session timeout on one row into a skip (issue #1876).
+    /// Whether `error` ends the work on one row but leaves the pass able to
+    /// continue (issue #1876).
     ///
-    /// A row lock held by another session can time out a nested lock, for
-    /// example on the owning execution. Postgres cancels only that statement,
-    /// so the pass continues on the same connection. The next pass retries
-    /// the row. Any other error ends the pass.
-    fn skip_on_session_timeout(
+    /// A `lock_timeout` or `statement_timeout` cancels one statement, for
+    /// example a lock on the owning execution. A deadlock (SQLSTATE 40P01)
+    /// aborts one transaction. `SKIP LOCKED` makes it possible: two
+    /// reclaimers can each lock a sibling orphan of one execution. In each
+    /// case the per-row transaction rolls back, and the connection stays
+    /// usable.
+    ///
+    /// Like [`crate::pool::is_session_timeout`], the check reads the English
+    /// message text.
+    pub(super) fn is_row_conflict(error: &HarvestError) -> bool {
+        crate::pool::is_session_timeout(error)
+            || matches!(error, HarvestError::Database(msg) if msg.contains("deadlock detected"))
+    }
+
+    /// Turn a row conflict into a skip (issue #1876).
+    fn skip_on_row_conflict(
         outcome: HarvestResult<bool>,
         task: &TaskQueueItem,
     ) -> HarvestResult<bool> {
         match outcome {
-            Err(e) if crate::pool::is_session_timeout(&e) => {
+            Err(e) if is_row_conflict(&e) => {
                 tracing::warn!(
                     task_id = %task.id,
                     error = %e,
-                    "orphan reclaim skipped a locked task; the next pass retries it"
+                    "orphan reclaim skipped a task after a row conflict; the next pass retries it"
                 );
                 Ok(false)
             }
@@ -926,9 +941,14 @@ mod scanner {
     /// touches `crash_strikes` and never quarantines — being stuck this way
     /// says nothing about the task itself.
     ///
+    /// A task row that another session locks is skipped. A timeout or a
+    /// deadlock on one row skips that row too. The next pass retries a
+    /// skipped row (issue #1876).
+    ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Database`] on query failure.
+    /// Returns [`HarvestError::Database`] on query failure, except for a
+    /// skipped row.
     pub async fn reclaim_orphaned_tasks(
         conn: &mut AsyncPgConnection,
         threshold: i32,
@@ -968,13 +988,13 @@ mod scanner {
                         codecs,
                     )
                     .await;
-                    if skip_on_session_timeout(outcome, &task)? {
+                    if skip_on_row_conflict(outcome, &task)? {
                         summary.quarantined += 1;
                     }
                 }
                 ReclaimAction::Requeue => {
                     let outcome = requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await;
-                    if skip_on_session_timeout(outcome, &task)? {
+                    if skip_on_row_conflict(outcome, &task)? {
                         summary.requeued += 1;
                         // Dispatch hint (issue #1312). The orphan is `PENDING`
                         // again and its inner transaction has committed, so the
@@ -994,7 +1014,7 @@ mod scanner {
                 .map_err(crate::error::database_error)?;
             for task in stuck {
                 let outcome = requeue_stuck_task(conn, &task, stuck_running_secs).await;
-                if skip_on_session_timeout(outcome, &task)? {
+                if skip_on_row_conflict(outcome, &task)? {
                     summary.stuck_requeued += 1;
                     crate::queue::record_pending_hints(conn, &[task.id]).await;
                 }
@@ -1144,6 +1164,38 @@ mod scanner {
             // registered and correctly ages into `Wedged`.
             crate::scanner_health::deregister_scanner(owner);
         })
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod scanner_tests {
+    use super::scanner::is_row_conflict;
+    use crate::error::HarvestError;
+
+    fn db(msg: &str) -> HarvestError {
+        HarvestError::Database(msg.to_owned())
+    }
+
+    /// Issue #1876: these errors end one row's work, so the pass skips the row.
+    #[test]
+    fn a_timeout_or_deadlock_on_one_row_is_a_row_conflict() {
+        assert!(is_row_conflict(&db(
+            "canceling statement due to lock timeout"
+        )));
+        assert!(is_row_conflict(&db(
+            "canceling statement due to statement timeout"
+        )));
+        assert!(is_row_conflict(&db("deadlock detected")));
+    }
+
+    /// Any other error ends the pass, so the poll loop reports it.
+    #[test]
+    fn other_errors_are_not_a_row_conflict() {
+        assert!(!is_row_conflict(&db("connection closed")));
+        assert!(!is_row_conflict(&db(
+            "canceling statement due to user request"
+        )));
+        assert!(!is_row_conflict(&HarvestError::Config("bad".to_owned())));
     }
 }
 

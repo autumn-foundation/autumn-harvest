@@ -157,6 +157,10 @@ statement is guaranteed never to block (the lock is already ours), so its
 snapshot is guaranteed fresh relative to anything that resolved during the
 first statement's wait.
 
+> **Since issue #1876**, that row lock is `SELECT ... FOR UPDATE SKIP
+> LOCKED`. It never waits. It skips a row that another session holds. The
+> two-statement shape stays.
+
 `quarantine_orphan` cannot use even this reduced fold: it still needs the
 row locked *before* inserting the dead-letter entry, so its
 liveness check must remain the original, separate `worker_still_dead`
