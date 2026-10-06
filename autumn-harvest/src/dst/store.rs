@@ -97,6 +97,10 @@ pub struct Row {
     pub attempt: i32,
     /// The `crash_strikes` column.
     pub crash_strikes: i32,
+    /// Whether `started_at` is set.
+    pub started: bool,
+    /// Whether `last_heartbeat_at` is set.
+    pub heartbeat_stamped: bool,
     /// The tag in `heartbeat_details`.
     pub heartbeat: Option<u64>,
     /// The tag in `output`.
@@ -112,6 +116,8 @@ impl Row {
             worker: None,
             attempt: 0,
             crash_strikes: 0,
+            started: false,
+            heartbeat_stamped: false,
             heartbeat: None,
             output: None,
         }
@@ -137,7 +143,7 @@ pub enum Op {
         /// The task index.
         task: usize,
     },
-    /// The start fence (`append_activity_started`).
+    /// The start fence (`append_activity_started_if_pending`).
     Start {
         /// The claim that starts.
         claim: Claim,
@@ -148,6 +154,15 @@ pub enum Op {
         claim: Claim,
         /// The payload tag for `heartbeat_details`.
         tag: u64,
+    },
+    /// The release of a claim that did not start (`queue::release_unstarted_claim`).
+    ///
+    /// It subtracts 1 from `attempt`, so a later claim can reuse an
+    /// `(worker_id, attempt)` pair. Only the full fence stops a stale
+    /// release.
+    Release {
+        /// The claim that gives the row back.
+        claim: Claim,
     },
     /// The terminal write (`finalize_activity_completion`).
     Complete {
@@ -186,7 +201,7 @@ pub enum Outcome {
     Beat,
     /// The claim, or `None` when the row was not claimable.
     Claimed(Option<Claim>),
-    /// The result of `Start`, `Heartbeat` or `Complete`.
+    /// The result of `Start`, `Heartbeat`, `Release` or `Complete`.
     Write(WriteOutcome),
     /// The rows that the scan found, in task order.
     Orphans(Vec<Orphan>),
@@ -236,7 +251,7 @@ pub trait ClaimStore {
 /// The in-memory oracle backend.
 ///
 /// Each operation follows the SQL statement that [`Op`] names. The
-/// differential test checks that claim against Postgres.
+/// differential test checks this against Postgres.
 #[derive(Debug, Clone)]
 pub struct OracleStore {
     fencing: Fencing,
@@ -290,6 +305,7 @@ impl OracleStore {
         row.state = TaskState::Running;
         row.worker = Some(worker.to_string());
         row.attempt += 1;
+        row.started = true;
         Outcome::Claimed(Some(Claim {
             task,
             worker: worker.to_string(),
@@ -326,6 +342,7 @@ impl OracleStore {
     }
 
     /// `requeue_orphan_stmt`. It keeps `attempt` and `heartbeat_details`.
+    /// It clears `started_at` and `last_heartbeat_at`.
     fn requeue(&mut self, orphan: &Orphan, now_ms: u64) -> Outcome {
         let dead = self.is_dead(&orphan.worker, now_ms);
         let row = &mut self.rows[orphan.task];
@@ -338,6 +355,8 @@ impl OracleStore {
         row.state = TaskState::Pending;
         row.worker = None;
         row.crash_strikes = orphan.crash_strikes + 1;
+        row.started = false;
+        row.heartbeat_stamped = false;
         Outcome::Requeued(true)
     }
 }
@@ -351,9 +370,17 @@ impl ClaimStore for OracleStore {
             }
             Op::Claim { worker, task } => self.claim(worker, *task),
             Op::Start { claim } => self.owner_write(claim, |_| {}),
-            Op::Heartbeat { claim, tag } => {
-                self.owner_write(claim, |row| row.heartbeat = Some(*tag))
-            }
+            Op::Heartbeat { claim, tag } => self.owner_write(claim, |row| {
+                row.heartbeat = Some(*tag);
+                row.heartbeat_stamped = true;
+            }),
+            Op::Release { claim } => self.owner_write(claim, |row| {
+                row.state = TaskState::Pending;
+                row.worker = None;
+                row.attempt = (row.attempt - 1).max(0);
+                row.started = false;
+                row.heartbeat_stamped = false;
+            }),
             Op::Complete { claim, tag } => self.owner_write(claim, |row| {
                 row.state = TaskState::Completed;
                 row.output = Some(*tag);
@@ -575,6 +602,64 @@ mod tests {
         reclaim(&mut store, 0);
         assert_eq!(store.rows()[0].heartbeat, Some(4));
         assert_eq!(store.rows()[0].worker, None);
+    }
+
+    #[test]
+    fn claim_epoch_rejects_a_forged_worker_with_the_current_attempt() {
+        let mut store = OracleStore::new(1, Fencing::ClaimEpoch, STALE);
+        let held = claim(&mut store, "w1", 0);
+        let forged = Claim {
+            worker: "w2".to_string(),
+            ..held
+        };
+        let ops = [
+            Op::Start {
+                claim: forged.clone(),
+            },
+            Op::Heartbeat {
+                claim: forged.clone(),
+                tag: 1,
+            },
+            Op::Release {
+                claim: forged.clone(),
+            },
+            Op::Complete {
+                claim: forged,
+                tag: 1,
+            },
+        ];
+        for op in ops {
+            assert_eq!(write(&mut store, &op), WriteOutcome::LeaseLost, "{op:?}");
+        }
+        assert_eq!(store.rows()[0].worker.as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn release_restores_attempt_and_clears_the_claim() {
+        let mut store = OracleStore::new(1, Fencing::ClaimEpoch, STALE);
+        let held = claim(&mut store, "w1", 0);
+        let hb = Op::Heartbeat {
+            claim: held.clone(),
+            tag: 3,
+        };
+        assert_eq!(write(&mut store, &hb), WriteOutcome::Applied);
+        let release = Op::Release { claim: held };
+        assert_eq!(write(&mut store, &release), WriteOutcome::Applied);
+        let row = &store.rows()[0];
+        assert_eq!(row.state, TaskState::Pending);
+        assert_eq!((row.attempt, row.worker.as_deref()), (0, None));
+        assert!(!row.started && !row.heartbeat_stamped);
+        assert_eq!(row.heartbeat, Some(3), "release keeps heartbeat_details");
+        assert_eq!(claim(&mut store, "w1", 0).attempt, 1, "the pair is reused");
+    }
+
+    #[test]
+    fn state_only_lets_a_stale_release_lower_a_later_claim() {
+        let (mut store, stale, fresh) = stale_and_fresh(Fencing::StateOnly);
+        let release = Op::Release { claim: stale };
+        assert_eq!(write(&mut store, &release), WriteOutcome::Applied);
+        let again = claim(&mut store, "w1", 0);
+        assert_eq!(again, fresh, "a new claim reuses the live pair of `fresh`");
     }
 
     #[test]

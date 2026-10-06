@@ -1,12 +1,16 @@
 # Deterministic simulation, nightly (issue #1830).
 #
 # - `sweep`: the oracle seed sweep of the `dst` target, in release mode.
-#   Four shards run 250000 seeds each. The seed base comes from the run
-#   number, so each night tests new seeds.
+#   Four shards run 1000000 seeds each.
 # - `differential`: replays oracle runs on Postgres. Four shards run 500
 #   seeds each.
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. GitHub tells only the last editor of a cron about a failure.
+#
+# A job's seed base is run_number * 4 * seeds-per-shard, so two runs never
+# share a seed. Each test step has a timeout below its job's timeout. A step
+# timeout is a failure, so the alert fires. A job timeout is a cancel, and
+# `failure()` does not see it.
 #
 # A failure prints its seed and a local replay command. See
 # docs/testing/simulation.md.
@@ -23,7 +27,7 @@ on:
       seeds:
         description: Seeds per sweep shard.
         required: false
-        default: "250000"
+        default: "1000000"
   schedule:
     # Nightly at 02:43 UTC, away from the chaos and proptest runs.
     - cron: "43 2 * * *"
@@ -49,7 +53,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3]
     env:
-      SEEDS: ${{ github.event.inputs.seeds || '250000' }}
+      SEEDS: ${{ github.event.inputs.seeds || '1000000' }}
       SEED_BASE: ${{ github.event.inputs.seed_base || '' }}
       SHARD: ${{ matrix.shard }}
       RUN_NUMBER: ${{ github.run_number }}
@@ -59,10 +63,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Pick the seeds
         run: |
-          base="${SEED_BASE:-$((RUN_NUMBER * 1000000))}"
+          for value in "$SEEDS" "$SEED_BASE"; do
+            case "$value" in
+              *[!0-9]*) echo "not a decimal number: '$value'" >&2; exit 1 ;;
+            esac
+          done
+          base="${SEED_BASE:-$((RUN_NUMBER * 4 * SEEDS))}"
           echo "HARVEST_DST_SEED_BASE=$((base + SHARD * SEEDS))" >> "$GITHUB_ENV"
           echo "HARVEST_DST_SEEDS=$SEEDS" >> "$GITHUB_ENV"
       - name: Run the sweep
+        timeout-minutes: 40
         run: cargo test --release -p autumn-harvest --no-default-features --test dst seed_sweep -- --nocapture
 
   differential:
@@ -84,12 +94,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Pick the seeds
         run: |
-          base="${SEED_BASE:-$((RUN_NUMBER * 1000000))}"
+          for value in "$SEEDS" "$SEED_BASE"; do
+            case "$value" in
+              *[!0-9]*) echo "not a decimal number: '$value'" >&2; exit 1 ;;
+            esac
+          done
+          base="${SEED_BASE:-$((RUN_NUMBER * 4 * SEEDS))}"
           echo "HARVEST_DST_SEED_BASE=$((base + SHARD * SEEDS))" >> "$GITHUB_ENV"
           echo "HARVEST_DST_SEEDS=$SEEDS" >> "$GITHUB_ENV"
       - name: Replay oracle runs on Postgres
         # The test owns a Postgres container (testcontainers), so the
         # runner needs only Docker.
+        timeout-minutes: 60
         run: 'cargo test -p autumn-harvest --test integration dst_differential_tests:: -- --nocapture --test-threads=1'
 
   alert:

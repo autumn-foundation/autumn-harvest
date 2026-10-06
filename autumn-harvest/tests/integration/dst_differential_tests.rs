@@ -3,11 +3,15 @@
 //! Each test runs seeded simulations on the in-memory oracle. It then
 //! replays each run's operation log on a real database through the
 //! production statements. Every step must give the same outcome and the
-//! same rows. A green run shows that the oracle models the SQL, so a
-//! seed sweep on the oracle says something about the engine.
+//! same rows. A green run shows that the oracle models the SQL for the
+//! compared columns, so an oracle sweep result also holds for the SQL.
 //!
-//! `HARVEST_DST_SEEDS` and `HARVEST_DST_SEED_BASE` pick the seeds, as for
-//! the `dst` target. `docs/testing/simulation.md` describes the harness.
+//! The `state-only` writes are not production statements. They copy the
+//! pre-#1789 guard of `formal/tla/ActivityClaim.tla`.
+//!
+//! `HARVEST_DST_SEEDS`, `HARVEST_DST_SEED_BASE` and `HARVEST_DST_SEED` pick
+//! the seeds, as for the `dst` target. `docs/testing/simulation.md`
+//! describes the harness.
 
 use std::collections::BTreeMap;
 
@@ -35,8 +39,9 @@ use uuid::Uuid;
 
 const ACTIVITY: &str = "dst_activity";
 
-/// The seeds of a normal test run. The nightly job sets more.
-const DEFAULT_SEEDS: u64 = 8;
+/// The seeds of a normal test run. The nightly job sets more. Fewer seeds
+/// miss the kept requeue and the stale write after a finish.
+const DEFAULT_SEEDS: u64 = 32;
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
@@ -109,6 +114,10 @@ struct TaskRow {
     attempt: i32,
     #[diesel(sql_type = Integer)]
     crash_strikes: i32,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    started: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    heartbeat_stamped: bool,
     #[diesel(sql_type = Nullable<Jsonb>)]
     heartbeat_details: Option<serde_json::Value>,
     #[diesel(sql_type = Nullable<Jsonb>)]
@@ -192,6 +201,7 @@ impl<'c> PgStore<'c> {
             Op::Claim { worker, task } => self.claim(worker, *task).await,
             Op::Start { claim } => self.start(claim).await,
             Op::Heartbeat { claim, tag } => self.heartbeat(claim, *tag).await,
+            Op::Release { claim } => self.release(claim).await,
             Op::Complete { claim, tag } => self.complete(claim, *tag).await,
             Op::Scan { now_ms } => self.scan(*now_ms).await,
             Op::Requeue { orphan, now_ms } => self.requeue(orphan, *now_ms).await,
@@ -254,7 +264,36 @@ impl<'c> PgStore<'c> {
                 .expect("start")
                 .is_some()
             }
+            // The pre-fix start appends an event under `state = 'RUNNING'`.
+            // The event is not compared, so the row read is enough.
             Fencing::StateOnly => self.row(claim.task).await.state == TaskState::Running,
+        };
+        write_outcome(applied)
+    }
+
+    async fn release(&mut self, claim: &Claim) -> Outcome {
+        let applied = match self.fencing {
+            Fencing::ClaimEpoch => {
+                let fenced = self.task_claim(claim);
+                queue::release_unstarted_claim(self.conn, &fenced)
+                    .await
+                    .expect("release")
+                    == ClaimWrite::Applied
+            }
+            // The release with the pre-fix guard: no claim predicate.
+            Fencing::StateOnly => {
+                diesel::sql_query(
+                    "UPDATE harvest_task_queue \
+                     SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
+                         last_heartbeat_at = NULL, attempt = GREATEST(attempt - 1, 0) \
+                     WHERE id = $1 AND state = 'RUNNING'",
+                )
+                .bind::<diesel::sql_types::Uuid, _>(self.tasks[claim.task].task_id)
+                .execute(self.conn)
+                .await
+                .expect("pre-fix release")
+                    > 0
+            }
         };
         write_outcome(applied)
     }
@@ -311,12 +350,30 @@ impl<'c> PgStore<'c> {
                 self.completed_events(exec_id).await > before
             }
             // `complete_task` is the unfenced write. Before issue #1789 the
-            // owner used it too.
+            // owner used it too. It appends no event.
             Fencing::StateOnly => queue::complete_task(self.conn, task_id, payload(tag))
                 .await
                 .is_ok(),
         };
         write_outcome(applied)
+    }
+
+    /// Check `TerminalStateHasOneEvent` on the real history: a completed
+    /// row has exactly one `ActivityCompleted` event, and any other row has
+    /// none.
+    async fn check_terminal_events(&mut self) -> Result<(), String> {
+        let rows = self.rows().await;
+        for (task, row) in rows.iter().enumerate() {
+            let events = self.completed_events(self.tasks[task].exec_id).await;
+            let expected = usize::from(row.state == TaskState::Completed);
+            if events != expected {
+                return Err(format!(
+                    "t{task} is {:?} with {events} ActivityCompleted events",
+                    row.state
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn completed_events(&mut self, exec_id: ExecutionId) -> usize {
@@ -392,7 +449,10 @@ impl<'c> PgStore<'c> {
     async fn rows(&mut self) -> Vec<Row> {
         let ids: Vec<Uuid> = self.tasks.iter().map(|task| task.task_id).collect();
         let loaded: Vec<TaskRow> = diesel::sql_query(
-            "SELECT id, state, worker_id, attempt, crash_strikes, heartbeat_details, output \
+            "SELECT id, state, worker_id, attempt, crash_strikes, \
+                 started_at IS NOT NULL AS started, \
+                 last_heartbeat_at IS NOT NULL AS heartbeat_stamped, \
+                 heartbeat_details, output \
              FROM harvest_task_queue WHERE id = ANY($1)",
         )
         .bind::<Array<diesel::sql_types::Uuid>, _>(ids)
@@ -412,6 +472,8 @@ impl<'c> PgStore<'c> {
                 worker: row.worker_id.as_deref().map(|id| self.sim_worker(id)),
                 attempt: row.attempt,
                 crash_strikes: row.crash_strikes,
+                started: row.started,
+                heartbeat_stamped: row.heartbeat_stamped,
                 heartbeat: row.heartbeat_details.as_ref().map(tag_of),
                 output: row.output.as_ref().map(tag_of),
             });
@@ -520,6 +582,16 @@ async fn insert_execution(conn: &mut AsyncPgConnection, queue: &str) -> Executio
     exec_id
 }
 
+/// The command that replays one seed of this test on Postgres.
+fn postgres_repro_command(seed: u64) -> String {
+    format!(
+        "{}={seed} cargo test -p autumn-harvest --test integration \
+         dst_differential_tests::postgres_matches_the_oracle_for_every_seed \
+         -- --nocapture --test-threads=1",
+        dst::SEED_VAR
+    )
+}
+
 /// Replay the operation log of `report` on Postgres and compare each step.
 async fn replay_on_postgres(conn: &mut AsyncPgConnection, report: &SimReport) {
     let seed = report.config.seed;
@@ -528,9 +600,11 @@ async fn replay_on_postgres(conn: &mut AsyncPgConnection, report: &SimReport) {
         let outcome = pg.apply(&record.op).await;
         let context = || {
             format!(
-                "seed {seed}, step {}: {:?}\nreproduce the oracle run: {}\nlast steps:\n{}",
+                "seed {seed}, step {}: {:?}\nreproduce on Postgres: {}\n\
+                 print the oracle trace: {}\nlast steps:\n{}",
                 record.step,
                 record.op,
+                postgres_repro_command(seed),
                 dst::repro_command(&report.config),
                 report.trace_tail(dst::TAIL_LINES)
             )
@@ -538,6 +612,13 @@ async fn replay_on_postgres(conn: &mut AsyncPgConnection, report: &SimReport) {
         assert_eq!(outcome, record.outcome, "outcome differs at {}", context());
         let rows = pg.rows().await;
         assert_eq!(rows, record.rows, "rows differ at {}", context());
+        // The pre-fix terminal write appends no event, so only the fenced
+        // replay checks the history.
+        if report.config.fencing == Fencing::ClaimEpoch
+            && let Err(error) = pg.check_terminal_events().await
+        {
+            panic!("{error} at {}", context());
+        }
     }
 }
 
@@ -549,19 +630,28 @@ async fn postgres_matches_the_oracle_for_every_seed() {
     let mut covered = dst::SimStats::default();
     for seed in plan.seeds() {
         let report = dst::run_twice(&SimConfig::new(seed)).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(
-            report.violation,
-            None,
-            "{}",
-            report.trace_tail(dst::TAIL_LINES)
-        );
+        if let Some(violation) = &report.violation {
+            panic!(
+                "seed {seed}: {violation}\nreproduce: {}\nlast steps:\n{}",
+                dst::repro_command(&report.config),
+                report.trace_tail(dst::TAIL_LINES)
+            );
+        }
         replay_on_postgres(&mut conn, &report).await;
         covered.merge(&report.stats);
     }
-    assert!(
-        covered.reclaims > 0 && covered.stale_rejected > 0,
-        "the replayed runs reach the reclaim race: {covered:?}"
-    );
+    // A sweep of one seed cannot reach every branch, so only a full run
+    // checks coverage.
+    if plan.count >= DEFAULT_SEEDS {
+        assert!(
+            covered.reclaims > 0
+                && covered.requeues_kept > 0
+                && covered.releases > 0
+                && covered.stale_completes_rejected > 0
+                && covered.stale_after_finish > 0,
+            "the replayed runs reach every race: {covered:?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -103,13 +103,21 @@ pub struct SimStats {
     pub stale_rejected: u64,
     /// Terminal writes that a stale claim lost.
     pub stale_completes_rejected: u64,
+    /// Owner writes that a stale claim lost after another claim finished the
+    /// task. This is the `NoStaleOwnerAfterFinish` witness of the TLA+ spec.
+    pub stale_after_finish: u64,
+    /// Releases of unstarted claims that took effect.
+    pub releases: u64,
     /// Orphan requeues that moved a row.
     pub reclaims: u64,
+    /// Orphan requeues that kept the row, because the worker beat again
+    /// between the scan and the requeue.
+    pub requeues_kept: u64,
     /// Injected stalls.
     pub stalls: u64,
     /// Injected crashes.
     pub crashes: u64,
-    /// The most distinct workers that claimed a row in one run.
+    /// The largest number of distinct workers that claimed a row in one run.
     pub claimers: usize,
 }
 
@@ -122,7 +130,10 @@ impl SimStats {
         self.completes += other.completes;
         self.stale_rejected += other.stale_rejected;
         self.stale_completes_rejected += other.stale_completes_rejected;
+        self.stale_after_finish += other.stale_after_finish;
+        self.releases += other.releases;
         self.reclaims += other.reclaims;
+        self.requeues_kept += other.requeues_kept;
         self.stalls += other.stalls;
         self.crashes += other.crashes;
         self.claimers = self.claimers.max(other.claimers);
@@ -154,13 +165,25 @@ impl SimReport {
 }
 
 /// Run `config` against the oracle store.
+///
+/// # Panics
+///
+/// Panics when `config` has no tasks, no workers or no slots.
 #[must_use]
 pub fn run(config: &SimConfig) -> SimReport {
     run_with(config, config.oracle())
 }
 
 /// Run `config` against `store`.
+///
+/// # Panics
+///
+/// Panics when `config` has no tasks, no workers or no slots.
 pub fn run_with<S: ClaimStore>(config: &SimConfig, store: S) -> SimReport {
+    assert!(
+        config.tasks > 0 && config.workers > 0 && config.slots > 0,
+        "a simulation needs at least one task, worker and slot: {config:?}"
+    );
     Sim::new(config, store).run()
 }
 
@@ -197,6 +220,7 @@ enum Action {
     Claim(usize, usize),
     Start(usize, usize),
     Heartbeat(usize, usize),
+    Release(usize, usize),
     Complete(usize, usize),
     Stall(usize),
     Crash(usize),
@@ -212,6 +236,7 @@ const W_CLAIM: u64 = 4;
 const W_START: u64 = 6;
 const W_HEARTBEAT: u64 = 4;
 const W_COMPLETE: u64 = 2;
+const W_RELEASE: u64 = 1;
 const W_STALL: u64 = 1;
 const W_CRASH: u64 = 1;
 const W_RESTART: u64 = 6;
@@ -277,9 +302,14 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
                 self.log("all tasks completed");
                 break;
             }
-            self.now_ms += self.rng.below(self.config.max_tick_ms + 1);
+            let tick = self.rng.below(self.config.max_tick_ms.saturating_add(1));
+            self.now_ms = self.now_ms.saturating_add(tick);
             let action = self.choose();
             self.act(action);
+            if self.report.violation.is_none() {
+                let found = self.ghost.terminal_states(&self.store.rows());
+                self.fail(found.into_iter().collect());
+            }
             self.step += 1;
         }
         self.report.stats.claimers = self.claimers.len();
@@ -312,7 +342,10 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
             for (i, slot) in worker.slots.iter().enumerate() {
                 match slot {
                     None => actions.push((W_CLAIM, Action::Claim(w, i))),
-                    Some(slot) if !slot.started => actions.push((W_START, Action::Start(w, i))),
+                    Some(slot) if !slot.started => {
+                        actions.push((W_START, Action::Start(w, i)));
+                        actions.push((W_RELEASE, Action::Release(w, i)));
+                    }
                     Some(_) => {
                         actions.push((W_HEARTBEAT, Action::Heartbeat(w, i)));
                         actions.push((W_COMPLETE, Action::Complete(w, i)));
@@ -354,6 +387,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
             Action::Claim(w, i) => self.claim(w, i),
             Action::Start(w, i) => self.owner_write(w, i, WriteKind::Start),
             Action::Heartbeat(w, i) => self.owner_write(w, i, WriteKind::Heartbeat),
+            Action::Release(w, i) => self.owner_write(w, i, WriteKind::Release),
             Action::Complete(w, i) => self.owner_write(w, i, WriteKind::Complete),
             Action::Stall(w) => self.stall(w),
             Action::Crash(w) => self.crash(w),
@@ -453,6 +487,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
         let op = match kind {
             WriteKind::Start => Op::Start { claim },
             WriteKind::Heartbeat => Op::Heartbeat { claim, tag },
+            WriteKind::Release => Op::Release { claim },
             WriteKind::Complete => Op::Complete { claim, tag },
         };
         let actor = format!("{}/s{i} #{}", self.workers[w].id(), slot.seq);
@@ -461,6 +496,10 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
         };
         let found = self.ghost.wrote(kind, slot.claim.task, slot.seq, outcome);
         self.count(kind, outcome);
+        let finished = self.store.rows()[slot.claim.task].state == TaskState::Completed;
+        if outcome == WriteOutcome::LeaseLost && finished {
+            self.report.stats.stale_after_finish += 1;
+        }
         self.workers[w].slots[i] = self.next_slot(slot, kind, outcome);
         self.fail(found);
     }
@@ -471,6 +510,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
             (WriteKind::Start, WriteOutcome::Applied) => stats.starts += 1,
             (WriteKind::Heartbeat, WriteOutcome::Applied) => stats.heartbeats += 1,
             (WriteKind::Complete, WriteOutcome::Applied) => stats.completes += 1,
+            (WriteKind::Release, WriteOutcome::Applied) => stats.releases += 1,
             (WriteKind::Complete, WriteOutcome::LeaseLost) => {
                 stats.stale_rejected += 1;
                 stats.stale_completes_rejected += 1;
@@ -481,11 +521,13 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
 
     /// The slot after an owner write.
     ///
-    /// A lost start stops the attempt. A lost heartbeat cancels the activity
-    /// under the claim epoch. Before issue #1789 the worker only logged it.
+    /// A release or a terminal write ends the attempt. So does a lost start.
+    /// A lost heartbeat cancels the activity under the claim epoch. Before
+    /// issue #1789 the worker only logged it.
     fn next_slot(&self, mut slot: Slot, kind: WriteKind, outcome: WriteOutcome) -> Option<Slot> {
         match (kind, outcome) {
-            (WriteKind::Complete, _) | (WriteKind::Start, WriteOutcome::LeaseLost) => None,
+            (WriteKind::Complete | WriteKind::Release, _)
+            | (WriteKind::Start, WriteOutcome::LeaseLost) => None,
             (WriteKind::Start, WriteOutcome::Applied) => {
                 slot.started = true;
                 Some(slot)
@@ -504,7 +546,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
     /// It keeps its claims but sends no beat, so it can look dead.
     fn stall(&mut self, w: usize) {
         let stale = self.config.stale_after_ms;
-        let pause = stale / 2 + self.rng.below(stale * 2);
+        let pause = stale / 2 + self.rng.below(stale.saturating_mul(2));
         let worker = &mut self.workers[w];
         worker.stalled_until_ms = self.now_ms + pause;
         let line = format!(
@@ -518,7 +560,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
 
     /// Kill the worker. Its claims die with it. It restarts later.
     fn crash(&mut self, w: usize) {
-        let down = 1_000 + self.rng.below(self.config.stale_after_ms * 2);
+        let down = 1_000 + self.rng.below(self.config.stale_after_ms.saturating_mul(2));
         let worker = &mut self.workers[w];
         worker.slots.iter_mut().for_each(|slot| *slot = None);
         worker.restart_at_ms = Some(self.now_ms + down);
@@ -563,6 +605,8 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
         if self.apply("reclaimer", op) == Outcome::Requeued(true) {
             self.ghost.requeued(task);
             self.report.stats.reclaims += 1;
+        } else {
+            self.report.stats.requeues_kept += 1;
         }
     }
 }
@@ -574,6 +618,7 @@ fn describe(op: &Op) -> String {
         Op::Claim { task, .. } => format!("claim t{task}"),
         Op::Start { claim } => format!("start t{} a{}", claim.task, claim.attempt),
         Op::Heartbeat { claim, .. } => format!("heartbeat t{} a{}", claim.task, claim.attempt),
+        Op::Release { claim } => format!("release t{} a{}", claim.task, claim.attempt),
         Op::Complete { claim, .. } => format!("complete t{} a{}", claim.task, claim.attempt),
         Op::Scan { .. } => "scan".to_string(),
         Op::Requeue { orphan, .. } => format!(

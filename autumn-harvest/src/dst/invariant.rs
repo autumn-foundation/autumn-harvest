@@ -4,16 +4,21 @@
 //! gets a ghost sequence number. The store never sees it. An invariant
 //! compares sequence numbers, not `(worker_id, attempt)`, so a reused pair
 //! cannot hide a stale write.
+//!
+//! One difference: the TLA+ spec does not count a start as an owner write.
+//! This harness does, so `OwnerWritesByCurrentClaim` is stricter here.
 
 use std::fmt;
 
-use super::store::{Claim, WriteOutcome};
+use super::store::{Claim, Row, TaskState, WriteOutcome};
 
 /// A safety property of the activity claim protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Invariant {
     /// At most one terminal write takes effect per task.
     AtMostOneTerminal,
+    /// A completed row has exactly one terminal write.
+    TerminalStateHasOneEvent,
     /// A terminal write takes effect only while its claim is current.
     TerminalByCurrentClaim,
     /// Every owner write takes effect only while its claim is current.
@@ -26,8 +31,9 @@ pub enum Invariant {
 
 impl Invariant {
     /// Every invariant.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::AtMostOneTerminal,
+        Self::TerminalStateHasOneEvent,
         Self::TerminalByCurrentClaim,
         Self::OwnerWritesByCurrentClaim,
         Self::HeartbeatByCurrentClaim,
@@ -39,6 +45,7 @@ impl Invariant {
     pub const fn name(self) -> &'static str {
         match self {
             Self::AtMostOneTerminal => "AtMostOneTerminal",
+            Self::TerminalStateHasOneEvent => "TerminalStateHasOneEvent",
             Self::TerminalByCurrentClaim => "TerminalByCurrentClaim",
             Self::OwnerWritesByCurrentClaim => "OwnerWritesByCurrentClaim",
             Self::HeartbeatByCurrentClaim => "HeartbeatByCurrentClaim",
@@ -101,6 +108,8 @@ pub enum WriteKind {
     Start,
     /// A task heartbeat.
     Heartbeat,
+    /// The release of a claim that did not start.
+    Release,
     /// The terminal write.
     Complete,
 }
@@ -158,10 +167,13 @@ impl Ghost {
             );
             found.push((Invariant::OwnerWritesByCurrentClaim, detail.clone()));
             match kind {
-                WriteKind::Start => {}
+                WriteKind::Start | WriteKind::Release => {}
                 WriteKind::Heartbeat => found.push((Invariant::HeartbeatByCurrentClaim, detail)),
                 WriteKind::Complete => found.push((Invariant::TerminalByCurrentClaim, detail)),
             }
+        }
+        if kind == WriteKind::Release {
+            self.holders[task] = None;
         }
         if kind == WriteKind::Complete {
             self.holders[task] = None;
@@ -172,6 +184,17 @@ impl Ghost {
             }
         }
         found
+    }
+
+    /// Check that each completed row has exactly one terminal write.
+    pub fn terminal_states(&self, rows: &[Row]) -> Option<(Invariant, String)> {
+        rows.iter().enumerate().find_map(|(task, row)| {
+            let writes = self.terminals[task].len();
+            (row.state == TaskState::Completed && writes != 1).then(|| {
+                let detail = format!("completed t{task} has {writes} terminal writes");
+                (Invariant::TerminalStateHasOneEvent, detail)
+            })
+        })
     }
 
     /// Check that no two live claims share a fencing token.
@@ -256,6 +279,31 @@ mod tests {
         ghost.claimed(0, 2);
         let found = ghost.wrote(WriteKind::Complete, 0, 2, WriteOutcome::Applied);
         assert_eq!(names(&found), [Invariant::AtMostOneTerminal]);
+    }
+
+    #[test]
+    fn a_completed_row_needs_one_terminal_write() {
+        let mut ghost = Ghost::new(1);
+        let mut row = Row::pending();
+        row.state = TaskState::Completed;
+        let found = ghost.terminal_states(std::slice::from_ref(&row));
+        assert_eq!(
+            found.map(|(i, _)| i),
+            Some(Invariant::TerminalStateHasOneEvent)
+        );
+        ghost.claimed(0, 1);
+        let _ = ghost.wrote(WriteKind::Complete, 0, 1, WriteOutcome::Applied);
+        assert_eq!(ghost.terminal_states(&[row]), None);
+    }
+
+    #[test]
+    fn a_stale_release_breaks_the_owner_invariant_only() {
+        let mut ghost = Ghost::new(1);
+        ghost.claimed(0, 1);
+        ghost.requeued(0);
+        ghost.claimed(0, 2);
+        let found = ghost.wrote(WriteKind::Release, 0, 1, WriteOutcome::Applied);
+        assert_eq!(names(&found), [Invariant::OwnerWritesByCurrentClaim]);
     }
 
     #[test]

@@ -1,13 +1,13 @@
 //! Seed sweeps, the run-twice determinism check, and local replay.
 
 use std::fmt;
-use std::ops::Range;
+use std::ops::RangeInclusive;
 
 use super::invariant::Invariant;
 use super::sim::{SimConfig, SimReport, SimStats, run};
 use super::store::Fencing;
 
-/// Run one seed, the default store, and only this seed.
+/// The one seed to run. It overrides [`SEEDS_VAR`] and [`SEED_BASE_VAR`].
 pub const SEED_VAR: &str = "HARVEST_DST_SEED";
 /// The number of seeds in a sweep.
 pub const SEEDS_VAR: &str = "HARVEST_DST_SEEDS";
@@ -58,8 +58,22 @@ pub fn first_divergence(a: &[String], b: &[String]) -> Option<usize> {
 ///
 /// Returns [`Nondeterminism`] when the two runs differ.
 pub fn run_twice(config: &SimConfig) -> Result<SimReport, Nondeterminism> {
-    let first = run(config);
-    let second = run(config);
+    run_twice_with(config, run)
+}
+
+/// [`run_twice`] with `runner` in place of [`run`].
+///
+/// A test passes a runner that changes its output to prove the check.
+///
+/// # Errors
+///
+/// Returns [`Nondeterminism`] when the two runs differ.
+pub fn run_twice_with(
+    config: &SimConfig,
+    mut runner: impl FnMut(&SimConfig) -> SimReport,
+) -> Result<SimReport, Nondeterminism> {
+    let first = runner(config);
+    let second = runner(config);
     if let Some(line) = first_divergence(&first.trace, &second.trace) {
         let at = |trace: &[String]| trace.get(line).cloned().unwrap_or_default();
         return Err(Nondeterminism {
@@ -97,7 +111,9 @@ impl SeedPlan {
     ///
     /// # Errors
     ///
-    /// Returns a message when a value is not a decimal `u64`.
+    /// Returns a message when a value is not a decimal `u64`, when the plan
+    /// has no seeds, or when its last seed is past `u64::MAX`. A plan that
+    /// runs no seed would pass with no test.
     pub fn parse(
         seed: Option<&str>,
         seeds: Option<&str>,
@@ -119,10 +135,20 @@ impl SeedPlan {
                 count: 1,
             });
         }
-        Ok(Self {
+        let plan = Self {
             first: number(SEED_BASE_VAR, base)?.unwrap_or(0),
             count: number(SEEDS_VAR, seeds)?.unwrap_or(default_count),
-        })
+        };
+        if plan.count == 0 {
+            return Err(format!("{SEEDS_VAR} is 0, so the sweep would run no seed"));
+        }
+        if plan.first.checked_add(plan.count - 1).is_none() {
+            return Err(format!(
+                "{SEED_BASE_VAR}={} with {SEEDS_VAR}={} ends past u64::MAX",
+                plan.first, plan.count
+            ));
+        }
+        Ok(plan)
     }
 
     /// Build a plan from [`SEED_VAR`], [`SEEDS_VAR`] and [`SEED_BASE_VAR`].
@@ -142,10 +168,13 @@ impl SeedPlan {
         )
     }
 
-    /// The seeds, in order.
+    /// The seeds, in order. The range is empty when `count` is 0.
     #[must_use]
-    pub const fn seeds(&self) -> Range<u64> {
-        self.first..self.first.saturating_add(self.count)
+    pub const fn seeds(&self) -> RangeInclusive<u64> {
+        if self.count == 0 {
+            return RangeInclusive::new(1, 0);
+        }
+        self.first..=self.first.saturating_add(self.count - 1)
     }
 }
 
@@ -186,21 +215,17 @@ pub fn config_from_env(seed: u64) -> Result<SimConfig, String> {
 
 /// The shell command that replays `config` locally.
 ///
-/// It names every value that [`config_from_env`] reads, so the replay
-/// builds the same config.
+/// It sets every variable that [`config_from_env`] reads, so a stale
+/// variable in the shell cannot change the replay.
 #[must_use]
 pub fn repro_command(config: &SimConfig) -> String {
-    let checks = if config.checks == Invariant::ALL {
-        String::new()
-    } else {
-        let names: Vec<&str> = config.checks.iter().map(|i| i.name()).collect();
-        format!("{CHECKS_VAR}={} ", names.join(","))
-    };
+    let checks: Vec<&str> = config.checks.iter().map(|i| i.name()).collect();
     format!(
-        "{SEED_VAR}={} {FENCING_VAR}={} {checks}cargo test -p autumn-harvest \
+        "{SEED_VAR}={} {FENCING_VAR}={} {CHECKS_VAR}={} cargo test -p autumn-harvest \
          --no-default-features --test dst replay_one_seed -- --nocapture",
         config.seed,
-        config.fencing.as_str()
+        config.fencing.as_str(),
+        checks.join(",")
     )
 }
 
@@ -286,8 +311,8 @@ mod tests {
         assert!(command.starts_with("HARVEST_DST_SEED=42 HARVEST_DST_FENCING=state-only "));
         assert!(command.contains("--test dst replay_one_seed"), "{command}");
         assert!(
-            !command.contains(CHECKS_VAR),
-            "all checks is the default: {command}"
+            command.contains("HARVEST_DST_CHECKS=AtMostOneTerminal,"),
+            "all checks are named: {command}"
         );
         assert!(!command.contains('\\'), "one line: {command}");
     }
@@ -320,11 +345,51 @@ mod tests {
     }
 
     #[test]
-    fn seeds_saturate_at_the_top_of_the_range() {
-        let plan = SeedPlan {
-            first: u64::MAX,
-            count: 5,
+    fn the_top_seed_runs() {
+        let plan = SeedPlan::parse(Some("18446744073709551615"), None, None, 5).expect("valid");
+        assert_eq!(plan.seeds().collect::<Vec<_>>(), [u64::MAX]);
+        let top = SeedPlan::parse(None, Some("2"), Some("18446744073709551614"), 5).expect("valid");
+        assert_eq!(top.seeds().count(), 2);
+    }
+
+    #[test]
+    fn empty_and_overflowing_plans_are_rejected() {
+        assert!(SeedPlan::parse(None, Some("0"), None, 5).is_err());
+        assert!(SeedPlan::parse(None, None, None, 0).is_err());
+        assert!(SeedPlan::parse(None, Some("3"), Some("18446744073709551614"), 5).is_err());
+        let empty = SeedPlan { first: 4, count: 0 };
+        assert_eq!(empty.seeds().count(), 0);
+    }
+
+    #[test]
+    fn run_twice_reports_a_runner_that_changes_its_trace() {
+        let config = SimConfig::new(1);
+        let mut calls = 0;
+        let flaky = |config: &SimConfig| {
+            calls += 1;
+            let mut report = run(config);
+            if calls == 2 {
+                report.trace[5].push_str(" (changed)");
+            }
+            report
         };
-        assert_eq!(plan.seeds().count(), 0);
+        let error = run_twice_with(&config, flaky).expect_err("the traces differ");
+        assert_eq!((error.seed, error.line), (1, 5));
+        assert!(error.second.ends_with("(changed)"), "{error}");
+    }
+
+    #[test]
+    fn run_twice_reports_a_change_outside_the_trace() {
+        let config = SimConfig::new(1);
+        let mut calls = 0;
+        let flaky = |config: &SimConfig| {
+            calls += 1;
+            let mut report = run(config);
+            if calls == 2 {
+                report.stats.claims += 1;
+            }
+            report
+        };
+        assert!(run_twice_with(&config, flaky).is_err());
     }
 }

@@ -4,7 +4,7 @@
 //! environment variables and the replay command.
 
 use autumn_harvest::dst::{
-    self, Fencing, Invariant, Outcome, SeedPlan, SimConfig, SimReport, WriteOutcome,
+    self, ClaimStore, Fencing, Invariant, Outcome, SeedPlan, SimConfig, SimReport, WriteOutcome,
 };
 
 /// The sweep size of a normal test run. The nightly job sets
@@ -48,7 +48,14 @@ fn three_workers_drive_claim_heartbeat_reclaim_and_complete() {
     assert!(stats.heartbeats > 0, "{stats:?}");
     assert!(stats.reclaims > 0, "{stats:?}");
     assert!(stats.completes > 0, "{stats:?}");
+    assert!(stats.releases > 0, "{stats:?}");
     assert!(stats.stalls > 0 && stats.crashes > 0, "{stats:?}");
+    // The faults have an effect: stale owners lose writes, a terminal write
+    // included, and some lose after another claim finished the task.
+    assert!(stats.stale_completes_rejected > 0, "{stats:?}");
+    assert!(stats.stale_after_finish > 0, "{stats:?}");
+    // A worker beats between a scan and its requeue, and the row stays.
+    assert!(stats.requeues_kept > 0, "{stats:?}");
 }
 
 #[test]
@@ -57,8 +64,8 @@ fn pre_fix_guard_reproduces_issue_1789() {
     let violation = report.violation.clone().expect("a violation");
     assert_eq!(violation.invariant, Invariant::TerminalByCurrentClaim);
     assert_eq!(
-        report.config.seed, 6,
-        "docs/testing/simulation.md names seed 6; update it with the seed"
+        report.config.seed, 3,
+        "docs/testing/simulation.md and the changelog fragment name seed 3; update both"
     );
 
     // The stale write took effect while another claim held the row.
@@ -79,14 +86,38 @@ fn pre_fix_guard_reproduces_issue_1789() {
 #[test]
 fn claim_epoch_guard_rejects_the_stale_write_on_the_same_seed() {
     let failing = first_pre_fix_failure();
-    let fixed = SimConfig::new(failing.config.seed);
-    let report = dst::run(&fixed);
-    assert_eq!(report.violation, None, "{}", report.trace_tail(40));
-    assert!(
-        report.stats.stale_completes_rejected > 0,
-        "the fixed run reaches the race and the fence wins: {:?}",
-        report.stats
+
+    // The same operations, in the same order, on a store with the fence.
+    let mut fenced = SimConfig::new(failing.config.seed).oracle();
+    let outcomes: Vec<Outcome> = failing
+        .steps
+        .iter()
+        .map(|record| fenced.apply(&record.op))
+        .collect();
+    assert_eq!(
+        outcomes.last(),
+        Some(&Outcome::Write(WriteOutcome::LeaseLost)),
+        "the fence rejects the write that broke the invariant"
     );
+
+    // The fixed run of the seed breaks no invariant.
+    let fixed = dst::run(&SimConfig::new(failing.config.seed));
+    assert_eq!(fixed.violation, None, "{}", fixed.trace_tail(40));
+}
+
+#[test]
+fn pre_fix_release_reuses_a_live_fencing_token() {
+    let found = (0..1_000)
+        .map(|seed| {
+            let config = SimConfig::new(seed)
+                .with_fencing(Fencing::StateOnly)
+                .checking(&[Invariant::ClaimIdsAreUnique]);
+            dst::run(&config)
+        })
+        .find(|report| report.violation.is_some())
+        .expect("the pre-fix guard reuses a token within 1000 seeds");
+    let fixed = dst::run(&SimConfig::new(found.config.seed));
+    assert_eq!(fixed.violation, None, "{}", fixed.trace_tail(40));
 }
 
 #[test]
@@ -135,7 +166,7 @@ fn trace_hash(report: &SimReport) -> u64 {
         })
 }
 
-/// The traces of the first seeds are fixed.
+/// The traces of a few seeds are fixed.
 ///
 /// A run-twice check runs in one process, so it cannot see a difference
 /// between platforms. CI runs this test on Linux, macOS and Windows. A
@@ -144,12 +175,13 @@ fn trace_hash(report: &SimReport) -> u64 {
 #[test]
 fn golden_traces_are_equal_on_every_platform() {
     let golden = [
-        (0, 231, 0x4d60_3824_99b5_a6f6),
-        (1, 109, 0xddfd_d365_e1ca_b6cf),
-        (2, 178, 0x2eba_e3e7_de3a_e3a7),
+        (0, Fencing::ClaimEpoch, 276, 0x82fa_8634_9ead_5f35),
+        (1, Fencing::ClaimEpoch, 76, 0x1cd1_2fc8_7839_5537),
+        (2, Fencing::ClaimEpoch, 314, 0x18a9_744d_50c2_d969),
+        (6, Fencing::StateOnly, 47, 0xf8f4_7697_a41b_2e0b),
     ];
-    for (seed, lines, hash) in golden {
-        let report = dst::run(&SimConfig::new(seed));
+    for (seed, fencing, lines, hash) in golden {
+        let report = dst::run(&SimConfig::new(seed).with_fencing(fencing));
         assert_eq!(
             (report.trace.len(), trace_hash(&report)),
             (lines, hash),
@@ -185,11 +217,13 @@ fn first_divergence_finds_the_first_differing_line() {
 #[test]
 fn seed_plan_reads_one_seed_or_a_range() {
     let one = SeedPlan::parse(Some("17"), Some("9"), Some("3"), 5).expect("valid");
-    assert_eq!(one.seeds(), 17..18, "one seed wins over a range");
+    assert_eq!(one.seeds(), 17..=17, "one seed wins over a range");
     let range = SeedPlan::parse(None, Some("9"), Some("3"), 5).expect("valid");
-    assert_eq!(range.seeds(), 3..12);
+    assert_eq!(range.seeds(), 3..=11);
     let default = SeedPlan::parse(None, None, None, 5).expect("valid");
-    assert_eq!(default.seeds(), 0..5);
+    assert_eq!(default.seeds(), 0..=4);
+    let spaced = SeedPlan::parse(Some(" 4 "), None, None, 5).expect("valid");
+    assert_eq!(spaced.seeds(), 4..=4);
     assert!(SeedPlan::parse(Some("x"), None, None, 5).is_err());
     assert!(SeedPlan::parse(None, Some("-1"), None, 5).is_err());
 }
@@ -208,6 +242,7 @@ fn seed_sweep() {
         ..template.clone()
     })
     .unwrap_or_else(|failure| panic!("{failure}"));
+    assert_eq!(summary.seeds, plan.count, "every planned seed ran");
     println!(
         "dst: {} seeds from {} passed, fencing {}: {:?}",
         summary.seeds,
@@ -219,15 +254,17 @@ fn seed_sweep() {
 
 /// Print the full trace of the seed in `HARVEST_DST_SEED`.
 ///
-/// Without that variable, the test does nothing.
+/// The seed runs twice, as in a sweep, so a nondeterminism failure
+/// reproduces too. Without that variable, the test does nothing.
 #[test]
 fn replay_one_seed() {
-    let Ok(seed) = std::env::var(dst::SEED_VAR) else {
+    let Ok(text) = std::env::var(dst::SEED_VAR) else {
         return;
     };
-    let seed: u64 = seed.parse().expect("HARVEST_DST_SEED is a decimal u64");
+    let plan = SeedPlan::parse(Some(&text), None, None, 1).unwrap_or_else(|e| panic!("{e}"));
+    let seed = plan.first;
     let config = dst::config_from_env(seed).unwrap_or_else(|error| panic!("{error}"));
-    let report = dst::run(&config);
+    let report = dst::run_twice(&config).unwrap_or_else(|error| panic!("{error}"));
     for line in &report.trace {
         println!("{line}");
     }
