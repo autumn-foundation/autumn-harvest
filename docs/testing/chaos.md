@@ -364,8 +364,10 @@ Each test works around a bug only where the bug applies:
   instance claimed. Each accepted `FAILED` must have the exact history: one
   activity terminal event, a `StartToClose` timeout, and one terminal event,
   a `WorkflowFailed` for the timeout.
-- For #1876, the partition test sets `idle_in_transaction_session_timeout =
-  5s` on the server to end the session.
+- The partition test sets `idle_in_transaction_session_timeout = 5s` on the
+  server. Since the #1876 fix, reclaim skips a row that the cut-off session
+  locks and reclaims the other rows. The skipped row stays locked until the
+  session ends. The timeout ends it within the test budget, so it stays.
 - For #1879, the latency test uses a 2 s heartbeat. A decision cycle also
   takes more than 10 s at that latency, so it keeps the default 60 s
   workflow-task budget.

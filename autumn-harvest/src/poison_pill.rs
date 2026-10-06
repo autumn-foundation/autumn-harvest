@@ -23,6 +23,11 @@
 //! own reset call fails to reach the database in time. The worker-liveness
 //! pass above never catches that case, since the worker itself never died.
 //! See [`stuck_running_tasks_query`].
+//!
+//! Neither pass waits on a task row that another session locks (issue
+//! #1876). A partitioned worker can keep its transaction, and its row locks,
+//! open on the server. Each pass skips such a row and retries it on the next
+//! pass. A session timeout on a nested lock skips the row too.
 
 /// What to do with an orphaned `RUNNING` task whose claiming worker has died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,11 +152,11 @@ pub const fn stuck_running_tasks_query() -> &'static str {
 /// separate round trips into one.
 ///
 /// Runs *after* the caller already holds the row lock. That lock comes
-/// from a plain `SELECT ... FOR UPDATE` naming only `harvest_task_queue`,
-/// in [`requeue_orphan`]. This statement then combines the row-state
-/// re-check and the worker-liveness re-check into a single `UPDATE ...
-/// WHERE ... RETURNING`. It replaces what used to be a dedicated liveness
-/// `SELECT` followed by the `UPDATE`.
+/// from a `SELECT ... FOR UPDATE SKIP LOCKED` naming only
+/// `harvest_task_queue`, in [`requeue_orphan`]. This statement then
+/// combines the row-state re-check and the worker-liveness re-check into a
+/// single `UPDATE ... WHERE ... RETURNING`. It replaces what used to be a
+/// dedicated liveness `SELECT` followed by the `UPDATE`.
 ///
 /// **This statement must never be the first one to touch the row in its
 /// transaction.** An `UPDATE`'s own row lock only guarantees a fresh read
@@ -167,13 +172,13 @@ pub const fn stuck_running_tasks_query() -> &'static str {
 /// committing the resurrection mid-wait (see this PR's review history for
 /// the reproduction).
 ///
-/// The caller's preceding `SELECT ... FOR UPDATE` absorbs that wait
-/// instead. By the time *this* statement runs, the row lock is already
-/// ours, so this statement can never itself block. A fresh top-level
-/// statement in `READ COMMITTED` always starts with a snapshot as of its
-/// own start. That start is after the caller's wait, if any, resolved.
-/// That is what makes the liveness check here as fresh as the dedicated
-/// `SELECT` it replaces, not merely close to it.
+/// The caller's preceding `SELECT ... FOR UPDATE SKIP LOCKED` takes the
+/// lock first. It never waits. It skips a row that another session holds
+/// (issue #1876). By the time *this* statement runs, the row lock is
+/// already ours, so this statement can never itself block. A fresh
+/// top-level statement in `READ COMMITTED` always starts with a snapshot
+/// as of its own start. That is what makes the liveness check here as
+/// fresh as the dedicated `SELECT` it replaces, not merely close to it.
 ///
 /// `$1` = task id, `$2` = claiming worker id, `$3` = the crash-strike
 /// count the caller observed at scan time. `$4` = the new crash-strike
@@ -303,7 +308,9 @@ mod scanner {
             // `harvest_task_queue`. This is what makes the combined
             // statement below safe. See `requeue_orphan_stmt`'s doc
             // comment: the liveness re-check cannot share a statement
-            // with the row's own lock acquisition.
+            // with the row's own lock acquisition. `SKIP LOCKED` returns
+            // no row while another session holds the lock. The next pass
+            // retries the orphan (issue #1876).
             let locked: Option<uuid::Uuid> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
@@ -325,10 +332,9 @@ mod scanner {
             //
             // `now` is read here, in Rust, rather than via SQL `NOW()`.
             // Postgres fixes `NOW()` at the transaction's start, not the
-            // statement's. A statement issued after the lock above had to
-            // wait would still see the pre-wait time. Reading it here
-            // matches the pre-fix code, which computed `Utc::now()` at
-            // this same point -- after the row lock, not before it.
+            // statement's. Reading it here matches the pre-fix code, which
+            // computed `Utc::now()` at this same point -- after the row
+            // lock, not before it.
             let now = Utc::now();
             let updated: Option<IdRow> = diesel::sql_query(super::requeue_orphan_stmt())
                 .bind::<diesel::sql_types::Uuid, _>(task_id)
@@ -392,6 +398,8 @@ mod scanner {
             // the pre-scan snapshot. A reset or a fresh re-claim between the
             // scan and here always changes it. Re-checking its age here is
             // what stops this from undoing a legitimate new attempt.
+            // `SKIP LOCKED` skips the row while another session holds it.
+            // The next pass retries it (issue #1876).
             let current: Option<StuckRowState> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
@@ -735,6 +743,8 @@ mod scanner {
                     // `worker_still_dead` below is deliberately a separate,
                     // later statement instead. It runs only once this lock is
                     // already ours, so it is guaranteed a fresh snapshot.
+                    // `SKIP LOCKED` skips the row while another session
+                    // holds it. The next pass retries it (issue #1876).
                     let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
                         .find(task_id)
                         .for_update()

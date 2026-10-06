@@ -98,6 +98,13 @@ set it on PostgreSQL 16 or earlier, because each new connection then fails.
 session, not only the statement. A result write that loses its connection
 runs again on a new connection. A task that still fails goes back to the queue.
 
+A worker cut off by a network partition can keep its transaction open on the
+server. That session keeps its row locks until
+`idle_in_transaction_session_timeout` or TCP keepalive ends it. Orphan reclaim
+skips a task row that another session locks, and retries it on the next pass
+(issue #1876). A session timeout on one row skips that row, not the pass. So
+the timeout bounds the delay for the locked row only.
+
 `ShardedDbPool::from_dsns`, which `harvest shard rebalance` uses, builds
 `Maintenance` pools.
 
