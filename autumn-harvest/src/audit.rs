@@ -255,6 +255,12 @@ pub const OP_SHARD_REBALANCE_AUTO_RESUME: &str = "shard.rebalance.auto_resume";
 /// The row has status `failed`, so the SIEM export marks it `ERROR`. The deny
 /// reason goes in `error_summary` and never into the response.
 pub const OP_AUTHZ_DENY: &str = "authz.deny";
+/// Audit operation: one API rate-limit bucket reached the sustained-rejection
+/// threshold in one window (issue #1827).
+///
+/// The row has status `failed`. The limiter writes it, not a route, so no
+/// `ALL_MUTATION_ROUTES` entry exists for it.
+pub const OP_API_RATE_LIMIT_SUSTAINED: &str = "api.rate_limit_sustained";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -968,6 +974,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // the rebalance-resume scanner write these rows.
     OP_SHARD_REBALANCE_MIGRATE,
     OP_SHARD_REBALANCE_AUTO_RESUME,
+    // API rate limiting (issue #1827). No route entry: the limiter writes it.
+    OP_API_RATE_LIMIT_SUSTAINED,
 ];
 
 /// Routes explicitly excluded from audit.
