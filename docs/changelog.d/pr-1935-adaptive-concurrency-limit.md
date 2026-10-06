@@ -20,8 +20,9 @@ failures. It never reads a queue wait or a permit wait.
   Gradient.
 - A window whose retryable failures pass `error_threshold` of its
   completions cuts the cap by `backoff_ratio`. A start-to-close,
-  schedule-to-close or heartbeat timeout counts as a retryable failure. A non-retryable failure, a panic and a WASM module
-  failure give no sample.
+  schedule-to-close or heartbeat timeout counts as a retryable failure. A
+  non-retryable failure, a panic and a WASM module or runtime fault give no
+  sample.
 - `WorkerConfig::with_adaptive_limit` and
   `HandlerRegistry::with_adaptive_limit` take an `AdaptiveLimitConfig`. The
   limit is off by default. An override for an unregistered name logs a

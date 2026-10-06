@@ -15711,11 +15711,17 @@ fn is_worker_local_failure(error_type: &str) -> bool {
     if error_type == crate::failure::ERROR_TYPE_HANDLER_PANIC {
         return true;
     }
+    // A WASM engine fault, such as a spent fuel budget or a guest trap, is
+    // not pressure from a dependency.
     #[cfg(feature = "wasm-activities")]
     if [
         crate::failure::ERROR_TYPE_WASM_MODULE_UNAVAILABLE,
         crate::failure::ERROR_TYPE_WASM_MODULE_INVALID,
         crate::failure::ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
+        crate::failure::ERROR_TYPE_RESOURCE_EXHAUSTED,
+        crate::failure::ERROR_TYPE_WASM_TRAP,
+        crate::failure::ERROR_TYPE_SANDBOX_DENIED,
+        crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
     ]
     .contains(&error_type)
     {
@@ -15893,8 +15899,8 @@ mod adaptive_limit_gate_tests {
         );
     }
 
-    /// A WASM module failure is a fault of the worker, not of the
-    /// dependency, so it gives no sample.
+    /// A WASM module or runtime failure is a fault of the worker or the
+    /// guest, not of the dependency, so it gives no sample.
     #[cfg(feature = "wasm-activities")]
     #[test]
     fn wasm_module_failures_give_no_sample() {
@@ -15902,6 +15908,10 @@ mod adaptive_limit_gate_tests {
             crate::failure::ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
             crate::failure::ERROR_TYPE_WASM_MODULE_UNAVAILABLE,
             crate::failure::ERROR_TYPE_WASM_MODULE_INVALID,
+            crate::failure::ERROR_TYPE_RESOURCE_EXHAUSTED,
+            crate::failure::ERROR_TYPE_WASM_TRAP,
+            crate::failure::ERROR_TYPE_SANDBOX_DENIED,
+            crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
         ] {
             assert_eq!(
                 limit_sample_outcome(
