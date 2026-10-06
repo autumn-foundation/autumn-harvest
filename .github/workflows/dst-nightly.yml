@@ -68,6 +68,12 @@ jobs:
               *[!0-9]*) echo "not a decimal number: '$value'" >&2; exit 1 ;;
             esac
           done
+          # Bash arithmetic is signed 64-bit with no overflow check. These
+          # bounds keep every value below i64::MAX.
+          if [ "${#SEEDS}" -gt 9 ] || [ "${#SEED_BASE}" -gt 18 ]; then
+            echo "seeds must have at most 9 digits, seed_base at most 18" >&2
+            exit 1
+          fi
           # Force base 10. Bash reads a leading 0 as octal.
           SEEDS=$((10#$SEEDS))
           if [ -n "$SEED_BASE" ]; then SEED_BASE=$((10#$SEED_BASE)); fi
@@ -102,6 +108,12 @@ jobs:
               *[!0-9]*) echo "not a decimal number: '$value'" >&2; exit 1 ;;
             esac
           done
+          # Bash arithmetic is signed 64-bit with no overflow check. These
+          # bounds keep every value below i64::MAX.
+          if [ "${#SEEDS}" -gt 9 ] || [ "${#SEED_BASE}" -gt 18 ]; then
+            echo "seeds must have at most 9 digits, seed_base at most 18" >&2
+            exit 1
+          fi
           # Force base 10. Bash reads a leading 0 as octal.
           SEEDS=$((10#$SEEDS))
           if [ -n "$SEED_BASE" ]; then SEED_BASE=$((10#$SEED_BASE)); fi
