@@ -258,6 +258,7 @@ fn make_worker(build_id: &str, info: WorkflowInfo, metrics: Arc<RecordingMetrics
             resident_workflows: true,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
+            scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
             poison_pill_threshold: 3,
             capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(30),
