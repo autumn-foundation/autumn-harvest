@@ -362,8 +362,9 @@ pub enum ChainFinding {
         /// The newest chained `seq` the database holds, if any.
         head_seq: Option<i64>,
     },
-    /// The row at the known head's `seq` has another link. Someone replaced
-    /// the chain after that point.
+    /// The row at the known head's `seq` has another link. Or retention
+    /// purged that row, and its successor names another link. Someone
+    /// replaced the chain after that point.
     KnownLinkMismatch {
         /// The `seq` of the known head.
         seq: i64,
@@ -425,6 +426,8 @@ pub struct ChainVerifier<'k> {
     /// The previous row, once the chain starts. See [`Previous`].
     previous: Option<Previous>,
     known_head: Option<KnownLink>,
+    /// `true` after the row at the known head's `seq`.
+    known_seen: bool,
 }
 
 /// The verifier state for the previous row.
@@ -455,6 +458,7 @@ impl<'k> ChainVerifier<'k> {
             report: ChainReport::default(),
             previous: None,
             known_head: None,
+            known_seen: false,
         }
     }
 
@@ -512,14 +516,20 @@ impl<'k> ChainVerifier<'k> {
     /// Check one row against its own hash and the row before it.
     pub fn push(&mut self, row: &ChainRow) {
         let seq = row.record.seq;
-        // The known link holds wherever it is, before the start too.
-        if let Some(known) = self.known_head
-            && known.seq == seq
-            && row.hash != Some(known.hash)
-        {
-            self.report
-                .findings
-                .push(ChainFinding::KnownLinkMismatch { seq });
+        // The known link holds wherever it is, before the start too. When
+        // retention purged it, its successor's `chain_prev` must name it.
+        if let Some(known) = self.known_head {
+            let mismatch = if seq == known.seq {
+                self.known_seen = true;
+                row.hash != Some(known.hash)
+            } else {
+                seq == known.seq + 1 && !self.known_seen && row.prev != Some(known.hash)
+            };
+            if mismatch {
+                self.report
+                    .findings
+                    .push(ChainFinding::KnownLinkMismatch { seq: known.seq });
+            }
         }
         // A re-anchor starts a new chain after chained rows. The checkpoint
         // start therefore decides, when there is one.
@@ -1433,6 +1443,49 @@ mod tests {
             }),
         );
         assert!(!report.is_intact(), "{report:?}");
+    }
+
+    #[test]
+    fn a_purged_known_head_is_checked_through_its_successor() {
+        let day = 86_400;
+        let original = chain_at(&[(1, 0), (2, day), (3, 2 * day)]);
+        let known = KnownLink {
+            seq: 2,
+            hash: original[1].hash.unwrap_or(GENESIS),
+        };
+        // A restored seq 1, then a replacement branch from seq 2 on.
+        let mut records: Vec<AuditExportRecord> =
+            original.iter().map(|row| row.record.clone()).collect();
+        records[1].actor = "mallory".into();
+        let branch = chain_records(records);
+        let cp = checkpoint(&branch);
+        let key = key();
+        let run = |rows: &[ChainRow]| {
+            let mut verifier = ChainVerifier::new(&key)
+                .with_start_seq(Some(1))
+                .with_retention_cutoff(Some(at(10 * day)))
+                .with_known_head(Some(known));
+            for row in rows {
+                verifier.push(row);
+            }
+            verifier.finish(cp.as_ref())
+        };
+        // Retention purged the replacement seq 2. Its successor still names it.
+        let survivors = [branch[0].clone(), branch[2].clone()];
+        assert_eq!(
+            run(&survivors).findings,
+            vec![ChainFinding::KnownLinkMismatch { seq: 2 }]
+        );
+        // The original chain with the same purge passes.
+        let cp_ok = checkpoint(&original);
+        let mut verifier = ChainVerifier::new(&key)
+            .with_start_seq(Some(1))
+            .with_retention_cutoff(Some(at(10 * day)))
+            .with_known_head(Some(known));
+        for row in [&original[0], &original[2]] {
+            verifier.push(row);
+        }
+        assert_eq!(verifier.finish(cp_ok.as_ref()).findings, Vec::new());
     }
 
     #[test]

@@ -304,7 +304,7 @@ short queries, so it holds no long snapshot. It returns a `ChainReport`:
 | `CheckpointInvalid` | The checkpoint MAC does not verify, or only some checkpoint columns are set. Someone edited the cursor, or you passed the wrong key. |
 | `CursorBehindCheckpoint` | The checkpoint head is past the cursor's `last_assigned_seq`. Someone lowered the cursor. Retention never does. |
 | `RolledBack` | The chain ends before the `known_head`. Someone restored an older state of the table and the cursor. |
-| `KnownLinkMismatch` | The row at the `known_head` sequence has another link. Someone replaced the chain after a rollback. |
+| `KnownLinkMismatch` | The row at the `known_head` sequence has another link, or, after retention purged that row, its successor does not name it. Someone replaced the chain after a rollback. |
 
 Rows sequenced before you set the key are an `unchained_prefix`, not a
 finding. `last_seq` and `last_hash` name the newest link. Compare them with
@@ -316,7 +316,9 @@ table and the cursor, and restore them later. The database then looks
 intact. To detect that, store `last_seq` and `last_hash` from each report
 outside the database, or take them from the SIEM copy. Pass them as
 `ChainVerifyOptions::known_head` on the next run. The verifier then reports
-`RolledBack` or `KnownLinkMismatch`.
+`RolledBack` or `KnownLinkMismatch`. Refresh the stored link on every run.
+Once retention purges the known row and its successor, the check has nothing
+to compare.
 
 **Retention.** Retention deletes old rows, so it leaves gaps. It keeps some
 old rows, such as the `audit_export.decommission` and
