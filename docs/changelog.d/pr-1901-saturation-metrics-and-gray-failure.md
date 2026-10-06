@@ -102,7 +102,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   interceptor does. It defaults to the type name. The cohort key holds the
   policy of each interceptor, in chain order.
 - `SlotTuner` gains `policy()`, a stable description of every setting
-  that changes `decide`. It defaults to `name()`. `DefaultSlotTuner`
+  that changes `decide`. It defaults to the type name, because `name()`
+  need not be unique. `DefaultSlotTuner`
   includes its grow step, shrink step and wait threshold. A custom tuner
   with settings overrides it, so that differently tuned workers are not
   peers.

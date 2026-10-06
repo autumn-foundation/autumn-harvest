@@ -154,10 +154,11 @@ pub trait SlotTuner: Send + Sync {
     ///
     /// Workers compare their task outcomes only with peers whose tuners
     /// return the same policy (issue #1815). Two tuners with one `name` can
-    /// resize slots differently, so a configurable tuner includes its
-    /// settings here. The default is `name`.
+    /// resize slots differently, so the default is the concrete type name,
+    /// as for [`crate::interceptor::ActivityInterceptor::policy`]. A
+    /// configurable tuner adds its settings here.
     fn policy(&self) -> String {
-        self.name().to_owned()
+        std::any::type_name::<Self>().to_owned()
     }
 }
 
@@ -886,21 +887,27 @@ impl TunedSlot {
 mod tests {
     use super::*;
 
-    /// Issue #1815: a tuner without settings of its own reports its name as
-    /// its policy. The default tuner adds every setting that changes
-    /// `decide`.
+    /// Issue #1815: a tuner without settings of its own reports its type as
+    /// its policy. Two custom tuners can share the default name, so the name
+    /// alone cannot tell them apart. The default tuner adds every setting
+    /// that changes `decide`.
     #[test]
-    fn policy_defaults_to_the_name_and_the_default_tuner_adds_its_settings() {
-        struct Named;
-        impl SlotTuner for Named {
+    fn policy_defaults_to_the_type_and_the_default_tuner_adds_its_settings() {
+        struct Doubling;
+        impl SlotTuner for Doubling {
+            fn decide(&self, observations: &SlotObservations) -> SlotTunerAction {
+                SlotTunerAction::Grow(observations.current_target)
+            }
+        }
+        struct Steady;
+        impl SlotTuner for Steady {
             fn decide(&self, _observations: &SlotObservations) -> SlotTunerAction {
                 SlotTunerAction::Hold
             }
-            fn name(&self) -> &'static str {
-                "named"
-            }
         }
-        assert_eq!(Named.policy(), "named");
+        assert_eq!(Doubling.name(), Steady.name(), "both keep the default name");
+        assert_ne!(Doubling.policy(), Steady.policy());
+        assert_eq!(Doubling.policy(), std::any::type_name::<Doubling>());
         assert_eq!(
             DefaultSlotTuner::default().policy(),
             "harvest-default grow=2 shrink=2 wait_ns=50000000"
