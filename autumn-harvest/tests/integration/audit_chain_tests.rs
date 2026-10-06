@@ -519,3 +519,25 @@ fn hex_bytes(hex: &str) -> [u8; 32] {
     }
     out
 }
+
+#[tokio::test]
+async fn deleting_every_row_is_detected() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    conn.batch_execute("DELETE FROM harvest_audit_log")
+        .await
+        .expect("truncate");
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(
+        report.findings,
+        vec![ChainFinding::HeadMismatch {
+            expected_seq: 3,
+            found_seq: None,
+        }]
+    );
+}
