@@ -312,7 +312,7 @@ pub fn render_step_detail(trace: &ReplayTrace, index: usize) -> String {
 }
 
 /// Shows an empty build id as `<none>` (issue #1833).
-fn build_label(build_id: &str) -> &str {
+const fn build_label(build_id: &str) -> &str {
     if build_id.is_empty() {
         "<none>"
     } else {
