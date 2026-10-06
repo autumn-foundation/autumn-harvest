@@ -49,6 +49,7 @@
 allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
+allos        autumn-harvest         integration                      -                          tenant_isolation_docs
 allos        autumn-harvest         integration                      fuzzing                    replay_fuzz_seeds
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
@@ -163,6 +164,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          sticky_default_tests
+linux        autumn-harvest         integration                      -                          tenant_cell_isolation_tests
 linux        autumn-harvest         integration                      -                          terminal_task_gc_tests
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          throttle_bucket_prelock_batch_perf
