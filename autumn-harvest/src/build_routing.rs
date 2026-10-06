@@ -632,7 +632,8 @@ async fn update_build_ramp_with_id(
                 OR target_build_id IS DISTINCT FROM $2 \
                 OR ramp_percent IS DISTINCT FROM $3) \
            AND NOT {aborted} \
-           AND NOT EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x WHERE x.ramp_id = $4) \
+           AND NOT EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x \
+                           WHERE x.queue_name = $1 AND x.ramp_id = $4) \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
@@ -742,7 +743,7 @@ async fn retire_replaced_ramp_id(
         }
         diesel::sql_query(
             "INSERT INTO harvest_ramp_retired_ids (ramp_id, queue_name) VALUES ($1, $2) \
-             ON CONFLICT (ramp_id) DO NOTHING",
+             ON CONFLICT (queue_name, ramp_id) DO NOTHING",
         )
         .bind::<diesel::sql_types::Uuid, _>(old)
         .bind::<diesel::sql_types::Text, _>(queue_name)
@@ -766,7 +767,9 @@ fn generation_aborted_sql(id: &str) -> String {
         "(harvest_build_policies.ramp_aborted \
               @> jsonb_build_array(jsonb_build_object('id', ({id})::text)) \
           OR EXISTS (SELECT 1 FROM harvest_ramp_abort_reports r WHERE r.ramp_id = {id}) \
-          OR EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x WHERE x.ramp_id = {id}))"
+          OR EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x \
+                     WHERE x.queue_name = harvest_build_policies.queue_name \
+                       AND x.ramp_id = {id}))"
     )
 }
 
@@ -817,7 +820,8 @@ pub async fn ramp_generation_aborted(
          ) OR EXISTS ( \
              SELECT 1 FROM harvest_ramp_abort_reports WHERE ramp_id = ANY($2::uuid[]) \
          ) OR EXISTS ( \
-             SELECT 1 FROM harvest_ramp_retired_ids WHERE ramp_id = ANY($2::uuid[]) \
+             SELECT 1 FROM harvest_ramp_retired_ids \
+             WHERE queue_name = $1 AND ramp_id = ANY($2::uuid[]) \
          ) AS aborted",
     )
     .bind::<diesel::sql_types::Text, _>(queue_name)

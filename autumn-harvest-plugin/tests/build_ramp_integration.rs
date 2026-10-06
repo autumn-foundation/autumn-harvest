@@ -606,6 +606,42 @@ async fn a_keyed_ramp_writes_nothing_when_a_shard_cannot_be_checked() {
     assert!(!ramp_is_active(&live).await, "no shard gets the ramp");
 }
 
+/// A shard that refuses the ramp with a conflict while another shard takes
+/// it leaves the fan-out divergent. The response says so with `207` and
+/// names the refusing shard (issue #1814).
+#[tokio::test]
+async fn a_conflict_on_one_shard_is_reported_when_another_shard_takes_the_ramp() {
+    use autumn_harvest::ShardId;
+    use autumn_harvest::shard::ShardedDbPool;
+
+    let (url_a, _container_a) = setup_test_database_url().await;
+    let (url_b, _container_b) = setup_test_database_url().await;
+    let with_base = build_test_pool(&url_a);
+    let mut conn = with_base.get().await.expect("get conn");
+    set_build_policy(&mut conn, "default", "base-v1", None)
+        .await
+        .expect("seed base policy");
+    drop(conn);
+    // Shard 1 has no base policy, so its write is a conflict.
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), with_base);
+    pools.insert(ShardId::new(1), build_test_pool(&url_b));
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(ShardedDbPool::from_map(
+        pools,
+        ShardId::new(0),
+    )));
+    let app = harvest_api_router(api_state);
+    let ramp =
+        json!({ "queue_name": "default", "target_build_id": "canary-v2", "ramp_percent": 10 });
+
+    let (status, body) = post_json(&app, "/admin/build-routing/ramp", ramp).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "body: {body}");
+    let errors = body["shard_errors"].to_string();
+    assert!(errors.contains("shard 1"), "body: {body}");
+}
+
 /// A late keyed retry does not undo an operator's clear (issue #1814).
 #[tokio::test]
 async fn a_keyed_retry_does_not_undo_a_manual_clear() {

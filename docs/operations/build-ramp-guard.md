@@ -294,12 +294,21 @@ The guard fails safe: when it cannot read, it does not abort.
   policy write and `DELETE /admin/build-routing/ramp/{queue_name}` record
   the `ramp_id` that they remove in `harvest_ramp_retired_ids`, on that
   pool. A late retry of the request that set that id gets `409 Conflict`,
-  by the same checks as an aborted id.
+  by the same checks as an aborted id. The retired row holds the queue, so
+  a caller id that a library reuses on another queue is not refused there.
+- The key protects the ramp only. `PUT /admin/build-routing/policy` stays
+  last-writer-wins for the base build, as before #1814. A late retry of an
+  old policy request sets its base again. Only the ramp that it carries is
+  refused.
+- A conflict on one pool while another pool takes the ramp gives `207`.
+  The refusing pool is listed in `shard_errors`.
 - The pool also keeps the request's own id in
   `harvest_build_policies.ramp_caller_id`. The stored `ramp_id` mixes in
   the base build, so a base change alone gives a new stored id. The
   writer retires the old request id too, so a retry after a base change
-  is refused all the same.
+  is refused all the same. The guard's abort retires it in the same
+  statement as the clear, so an aborted ramp also stays aborted on a new
+  base.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported, older than `report_grace`, and whose ramp no

@@ -419,19 +419,35 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
 /// instead, so its report stays recoverable. A newer abort keeps the older
 /// markers. The new marker is always unreported. Only a committed report
 /// marks it. The UPDATE returns the `id` of the new marker as `marker_id`.
+///
+/// The same statement retires the row's `ramp_caller_id`. A retry after a
+/// base change derives another stored id, so only the caller id refuses it.
+/// The retire reads the output of the clear, so it retires an id only when
+/// the clear changed that row. The subquery reads the caller id before the
+/// clear. A concurrent writer changes `updated_at`, so the pinned step
+/// rejects a row that changed after that read.
 #[must_use]
 pub const fn abort_ramp_query() -> &'static str {
-    "UPDATE harvest_build_policies \
-     SET ramp_aborted = jsonb_build_array(jsonb_build_object( \
-                 'id', COALESCE(ramp_id, $5), 'base', build_id, 'target', target_build_id, \
-                 'reported', false, \
-                 'at', (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)) \
-                 || ramp_aborted, \
-         ramp_id = NULL, ramp_caller_id = NULL, target_build_id = NULL, ramp_percent = NULL, \
-         updated_at = NOW() \
-     WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
-       AND updated_at = $4 \
-     RETURNING (ramp_aborted -> 0 ->> 'id')::uuid AS marker_id"
+    "WITH cleared AS ( \
+         UPDATE harvest_build_policies \
+         SET ramp_aborted = jsonb_build_array(jsonb_build_object( \
+                     'id', COALESCE(ramp_id, $5), 'base', build_id, \
+                     'target', target_build_id, 'reported', false, \
+                     'at', (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)) \
+                     || ramp_aborted, \
+             ramp_id = NULL, ramp_caller_id = NULL, target_build_id = NULL, \
+             ramp_percent = NULL, updated_at = NOW() \
+         FROM (SELECT ramp_caller_id AS caller FROM harvest_build_policies \
+               WHERE queue_name = $1) AS old \
+         WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
+           AND updated_at = $4 \
+         RETURNING queue_name, old.caller, (ramp_aborted -> 0 ->> 'id')::uuid AS marker_id \
+     ), retired AS ( \
+         INSERT INTO harvest_ramp_retired_ids (queue_name, ramp_id) \
+         SELECT queue_name, caller FROM cleared WHERE caller IS NOT NULL \
+         ON CONFLICT (queue_name, ramp_id) DO NOTHING \
+     ) \
+     SELECT marker_id FROM cleared"
 }
 
 /// SQL that removes finished abort markers from one policy row.
@@ -1241,6 +1257,20 @@ async fn record_abort_tombstones(
                 "INSERT INTO harvest_ramp_abort_reports (ramp_id, queue_name) \
                  SELECT id, $1 FROM unnest($2::uuid[]) AS t(id) \
                  ON CONFLICT (ramp_id) DO NOTHING",
+            )
+            .bind::<Text, _>(queue)
+            .bind::<Array<diesel::sql_types::Uuid>, _>(ramp_ids)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+            // A late write of an aborted ramp holds a caller id too. Retire it,
+            // so a retry after a base change is refused as well.
+            diesel::sql_query(
+                "INSERT INTO harvest_ramp_retired_ids (queue_name, ramp_id) \
+                 SELECT queue_name, ramp_caller_id FROM harvest_build_policies \
+                 WHERE queue_name = $1 AND ramp_id = ANY($2::uuid[]) \
+                   AND ramp_caller_id IS NOT NULL \
+                 ON CONFLICT (queue_name, ramp_id) DO NOTHING",
             )
             .bind::<Text, _>(queue)
             .bind::<Array<diesel::sql_types::Uuid>, _>(ramp_ids)

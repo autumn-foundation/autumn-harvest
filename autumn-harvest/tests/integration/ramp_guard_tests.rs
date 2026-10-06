@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::build_routing::{
-    clear_build_ramp, get_build_policy, lock_ramp_generations, ramp_bucket, ramp_generation_id,
-    set_build_policy, set_build_policy_with_ramp_id, set_build_ramp, set_build_ramp_with_id,
+    clear_build_ramp, get_build_policy, lock_ramp_generations, ramp_bucket,
+    ramp_generation_aborted, ramp_generation_id, set_build_policy, set_build_policy_with_ramp_id,
+    set_build_ramp, set_build_ramp_with_id,
 };
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
@@ -2154,6 +2155,31 @@ async fn a_ramp_retry_after_a_base_change_is_refused() {
     assert_eq!(policy.ramp_percent, Some(50), "the operator ramp stays");
 }
 
+/// An abort retires the request's own id too. A retry after a base change
+/// derives another stored id, but it is still refused.
+#[tokio::test]
+async fn a_retry_of_an_aborted_ramp_after_a_base_change_is_refused() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let first = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, first).await;
+    let step = policy_step(&mut conn).await;
+    abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+        .await
+        .expect("clear")
+        .expect("cleared");
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, uuid::Uuid::new_v4())
+        .await
+        .expect("base change");
+
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, first).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "a retry of an aborted ramp is refused on a new base: {retry:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+}
+
 /// A guard can stop after its clear commits and before its report. A later
 /// pass reports that abort once, from the marker, after the report grace.
 #[tokio::test]
@@ -2278,6 +2304,32 @@ async fn one_caller_id_on_two_queues_gives_two_ramp_ids() {
     }
     assert!(stored_ids[0].is_some(), "{stored_ids:?}");
     assert_ne!(stored_ids[0], stored_ids[1], "each queue has its own id");
+}
+
+/// A clear on one queue retires the caller id for that queue only. A retry
+/// of the same caller id on another queue stays idempotent.
+#[tokio::test]
+async fn a_clear_on_one_queue_does_not_refuse_the_caller_id_on_another() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    for queue in [QUEUE, "other-queue"] {
+        set_build_policy(&mut conn, queue, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        set_build_ramp_with_id(&mut conn, queue, BUILD_B, RAMP_PERCENT, ramp_id)
+            .await
+            .expect("set ramp");
+    }
+    clear_build_ramp(&mut conn, QUEUE).await.expect("clear");
+
+    let retry =
+        set_build_ramp_with_id(&mut conn, "other-queue", BUILD_B, RAMP_PERCENT, ramp_id).await;
+    assert!(retry.is_ok(), "the other queue keeps its ramp: {retry:?}");
+    let aborted = ramp_generation_aborted(&mut conn, "other-queue", &[ramp_id])
+        .await
+        .expect("check");
+    assert!(!aborted, "the retired id belongs to the cleared queue only");
 }
 
 /// Build ids are free text, so a `/` in one cannot shift the split between

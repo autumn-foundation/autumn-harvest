@@ -17,8 +17,11 @@
 ALTER TABLE harvest_build_policies
     ADD COLUMN IF NOT EXISTS ramp_caller_id UUID NULL;
 
+-- The key holds the queue. A library caller can reuse one caller id on two
+-- queues, so a retire on one queue must not refuse the id on another.
 CREATE TABLE IF NOT EXISTS harvest_ramp_retired_ids (
-    ramp_id    UUID PRIMARY KEY,
     queue_name TEXT NOT NULL,
-    retired_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    ramp_id    UUID NOT NULL,
+    retired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (queue_name, ramp_id)
 );

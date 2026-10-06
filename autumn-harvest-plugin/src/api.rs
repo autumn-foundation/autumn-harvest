@@ -48245,6 +48245,7 @@ async fn set_build_ramp_handler(
 
     let mut last_policy = None;
     let mut last_conflict = None;
+    let mut shard_conflicts: Vec<String> = Vec::new();
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -48265,6 +48266,7 @@ async fn set_build_ramp_handler(
         {
             Ok(p) => last_policy = Some(p),
             Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                shard_conflicts.push(format!("shard {}: {e}", shard_id.as_i32()));
                 last_conflict = Some(e);
             }
             Err(e) => {
@@ -48280,6 +48282,9 @@ async fn set_build_ramp_handler(
     {
         return conflict_from(conflict).into_response();
     }
+    // A conflict on one shard while another shard takes the ramp leaves the
+    // fan-out divergent. Report it as a partial failure (issue #1814).
+    shard_errors.extend(shard_conflicts);
 
     // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
