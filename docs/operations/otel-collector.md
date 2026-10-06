@@ -17,18 +17,23 @@ no native OTLP exporter: [`docs/adr/0004-security-extras.md`](../adr/0004-securi
 2. Set explicit buckets for `harvest_activity_duration`. Without buckets the
    exporter renders a summary, and the Collector copies a summary, not a
    histogram.
-3. Use an `otelcol-contrib` build. The `metricstransform` processor is in the
-   contrib distribution only.
+3. Use an `otelcol-contrib` build. The `metricstransform` and `transform`
+   processors are in the contrib distribution only.
 
 ## Mapped metrics
 
-| Harvest metric | Semconv metric | `messaging.operation.name` | `messaging.operation.type` | `messaging.destination.name` from |
-|---|---|---|---|---|
-| `harvest.queue.dispatched` | `messaging.client.consumed.messages` | `claim` | `receive` | `queue` |
-| `harvest.activity.duration` | `messaging.process.duration` | `process` | `process` | `queue` |
+| Harvest metric | Semconv metric | Unit | `messaging.operation.name` | `messaging.operation.type` | `messaging.destination.name` from |
+|---|---|---|---|---|---|
+| `harvest.queue.dispatched` | `messaging.client.consumed.messages` | `{message}` | `claim` | `receive` | `queue` |
+| `harvest.activity.duration` | `messaging.process.duration` | `s` | `process` | `process` | `queue` |
 
 Each copy also gets `messaging.system = harvest`. The other labels of the
 source stay on the copy.
+
+The Prometheus exposition carries no unit, and `metricstransform` cannot set
+one. So a `transform` processor sets the unit that each semconv metric
+requires. A backend that selects semconv metrics by name and unit then finds
+the copies.
 
 The OTel messaging conventions still have Development status. A later semconv
 release can rename these metrics. Then this table and the recipe change
@@ -103,6 +108,12 @@ processors:
           - action: add_label
             new_label: messaging.operation.type
             new_value: process
+  transform/harvest-semconv-units:
+    metric_statements:
+      - context: metric
+        statements:
+          - 'set(unit, "{message}") where name == "messaging.client.consumed.messages"'
+          - 'set(unit, "s") where name == "messaging.process.duration"'
   batch: {}
 
 exporters:
@@ -113,7 +124,7 @@ service:
   pipelines:
     metrics:
       receivers: [prometheus]
-      processors: [metricstransform/harvest-semconv, batch]
+      processors: [metricstransform/harvest-semconv, transform/harvest-semconv-units, batch]
       exporters: [otlp]
 ```
 

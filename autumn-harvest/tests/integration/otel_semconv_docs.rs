@@ -88,10 +88,24 @@ fn render_recipe() -> String {
             kind = mapping.operation_type,
         );
     }
+    // `metricstransform` cannot set a unit, so a `transform` processor does.
+    yaml.push_str(
+        "  transform/harvest-semconv-units:\n    metric_statements:\n      \
+         - context: metric\n        statements:\n",
+    );
+    for mapping in SEMCONV_METRIC_MAPPINGS {
+        let _ = writeln!(
+            yaml,
+            "          - 'set(unit, \"{unit}\") where name == \"{target}\"'",
+            unit = mapping.unit,
+            target = mapping.target,
+        );
+    }
     yaml.push_str(
         "  batch: {}\n\nexporters:\n  otlp:\n    endpoint: otel-backend:4317\n\n\
          service:\n  pipelines:\n    metrics:\n      receivers: [prometheus]\n      \
-         processors: [metricstransform/harvest-semconv, batch]\n      exporters: [otlp]\n",
+         processors: [metricstransform/harvest-semconv, transform/harvest-semconv-units, \
+         batch]\n      exporters: [otlp]\n",
     );
     yaml
 }
@@ -127,16 +141,21 @@ fn every_mapping_names_a_cataloged_harvest_metric() {
 #[test]
 fn every_target_is_a_messaging_semconv_metric_of_the_right_kind() {
     for mapping in SEMCONV_METRIC_MAPPINGS {
-        let expected = match mapping.target {
+        let (expected, unit) = match mapping.target {
             "messaging.client.sent.messages" | "messaging.client.consumed.messages" => {
-                SemconvInstrument::Counter
+                (SemconvInstrument::Counter, "{message}")
             }
             "messaging.process.duration" | "messaging.client.operation.duration" => {
-                SemconvInstrument::Histogram
+                (SemconvInstrument::Histogram, "s")
             }
             other => panic!("{other} is not a messaging semconv metric"),
         };
         assert_eq!(mapping.instrument, expected, "{}", mapping.source);
+        assert_eq!(
+            mapping.unit, unit,
+            "{} needs the semconv unit",
+            mapping.target
+        );
         assert!(
             ["create", "send", "receive", "process", "settle"].contains(&mapping.operation_type),
             "{} is not a messaging.operation.type value",
@@ -173,7 +192,10 @@ fn the_docs_hold_the_rendered_collector_recipe() {
 fn the_docs_list_every_mapping_in_the_table() {
     let doc = read(RECIPE_DOC);
     for mapping in SEMCONV_METRIC_MAPPINGS {
-        let row = format!("| `{}` | `{}` |", mapping.source, mapping.target);
+        let row = format!(
+            "| `{}` | `{}` | `{}` |",
+            mapping.source, mapping.target, mapping.unit
+        );
         assert!(doc.contains(&row), "{RECIPE_DOC} lacks the row {row}");
     }
 }

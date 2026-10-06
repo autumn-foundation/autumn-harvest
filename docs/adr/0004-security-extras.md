@@ -137,8 +137,9 @@ declined.
   `harvest.activity.duration` to `messaging.process.duration`.
 - [`docs/operations/otel-collector.md`](../operations/otel-collector.md)
   publishes the Collector recipe. It scrapes the Prometheus endpoint and
-  copies each mapped series under its semconv name. A test renders the recipe
-  from the table, so the two cannot drift.
+  copies each mapped series under its semconv name. It also sets the unit
+  each semconv metric requires, because the Prometheus scrape carries none. A
+  test renders the recipe from the table, so the two cannot drift.
 - Harvest keeps its own metric names. Dashboards, alerts and SLO rules do not
   change.
 

@@ -1990,6 +1990,9 @@ pub struct SemconvMapping {
     pub operation_type: &'static str,
     /// The Harvest label that becomes `messaging.destination.name`.
     pub destination_label: &'static str,
+    /// The UCUM unit the semconv metric requires. The Collector recipe sets
+    /// it, because the source carries no unit.
+    pub unit: &'static str,
 }
 
 /// Every `harvest.*` metric with a messaging semconv equivalent (issue #1838).
@@ -2004,6 +2007,7 @@ pub const SEMCONV_METRIC_MAPPINGS: &[SemconvMapping] = &[
         operation_name: "claim",
         operation_type: "receive",
         destination_label: METRIC_LABEL_QUEUE,
+        unit: "{message}",
     },
     // An activity attempt runs a claimed task: the processing duration.
     SemconvMapping {
@@ -2013,6 +2017,7 @@ pub const SEMCONV_METRIC_MAPPINGS: &[SemconvMapping] = &[
         operation_name: "process",
         operation_type: "process",
         destination_label: METRIC_LABEL_QUEUE,
+        unit: "s",
     },
 ];
 
