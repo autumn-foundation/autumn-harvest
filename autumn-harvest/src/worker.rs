@@ -241,6 +241,9 @@ pub struct WorkerRuntimeConfig {
     /// Per-shard, per-tick batch size for the lazy payload-codec re-encryption
     /// sweep (issue #948). `0` disables it.
     pub codec_rotation_batch_size: i64,
+    /// Per-shard scanner election, cadence, and batch size (issue #1795).
+    /// See [`crate::builder::WorkerConfig::scanner`].
+    pub scanner: crate::scanner_lease::ScannerConfig,
     /// This worker's cross-region DR configuration (issue #954). See
     /// [`crate::builder::WorkerConfig::dr_fencing`] and its sibling knobs.
     ///
@@ -471,6 +474,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             slot_tuner: cfg.slot_tuner,
             max_concurrent_sessions: cfg.max_concurrent_sessions,
             codec_rotation_batch_size: cfg.codec_rotation_batch_size,
+            scanner: cfg.scanner,
         }
     }
 }
@@ -31103,7 +31107,11 @@ impl Worker {
                 crate::timeout::spawn_timeout_checker_on_shard_pool(
                     shard_pool.clone(),
                     self.shutdown.clone(),
-                    self.config.poll_interval,
+                    // Issue #1795: `None` keeps the poll-interval cadence.
+                    self.config
+                        .scanner
+                        .timeout_interval
+                        .unwrap_or(self.config.poll_interval),
                     self.registry.telemetry().clone(),
                     self.config.unknown_target_grace_window,
                     self.config.sharded_pool.clone(),
@@ -31117,6 +31125,11 @@ impl Worker {
                     *shard,
                     self.registry.payload_codecs().clone(),
                     self.config.codec_rotation_batch_size,
+                    // Issue #1795: this worker's id is its lease holder id.
+                    self.config
+                        .scanner
+                        .coordination(self.config.worker_id.clone()),
+                    self.config.scanner.timeout_batch_size,
                 )
             })
             .collect();
@@ -36547,6 +36560,7 @@ mod tests {
             slot_tuner: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            scanner: crate::scanner_lease::ScannerConfig::default(),
         }
     }
 
@@ -37407,6 +37421,7 @@ mod tests {
             slot_tuner: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            scanner: crate::scanner_lease::ScannerConfig::default(),
             retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
             #[cfg(feature = "db")]
             sharded_pool: None,

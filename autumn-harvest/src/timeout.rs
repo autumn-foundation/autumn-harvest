@@ -454,8 +454,11 @@ pub fn classify_workflow_timeout(
 
 /// Find all tasks that have exceeded their timeout limits.
 ///
-/// Runs all three timeout queries and returns the matched tasks along with
+/// Runs all four timeout queries and returns the matched tasks along with
 /// their timeout reason.
+///
+/// This scan has no bound. The spawned checker uses
+/// [`find_timed_out_tasks_batch`] instead (issue #1795).
 ///
 /// # Errors
 ///
@@ -466,53 +469,661 @@ pub async fn find_timed_out_tasks(
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
-    // Heartbeat timeouts
-    let heartbeat_tasks: Vec<TaskQueueItem> = diesel::sql_query(heartbeat_timeout_query())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    for task in heartbeat_tasks {
-        if seen.insert(task.id) {
-            results.push((task, TimeoutReason::Heartbeat));
-        }
-    }
-
-    // Start-to-close timeouts
-    let start_close_tasks: Vec<TaskQueueItem> = diesel::sql_query(start_to_close_timeout_query())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    for task in start_close_tasks {
-        if seen.insert(task.id) {
-            results.push((task, TimeoutReason::StartToClose));
-        }
-    }
-
-    // Schedule-to-start timeouts
-    let sched_start_tasks: Vec<TaskQueueItem> =
-        diesel::sql_query(schedule_to_start_timeout_query())
+    for (reason, predicate) in task_timeout_scans() {
+        let tasks: Vec<TaskQueueItem> = diesel::sql_query(predicate)
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
-    for task in sched_start_tasks {
-        if seen.insert(task.id) {
-            results.push((task, TimeoutReason::ScheduleToStart));
-        }
-    }
-
-    // Schedule-to-close timeouts (cross-retry wall-clock deadline, issue #378)
-    let sched_close_tasks: Vec<TaskQueueItem> =
-        diesel::sql_query(schedule_to_close_timeout_query())
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-    for task in sched_close_tasks {
-        if seen.insert(task.id) {
-            results.push((task, TimeoutReason::ScheduleToClose));
+        for task in tasks {
+            if seen.insert(task.id) {
+                results.push((task, reason.clone()));
+            }
         }
     }
 
     Ok(results)
+}
+
+pub use crate::scanner_lease::DEFAULT_TIMEOUT_SCAN_BATCH_SIZE;
+
+/// The four task-timeout scans, in enforcement order.
+///
+/// [`find_timed_out_tasks`] and [`find_timed_out_tasks_batch`] both read this
+/// list, so the two cannot disagree on a predicate.
+const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
+    [
+        (TimeoutReason::Heartbeat, heartbeat_timeout_query()),
+        (TimeoutReason::StartToClose, start_to_close_timeout_query()),
+        (
+            TimeoutReason::ScheduleToStart,
+            schedule_to_start_timeout_query(),
+        ),
+        (
+            TimeoutReason::ScheduleToClose,
+            schedule_to_close_timeout_query(),
+        ),
+    ]
+}
+
+/// The sort key of a live row in a timeout sweep (issue #1795).
+///
+/// It is the row's creation time. Rows enqueued before migration
+/// `20260619000000` have no `created_at`, so they sort first. The partial
+/// index `idx_harvest_tq_live_created` holds live rows in `(key, id)` order.
+/// The text must match the index expression, or Postgres cannot use it.
+const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00')";
+
+/// One refill of a task-timeout queue (issue #1795).
+///
+/// The refill reads one page of live rows in `(key, id)` order, where the
+/// key is [`LIVE_ROW_KEY`]. A live row is `PENDING` or `RUNNING`. The page
+/// reads only rows created at or before the sweep's clock. The index scan
+/// applies that bound and the keyset bound itself. So the page reads at most
+/// `LIMIT` index entries, and rows created later are never visited.
+///
+/// The page holds the columns the predicates read. Each predicate then reads
+/// the page, not the table, so no predicate can fall back to its own index and scan past the
+/// page. A row is left to an earlier reason only when that reason's lane can
+/// still claim it. The query returns the expired ids, oldest first. It also returns the
+/// key and id of the last row of the page, and the number of rows read. So
+/// the work of a refill does not grow with the backlog. One sweep reads once
+/// each row that was live at its start.
+///
+/// Each predicate compares against the sweep's clock, not `NOW()`. So the
+/// sweep queues only rows that had expired when it started. The predicate
+/// consts stay plain, because the backup drill `UNION`s them.
+///
+/// With `after`, `$1` and `$2` are the key and id of the last row of the
+/// previous page. Then `$3` is the page size and `$4` is the sweep's clock.
+/// Without it, `$1` is the page size and `$2` is the clock. The next four
+/// params describe the earlier lanes. They hold the clocks, the cursor keys,
+/// the cursor ids, and the ids that the lanes hold.
+///
+/// An earlier lane matches each row at its own clock. A row ahead of its
+/// cursor is left to it. A row that it holds is left to it whatever it
+/// matches, because the row can have moved there after that clock. A row
+/// that it has already passed goes to this lane.
+fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
+    use std::fmt::Write as _;
+
+    let (keyset, limit, clock, first) = if after {
+        (
+            format!(" AND ({LIVE_ROW_KEY}, id) > ($1, $2)"),
+            "$3",
+            "$4",
+            5,
+        )
+    } else {
+        (String::new(), "$1", "$2", 3)
+    };
+    let [clocks, keys, ids, held] = std::array::from_fn::<_, 4, _>(|i| format!("${}", first + i));
+    let on_page = |sql: &str, at: &str| on_refill_page(sql).replace("NOW()", at);
+    // `EXCEPT` leaves a row to an earlier reason. A set operation stays near
+    // linear in the page. A correlated `NOT EXISTS` on the page can run as a
+    // nested loop, because the planner cannot estimate the page's rows.
+    let mut expired = format!(
+        "SELECT q.id, q.row_key FROM ({}) q",
+        on_page(predicate, clock)
+    );
+    for (index, earlier) in higher.iter().enumerate() {
+        let k = index + 1;
+        let at = format!("({clocks})[{k}]");
+        let _ = write!(
+            expired,
+            " EXCEPT SELECT h.id, h.row_key FROM ({}) h WHERE h.row_key <= {at} \
+             AND (({keys})[{k}] IS NULL OR (h.row_key, h.id) > (({keys})[{k}], ({ids})[{k}]))",
+            on_page(earlier, &at)
+        );
+    }
+    if !higher.is_empty() {
+        let _ = write!(
+            expired,
+            " EXCEPT SELECT p.id, p.row_key FROM page p \
+             WHERE p.id IN (SELECT u.id FROM unnest({held}) AS u(id))"
+        );
+    }
+    format!(
+        "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS}, {LIVE_ROW_KEY} AS row_key \
+         FROM harvest_task_queue \
+         WHERE state IN ('PENDING', 'RUNNING') AND {LIVE_ROW_KEY} <= {clock}{keyset} \
+         ORDER BY {LIVE_ROW_KEY}, id LIMIT {limit}), \
+         tail AS (SELECT row_key, id FROM page ORDER BY row_key DESC, id DESC LIMIT 1) \
+         SELECT (SELECT row_key FROM tail) AS last_key, (SELECT id FROM tail) AS last_id, \
+         (SELECT COUNT(*) FROM page) AS rows_read, \
+         ARRAY(SELECT e.id FROM ({expired}) e ORDER BY e.row_key, e.id) AS expired"
+    )
+}
+
+/// The columns of a refill page (issue #1795).
+///
+/// These are the id and the columns that the four predicates read. Payload
+/// columns stay out, so a refill does not copy task inputs. The bounded
+/// batch query loads whole rows. A unit test checks the list against the
+/// predicates.
+const TIMEOUT_PAGE_COLUMNS: &str = "id, state, queue_name, task_type, activity_name, \
+     workflow_exec_id, scheduled_at, started_at, last_heartbeat_at, heartbeat_timeout, \
+     start_to_close, schedule_to_start, schedule_to_close_at";
+
+/// Points a timeout predicate at the refill page instead of the table.
+///
+/// Every predicate reads `harvest_task_queue` once, at its top level. Its
+/// subqueries read other tables only. A unit test holds both facts.
+fn on_refill_page(predicate: &str) -> String {
+    predicate.replacen("FROM harvest_task_queue", "FROM page", 1)
+}
+
+/// The start of a sweep (issue #1795): the database clock.
+///
+/// The sweep reads the rows created at or before this time, and tests
+/// expiry against it. See [`timeout_refill_query`].
+const TIMEOUT_SWEEP_START_SQL: &str = "SELECT NOW() AS as_of";
+
+/// The rows of one batch of queued ids (issue #1795).
+///
+/// `$1` is the batch of ids. A primary-key lookup finds them, so the work is
+/// bounded by the batch. The predicate is checked again, because a queued
+/// row can stop matching before its turn.
+///
+/// The batch keeps the reason that the refill gave each row. An earlier
+/// reason that starts to match later does not drop the row. That reason's
+/// sweep has already passed it, so the row would wait for the next sweep.
+fn timeout_batch_query(predicate: &str) -> String {
+    format!("SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q ORDER BY q.id")
+}
+
+/// The ids among `$1` that match `predicate` now (issue #1795).
+///
+/// It selects ids only. A probe of a large batch then loads no payloads.
+fn timeout_probe_query(predicate: &str) -> String {
+    format!("SELECT q.id FROM ({predicate} AND id = ANY($1) OFFSET 0) q")
+}
+
+/// One id from [`timeout_probe_query`].
+#[derive(diesel::QueryableByName)]
+struct ProbedId {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+}
+
+/// What an earlier lane can still claim in its current sweep (issue #1795).
+///
+/// A later lane leaves a row to this lane only if this lane can still claim
+/// it. The row is then ahead of the cursor of this lane, or held by it.
+struct LaneClaim {
+    /// The lane's sweep clock. `None` when its sweep is over, so its next
+    /// sweep starts later with a newer clock.
+    clock: Option<chrono::DateTime<chrono::Utc>>,
+    /// The last row the lane has read. `None` means every row is ahead.
+    read_to: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    /// The ids in the lane's queue, moved list and retry list. The lane
+    /// holds them also after its sweep is over.
+    held: Vec<uuid::Uuid>,
+}
+
+impl TimeoutScanLane {
+    /// What this lane can still claim after a batch of `limit`.
+    fn claim(&self, limit: usize) -> LaneClaim {
+        let (_, _, queued_taken) = self.batch_split(limit);
+        let open = self.after.is_some() || self.queued.len() > queued_taken;
+        let as_of = self.as_of.filter(|_| open);
+        LaneClaim {
+            clock: as_of,
+            // A lane on its last page has read every row of its sweep.
+            read_to: as_of.map(|as_of| self.after.unwrap_or((as_of, uuid::Uuid::max()))),
+            held: self
+                .queued
+                .iter()
+                .chain(&self.moved)
+                .copied()
+                .chain(self.retry.iter().map(|(id, _)| *id))
+                .collect(),
+        }
+    }
+}
+
+/// Batches of live rows that one refill reads, per timeout reason.
+///
+/// A refill reads one page of live rows and queues the expired ones. A
+/// larger page means fewer refills per sweep. Each refill still reads a
+/// bounded number of rows.
+const REFILL_BATCHES: i64 = 64;
+
+/// Most live rows that one refill reads, whatever the batch size.
+const MAX_PAGE_ROWS: i64 = 100_000;
+
+/// The batch limit and the refill page size for a requested `limit`.
+///
+/// The limit is kept within 1 and [`MAX_PAGE_ROWS`]. So no setting can make
+/// a refill read more than [`MAX_PAGE_ROWS`] rows.
+fn timeout_scan_bounds(limit: i64) -> (i64, i64) {
+    let limit = limit.clamp(1, MAX_PAGE_ROWS);
+    let page_rows = limit.saturating_mul(REFILL_BATCHES).min(MAX_PAGE_ROWS);
+    (limit, page_rows)
+}
+
+/// One timeout reason's place in its sweep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TimeoutScanLane {
+    /// The key and id of the last row of the last full page. `None` starts
+    /// the sweep from its first row.
+    after: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    /// The database clock when the current sweep started. It stays until the
+    /// next sweep starts. Refills read rows created by then, and test expiry
+    /// against it.
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// Expired ids from the last refill, not yet handed out.
+    queued: std::collections::VecDeque<uuid::Uuid>,
+    /// Ids that failed to enforce, with the tries each has had. The next
+    /// batch loads them first.
+    retry: Vec<(uuid::Uuid, u32)>,
+    /// The retried ids of the last loaded batch, with their tries.
+    loaded_retries: std::collections::HashMap<uuid::Uuid, u32>,
+    /// Ids that moved here from another reason. They stay out of `queued`,
+    /// so moves never hold back a refill. At most one batch of them waits.
+    moved: std::collections::VecDeque<uuid::Uuid>,
+    /// Which of moved and queued ids gets the odd slot of the next batch.
+    /// It flips each pass that has both, so neither can starve the other.
+    favor_moved: bool,
+}
+
+/// Most passes in a row that try one failing row.
+///
+/// It matches the failed passes after which a leader gives up its lease.
+/// After that, the row waits for the next sweep. So rows that keep failing
+/// cannot hold the batch forever on a checker without a lease.
+const MAX_ROW_TRIES: u32 = 3;
+
+impl TimeoutScanLane {
+    /// The ids of the next batch, without taking them.
+    ///
+    /// Retried ids come first. Moved and queued ids share the rest. All
+    /// three share one `limit`, so the load of a pass stays bounded.
+    fn next_batch(&self, limit: usize) -> Vec<uuid::Uuid> {
+        let (retries, moved, queued) = self.batch_split(limit);
+        self.retry[..retries]
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(self.moved.iter().take(moved).copied())
+            .chain(self.queued.iter().take(queued).copied())
+            .collect()
+    }
+
+    /// Takes the ids of [`Self::next_batch`] after the batch loads.
+    ///
+    /// Ids that the batch did not load stay for the next pass.
+    fn commit_batch(&mut self, limit: usize) {
+        let (retries, moved, queued) = self.batch_split(limit);
+        if !self.moved.is_empty() && !self.queued.is_empty() {
+            self.favor_moved = !self.favor_moved;
+        }
+        self.loaded_retries = self.retry.drain(..retries).collect();
+        self.moved.drain(..moved);
+        self.queued.drain(..queued);
+    }
+
+    /// The retried, moved and queued ids that a batch of `limit` takes.
+    ///
+    /// When both have ids, moved and queued ids split the slots after the
+    /// retries. A slot one of them leaves unused goes to the other.
+    fn batch_split(&self, limit: usize) -> (usize, usize, usize) {
+        let retries = limit.min(self.retry.len());
+        let rest = limit - retries;
+        let share = if self.favor_moved {
+            rest.div_ceil(2)
+        } else {
+            rest / 2
+        };
+        let mut moved = self.moved.len().min(share);
+        let queued = self.queued.len().min(rest - moved);
+        moved = self.moved.len().min(rest - queued);
+        (retries, moved, queued)
+    }
+
+    /// Queues the expired ids of a refill.
+    ///
+    /// An id that waits for a retry is left out. A second, queued copy would
+    /// count as a first try, so the row could hold the batch past
+    /// [`MAX_ROW_TRIES`].
+    fn queue_refill(&mut self, expired: impl IntoIterator<Item = uuid::Uuid>) {
+        let held: HashSet<uuid::Uuid> = self
+            .retry
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(self.moved.iter().copied())
+            .collect();
+        self.queued
+            .extend(expired.into_iter().filter(|id| !held.contains(id)));
+    }
+
+    /// Tries `id` again on the next pass, unless it has had its tries.
+    fn retry(&mut self, id: uuid::Uuid) {
+        let tries = self.loaded_retries.get(&id).map_or(1, |tries| tries + 1);
+        if tries < MAX_ROW_TRIES {
+            self.retry.push((id, tries));
+        }
+    }
+}
+
+/// Where the next batched task-timeout scan starts (issue #1795).
+///
+/// One lane per timeout reason. A sweep starts by fixing a clock: the
+/// database time at that moment. When a lane runs empty, one refill reads
+/// the next page of live rows created by then, in creation order. It queues
+/// the rows of that page that had expired by the clock. Each pass then takes
+/// one batch from the queue and loads it by primary key. A full page moves
+/// the position to its last row. A short page ends the sweep, so the next
+/// sweep starts again with a new clock.
+///
+/// A sweep reads each row that was live at its start once. It queues each
+/// such row that had expired by its clock and still matches. A row created
+/// after the sweep starts, or that expires later, waits for the next sweep.
+/// So new rows cannot stretch a sweep or push an older row out of it. A
+/// queued row that stops matching moves to the first other reason that
+/// matches when its batch loads. It waits in that lane's moved list, which
+/// holds at most one batch and shares each batch with the queue. A row that
+/// matches none is dropped.
+///
+/// Each refill reads at most one page of index entries, and each pass loads
+/// at most one batch. So the work of a pass does not grow with the backlog.
+///
+/// A row that fails to enforce is tried again first in the next batch, for
+/// at most three passes in a row. So a leader that fails on it keeps failing
+/// until it gives up its lease. After that, the row waits for the next sweep,
+/// so rows that keep failing cannot block the rows behind them. A replica
+/// starts a new sweep after a tick without a pass, as a standby or without
+/// a connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimeoutScanCursor {
+    lanes: [TimeoutScanLane; 4],
+}
+
+impl TimeoutScanCursor {
+    /// Tries `id` again on the next pass, in the lane of `reason`.
+    pub(crate) fn retry(&mut self, reason: &TimeoutReason, id: uuid::Uuid) {
+        self.lanes[timeout_lane(reason)].retry(id);
+    }
+
+    /// Prepares the cursor for a tick that runs the pass.
+    ///
+    /// After a tick that did not run the pass, for example as a standby, the
+    /// cursor starts a new sweep. The old sweep's clock and queue are stale,
+    /// and another replica may have done its work.
+    pub(crate) fn resume(&mut self, ran_last_tick: bool) {
+        if !ran_last_tick {
+            *self = Self::default();
+        }
+    }
+}
+
+/// The lane of `reason` in [`task_timeout_scans`] order.
+const fn timeout_lane(reason: &TimeoutReason) -> usize {
+    match reason {
+        TimeoutReason::Heartbeat => 0,
+        TimeoutReason::StartToClose => 1,
+        TimeoutReason::ScheduleToStart => 2,
+        TimeoutReason::ScheduleToClose => 3,
+    }
+}
+
+#[derive(diesel::QueryableByName)]
+struct SweepStart {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    as_of: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(diesel::QueryableByName)]
+struct Refill {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    last_key: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    last_id: Option<uuid::Uuid>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    rows_read: i64,
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
+    expired: Vec<uuid::Uuid>,
+}
+
+/// Reads the next page of `lane`'s sweep and queues its expired rows.
+///
+/// `claims` describes the earlier lanes, in scan order.
+async fn refill_lane(
+    conn: &mut AsyncPgConnection,
+    lane: &mut TimeoutScanLane,
+    predicate: &str,
+    higher: &[&str],
+    claims: &[LaneClaim],
+    page_rows: i64,
+) -> HarvestResult<()> {
+    use diesel::sql_types::{Array, BigInt, Nullable, Timestamptz, Uuid};
+
+    let Some(as_of) = lane.as_of else {
+        return Ok(());
+    };
+    let clocks: Vec<_> = claims.iter().map(|c| c.clock.unwrap_or(as_of)).collect();
+    let keys: Vec<_> = claims.iter().map(|c| c.read_to.map(|r| r.0)).collect();
+    let ids: Vec<_> = claims.iter().map(|c| c.read_to.map(|r| r.1)).collect();
+    let held: Vec<uuid::Uuid> = claims.iter().flat_map(|c| c.held.iter().copied()).collect();
+    let refill: Vec<Refill> = match lane.after {
+        Some((after_key, after_id)) => {
+            diesel::sql_query(timeout_refill_query(predicate, higher, true))
+                .bind::<Timestamptz, _>(after_key)
+                .bind::<Uuid, _>(after_id)
+                .bind::<BigInt, _>(page_rows)
+                .bind::<Timestamptz, _>(as_of)
+                .bind::<Array<Timestamptz>, _>(&clocks)
+                .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
+                .bind::<Array<Nullable<Uuid>>, _>(&ids)
+                .bind::<Array<Uuid>, _>(&held)
+                .load(conn)
+                .await
+        }
+        None => {
+            diesel::sql_query(timeout_refill_query(predicate, higher, false))
+                .bind::<BigInt, _>(page_rows)
+                .bind::<Timestamptz, _>(as_of)
+                .bind::<Array<Timestamptz>, _>(&clocks)
+                .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
+                .bind::<Array<Nullable<Uuid>>, _>(&ids)
+                .bind::<Array<Uuid>, _>(&held)
+                .load(conn)
+                .await
+        }
+    }
+    .map_err(crate::error::database_error)?;
+    let refill = refill.into_iter().next();
+    // A full page moves the position. A short page ends the sweep.
+    lane.after = refill
+        .as_ref()
+        .filter(|r| r.rows_read >= page_rows)
+        .and_then(|r| r.last_key.zip(r.last_id));
+    lane.queue_refill(refill.into_iter().flat_map(|r| r.expired));
+    Ok(())
+}
+
+/// The ids of `batch` that its load did not return.
+///
+/// A set keeps this linear, also at a batch of 100,000.
+fn lapsed_ids(batch: &[uuid::Uuid], loaded: impl Iterator<Item = uuid::Uuid>) -> Vec<uuid::Uuid> {
+    let loaded: HashSet<uuid::Uuid> = loaded.collect();
+    batch
+        .iter()
+        .filter(|id| !loaded.contains(id))
+        .copied()
+        .collect()
+}
+
+/// The lanes of other reasons that match `lapsed` now, in scan order.
+///
+/// `lapsed` holds the ids that stopped matching the reason of lane `index`.
+/// Each id goes to the first other reason that matches it. An id that
+/// matches none is left out.
+async fn lapsed_moves(
+    conn: &mut AsyncPgConnection,
+    index: usize,
+    mut lapsed: Vec<uuid::Uuid>,
+) -> HarvestResult<Vec<(usize, uuid::Uuid)>> {
+    let mut moves = Vec::new();
+    for (other, (_, predicate)) in task_timeout_scans().into_iter().enumerate() {
+        if other == index || lapsed.is_empty() {
+            continue;
+        }
+        let matched: Vec<ProbedId> = diesel::sql_query(timeout_probe_query(predicate))
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&lapsed)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        let matched_ids: HashSet<uuid::Uuid> = matched.iter().map(|row| row.id).collect();
+        lapsed.retain(|id| !matched_ids.contains(id));
+        moves.extend(matched.iter().map(|row| (other, row.id)));
+    }
+    Ok(moves)
+}
+
+/// Bounded form of [`find_timed_out_tasks`] (issue #1795).
+///
+/// Returns at most `limit` rows per timeout reason, from `cursor` onward, and
+/// moves `cursor`. The `limit` is kept within 1 and 100,000.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn find_timed_out_tasks_batch(
+    conn: &mut AsyncPgConnection,
+    cursor: &mut TimeoutScanCursor,
+    limit: i64,
+) -> HarvestResult<Vec<(TaskQueueItem, TimeoutReason)>> {
+    let (limit, page_rows) = timeout_scan_bounds(limit);
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    let scans = task_timeout_scans();
+    let predicates = scans.clone().map(|(_, predicate)| predicate);
+    let take = usize::try_from(limit).unwrap_or(usize::MAX);
+    // What each lane already done in this pass can still claim.
+    let mut claims: Vec<LaneClaim> = Vec::with_capacity(4);
+    // Rows whose queued reason lapsed, with the lane of a reason that
+    // matches now. They join that lane's queue after the pass.
+    let mut moves: Vec<Move> = Vec::new();
+    for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
+        let higher = &predicates[..index];
+        if lane.queued.is_empty() && lane.after.is_none() {
+            // A new sweep: fix its clock.
+            let start: Vec<SweepStart> = diesel::sql_query(TIMEOUT_SWEEP_START_SQL)
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            lane.as_of = start.into_iter().next().map(|r| r.as_of);
+        }
+        if lane.queued.is_empty() {
+            refill_lane(conn, lane, predicate, higher, &claims, page_rows).await?;
+        }
+        claims.push(lane.claim(take));
+
+        let batch = lane.next_batch(take);
+        if batch.is_empty() {
+            continue;
+        }
+        let page: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate))
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&batch)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        let lapsed = lapsed_ids(&batch, page.iter().map(|task| task.id));
+        for task in page {
+            if seen.insert(task.id) {
+                results.push((task, reason.clone()));
+            }
+        }
+        // A row whose queued reason stopped matching can match another one
+        // now. The other lanes may have left it to this reason. It moves to
+        // the first one that matches, and counts against that lane's limit.
+        // The move is reserved for the rest of the pass, so no later lane
+        // hands the row out under its own reason.
+        if !lapsed.is_empty() {
+            let reserved = lapsed_moves(conn, index, lapsed).await?;
+            seen.extend(reserved.iter().map(|(_, id)| *id));
+            moves.extend(reserved.into_iter().map(|(to, id)| Move {
+                from: index,
+                to,
+                id,
+            }));
+        }
+    }
+
+    // The lanes give up their ids only after every load succeeds. So a
+    // failed load loses no id, in this lane or an earlier one.
+    for lane in &mut cursor.lanes {
+        lane.commit_batch(take);
+    }
+    admit_moves(&mut cursor.lanes, moves, take);
+    Ok(results)
+}
+
+/// A row whose queued reason lapsed, with the lane it came from and the lane
+/// of a reason that matches it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Move {
+    from: usize,
+    to: usize,
+    id: uuid::Uuid,
+}
+
+/// Hands each moved row to the lane of its new reason.
+///
+/// Moved rows wait in their own list, first in, first out. The list keeps
+/// the row reserved for its new reason across passes. A later lane never
+/// takes a held row, so it cannot record the wrong reason.
+///
+/// A lane holds at most `limit` moved rows. Three other lanes can each move
+/// a full batch here in one pass. A move past the cap is not dropped. It goes
+/// back to the front of its source lane's queue, so that lane still holds it
+/// and probes it again next pass. That is backpressure: a source whose moves
+/// do not fit stops taking new rows until the lane drains. The moved list
+/// gives up at least half a batch each pass, so the source always resumes.
+/// No list grows, because a deferred id only changes lists.
+fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<Move>, limit: usize) {
+    if moves.is_empty() {
+        return;
+    }
+    let mut held: Vec<HashSet<uuid::Uuid>> = lanes
+        .iter()
+        .map(|lane| {
+            lane.queued
+                .iter()
+                .chain(&lane.moved)
+                .copied()
+                .chain(lane.retry.iter().map(|(id, _)| *id))
+                .collect()
+        })
+        .collect();
+    let mut deferred: [Vec<uuid::Uuid>; 4] = Default::default();
+    for Move { from, to, id } in moves {
+        if held[to].contains(&id) {
+            continue;
+        }
+        if lanes[to].moved.len() < limit {
+            held[to].insert(id);
+            lanes[to].moved.push_back(id);
+        } else if held[from].insert(id) {
+            deferred[from].push(id);
+        }
+    }
+    for (lane, ids) in lanes.iter_mut().zip(deferred) {
+        for id in ids.into_iter().rev() {
+            lane.queued.push_front(id);
+        }
+    }
+}
+
+/// Which task-timeout scan one pass runs (issue #1795).
+pub(crate) enum TaskScan<'a> {
+    /// Every expired row. The public [`enforce_timeouts_once`] keeps this.
+    All,
+    /// One bounded page per reason. The spawned checker uses this.
+    Batch {
+        cursor: &'a mut TimeoutScanCursor,
+        limit: i64,
+    },
 }
 
 fn timeout_error(task_name: &str, reason: &TimeoutReason) -> String {
@@ -4738,6 +5349,7 @@ pub async fn enforce_timeouts_once(
     enforce_timeouts_once_on_conn_shard(
         conn,
         None,
+        TaskScan::All,
         metrics,
         unknown_target_grace_window,
         sharded_pool,
@@ -4763,6 +5375,7 @@ pub async fn enforce_timeouts_once(
 pub(crate) async fn enforce_timeouts_once_on_conn_shard(
     conn: &mut AsyncPgConnection,
     conn_shard: Option<crate::types::ShardId>,
+    task_scan: TaskScan<'_>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
@@ -4803,8 +5416,18 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
         ),
     }
 
-    let timed_out = find_timed_out_tasks(conn).await?;
+    let (timed_out, mut retry_cursor) = match task_scan {
+        TaskScan::All => (find_timed_out_tasks(conn).await?, None),
+        TaskScan::Batch { cursor, limit } => (
+            find_timed_out_tasks_batch(conn, cursor, limit).await?,
+            Some(cursor),
+        ),
+    };
     count += timed_out.len();
+    // Issue #1795: in a batched pass, a row that fails is tried again on the
+    // next pass, and the rest of the pass goes on. The pass still reports the
+    // first error, so a leader that keeps failing gives up its lease.
+    let mut first_error = None;
 
     for (task, reason) in timed_out {
         let result = match (task.task_type.as_str(), task.workflow_exec_id) {
@@ -4842,7 +5465,13 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
                 error = %error,
                 "failed to enforce timed-out task"
             );
-            return Err(error);
+            match retry_cursor.as_deref_mut() {
+                Some(cursor) => {
+                    cursor.retry(&reason, task.id);
+                    first_error.get_or_insert(error);
+                }
+                None => return Err(error),
+            }
         }
     }
 
@@ -5026,7 +5655,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
             crate::mutex::reclaim_expired_leases_and_wake(conn).await
         })
         .await?;
-    Ok(count)
+    first_error.map_or(Ok(count), Err)
 }
 
 /// Spawn a background task that periodically checks for timed-out tasks.
@@ -5085,6 +5714,10 @@ pub fn spawn_timeout_checker(
 /// shard label, so this is the only surface that can localize it.
 ///
 /// Pass `None` for a process-wide loop or a single-shard deployment.
+///
+/// This loop does not take part in election and does not jitter. Every
+/// caller runs every pass on a fixed cadence. For election, use
+/// [`spawn_coordinated_timeout_checker_for_shard`] (issue #1795).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_timeout_checker_for_shard(
@@ -5117,7 +5750,85 @@ pub fn spawn_timeout_checker_for_shard(
         None,
         payload_codecs,
         codec_rotation_batch_size,
+        crate::scanner_lease::ScannerCoordination::unelected(),
+        DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
     )
+}
+
+/// [`spawn_timeout_checker_for_shard`] with scanner election (issue #1795).
+///
+/// With a holder in `coordination`, replicas that share a database elect
+/// one checker for `shard`. Only that checker runs the pass. The others
+/// stand by and take over within the lease TTL. `task_batch_size` bounds the
+/// task-timeout rows that one pass reads per reason. See
+/// [`crate::scanner_lease`].
+///
+/// `pool_shard` names the shard whose own pool `pool` is, when the caller
+/// knows it. The pass then reuses its held connection for that shard. Without
+/// it, a pass that also scans that shard through `sharded_pool` checks out a
+/// second connection, and a pool of one connection waits forever.
+///
+/// The lease key is `pool_shard`, then `shard`, then shard 0.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_coordinated_timeout_checker_for_shard(
+    pool: Pool<AsyncPgConnection>,
+    cancel: CancellationToken,
+    interval: Duration,
+    telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+    unknown_target_grace_window: Duration,
+    sharded_pool: Option<crate::shard::ShardedDbPool>,
+    shard_assignments: Vec<crate::types::ShardId>,
+    circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
+    shard: Option<crate::types::ShardId>,
+    pool_shard: Option<crate::types::ShardId>,
+    payload_codecs: crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
+    coordination: crate::scanner_lease::ScannerCoordination,
+    task_batch_size: u32,
+) -> tokio::task::JoinHandle<()> {
+    spawn_timeout_checker_on_shard_pool(
+        pool,
+        cancel,
+        interval,
+        telemetry,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+        circuit_breakers,
+        max_workflow_history_events,
+        session_worker_stale_secs,
+        shard,
+        pool_shard,
+        payload_codecs,
+        codec_rotation_batch_size,
+        coordination,
+        task_batch_size,
+    )
+}
+
+/// Records a checker tick that got no connection (issue #1795).
+///
+/// The tick ran no pass, so the next pass starts a new sweep. The lease can
+/// move during the gap, so the run of failed leader passes ends too.
+fn skip_tick(ran_last_tick: &mut bool, leader_failures: &mut crate::scanner_lease::LeaderFailures) {
+    *ran_last_tick = false;
+    *leader_failures = crate::scanner_lease::LeaderFailures::default();
+}
+
+/// The tick interval of a timeout checker.
+///
+/// A zero interval would busy-spin and time out every checkout, so every
+/// checker gets the floor. Only a leased checker gets the cap, because the
+/// cap keeps three of its sleeps within the lease TTL.
+fn checker_interval(interval: Duration, leased: bool) -> Duration {
+    if leased {
+        crate::scanner_lease::scanner_interval(interval)
+    } else {
+        interval.max(crate::scanner_lease::MIN_SCANNER_INTERVAL)
+    }
 }
 
 /// [`spawn_timeout_checker_for_shard`] for a caller that knows `pool`'s shard.
@@ -5125,8 +5836,15 @@ pub fn spawn_timeout_checker_for_shard(
 /// `pool_shard` must name the shard whose own pool `pool` is. `shard` stays
 /// a health-check label only. The worker passes both, because it builds
 /// `pool` from `sharded_pool.pool_for(shard)` itself.
+///
+/// `coordination` decides which replica runs the pass (issue #1795). With a
+/// holder, each tick takes or renews the `timeout` lease for this shard. Only
+/// the holder runs the pass. A standby still refreshes the active codec key,
+/// because `codec_rotation::FleetWriteFence` counts on every live process
+/// to do that once per tick. `task_batch_size` bounds the task-timeout scans
+/// of one pass. See [`crate::scanner_lease`].
 #[must_use]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn spawn_timeout_checker_on_shard_pool(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
@@ -5142,7 +5860,44 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
     pool_shard: Option<crate::types::ShardId>,
     payload_codecs: crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
+    coordination: crate::scanner_lease::ScannerCoordination,
+    task_batch_size: u32,
 ) -> tokio::task::JoinHandle<()> {
+    use crate::scanner_lease::{ScannerLease, ScannerRole};
+
+    let interval = checker_interval(interval, coordination.holder.is_some());
+    let jitter = coordination.jitter;
+    // Liveness judges the loop against its longest sleep, not its mean.
+    let longest_sleep = crate::scanner_lease::max_jittered_interval(interval, jitter);
+    // The lease row is per shard. `pool_shard` names the database this loop
+    // scans. The health label is the fallback for a caller that has no pool
+    // shard.
+    let lease_shard = pool_shard
+        .or(shard)
+        .unwrap_or(crate::types::ShardId::new(0));
+    let lease_ttl =
+        crate::scanner_lease::effective_lease_ttl(coordination.lease_ttl, interval, jitter);
+    // The key carries this checker's scope when the scope is not just the
+    // lease shard. Checkers on one pool with different shard assignments then
+    // each lead their own scope, instead of one leaving the others unscanned.
+    // It also carries the routing mode, because a sharded pass and a local
+    // pass do different work with one scope.
+    let routing = if sharded_pool.is_some() {
+        crate::scanner_lease::LeaseRouting::Sharded
+    } else {
+        crate::scanner_lease::LeaseRouting::Local
+    };
+    let lease_key = crate::scanner_lease::lease_scanner_key(
+        crate::scanner_health::Scanner::Timeout,
+        lease_shard,
+        &shard_assignments,
+        routing,
+    );
+    let lease = coordination
+        .holder
+        .map(|holder| ScannerLease::new(lease_shard, lease_key, holder, lease_ttl));
+    let task_batch_size = i64::from(task_batch_size.max(1));
+
     // Issue #797: declare this loop (and the sub-passes it drives) before the
     // first iteration, so the `scanner_liveness` health check knows they are
     // expected in this process and grants them their boot grace window.
@@ -5166,27 +5921,37 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         crate::scanner_health::register_scanner_for_shard(
             &*telemetry.metrics,
             scanner,
-            interval,
+            longest_sleep,
             shard,
         )
     })
     .collect();
+    // The tick series and the pass series carry the same shard label.
+    let shard_label = owners[0].shard_label();
     // Keep the worker dispatch binding for hints (issue #1431).
     crate::dispatch::spawn_bound(async move {
+        let mut cursor = TimeoutScanCursor::default();
+        let mut last_role: Option<ScannerRole> = None;
+        let mut leader_failures = crate::scanner_lease::LeaderFailures::default();
+        let mut ran_last_tick = true;
+        let mut abdicated_until: Option<tokio::time::Instant> = None;
         loop {
+            // Issue #1795: a random sleep in `[1 - jitter, 1 + jitter]` of
+            // the interval. The mean is the interval, so enforcement latency
+            // does not change. Replica ticks stop lining up.
+            let sleep = crate::scanner_lease::jittered_interval(interval, jitter, rand::random());
             tokio::select! {
                 () = cancel.cancelled() => {
                     tracing::debug!("timeout checker cancelled");
                     break;
                 }
-                () = tokio::time::sleep(interval) => {
-                    // Check for timed out tasks
-                }
+                () = tokio::time::sleep(sleep) => {}
             }
             // Issue #1823: the tick holds a fence barrier on this shard and on
             // every pinned shard colocated with it. A held or fenced shard
             // skips the tick, and a lost barrier stops it.
             let Some(fence) = crate::replication::begin_shard_tick(&pool, pool_shard).await else {
+                skip_tick(&mut ran_last_tick, &mut leader_failures);
                 continue;
             };
 
@@ -5213,41 +5978,141 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 result = tokio::time::timeout(interval, pool.get()) => result,
             };
             match get_result {
-                Ok(Ok(mut conn)) => match crate::replication::run_fenced_pass(
-                    &fence,
-                    Box::pin(enforce_timeouts_once_on_conn_shard(
-                        &mut conn,
-                        pool_shard,
-                        &*telemetry.metrics,
-                        unknown_target_grace_window,
-                        &sharded_pool,
-                        &shard_assignments,
-                        Some(&circuit_breakers),
-                        max_workflow_history_events,
-                        session_worker_stale_secs,
-                        &payload_codecs,
-                        codec_rotation_batch_size,
-                    )),
-                )
-                .await
-                .and_then(|done| done)
-                {
-                    Ok(enforced_count) if enforced_count > 0 => {
-                        tracing::warn!(enforced_count, "enforced timed-out tasks");
+                Ok(Ok(mut conn)) => {
+                    let abdicated =
+                        abdicated_until.is_some_and(|until| tokio::time::Instant::now() < until);
+                    let role = match &lease {
+                        None => ScannerRole::Unelected,
+                        // After giving up the lease, stand by for one TTL, so
+                        // another replica can take it.
+                        Some(_) if abdicated => ScannerRole::Standby,
+                        Some(lease) => match lease.try_acquire(&mut conn).await {
+                            Ok(Some(_epoch)) => ScannerRole::Leader,
+                            Ok(None) => ScannerRole::Standby,
+                            Err(e) => {
+                                if last_role != Some(ScannerRole::FailOpen) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "timeout scanner lease query failed; running the pass \
+                                         without election until it recovers"
+                                    );
+                                }
+                                ScannerRole::FailOpen
+                            }
+                        },
+                    };
+                    if last_role != Some(role) {
+                        tracing::info!(
+                            shard = %shard_label,
+                            role = role.as_str(),
+                            "timeout scanner role changed"
+                        );
+                        last_role = Some(role);
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to enforce timed-out tasks");
+
+                    if role.runs_pass() {
+                        cursor.resume(ran_last_tick);
                     }
-                },
+                    ran_last_tick = role.runs_pass();
+                    if role.runs_pass() {
+                        // Issue #1823: the pass runs under the tick's fence
+                        // barrier. A lost barrier stops it before its next
+                        // write.
+                        let failed = match crate::replication::run_fenced_pass(
+                            &fence,
+                            Box::pin(enforce_timeouts_once_on_conn_shard(
+                                &mut conn,
+                                pool_shard,
+                                TaskScan::Batch {
+                                    cursor: &mut cursor,
+                                    limit: task_batch_size,
+                                },
+                                &*telemetry.metrics,
+                                unknown_target_grace_window,
+                                &sharded_pool,
+                                &shard_assignments,
+                                Some(&circuit_breakers),
+                                max_workflow_history_events,
+                                session_worker_stale_secs,
+                                &payload_codecs,
+                                codec_rotation_batch_size,
+                            )),
+                        )
+                        .await
+                        .and_then(|done| done)
+                        {
+                            Ok(enforced_count) => {
+                                if enforced_count > 0 {
+                                    tracing::warn!(enforced_count, "enforced timed-out tasks");
+                                }
+                                false
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to enforce timed-out tasks");
+                                true
+                            }
+                        };
+                        // A pass can fail on one replica alone, for example on
+                        // a codec only that replica lacks. Before #1795,
+                        // another replica's pass did the work. So a leader
+                        // that keeps failing gives up the lease.
+                        if leader_failures.record(role, failed)
+                            && let Some(lease) = &lease
+                        {
+                            abdicated_until = Some(tokio::time::Instant::now() + lease_ttl);
+                            tracing::warn!(
+                                shard = %shard_label,
+                                "timeout scanner gave up its lease after failed passes"
+                            );
+                            // Bounded like the shutdown release. A failure
+                            // only leaves the lease to expire after its TTL.
+                            match tokio::time::timeout(
+                                crate::scanner_lease::LEASE_RELEASE_BOUND,
+                                lease.release(&mut conn),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %e, "timeout scanner lease release failed");
+                                }
+                                Err(_elapsed) => {
+                                    tracing::warn!("timeout scanner lease release timed out");
+                                }
+                            }
+                        }
+                    } else {
+                        // A standby tick ends any run of failed leader passes.
+                        let _ = leader_failures.record(role, false);
+                        if let Err(e) = crate::codec_rotation::refresh_active_codec_key(
+                            &mut conn,
+                            &payload_codecs,
+                        )
+                        .await
+                        {
+                            // A standby skips the pass but not this refresh.
+                            // The pass runs the same refresh first on the
+                            // leader.
+                            tracing::warn!(error = %e, "codec key state refresh failed on a standby");
+                        }
+                    }
+
+                    telemetry.metrics.record_scanner_pass(
+                        crate::scanner_health::Scanner::Timeout.as_str(),
+                        &shard_label,
+                        role.as_str(),
+                    );
+                }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "failed to acquire DB connection for timeout check");
+                    skip_tick(&mut ran_last_tick, &mut leader_failures);
                 }
                 Err(_elapsed) => {
                     tracing::error!(
                         ?interval,
                         "pool acquisition exceeded the tick interval; skipping this tick"
                     );
+                    skip_tick(&mut ran_last_tick, &mut leader_failures);
                 }
             }
 
@@ -5255,12 +6120,35 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             // no-work pass, an enforcement error, and a failed connection
             // checkout all still prove the loop itself is alive. Only a
             // panicked, deadlocked, or permanently hung loop stops ticking.
+            // A standby tick counts too: the loop is alive and ready to lead.
             for owner in &owners {
                 crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
             }
 
             if cancel.is_cancelled() {
                 break;
+            }
+        }
+
+        // Issue #1795: a graceful stop expires the lease at once, so a
+        // standby leads on its next tick instead of after the TTL. Best
+        // effort: a failure here only delays the handover to the TTL.
+        //
+        // The bound is fixed, not the scan interval. Worker shutdown awaits
+        // each checker in turn, so a long interval would add up per shard.
+        if let Some(lease) = &lease {
+            let release = async {
+                let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+                lease.release(&mut conn).await.map_err(|e| e.to_string())
+            };
+            match tokio::time::timeout(crate::scanner_lease::LEASE_RELEASE_BOUND, release).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "timeout scanner lease release failed");
+                }
+                Err(_elapsed) => {
+                    tracing::warn!("timeout scanner lease release timed out");
+                }
             }
         }
 
@@ -5852,6 +6740,465 @@ mod tests {
             },
         ];
         assert!(named_activity_has_terminal_event(&history, "hung_activity"));
+    }
+
+    #[test]
+    fn refill_query_reads_one_bounded_page_of_live_rows() {
+        let predicate = start_to_close_timeout_query();
+        // The first page of a sweep is bounded only by the clock.
+        let first = timeout_refill_query(predicate, &[], false);
+        assert!(first.starts_with(&format!(
+            "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS}, {LIVE_ROW_KEY} AS row_key \
+             FROM harvest_task_queue WHERE state IN ('PENDING', 'RUNNING') \
+             AND {LIVE_ROW_KEY} <= $2 ORDER BY {LIVE_ROW_KEY}, id LIMIT $1)"
+        )));
+        assert!(!first.contains("$3"));
+        // A later page starts after the last row of the previous one. Both
+        // bounds are on the index key, so the index scan applies them.
+        let next = timeout_refill_query(predicate, &[], true);
+        assert!(next.contains(&format!(
+            "AND {LIVE_ROW_KEY} <= $4 AND ({LIVE_ROW_KEY}, id) > ($1, $2) \
+             ORDER BY {LIVE_ROW_KEY}, id LIMIT $3)"
+        )));
+        // The predicate reads the page, not the table.
+        let on_page = on_refill_page(predicate).replace("NOW()", "$4");
+        assert!(next.contains(&format!(
+            "ARRAY(SELECT e.id FROM (SELECT q.id, q.row_key FROM ({on_page}) q) e"
+        )));
+        // The queue keeps the page's order, oldest first.
+        assert!(next.contains("ORDER BY e.row_key, e.id) AS expired"));
+        assert!(next.contains("AS last_key"));
+        assert!(next.contains("AS last_id"));
+        assert!(next.contains("(SELECT COUNT(*) FROM page) AS rows_read"));
+    }
+
+    /// The column names of `harvest_task_queue`, read from the schema.
+    fn task_queue_columns() -> Vec<String> {
+        let schema = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/schema.rs"))
+            .expect("read the schema");
+        let start = schema
+            .find("harvest_task_queue (id)")
+            .expect("the task queue table");
+        let body = &schema[start..];
+        let body = &body[..body.find("\n    }").expect("the end of the table")];
+        body.lines()
+            .filter_map(|line| line.split_once("->"))
+            .map(|(name, _)| name.trim().to_owned())
+            .filter(|name| !name.is_empty() && !name.contains(' '))
+            .collect()
+    }
+
+    /// Whether `sql` names `column` as a whole word.
+    fn names_column(sql: &str, column: &str) -> bool {
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        sql.match_indices(column).any(|(at, _)| {
+            let before = sql[..at].chars().next_back();
+            let after = sql[at + column.len()..].chars().next();
+            !before.is_some_and(word) && !after.is_some_and(word)
+        })
+    }
+
+    #[test]
+    fn the_refill_page_holds_only_the_columns_its_predicates_read() {
+        let columns = task_queue_columns();
+        assert!(columns.len() > 20, "{columns:?}");
+        let sql = timeout_refill_query(start_to_close_timeout_query(), &[], true);
+        let page = &sql[..sql.find("), tail AS").expect("the page CTE")];
+        // Payload columns such as `input` and `context_headers` stay out of
+        // the page. The bounded batch query loads whole rows.
+        assert!(!page.contains("harvest_task_queue.*"), "{page}");
+        assert!(!names_column(page, "input"), "{page}");
+        // Every column that a predicate reads is on the page.
+        for (_, predicate) in task_timeout_scans() {
+            for column in columns.iter().filter(|c| names_column(predicate, c)) {
+                assert!(
+                    names_column(page, column),
+                    "the page must hold `{column}`: {page}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_predicate_reads_the_task_queue_once_at_its_top_level() {
+        for (reason, predicate) in task_timeout_scans() {
+            assert_eq!(
+                predicate.matches("harvest_task_queue").count(),
+                1,
+                "{reason:?} must read the task queue once, or the page rewrite misses a read"
+            );
+            let on_page = on_refill_page(predicate);
+            assert!(
+                on_page.contains("FROM page") && !on_page.contains("harvest_task_queue"),
+                "{reason:?} must read the page after the rewrite: {on_page}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_row_key_matches_the_index_expression() {
+        // Read at run time: the migration hygiene guard bans `include_str!`
+        // of a migration outside the paved-path helper.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join("20261002110913_harvest_task_queue_live_created_index")
+            .join("up.sql");
+        let migration = std::fs::read_to_string(path).expect("read the index migration");
+        assert!(migration.contains(&format!("(({LIVE_ROW_KEY}), id)")));
+    }
+
+    #[test]
+    fn refill_query_tests_expiry_against_the_sweep_clock() {
+        // Every reason, with all its earlier reasons as exclusions.
+        let predicates = task_timeout_scans().map(|(_, predicate)| predicate);
+        for (index, predicate) in predicates.iter().enumerate() {
+            for after in [false, true] {
+                let sql = timeout_refill_query(predicate, &predicates[..index], after);
+                assert!(
+                    !sql.contains("NOW()"),
+                    "a refill must not use the live clock: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_start_takes_the_database_clock() {
+        assert_eq!(TIMEOUT_SWEEP_START_SQL, "SELECT NOW() AS as_of");
+    }
+
+    #[test]
+    fn refill_query_leaves_a_row_to_the_first_reason_it_matches() {
+        let higher = heartbeat_timeout_query();
+        let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
+        // The earlier reason is tested at its own lane's clock, and only for
+        // rows ahead of that lane's cursor.
+        let higher = on_refill_page(higher).replace("NOW()", "($5)[1]");
+        assert!(sql.contains(&format!(
+            " EXCEPT SELECT h.id, h.row_key FROM ({higher}) h WHERE h.row_key <= ($5)[1] \
+             AND (($6)[1] IS NULL OR (h.row_key, h.id) > (($6)[1], ($7)[1]))"
+        )));
+        // A row that an earlier lane holds is left to it, whatever it matches.
+        assert!(sql.contains(
+            " EXCEPT SELECT p.id, p.row_key FROM page p \
+             WHERE p.id IN (SELECT u.id FROM unnest($8) AS u(id))"
+        ));
+        // A first lane has no earlier lane, so it binds no lane params.
+        let first = timeout_refill_query(heartbeat_timeout_query(), &[], true);
+        assert!(!first.contains("$5") && !first.contains("EXCEPT"));
+    }
+
+    #[test]
+    fn a_lane_holds_its_moved_and_retried_rows_after_its_sweep() {
+        let (moved, retried, queued) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let lane = TimeoutScanLane {
+            as_of: Some(chrono::Utc::now()),
+            queued: [queued].into(),
+            retry: vec![(retried, 1)],
+            moved: [moved].into(),
+            ..TimeoutScanLane::default()
+        };
+        // A batch of two takes the retry and the queued row. The moved row
+        // waits, and the sweep is on its last page.
+        let claim = lane.claim(2);
+        assert_eq!(claim.clock, None);
+        // A later lane must still leave each held row to this lane.
+        let held: HashSet<_> = claim.held.into_iter().collect();
+        assert_eq!(held, HashSet::from([moved, retried, queued]));
+    }
+
+    #[test]
+    fn batch_query_loads_by_id_and_checks_the_predicate_again() {
+        let predicate = start_to_close_timeout_query();
+        let sql = timeout_batch_query(predicate);
+        assert!(sql.starts_with(&format!(
+            "SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q"
+        )));
+        // The batch keeps the reason of the refill. See the integration test
+        // `a_queued_row_keeps_its_reason_when_an_earlier_one_starts_to_match`.
+        assert!(!sql.contains("NOT EXISTS"));
+        assert!(!sql.contains("LIMIT"));
+    }
+
+    #[test]
+    fn retries_and_queued_rows_share_one_batch_limit() {
+        let reason = TimeoutReason::StartToClose;
+        let lane = timeout_lane(&reason);
+        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
+        let mut cursor = TimeoutScanCursor::default();
+        let queued = ids(5);
+        cursor.lanes[lane].queued = queued.clone().into();
+        let failed = ids(2);
+        for id in &failed {
+            cursor.retry(&reason, *id);
+        }
+        // Retries come first and take slots from the same limit.
+        let batch = cursor.lanes[lane].next_batch(3);
+        assert_eq!(batch, [failed[0], failed[1], queued[0]]);
+        cursor.lanes[lane].commit_batch(3);
+        assert_eq!(cursor.lanes[lane].next_batch(3), queued[1..4]);
+
+        // More retries than the limit wait for the next pass.
+        let failed = ids(7);
+        for id in &failed {
+            cursor.retry(&reason, *id);
+        }
+        assert_eq!(cursor.lanes[lane].next_batch(3), failed[..3]);
+        cursor.lanes[lane].commit_batch(3);
+        assert_eq!(cursor.lanes[lane].next_batch(3), failed[3..6]);
+    }
+
+    #[test]
+    fn a_row_is_tried_at_most_three_passes_in_a_row() {
+        let reason = TimeoutReason::Heartbeat;
+        let lane = timeout_lane(&reason);
+        let id = uuid::Uuid::new_v4();
+        let mut cursor = TimeoutScanCursor::default();
+        // The first try failed. Two more tries follow, then the row waits
+        // for the next sweep, so it cannot hold a slot forever.
+        cursor.retry(&reason, id);
+        for _ in 0..2 {
+            assert_eq!(cursor.lanes[lane].next_batch(1), [id]);
+            cursor.lanes[lane].commit_batch(1);
+            cursor.retry(&reason, id);
+        }
+        assert_eq!(cursor.lanes[lane].next_batch(1), Vec::<uuid::Uuid>::new());
+    }
+
+    #[test]
+    fn a_tick_without_a_connection_ends_the_run() {
+        use crate::scanner_lease::{LeaderFailures, ScannerRole};
+        let mut ran_last_tick = true;
+        let mut failures = LeaderFailures::default();
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(!failures.record(ScannerRole::Leader, true));
+        skip_tick(&mut ran_last_tick, &mut failures);
+        // The next pass starts a new sweep. The lease may have moved during
+        // the gap, so the run of failed passes starts again too.
+        assert!(!ran_last_tick);
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(failures.record(ScannerRole::Leader, true));
+    }
+
+    #[test]
+    fn only_a_leased_checker_caps_its_interval() {
+        use crate::scanner_lease::{MAX_SCANNER_INTERVAL, MIN_SCANNER_INTERVAL};
+        let day = Duration::from_secs(24 * 3600);
+        assert_eq!(checker_interval(day, true), MAX_SCANNER_INTERVAL);
+        assert_eq!(checker_interval(day, false), day);
+        for leased in [true, false] {
+            assert_eq!(
+                checker_interval(Duration::ZERO, leased),
+                MIN_SCANNER_INTERVAL
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_batch_cannot_raise_the_page_bound() {
+        assert_eq!(timeout_scan_bounds(0), (1, REFILL_BATCHES));
+        assert_eq!(timeout_scan_bounds(500), (500, 500 * REFILL_BATCHES));
+        let (limit, page_rows) = timeout_scan_bounds(i64::from(u32::MAX));
+        assert_eq!((limit, page_rows), (MAX_PAGE_ROWS, MAX_PAGE_ROWS));
+    }
+
+    #[test]
+    fn a_refill_skips_rows_that_wait_for_a_retry() {
+        let (failing, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut lane = TimeoutScanLane {
+            retry: vec![(failing, 1)],
+            ..TimeoutScanLane::default()
+        };
+        // A new sweep reads the failing row again. A second, queued copy
+        // would count as a first try and reset the cap on tries in a row.
+        lane.queue_refill([failing, other]);
+        assert_eq!(lane.queued, [other]);
+    }
+
+    #[test]
+    fn lapsed_ids_stay_linear_at_the_largest_batch() {
+        let limit = usize::try_from(MAX_PAGE_ROWS).expect("fits");
+        let batch: Vec<uuid::Uuid> = (0..limit).map(|_| uuid::Uuid::new_v4()).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(lapsed_ids(&batch, batch[1..].iter().copied()), batch[..1]);
+        // A scan of the page per id takes minutes here. A set takes far
+        // less than a second, even in a debug build.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn moved_rows_do_not_hold_back_a_refill() {
+        let mut lanes: [TimeoutScanLane; 4] = Default::default();
+        admit_moves(&mut lanes, vec![to_lane_3(uuid::Uuid::new_v4())], 1);
+        // The lane refills when its queue runs empty. A move must not fill
+        // that queue, or steady moves would stop the lane's sweep.
+        assert!(lanes[3].queued.is_empty());
+        assert_eq!(lanes[3].moved.len(), 1);
+    }
+
+    #[test]
+    fn moved_and_queued_rows_share_each_batch() {
+        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
+        let mut lane = TimeoutScanLane {
+            queued: ids(10).into(),
+            moved: ids(10).into(),
+            ..TimeoutScanLane::default()
+        };
+        // Two each at a limit of 4.
+        assert_eq!(lane.batch_split(4), (0, 2, 2));
+        // At a limit of 1, the slot alternates between them.
+        let mut picks = Vec::new();
+        for _ in 0..4 {
+            let (_, moved, queued) = lane.batch_split(1);
+            picks.push((moved, queued));
+            lane.commit_batch(1);
+        }
+        assert_eq!(picks, [(0, 1), (1, 0), (0, 1), (1, 0)]);
+        // A slot one list leaves unused goes to the other.
+        let lane = TimeoutScanLane {
+            moved: ids(5).into(),
+            ..TimeoutScanLane::default()
+        };
+        assert_eq!(lane.batch_split(4), (0, 4, 0));
+    }
+
+    /// The probe for lapsed rows needs their ids only. It must not load task
+    /// payloads, which a batch of 100,000 rows makes large.
+    fn to_lane_3(id: uuid::Uuid) -> Move {
+        Move { from: 0, to: 3, id }
+    }
+
+    /// Three source lanes can each move a full batch into one lane in one
+    /// pass. The lane takes one batch. Each other move waits at the front
+    /// of its source lane's queue, so it stays held and is probed again.
+    /// No move is dropped, and no list grows past its bound.
+    #[test]
+    fn a_move_past_the_cap_waits_in_its_source_lane() {
+        let mut lanes: [TimeoutScanLane; 4] = Default::default();
+        let ids: Vec<uuid::Uuid> = (0..6).map(|_| uuid::Uuid::new_v4()).collect();
+        lanes[1].queued.push_back(ids[5]);
+        let moves = [
+            (0, ids[0]),
+            (0, ids[1]),
+            (1, ids[2]),
+            (2, ids[3]),
+            (2, ids[4]),
+        ]
+        .into_iter()
+        .map(|(from, id)| Move { from, to: 3, id })
+        .collect();
+        admit_moves(&mut lanes, moves, 2);
+        assert_eq!(lanes[3].moved, ids[..2].to_vec());
+        assert_eq!(lanes[0].queued, [] as [uuid::Uuid; 0]);
+        assert_eq!(lanes[1].queued, [ids[2], ids[5]]);
+        assert_eq!(lanes[2].queued, ids[3..5].to_vec());
+        // A row the lane already holds is not added twice.
+        admit_moves(&mut lanes, vec![to_lane_3(ids[0])], 2);
+        assert_eq!(lanes[3].moved, ids[..2].to_vec());
+        assert!(lanes[0].queued.is_empty());
+    }
+
+    #[test]
+    fn the_lapsed_row_probe_selects_ids_only() {
+        for (_, predicate) in task_timeout_scans() {
+            let sql = timeout_probe_query(predicate);
+            assert!(sql.starts_with("SELECT q.id FROM ("), "{sql}");
+        }
+    }
+
+    #[test]
+    fn moved_rows_wait_behind_the_rows_already_queued() {
+        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
+        let waiting = ids(2);
+        let moved = ids(2);
+        let mut lanes: [TimeoutScanLane; 4] = Default::default();
+        lanes[3].moved = waiting.clone().into();
+        admit_moves(
+            &mut lanes,
+            moved.iter().map(|id| to_lane_3(*id)).collect(),
+            4,
+        );
+        // First in, first out among moved rows.
+        let order: Vec<_> = lanes[3].moved.iter().copied().collect();
+        assert_eq!(order, [waiting, moved].concat());
+    }
+
+    #[test]
+    fn a_batch_stays_queued_until_it_loads() {
+        let lane = TimeoutScanLane {
+            queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
+            retry: vec![(uuid::Uuid::new_v4(), 1)],
+            ..TimeoutScanLane::default()
+        };
+        let before = lane.clone();
+        let _ = lane.next_batch(1);
+        assert_eq!(lane, before);
+    }
+
+    #[test]
+    fn timeout_lanes_follow_the_scan_order() {
+        for (index, (reason, _)) in task_timeout_scans().into_iter().enumerate() {
+            assert_eq!(timeout_lane(&reason), index, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_cursor_starts_a_new_sweep_after_a_tick_without_a_pass() {
+        let mut cursor = TimeoutScanCursor::default();
+        cursor.lanes[1] = TimeoutScanLane {
+            after: Some((chrono::Utc::now(), uuid::Uuid::new_v4())),
+            as_of: Some(chrono::Utc::now()),
+            queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
+            retry: vec![(uuid::Uuid::new_v4(), 1)],
+            loaded_retries: [(uuid::Uuid::new_v4(), 1)].into(),
+            moved: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
+            favor_moved: true,
+        };
+        let mid_sweep = cursor.clone();
+        // A leader that ran the last tick goes on with its sweep.
+        cursor.resume(true);
+        assert_eq!(cursor, mid_sweep);
+        // A replica back from standby starts again with a new clock.
+        cursor.resume(false);
+        assert_eq!(cursor, TimeoutScanCursor::default());
+    }
+
+    #[test]
+    fn a_failed_row_is_retried_in_its_own_lane() {
+        let mut cursor = TimeoutScanCursor::default();
+        let id = uuid::Uuid::new_v4();
+        cursor.retry(&TimeoutReason::ScheduleToStart, id);
+        assert_eq!(cursor.lanes[2].retry, vec![(id, 1)]);
+        assert!(
+            cursor
+                .lanes
+                .iter()
+                .enumerate()
+                .all(|(i, l)| i == 2 || l.retry.is_empty())
+        );
+    }
+
+    #[test]
+    fn task_timeout_scans_keep_their_enforcement_order() {
+        let reasons: Vec<_> = task_timeout_scans().into_iter().map(|(r, _)| r).collect();
+        assert_eq!(
+            reasons,
+            [
+                TimeoutReason::Heartbeat,
+                TimeoutReason::StartToClose,
+                TimeoutReason::ScheduleToStart,
+                TimeoutReason::ScheduleToClose,
+            ]
+        );
     }
 
     #[test]

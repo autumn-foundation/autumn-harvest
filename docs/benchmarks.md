@@ -13,6 +13,9 @@ answers the question an evaluating architect asks first:
 This page answers it, and ships the harness so you can check the answer on your
 own hardware in one command.
 
+For commit throughput with concurrent `pg_notify` writers (issue #1796), see
+[`benchmarks/notify-commit.md`](benchmarks/notify-commit.md).
+
 > **These are reference-machine numbers, not an SLO.** They were taken on one
 > box, with one Postgres configuration, at one load level, all documented below.
 > Your CPU count, your `shared_buffers`, your durability settings, your workflow

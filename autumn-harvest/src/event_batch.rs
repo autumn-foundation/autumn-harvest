@@ -275,30 +275,15 @@ pub async fn admit_batched_start_with_codecs(
                 if is_flushed {
                     let exec_id =
                         ExecutionId::new_for_shard(crate::types::ShardId::new(row.shard_id));
-                    let reuse_policy = opts
-                        .reuse_policy
-                        .as_deref()
-                        .and_then(parse_reuse_policy)
-                        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
-
-                    let execution_timeout = opts
-                        .execution_timeout_secs
-                        .and_then(chrono::Duration::try_seconds);
-                    let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
-                    let max_execution_timeout_ceiling = opts
-                        .max_execution_timeout_ceiling_secs
-                        .and_then(chrono::Duration::try_seconds);
-                    // Chain-scoped lifetime cap captured at admission (#617).
-                    let chain_execution_timeout = opts
-                        .chain_execution_timeout_secs
-                        .and_then(chrono::Duration::try_seconds);
-                    let max_workflow_chain_timeout_ceiling = opts
-                        .max_workflow_chain_timeout_ceiling_secs
-                        .and_then(chrono::Duration::try_seconds);
-                    let priority = opts
-                        .priority
-                        .and_then(crate::types::Priority::from_i32)
-                        .unwrap_or_default();
+                    let crate::debounce::DeferredAdmissionFields {
+                        reuse_policy,
+                        execution_timeout,
+                        sla,
+                        max_execution_timeout_ceiling,
+                        chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling,
+                        priority,
+                    } = crate::debounce::decode_deferred_admission_fields(&opts);
 
                     // Restore the provenance captured at admission (#740),
                     // defaulting to `Batch` for a pre-#740 row.
@@ -621,30 +606,15 @@ async fn fire_claimed_batch_row(
     let shard = crate::types::ShardId::new(row.shard_id);
     let exec_id = crate::types::ExecutionId::new_for_shard(shard);
 
-    let reuse_policy = opts
-        .reuse_policy
-        .as_deref()
-        .and_then(parse_reuse_policy)
-        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
-
-    let execution_timeout = opts
-        .execution_timeout_secs
-        .and_then(chrono::Duration::try_seconds);
-    let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
-    let max_execution_timeout_ceiling = opts
-        .max_execution_timeout_ceiling_secs
-        .and_then(chrono::Duration::try_seconds);
-    // Chain-scoped lifetime cap captured at admission (issue #617).
-    let chain_execution_timeout = opts
-        .chain_execution_timeout_secs
-        .and_then(chrono::Duration::try_seconds);
-    let max_workflow_chain_timeout_ceiling = opts
-        .max_workflow_chain_timeout_ceiling_secs
-        .and_then(chrono::Duration::try_seconds);
-    let priority = opts
-        .priority
-        .and_then(crate::types::Priority::from_i32)
-        .unwrap_or_default();
+    let crate::debounce::DeferredAdmissionFields {
+        reuse_policy,
+        execution_timeout,
+        sla,
+        max_execution_timeout_ceiling,
+        chain_execution_timeout,
+        max_workflow_chain_timeout_ceiling,
+        priority,
+    } = crate::debounce::decode_deferred_admission_fields(&opts);
 
     let workflow_name = row.workflow_name.clone();
     let workflow_id = row.workflow_id.clone();
@@ -989,18 +959,4 @@ pub async fn list_pending_event_batches(
             }
         })
         .collect())
-}
-
-#[cfg(feature = "db")]
-fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReusePolicy> {
-    use crate::types::WorkflowIdReusePolicy::{
-        AllowDuplicate, AllowDuplicateFailedOnly, RejectDuplicate, TerminateIfRunning,
-    };
-    match s {
-        "allow_duplicate" => Some(AllowDuplicate),
-        "reject_duplicate" => Some(RejectDuplicate),
-        "allow_duplicate_failed_only" => Some(AllowDuplicateFailedOnly),
-        "terminate_if_running" => Some(TerminateIfRunning),
-        _ => None,
-    }
 }

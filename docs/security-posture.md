@@ -684,6 +684,36 @@ in clear, so that operators can query them:
 - `harvest_signals.payload` and `harvest_dead_letters.input`;
 - other denormalized copies, for example schedule inputs and outbox rows.
 
+Failure text also stays in clear (issue #1920). The codec does not encrypt
+these free-form strings in `harvest_events.event_data`:
+
+- `error` in `WorkflowFailed`, `ActivityFailed`, `ActivityFailedExternally`,
+  `LocalActivityFailed`, `LocalActivityExhausted`, `ChildWorkflowFailed` and
+  `UpdateFailed`.
+- `last_error` in `WorkflowStarted`.
+- `reason` in `WorkflowCancelled`, `WorkflowResetFork`,
+  `WorkflowResetTerminated`, `WorkflowExecutionPaused` and `WorkflowRedriven`.
+- `message` in `ExternalAwaitFailed`.
+- `error_type` and `reason_code`, which name a failure class.
+
+The engine also writes the `error` columns of `harvest_workflow_executions`,
+`harvest_task_queue` and `harvest_dead_letters` as plain text. The dead-letter
+`failure_signature` derives from the error text. The history export keeps
+every failure string above in clear, in both the full and the redacted JSON
+mode. The redacted mode summarizes payload and token fields only. The Mermaid
+diagram also prints some error text. A completion callback sends the error text
+to its URL.
+
+Erasure (issue #495) does not erase error text. Operators need it to diagnose
+failures. A validation message often quotes the bad value, for example an email
+address or a social security number.
+
+Keep PII out of error strings. Only `WorkflowFailed`, `ActivityFailed`,
+`ChildWorkflowFailed` and `ExternalAwaitFailed` carry a `details` field, which
+the codec encrypts. Set it with `WorkflowFailure::with_details` or
+`ActivityFailure::with_details`. A plain `Err(String)` sets no `details`. The
+other variants have no encrypted field for failure data.
+
 Event types, ids, timestamps and workflow names also stay in clear. Do not put
 PII in a memo, a search attribute, a workflow id or a workflow name. If these
 columns must not hold PII, encrypt the value in workflow code before Harvest
@@ -891,7 +921,8 @@ multi-shard deployments.
 
 If a workflow carries PII or secrets, register an `AeadCodec` with
 `aead_payload_codec_key`. Load the key from a `KeyProvider`, never from
-source code. Read [what the codec does not cover](#what-the-codec-does-not-cover).
+source code. Keep PII out of error text. Read
+[what the codec does not cover](#what-the-codec-does-not-cover).
 
 ---
 
