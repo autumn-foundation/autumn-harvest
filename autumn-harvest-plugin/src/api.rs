@@ -17251,9 +17251,14 @@ pub(crate) async fn start_workflow(
     // `MINT_CAP` and warn, only for the start to be rejected moments later on
     // the fresh-start path anyway. A dedup hit never uses the minted id (it
     // returns the original execution), so skipping the mint costs nothing.
+    //
+    // A reserved (cell) shard is writable, but unpinned placement never picks
+    // it (issue #1837). No minted id can hash there, so the loop skips it.
+    // A cell tenant must pin every start, as ADR 0004 states.
     if (idempotency_key.is_some() || !placement.is_auto())
         && !explicit_workflow_id
         && pin_is_writable
+        && runtime.router.accepts_unpinned(shard)
     {
         const MINT_CAP: u32 = 10_000;
         let mut attempts = 0u32;

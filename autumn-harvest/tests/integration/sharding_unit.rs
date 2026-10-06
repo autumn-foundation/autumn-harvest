@@ -163,7 +163,7 @@ fn no_reservation_leaves_placement_byte_identical() {
     let all = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
     let plain = ShardRouter::new(all.clone(), all, ShardId::new(0));
     let empty = plain.clone().with_reserved_shards([]);
-    assert!(empty.reserved_shards().is_empty());
+    assert_eq!(empty.reserved_shards(), &[] as &[ShardId]);
     for i in 0..500 {
         let id = format!("k-{i}");
         assert_eq!(
@@ -200,6 +200,32 @@ fn reserving_an_unknown_shard_panics_at_boot() {
 #[test]
 #[should_panic(expected = "leaves no writable shard for unpinned starts")]
 fn reserving_every_writable_shard_panics_at_boot() {
-    let all = vec![ShardId::new(0), ShardId::new(1)];
-    let _ = ShardRouter::new(all.clone(), all.clone(), ShardId::new(0)).with_reserved_shards(all);
+    // Shard 0 is the default but drained, so shards 1 and 2 hold all writes.
+    let readable = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+    let writable = vec![ShardId::new(1), ShardId::new(2)];
+    let _ = ShardRouter::new(readable, writable.clone(), ShardId::new(0))
+        .with_reserved_shards(writable);
+}
+
+#[test]
+#[should_panic(expected = "reserved shard 0 is the default shard")]
+fn reserving_the_default_shard_panics_at_boot() {
+    let all = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+    let _ =
+        ShardRouter::new(all.clone(), all, ShardId::new(0)).with_reserved_shards([ShardId::new(0)]);
+}
+
+#[test]
+fn accepts_unpinned_excludes_reserved_and_drained_shards() {
+    let readable = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+    let writable = vec![ShardId::new(0), ShardId::new(1)];
+    let router = ShardRouter::new(readable, writable, ShardId::new(0))
+        .with_reserved_shards([ShardId::new(1)]);
+    assert!(router.accepts_unpinned(ShardId::new(0)));
+    assert!(!router.accepts_unpinned(ShardId::new(1)), "reserved");
+    assert!(!router.accepts_unpinned(ShardId::new(2)), "drained");
+    assert!(
+        router.is_writable(ShardId::new(1)),
+        "a pin still reaches it"
+    );
 }

@@ -750,6 +750,7 @@ impl PreparedHarvestRuntime {
     fn build(
         built: BuiltHarvest,
         resources: HarvestRunnerResources,
+        worker_enabled: bool,
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
@@ -855,17 +856,12 @@ impl PreparedHarvestRuntime {
 
         // An auto pool covers every pool shard, cell shards included. It
         // would drain a tenant cell and void its isolation (issue #1837).
-        let unassigned_cells = reserved_shards_under_auto_assignment(
+        refuse_auto_pool_over_cells(
             &shard_router,
             &worker_runtime_config.shard_assignments,
-        );
-        if !unassigned_cells.is_empty() {
-            return Err(AutumnError::service_unavailable_msg(format!(
-                "ShardRouter reserves shards {unassigned_cells:?} for tenant cells, but this \
-                 worker has no explicit shard assignments and would drain them; call \
-                 WorkerConfig::with_shard_assignments with the shards this pool serves"
-            )));
-        }
+            worker_enabled,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
 
         // Resolve auto (empty) shard assignments now that `sharded_pool` is
         // final (issue #961, AC1). `Worker::new` runs the same idempotent pass,
@@ -1113,7 +1109,7 @@ impl HarvestRunner {
         }
 
         let completion_triggers = built.completion_triggers().to_vec();
-        let mut prepared = PreparedHarvestRuntime::build(built, resources)?;
+        let mut prepared = PreparedHarvestRuntime::build(built, resources, config.worker_enabled)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
@@ -2304,12 +2300,36 @@ fn warn_uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId])
     }
 }
 
+/// Refuse a worker pool that would drain a tenant cell (issue #1837).
+///
+/// An API-only process (`worker_enabled == false`) claims nothing, so it
+/// passes. Otherwise see [`reserved_shards_under_auto_assignment`].
+fn refuse_auto_pool_over_cells(
+    router: &ShardRouter,
+    assignments: &[ShardId],
+    worker_enabled: bool,
+) -> Result<(), String> {
+    if !worker_enabled {
+        return Ok(());
+    }
+    let cells = reserved_shards_under_auto_assignment(router, assignments);
+    if cells.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "ShardRouter reserves shards {cells:?} for tenant cells, but this worker has no \
+         explicit shard assignments and would drain them; call \
+         WorkerConfig::with_shard_assignments with the shards this pool serves, or disable \
+         the worker on an API-only replica (see docs/sharding.md#tenant-cells-issue-1837)"
+    ))
+}
+
 /// Reserved shards that an auto-assigned worker would drain (issue #1837).
 ///
 /// An empty `assignments` list means auto: the worker covers every pool
 /// shard. When the router reserves shards for tenant cells, such a worker
-/// also claims cell work. Startup refuses it. An explicit list is a
-/// deliberate choice, so it is accepted even when it names a cell shard.
+/// also claims cell work. An explicit list is a deliberate choice. Startup
+/// accepts it, even when it names a cell shard.
 fn reserved_shards_under_auto_assignment(
     router: &ShardRouter,
     assignments: &[ShardId],
@@ -2366,9 +2386,10 @@ pub(crate) fn injected_runtime_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeferredAuditExportInstall, HarvestRunnerResources, registered_workflow_type_names,
-        reserved_shards_under_auto_assignment, resolve_runtime_storage_pool,
-        select_runtime_gate_shards, select_runtime_shard0_pool, uncovered_writable_shards,
+        DeferredAuditExportInstall, HarvestRunnerResources, refuse_auto_pool_over_cells,
+        registered_workflow_type_names, reserved_shards_under_auto_assignment,
+        resolve_runtime_storage_pool, select_runtime_gate_shards, select_runtime_shard0_pool,
+        uncovered_writable_shards,
     };
     use autumn_harvest::shard::ShardRouter;
     use autumn_harvest::shard::ShardedDbPool;
@@ -2620,13 +2641,47 @@ mod tests {
     #[test]
     fn explicit_assignment_is_accepted_with_reserved_shards() {
         let router = cell_router();
-        assert!(reserved_shards_under_auto_assignment(&router, &[ShardId::new(0)]).is_empty());
-        assert!(reserved_shards_under_auto_assignment(&router, &[ShardId::new(1)]).is_empty());
+        let none = Vec::<i32>::new();
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&router, &[ShardId::new(0)]),
+            none
+        );
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&router, &[ShardId::new(1)]),
+            none
+        );
     }
 
     #[test]
     fn auto_assignment_is_accepted_without_reserved_shards() {
-        assert!(reserved_shards_under_auto_assignment(&three_shard_router(), &[]).is_empty());
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&three_shard_router(), &[]),
+            Vec::<i32>::new()
+        );
+    }
+
+    #[test]
+    fn startup_refuses_an_auto_pool_over_a_cell() {
+        let error = refuse_auto_pool_over_cells(&cell_router(), &[], true)
+            .expect_err("an auto pool would drain the cell");
+        assert!(error.contains("[1]"), "the error names the cell: {error}");
+        assert!(error.contains("with_shard_assignments"), "{error}");
+    }
+
+    #[test]
+    fn startup_accepts_an_api_only_process_with_cells() {
+        assert_eq!(
+            refuse_auto_pool_over_cells(&cell_router(), &[], false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn startup_accepts_an_explicit_pool_with_cells() {
+        assert_eq!(
+            refuse_auto_pool_over_cells(&cell_router(), &[ShardId::new(0)], true),
+            Ok(())
+        );
     }
 
     // ---------------------------------------------------------------------

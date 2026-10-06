@@ -161,8 +161,8 @@ curl -s .../admin/config | jq -S '.shard_topology'
 {
   "default_shard": 0,
   "readable_shards": [0, 1],
-  "residency_map": { "eu": 0, "us": 1 },
   "reserved_shards": [],
+  "residency_map": { "eu": 0, "us": 1 },
   "shard_forwards": {},
   "writable_shards": [0, 1]
 }
@@ -247,7 +247,7 @@ So pinning the **root** of a workflow tree confines the whole tree.
 
 - **`(workflow_name, workflow_id)` uniqueness is per-shard.** A pin moves a run off its hash-derived shard, so a *later, unpinned* start of the same `workflow_id` would route elsewhere and could create a duplicate. When the caller omits `workflow_id`, Harvest mints one that hashes to the pinned shard, closing the hole automatically. When the caller supplies an **explicit** `workflow_id`, be consistent: either always pin it or never pin it. (This is the same consistency requirement idempotency-key routing already documents.)
 - **Placement is resolved before idempotency-key replay.** A retry of a keyed start must carry the same placement as the original delivery. A *committed* keyed replay still returns its original `200` even if the pinned shard has since been drained — the replay creates no new work, so it is validated against `readable_shards` only.
-- **Only the HTTP start route and the CLI carry placement.** `POST /workflows/{name}/signal-with-start` and `/update-with-start` have no `shard_id` / `residency_key` field, and the in-process SDK start APIs (`StartWorkflowParams`, the typed client stubs) carry none either — all of them route by hash. An entity workflow created through the documented signal-with-start pattern therefore **cannot** be pinned today. If a residency-bound workflow must be reachable that way, start it explicitly first (pinned) and let signal-with-start attach to the existing run. `WorkflowHandleClient::resolve_shard_placement` resolves and validates a placement for pre-flight tooling, but does not itself place anything.
+- **Only the HTTP start route and the CLI carry placement.** `POST /workflows/{name}/signal-with-start` and `/update-with-start` have no `shard_id` / `residency_key` field, and the in-process SDK start APIs (`StartWorkflowParams`, the typed client stubs) carry none either — all of them route by hash. The one exception: a caller that builds `StartWorkflowParams` itself can pin by minting its `exec_id` with `ExecutionId::new_for_shard` (see [Tenant cells](#tenant-cells-issue-1837)). An entity workflow created through the documented signal-with-start pattern therefore **cannot** be pinned today. If a residency-bound workflow must be reachable that way, start it explicitly first (pinned) and let signal-with-start attach to the existing run. `WorkflowHandleClient::resolve_shard_placement` resolves and validates a placement for pre-flight tooling, but does not itself place anything.
 - **Deferred starts cannot be pinned.** Debounce (#499) and batch (#518) admit a start without creating an execution, so there is nothing to place at request time; combining either with `shard_id` / `residency_key` is a `400` rather than a silently discarded pin. A throttled start (#607) *is* pinned — it defers the same concrete placement to its scanner.
 - **Rollout ordering.** Placement is enforced by the node handling the start. During a rolling deploy, a pinned request that lands on a pre-#697 node is accepted and hashed, silently ignoring the pin. Upgrade the whole fleet before you begin sending pinned starts, and treat the first pinned start as the cutover point.
 - **Residency keys are an operator-declared, low-cardinality set.** The map is held in memory on every node and validated at boot; it is sized for regions/jurisdictions (single digits to dozens), not per-tenant keys. For per-tenant placement, map the tenant to a region in your own application layer and pass the region as the key.
@@ -475,14 +475,25 @@ let exec_id = ExecutionId::new_for_shard(shard);
   the other writable shards. Other keys keep their shard.
 - **Reserve a fresh shard.** A business key already on the shard hashes
   elsewhere after the reservation. This is the same effect as a drain.
-- **An auto pool is refused.** The standalone runner does not start a
-  worker without explicit shard assignments when the router reserves
-  shards. An auto pool covers every pool shard, cells included.
-- **Children stay in the cell** by default. `Distributed` children leave it.
-- **Some start paths cannot reach a cell.** Signal-with-start,
-  update-with-start, debounce, batch and the typed stubs carry no pin.
+- **The runner refuses an auto pool.** It does not start a worker without
+  explicit shard assignments when the router reserves shards. An auto pool
+  covers every pool shard, cells included. An API-only process passes.
+- **Children stay in the cell** by default. `Distributed` children leave
+  it. A child pinned by `Shard` or `ResidencyKey` can enter any cell.
+- **Some start paths cannot reach a cell.** These carry no pin:
+  signal-with-start, update-with-start, debounce, batch, webhooks, broker
+  connectors, the MCP start tool, the outbox, completion triggers, workflow
+  schedules and the typed stubs.
+- **The default shard stays shared.** Schedules and unencoded ids land on
+  it. The router panics at boot if you reserve it.
 - **At least one writable shard stays unreserved.** The router panics at
   boot otherwise.
+- **Some loops still visit every shard.** The schedule ticker and the
+  retention janitor run over every pool shard in each process. The
+  liveness canary probes each writable shard, cells included.
+- **Upgrade the fleet first.** A pre-#1837 replica cannot reserve a shard.
+  It hashes shared tenants into the cell. Add the cell shard to the
+  writable set in the same deploy that reserves it.
 
 ### Verify a cell
 

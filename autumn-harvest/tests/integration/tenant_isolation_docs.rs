@@ -45,9 +45,9 @@ fn adr_records_an_accepted_decision() {
         assert!(adr.contains(heading), "{ADR} lacks `{heading}`");
     }
     for answer in [
-        "Cooperative multi-tenant deployment is supported",
-        "Hostile multi-tenancy is not supported",
-        "First-class namespaces are not added",
+        "Harvest supports cooperative multi-tenant deployment",
+        "Harvest does not support hostile multi-tenancy",
+        "Harvest adds no first-class namespaces",
     ] {
         assert!(adr.contains(answer), "{ADR} must state: {answer}");
     }

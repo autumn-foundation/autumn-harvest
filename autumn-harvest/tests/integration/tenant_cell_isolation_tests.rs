@@ -459,13 +459,11 @@ async fn wait_completed(url: &str, exec_id: ExecutionId, budget: Duration) -> bo
     }
 }
 
-/// Start [`FLOOD`] tenant A workflows. Return once the backlog is deep.
-async fn flood_tenant_a(
-    router: &ShardRouter,
-    sharded: &ShardedDbPool,
-    placement: &ShardPlacement,
-    url: &str,
-) {
+/// Start [`FLOOD`] tenant A workflows.
+///
+/// Call this before the workers start. The pools then cannot drain the
+/// flood while it is still being written, so the backlog always forms.
+async fn flood_tenant_a(router: &ShardRouter, sharded: &ShardedDbPool, placement: &ShardPlacement) {
     for i in 0..FLOOD {
         start(
             router,
@@ -477,7 +475,6 @@ async fn flood_tenant_a(
         )
         .await;
     }
-    wait_for_backlog(url, BACKLOG_BEFORE_PROBE).await;
 }
 
 /// Start [`PROBES`] tenant B workflows with no pin and wait for each.
@@ -550,11 +547,11 @@ async fn a_flood_in_one_cell_does_not_raise_the_other_tenants_schedule_to_start(
         "shared",
     );
     let cell_pool = build_worker(&sharded, vec![CELL_A], Arc::clone(&cell_metrics), "cell-a");
+    let cell = ShardPlacement::residency_key("cell-a");
+    flood_tenant_a(&router, &sharded, &cell).await;
     let shared_run = spawn(&shared_pool, &sharded);
     let cell_run = spawn(&cell_pool, &sharded);
-
-    let cell = ShardPlacement::residency_key("cell-a");
-    flood_tenant_a(&router, &sharded, &cell, &urls[&CELL_A]).await;
+    wait_for_backlog(&urls[&CELL_A], BACKLOG_BEFORE_PROBE).await;
     let worst_b = probe_tenant_b(&router, &sharded, &urls, &shared_metrics).await;
 
     stop(&shared_pool, shared_run).await;
@@ -588,9 +585,9 @@ async fn the_same_flood_on_a_shared_shard_breaks_the_bound() {
 
     let metrics = Arc::new(WaitRecorder::default());
     let pool = build_worker(&sharded, vec![SHARED], Arc::clone(&metrics), "shared");
+    flood_tenant_a(&router, &sharded, &ShardPlacement::Auto).await;
     let run = spawn(&pool, &sharded);
-
-    flood_tenant_a(&router, &sharded, &ShardPlacement::Auto, &urls[&SHARED]).await;
+    wait_for_backlog(&urls[&SHARED], BACKLOG_BEFORE_PROBE).await;
     let worst_b = probe_tenant_b(&router, &sharded, &urls, &metrics).await;
 
     stop(&pool, run).await;

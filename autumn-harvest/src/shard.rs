@@ -531,8 +531,10 @@ impl ShardRouter {
     /// # Panics
     ///
     /// Panics if a reserved shard is not in `readable_shards`. Panics if the
-    /// reservation leaves no writable shard for unpinned starts. Both fail at
-    /// boot, like the other router builders.
+    /// default shard is reserved: workflow schedules and unencoded ids resolve
+    /// to it without a pin. Panics if the reservation leaves no writable
+    /// shard for unpinned starts. All three fail at boot, like the other
+    /// router builders.
     #[must_use]
     pub fn with_reserved_shards(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
         let mut reserved: Vec<ShardId> = shards.into_iter().collect();
@@ -542,6 +544,11 @@ impl ShardRouter {
             assert!(
                 self.readable_shards.contains(shard),
                 "reserved shard {shard} is not in the readable set"
+            );
+            assert_ne!(
+                *shard, self.default_shard,
+                "reserved shard {shard} is the default shard; unpinned schedules and \
+                 unencoded ids land there, so keep the default shard shared"
             );
         }
         let shared_writable = self
@@ -569,6 +576,15 @@ impl ShardRouter {
     #[must_use]
     pub fn is_reserved(&self, shard: ShardId) -> bool {
         self.reserved_shards.binary_search(&shard).is_ok()
+    }
+
+    /// Can unpinned placement pick `shard` (issue #1837)?
+    ///
+    /// True when the shard is writable and not reserved. A pin may still
+    /// target a shard for which this is false, if the shard is writable.
+    #[must_use]
+    pub fn accepts_unpinned(&self, shard: ShardId) -> bool {
+        self.is_writable(shard) && !self.is_reserved(shard)
     }
 
     /// Borrow every placement-affecting field at once, for exhaustive
@@ -786,7 +802,7 @@ impl ShardRouter {
     /// re-hash then runs over the unreserved writable shards only.
     fn pick_writable(&self, primary: &str, secondary: &str) -> ShardId {
         let initial = rendezvous_pick(&self.readable_shards, primary, secondary);
-        if self.writable_shards.contains(&initial) && !self.is_reserved(initial) {
+        if self.accepts_unpinned(initial) {
             return initial;
         }
         if self.writable_shards.is_empty() {
@@ -898,6 +914,9 @@ impl ShardRouter {
         } else {
             &self.writable_shards
         };
+        if self.reserved_shards.is_empty() {
+            return rendezvous_pick(primary, dag_name, "");
+        }
         let candidates = self.without_reserved(primary);
         // Empty only when no shard is writable and all readable shards are
         // reserved. The pick then keeps the pre-#1837 behaviour.

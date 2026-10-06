@@ -542,21 +542,25 @@ for the mechanism. Security-relevant properties:
 
 [ADR 0004](./adr/0004-tenant-isolation-cells.md) records the decision.
 
-- **Cooperative multi-tenancy is supported.** Many tenants of one operator
-  can share a deployment. Quotas, throttles and concurrency caps bound a
+- **Harvest supports cooperative multi-tenancy.** Many tenants of one
+  operator can share a deployment. Quotas, throttles and concurrency caps bound a
   tenant on a shared shard. A **cell** gives a tenant its own shard and its
   own worker pool. See [Tenant cells](./sharding.md#tenant-cells-issue-1837).
 - **A cell is not a security boundary between tenants.** It bounds load,
   not access. Any caller that may start a workflow may also pin it into any
   cell. To confine a caller to its tenant, install an
-  [authorizer hook](#authorizer-hook-issue-1803) and check the shard and
-  the target.
+  [authorizer hook](#authorizer-hook-issue-1803). On a pinned start, check
+  the shard. On a route where the hook sees no shard, check the target in
+  `path`, or deny it.
+- **A workflow can pin a child into a cell.** `ChildPlacement::Shard` and
+  `ChildPlacement::ResidencyKey` place a child on any shard. The hook does
+  not see that decision. Do not build a child pin from caller input.
 - **The tenant header is not an identity.** The caller declares
   `x-harvest-tenant`. Harvest does not bind it to stored executions.
 - **Name cells, not tenants.** A cell residency key appears in requests,
   CLI calls and audit rows. Use `cell-a`, not a customer name. Keep the
   tenant-to-cell map in the application.
-- **Namespaces are not supported.** All tenants on one shard share its
+- **Harvest has no namespaces.** All tenants on one shard share its
   tables. Harvest has no per-tenant row scoping.
 
 ---
