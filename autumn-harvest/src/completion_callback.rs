@@ -1503,8 +1503,19 @@ pub trait CompletionCallbackDeliverer: Send + Sync + 'static {
 /// The value is delta-seconds or an HTTP-date (RFC 9110 section 10.2.3).
 /// A date in the past gives a zero delay. Any other value gives `None`.
 #[must_use]
-pub fn parse_retry_after(_value: &str, _now: DateTime<Utc>) -> Option<std::time::Duration> {
-    None
+pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        // All digits, so only overflow fails. Overflow saturates.
+        let secs = value.parse::<u64>().unwrap_or(u64::MAX);
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    let at = DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        (at.with_timezone(&Utc) - now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO),
+    )
 }
 
 #[cfg(test)]
@@ -1656,14 +1667,19 @@ pub fn classify_outcome(
         return OutcomeAction::Delivered { status };
     }
 
-    if attempt >= max_attempts {
+    if attempt >= max_attempts || outcome.is_permanent_failure() {
         return OutcomeAction::DeadLetter {
             last_status: outcome.status,
             last_error: outcome.transport_error.clone(),
         };
     }
 
-    let delay = crate::policy::compute_retry_delay_with_seed(retry_policy, attempt, seed);
+    let mut delay = crate::policy::compute_retry_delay_with_seed(retry_policy, attempt, seed);
+    // `Retry-After` is a floor, never a cap. The policy ceiling bounds it,
+    // so a receiver cannot park a delivery for an unbounded time.
+    if let Some(retry_after) = outcome.retry_after {
+        delay = delay.max(retry_after.min(retry_policy.max_interval));
+    }
     let next_attempt_at =
         now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(0));
 

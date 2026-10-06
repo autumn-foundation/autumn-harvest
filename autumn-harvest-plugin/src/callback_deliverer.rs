@@ -8,7 +8,7 @@
 //! without supplying their own deliverer.
 
 use autumn_harvest::completion_callback::{
-    CompletionCallbackDeliverer, DeliverFuture, DeliveryAttempt,
+    CompletionCallbackDeliverer, DeliverFuture, DeliveryAttempt, parse_retry_after,
 };
 use std::time::Duration;
 
@@ -25,6 +25,9 @@ pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// which `DeliveryAttempt::is_success` correctly classifies as a failure
 /// (only 2xx is success), so it flows through the normal retry/backoff/
 /// dead-letter path like any other non-2xx response.
+///
+/// A `Retry-After` response header goes onto the attempt. Core uses it as
+/// the backoff floor (issue #1832).
 pub struct ReqwestCallbackDeliverer {
     client: reqwest::Client,
 }
@@ -81,7 +84,19 @@ impl CompletionCallbackDeliverer for ReqwestCallbackDeliverer {
             }
 
             match request.send().await {
-                Ok(response) => DeliveryAttempt::success(response.status().as_u16()),
+                Ok(response) => {
+                    let attempt = DeliveryAttempt::success(response.status().as_u16());
+                    // Core clamps the hint and ignores it on a permanent 4xx.
+                    let retry_after = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| parse_retry_after(value, chrono::Utc::now()));
+                    match retry_after {
+                        Some(delay) => attempt.with_retry_after(delay),
+                        None => attempt,
+                    }
+                }
                 Err(error) => DeliveryAttempt::transport_error(error.to_string()),
             }
         })
