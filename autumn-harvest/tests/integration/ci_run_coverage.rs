@@ -158,33 +158,27 @@ fn is_db_harness_only(source: &str) -> bool {
     !code.contains("#[tokio::test") && !code.contains("block_on")
 }
 
-// ── Allowlist: DB-gated tests without a covering manifest row (technical debt) ─
+// ── Allowlist: DB-gated tests without a covering manifest row ──────────────
 //
 // Keyed `core:<module>` / `plugin:<file-stem>`. Every entry carries a reason.
-// Seeded fail-closed with the tests that currently lack a covering manifest row
-// so the guard is green on commit. SHRINK this by adding manifest rows. The
-// ratchet below forbids silent growth. An entry that a row covers is stale.
+// Issue #1799 wired every suite that passes against Docker Postgres. What is
+// left is either debt with an owner, or a suite that CI does not run by
+// design. `docs/testing/ci-db-suite-allowlist.md` lists each entry with its
+// owner. A debt reason must be in `DEBT_REASONS`.
 // This guard PROVED it bites: during development `nd_block_tests` was left
-// out and the guard failed naming it (the TDD red step). `nd_block_tests`, `worker_session_tests`, and the plugin
-// `build_ramp_integration` suites are wired (they have `linux` manifest rows),
-// so they are no longer here.
+// out and the guard failed naming it (the TDD red step).
 
-const ALLOWLIST_DEBT_REASON: &str =
-    "DB integration test not yet wired to a covering manifest row; test-coverage debt to shrink";
-const ALLOWLIST_TESTING_REASON: &str = "DB+testing-gated integration test not yet wired to a covering manifest row (needs the `testing` feature when wired)";
-// mcp_tools_integration / webhook_* integration: paved-path DB tests
+// mcp_tools_integration / webhook_durable_integration: paved-path DB tests
 // (autumn_web::test::TestDb + run_pending(MIGRATIONS)) that are feature-gated
-// AND have every test #[ignore]d, so no CI run can execute them. The mcp one is
-// only `compileonly` in the manifest; the webhooks feature is enabled by no CI
-// run. Wiring real Docker-backed runs for #[ignore]d/feature-gated suites is
-// out of scope for this test-infra PR — tracked here honestly instead.
+// AND have every test #[ignore]d, so no CI run can execute them. Issue #1959
+// tracks the fix.
 const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `compileonly` in the manifest) AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness) — no CI run can execute it; tracked";
+     (TestDb/run_pending paved-path DB harness) — no CI run can execute it; tracked in #1959";
 const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI, via a dedicated Linux-only \
      ci.yml step (it needs an apt libcurl/cmake install first, and the manifest's compile mode would try to build \
      vendored librdkafka on macOS/Windows). Not a coverage gap — see the `Run plugin Kafka broker connector tests` step.";
 const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness); tracked";
+     (TestDb/run_pending paved-path DB harness); tracked in #1959";
 const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): not in the manifest's `test` job. \
      The `chaos` feature is off by default, and the seeded sweep is slow, so each PR does not run it. \
      It runs only in the nightly and manual job in .github/workflows/chaos.yml, with at least 5 seeds. \
@@ -204,68 +198,17 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "core:audit_log_unexported_idx_write_cost_perf",
         ALLOWLIST_EVIDENCE_HARNESS_REASON,
     ),
-    ("core:audit_tests", ALLOWLIST_DEBT_REASON),
-    ("core:build_routing_tests", ALLOWLIST_DEBT_REASON),
-    ("core:cache_delta_load_tests", ALLOWLIST_DEBT_REASON),
     ("core:chaos_tests", ALLOWLIST_CHAOS_REASON),
-    ("core:child_policy_tests", ALLOWLIST_DEBT_REASON),
-    ("core:cross_workflow_cancel_tests", ALLOWLIST_DEBT_REASON),
-    ("core:debounce_tests", ALLOWLIST_DEBT_REASON),
-    ("core:delayed_start_tests", ALLOWLIST_DEBT_REASON),
-    ("core:legal_hold_tests", ALLOWLIST_DEBT_REASON),
-    ("core:payload_offload_db_tests", ALLOWLIST_DEBT_REASON),
-    ("core:queue_fairness_tests", ALLOWLIST_DEBT_REASON),
-    ("core:replay_canary_tests", ALLOWLIST_TESTING_REASON),
-    ("core:retry_now_tests", ALLOWLIST_DEBT_REASON),
-    ("core:schedule_decisions", ALLOWLIST_DEBT_REASON),
-    ("core:schedule_to_close_tests", ALLOWLIST_DEBT_REASON),
-    ("core:schedule_update_tests", ALLOWLIST_DEBT_REASON),
-    ("core:scheduled_time_tests", ALLOWLIST_TESTING_REASON),
-    ("core:scheduler_bounded_runs_tests", ALLOWLIST_DEBT_REASON),
-    ("core:scheduler_carryover_tests", ALLOWLIST_TESTING_REASON),
-    ("core:scheduler_catchup_tests", ALLOWLIST_DEBT_REASON),
-    ("core:signal_with_start_tests", ALLOWLIST_DEBT_REASON),
-    ("core:sla_breach_tests", ALLOWLIST_DEBT_REASON),
-    ("core:sticky_routing_tests", ALLOWLIST_DEBT_REASON),
-    ("core:telemetry_span_tests", ALLOWLIST_DEBT_REASON),
-    ("core:throttle_tests", ALLOWLIST_DEBT_REASON),
-    ("core:transactional_activity_tests", ALLOWLIST_DEBT_REASON),
-    ("core:typed_stubs_tests", ALLOWLIST_DEBT_REASON),
-    ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
-    ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:build_routing_ui_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:connector_kafka_broker",
         ALLOWLIST_KAFKA_BROKER_REASON,
     ),
-    ("plugin:dag_retry_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:event_batch_integration", ALLOWLIST_DEBT_REASON),
-    (
-        "plugin:external_handoffs_integration",
-        ALLOWLIST_DEBT_REASON,
-    ),
-    ("plugin:history_export_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:mcp_tools_integration", ALLOWLIST_MCP_IGNORED_REASON),
-    ("plugin:outbox_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:outbox_start_relay_perf",
         ALLOWLIST_PERF_EVIDENCE_REASON,
     ),
-    ("plugin:preflight_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:replay_canary_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:retirement_check_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:scaling_api_tests", ALLOWLIST_DEBT_REASON),
-    ("plugin:schedule_update_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:shard_health_integration", ALLOWLIST_DEBT_REASON),
-    (
-        "plugin:signal_with_start_integration",
-        ALLOWLIST_DEBT_REASON,
-    ),
-    ("plugin:stalled_workflow_tests", ALLOWLIST_DEBT_REASON),
-    ("plugin:telemetry_propagation_tests", ALLOWLIST_DEBT_REASON),
-    ("plugin:usage_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:version_usage_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:webhook_durable_integration",
         ALLOWLIST_WEBHOOKS_IGNORED_REASON,
@@ -274,13 +217,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // `TestApp::plugin` deadlock was fixed (multi-thread flavor) and its tests
     // un-ignored, so it is now wired to a covering `linux` manifest row and runs
     // for real against Docker Postgres in CI.
-    ("plugin:workflow_count_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:workflow_filter_integration", ALLOWLIST_DEBT_REASON),
-    (
-        "plugin:workflow_history_pagination_integration",
-        ALLOWLIST_DEBT_REASON,
-    ),
-    ("plugin:workflow_result_integration", ALLOWLIST_DEBT_REASON),
 ];
 
 /// Hard ratchet: the cap must equal `ALLOWLIST.len()` (issue #1799).
@@ -298,7 +234,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// `chaos.yml`.
 /// Then 55: issue #1799 wired five suites. It also removed three entries
 /// for suites that CI already ran.
-const ALLOWLIST_MAX_LEN: usize = 55;
+/// Then 6: issue #1799 wired the other 49 suites, 27 core and 22 plugin.
+/// Four of them needed a test fix first.
+const ALLOWLIST_MAX_LEN: usize = 6;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
@@ -1213,7 +1151,10 @@ const WONT_WIRE: &str = "won't wire";
 
 /// Reasons that mark an entry as debt to wire. Every other reason marks a
 /// suite that CI does not run by design.
-const DEBT_REASONS: &[&str] = &[ALLOWLIST_DEBT_REASON, ALLOWLIST_TESTING_REASON];
+const DEBT_REASONS: &[&str] = &[
+    ALLOWLIST_MCP_IGNORED_REASON,
+    ALLOWLIST_WEBHOOKS_IGNORED_REASON,
+];
 
 /// One table row: the suite key, the owner and the reason.
 struct TrackingRow {
@@ -1260,7 +1201,11 @@ fn tracking_table_lists_every_allowlist_entry_with_an_owner_or_reason() {
     let rows = parse_tracking_table(TRACKING_DOC);
     let table: BTreeSet<&str> = rows.iter().map(|r| r.key.as_str()).collect();
     let code: BTreeSet<&str> = ALLOWLIST.iter().map(|&(k, _)| k).collect();
-    assert_eq!(rows.len(), table.len(), "the tracking table has a duplicate row");
+    assert_eq!(
+        rows.len(),
+        table.len(),
+        "the tracking table has a duplicate row"
+    );
     assert_eq!(
         table, code,
         "docs/testing/ci-db-suite-allowlist.md must list each ALLOWLIST key once, and no other key"
