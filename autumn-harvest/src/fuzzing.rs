@@ -780,32 +780,74 @@ fn mirror_fan_out(
 ) -> Op {
     let mut activities = Vec::new();
     let mut children = Vec::new();
+    let mut activity_ids = HashSet::new();
+    let mut child_ids = HashSet::new();
+    // The first wave is the run of schedules right after the marker. After
+    // it, each completed item lets one more schedule refill its slot.
+    let mut first_wave = true;
+    let mut first_wave_len = 0;
+    let mut refills = 0usize;
     for (index, event) in history.iter().enumerate().skip(start) {
         if activities.len() + children.len() >= count {
             break;
         }
+        let open = first_wave || refills > 0;
         match event {
             WorkflowEvent::ActivityScheduled {
-                name, input, queue, ..
-            } if children.is_empty() => {
+                activity_id,
+                name,
+                input,
+                queue,
+            } if open && children.is_empty() => {
                 activities.push((name.clone(), input.clone(), queue.clone()));
+                activity_ids.insert(*activity_id);
             }
             WorkflowEvent::ChildWorkflowStarted {
+                child_id,
                 workflow_name,
                 input,
-                ..
-            } if activities.is_empty() => children.push((workflow_name.clone(), input.clone())),
-            _ => continue,
+            } if open && activities.is_empty() => {
+                children.push((workflow_name.clone(), input.clone()));
+                child_ids.insert(*child_id);
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+                if activity_ids.contains(activity_id) =>
+            {
+                first_wave = false;
+                refills += 1;
+                continue;
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+                if child_ids.contains(child_id) =>
+            {
+                first_wave = false;
+                refills += 1;
+                continue;
+            }
+            WorkflowEvent::ActivityStarted { activity_id, .. }
+            | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                if activity_ids.contains(activity_id) =>
+            {
+                first_wave = false;
+                continue;
+            }
+            // A failed item ends a fail-fast group. Any other event is not
+            // part of the group, so a later schedule is the caller's own.
+            _ => break,
+        }
+        if first_wave {
+            first_wave_len += 1;
+        } else {
+            refills -= 1;
         }
         consumed.insert(index);
     }
     // A windowed or unfinished fan-out schedules fewer items than its
     // marker counts. The count must still match, so the last item repeats.
     // Replay never reaches the repeats, because history ends first.
-    let scheduled = activities.len();
     if children.is_empty() {
         pad_to(&mut activities, count);
-        let window = (scheduled > 0 && scheduled < count).then_some(scheduled);
+        let window = (first_wave_len > 0 && first_wave_len < count).then_some(first_wave_len);
         Op::FanOut { activities, window }
     } else {
         pad_to(&mut children, count);
@@ -859,12 +901,18 @@ fn mirror_race<'h>(
 
 /// The indexes of the `TimerStarted` events that the cancellable timer API
 /// wrote. Such a start is followed by a `TimerCancelled` for its id before
-/// any `TimerFired`. An id can be reused, so each start is judged alone.
+/// any `TimerFired`. A start with neither event, in a history that ends the
+/// run, is also cancellable: it stayed armed, and a classic timer cannot.
+/// An id can be reused, so each start is judged alone.
 fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
     let mut next_is_cancel: HashMap<&str, bool> = HashMap::new();
     let mut armed = HashSet::new();
+    let mut run_ends = false;
     for (index, event) in history.iter().enumerate().rev() {
         match event {
+            WorkflowEvent::WorkflowCompleted { .. }
+            | WorkflowEvent::WorkflowFailed { .. }
+            | WorkflowEvent::WorkflowContinuedAsNew { .. } => run_ends = true,
             WorkflowEvent::TimerCancelled { timer_id } => {
                 next_is_cancel.insert(timer_id.as_str(), true);
             }
@@ -875,7 +923,7 @@ fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
                 // The start consumes the next event, so an earlier start of a
                 // reused id looks further back.
                 let next = next_is_cancel.remove(timer_id.as_str());
-                if next == Some(true) {
+                if next == Some(true) || (next.is_none() && run_ends) {
                     armed.insert(index);
                 }
             }
