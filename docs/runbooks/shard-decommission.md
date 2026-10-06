@@ -107,6 +107,11 @@ run the resume sweep before the next batch. It is idempotent:
 harvest shard rebalance-resume --shard 0=... --shard 1=... --from 0
 ```
 
+A running worker settles a migration that stalled after its cutover on its
+own (issue #1839). It writes a `shard.rebalance.auto_resume` audit row. The
+resume sweep is still needed for a migration that stopped before the cutover.
+See [`sharding.md`](../sharding.md#automatic-resume-after-a-stalled-cutover-issue-1839).
+
 ## 3. Converge: deal with what will not move
 
 Re-run the dry run until it reports nothing left to migrate. What remains falls

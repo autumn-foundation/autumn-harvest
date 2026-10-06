@@ -406,6 +406,9 @@ mod quota_lock_order;
 /// [`quota_reconcile::ReconcileSummary`]) compiles without the `db` feature;
 /// the sweep and its periodic spawner are DB-gated.
 pub mod quota_reconcile;
+/// Automatic resume of a shard rebalance stalled after its cutover (issue
+/// #1839).
+pub mod rebalance_resume;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///

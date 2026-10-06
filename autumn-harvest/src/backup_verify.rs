@@ -218,6 +218,14 @@ pub enum FindingClass {
     /// cannot hold the triggered workflow. The loss is provable, not merely
     /// likely.
     CompletionTriggerFireLost,
+    /// Two `harvest_events` rows share one `(workflow_exec_id, event_id)`
+    /// (issue #1839).
+    ///
+    /// Only the partitioned layout can hold one. Its unique constraint covers
+    /// one cohort, and its insert trigger cannot see an uncommitted row. Two
+    /// in-flight appends that land in two cohorts both commit. Replay of
+    /// that history is ambiguous.
+    DuplicateEventId,
 
     // ── Advisory: operator judgement ────────────────────────────────────────
     /// A caller recorded an external *signal* as delivered and the target's
@@ -271,7 +279,7 @@ pub enum FindingClass {
 
 impl FindingClass {
     /// Every class, in a stable order. Used by tests and by the runbook table.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::DeadWorkerRunningTask,
         Self::TimedOutTask,
         Self::WorkflowDeadlineExpired,
@@ -290,6 +298,7 @@ impl FindingClass {
         Self::ReplayDivergence,
         Self::ReplayWorkflowFailed,
         Self::CompletionTriggerFireLost,
+        Self::DuplicateEventId,
         Self::ExternalEffectUnverifiable,
         Self::RestorePointSkew,
         Self::ReplaySkippedNoHandler,
@@ -327,7 +336,8 @@ impl FindingClass {
             | Self::ExternalEffectRolledBack
             | Self::ReplayDivergence
             | Self::ReplayWorkflowFailed
-            | Self::CompletionTriggerFireLost => FindingSeverity::Incoherent,
+            | Self::CompletionTriggerFireLost
+            | Self::DuplicateEventId => FindingSeverity::Incoherent,
 
             Self::ExternalEffectUnverifiable
             | Self::RestorePointSkew
@@ -373,6 +383,7 @@ impl FindingClass {
             Self::RetentionUnproven => "retention_unproven",
             Self::CompletionTriggerFireLost => "completion_trigger_fire_lost",
             Self::CompletionTriggerFireUnproven => "completion_trigger_fire_unproven",
+            Self::DuplicateEventId => "duplicate_event_id",
         }
     }
 
@@ -472,6 +483,11 @@ impl FindingClass {
                 "the source shard confirms a completion-trigger relay delivered, but \
                  the target execution is absent and the target shard's restore point \
                  does not rule out ordinary retention (issue #1401)"
+            }
+            Self::DuplicateEventId => {
+                "two event rows share one (workflow_exec_id, event_id) in different \
+                 cohorts of the partitioned layout, so replay of this history is \
+                 ambiguous (issue #1839)"
             }
         }
     }
@@ -1827,7 +1843,7 @@ mod probes {
             }
         }
 
-        // ── Incoherent: shard-local referential breaks ──────────────────────
+        // ── Incoherent: shard-local invariant breaks ────────────────────────
         let mut dangling: Vec<(FindingClass, String)> = vec![(
             FindingClass::DanglingTaskExecution,
             bounded(
@@ -1879,6 +1895,24 @@ mod probes {
                     "SELECT DISTINCT ev.workflow_exec_id AS id FROM harvest_events ev \
                      WHERE NOT EXISTS (SELECT 1 FROM harvest_workflow_executions e \
                                        WHERE e.id = ev.workflow_exec_id)",
+                    "sub.id::text",
+                    limit,
+                ),
+            ));
+        }
+        // Issue #1839: on the partitioned layout the unique constraint covers
+        // one cohort only. Two in-flight appends of one `event_id` that land
+        // in two cohorts both commit. ADR 0004 records the decision to detect
+        // this, not to prevent it. The flat layout's constraint makes the
+        // state impossible, so the probe runs on the partitioned layout only.
+        if layout.is_some_and(|l| l.is_partitioned()) {
+            dangling.push((
+                FindingClass::DuplicateEventId,
+                bounded(
+                    "SELECT DISTINCT dup.workflow_exec_id AS id FROM ( \
+                         SELECT ev.workflow_exec_id FROM harvest_events ev \
+                          GROUP BY ev.workflow_exec_id, ev.event_id \
+                         HAVING COUNT(*) > 1) dup",
                     "sub.id::text",
                     limit,
                 ),
@@ -4721,6 +4755,7 @@ mod tests {
             (FindingClass::ReplayDivergence, Incoherent),
             (FindingClass::ReplayWorkflowFailed, Incoherent),
             (FindingClass::CompletionTriggerFireLost, Incoherent),
+            (FindingClass::DuplicateEventId, Incoherent),
             (FindingClass::ExternalEffectUnverifiable, Advisory),
             // Worth an operator's eye; does not fail the gate.
             (FindingClass::RestorePointSkew, Advisory),

@@ -637,8 +637,8 @@ pub use db::{
     observe_quiescence, reconcile_migrated_seal_terminality, reconcile_migrated_seals,
     reconcile_migrated_seals_after, release_legal_hold_forwarded, residence_chain,
     resolve_execution_shard, resolve_execution_shard_holding, resolve_target_shard,
-    resolve_target_shard_holding, resume_incomplete_migrations, set_legal_hold_forwarded,
-    shard_of_held_row, stage_copy, verify_target_copy,
+    resolve_target_shard_holding, resume_incomplete_migrations, resume_stalled_cutovers,
+    set_legal_hold_forwarded, shard_of_held_row, stage_copy, verify_target_copy,
 };
 
 // This is `pub(crate)`, not part of the `pub use` block above (issue #1596
@@ -3579,7 +3579,7 @@ mod db {
                     let mut source = checkout(pool, source_shard).await?;
                     record_migration_audit(
                         &mut source,
-                        actor,
+                        MigrationDriver::Operator(actor),
                         source_shard,
                         target_shard,
                         &outcome,
@@ -3636,8 +3636,14 @@ mod db {
             // already sealed its source — the one record an operator most needs.
             {
                 let mut source = checkout(pool, source_shard).await?;
-                record_migration_audit(&mut source, actor, source_shard, target_shard, &outcome)
-                    .await?;
+                record_migration_audit(
+                    &mut source,
+                    MigrationDriver::Operator(actor),
+                    source_shard,
+                    target_shard,
+                    &outcome,
+                )
+                .await?;
             }
             outcomes.push(outcome);
         }
@@ -3668,6 +3674,23 @@ mod db {
         })
     }
 
+    /// The audit operation of a migration step that an operator drives.
+    const OP_SHARD_REBALANCE_MIGRATE: &str = "shard.rebalance.migrate";
+
+    /// Who drives a migration step. The audit row names it.
+    #[derive(Debug, Clone, Copy)]
+    enum MigrationDriver<'a> {
+        /// An operator, through `harvest shard rebalance` or
+        /// `rebalance-resume`. Holds the operator's actor name.
+        Operator(&'a str),
+        /// The rebalance-resume scanner (issue #1839).
+        ///
+        /// The audit row has actor `system` and source `cli`. The audit table
+        /// accepts only `api`, `cli` and `ui`. The rebalance surface is the
+        /// CLI, and the `background.*` route marks the row as automatic.
+        Scanner,
+    }
+
     /// Write one `harvest_audit_log` row for a migration attempt.
     ///
     /// On the **source** shard: the shard whose residents are moving, and the
@@ -3677,7 +3700,7 @@ mod db {
     /// (issue #953's audit export) before step 5 of the decommission runbook.
     async fn record_migration_audit(
         conn: &mut AsyncPgConnection,
-        actor: &str,
+        driver: MigrationDriver<'_>,
         source_shard: ShardId,
         target_shard: ShardId,
         outcome: &MigrationOutcome,
@@ -3704,14 +3727,24 @@ mod db {
             MigrationOutcome::Aborted { reason, .. } => ("failed", Some(reason.clone())),
         };
         let exec_id = outcome.execution_id().to_string();
+        let (actor, operation, command) = match driver {
+            MigrationDriver::Operator(actor) => {
+                (actor, OP_SHARD_REBALANCE_MIGRATE, "shard rebalance")
+            }
+            MigrationDriver::Scanner => (
+                "system",
+                crate::audit::OP_SHARD_REBALANCE_AUTO_RESUME,
+                "background.rebalance_resume_scanner",
+            ),
+        };
         let route = format!(
-            "shard rebalance {} -> {}",
+            "{command} {} -> {}",
             source_shard.as_i32(),
             target_shard.as_i32()
         );
         let record = crate::models::NewAuditRecord {
             actor,
-            operation: "shard.rebalance.migrate",
+            operation,
             target_type: "workflow_execution",
             target_id: Some(&exec_id),
             route_or_command: &route,
@@ -3750,8 +3783,6 @@ mod db {
     ///
     /// [`HarvestError::Database`] on query failure. An individual row that
     /// cannot be advanced records its error and does not fail the sweep.
-    #[allow(clippy::too_many_lines)] // The phase machine's dispatch is one
-    // exhaustive `match`; extracting arms would hide which step each phase takes.
     pub async fn resume_incomplete_migrations(
         pool: &ShardedDbPool,
         source_shard: ShardId,
@@ -3783,184 +3814,284 @@ mod db {
 
         let mut outcomes = Vec::new();
         for record in unsettled {
-            let exec_id = record.execution_id;
-            // A `?` here would exit the whole sweep on one record naming an
-            // unavailable or unconfigured shard (issue #1317). That starves
-            // every later record behind it, including a settled one whose own
-            // target is healthy. Record the failure and move on, the same way
-            // an error from a migration STEP is already handled below.
-            let checked_out = async {
-                let source = checkout(pool, record.source_shard).await?;
-                let target = checkout(pool, record.target_shard).await?;
-                Ok::<_, HarvestError>((source, target))
-            }
-            .await;
-            let (mut source, mut target) = match checked_out {
-                Ok(pair) => pair,
-                Err(error) => {
-                    let reason = format!(
-                        "could not check out a connection to resume this migration: {error}"
-                    );
-                    // Best-effort: bumps `attempts` so the ORDER BY above sinks
-                    // this record behind less-tried ones on the next sweep.
-                    // `record.source_shard` is usually the same pool already
-                    // used to read this record's own table. A fresh checkout
-                    // of it typically succeeds even when the record's TARGET
-                    // is what is actually unavailable. If this checkout also
-                    // fails, there is nothing to record to. The record is
-                    // left for the next sweep as-is.
-                    if let Ok(mut source) = checkout(pool, record.source_shard).await {
-                        let _ = record_attempt(&mut source, exec_id, &reason).await;
-                    }
-                    outcomes.push(MigrationOutcome::Aborted {
-                        execution_id: exec_id,
-                        reason,
-                    });
-                    continue;
+            drive_migration(
+                pool,
+                record,
+                MigrationDriver::Operator(actor),
+                codecs,
+                &mut outcomes,
+            )
+            .await?;
+        }
+        Ok(outcomes)
+    }
+
+    /// Step one migration record until it settles or stops making progress.
+    ///
+    /// Shared by [`resume_incomplete_migrations`] and
+    /// [`resume_stalled_cutovers`]. Each outcome goes into `outcomes`. A
+    /// failed step records an attempt on the row and ends the loop.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Database`] when the attempt, the audit row or the
+    /// phase re-read fails.
+    #[allow(clippy::too_many_lines)] // The phase machine's dispatch is one
+    // exhaustive `match`; extracting arms would hide which step each phase takes.
+    async fn drive_migration(
+        pool: &ShardedDbPool,
+        record: MigrationRecord,
+        driver: MigrationDriver<'_>,
+        codecs: &PayloadCodecs,
+        outcomes: &mut Vec<MigrationOutcome>,
+    ) -> HarvestResult<()> {
+        let exec_id = record.execution_id;
+        // A `?` here would exit the whole sweep on one record naming an
+        // unavailable or unconfigured shard (issue #1317). That starves
+        // every later record behind it, including a settled one whose own
+        // target is healthy. Record the failure and move on, the same way
+        // an error from a migration STEP is already handled below.
+        let checked_out = async {
+            let source = checkout(pool, record.source_shard).await?;
+            let target = checkout(pool, record.target_shard).await?;
+            Ok::<_, HarvestError>((source, target))
+        }
+        .await;
+        let (mut source, mut target) = match checked_out {
+            Ok(pair) => pair,
+            Err(error) => {
+                let reason =
+                    format!("could not check out a connection to resume this migration: {error}");
+                // Best-effort: bumps `attempts` so the ORDER BY above sinks
+                // this record behind less-tried ones on the next sweep.
+                // `record.source_shard` is usually the same pool already
+                // used to read this record's own table. A fresh checkout
+                // of it typically succeeds even when the record's TARGET
+                // is what is actually unavailable. If this checkout also
+                // fails, there is nothing to record to. The record is
+                // left for the next sweep as-is.
+                if let Ok(mut source) = checkout(pool, record.source_shard).await {
+                    let _ = record_attempt(&mut source, exec_id, &reason).await;
                 }
-            };
-            let mut phase = record.phase;
-
-            for _ in 0..MAX_RESUME_STEPS {
-                // Propagated, never swallowed: `unwrap_or(false)` here would turn a
-                // pool blip into "the source is no longer quiescent", and the phase
-                // machine would abort a perfectly good migration and record a reason
-                // naming a wake that never happened.
-                let source_still_quiescent = if phase.is_past_cutover() {
-                    false
-                } else {
-                    assess_quiescence(&observe_quiescence(&mut source, exec_id).await?)
-                        .is_eligible()
-                };
-
-                let action = next_migration_action(&MigrationObservation {
-                    phase,
-                    source_still_quiescent,
+                outcomes.push(MigrationOutcome::Aborted {
+                    execution_id: exec_id,
+                    reason,
                 });
-                if action == MigrationAction::Retire {
-                    break;
-                }
+                return Ok(());
+            }
+        };
+        let mut phase = record.phase;
 
-                let stepped: HarvestResult<Option<MigrationOutcome>> = async {
-                    match action {
-                        MigrationAction::StageCopy => {
-                            stage_copy(&mut source, &mut target, exec_id, record.target_shard)
-                                .await?;
+        for _ in 0..MAX_RESUME_STEPS {
+            // Propagated, never swallowed: `unwrap_or(false)` here would turn a
+            // pool blip into "the source is no longer quiescent", and the phase
+            // machine would abort a perfectly good migration and record a reason
+            // naming a wake that never happened.
+            let source_still_quiescent = if phase.is_past_cutover() {
+                false
+            } else {
+                assess_quiescence(&observe_quiescence(&mut source, exec_id).await?).is_eligible()
+            };
+
+            let action = next_migration_action(&MigrationObservation {
+                phase,
+                source_still_quiescent,
+            });
+            if action == MigrationAction::Retire {
+                break;
+            }
+
+            let stepped: HarvestResult<Option<MigrationOutcome>> = async {
+                match action {
+                    MigrationAction::StageCopy => {
+                        stage_copy(&mut source, &mut target, exec_id, record.target_shard).await?;
+                        Ok(None)
+                    }
+                    MigrationAction::Verify => {
+                        verify_target_copy(&mut source, &mut target, exec_id, codecs).await?;
+                        Ok(None)
+                    }
+                    MigrationAction::Cutover => {
+                        if commit_cutover(&mut source, exec_id, record.target_shard).await? {
                             Ok(None)
-                        }
-                        MigrationAction::Verify => {
-                            verify_target_copy(&mut source, &mut target, exec_id, codecs).await?;
-                            Ok(None)
-                        }
-                        MigrationAction::Cutover => {
-                            if commit_cutover(&mut source, exec_id, record.target_shard).await? {
-                                Ok(None)
-                            } else {
-                                // A declined cutover has to CLEAN UP, not merely
-                                // report. Without this the record stays
-                                // `VERIFIED`, the target keeps its `MIGRATING`
-                                // copy and that shard's uniqueness slot, and the
-                                // loop exits because the phase did not advance —
-                                // so the command says "aborted" while nothing was
-                                // undone, and a second resume is needed to
-                                // actually finish the job.
-                                let reason = cutover_decline_reason(&mut source, exec_id)
-                                    .await?
-                                    .to_string();
-                                abort_migration(
-                                    &mut source,
-                                    &mut target,
-                                    exec_id,
-                                    record.target_shard,
-                                    &reason,
-                                )
-                                .await?;
-                                Ok(Some(MigrationOutcome::Aborted {
-                                    execution_id: exec_id,
-                                    reason,
-                                }))
-                            }
-                        }
-                        MigrationAction::ActivateTarget => {
-                            activate_target(&mut source, &mut target, exec_id).await?;
-                            collapse_forward_chain(
-                                pool,
-                                exec_id,
-                                record.source_shard,
-                                record.target_shard,
-                            )
-                            .await;
-                            Ok(Some(MigrationOutcome::Migrated {
-                                execution_id: exec_id,
-                                fingerprint: record
-                                    .verified_fingerprint
-                                    .clone()
-                                    .unwrap_or_default(),
-                            }))
-                        }
-                        MigrationAction::Abort => {
+                        } else {
+                            // A declined cutover has to CLEAN UP, not merely
+                            // report. Without this the record stays
+                            // `VERIFIED`, the target keeps its `MIGRATING`
+                            // copy and that shard's uniqueness slot, and the
+                            // loop exits because the phase did not advance —
+                            // so the command says "aborted" while nothing was
+                            // undone, and a second resume is needed to
+                            // actually finish the job.
+                            let reason = cutover_decline_reason(&mut source, exec_id)
+                                .await?
+                                .to_string();
                             abort_migration(
                                 &mut source,
                                 &mut target,
                                 exec_id,
                                 record.target_shard,
-                                "the execution woke up before cutover",
+                                &reason,
                             )
                             .await?;
                             Ok(Some(MigrationOutcome::Aborted {
                                 execution_id: exec_id,
-                                reason: "the execution woke up before cutover".to_string(),
+                                reason,
                             }))
                         }
-                        MigrationAction::Retire => Ok(None),
                     }
-                }
-                .await;
-
-                match stepped {
-                    Ok(Some(outcome)) => {
-                        // The resume path performs real cutovers and activations,
-                        // so it is audited exactly like the batch path; without this
-                        // a migration completed by `rebalance-resume` would leave no
-                        // audit record at all.
-                        record_migration_audit(
-                            &mut source,
-                            actor,
+                    MigrationAction::ActivateTarget => {
+                        activate_target(&mut source, &mut target, exec_id).await?;
+                        collapse_forward_chain(
+                            pool,
+                            exec_id,
                             record.source_shard,
                             record.target_shard,
-                            &outcome,
+                        )
+                        .await;
+                        Ok(Some(MigrationOutcome::Migrated {
+                            execution_id: exec_id,
+                            fingerprint: record.verified_fingerprint.clone().unwrap_or_default(),
+                        }))
+                    }
+                    MigrationAction::Abort => {
+                        abort_migration(
+                            &mut source,
+                            &mut target,
+                            exec_id,
+                            record.target_shard,
+                            "the execution woke up before cutover",
                         )
                         .await?;
-                        outcomes.push(outcome);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let reason = error.to_string();
-                        record_attempt(&mut source, exec_id, &reason).await?;
-                        outcomes.push(MigrationOutcome::Aborted {
+                        Ok(Some(MigrationOutcome::Aborted {
                             execution_id: exec_id,
-                            reason,
-                        });
-                        // A failed step leaves the phase where it was; stop rather
-                        // than re-attempting it in a tight loop. The next sweep
-                        // picks it up, under the recorded backoff.
-                        break;
+                            reason: "the execution woke up before cutover".to_string(),
+                        }))
                     }
+                    MigrationAction::Retire => Ok(None),
                 }
-
-                // Re-read rather than infer: `commit_cutover` can decline (the run
-                // woke) and `abort_migration` can be a no-op past the cutover, so
-                // the stored phase is the only honest source of what happened.
-                let Some(next) = load_migration(&mut source, exec_id).await? else {
-                    break;
-                };
-                if next.phase == phase {
-                    // No forward progress — a declined cutover, or a step that
-                    // could not advance. Leave it for the next sweep.
-                    break;
-                }
-                phase = next.phase;
             }
+            .await;
+
+            match stepped {
+                Ok(Some(outcome)) => {
+                    // The resume path performs real cutovers and activations,
+                    // so it is audited exactly like the batch path; without this
+                    // a migration completed by `rebalance-resume` would leave no
+                    // audit record at all.
+                    record_migration_audit(
+                        &mut source,
+                        driver,
+                        record.source_shard,
+                        record.target_shard,
+                        &outcome,
+                    )
+                    .await?;
+                    outcomes.push(outcome);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let reason = error.to_string();
+                    record_attempt(&mut source, exec_id, &reason).await?;
+                    outcomes.push(MigrationOutcome::Aborted {
+                        execution_id: exec_id,
+                        reason,
+                    });
+                    // A failed step leaves the phase where it was; stop rather
+                    // than re-attempting it in a tight loop. The next sweep
+                    // picks it up, under the recorded backoff.
+                    break;
+                }
+            }
+
+            // Re-read rather than infer: `commit_cutover` can decline (the run
+            // woke) and `abort_migration` can be a no-op past the cutover, so
+            // the stored phase is the only honest source of what happened.
+            let Some(next) = load_migration(&mut source, exec_id).await? else {
+                break;
+            };
+            if next.phase == phase {
+                // No forward progress — a declined cutover, or a step that
+                // could not advance. Leave it for the next sweep.
+                break;
+            }
+            phase = next.phase;
+        }
+        Ok(())
+    }
+
+    /// Settle the stalled migrations past the cutover on one shard (issue
+    /// #1839).
+    ///
+    /// A crash between the cutover and the activation leaves a `COMMITTED`
+    /// record. The run is then claimable on neither shard. This pass finds
+    /// such records and activates their targets, as `rebalance-resume` does.
+    ///
+    /// A record is stalled when its `updated_at` is at least `stall_after`
+    /// old. The grace period lets a live `harvest shard rebalance` finish its
+    /// own activation first.
+    ///
+    /// Records before the cutover are not touched. There the source is still
+    /// claimable, so no liveness gap exists. A cutover is the operator's
+    /// decision.
+    ///
+    /// One statement claims each record and sets its `updated_at`. Other
+    /// passes then skip it for one grace period. So many replicas can run
+    /// this pass, and each record gets one audit row per settlement. The
+    /// claim also spaces out the retries when a target is down.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Database`] when the claim fails, and
+    /// [`HarvestError::ShardUnavailable`] when `source_shard` has no pool. A
+    /// record that cannot be advanced records its error and does not fail the
+    /// pass.
+    pub async fn resume_stalled_cutovers(
+        pool: &ShardedDbPool,
+        source_shard: ShardId,
+        stall_after: std::time::Duration,
+        limit: i64,
+    ) -> HarvestResult<Vec<MigrationOutcome>> {
+        let stalled: Vec<MigrationRecord> = {
+            let mut source = checkout(pool, source_shard).await?;
+            // `SKIP LOCKED` skips a record that another pass claims now. A
+            // record that another pass claimed before has a new `updated_at`,
+            // so the stall filter drops it.
+            let rows: Vec<MigrationRow> = diesel::sql_query(format!(
+                "UPDATE harvest_shard_migrations \
+                    SET updated_at = NOW() \
+                  WHERE execution_id IN ( \
+                        SELECT execution_id FROM harvest_shard_migrations \
+                         WHERE phase = 'COMMITTED' \
+                           AND updated_at <= NOW() - make_interval(secs => $1) \
+                         ORDER BY attempts ASC, created_at ASC \
+                         LIMIT $2 \
+                           FOR UPDATE SKIP LOCKED) \
+                RETURNING {MIGRATION_COLUMNS}"
+            ))
+            .bind::<diesel::sql_types::Double, _>(stall_after.as_secs_f64())
+            .bind::<BigInt, _>(limit)
+            .load(&mut *source)
+            .await
+            .map_err(database_error)?;
+            rows.into_iter()
+                .map(MigrationRow::into_record)
+                .collect::<HarvestResult<Vec<_>>>()?
+        };
+
+        // Past the cutover the only step is the activation. It decodes no
+        // payload, so the default codecs are enough.
+        let codecs = PayloadCodecs::default();
+        let mut outcomes = Vec::new();
+        for record in stalled {
+            drive_migration(
+                pool,
+                record,
+                MigrationDriver::Scanner,
+                &codecs,
+                &mut outcomes,
+            )
+            .await?;
         }
         Ok(outcomes)
     }

@@ -665,6 +665,7 @@ outstanding:
 
 Only `VERIFIED → COMMITTED` changes who is authoritative, and it is a single
 statement on one database. Run `harvest shard rebalance-resume` after any crash.
+For a `COMMITTED` row, the worker also does this for you (see below).
 
 **Why the cutover re-checks the history and not only quiescence.** Verification
 proves the copy matches the source *as of the copy*. On the end-to-end path the
@@ -685,6 +686,36 @@ current history rather than wedged.
 > instant, and claimability follows within one resume step. Closing it entirely
 > would need a two-phase commit across two databases, which the sharding design
 > rules out.
+
+### Automatic resume after a stalled cutover (issue #1839)
+
+The worker closes the gap above without an operator. Each worker runs one
+rebalance-resume scanner per assigned shard, when a `ShardedDbPool` is
+configured.
+
+- A pass finds each `COMMITTED` record whose `updated_at` is older than
+  `ScannerConfig::rebalance_stall_after` (default 30 s). It activates the
+  target, as `rebalance-resume` does, and moves the record to `DONE`.
+- Passes run every `ScannerConfig::rebalance_resume_interval` (default 5 s).
+  The run is claimable again at most one grace period plus one interval after
+  the crash.
+- Each settled record writes one `shard.rebalance.auto_resume` audit row on the
+  source shard: actor `system`, source `cli`, route
+  `background.rebalance_resume_scanner <from> -> <to>`. The audit table accepts
+  only the sources `api`, `cli` and `ui`. The rebalance surface is the CLI.
+- The scanner never touches a record before the cutover. There the source is
+  still claimable, so no liveness gap exists, and a cutover is the operator's
+  decision. Use `harvest shard rebalance-resume` for those records.
+- One statement claims each record and sets its `updated_at`. So many replicas
+  can run the scanner, and each settlement writes one audit row. When the
+  target is down, the retries come one grace period apart, and each failed
+  step counts in `attempts`.
+- The grace period lets a live `harvest shard rebalance` finish its own
+  activation first. Do not set it below a few seconds in production.
+
+The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
+`harvest.scanner.tick`. GET /admin/config shows `rebalance_resume_interval_ms`
+and `rebalance_stall_after_ms`.
 
 ### What migrates, and what does not (the dedupe scopes)
 
@@ -790,7 +821,8 @@ harvest shard rebalance \
   --shard 1=postgres://.../harvest_shard1 \
   --from 0 --to 1 --limit 100 --actor alice@example.com
 
-# After any crash or interruption.
+# After any crash or interruption. A worker settles a record past the
+# cutover on its own; this command also handles the earlier phases.
 harvest shard rebalance-resume \
   --shard 0=... --shard 1=... --from 0
 ```

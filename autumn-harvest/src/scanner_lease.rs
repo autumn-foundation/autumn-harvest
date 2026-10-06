@@ -165,7 +165,25 @@ pub struct ScannerConfig {
     /// Most rows per timeout reason that one timeout pass enforces. Defaults
     /// to [`DEFAULT_TIMEOUT_SCAN_BATCH_SIZE`]. Kept within 1 and 100,000.
     pub timeout_batch_size: u32,
+    /// Time between rebalance-resume passes (issue #1839). Defaults to
+    /// [`DEFAULT_REBALANCE_RESUME_INTERVAL`]. Kept within
+    /// [`MIN_SCANNER_INTERVAL`] and [`MAX_SCANNER_INTERVAL`].
+    pub rebalance_resume_interval: Duration,
+    /// How long a migration stays in the `COMMITTED` phase before the
+    /// rebalance-resume scanner settles it (issue #1839). Defaults to
+    /// [`DEFAULT_REBALANCE_STALL_AFTER`].
+    ///
+    /// The grace period lets a live `harvest shard rebalance` finish its own
+    /// activation first.
+    pub rebalance_stall_after: Duration,
 }
+
+/// Default time between rebalance-resume passes (issue #1839).
+pub const DEFAULT_REBALANCE_RESUME_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Default grace period before a `COMMITTED` migration counts as stalled
+/// (issue #1839).
+pub const DEFAULT_REBALANCE_STALL_AFTER: Duration = Duration::from_secs(30);
 
 /// Default cap on the rows per timeout reason that one checker pass enforces.
 pub const DEFAULT_TIMEOUT_SCAN_BATCH_SIZE: u32 = 500;
@@ -178,6 +196,8 @@ impl Default for ScannerConfig {
             jitter: DEFAULT_SCANNER_JITTER,
             timeout_interval: None,
             timeout_batch_size: DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
+            rebalance_resume_interval: DEFAULT_REBALANCE_RESUME_INTERVAL,
+            rebalance_stall_after: DEFAULT_REBALANCE_STALL_AFTER,
         }
     }
 }
