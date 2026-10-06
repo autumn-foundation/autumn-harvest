@@ -874,6 +874,7 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     while index < history.len() {
         let event = &history[index];
         index += 1;
+        let claimed_before = claimed.clone();
         let op = match event {
             _ if superseded.contains(&(index - 1)) => continue,
             WorkflowEvent::MarkerRecorded { name, details } if name.starts_with("fan_out:") => {
@@ -910,7 +911,17 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         };
         match op {
             Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => {
-                batch.push(op, pending_key(event));
+                // A group op waits for the commands that it claimed.
+                let mut keys: HashSet<Pending> = pending_key(event).into_iter().collect();
+                for i in claimed.difference(&claimed_before) {
+                    keys.extend(pending_key(&history[*i]));
+                }
+                let any = matches!(
+                    op,
+                    Op::Race { .. } | Op::ChildTimeout { .. } | Op::SignalTimeout { .. }
+                );
+                let waits = (!keys.is_empty()).then_some(Waits { keys, any });
+                batch.push(op, waits);
             }
             None if batch.settle(event) => {}
             other => {
@@ -963,6 +974,13 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
     }
 }
 
+/// The outcomes that one batch branch waits for. With `any`, the first
+/// outcome settles the branch, as for a race. Otherwise it waits for all.
+struct Waits {
+    keys: HashSet<Pending>,
+    any: bool,
+}
+
 /// The commands of one decision, as the branches of a `join!`.
 ///
 /// A batch stays open past the outcome of one member while another member
@@ -974,7 +992,7 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
 struct Batch {
     branches: Vec<Vec<Op>>,
     /// What each branch waits for. `None` once it settled.
-    pending: Vec<Option<Pending>>,
+    pending: Vec<Option<Waits>>,
     /// The branch that settled last, while another one still waits.
     resumed: Option<usize>,
 }
@@ -984,7 +1002,7 @@ impl Batch {
         self.branches.is_empty()
     }
 
-    fn push(&mut self, op: Op, waits_for: Option<Pending>) {
+    fn push(&mut self, op: Op, waits_for: Option<Waits>) {
         if let Some(branch) = self.resumed {
             self.branches[branch].push(op);
             // An immediate op does not park, so the branch goes on with the
@@ -1005,11 +1023,21 @@ impl Batch {
         let Some(key) = settled_key(event) else {
             return false;
         };
-        let Some(branch) = self.pending.iter().position(|p| p.as_ref() == Some(&key)) else {
+        let Some(branch) = self
+            .pending
+            .iter()
+            .position(|p| p.as_ref().is_some_and(|w| w.keys.contains(&key)))
+        else {
             return false;
         };
-        self.pending[branch] = None;
-        self.resumed = Some(branch);
+        let settled = self.pending[branch].as_mut().is_some_and(|w| {
+            w.keys.remove(&key);
+            w.any || w.keys.is_empty()
+        });
+        if settled {
+            self.pending[branch] = None;
+            self.resumed = Some(branch);
+        }
         self.pending.iter().any(Option::is_some)
     }
 
@@ -1457,6 +1485,17 @@ fn mirror_race<'h>(
                 in_run = false;
                 signal = mirror_event(event, false);
                 taken.others.insert(index);
+            }
+            // The slots are full, but no claimed command finished yet. A
+            // sibling took the signal's slot, so the signal gets it back.
+            WorkflowEvent::SignalReceived { .. } if signal.is_none() && finished.is_empty() => {
+                in_run = false;
+                if let Some(pos) = commands.iter().rposition(|c| c.branch.is_some()) {
+                    let sibling = commands.remove(pos);
+                    taken.commands.remove(&sibling.index);
+                    signal = mirror_event(event, false);
+                    taken.others.insert(index);
+                }
             }
             _ => in_run = false,
         }
