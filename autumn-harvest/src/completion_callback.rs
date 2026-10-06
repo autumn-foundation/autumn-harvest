@@ -1534,11 +1534,11 @@ fn parse_http_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 
 /// Parse an RFC 850 date, for example `Sunday, 06-Nov-94 08:49:37 GMT`.
 ///
-/// The two-digit year is in the century of `now`. A date more than 50 years
-/// after `now` moves back 100 years (RFC 9110 section 5.6.7). The cutoff
-/// compares the full timestamp, not only the year. Chrono's `%y` uses a
-/// fixed pivot instead, so this code sets the century itself. The weekday
-/// must match the date that results.
+/// The two-digit year gives the latest date that is not more than 50 years
+/// after `now` (RFC 9110 section 5.6.7). The cutoff compares the full
+/// timestamp, not only the year, and the window slides across a century
+/// boundary. Chrono's `%y` uses a fixed pivot instead, so this code sets the
+/// century itself. The weekday must match the date that results.
 fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let (weekday, rest) = value.split_once(", ")?;
     let (date, time) = rest.split_once(' ')?;
@@ -1558,10 +1558,26 @@ fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let now_year = chrono::Datelike::year(&now);
     let century = now_year - now_year.rem_euclid(100);
     let cutoff = now.checked_add_months(chrono::Months::new(50 * 12))?;
-    let mut at = at_year(century + yy)?;
-    if at > cutoff {
-        at = at_year(century + yy - 100)?;
-    }
+    // Read the month, day and time in a leap year, so 29 February parses.
+    let in_leap_year = at_year(2000)?;
+    let key = |at: DateTime<Utc>| {
+        (
+            chrono::Datelike::year(&at),
+            chrono::Datelike::month(&at),
+            chrono::Datelike::day(&at),
+            at.time(),
+        )
+    };
+    let (_, month, day, time) = key(in_leap_year);
+    let cutoff_key = key(cutoff);
+    // The candidates are 100 years apart, so the latest one at or before
+    // the cutoff is the only one inside the 100-year window. Compare the
+    // calendar fields, so a date that is invalid in its year is not skipped.
+    let year = [century + 100, century, century - 100]
+        .into_iter()
+        .map(|base| base + yy)
+        .find(|year| (*year, month, day, time) <= cutoff_key)?;
+    let at = at_year(year)?;
     let weekday: chrono::Weekday = weekday.parse().ok()?;
     (chrono::Datelike::weekday(&at) == weekday).then_some(at)
 }
@@ -1666,6 +1682,30 @@ mod deliverer_trait_tests {
         let ahead =
             parse_retry_after("Monday, 05-Oct-76 00:00:00 GMT", now).expect("a valid RFC 850 date");
         assert!(ahead > std::time::Duration::from_secs(49 * 365 * 86_400));
+    }
+
+    #[test]
+    fn parse_retry_after_resolves_an_rfc_850_year_across_a_century() {
+        // In 2076, `10` means 2110: 34 years ahead, inside the window.
+        let now = DateTime::parse_from_rfc3339("2076-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ahead = parse_retry_after("Wednesday, 01-Jan-10 00:00:00 GMT", now)
+            .expect("a valid RFC 850 date");
+        assert!(ahead > std::time::Duration::from_secs(33 * 365 * 86_400));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_a_date_that_does_not_exist_in_its_year() {
+        // In 2076, `00` means 2100, which has no 29 February. The parser must
+        // not fall back to 2000, where the date and the weekday are valid.
+        let now = DateTime::parse_from_rfc3339("2076-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_retry_after("Tuesday, 29-Feb-00 00:00:00 GMT", now),
+            None
+        );
     }
 
     #[test]
