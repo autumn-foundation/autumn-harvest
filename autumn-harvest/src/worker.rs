@@ -15715,14 +15715,12 @@ const fn timeout_check(
 /// (issue #1836).
 ///
 /// A cancel can mean a lost claim. A heartbeat timeout can fire before the
-/// attempt deadline, but only after `heartbeat_timeout` has elapsed. A
-/// handler can also answer before the cancel observer sees that loss.
-fn claim_may_be_lost(
-    was_cancelled: bool,
-    heartbeat_timeout: Option<Duration>,
-    elapsed: Duration,
-) -> bool {
-    was_cancelled || heartbeat_timeout.is_some_and(|timeout| elapsed >= timeout)
+/// attempt deadline, and a handler can answer before the cancel observer
+/// sees that loss. The heartbeat budget starts at the claim in the
+/// database, and the claim reaches this worker after an unbounded delay.
+/// So a task with a heartbeat timeout always reads the row.
+const fn claim_may_be_lost(was_cancelled: bool, has_heartbeat_timeout: bool) -> bool {
+    was_cancelled || has_heartbeat_timeout
 }
 
 /// Whether an attempt timed out (issue #1836). See [`timeout_check`].
@@ -15927,16 +15925,16 @@ mod adaptive_limit_gate_tests {
         );
     }
 
-    /// The scanner can fire a heartbeat timeout only after the heartbeat
-    /// timeout has elapsed. So the row read runs then, or after a cancel.
+    /// A cancel can mean a lost claim. A heartbeat timeout can take the
+    /// claim before the local clock sees the heartbeat budget spent. The
+    /// budget starts at the claim in the database. So a task with a
+    /// heartbeat timeout always reads the row.
     #[test]
-    fn the_claim_may_be_lost_after_a_cancel_or_a_heartbeat_timeout() {
+    fn the_claim_may_be_lost_after_a_cancel_or_with_a_heartbeat_timeout() {
         use super::claim_may_be_lost;
-        let ms = Duration::from_millis;
-        assert!(claim_may_be_lost(true, None, ms(0)));
-        assert!(!claim_may_be_lost(false, None, ms(10_000)));
-        assert!(!claim_may_be_lost(false, Some(ms(500)), ms(499)));
-        assert!(claim_may_be_lost(false, Some(ms(500)), ms(500)));
+        assert!(claim_may_be_lost(true, false));
+        assert!(!claim_may_be_lost(false, false));
+        assert!(claim_may_be_lost(false, true));
     }
 
     /// The deadline check uses the database-clock budget and the monotonic
@@ -18008,12 +18006,10 @@ async fn process_activity_task(
     // and free the slot. See `limit_sample_outcome` for which attempts give
     // no sample.
     if let Some(permit) = limit_permit.take() {
-        let elapsed = dispatched_at.elapsed();
-        let heartbeat_timeout = task.heartbeat_timeout.and_then(|d| d.to_std().ok());
         let check = timeout_check(
             committed_transactionally,
-            past_attempt_deadline(attempt_deadline, task.started_at, elapsed),
-            claim_may_be_lost(was_cancelled, heartbeat_timeout, elapsed),
+            past_attempt_deadline(attempt_deadline, task.started_at, dispatched_at.elapsed()),
+            claim_may_be_lost(was_cancelled, task.heartbeat_timeout.is_some()),
         );
         let timed_out = attempt_timed_out(pool, &activity_claim, activity_name, check).await;
         let error_type = failure_info.as_ref().map(|(et, _, _)| et.as_str());
