@@ -24841,7 +24841,7 @@ async fn process_workflow_task(
             // `resume_workflow_execution`'s own lock. A concurrent resume
             // therefore always commits its own wake after this park commits.
             let still_paused = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
-                check_paused_and_park(
+                let parked = check_paused_and_park(
                     conn,
                     prepared.exec_id.as_uuid(),
                     task.id,
@@ -24850,7 +24850,23 @@ async fn process_workflow_task(
                     task.attempt,
                     sticky_timeout,
                 )
-                .await
+                .await?;
+                // Issue #1833: inline steps can have appended events
+                // already. They keep their boundary, as on the park at
+                // persist time.
+                if parked {
+                    record_decision_boundary(
+                        conn,
+                        registry,
+                        prepared.exec_id,
+                        decision_start_event_id,
+                        next_event_id > decision_start_event_id,
+                        worker_id,
+                        build_id,
+                    )
+                    .await?;
+                }
+                Ok(parked)
             }))
             .await?;
             if still_paused {

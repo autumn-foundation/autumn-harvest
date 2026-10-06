@@ -118,6 +118,40 @@ async fn boundary_mutex_waiter(
     Ok(serde_json::json!("acquired"))
 }
 
+/// The database the run pauses itself through, and whether it did so.
+static PAUSE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PAUSE_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Runs a local activity, pauses this run once, then waits for `go`.
+///
+/// The local activity writes its events inline. The pause commits after
+/// them and before the decision persists. So the worker parks on its
+/// early pause check, outside the persist transaction.
+#[workflow]
+async fn boundary_pause_inline(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    ctx.execute_local_activity_raw("boundary_step", input, None, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(url) = PAUSE_URL.get()
+        && !PAUSE_SENT.swap(true, Ordering::SeqCst)
+    {
+        let mut conn = connect(url).await;
+        autumn_harvest::execution::pause_workflow_execution(
+            &mut conn,
+            ctx.info().execution_id,
+            Some("hold"),
+            "test",
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 #[activity(start_to_close = "30s")]
 async fn boundary_step(
     _ctx: &ActivityContext,
@@ -162,6 +196,7 @@ fn registry(policy: WorkflowHistoryPolicy, decisions: Arc<DecisionCount>) -> Arc
                 boundary_signal_wait_info(),
                 boundary_mutex_holder_info(),
                 boundary_mutex_waiter_info(),
+                boundary_pause_inline_info(),
             ],
             activities![boundary_step],
             autumn_harvest::context::empty_shared_state(),
@@ -483,6 +518,39 @@ async fn a_contended_acquire_records_no_boundary_after_a_foreign_write() {
         boundaries(&events),
         vec![(BUILD_ID.to_string(), FOREIGN_WORKER.to_string())],
         "an enqueue-only decision must write no boundary: {:?}",
+        type_names(&events)
+    );
+}
+
+#[tokio::test]
+async fn a_pause_before_persist_keeps_the_boundary_of_inline_writes() {
+    // The local activity writes events inline, then pauses the run. The
+    // worker sees the pause before it persists and parks. Those inline
+    // events are this decision's writes, so its boundary must follow.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("pause");
+    let running = Running::start(&queue, &pool, WorkflowHistoryPolicy::default());
+    let worker_id = running.worker_id.clone();
+    PAUSE_URL.set(url.clone()).expect("one test sets the URL");
+    let mut conn = connect(&url).await;
+    let exec_id = seed(
+        &mut conn,
+        "boundary_pause_inline",
+        &queue,
+        serde_json::json!({}),
+    )
+    .await;
+    wait_for_execution_state_with_timeout(&url, exec_id, "PAUSED", Duration::from_secs(30)).await;
+    // A paused park keeps a sticky hint, so `is_parked` does not apply.
+    // Stopping the worker drains the decision in flight.
+    running.stop().await;
+
+    let events = history(&url, exec_id).await;
+    assert_eq!(
+        boundaries(&events),
+        vec![(BUILD_ID.to_string(), worker_id)],
+        "{:?}",
         type_names(&events)
     );
 }
