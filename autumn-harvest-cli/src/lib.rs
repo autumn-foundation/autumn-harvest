@@ -6140,31 +6140,66 @@ async fn direct_write_authority(
     })
 }
 
-/// Open a fence barrier for one partition command on one shard (issue
-/// #1823), at the epoch the operator stated. A shard with no stated epoch
-/// has no DR marker, so it needs no barrier.
+/// Open the fence barriers for one partition command on one database (issue
+/// #1823), at the epochs the operator stated.
 ///
-/// The barrier takes its own connection. A bump cannot commit while the
-/// caller holds it, so the command's DDL and row moves keep their authority.
+/// The command changes tables that every logical shard on the database
+/// shares. So it holds a barrier for the named shard and for every other
+/// shard whose generation row is on that database. A bump of any of them
+/// then waits for the command. A named shard with no stated epoch has no DR
+/// marker, so it needs no barrier. A colocated shard with no stated epoch is
+/// refused: the command cannot hold its barrier.
+///
+/// Each barrier takes its own connection. A bump cannot commit while the
+/// caller holds them, so the command's DDL and row moves keep their
+/// authority.
 async fn partition_fence(
     dsn: &str,
     shard_id: i32,
     expect_generation: &[ExpectGeneration],
-) -> Result<Option<autumn_harvest::replication::FencePassGuard>, String> {
-    let Some(expected) =
-        expected_generation_for(expect_generation, shard_id).map_err(|e| e.to_string())?
-    else {
-        return Ok(None);
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, String> {
+    let rows = {
+        let mut probe = dr_connect(dsn).await.map_err(|e| e.to_string())?;
+        autumn_harvest::replication::probe_dr_markers(
+            &mut probe,
+            autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .generation_shards
     };
-    let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;
-    autumn_harvest::replication::begin_fenced_pass_on(
-        conn,
-        autumn_harvest::types::ShardId::new(shard_id),
-        autumn_harvest::replication::ShardGeneration::new(expected),
-    )
-    .await
-    .map(Some)
-    .map_err(|e| e.to_string())
+    let mut shards = vec![shard_id];
+    for row in rows {
+        if !shards.contains(&row.as_i32()) {
+            shards.push(row.as_i32());
+        }
+    }
+    let mut guards = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let Some(expected) =
+            expected_generation_for(expect_generation, shard).map_err(|e| e.to_string())?
+        else {
+            if shard == shard_id {
+                continue;
+            }
+            return Err(format!(
+                "this database also holds the generation row of shard {shard}. The command \
+                 changes tables that shard shares, so it must hold its barrier too. Pass \
+                 --expect-generation <N> for every shard, or {shard}=<N>."
+            ));
+        };
+        let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;
+        guards.push(
+            autumn_harvest::replication::begin_fenced_pass_on(
+                conn,
+                autumn_harvest::types::ShardId::new(shard),
+                autumn_harvest::replication::ShardGeneration::new(expected),
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(guards)
 }
 
 /// [`direct_write_authority`] for every shard of a rebalance pool, before any
@@ -6532,7 +6567,7 @@ async fn run_partition_enable(
         // conversion of the rest.
         // A lost fence session stops the mutation. See `run_fenced_pass`.
         let enabled = autumn_harvest::replication::run_fenced_pass(
-            fence.as_ref(),
+            &fence,
             autumn_harvest::partition::enable_partitioning(&mut conn, opts),
         )
         .await
@@ -6596,7 +6631,7 @@ async fn run_partition_maintain(
         };
         // A lost fence session stops the pass. See `run_fenced_pass`.
         let maintained = autumn_harvest::replication::run_fenced_pass(
-            fence.as_ref(),
+            &fence,
             autumn_harvest::partition::maintain(
                 &mut conn,
                 autumn_harvest::chrono::Utc::now(),
@@ -6672,7 +6707,7 @@ async fn run_partition_disable(
         };
         // A lost fence session stops the mutation. See `run_fenced_pass`.
         let disabled = autumn_harvest::replication::run_fenced_pass(
-            fence.as_ref(),
+            &fence,
             autumn_harvest::partition::disable_partitioning(&mut conn),
         )
         .await

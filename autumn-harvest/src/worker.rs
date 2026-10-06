@@ -27375,6 +27375,18 @@ async fn sample_one_shard(
             );
             return ShardSample::Fenced;
         }
+        // A generation row this process did not pin (issue #1823). Claims
+        // already fail closed. The worker stops, and a restart pins the row.
+        Err(crate::error::HarvestError::Config(message)) => {
+            telemetry.metrics.record_shard_fenced(shard_u16);
+            tracing::error!(
+                shard_id = shard_id.as_i32(),
+                %message,
+                "stopping: this database holds a shard row this process did not pin. \
+                 Restart the process to pin it."
+            );
+            return ShardSample::Fenced;
+        }
         Err(error) => {
             // A transient failure to *read* the fence is not a
             // fence. Fencing is enforced structurally in the claim
@@ -30942,7 +30954,10 @@ impl Worker {
                         "stopping: a held shard needs a DR pin"
                     );
                     // The process must restart and pin, so the holds stay.
+                    // The shard may be an unpromoted standby, so shutdown
+                    // writes nothing to the database (issue #1823).
                     held.0.clear();
+                    crate::replication::FenceRegistry::mark_fenced_out();
                     shutdown.cancel();
                     return;
                 }
