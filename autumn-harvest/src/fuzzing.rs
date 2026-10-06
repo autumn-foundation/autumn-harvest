@@ -311,6 +311,14 @@ pub enum Op {
         /// Lock key.
         key: String,
     },
+    /// `ctx.continue_as_new`, or `ctx.continue_as_new_as_type` with a type.
+    ContinueAsNew {
+        /// Input of the next run.
+        #[arbitrary(with = value)]
+        input: Value,
+        /// Workflow type of the next run.
+        workflow_type: Option<String>,
+    },
     /// Runs the ops concurrently, as `join!` does.
     Concurrent {
         /// The ops of one command batch.
@@ -629,9 +637,7 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
     let Some(message) = report.failure_message() else {
         return;
     };
-    let from_program = program
-        .iter()
-        .any(|op| matches!(op, Op::Fail { error } if error == message));
+    let from_program = program.iter().any(|op| op.fails_with(message));
     let panicked = crate::failure::parse_workflow_typed_payload(message)
         .is_some_and(|failure| failure.error_type == ERROR_TYPE_HANDLER_PANIC);
     assert!(
@@ -648,14 +654,15 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
 #[must_use]
 ///
 /// Consecutive commands that park, with no other event between them, came
-/// from one batch, such as a `join!` of two activities. They run as one
-/// [`Op::Concurrent`], so the replayer matches the whole batch.
+/// from one batch, such as a `join!` of two activities. An immediate command
+/// that follows a parking one in the same run joins that batch too. A batch
+/// runs as one [`Op::Concurrent`], so the replayer matches all of it.
 pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     let mut program = Vec::new();
     let mut batch = Vec::new();
     for event in history {
         match mirror_event(event) {
-            Some(op) if op.parks() => batch.push(op),
+            Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => batch.push(op),
             other => {
                 flush_batch(&mut program, &mut batch);
                 program.extend(other);
@@ -689,7 +696,33 @@ impl Op {
                 | Self::Child { .. }
                 | Self::ExternalActivity { .. }
                 | Self::AwaitExternal { .. }
+                | Self::SignalExternal { .. }
+                | Self::CancelExternal { .. }
+                | Self::Mutex { .. }
         )
+    }
+
+    /// True for a command that resolves in the same decision, such as a
+    /// side effect. It can share a batch that a parking command opened.
+    const fn is_immediate(&self) -> bool {
+        matches!(
+            self,
+            Self::Now
+                | Self::NewUuid
+                | Self::Random
+                | Self::Patched { .. }
+                | Self::SideEffect { .. }
+                | Self::DetachedChild { .. }
+        )
+    }
+
+    /// True when this op, or an op nested in it, is `Fail` with `message`.
+    fn fails_with(&self, message: &str) -> bool {
+        match self {
+            Self::Fail { error } => error == message,
+            Self::Concurrent { ops } => ops.iter().any(|op| op.fails_with(message)),
+            _ => false,
+        }
     }
 }
 
@@ -728,6 +761,14 @@ fn mirror_event(event: &WorkflowEvent) -> Option<Op> {
             .map(|id| Op::Patched { id: id.to_string() }),
         WorkflowEvent::WorkflowCompleted { output } => Some(Op::Complete {
             output: output.clone(),
+        }),
+        WorkflowEvent::WorkflowContinuedAsNew {
+            input,
+            new_workflow_type,
+            ..
+        } => Some(Op::ContinueAsNew {
+            input: input.clone(),
+            workflow_type: new_workflow_type.clone(),
         }),
         WorkflowEvent::WorkflowFailed { error, .. } => Some(Op::Fail {
             error: error.clone(),
@@ -789,7 +830,7 @@ fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
         }
         WorkflowEvent::MutexGranted { key, .. } => Some(Op::Mutex { key: key.clone() }),
         // Every other variant, listed so that a new one fails to compile here.
-        // `mirror_event` handles the first eight.
+        // `mirror_event` handles the first nine.
         WorkflowEvent::ActivityScheduled { .. }
         | WorkflowEvent::LocalActivityScheduled { .. }
         | WorkflowEvent::TimerStarted { .. }
@@ -798,6 +839,7 @@ fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
         | WorkflowEvent::MarkerRecorded { .. }
         | WorkflowEvent::WorkflowCompleted { .. }
         | WorkflowEvent::WorkflowFailed { .. }
+        | WorkflowEvent::WorkflowContinuedAsNew { .. }
         | WorkflowEvent::WorkflowStarted { .. }
         | WorkflowEvent::WorkflowCancelled { .. }
         | WorkflowEvent::ActivityStarted { .. }
@@ -808,7 +850,6 @@ fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
         | WorkflowEvent::TimerFired { .. }
         | WorkflowEvent::ChildWorkflowCompleted { .. }
         | WorkflowEvent::ChildWorkflowFailed { .. }
-        | WorkflowEvent::WorkflowContinuedAsNew { .. }
         | WorkflowEvent::LocalActivityCompleted { .. }
         | WorkflowEvent::LocalActivityFailed { .. }
         | WorkflowEvent::ActivityCompletedExternally { .. }
@@ -894,6 +935,15 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
         }
         Op::Complete { output } => return Some(Ok(output)),
         Op::Fail { error } => return Some(Err(error)),
+        Op::ContinueAsNew {
+            input,
+            workflow_type,
+        } => {
+            let _ = match workflow_type {
+                Some(workflow_type) => ctx.continue_as_new_as_type(&workflow_type, input).await,
+                None => ctx.continue_as_new(input).await,
+            };
+        }
         Op::Concurrent { ops } => {
             let runs = ops.into_iter().map(|op| Box::pin(run_op(ctx, op)));
             // The first result in program order wins, as in a sequence.
