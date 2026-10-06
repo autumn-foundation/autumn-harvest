@@ -7,8 +7,9 @@ A history now shows which build and which worker made each decision.
 - **Write path:** the Postgres worker appends one boundary in the transaction
   that persists the decision outcome, after the outcome events. A decision
   that writes no event of its own writes no boundary, even when another
-  writer appends meanwhile. The row stages no `NOTIFY`, so
-  `last_event_type` does not change. `store::append_decision_boundary` shares
+  writer appends meanwhile. The notification counts the boundary in
+  `event_count`, and `last_event_type` stays the outcome event. A boundary
+  never brings a running history to its event hard cap. `store::append_decision_boundary` shares
   the DR write fence with `append_events_with_codecs`.
 - **Replay:** `HistoryMatcher::new` marks every boundary consumed, like pause
   and resume. `terminal_failure_tail_start` skips a boundary, so the issue

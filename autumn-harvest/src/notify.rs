@@ -289,6 +289,31 @@ pub async fn notify_workflow_events_appended(
     .await
 }
 
+/// Add trailing events to the next wake of [`workflow_events_channel`].
+///
+/// A decision boundary (issue #1833) uses it. The count of the wake includes
+/// the boundary, and the last event type stays the decision's outcome.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_trailing_events_appended(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    event_count: usize,
+    event_type: &str,
+) -> HarvestResult<()> {
+    stage(
+        conn,
+        vec![Note::Trailing {
+            exec_id: workflow_exec_id,
+            count: event_count,
+            event_type: event_type.to_string(),
+        }],
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Post-commit delivery (issue #1796)
 // ---------------------------------------------------------------------------
@@ -360,6 +385,18 @@ pub(crate) enum Note {
         /// Type name of the last appended event.
         last_event_type: String,
     },
+    /// Events that trail the decision's own events, such as a decision
+    /// boundary (issue #1833). They add to the count of the execution. The
+    /// last type of a note before them stays, so a listener still sees the
+    /// outcome event.
+    Trailing {
+        /// The execution.
+        exec_id: Uuid,
+        /// Number of events appended.
+        count: usize,
+        /// Type name to report when no note before them names one.
+        event_type: String,
+    },
 }
 
 impl Note {
@@ -367,7 +404,7 @@ impl Note {
     fn channel(&self) -> &str {
         match self {
             Self::Task { channel, .. } => channel,
-            Self::Events { .. } => workflow_events_channel(),
+            Self::Events { .. } | Self::Trailing { .. } => workflow_events_channel(),
         }
     }
 }
@@ -420,6 +457,21 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                 } else {
                     index.insert(key, merged.len());
                     merged.push(Merged::Events(exec_id, count, last_event_type));
+                }
+            }
+            Note::Trailing {
+                exec_id,
+                count,
+                event_type,
+            } => {
+                let key = format!("events:{exec_id}");
+                if let Some(&i) = index.get(&key) {
+                    if let Merged::Events(_, total, _) = &mut merged[i] {
+                        *total += count;
+                    }
+                } else {
+                    index.insert(key, merged.len());
+                    merged.push(Merged::Events(exec_id, count, event_type));
                 }
             }
         }
@@ -1993,6 +2045,47 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_trailing_note_adds_its_count_and_keeps_the_last_type() {
+        // A decision boundary follows the outcome events (issue #1833). The
+        // count must include it, and the outcome stays the last type.
+        let a = Uuid::new_v4();
+        let sent = coalesce(vec![
+            events_note(a, 2, "WorkflowCompleted"),
+            Note::Trailing {
+                exec_id: a,
+                count: 1,
+                event_type: "DecisionCommitted".to_string(),
+            },
+        ]);
+        let payload: WorkflowEventNotifyPayload =
+            serde_json::from_str(&sent[0].1).expect("payload parses");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            payload,
+            WorkflowEventNotifyPayload {
+                workflow_exec_id: a,
+                event_count: 3,
+                last_event_type: "WorkflowCompleted".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_trailing_note_alone_reports_its_own_type() {
+        // A decision whose only write is inline staged no event note here.
+        let a = Uuid::new_v4();
+        let sent = coalesce(vec![Note::Trailing {
+            exec_id: a,
+            count: 1,
+            event_type: "DecisionCommitted".to_string(),
+        }]);
+        let payload: WorkflowEventNotifyPayload =
+            serde_json::from_str(&sent[0].1).expect("payload parses");
+        assert_eq!(payload.event_count, 1);
+        assert_eq!(payload.last_event_type, "DecisionCommitted");
     }
 
     #[test]

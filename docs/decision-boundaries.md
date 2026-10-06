@@ -172,10 +172,12 @@ close to a history limit before this release, raise that limit.
   boundary. The next boundary then covers them.
 - A decision that the engine ends before it persists an outcome writes no
   boundary. Examples are the history cap and a non-determinism block.
-- The boundary row stages no `NOTIFY`. The `last_event_type` of the decision
-  notification stays the type of its last outcome event. Its `event_count`
-  does not count the boundary. A live tail sees the boundary at the next
-  notification.
+- A boundary never brings a running history to its event hard cap. The cap
+  check runs before persistence, so a row it cannot foresee can leave room
+  for the decision but not for its boundary. That decision has no boundary.
+- The `event_count` of the decision's notification counts the boundary. Its
+  `last_event_type` stays the type of the last outcome event, so a listener
+  still sees, for example, `WorkflowCompleted`.
 
 ## Reproduce the measurement
 

@@ -264,9 +264,9 @@ async fn insert_event_rows(
 /// Call it inside the transaction that persists the decision outcome. The
 /// `FOR UPDATE` lock in [`next_event_id_for`] keeps the id valid.
 ///
-/// The insert stages no NOTIFY. The events of the decision already staged
-/// one, and the boundary must not change its `last_event_type`. So the
-/// `event_count` of that notification does not count the boundary.
+/// The insert adds a trailing note to the staged NOTIFY. The `event_count`
+/// of the wake counts the boundary. Its `last_event_type` stays the
+/// decision's outcome, so a listener still sees, say, `WorkflowCompleted`.
 ///
 /// `running_cap` is the event hard cap when the run stays running. The
 /// boundary is skipped when it would bring the history to that cap.
@@ -305,6 +305,13 @@ pub(crate) async fn append_decision_boundary(
         codecs,
     )?;
     insert_event_rows(conn, exec_id, &rows).await?;
+    crate::notify::notify_trailing_events_appended(
+        conn,
+        exec_id.as_uuid(),
+        rows.len(),
+        boundary.type_name(),
+    )
+    .await?;
     Ok(true)
 }
 

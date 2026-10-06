@@ -741,6 +741,35 @@ async fn a_boundary_never_brings_a_running_history_to_the_cap() {
 }
 
 #[tokio::test]
+async fn the_terminal_wake_counts_its_boundary() {
+    // The last decision writes `WorkflowCompleted` and its boundary in one
+    // transaction. Its wake counts both rows, and the last type stays the
+    // outcome. A listener that reads by count then sees the boundary too.
+    use autumn_harvest::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
+
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+    let (exec_id, _, _) = completed_two_steps(&url, &pool, boundaries_on()).await;
+
+    let mut terminal = None;
+    while let WorkflowEventWaitOutcome::Notification(wake) = listener
+        .wait_for_notification_timeout(Duration::from_secs(2))
+        .await
+        .expect("payload parses")
+    {
+        if wake.workflow_exec_id == exec_id.as_uuid() && wake.last_event_type == "WorkflowCompleted"
+        {
+            terminal = Some(wake);
+        }
+    }
+    let terminal = terminal.expect("a wake for the completion");
+    assert_eq!(terminal.event_count, 2, "{terminal:?}");
+}
+
+#[tokio::test]
 async fn the_default_records_no_boundary() {
     // Boundaries are opt-in in this release. A process of the previous
     // release cannot decode one, and the rolling-deploy contract forbids
