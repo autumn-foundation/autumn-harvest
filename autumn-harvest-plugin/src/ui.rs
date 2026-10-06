@@ -15016,6 +15016,9 @@ mod tests {
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
             timer_fires_at: None,
+            handler_started_attempt: None,
+            timed_out_claims: None,
+            handler_started_at: None,
             new_start: false,
         }
     }

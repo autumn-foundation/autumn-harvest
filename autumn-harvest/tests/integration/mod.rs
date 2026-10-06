@@ -16,6 +16,8 @@ mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;
 #[cfg(feature = "db")]
 mod activity_pause_tests;
+#[cfg(feature = "db")]
+mod activity_timeout_retry_tests;
 mod adaptive_limit_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
@@ -160,6 +162,7 @@ mod legal_hold_tests;
 #[cfg(feature = "db")]
 mod lifecycle_model_props;
 mod lineage_store_tests;
+mod lock_order_docs;
 mod macros_activity;
 mod macros_collect;
 #[cfg(feature = "testing")]
@@ -316,6 +319,8 @@ mod transactional_activity_tests;
 mod transactional_start_tests;
 #[cfg(feature = "db")]
 mod triage_tests;
+#[cfg(feature = "db")]
+mod tx_conflict_retry_tests;
 #[cfg(feature = "db")]
 mod typed_stub_deferred_admission_tests;
 #[cfg(feature = "db")]

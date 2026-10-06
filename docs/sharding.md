@@ -73,6 +73,8 @@ Postgres's one-argument advisory locks share a single 64-bit space, and the dura
 
 If both happen concurrently Postgres detects the cycle and aborts one side with SQLSTATE `40P01`, surfacing as a database error on the *start*. The aborted transaction rolls back atomically — no partial supersede, no orphaned cancellation — and the start is safe to retry. It is a **liveness** hazard, not a correctness one, and it needs a workflow that both declares `on_conflict = "cancel_running"` and participates in `ctx.mutex` on the same terminal path. If you see `40P01` on such a start, retry it; if it recurs, split the mutex usage out of the latest-wins workflow.
 
+When the abort hits a workflow-task persist, the engine resets the task and replay runs it again (issue #1822). `harvest.db.transaction_retry{site="workflow_task", reason="deadlock"}` counts it. A start through the API or a client still returns the error, and the caller retries it.
+
 ---
 
 ## Explicit shard placement and data residency (issue #697)
