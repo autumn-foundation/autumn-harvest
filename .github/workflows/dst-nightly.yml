@@ -7,8 +7,8 @@
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. GitHub tells only the last editor of a cron about a failure.
 #
-# A job's seed base is run_number * 4 * seeds-per-shard, so two runs never
-# share a seed. Each test step has a timeout below its job's timeout. A step
+# A job's seed base is run_number * 4 * 999999999. Each shard has at most
+# 999999999 seeds, so two runs never share a seed, whatever their sizes. Each test step has a timeout below its job's timeout. A step
 # timeout is a failure, so the alert fires. A job timeout is a cancel, and
 # `failure()` does not see it.
 #
@@ -77,7 +77,8 @@ jobs:
           # Force base 10. Bash reads a leading 0 as octal.
           SEEDS=$((10#$SEEDS))
           if [ -n "$SEED_BASE" ]; then SEED_BASE=$((10#$SEED_BASE)); fi
-          base="${SEED_BASE:-$((RUN_NUMBER * 4 * SEEDS))}"
+          # A fixed stride per run: 4 shards of the largest allowed size.
+          base="${SEED_BASE:-$((RUN_NUMBER * 4 * 999999999))}"
           echo "HARVEST_DST_SEED_BASE=$((base + SHARD * SEEDS))" >> "$GITHUB_ENV"
           echo "HARVEST_DST_SEEDS=$SEEDS" >> "$GITHUB_ENV"
       - name: Run the sweep
@@ -117,7 +118,8 @@ jobs:
           # Force base 10. Bash reads a leading 0 as octal.
           SEEDS=$((10#$SEEDS))
           if [ -n "$SEED_BASE" ]; then SEED_BASE=$((10#$SEED_BASE)); fi
-          base="${SEED_BASE:-$((RUN_NUMBER * 4 * SEEDS))}"
+          # A fixed stride per run: 4 shards of the largest allowed size.
+          base="${SEED_BASE:-$((RUN_NUMBER * 4 * 999999999))}"
           echo "HARVEST_DST_SEED_BASE=$((base + SHARD * SEEDS))" >> "$GITHUB_ENV"
           echo "HARVEST_DST_SEEDS=$SEEDS" >> "$GITHUB_ENV"
       - name: Replay oracle runs on Postgres
