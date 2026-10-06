@@ -42,11 +42,12 @@ pub use crate::interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
 };
 pub use crate::policy::{
-    CircuitBreakerPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy,
+    AdaptiveLimitPolicy, CircuitBreakerPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy,
     RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
 };
 pub use crate::query::QueryRegistry;
 pub use crate::retry_budget::RetryBudgetConfig;
+pub use crate::adaptive_limit::AdaptiveLimitConfig;
 pub use crate::saga::Saga;
 #[cfg(feature = "db")]
 pub use crate::scheduler::{

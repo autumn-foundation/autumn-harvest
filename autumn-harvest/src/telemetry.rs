@@ -1273,6 +1273,27 @@ pub const METRIC_RETRY_BUDGET_AVAILABLE: &str = "harvest.retry.budget.available"
 /// `harvest_retry_budget_exhausted_total`.
 pub const METRIC_RETRY_BUDGET_EXHAUSTED: &str = "harvest.retry.budget.exhausted";
 
+/// Gauge: the adaptive concurrency limit of one activity type (issue #1836).
+///
+/// Labeled by `activity`. It is the cap on in-flight attempts on one worker.
+/// The limit registry sets it after every change, under its lock.
+pub const METRIC_ACTIVITY_CONCURRENCY_LIMIT: &str = "harvest.activity.concurrency_limit";
+
+/// Gauge: in-flight attempts of one activity type that hold an adaptive
+/// limit slot (issue #1836).
+///
+/// Labeled by `activity`. When it equals the limit, the worker claims no
+/// more tasks of that type.
+pub const METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT: &str = "harvest.activity.concurrency_in_flight";
+
+/// Gauge: the no-load handler latency estimate of one activity type, in
+/// seconds (issue #1836).
+///
+/// Labeled by `activity`. The adaptive limit compares each latency sample
+/// with it. A probe resets it. Until the first sample after a probe, the
+/// gauge keeps its last value.
+pub const METRIC_ACTIVITY_LATENCY_BASELINE: &str = "harvest.activity.latency_baseline_seconds";
+
 /// Counter: incremented on each scheduler tick-loop fire attempt for a due schedule slot.
 ///
 /// Labels:
@@ -2941,6 +2962,25 @@ pub trait MetricsRecorder: Send + Sync {
     /// `activity` argument is the registered activity name.
     fn record_retry_budget_exhausted(&self, activity: &str) {
         let _ = activity;
+    }
+
+    /// Record the adaptive concurrency limit state of one activity type
+    /// (issue #1836).
+    ///
+    /// Maps to three gauges, each labeled by `activity`:
+    /// `harvest.activity.concurrency_limit`,
+    /// `harvest.activity.concurrency_in_flight` and
+    /// `harvest.activity.latency_baseline_seconds`. A `baseline_secs` of
+    /// `None` means no estimate yet. The baseline gauge then keeps its last
+    /// value.
+    fn record_activity_concurrency_limit(
+        &self,
+        activity: &str,
+        limit: u32,
+        in_flight: u32,
+        baseline_secs: Option<f64>,
+    ) {
+        let _ = (activity, limit, in_flight, baseline_secs);
     }
 
     /// Current number of entries in the dead-letter queue on one shard.

@@ -199,6 +199,8 @@ pub fn test_partitioned_layout_requested() -> bool {
 
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
+/// Adaptive concurrency limit per activity type (issue #1836).
+pub mod adaptive_limit;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
 /// AES-256-GCM payload codec and data-key providers (issue #1825).
@@ -673,7 +675,7 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
+    AdaptiveLimitPolicy, CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
     Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
@@ -699,6 +701,7 @@ pub use retention::{
     set_legal_hold,
 };
 pub use retry_budget::RetryBudgetConfig;
+pub use adaptive_limit::AdaptiveLimitConfig;
 pub use run_chain::{
     RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };
