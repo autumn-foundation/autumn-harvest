@@ -261,11 +261,16 @@ struct DeliveryRow {
     target_url: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     next_attempt_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    last_status: Option<i32>,
 }
 
 async fn load_deliveries(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<DeliveryRow> {
     diesel::sql_query(
-        "SELECT state, target_url, next_attempt_at FROM harvest_completion_deliveries \
+        "SELECT state, target_url, next_attempt_at, attempt, last_status \
+         FROM harvest_completion_deliveries \
          WHERE workflow_exec_id = $1 ORDER BY callback_index ASC",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
@@ -927,6 +932,113 @@ async fn scanner_dead_letters_on_retry_exhaustion() {
         !dlq[0].error.contains("PoisonPill") && !dlq[0].error.contains("WorkflowTaskTimeout"),
         "typed reason must be distinct from clean task-retry exhaustion reasons"
     );
+}
+
+/// Count this execution's `CALLBACK` dead letters.
+async fn callback_dead_letter_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let row: Count = diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_dead_letters \
+         WHERE workflow_exec_id = $1 AND task_type = 'CALLBACK'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(conn)
+    .await
+    .expect("count dlq");
+    row.n
+}
+
+/// Enqueue one delivery for a fresh terminal execution.
+async fn enqueue_one_delivery(conn: &mut AsyncPgConnection) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        conn,
+        exec_id,
+        "wf-1",
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+    exec_id
+}
+
+// Issue #1832 AC: a receiver that returns 400 is not retried. The first
+// attempt dead-letters at once, with budget left.
+#[tokio::test]
+async fn scanner_dead_letters_a_permanent_4xx_without_retrying() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(400)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(5, Duration::from_millis(1)),
+    );
+    let exec_id = enqueue_one_delivery(&mut conn).await;
+
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(rows[0].state, "FAILED", "a 400 must not be rescheduled");
+    assert_eq!(rows[0].attempt, 1);
+    assert_eq!(callback_dead_letter_count(&mut conn, exec_id).await, 1);
+
+    // Nothing is due, so a later tick does not POST again.
+    diesel::sql_query(
+        "UPDATE harvest_completion_deliveries SET next_attempt_at = now() WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("force due");
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("second scanner tick");
+    assert_eq!(deliverer.call_count(), 1, "a 400 is sent exactly once");
+}
+
+// Issue #1832 AC: 429 with `Retry-After: 10` is retried after 10 s or
+// more. The policy alone would retry after 1 s.
+#[tokio::test]
+async fn scanner_honours_retry_after_on_429() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![
+        DeliveryAttempt::success(429).with_retry_after(Duration::from_secs(10)),
+    ]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(5, Duration::from_secs(1))
+            .with_jitter(autumn_harvest::policy::JitterPolicy::None),
+    );
+    let exec_id = enqueue_one_delivery(&mut conn).await;
+
+    let before = chrono::Utc::now();
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(rows[0].state, "PENDING", "a 429 is retried");
+    assert_eq!(rows[0].last_status, Some(429));
+    assert!(
+        rows[0].next_attempt_at >= before + chrono::Duration::seconds(10),
+        "next attempt {} must be 10 s or more after {before}",
+        rows[0].next_attempt_at
+    );
+    assert_eq!(callback_dead_letter_count(&mut conn, exec_id).await, 0);
 }
 
 // Regression (issue #921 review, Codex P2): `target_url` is only ever

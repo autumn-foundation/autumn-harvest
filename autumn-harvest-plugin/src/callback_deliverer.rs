@@ -99,6 +99,49 @@ mod tests {
         let _: Box<dyn CompletionCallbackDeliverer> = Box::new(ReqwestCallbackDeliverer::new());
     }
 
+    /// Serve one canned HTTP response on a loopback port.
+    async fn one_response_server(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0_u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}/hook")
+    }
+
+    #[tokio::test]
+    async fn deliver_reports_the_retry_after_header() {
+        let url = one_response_server(
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 10\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let attempt = ReqwestCallbackDeliverer::new()
+            .deliver(&url, b"{}", &[])
+            .await;
+        assert_eq!(attempt.status, Some(429));
+        assert_eq!(attempt.retry_after, Some(Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    async fn deliver_without_retry_after_reports_none() {
+        let url = one_response_server(
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let attempt = ReqwestCallbackDeliverer::new()
+            .deliver(&url, b"{}", &[])
+            .await;
+        assert_eq!(attempt.status, Some(400));
+        assert_eq!(attempt.retry_after, None);
+    }
+
     #[test]
     fn default_matches_new() {
         let _ = ReqwestCallbackDeliverer::default();

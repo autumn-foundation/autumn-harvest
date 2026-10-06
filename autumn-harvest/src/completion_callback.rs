@@ -1436,6 +1436,8 @@ pub type DeliverFuture<'a> =
 pub struct DeliveryAttempt {
     pub status: Option<u16>,
     pub transport_error: Option<String>,
+    /// The receiver's `Retry-After` delay, if it sent one (issue #1832).
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl DeliveryAttempt {
@@ -1444,6 +1446,7 @@ impl DeliveryAttempt {
         Self {
             status: Some(status),
             transport_error: None,
+            retry_after: None,
         }
     }
 
@@ -1452,13 +1455,30 @@ impl DeliveryAttempt {
         Self {
             status: None,
             transport_error: Some(message),
+            retry_after: None,
         }
+    }
+
+    /// Attach the receiver's `Retry-After` delay.
+    #[must_use]
+    pub const fn with_retry_after(mut self, delay: std::time::Duration) -> Self {
+        self.retry_after = Some(delay);
+        self
     }
 
     /// `true` only for a 2xx response status.
     #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(self.status, Some(s) if (200..300).contains(&s))
+    }
+
+    /// `true` for a 4xx status that a retry cannot fix (issue #1832).
+    ///
+    /// 408, 425 and 429 are transient. RFC 9110, RFC 8470 and RFC 6585 let
+    /// a client retry them. Every other 4xx is permanent.
+    #[must_use]
+    pub fn is_permanent_failure(&self) -> bool {
+        matches!(self.status, Some(s) if (400..500).contains(&s) && !matches!(s, 408 | 425 | 429))
     }
 }
 
@@ -1476,6 +1496,15 @@ pub trait CompletionCallbackDeliverer: Send + Sync + 'static {
         body: &'a [u8],
         headers: &'a [(&'static str, String)],
     ) -> DeliverFuture<'a>;
+}
+
+/// Parse a `Retry-After` header value into a delay from `now` (issue #1832).
+///
+/// The value is delta-seconds or an HTTP-date (RFC 9110 section 10.2.3).
+/// A date in the past gives a zero delay. Any other value gives `None`.
+#[must_use]
+pub fn parse_retry_after(_value: &str, _now: DateTime<Utc>) -> Option<std::time::Duration> {
+    None
 }
 
 #[cfg(test)]
@@ -1501,6 +1530,56 @@ mod deliverer_trait_tests {
     fn transport_error_is_never_success() {
         assert!(!DeliveryAttempt::transport_error("connection refused".to_string()).is_success());
     }
+
+    #[test]
+    fn constructors_carry_no_retry_after() {
+        assert_eq!(DeliveryAttempt::success(429).retry_after, None);
+        assert_eq!(
+            DeliveryAttempt::transport_error("x".to_string()).retry_after,
+            None
+        );
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn parse_retry_after_reads_delta_seconds() {
+        let ten = Some(std::time::Duration::from_secs(10));
+        assert_eq!(parse_retry_after("10", now()), ten);
+        assert_eq!(parse_retry_after(" 10 ", now()), ten);
+        assert_eq!(
+            parse_retry_after("0", now()),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_an_http_date() {
+        // 2026-01-01T00:00:00Z is a Thursday.
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 GMT", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_treats_a_past_date_as_zero() {
+        assert_eq!(
+            parse_retry_after("Wed, 31 Dec 2025 23:59:00 GMT", now()),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_garbage() {
+        for value in ["", "soon", "-1", "1.5", "10s", "0x10"] {
+            assert_eq!(parse_retry_after(value, now()), None, "value {value:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1519,8 +1598,8 @@ pub enum OutcomeAction {
         last_status: Option<u16>,
         last_error: Option<String>,
     },
-    /// Non-2xx or transport error, and `attempt >= max_attempts` — mark the
-    /// delivery `FAILED` and route to the DLQ.
+    /// `attempt >= max_attempts`, or a permanent 4xx (issue #1832). Mark the
+    /// delivery `FAILED` and route it to the DLQ.
     DeadLetter {
         last_status: Option<u16>,
         last_error: Option<String>,
@@ -1559,6 +1638,9 @@ fn delivery_stream_seed(delivery_id: Uuid) -> u64 {
 /// (typically [`delivery_stream_seed`] of the delivery's id) drives
 /// `retry_policy.jitter` — without it, a configured `JitterPolicy` would be
 /// silently ignored and every delivery would back off in perfect lockstep.
+///
+/// A permanent 4xx dead-letters at once. A `Retry-After` hint sets the
+/// minimum backoff, clamped to `retry_policy.max_interval` (issue #1832).
 #[must_use]
 pub fn classify_outcome(
     outcome: &DeliveryAttempt,
@@ -1761,6 +1843,97 @@ mod classify_outcome_tests {
             "expected varying delays across seeds under Full jitter, got a single value \
              {delays:?} — classify_outcome is not honoring the seed"
         );
+    }
+
+    fn backoff_delay(action: &OutcomeAction) -> StdDuration {
+        let OutcomeAction::Backoff {
+            next_attempt_at, ..
+        } = action
+        else {
+            panic!("expected Backoff, got {action:?}");
+        };
+        (*next_attempt_at - now()).to_std().unwrap()
+    }
+
+    #[test]
+    fn permanent_4xx_dead_letters_on_the_first_attempt() {
+        // Issue #1832 AC: a receiver that returns 400 is not retried.
+        for status in [400_u16, 401, 403, 404, 410, 422] {
+            let outcome = DeliveryAttempt::success(status);
+            let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+            assert_eq!(
+                action,
+                OutcomeAction::DeadLetter {
+                    last_status: Some(status),
+                    last_error: None,
+                },
+                "a {status} response must dead-letter on attempt 1"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_4xx_still_backs_off() {
+        // 408, 425 and 429 invite a retry (RFC 9110, RFC 8470, RFC 6585).
+        for status in [408_u16, 425, 429] {
+            let outcome = DeliveryAttempt::success(status);
+            let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+            assert!(
+                matches!(action, OutcomeAction::Backoff { .. }),
+                "a {status} response must back off, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_4xx_dead_letters_even_with_retry_after() {
+        let outcome = DeliveryAttempt::success(400).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
+    }
+
+    #[test]
+    fn retry_after_is_the_floor_of_the_backoff() {
+        // Issue #1832 AC: 429 with `Retry-After: 10` waits 10 s or more.
+        // The policy alone gives 1 s on attempt 1.
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(
+            backoff_delay(&action) >= StdDuration::from_secs(10),
+            "Retry-After must delay the retry, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_clamped_to_the_policy_ceiling() {
+        // `test_policy` caps a retry at 300 s.
+        let outcome =
+            DeliveryAttempt::success(503).with_retry_after(StdDuration::from_secs(86_400));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(300));
+    }
+
+    #[test]
+    fn short_retry_after_keeps_the_longer_policy_backoff() {
+        // Attempt 4 of exponential(1 s) gives 8 s, more than the 2 s hint.
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(2));
+        let action = classify_outcome(&outcome, 4, 10, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(8));
+    }
+
+    #[test]
+    fn retry_after_applies_to_a_transport_error_too() {
+        let outcome = DeliveryAttempt::transport_error("reset".to_string())
+            .with_retry_after(StdDuration::from_secs(20));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(20));
+    }
+
+    #[test]
+    fn retry_after_does_not_extend_past_max_attempts() {
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 5, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
     }
 
     #[test]
