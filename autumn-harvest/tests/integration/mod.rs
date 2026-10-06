@@ -135,6 +135,7 @@ mod external_outbox_scan_tests;
 mod fanout_tests;
 mod force_fail_tests;
 mod formal_models_coverage;
+mod fuzz_nightly_wiring;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
@@ -225,6 +226,8 @@ mod redrive_tests;
 mod replay_canary_tests;
 #[cfg(feature = "testing")]
 mod replay_drift_tests;
+#[cfg(feature = "fuzzing")]
+mod replay_fuzz_seeds;
 mod replay_tests;
 #[cfg(feature = "testing")]
 mod replay_verifier_tests;

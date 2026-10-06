@@ -1,0 +1,25 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "program": [
+    {
+      "op": "concurrent",
+      "ops": [
+        {
+          "op": "fail",
+          "error": "{\"harvest_workflow_failure_v1\":{\"error_type\":\"HandlerPanic\",\"message\":\"programmed\",\"non_retryable\":true}}"
+        }
+      ]
+    }
+  ],
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": null,
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    }
+  ]
+}
