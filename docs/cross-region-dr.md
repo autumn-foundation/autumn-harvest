@@ -257,10 +257,13 @@ shard is plain:
   writes against another database. The reverse order is refused too: a
   process that runs an unfenced worker refuses a fenced one. Run each in
   its own process, or set `DrFencing::Enabled` on both.
-- A worker that finds its pin superseded stops. Its shutdown then skips
-  its database writes: fleet status, sticky-pin release, claim release and
-  the lease keeper. Another region owns those rows. Its orphan reclaim
-  recovers the claims.
+- A worker's startup writes (its fleet row and its rate-limit buckets) and
+  each heartbeat run under the fence barrier. A held or fenced shard gets
+  none of them, and they retry later.
+- A worker that finds its pin superseded stops. Its heartbeat stops at
+  once, and its shutdown skips its database writes: fleet status,
+  sticky-pin release, claim release and the lease keeper. Another region
+  owns those rows. Its orphan reclaim recovers the claims.
 - A fenced worker with an assigned shard it cannot reach refuses to start.
   It cannot pin that shard.
 - A fenced worker holds an unassigned shard it cannot reach, and it serves

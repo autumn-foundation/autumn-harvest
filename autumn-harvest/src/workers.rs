@@ -1795,9 +1795,16 @@ pub fn spawn_worker_heartbeat(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            if held_gate.is_some_and(crate::replication::FenceRegistry::is_held) {
-                continue;
+            // Issue #1823: a process that lost write authority stops beating.
+            // Another region owns this row, and may reuse this worker id.
+            if crate::replication::FenceRegistry::is_fenced_out() {
+                break;
             }
+            // A held or fenced shard gets no beat. Otherwise the beat runs
+            // under the shard's fence barrier, so a bump waits for it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, held_gate).await else {
+                continue;
+            };
             // Loaded fresh each tick (issue #548 review): a tuned worker's
             // dispatch target can change between heartbeats, so a value
             // captured once at spawn time would drift from reality.
@@ -1825,17 +1832,21 @@ pub fn spawn_worker_heartbeat(
             let registered_codec_key_ids = codecs.registered_key_ids();
             match get_result {
                 Ok(mut conn) => {
-                    let () = do_heartbeat_tick(
-                        &mut conn,
-                        &registration,
-                        in_flight,
-                        &labels_json,
-                        &worker_shutdown,
-                        &drain_deadline_max,
-                        &remote_drain_deadline,
-                        in_use_sessions,
-                        &registration_pending,
-                        &registered_codec_key_ids,
+                    // A lost barrier stops the beat. The next tick tries again.
+                    let _beat = crate::replication::run_fenced_pass(
+                        &fence,
+                        Box::pin(do_heartbeat_tick(
+                            &mut conn,
+                            &registration,
+                            in_flight,
+                            &labels_json,
+                            &worker_shutdown,
+                            &drain_deadline_max,
+                            &remote_drain_deadline,
+                            in_use_sessions,
+                            &registration_pending,
+                            &registered_codec_key_ids,
+                        )),
                     )
                     .await;
                 }

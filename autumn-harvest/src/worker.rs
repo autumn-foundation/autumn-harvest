@@ -27272,6 +27272,22 @@ fn spawn_replication_sampler(
     })
 }
 
+/// Run one startup write for `shard` under its fence barrier (issue #1823).
+///
+/// `None` means the write did not run, or stopped: the shard is held or
+/// fenced, or the barrier was lost. The caller then retries later, under the
+/// fence again. With no pin, the write runs as before.
+async fn fenced_startup_write<T>(
+    pool: &DbPool,
+    shard: crate::types::ShardId,
+    write: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let fence = crate::replication::begin_shard_tick(pool, Some(shard)).await?;
+    crate::replication::run_fenced_pass(&fence, Box::pin(write))
+        .await
+        .ok()
+}
+
 /// Whether a shutdown write must be skipped because this process lost write
 /// authority (issue #1823). Another region owns the rows now, and may reuse
 /// this worker id. The new region's orphan reclaim recovers the claims.
@@ -30708,20 +30724,28 @@ impl Worker {
         };
         let _held_resolver = self.spawn_held_resolver(held);
 
-        // A held shard gets no startup write (issue #1823). The heartbeat and
-        // the bucket retry write once the resolver releases it.
+        // A held or fenced shard gets no startup write (issue #1823). The
+        // heartbeat and the bucket retry write later, under the fence.
         let held_gate = self
             .dr_fence_targets(pool)
             .map_or(crate::types::ShardId::UNENCODED, |(_, shard)| shard);
-        let held_now = crate::replication::FenceRegistry::is_held(held_gate);
         let registration_pending = Arc::new(AtomicBool::new(
-            held_now || self.register_in_fleet(pool, None).await,
+            fenced_startup_write(pool, held_gate, self.register_in_fleet(pool, None))
+                .await
+                .unwrap_or(true),
         ));
 
         // Auto-register rate limit buckets for the activities configured on this worker.
         // A registration that does not complete runs again in the background.
-        let _bucket_retry = (held_now || !self.register_rate_limit_buckets(pool, None).await)
-            .then(|| self.spawn_rate_limit_bucket_retry(pool, None, held_gate));
+        let buckets_done = fenced_startup_write(
+            pool,
+            held_gate,
+            self.register_rate_limit_buckets(pool, None),
+        )
+        .await
+        .unwrap_or(false);
+        let _bucket_retry =
+            (!buckets_done).then(|| self.spawn_rate_limit_bucket_retry(pool, None, held_gate));
 
         let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool), dr_targets);
         let heartbeat_cancel = CancellationToken::new();
@@ -32828,16 +32852,18 @@ impl Worker {
         let mut registration_pending_per_shard = Vec::with_capacity(shard_targets.len());
         let mut bucket_retries = Vec::new();
         for (shard, shard_pool) in shard_targets {
-            // A held shard gets no startup write (issue #1823). Its heartbeat
-            // and bucket retry write once the resolver releases it.
-            let held = crate::replication::FenceRegistry::is_held(*shard);
+            // A held or fenced shard gets no startup write (issue #1823). Its
+            // heartbeat and bucket retry write later, under the fence.
+            let registration = self.register_in_fleet(shard_pool, startup_bound);
             registration_pending_per_shard.push(Arc::new(AtomicBool::new(
-                held || self.register_in_fleet(shard_pool, startup_bound).await,
-            )));
-            if held
-                || !self
-                    .register_rate_limit_buckets(shard_pool, startup_bound)
+                fenced_startup_write(shard_pool, *shard, registration)
                     .await
+                    .unwrap_or(true),
+            )));
+            let buckets = self.register_rate_limit_buckets(shard_pool, startup_bound);
+            if !fenced_startup_write(shard_pool, *shard, buckets)
+                .await
+                .unwrap_or(false)
             {
                 bucket_retries.push(self.spawn_rate_limit_bucket_retry(
                     shard_pool,
@@ -32892,17 +32918,16 @@ impl Worker {
                 let registry = Arc::clone(&registry);
                 let worker_id = worker_id.clone();
                 async move {
-                    // A held shard gets no write until the resolver releases it.
-                    if crate::replication::FenceRegistry::is_held(held_gate) {
-                        return false;
-                    }
-                    let done = register_static_rate_limit_buckets(
+                    // A held or fenced shard gets no write (issue #1823).
+                    let write = register_static_rate_limit_buckets(
                         &pool,
                         acquire_bound,
                         &registry,
                         &worker_id,
-                    )
-                    .await;
+                    );
+                    let done = fenced_startup_write(&pool, held_gate, write)
+                        .await
+                        .unwrap_or(false);
                     if done {
                         tracing::info!(
                             worker_id = %worker_id,
