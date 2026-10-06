@@ -570,6 +570,9 @@ pub struct HandlerRegistry {
     circuit_breakers: Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
     /// Per-activity-type retry budgets (issue #1793). On by default.
     retry_budgets: Arc<crate::retry_budget::RetryBudgetRegistry>,
+    /// Per-activity-type adaptive concurrency limits (issue #1836). Off by
+    /// default.
+    adaptive_limits: Arc<crate::adaptive_limit::AdaptiveLimitRegistry>,
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
@@ -803,6 +806,10 @@ impl HandlerRegistry {
             crate::retry_budget::RetryBudgetRegistry::default()
                 .with_metrics(Arc::clone(&telemetry.metrics)),
         );
+        let adaptive_limits = Arc::new(
+            crate::adaptive_limit::AdaptiveLimitRegistry::default()
+                .with_metrics(Arc::clone(&telemetry.metrics)),
+        );
         Self {
             workflows,
             activities,
@@ -822,6 +829,7 @@ impl HandlerRegistry {
                 circuit_policies,
             )),
             retry_budgets,
+            adaptive_limits,
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
@@ -1217,6 +1225,40 @@ impl HandlerRegistry {
         Arc::clone(&self.retry_budgets)
     }
 
+    /// Set the per-activity-type adaptive concurrency limits (issue #1836).
+    ///
+    /// Mirrors [`crate::builder::WorkerConfig::with_adaptive_limit`]. The
+    /// default limits no type.
+    ///
+    /// An override for a name that this registry does not register has no
+    /// effect. The call logs a warning for each such name.
+    #[must_use]
+    pub fn with_adaptive_limit(
+        mut self,
+        config: crate::adaptive_limit::AdaptiveLimitConfig,
+    ) -> Self {
+        for name in config.overrides().keys() {
+            if !self.activities.contains_key(name) {
+                tracing::warn!(
+                    activity_name = %name,
+                    "adaptive limit override names an activity that is not registered; it has no effect"
+                );
+            }
+        }
+        self.adaptive_limits = Arc::new(
+            crate::adaptive_limit::AdaptiveLimitRegistry::new(config)
+                .with_metrics(Arc::clone(&self.telemetry.metrics)),
+        );
+        self
+    }
+
+    /// Access the per-activity-type adaptive concurrency limits (issue
+    /// #1836).
+    #[must_use]
+    pub fn adaptive_limits(&self) -> Arc<crate::adaptive_limit::AdaptiveLimitRegistry> {
+        Arc::clone(&self.adaptive_limits)
+    }
+
     /// History-size guardrails applied to workflow contexts run by this registry.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -1493,6 +1535,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("workflow_log_policy", &self.workflow_log_policy)
             .field("circuit_breakers", &self.circuit_breakers)
             .field("retry_budgets", &self.retry_budgets)
+            .field("adaptive_limits", &self.adaptive_limits)
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
@@ -15578,6 +15621,671 @@ mod retry_budget_gate_tests {
     }
 }
 
+/// Whether the adaptive limit gates this attempt (issue #1836).
+///
+/// A `None` token is a circuit short-circuit. It never reaches the
+/// dependency, so it takes no slot. A half-open probe is the breaker's
+/// recovery signal, so the limit never defers it.
+const fn adaptive_limit_gates(
+    circuit_token: Option<crate::circuit_breaker::DispatchToken>,
+) -> bool {
+    match circuit_token {
+        Some(token) => !token.is_probe(),
+        None => false,
+    }
+}
+
+/// The adaptive limit sample for one attempt (issue #1836).
+///
+/// - A fault of the worker, such as a panic, gives no sample. This holds
+///   even past the deadline. `error_type` names the fault.
+/// - An attempt that timed out (`timed_out`) is overload. A hung dependency
+///   is the classic overload signal.
+/// - A retryable failure is overload.
+/// - A success is an answer.
+/// - A non-retryable failure gives no sample. It is often fast, and its
+///   latency would pull the baseline down.
+/// - Any other cancelled attempt (`outcome` is `None`) gives no sample.
+fn limit_sample_outcome(
+    outcome: Option<crate::circuit_breaker::AttemptOutcome>,
+    error_type: Option<&str>,
+    timed_out: bool,
+) -> Option<crate::adaptive_limit::SampleOutcome> {
+    use crate::adaptive_limit::SampleOutcome;
+    use crate::circuit_breaker::AttemptOutcome;
+    // A worker fault gives no sample, even past the deadline.
+    if error_type.is_some_and(is_worker_local_failure) {
+        return None;
+    }
+    if timed_out {
+        return Some(SampleOutcome::Overloaded);
+    }
+    match outcome {
+        Some(AttemptOutcome::RetryableFailure) => Some(SampleOutcome::Overloaded),
+        Some(AttemptOutcome::Success) => Some(SampleOutcome::Answered),
+        Some(AttemptOutcome::NonRetryableFailure) | None => None,
+    }
+}
+
+/// Whether an attempt ran past its deadline (issue #1836).
+///
+/// `deadline` and `started_at` both come from the database clock, so their
+/// difference is the attempt budget. `elapsed` runs on this host's monotonic
+/// clock from the claim. A host clock skew therefore cannot change the
+/// answer. The timeout scanner also judges the deadline by the database
+/// clock.
+fn past_attempt_deadline(
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    elapsed: Duration,
+) -> bool {
+    let (Some(deadline), Some(started_at)) = (deadline, started_at) else {
+        return false;
+    };
+    // A deadline before the claim leaves no budget.
+    let budget = (deadline - started_at).to_std().unwrap_or(Duration::ZERO);
+    elapsed >= budget
+}
+
+/// What the worker knows about whether an attempt timed out (issue #1836).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutCheck {
+    /// The attempt did not time out.
+    NotTimedOut,
+    /// The attempt ran past its deadline.
+    TimedOut,
+    /// The attempt ran past the deadline that it read at the claim. A
+    /// resume can move `schedule_to_close_at`, so read the current one.
+    RecheckDeadline,
+    /// The timeout scanner may have taken the claim. Read the task row.
+    ReadRow,
+}
+
+/// Where an attempt ended against the deadline that it read at the claim
+/// (issue #1836).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptEnd {
+    /// The attempt ended before its deadline.
+    InTime,
+    /// The attempt ended past a deadline that cannot move.
+    PastFixed,
+    /// The attempt ended past a deadline that a resume can move. Only
+    /// `schedule_to_close_at` moves.
+    PastMovable,
+}
+
+impl AttemptEnd {
+    const fn new(past_deadline: bool, deadline_may_move: bool) -> Self {
+        match (past_deadline, deadline_may_move) {
+            (false, _) => Self::InTime,
+            (true, false) => Self::PastFixed,
+            (true, true) => Self::PastMovable,
+        }
+    }
+}
+
+/// Decide what to check for a timeout of one attempt (issue #1836).
+///
+/// - A sealed transactional success held its claim when it committed, so it
+///   did not time out.
+/// - An attempt that ends after its deadline timed out, even when the
+///   handler returned before the cancel observer saw the lost claim.
+/// - A resume after a pause can move `schedule_to_close_at` forward. So
+///   when the deadline can move, a late attempt reads the current one.
+/// - When the claim may be lost, the task row tells. The timeout scanner
+///   writes its timeout error there.
+const fn timeout_check(
+    committed_transactionally: bool,
+    end: AttemptEnd,
+    claim_may_be_lost: bool,
+) -> TimeoutCheck {
+    if committed_transactionally {
+        return TimeoutCheck::NotTimedOut;
+    }
+    match end {
+        AttemptEnd::PastMovable => TimeoutCheck::RecheckDeadline,
+        AttemptEnd::PastFixed => TimeoutCheck::TimedOut,
+        AttemptEnd::InTime if claim_may_be_lost => TimeoutCheck::ReadRow,
+        AttemptEnd::InTime => TimeoutCheck::NotTimedOut,
+    }
+}
+
+/// Whether the timeout scanner may have taken the claim of an attempt
+/// (issue #1836).
+///
+/// A cancel can mean a lost claim. A heartbeat timeout can fire before the
+/// attempt deadline, and a handler can answer before the cancel observer
+/// sees that loss. The heartbeat budget starts at the claim in the
+/// database, and the claim reaches this worker after an unbounded delay.
+/// So a task with a heartbeat timeout always reads the row.
+const fn claim_may_be_lost(was_cancelled: bool, has_heartbeat_timeout: bool) -> bool {
+    was_cancelled || has_heartbeat_timeout
+}
+
+/// Whether an attempt timed out (issue #1836). See [`timeout_check`].
+///
+/// For [`TimeoutCheck::ReadRow`] and [`TimeoutCheck::RecheckDeadline`],
+/// the function reads the task row. `None` means the read failed, so the
+/// answer is unknown and the attempt gives no sample.
+///
+/// `past_deadline` tells whether the attempt ended past the deadline that
+/// a given `schedule_to_close_at` sets.
+async fn attempt_timed_out(
+    pool: &DbPool,
+    claim: &queue::TaskClaim,
+    activity_name: &str,
+    check: TimeoutCheck,
+    past_deadline: impl FnOnce(Option<chrono::DateTime<chrono::Utc>>) -> bool,
+) -> Option<bool> {
+    if let TimeoutCheck::NotTimedOut | TimeoutCheck::TimedOut = check {
+        return Some(check == TimeoutCheck::TimedOut);
+    }
+    let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
+        return None;
+    };
+    if check == TimeoutCheck::RecheckDeadline {
+        return timed_out_from_deadline(
+            queue::task_deadline_for_claim(&mut conn, claim).await,
+            activity_name,
+            past_deadline,
+        );
+    }
+    timed_out_from_row(
+        queue::task_status_for_claim(&mut conn, claim).await,
+        activity_name,
+    )
+}
+
+/// Read a timeout from the current deadline of one late attempt (issue
+/// #1836).
+///
+/// - The scanner's timeout error on a lost claim is a timeout.
+/// - Otherwise the current `schedule_to_close_at` decides. A resume can
+///   have moved it past the end of the attempt.
+/// - A missing row gives no new evidence, so the late end stays a timeout.
+/// - A failed read is unknown.
+fn timed_out_from_deadline(
+    read: HarvestResult<Option<queue::TaskDeadline>>,
+    activity_name: &str,
+    past_deadline: impl FnOnce(Option<chrono::DateTime<chrono::Utc>>) -> bool,
+) -> Option<bool> {
+    match read {
+        Err(_) => None,
+        Ok(None) => Some(true),
+        Ok(Some(row)) => {
+            let scanner_timeout = !row.claim_held
+                && row
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| is_attempt_timeout_error(error, activity_name));
+            Some(scanner_timeout || past_deadline(row.schedule_to_close_at))
+        }
+    }
+}
+
+/// Read a timeout from the task row of one attempt (issue #1836).
+///
+/// A lost claim with the scanner's timeout error for this activity is a
+/// timeout. A held claim, another error or a missing row is not. A failed
+/// read is unknown.
+fn timed_out_from_row(
+    read: HarvestResult<Option<(String, Option<String>, bool)>>,
+    activity_name: &str,
+) -> Option<bool> {
+    match read {
+        Err(_) => None,
+        Ok(Some((_, Some(error), false))) => Some(is_attempt_timeout_error(&error, activity_name)),
+        Ok(_) => Some(false),
+    }
+}
+
+/// Whether a claim's exclusion list marked `activity_name` as saturated
+/// (issue #1836).
+///
+/// The by-id claim keeps this answer. The limiter state can change between
+/// the claim and the decision about its reference.
+fn excluded_as_saturated(exclusions: &[String], activity_name: &str) -> bool {
+    exclusions
+        .iter()
+        .any(|name| name.strip_prefix(queue::SATURATED_ACTIVITY_MARKER) == Some(activity_name))
+}
+
+/// Whether a task-row error is a timeout of one activity attempt (issue
+/// #1836). The timeout scanner writes `HarvestError::Timeout` as text.
+fn is_attempt_timeout_error(error: &str, activity_name: &str) -> bool {
+    use crate::error::TimeoutType;
+    [
+        TimeoutType::Heartbeat,
+        TimeoutType::StartToClose,
+        TimeoutType::ScheduleToClose,
+    ]
+    .into_iter()
+    .any(|timeout_type| {
+        error
+            == HarvestError::Timeout {
+                timeout_type,
+                task_name: activity_name.to_owned(),
+            }
+            .to_string()
+    })
+}
+
+/// Whether a failure type is a fault of the worker, not of the dependency
+/// (issue #1836).
+fn is_worker_local_failure(error_type: &str) -> bool {
+    if error_type == crate::failure::ERROR_TYPE_HANDLER_PANIC {
+        return true;
+    }
+    // A WASM engine fault, such as a spent fuel budget or a guest trap, is
+    // not pressure from a dependency.
+    #[cfg(feature = "wasm-activities")]
+    if [
+        crate::failure::ERROR_TYPE_WASM_MODULE_UNAVAILABLE,
+        crate::failure::ERROR_TYPE_WASM_MODULE_INVALID,
+        crate::failure::ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
+        crate::failure::ERROR_TYPE_RESOURCE_EXHAUSTED,
+        crate::failure::ERROR_TYPE_WASM_TRAP,
+        crate::failure::ERROR_TYPE_SANDBOX_DENIED,
+        crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+    ]
+    .contains(&error_type)
+    {
+        return true;
+    }
+    false
+}
+
+/// The registered activities whose requirements these worker labels do not
+/// meet.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] for an invalid requirement, or for a
+/// name that starts with [`queue::SATURATED_ACTIVITY_MARKER`].
+fn ineligible_activities(
+    registry: &HandlerRegistry,
+    labels: &std::collections::HashMap<String, String>,
+) -> HarvestResult<Vec<String>> {
+    let mut ineligible_activities = Vec::new();
+    for activity in registry.activities.values() {
+        // The claim reads a `$6` entry that starts with the marker as a
+        // saturated type (issue #1836). A registered name must not start
+        // with it.
+        if activity.name.starts_with(queue::SATURATED_ACTIVITY_MARKER) {
+            return Err(HarvestError::Config(format!(
+                "activity name {:?} starts with a reserved control character",
+                activity.name
+            )));
+        }
+        if let Some(requires) = activity.requires {
+            let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
+                HarvestError::Config(format!(
+                    "Invalid requirements for activity {}: {}",
+                    activity.name, err
+                ))
+            })?;
+            if !crate::eligibility::matches_requirements(&reqs, labels) {
+                ineligible_activities.push(activity.name.to_string());
+            }
+        }
+    }
+    Ok(ineligible_activities)
+}
+
+/// The activity names that a claim must skip (issue #1836).
+///
+/// These are the names with unmet requirements, plus the types at their
+/// adaptive limit. A saturated type carries
+/// [`queue::SATURATED_ACTIVITY_MARKER`], so the claim skips it even on a row
+/// with capability requirements. The common case has no saturated type and
+/// allocates nothing.
+fn claim_exclusions(
+    ineligible: &[String],
+    saturated: Vec<String>,
+) -> std::borrow::Cow<'_, [String]> {
+    if saturated.is_empty() {
+        return std::borrow::Cow::Borrowed(ineligible);
+    }
+    let mut names = ineligible.to_vec();
+    names.extend(
+        saturated
+            .into_iter()
+            .map(|name| format!("{}{name}", queue::SATURATED_ACTIVITY_MARKER)),
+    );
+    std::borrow::Cow::Owned(names)
+}
+
+#[cfg(test)]
+mod adaptive_limit_gate_tests {
+    use super::{adaptive_limit_gates, claim_exclusions, limit_sample_outcome};
+    use crate::adaptive_limit::SampleOutcome;
+    use crate::circuit_breaker::{
+        AttemptOutcome, CircuitBreakerRegistry, DispatchDecision, DispatchToken,
+    };
+    use crate::policy::CircuitBreakerPolicy;
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// A normal token, and a half-open probe token from a tripped breaker.
+    fn tokens() -> (DispatchToken, DispatchToken) {
+        let policy = CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(5));
+        let reg = CircuitBreakerRegistry::new(HashMap::from([("act".to_owned(), policy)]));
+        let t0 = Instant::now();
+        let DispatchDecision::Allow { token: normal } = reg.on_dispatch("act", t0) else {
+            panic!("a closed breaker allows");
+        };
+        let _ = reg.on_result("act", AttemptOutcome::RetryableFailure, normal, t0);
+        let DispatchDecision::Allow { token: probe } =
+            reg.on_dispatch("act", t0 + Duration::from_secs(6))
+        else {
+            panic!("the cooldown admits a probe");
+        };
+        (normal, probe)
+    }
+
+    #[test]
+    fn only_a_real_non_probe_call_takes_a_slot() {
+        let (normal, probe) = tokens();
+        assert!(adaptive_limit_gates(Some(normal)));
+        assert!(!adaptive_limit_gates(Some(probe)));
+        assert!(!adaptive_limit_gates(None));
+    }
+
+    /// Only a retryable failure signals overload. A bad-input failure is
+    /// often fast, and its latency would pull the baseline down, so it gives
+    /// no sample.
+    #[test]
+    fn breaker_outcomes_map_to_limit_samples() {
+        assert_eq!(
+            limit_sample_outcome(Some(AttemptOutcome::Success), None, false),
+            Some(SampleOutcome::Answered)
+        );
+        assert_eq!(
+            limit_sample_outcome(Some(AttemptOutcome::NonRetryableFailure), None, false),
+            None
+        );
+        assert_eq!(
+            limit_sample_outcome(Some(AttemptOutcome::RetryableFailure), None, false),
+            Some(SampleOutcome::Overloaded)
+        );
+        assert_eq!(limit_sample_outcome(None, None, false), None);
+    }
+
+    /// A row read that fails says nothing, so the attempt gives no sample.
+    #[test]
+    fn a_failed_row_read_is_an_unknown_timeout() {
+        use super::timed_out_from_row;
+        use crate::error::HarvestError;
+        let timeout = "timeout: Heartbeat for charge_card".to_owned();
+        assert_eq!(
+            timed_out_from_row(Err(HarvestError::Config("down".into())), "charge_card"),
+            None
+        );
+        assert_eq!(
+            timed_out_from_row(
+                Ok(Some(("FAILED".into(), Some(timeout.clone()), false))),
+                "charge_card"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            timed_out_from_row(Ok(Some(("RUNNING".into(), None, true))), "charge_card"),
+            Some(false)
+        );
+        assert_eq!(
+            timed_out_from_row(
+                Ok(Some(("PENDING".into(), Some(timeout), true))),
+                "charge_card"
+            ),
+            Some(false),
+            "a claim that is still held did not time out"
+        );
+        assert_eq!(timed_out_from_row(Ok(None), "charge_card"), Some(false));
+    }
+
+    /// A late attempt reads the current deadline. A deadline that a resume
+    /// moved past the end of the attempt makes it an answer.
+    #[test]
+    fn a_moved_deadline_decides_a_late_attempt() {
+        use super::timed_out_from_deadline;
+        use crate::error::HarvestError;
+        use crate::queue::TaskDeadline;
+        let moved = chrono::Utc::now();
+        let row = |error: Option<&str>, claim_held, schedule_to_close_at| {
+            Ok(Some(TaskDeadline {
+                error: error.map(str::to_owned),
+                claim_held,
+                schedule_to_close_at,
+            }))
+        };
+        let in_time = |at: Option<_>| at != Some(moved);
+        // The moved deadline is past the end of the attempt.
+        assert_eq!(
+            timed_out_from_deadline(row(None, true, Some(moved)), "charge_card", in_time),
+            Some(false)
+        );
+        // The deadline did not move.
+        assert_eq!(
+            timed_out_from_deadline(row(None, true, None), "charge_card", in_time),
+            Some(true)
+        );
+        // The scanner timed the attempt out.
+        assert_eq!(
+            timed_out_from_deadline(
+                row(
+                    Some("timeout: ScheduleToClose for charge_card"),
+                    false,
+                    Some(moved)
+                ),
+                "charge_card",
+                in_time
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            timed_out_from_deadline(
+                Err(HarvestError::Config("down".into())),
+                "charge_card",
+                in_time
+            ),
+            None
+        );
+        assert_eq!(
+            timed_out_from_deadline(Ok(None), "charge_card", in_time),
+            Some(true)
+        );
+    }
+
+    /// The by-id claim's own exclusion list tells whether saturation caused
+    /// a miss. Current limiter state can change after the claim.
+    #[test]
+    fn a_marked_exclusion_records_the_saturation_cause() {
+        use super::excluded_as_saturated;
+        let exclusions = vec!["gpu_job".to_owned(), "\u{1}charge_card".to_owned()];
+        assert!(excluded_as_saturated(&exclusions, "charge_card"));
+        assert!(!excluded_as_saturated(&exclusions, "gpu_job"));
+        assert!(!excluded_as_saturated(&exclusions, "send_email"));
+    }
+
+    /// The timeout decision table (issue #1836).
+    #[test]
+    fn the_timeout_decision_follows_the_evidence() {
+        use super::{AttemptEnd, TimeoutCheck, timeout_check};
+        // A sealed transactional success held its claim, so it never timed
+        // out, whatever the clock says.
+        assert_eq!(
+            timeout_check(true, AttemptEnd::new(true, true), true),
+            TimeoutCheck::NotTimedOut
+        );
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(true, false), false),
+            TimeoutCheck::TimedOut
+        );
+        // A resume can move a schedule-to-close deadline, so a late attempt
+        // reads the current one.
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(true, true), false),
+            TimeoutCheck::RecheckDeadline
+        );
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(true, true), true),
+            TimeoutCheck::RecheckDeadline
+        );
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(false, true), true),
+            TimeoutCheck::ReadRow
+        );
+        assert_eq!(
+            timeout_check(false, AttemptEnd::new(false, true), false),
+            TimeoutCheck::NotTimedOut
+        );
+    }
+
+    /// A cancel can mean a lost claim. A heartbeat timeout can take the
+    /// claim before the local clock sees the heartbeat budget spent. The
+    /// budget starts at the claim in the database. So a task with a
+    /// heartbeat timeout always reads the row.
+    #[test]
+    fn the_claim_may_be_lost_after_a_cancel_or_with_a_heartbeat_timeout() {
+        use super::claim_may_be_lost;
+        assert!(claim_may_be_lost(true, false));
+        assert!(!claim_may_be_lost(false, false));
+        assert!(claim_may_be_lost(false, true));
+    }
+
+    /// The deadline check uses the database-clock budget and the monotonic
+    /// elapsed time, so a host clock skew cannot change the answer.
+    #[test]
+    fn the_deadline_check_ignores_the_host_clock() {
+        use super::past_attempt_deadline;
+        use chrono::TimeZone as _;
+        // Database timestamps far from the host clock, as under a skew.
+        let started = chrono::Utc.with_ymd_and_hms(2001, 1, 1, 0, 0, 0).single();
+        let deadline = started.map(|s| s + chrono::Duration::milliseconds(300));
+        let ms = Duration::from_millis;
+        assert!(!past_attempt_deadline(deadline, started, ms(280)));
+        assert!(past_attempt_deadline(deadline, started, ms(300)));
+        assert!(past_attempt_deadline(deadline, started, ms(320)));
+        assert!(!past_attempt_deadline(None, started, ms(10_000)));
+        assert!(!past_attempt_deadline(deadline, None, ms(10_000)));
+        // A deadline before the claim leaves no budget.
+        assert!(past_attempt_deadline(started, deadline, ms(0)));
+    }
+
+    /// The scanner's timeout errors for this activity are timeouts. Other
+    /// errors, such as a cancel, and other activities are not.
+    #[test]
+    fn only_an_attempt_timeout_of_this_activity_matches() {
+        use super::is_attempt_timeout_error;
+        assert!(is_attempt_timeout_error(
+            "timeout: Heartbeat for charge_card",
+            "charge_card"
+        ));
+        assert!(is_attempt_timeout_error(
+            "timeout: StartToClose for charge_card",
+            "charge_card"
+        ));
+        assert!(is_attempt_timeout_error(
+            "timeout: ScheduleToClose for charge_card",
+            "charge_card"
+        ));
+        assert!(!is_attempt_timeout_error(
+            "timeout: ScheduleToStart for charge_card",
+            "charge_card"
+        ));
+        assert!(!is_attempt_timeout_error(
+            "timeout: Heartbeat for send_email",
+            "charge_card"
+        ));
+        assert!(!is_attempt_timeout_error("cancelled", "charge_card"));
+    }
+
+    /// An attempt cancelled because its deadline passed timed out. A hung
+    /// dependency is overload, so it must back the cap off.
+    #[test]
+    fn a_timed_out_attempt_is_overload() {
+        assert_eq!(
+            limit_sample_outcome(None, None, true),
+            Some(SampleOutcome::Overloaded)
+        );
+    }
+
+    /// A panic is a fault of the worker, not of the dependency, so it gives
+    /// no sample.
+    #[test]
+    fn a_panic_gives_no_sample() {
+        assert_eq!(
+            limit_sample_outcome(
+                Some(AttemptOutcome::RetryableFailure),
+                Some(crate::failure::ERROR_TYPE_HANDLER_PANIC),
+                false
+            ),
+            None
+        );
+    }
+
+    /// A worker fault that ends past the deadline is still a worker fault.
+    /// Its late end says nothing about the dependency, so it gives no sample.
+    #[test]
+    fn a_late_worker_local_failure_gives_no_sample() {
+        assert_eq!(
+            limit_sample_outcome(
+                Some(AttemptOutcome::RetryableFailure),
+                Some(crate::failure::ERROR_TYPE_HANDLER_PANIC),
+                true
+            ),
+            None
+        );
+    }
+
+    /// A WASM module or runtime failure is a fault of the worker or the
+    /// guest, not of the dependency, so it gives no sample.
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_module_failures_give_no_sample() {
+        for error_type in [
+            crate::failure::ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
+            crate::failure::ERROR_TYPE_WASM_MODULE_UNAVAILABLE,
+            crate::failure::ERROR_TYPE_WASM_MODULE_INVALID,
+            crate::failure::ERROR_TYPE_RESOURCE_EXHAUSTED,
+            crate::failure::ERROR_TYPE_WASM_TRAP,
+            crate::failure::ERROR_TYPE_SANDBOX_DENIED,
+            crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+        ] {
+            assert_eq!(
+                limit_sample_outcome(
+                    Some(AttemptOutcome::RetryableFailure),
+                    Some(error_type),
+                    false
+                ),
+                None,
+                "{error_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_exclusions_borrow_when_no_type_is_saturated() {
+        let ineligible = vec!["gpu_job".to_owned()];
+        let out = claim_exclusions(&ineligible, Vec::new());
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), ineligible.as_slice());
+    }
+
+    /// A saturated type carries the marker, so the claim skips it even on
+    /// a row with capability requirements.
+    #[test]
+    fn claim_exclusions_add_the_saturated_types_with_the_marker() {
+        let ineligible = vec!["gpu_job".to_owned()];
+        let out = claim_exclusions(&ineligible, vec!["charge_card".to_owned()]);
+        assert_eq!(
+            out.as_ref(),
+            ["gpu_job".to_owned(), "\u{1}charge_card".to_owned()].as_slice()
+        );
+    }
+}
+
 /// Consult the retry budget for one claimed attempt.
 ///
 /// A claim with `attempt > 1` is a retry. An orphan reclaim also raises
@@ -15679,17 +16387,7 @@ async fn defer_retry_for_budget(
     wake_at: std::time::Instant,
     reservation: &mut Option<crate::retry_budget::SlotReservation>,
 ) -> HarvestResult<bool> {
-    if activity.circuit_breaker.is_none()
-        && let Some(key) = task.rate_limit_key.as_deref()
-        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
-    {
-        tracing::warn!(
-            task_id = %task.id,
-            rate_limit_key = %key,
-            %error,
-            "failed to refund the rate-limit token for a retry-budget deferral"
-        );
-    }
+    refund_claim_rate_limit_token(conn, task, activity, "retry-budget deferral").await;
     // The delay runs on the database clock. See `defer_claimed_retry_for_budget`.
     let delay = budgets.wake_delay(
         activity_name,
@@ -15697,12 +16395,68 @@ async fn defer_retry_for_budget(
         reservation,
         std::time::Instant::now(),
     );
+    defer_unstarted_claim(conn, task, delay, "retry-budget deferral").await
+}
+
+/// Defer a claimed activity that the adaptive limit did not admit (issue
+/// #1836).
+///
+/// The claim skips a type at its cap, so this runs only when a claim raced
+/// past the cap. The write is the retry-budget deferral. It lowers `attempt`
+/// again, keeps `error` and `crash_strikes`, and appends no event. The
+/// claim-time rate-limit token goes back, as for a budget deferral.
+///
+/// Returns `false` when the lease was lost, so the write changed nothing.
+async fn defer_for_adaptive_limit(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    activity: &ActivityInfo,
+    delay: Duration,
+) -> HarvestResult<bool> {
+    refund_claim_rate_limit_token(conn, task, activity, "adaptive-limit deferral").await;
+    defer_unstarted_claim(conn, task, delay, "adaptive-limit deferral").await
+}
+
+/// Put a claimed activity that did not start back to `PENDING`, `delay`
+/// past the database clock. See `queue::defer_claimed_retry_for_budget`.
+///
+/// Returns `false` when the lease was lost, so the write changed nothing.
+async fn defer_unstarted_claim(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    delay: Duration,
+    write_name: &str,
+) -> HarvestResult<bool> {
     let delay = chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(1));
     let write = queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?;
     if write == queue::ClaimWrite::LeaseLost {
-        log_lease_lost(task, "retry-budget deferral");
+        log_lease_lost(task, write_name);
     }
     Ok(write == queue::ClaimWrite::Applied)
+}
+
+/// Give back the claim-time rate-limit token of an activity that does not
+/// run. Only an activity without a circuit breaker debits at claim. The
+/// function logs a refund failure and does not return it, like a
+/// capability-miss refund.
+async fn refund_claim_rate_limit_token(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    activity: &ActivityInfo,
+    write_name: &str,
+) {
+    if activity.circuit_breaker.is_none()
+        && let Some(key) = task.rate_limit_key.as_deref()
+        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
+    {
+        tracing::warn!(
+            task_id = %task.id,
+            rate_limit_key = %key,
+            write = write_name,
+            %error,
+            "failed to refund the rate-limit token of a deferred activity"
+        );
+    }
 }
 
 /// The prefix of the error a drain-released activity carries into its next
@@ -16687,6 +17441,34 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
 
+    // Adaptive limit (issue #1836). The claim skips a type at its cap, so
+    // this gate catches only a claim that raced past the cap. It runs before
+    // the retry budget, so its deferral spends no budget token. Every return
+    // before the handler drops the permit, which frees the slot without a
+    // sample.
+    let mut limit_permit = None;
+    if adaptive_limit_gates(circuit_token) {
+        match registry.adaptive_limits().try_acquire(activity_name) {
+            crate::adaptive_limit::Acquire::Untracked => {}
+            crate::adaptive_limit::Acquire::Acquired(permit) => limit_permit = Some(permit),
+            crate::adaptive_limit::Acquire::Limited { retry_after } => {
+                if let Some(token) = circuit_token {
+                    circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+                }
+                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+                if defer_for_adaptive_limit(&mut conn, task, activity, retry_after).await? {
+                    // Count only a deferral that persisted, as the retry
+                    // budget does.
+                    registry
+                        .telemetry()
+                        .metrics
+                        .record_activity_concurrency_deferred(activity_name);
+                }
+                return Ok(());
+            }
+        }
+    }
+
     // Retry budget (issue #1793). See `retry_budget_gates` for which
     // attempts it gates. The gate runs before ActivityStarted, so a deferred
     // retry leaves no event.
@@ -17346,8 +18128,11 @@ async fn process_activity_task(
     // resolved. On non-`db` builds `run_transactional` does not exist, so the
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
+    // The adaptive limit reads a timeout as overload (issue #1836).
+    let attempt_deadline = ctx.deadline();
 
-    let duration_secs = attempt_clock_start.elapsed().as_secs_f64();
+    let attempt_latency = attempt_clock_start.elapsed();
+    let duration_secs = attempt_latency.as_secs_f64();
     let status = if committed_transactionally || activity_result.is_ok() {
         ActivityStatus::Completed
     } else {
@@ -17448,6 +18233,40 @@ async fn process_activity_task(
             Err(_) => crate::circuit_breaker::AttemptOutcome::RetryableFailure,
         })
     };
+    // Adaptive limit (issue #1836): report the handler latency and outcome,
+    // and free the slot. See `limit_sample_outcome` for which attempts give
+    // no sample.
+    if let Some(permit) = limit_permit.take() {
+        let elapsed = dispatched_at.elapsed();
+        let check = timeout_check(
+            committed_transactionally,
+            AttemptEnd::new(
+                past_attempt_deadline(attempt_deadline, task.started_at, elapsed),
+                task.schedule_to_close_at.is_some(),
+            ),
+            claim_may_be_lost(was_cancelled, task.heartbeat_timeout.is_some()),
+        );
+        let past_deadline = |schedule_to_close_at| {
+            past_attempt_deadline(
+                crate::context::attempt_deadline(
+                    task.started_at,
+                    task.start_to_close,
+                    schedule_to_close_at,
+                ),
+                task.started_at,
+                elapsed,
+            )
+        };
+        let error_type = failure_info.as_ref().map(|(et, _, _)| et.as_str());
+        // An unknown timeout answer gives no sample.
+        let outcome = attempt_timed_out(pool, &activity_claim, activity_name, check, past_deadline)
+            .await
+            .and_then(|timed_out| limit_sample_outcome(circuit_outcome, error_type, timed_out));
+        match outcome {
+            Some(outcome) => permit.complete(attempt_latency, outcome),
+            None => drop(permit),
+        }
+    }
     // `circuit_token` is always `Some` here: the short-circuit path returned
     // early above, so reaching this point means the attempt was dispatched.
     if let Some(transition) = circuit_token
@@ -27922,6 +28741,10 @@ pub struct Worker {
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
     /// backlog.
     gate_refused: Arc<GateRefused>,
+    /// A claim skipped a type at its adaptive limit since the last idle
+    /// wait (issue #1836). The next idle wait then also wakes on
+    /// `capacity_freed`, even when the slot freed before the wait began.
+    limit_refused: AtomicBool,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -29546,6 +30369,7 @@ fn reference_outcome(
     redeliveries: u32,
     now: chrono::DateTime<chrono::Utc>,
     settings: &crate::dispatch::DispatchSettings,
+    saturated_delay: Option<Duration>,
 ) -> ReferenceOutcome {
     let Some(probe) = probe else {
         // Absent row. A publish can beat its own commit, so give the row a few
@@ -29582,6 +30406,13 @@ fn reference_outcome(
         // reference on at once, so the owner can see it before the pin ends.
         // A growing delay here would outlast the sticky window.
         return ReferenceOutcome::Release(settings.poll_interval.min(settings.release_backoff_cap));
+    }
+    if let Some(delay) = saturated_delay {
+        // The type is at its adaptive limit (issue #1836). A slot frees in
+        // about one handler latency. The gate backoff would hold that slot
+        // idle for up to the backoff cap. A freed slot cannot wake a released
+        // reference, so the reference returns when a slot is likely free.
+        return ReferenceOutcome::Release(delay.min(settings.release_backoff_cap));
     }
     // Due but gated: a queue pause, a concurrency cap, a rate limit, a session
     // pin, or any other claim gate. Back off so a held row does not cycle once
@@ -29787,20 +30618,10 @@ impl Worker {
             let _ = global_dispatch.set(captured);
         }
 
-        let mut ineligible_activities = Vec::new();
-        for activity in registry.activities.values() {
-            if let Some(requires) = activity.requires {
-                let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
-                    HarvestError::Config(format!(
-                        "Invalid requirements for activity {}: {}",
-                        activity.name, err
-                    ))
-                })?;
-                if !crate::eligibility::matches_requirements(&reqs, &config.labels) {
-                    ineligible_activities.push(activity.name.to_string());
-                }
-            }
-        }
+        let ineligible_activities = ineligible_activities(&registry, &config.labels)?;
+        // The limit registry fires this wake when a limit slot frees (issue
+        // #1836). That happens before the attempt writes its result.
+        let capacity_freed = registry.adaptive_limits.slot_freed_notify();
 
         let workflow_parts =
             build_dispatch_semaphore(config.max_concurrent_workflows, config.slot_tuner.as_ref());
@@ -29822,8 +30643,9 @@ impl Worker {
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
-            capacity_freed: Arc::new(tokio::sync::Notify::new()),
+            capacity_freed,
             gate_refused: Arc::new(GateRefused::default()),
+            limit_refused: AtomicBool::new(false),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             drain_cancel: CancellationToken::new(),
@@ -32274,6 +33096,7 @@ impl Worker {
         };
 
         let circuit_breakers = self.registry.circuit_breakers();
+        let exclusions = self.claim_exclusions();
         let claimed = queue::claim_task_by_id_on_shard(
             &mut conn,
             lease.task_id,
@@ -32282,7 +33105,7 @@ impl Worker {
             &self.config.build_id,
             self.config.priority_aging_secs,
             circuit_breakers.tracked_activity_names(),
-            &self.ineligible_activities,
+            &exclusions,
             shard,
         )
         .await;
@@ -32326,11 +33149,25 @@ impl Worker {
                         return ReferenceDisposition::Handled;
                     }
                 };
+                // The claim's own exclusions tell whether saturation caused
+                // the miss. The slot may have freed since, so a type that is
+                // no longer saturated retries after the shortest delay.
+                let saturated_delay = probe
+                    .as_ref()
+                    .and_then(|p| p.activity_name.as_deref())
+                    .filter(|name| excluded_as_saturated(&exclusions, name))
+                    .map(|name| {
+                        self.registry
+                            .adaptive_limits
+                            .saturated_delay(name)
+                            .unwrap_or(crate::adaptive_limit::MIN_LIMIT_DEFER)
+                    });
                 let outcome = reference_outcome(
                     probe.as_ref(),
                     lease.redeliveries,
                     chrono::Utc::now(),
                     &installed.settings,
+                    saturated_delay,
                 );
                 // Same reason as the claimed arm: disposal is a channel round
                 // trip the caller batches, so the connection goes back first.
@@ -33221,8 +34058,19 @@ impl Worker {
     /// True when at least one pool has no free permit. The idle wait then
     /// also wakes on `capacity_freed`. A NOTIFY alone does not do it: the
     /// backlog that waits for the permit sent its NOTIFY long ago.
+    ///
+    /// Also true while an activity type is at its adaptive limit, or when a
+    /// claim skipped such a type since the last wait (issue #1836). That
+    /// backlog waits for a slot even when the pools have free permits. The
+    /// slot can free between the claim and this check. The flag keeps that
+    /// wake, because `Notify` stores it until the wait polls it. The attempt
+    /// frees its limit slot before its dispatch permit, so the wake finds
+    /// the slot free.
     fn capacity_bound(&self) -> bool {
+        let limit_refused = self.limit_refused.swap(false, Ordering::Relaxed);
         self.poll_admission_now() != PollAdmission::Any
+            || limit_refused
+            || self.registry.adaptive_limits.any_saturated()
     }
 
     /// Mark each kind the gate refuses (issue #1787). See `gate_refused`.
@@ -33240,6 +34088,21 @@ impl Worker {
         if activity {
             AtomicBool::store(&self.gate_refused.activity, true, Ordering::Relaxed);
         }
+    }
+
+    /// The activity names that a claim must skip: the names with unmet
+    /// requirements, plus the types at their adaptive limit (issue #1836).
+    fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
+        let limits = &self.registry.adaptive_limits;
+        // The common case reads one atomic and takes no lock.
+        if !limits.any_saturated() {
+            return std::borrow::Cow::Borrowed(&self.ineligible_activities);
+        }
+        let exclusions = claim_exclusions(&self.ineligible_activities, limits.saturated());
+        if matches!(exclusions, std::borrow::Cow::Owned(_)) {
+            self.limit_refused.store(true, Ordering::Relaxed);
+        }
+        exclusions
     }
 
     /// Execute a single poll iteration.
@@ -33303,6 +34166,7 @@ impl Worker {
         // still atomically reserves a token. The set is static.
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
+        let exclusions = self.claim_exclusions();
 
         // --- Weighted queue selection (issue #515) ---
         //
@@ -33340,7 +34204,7 @@ impl Worker {
                     &self.config.build_id,
                     self.config.priority_aging_secs,
                     circuit_breaker_activities,
-                    &self.ineligible_activities,
+                    &exclusions,
                     shard,
                     kind,
                 )
@@ -33384,7 +34248,7 @@ impl Worker {
             &self.config.build_id,
             self.config.priority_aging_secs,
             circuit_breaker_activities,
-            &self.ineligible_activities,
+            &exclusions,
             shard,
             kind,
         )
@@ -37589,6 +38453,7 @@ mod tests {
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
             retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
+            adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };
@@ -41093,6 +41958,39 @@ mod tests {
                 .to_string()
                 .contains("exceeds chrono::Duration bounds")
         );
+    }
+
+    /// A registered name that starts with the saturation marker would read
+    /// as a marked `$6` entry, so the worker rejects it (issue #1836).
+    #[test]
+    fn worker_rejects_an_activity_name_with_the_saturation_marker() {
+        let act = ActivityInfo {
+            name: "\u{1}charge_card",
+            module: "app::activities",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            requires: Some("gpu = true"),
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
+        match Worker::new(default_runtime_config(), registry) {
+            Err(err) => assert!(matches!(err, HarvestError::Config(_)), "{err}"),
+            Ok(_) => panic!("the marker prefix must be rejected"),
+        }
     }
 
     #[test]
@@ -47286,7 +48184,31 @@ mod tests {
             scheduled_at,
             has_worker: state == "RUNNING",
             pinned_elsewhere: false,
+            activity_name: None,
         }
+    }
+
+    /// A due reference to a type at its adaptive limit returns after the
+    /// limit delay, not the growing gate backoff (issue #1836).
+    #[test]
+    fn a_saturated_reference_is_released_for_the_limit_delay() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let due = probe("PENDING", now - chrono::Duration::seconds(1));
+        let delay = Duration::from_millis(80);
+        for redeliveries in [0, 5, 40] {
+            assert_eq!(
+                reference_outcome(Some(&due), redeliveries, now, &settings, Some(delay)),
+                ReferenceOutcome::Release(delay),
+                "redelivery {redeliveries}"
+            );
+        }
+        // A row that is not yet due keeps waiting for its due time.
+        let later = probe("PENDING", now + chrono::Duration::seconds(5));
+        assert_eq!(
+            reference_outcome(Some(&later), 0, now, &settings, Some(delay)),
+            ReferenceOutcome::Release(Duration::from_secs(5)),
+        );
     }
 
     #[test]
@@ -47300,7 +48222,7 @@ mod tests {
 
         for redeliveries in [0, 3, 40] {
             assert_eq!(
-                reference_outcome(Some(&pinned), redeliveries, now, &settings),
+                reference_outcome(Some(&pinned), redeliveries, now, &settings, None),
                 ReferenceOutcome::Release(settings.poll_interval),
                 "redelivery {redeliveries} must not back off"
             );
@@ -47314,15 +48236,15 @@ mod tests {
         let due = probe("PENDING", now - chrono::Duration::seconds(1));
 
         assert_eq!(
-            reference_outcome(Some(&due), 0, now, &settings),
+            reference_outcome(Some(&due), 0, now, &settings, None),
             ReferenceOutcome::Release(Duration::from_millis(20))
         );
         assert_eq!(
-            reference_outcome(Some(&due), 3, now, &settings),
+            reference_outcome(Some(&due), 3, now, &settings, None),
             ReferenceOutcome::Release(Duration::from_millis(160))
         );
         assert_eq!(
-            reference_outcome(Some(&due), 40, now, &settings),
+            reference_outcome(Some(&due), 40, now, &settings, None),
             ReferenceOutcome::Release(settings.release_backoff_cap)
         );
     }
@@ -47334,7 +48256,7 @@ mod tests {
         let later = probe("PENDING", now + chrono::Duration::milliseconds(500));
 
         assert_eq!(
-            reference_outcome(Some(&later), 0, now, &settings),
+            reference_outcome(Some(&later), 0, now, &settings, None),
             ReferenceOutcome::Release(Duration::from_millis(500))
         );
     }
@@ -47346,7 +48268,7 @@ mod tests {
         let far = probe("PENDING", now + chrono::Duration::days(7));
 
         assert_eq!(
-            reference_outcome(Some(&far), 0, now, &settings),
+            reference_outcome(Some(&far), 0, now, &settings, None),
             ReferenceOutcome::Release(settings.release_backoff_cap)
         );
     }
@@ -47357,7 +48279,7 @@ mod tests {
         let now = chrono::Utc::now();
         for state in ["RUNNING", "COMPLETED", "FAILED", "CANCELLED"] {
             assert_eq!(
-                reference_outcome(Some(&probe(state, now)), 0, now, &settings),
+                reference_outcome(Some(&probe(state, now)), 0, now, &settings, None),
                 ReferenceOutcome::Ack,
                 "a {state} row must be acked"
             );
@@ -47373,17 +48295,24 @@ mod tests {
             scheduled_at: now,
             has_worker: false,
             pinned_elsewhere: false,
+            activity_name: None,
         };
 
         for redeliveries in 0..DISPATCH_PARKED_ROW_RELEASES {
             assert_eq!(
-                reference_outcome(Some(&parked), redeliveries, now, &settings),
+                reference_outcome(Some(&parked), redeliveries, now, &settings, None),
                 ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
                 "a wake may be in flight against a parked row"
             );
         }
         assert_eq!(
-            reference_outcome(Some(&parked), DISPATCH_PARKED_ROW_RELEASES, now, &settings),
+            reference_outcome(
+                Some(&parked),
+                DISPATCH_PARKED_ROW_RELEASES,
+                now,
+                &settings,
+                None
+            ),
             ReferenceOutcome::Ack,
             "a row still parked after the grace releases has no wake in flight"
         );
@@ -47437,13 +48366,13 @@ mod tests {
 
         for redeliveries in 0..DISPATCH_ABSENT_ROW_RELEASES {
             assert_eq!(
-                reference_outcome(None, redeliveries, now, &settings),
+                reference_outcome(None, redeliveries, now, &settings, None),
                 ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
                 "an uncommitted insert must get a short release"
             );
         }
         assert_eq!(
-            reference_outcome(None, DISPATCH_ABSENT_ROW_RELEASES, now, &settings),
+            reference_outcome(None, DISPATCH_ABSENT_ROW_RELEASES, now, &settings, None),
             ReferenceOutcome::Ack,
             "a row that is still absent after the grace releases is gone"
         );

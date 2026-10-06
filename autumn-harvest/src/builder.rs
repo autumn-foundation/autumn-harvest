@@ -1373,7 +1373,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_start_to_close,
         )
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
-        .with_retry_budget(self.worker_config.retry_budget.clone());
+        .with_retry_budget(self.worker_config.retry_budget.clone())
+        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1474,7 +1475,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_start_to_close,
         )
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
-        .with_retry_budget(self.worker_config.retry_budget.clone());
+        .with_retry_budget(self.worker_config.retry_budget.clone())
+        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -4077,6 +4079,16 @@ pub struct WorkerConfig {
     /// The Postgres worker enforces the budget. Local activities and the
     /// `autumn-harvest-sqlite` backend do not use it.
     pub retry_budget: crate::retry_budget::RetryBudgetConfig,
+    /// Per-activity-type adaptive concurrency limits (issue #1836).
+    ///
+    /// **Off by default.** A limited type has a cap on its in-flight
+    /// attempts on this worker. The cap follows the handler latency and the
+    /// retryable failures. At the cap, the worker claims no more tasks of
+    /// that type. Set via `with_adaptive_limit`.
+    ///
+    /// The Postgres worker enforces the limit. Local activities and the
+    /// `autumn-harvest-sqlite` backend do not use it.
+    pub adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -4227,6 +4239,7 @@ impl Default for WorkerConfig {
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
             retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
+            adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
         }
     }
 }
@@ -4850,6 +4863,17 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_retry_budget(mut self, config: crate::retry_budget::RetryBudgetConfig) -> Self {
         self.retry_budget = config;
+        self
+    }
+
+    /// Set the per-activity-type adaptive concurrency limits (issue #1836).
+    /// See [`WorkerConfig::adaptive_limit`].
+    #[must_use]
+    pub fn with_adaptive_limit(
+        mut self,
+        config: crate::adaptive_limit::AdaptiveLimitConfig,
+    ) -> Self {
+        self.adaptive_limit = config;
         self
     }
 }
@@ -5784,6 +5808,42 @@ mod tests {
         let (registry, _dags, _schedules, _worker_config) =
             built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
         assert_eq!(registry.retry_budgets().config(), &config);
+    }
+
+    /// The worker registry enforces the configured adaptive limit (issue
+    /// #1836).
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_adaptive_limit_into_worker_registry() {
+        use crate::adaptive_limit::AdaptiveLimitConfig;
+        use crate::policy::AdaptiveLimitPolicy;
+
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let config = AdaptiveLimitConfig::disabled()
+            .with_activity("charge_card", Some(AdaptiveLimitPolicy::new(2, 32)));
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_adaptive_limit(config.clone()))
+            .build();
+        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
+        assert_eq!(registry.adaptive_limits().config(), &config);
+
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_adaptive_limit(config.clone()))
+            .build();
+        let (registry, _dags, _schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+        assert_eq!(registry.adaptive_limits().config(), &config);
+    }
+
+    /// The adaptive limit is off by default (issue #1836).
+    #[test]
+    fn worker_config_adaptive_limit_is_off_by_default() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.adaptive_limit.default_policy(), None);
+        assert!(config.adaptive_limit.overrides().is_empty());
     }
 
     /// The retry budget is on by default (issue #1793).

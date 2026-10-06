@@ -10,6 +10,9 @@ Issue #1819 adds two tools:
 
 Neither tool replaces the Docker-backed integration tests. A model checks the
 design. The integration tests check that the SQL implements it.
+[`simulation.md`](simulation.md) covers a seeded harness that checks the
+`ActivityClaim` invariants on an oracle. A differential test checks the
+oracle against Postgres.
 [`concurrency-model-checking.md`](concurrency-model-checking.md) covers loom
 and Shuttle, which check in-process concurrency.
 

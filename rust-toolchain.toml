@@ -1,15 +1,17 @@
 # Pinned Rust toolchain for this workspace.
 #
-# `dtolnay/rust-toolchain@stable` in CI runs `rustup default`, and rustup
-# gives this file precedence over the default. Every CI job and every local
-# build therefore compiles, formats and lints with the same release. A new
+# `dtolnay/rust-toolchain` with `toolchain: stable` in CI runs `rustup
+# default`, and rustup gives this file precedence over the default. Every CI
+# job and every local build therefore compiles, formats and lints with the
+# same release. A new
 # stable release moves CI only when this file changes, so new clippy lints
 # arrive as one reviewed PR instead of breaking every open branch at once
 # (as Rust 1.99 did on 2026-10-01).
 #
 # Jobs that need another release override this file explicitly: the MSRV job
-# sets `RUSTUP_TOOLCHAIN=1.88.0`, and the fuzz job calls `cargo +nightly`. The
-# MSRV itself is `rust-version` in Cargo.toml, not this file.
+# sets `RUSTUP_TOOLCHAIN=1.88.0`, and the fuzz jobs call `cargo +<nightly>`
+# with the nightly that `fuzz-nightly.yml` pins. The MSRV itself is
+# `rust-version` in Cargo.toml, not this file.
 [toolchain]
 channel = "1.99.0"
 components = ["rustfmt", "clippy"]
