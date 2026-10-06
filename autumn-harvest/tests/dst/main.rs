@@ -63,11 +63,7 @@ fn pre_fix_guard_reproduces_issue_1789() {
         .iter()
         .find(|record| record.step == violation.step)
         .expect("the violating step is a store operation");
-    assert!(
-        matches!(step.op, dst::Op::Complete { .. }),
-        "{:?}",
-        step.op
-    );
+    assert!(matches!(step.op, dst::Op::Complete { .. }), "{:?}", step.op);
     assert_eq!(step.outcome, Outcome::Write(WriteOutcome::Applied));
 
     // The same seed replays to the same trace and the same violation.
@@ -93,7 +89,10 @@ fn claim_epoch_guard_rejects_the_stale_write_on_the_same_seed() {
 fn a_sweep_failure_prints_a_local_replay_command() {
     let failure = dst::sweep(&PRE_FIX_SEEDS, pre_fix).expect_err("the pre-fix sweep fails");
     let text = failure.to_string();
-    assert!(text.contains(&format!("HARVEST_DST_SEED={}", failure.seed)), "{text}");
+    assert!(
+        text.contains(&format!("HARVEST_DST_SEED={}", failure.seed)),
+        "{text}"
+    );
     assert!(text.contains("HARVEST_DST_FENCING=state-only"), "{text}");
     assert!(text.contains("TerminalByCurrentClaim"), "{text}");
 }
@@ -117,9 +116,18 @@ fn distinct_seeds_give_distinct_runs() {
 #[test]
 fn first_divergence_finds_the_first_differing_line() {
     let lines = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
-    assert_eq!(dst::first_divergence(&lines(&["a", "b"]), &lines(&["a", "b"])), None);
-    assert_eq!(dst::first_divergence(&lines(&["a", "b"]), &lines(&["a", "c"])), Some(1));
-    assert_eq!(dst::first_divergence(&lines(&["a"]), &lines(&["a", "b"])), Some(1));
+    assert_eq!(
+        dst::first_divergence(&lines(&["a", "b"]), &lines(&["a", "b"])),
+        None
+    );
+    assert_eq!(
+        dst::first_divergence(&lines(&["a", "b"]), &lines(&["a", "c"])),
+        Some(1)
+    );
+    assert_eq!(
+        dst::first_divergence(&lines(&["a"]), &lines(&["a", "b"])),
+        Some(1)
+    );
 }
 
 #[test]

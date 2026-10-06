@@ -18,18 +18,27 @@ impl SplitMix64 {
     }
 
     /// The next 64 random bits.
-    pub fn next_u64(&mut self) -> u64 {
-        todo!("issue #1830")
+    pub const fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
     }
 
     /// A value in `0..n`. Returns 0 when `n` is 0.
-    pub fn below(&mut self, n: u64) -> u64 {
-        let _ = n;
-        todo!("issue #1830")
+    ///
+    /// The modulo has a small bias. The simulator needs a fixed mapping,
+    /// not a uniform one.
+    pub const fn below(&mut self, n: u64) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        self.next_u64() % n
     }
 
     /// `true` with probability `percent` / 100.
-    pub fn chance(&mut self, percent: u64) -> bool {
+    pub const fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
     }
 }

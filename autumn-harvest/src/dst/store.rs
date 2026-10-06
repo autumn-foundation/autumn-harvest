@@ -34,8 +34,10 @@ impl Fencing {
     ///
     /// Returns a message that names the accepted values.
     pub fn parse(name: &str) -> Result<Self, String> {
-        let _ = name;
-        todo!("issue #1830")
+        [Self::ClaimEpoch, Self::StateOnly]
+            .into_iter()
+            .find(|fencing| fencing.as_str() == name)
+            .ok_or_else(|| format!("unknown fencing {name:?}: use claim-epoch or state-only"))
     }
 }
 
@@ -194,8 +196,29 @@ pub enum Outcome {
 
 impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!("issue #1830")
+        match self {
+            Self::Beat => f.write_str("ok"),
+            Self::Claimed(None) => f.write_str("none"),
+            Self::Claimed(Some(claim)) => write!(f, "claimed a{}", claim.attempt),
+            Self::Write(WriteOutcome::Applied) => f.write_str("applied"),
+            Self::Write(WriteOutcome::LeaseLost) => f.write_str("lease-lost"),
+            Self::Orphans(orphans) => {
+                f.write_str("orphans [")?;
+                for (i, orphan) in orphans.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(
+                        f,
+                        "t{} {} s{}",
+                        orphan.task, orphan.worker, orphan.crash_strikes
+                    )?;
+                }
+                f.write_str("]")
+            }
+            Self::Requeued(true) => f.write_str("requeued"),
+            Self::Requeued(false) => f.write_str("kept"),
+        }
     }
 }
 
@@ -235,12 +258,110 @@ impl OracleStore {
             beats: BTreeMap::new(),
         }
     }
+
+    /// `NOT EXISTS` a liveness row newer than `now_ms - stale_after_ms`.
+    fn is_dead(&self, worker: &str, now_ms: u64) -> bool {
+        self.beats
+            .get(worker)
+            .is_none_or(|beat| beat.saturating_add(self.stale_after_ms) <= now_ms)
+    }
+
+    /// The `WHERE` clause of an owner write.
+    fn accepts(&self, claim: &Claim) -> bool {
+        let row = &self.rows[claim.task];
+        let running = row.state == TaskState::Running;
+        match self.fencing {
+            Fencing::ClaimEpoch => {
+                running
+                    && row.worker.as_deref() == Some(claim.worker.as_str())
+                    && row.attempt == claim.attempt
+            }
+            Fencing::StateOnly => running,
+        }
+    }
+
+    /// `claim_task`: `PENDING` to `RUNNING`, set `worker_id`, add 1 to
+    /// `attempt`.
+    fn claim(&mut self, worker: &str, task: usize) -> Outcome {
+        let row = &mut self.rows[task];
+        if row.state != TaskState::Pending {
+            return Outcome::Claimed(None);
+        }
+        row.state = TaskState::Running;
+        row.worker = Some(worker.to_string());
+        row.attempt += 1;
+        Outcome::Claimed(Some(Claim {
+            task,
+            worker: worker.to_string(),
+            attempt: row.attempt,
+        }))
+    }
+
+    /// An owner write. `write` changes the row when the guard matches.
+    fn owner_write(&mut self, claim: &Claim, write: impl FnOnce(&mut Row)) -> Outcome {
+        if !self.accepts(claim) {
+            return Outcome::Write(WriteOutcome::LeaseLost);
+        }
+        write(&mut self.rows[claim.task]);
+        Outcome::Write(WriteOutcome::Applied)
+    }
+
+    /// `orphaned_running_tasks_query` with the time bound to `now_ms`.
+    fn scan(&self, now_ms: u64) -> Outcome {
+        let orphans = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.state == TaskState::Running)
+            .filter_map(|(task, row)| {
+                let worker = row.worker.as_deref()?;
+                self.is_dead(worker, now_ms).then(|| Orphan {
+                    task,
+                    worker: worker.to_string(),
+                    crash_strikes: row.crash_strikes,
+                })
+            })
+            .collect();
+        Outcome::Orphans(orphans)
+    }
+
+    /// `requeue_orphan_stmt`. It keeps `attempt` and `heartbeat_details`.
+    fn requeue(&mut self, orphan: &Orphan, now_ms: u64) -> Outcome {
+        let dead = self.is_dead(&orphan.worker, now_ms);
+        let row = &mut self.rows[orphan.task];
+        let matches = row.state == TaskState::Running
+            && row.worker.as_deref() == Some(orphan.worker.as_str())
+            && row.crash_strikes == orphan.crash_strikes;
+        if !(matches && dead) {
+            return Outcome::Requeued(false);
+        }
+        row.state = TaskState::Pending;
+        row.worker = None;
+        row.crash_strikes = orphan.crash_strikes + 1;
+        Outcome::Requeued(true)
+    }
 }
 
 impl ClaimStore for OracleStore {
     fn apply(&mut self, op: &Op) -> Outcome {
-        let _ = op;
-        todo!("issue #1830")
+        match op {
+            Op::Beat { worker, at_ms } => {
+                self.beats.insert(worker.clone(), *at_ms);
+                Outcome::Beat
+            }
+            Op::Claim { worker, task } => self.claim(worker, *task),
+            Op::Start { claim } => self.owner_write(claim, |_| {}),
+            Op::Heartbeat { claim, tag } => {
+                self.owner_write(claim, |row| row.heartbeat = Some(*tag))
+            }
+            Op::Complete { claim, tag } => self.owner_write(claim, |row| {
+                row.state = TaskState::Completed;
+                row.output = Some(*tag);
+                row.heartbeat = None;
+            }),
+            Op::Scan { now_ms } => self.scan(*now_ms),
+            Op::Requeue { orphan, now_ms } => self.requeue(orphan, *now_ms),
+        }
     }
 
     fn rows(&self) -> Vec<Row> {
@@ -315,7 +436,11 @@ mod tests {
             worker: "w2".to_string(),
             task: 1,
         });
-        assert_eq!(again, Outcome::Claimed(None), "a running row is not claimable");
+        assert_eq!(
+            again,
+            Outcome::Claimed(None),
+            "a running row is not claimable"
+        );
     }
 
     #[test]
@@ -474,7 +599,10 @@ mod tests {
             "claimed a3"
         );
         assert_eq!(Outcome::Write(WriteOutcome::Applied).to_string(), "applied");
-        assert_eq!(Outcome::Write(WriteOutcome::LeaseLost).to_string(), "lease-lost");
+        assert_eq!(
+            Outcome::Write(WriteOutcome::LeaseLost).to_string(),
+            "lease-lost"
+        );
         assert_eq!(Outcome::Requeued(true).to_string(), "requeued");
         assert_eq!(Outcome::Requeued(false).to_string(), "kept");
         assert_eq!(Outcome::Orphans(Vec::new()).to_string(), "orphans []");

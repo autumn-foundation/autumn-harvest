@@ -66,7 +66,11 @@ pub struct Violation {
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at step {}: {}", self.invariant, self.step, self.detail)
+        write!(
+            f,
+            "{} at step {}: {}",
+            self.invariant, self.step, self.detail
+        )
     }
 }
 
@@ -106,14 +110,12 @@ impl Ghost {
 
     /// Claim `seq` now holds `task`.
     pub fn claimed(&mut self, task: usize, seq: u64) {
-        let _ = (task, seq);
-        todo!("issue #1830")
+        self.holders[task] = Some(seq);
     }
 
     /// The reclaimer moved `task` back to `PENDING`.
     pub fn requeued(&mut self, task: usize) {
-        let _ = task;
-        todo!("issue #1830")
+        self.holders[task] = None;
     }
 
     /// Record an owner write by claim `seq` and return what it broke.
@@ -124,14 +126,48 @@ impl Ghost {
         seq: u64,
         outcome: WriteOutcome,
     ) -> Vec<(Invariant, String)> {
-        let _ = (kind, task, seq, outcome);
-        todo!("issue #1830")
+        let mut found = Vec::new();
+        if outcome == WriteOutcome::LeaseLost {
+            return found;
+        }
+        let holder = self.holders[task];
+        if holder != Some(seq) {
+            let detail = format!(
+                "{kind:?} by claim #{seq} took effect on t{task}, held by {}",
+                holder.map_or_else(|| "no claim".to_string(), |h| format!("claim #{h}"))
+            );
+            found.push((Invariant::OwnerWritesByCurrentClaim, detail.clone()));
+            match kind {
+                WriteKind::Start => {}
+                WriteKind::Heartbeat => found.push((Invariant::HeartbeatByCurrentClaim, detail)),
+                WriteKind::Complete => found.push((Invariant::TerminalByCurrentClaim, detail)),
+            }
+        }
+        if kind == WriteKind::Complete {
+            self.holders[task] = None;
+            self.terminals[task].push(seq);
+            if self.terminals[task].len() > 1 {
+                let detail = format!("t{task} has terminal writes by {:?}", self.terminals[task]);
+                found.push((Invariant::AtMostOneTerminal, detail));
+            }
+        }
+        found
     }
 
     /// Check that no two live claims share a fencing token.
     pub fn unique_ids(live: &[Live<'_>]) -> Option<(Invariant, String)> {
-        let _ = live;
-        todo!("issue #1830")
+        live.iter().enumerate().find_map(|(i, a)| {
+            live[i + 1..]
+                .iter()
+                .find(|b| b.claim == a.claim && b.seq != a.seq)
+                .map(|b| {
+                    let detail = format!(
+                        "claims #{} and #{} share t{} {} a{}",
+                        a.seq, b.seq, a.claim.task, a.claim.worker, a.claim.attempt
+                    );
+                    (Invariant::ClaimIdsAreUnique, detail)
+                })
+        })
     }
 }
 
@@ -195,7 +231,11 @@ mod tests {
     fn a_second_terminal_write_breaks_at_most_one_terminal() {
         let mut ghost = Ghost::new(1);
         ghost.claimed(0, 1);
-        assert!(ghost.wrote(WriteKind::Complete, 0, 1, WriteOutcome::Applied).is_empty());
+        assert!(
+            ghost
+                .wrote(WriteKind::Complete, 0, 1, WriteOutcome::Applied)
+                .is_empty()
+        );
         ghost.claimed(0, 2);
         let found = ghost.wrote(WriteKind::Complete, 0, 2, WriteOutcome::Applied);
         assert_eq!(names(&found), [Invariant::AtMostOneTerminal]);
@@ -209,8 +249,17 @@ mod tests {
             attempt: 1,
         };
         let b = a.clone();
-        let other_task = Claim { task: 1, ..a.clone() };
-        let ok = [Live { claim: &a, seq: 1 }, Live { claim: &other_task, seq: 2 }];
+        let other_task = Claim {
+            task: 1,
+            ..a.clone()
+        };
+        let ok = [
+            Live { claim: &a, seq: 1 },
+            Live {
+                claim: &other_task,
+                seq: 2,
+            },
+        ];
         assert_eq!(Ghost::unique_ids(&ok), None);
         let bad = [Live { claim: &a, seq: 1 }, Live { claim: &b, seq: 3 }];
         let found = Ghost::unique_ids(&bad).map(|(invariant, _)| invariant);

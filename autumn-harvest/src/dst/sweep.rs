@@ -43,8 +43,10 @@ impl fmt::Display for Nondeterminism {
 /// Returns `None` when they are equal.
 #[must_use]
 pub fn first_divergence(a: &[String], b: &[String]) -> Option<usize> {
-    let _ = (a, b);
-    todo!("issue #1830")
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .or_else(|| (a.len() != b.len()).then(|| a.len().min(b.len())))
 }
 
 /// Run `config` twice and compare the traces and the operation logs.
@@ -53,8 +55,26 @@ pub fn first_divergence(a: &[String], b: &[String]) -> Option<usize> {
 ///
 /// Returns [`Nondeterminism`] when the two runs differ.
 pub fn run_twice(config: &SimConfig) -> Result<SimReport, Nondeterminism> {
-    let _ = config;
-    todo!("issue #1830")
+    let first = run(config);
+    let second = run(config);
+    if let Some(line) = first_divergence(&first.trace, &second.trace) {
+        let at = |trace: &[String]| trace.get(line).cloned().unwrap_or_default();
+        return Err(Nondeterminism {
+            seed: config.seed,
+            line,
+            first: at(&first.trace),
+            second: at(&second.trace),
+        });
+    }
+    if first != second {
+        return Err(Nondeterminism {
+            seed: config.seed,
+            line: first.trace.len(),
+            first: "equal trace, different operation log or stats".to_string(),
+            second: String::new(),
+        });
+    }
+    Ok(first)
 }
 
 /// The seeds of a sweep.
@@ -81,8 +101,25 @@ impl SeedPlan {
         base: Option<&str>,
         default_count: u64,
     ) -> Result<Self, String> {
-        let _ = (seed, seeds, base, default_count);
-        todo!("issue #1830")
+        let number = |name: &str, value: Option<&str>| -> Result<Option<u64>, String> {
+            value
+                .map(|text| {
+                    text.trim()
+                        .parse::<u64>()
+                        .map_err(|error| format!("{name}={text:?} is not a decimal u64: {error}"))
+                })
+                .transpose()
+        };
+        if let Some(seed) = number(SEED_VAR, seed)? {
+            return Ok(Self {
+                first: seed,
+                count: 1,
+            });
+        }
+        Ok(Self {
+            first: number(SEED_BASE_VAR, base)?.unwrap_or(0),
+            count: number(SEEDS_VAR, seeds)?.unwrap_or(default_count),
+        })
     }
 
     /// Build a plan from [`SEED_VAR`], [`SEEDS_VAR`] and [`SEED_BASE_VAR`].
@@ -121,8 +158,11 @@ pub fn fencing_from_env() -> Result<Fencing, String> {
 /// The shell command that replays `seed` locally.
 #[must_use]
 pub fn repro_command(seed: u64, fencing: Fencing) -> String {
-    let _ = (seed, fencing);
-    todo!("issue #1830")
+    format!(
+        "{SEED_VAR}={seed} {FENCING_VAR}={} cargo test -p autumn-harvest \
+         --no-default-features --test dst replay_one_seed -- --nocapture",
+        fencing.as_str()
+    )
 }
 
 /// A seed that failed a sweep.
@@ -172,6 +212,48 @@ pub fn sweep(
     plan: &SeedPlan,
     config: impl Fn(u64) -> SimConfig,
 ) -> Result<SweepSummary, SweepFailure> {
-    let _ = (plan, config, run);
-    todo!("issue #1830")
+    let mut summary = SweepSummary::default();
+    for seed in plan.seeds() {
+        let config = config(seed);
+        let fencing = config.fencing;
+        let report = run_twice(&config).map_err(|error| SweepFailure {
+            seed,
+            fencing,
+            reason: error.to_string(),
+            trace_tail: String::new(),
+        })?;
+        if let Some(violation) = &report.violation {
+            return Err(SweepFailure {
+                seed,
+                fencing,
+                reason: violation.to_string(),
+                trace_tail: report.trace_tail(TAIL_LINES),
+            });
+        }
+        summary.seeds += 1;
+        summary.stats.merge(&report.stats);
+    }
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repro_command_names_the_seed_the_fencing_and_the_test() {
+        let command = repro_command(42, Fencing::StateOnly);
+        assert!(command.starts_with("HARVEST_DST_SEED=42 HARVEST_DST_FENCING=state-only "));
+        assert!(command.contains("--test dst replay_one_seed"), "{command}");
+        assert!(!command.contains('\\'), "one line: {command}");
+    }
+
+    #[test]
+    fn seeds_saturate_at_the_top_of_the_range() {
+        let plan = SeedPlan {
+            first: u64::MAX,
+            count: 5,
+        };
+        assert_eq!(plan.seeds().count(), 0);
+    }
 }
