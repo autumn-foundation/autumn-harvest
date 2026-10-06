@@ -12,6 +12,7 @@
 //!   `harvest.task.quarantined` metric is emitted.
 //! - A task whose worker is still heartbeating is never reclaimed.
 //! - A threshold of 0 disables quarantine (legacy requeue-forever behaviour).
+//! - A row that another session locks does not stall the pass (issue #1876).
 
 use std::sync::Mutex;
 
@@ -67,14 +68,19 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
         .start()
         .await
         .expect("postgres start");
-    let host = container.get_host().await.expect("host");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
-    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut conn = connect(&container).await;
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
     (conn, container)
+}
+
+/// Open a new session on the database in `container`.
+async fn connect(container: &ContainerAsync<Postgres>) -> AsyncPgConnection {
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
+    AsyncPgConnection::establish(&url).await.expect("connect")
 }
 
 /// Insert a RUNNING workflow execution and return its id.
@@ -805,4 +811,229 @@ struct FailRow {
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
+}
+
+// Issue #1876: a row lock held by another session must not stall the pass.
+// A partitioned worker can leave its transaction open on the server. That
+// session keeps its row locks until the server ends it. The pass must skip
+// such a row, reclaim the other rows, and retry the skipped row later.
+
+/// The longest time a pass may take when one of its rows is locked.
+const NO_STALL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Lock row `id` of `table` in an open transaction on a new session.
+///
+/// The session stands in for a partitioned worker. Run `ROLLBACK` on it to
+/// release the lock.
+async fn hold_row_lock(
+    container: &ContainerAsync<Postgres>,
+    table: &str,
+    id: Uuid,
+) -> AsyncPgConnection {
+    let mut zombie = connect(container).await;
+    zombie.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(format!("SELECT 1 FROM {table} WHERE id = $1 FOR UPDATE"))
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .execute(&mut zombie)
+        .await
+        .expect("lock the row");
+    zombie
+}
+
+/// Run one pass, and fail the test if the pass waits on a row lock.
+async fn reclaim_without_stall(
+    conn: &mut AsyncPgConnection,
+    threshold: i32,
+    stuck_running_secs: Option<i64>,
+    metrics: &RecordingMetrics,
+) -> autumn_harvest::poison_pill::ReclaimSummary {
+    tokio::time::timeout(
+        NO_STALL,
+        reclaim_orphaned_tasks(
+            conn,
+            threshold,
+            10,
+            stuck_running_secs,
+            metrics,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        ),
+    )
+    .await
+    .expect("a locked row must not stall the pass (issue #1876)")
+    .expect("reclaim")
+}
+
+async fn dead_letter_count(conn: &mut AsyncPgConnection) -> i64 {
+    diesel::sql_query("SELECT COUNT(*)::bigint AS count FROM harvest_dead_letters")
+        .get_result::<CountRow>(conn)
+        .await
+        .expect("count dead letters")
+        .count
+}
+
+#[tokio::test]
+async fn locked_orphan_does_not_stall_the_requeue_of_other_orphans() {
+    let (mut conn, container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-locked-requeue").await;
+    let locked = insert_running_task(&mut conn, Some(exec_id), "dead-worker-locked", 0).await;
+    let free = insert_running_task(&mut conn, Some(exec_id), "dead-worker-locked", 0).await;
+    let mut zombie = hold_row_lock(&container, "harvest_task_queue", locked).await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(summary.requeued, 1, "the free orphan is requeued");
+    assert_eq!(task_state(&mut conn, free).await.0, "PENDING");
+    let (state, strikes, worker) = task_state(&mut conn, locked).await;
+    assert_eq!(state, "RUNNING", "the locked orphan is skipped");
+    assert_eq!(strikes, 0, "a skipped orphan gets no crash strike");
+    assert_eq!(worker.as_deref(), Some("dead-worker-locked"));
+
+    zombie.batch_execute("ROLLBACK").await.expect("release");
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(
+        summary.requeued, 1,
+        "the next pass requeues the skipped orphan"
+    );
+    assert_eq!(
+        task_state(&mut conn, locked).await,
+        ("PENDING".to_owned(), 1, None)
+    );
+}
+
+#[tokio::test]
+async fn locked_orphan_does_not_stall_the_quarantine_of_other_orphans() {
+    let (mut conn, container) = setup_db().await;
+    // Each orphan has its own execution. A quarantine fails every open task of
+    // its execution, so a shared execution would touch the locked row too.
+    let locked_exec = insert_running_workflow(&mut conn, "wf-locked-quarantine").await;
+    let free_exec = insert_running_workflow(&mut conn, "wf-free-quarantine").await;
+    let locked = insert_running_task(&mut conn, Some(locked_exec), "dead-worker-q", 2).await;
+    let free = insert_running_task(&mut conn, Some(free_exec), "dead-worker-q", 2).await;
+    let mut zombie = hold_row_lock(&container, "harvest_task_queue", locked).await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(summary.quarantined, 1, "the free orphan is quarantined");
+    assert_eq!(task_state(&mut conn, free).await.0, "FAILED");
+    assert_eq!(workflow_state(&mut conn, free_exec).await, "FAILED");
+    let (state, strikes, _) = task_state(&mut conn, locked).await;
+    assert_eq!(state, "RUNNING", "the locked orphan is skipped");
+    assert_eq!(strikes, 2, "a skipped orphan gets no crash strike");
+    assert_eq!(workflow_state(&mut conn, locked_exec).await, "RUNNING");
+
+    zombie.batch_execute("ROLLBACK").await.expect("release");
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(
+        summary.quarantined, 1,
+        "the next pass quarantines the skipped orphan"
+    );
+    assert_eq!(task_state(&mut conn, locked).await.0, "FAILED");
+    assert_eq!(dead_letter_count(&mut conn).await, 2);
+}
+
+#[tokio::test]
+async fn locked_stuck_task_does_not_stall_the_stuck_running_backstop() {
+    let (mut conn, container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-locked-stuck").await;
+    let age = chrono::Duration::hours(1);
+    let locked =
+        insert_running_task_of_type(&mut conn, Some(exec_id), "live-worker-l", "workflow", age)
+            .await;
+    let free =
+        insert_running_task_of_type(&mut conn, Some(exec_id), "live-worker-l", "workflow", age)
+            .await;
+    insert_live_worker(&mut conn, "live-worker-l").await;
+    let mut zombie = hold_row_lock(&container, "harvest_task_queue", locked).await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_without_stall(&mut conn, 3, Some(60), &metrics).await;
+
+    assert_eq!(summary.stuck_requeued, 1, "the free stuck task is requeued");
+    assert_eq!(task_state(&mut conn, free).await.0, "PENDING");
+    assert_eq!(task_state(&mut conn, locked).await.0, "RUNNING");
+
+    zombie.batch_execute("ROLLBACK").await.expect("release");
+    let summary = reclaim_without_stall(&mut conn, 3, Some(60), &metrics).await;
+
+    assert_eq!(
+        summary.stuck_requeued, 1,
+        "the next pass requeues the skipped task"
+    );
+    assert_eq!(task_state(&mut conn, locked).await.0, "PENDING");
+}
+
+/// A quarantine also locks the owning execution row. A `lock_timeout` on that
+/// lock must skip the orphan, not end the pass.
+#[tokio::test]
+async fn lock_timeout_on_one_orphan_does_not_end_the_pass() {
+    let (mut conn, container) = setup_db().await;
+    let locked_exec = insert_running_workflow(&mut conn, "wf-locked-exec").await;
+    let free_exec = insert_running_workflow(&mut conn, "wf-free-exec").await;
+    let blocked = insert_running_task(&mut conn, Some(locked_exec), "dead-worker-x", 2).await;
+    let free = insert_running_task(&mut conn, Some(free_exec), "dead-worker-x", 2).await;
+    let mut zombie = hold_row_lock(&container, "harvest_workflow_executions", locked_exec).await;
+    // A short stand-in for the 30 s `lock_timeout` of `DbRole::Scanner`.
+    conn.batch_execute("SET lock_timeout = '200ms'")
+        .await
+        .expect("set lock_timeout");
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(summary.quarantined, 1, "the free orphan is quarantined");
+    assert_eq!(task_state(&mut conn, free).await.0, "FAILED");
+    let (state, strikes, _) = task_state(&mut conn, blocked).await;
+    assert_eq!(state, "RUNNING", "the timed-out quarantine rolls back");
+    assert_eq!(strikes, 2);
+    assert_eq!(
+        dead_letter_count(&mut conn).await,
+        1,
+        "no dead letter survives the rollback"
+    );
+
+    zombie.batch_execute("ROLLBACK").await.expect("release");
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(
+        summary.quarantined, 1,
+        "the next pass quarantines the skipped orphan"
+    );
+    assert_eq!(task_state(&mut conn, blocked).await.0, "FAILED");
+    assert_eq!(workflow_state(&mut conn, locked_exec).await, "FAILED");
+}
+
+/// A quarantine fails every open task of its execution. A sibling task that
+/// another session locks must skip the orphan, not stall or end the pass.
+#[tokio::test]
+async fn locked_sibling_skips_the_quarantine_of_its_execution() {
+    let (mut conn, container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-locked-sibling").await;
+    let orphan = insert_running_task(&mut conn, Some(exec_id), "dead-worker-s", 2).await;
+    let sibling = insert_running_task(&mut conn, Some(exec_id), "dead-worker-s", 2).await;
+    let mut zombie = hold_row_lock(&container, "harvest_task_queue", sibling).await;
+    // A short stand-in for the 30 s `lock_timeout` of `DbRole::Scanner`.
+    conn.batch_execute("SET lock_timeout = '200ms'")
+        .await
+        .expect("set lock_timeout");
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(summary.quarantined, 0, "the sibling lock skips the orphan");
+    assert_eq!(task_state(&mut conn, orphan).await.0, "RUNNING");
+    assert_eq!(task_state(&mut conn, sibling).await.0, "RUNNING");
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
+    assert_eq!(dead_letter_count(&mut conn).await, 0);
+
+    zombie.batch_execute("ROLLBACK").await.expect("release");
+    let summary = reclaim_without_stall(&mut conn, 3, None, &metrics).await;
+
+    assert_eq!(summary.quarantined, 1, "one quarantine fails the execution");
+    assert_eq!(task_state(&mut conn, orphan).await.0, "FAILED");
+    assert_eq!(task_state(&mut conn, sibling).await.0, "FAILED");
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");
 }
