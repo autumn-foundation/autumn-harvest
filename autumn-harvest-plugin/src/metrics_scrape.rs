@@ -28,7 +28,9 @@
 //! on every tick with their results silently discarded. It also aggregates the
 //! four broker-connector families (issue #944), which are not sampler-adjacent
 //! but do back shipped dashboard panels — leaving those to the no-op default
-//! would make a dropped metric indistinguishable from an idle consumer. Every
+//! would make a dropped metric indistinguishable from an idle consumer. It
+//! also aggregates `harvest.api.rate_limited` from the plugin's own API rate
+//! limiter (issue #1827). Every
 //! other `MetricsRecorder` method keeps the trait's no-op default — an embedder
 //! who needs the full metric surface (e.g. `harvest.workflow.terminal`,
 //! `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`,

@@ -5469,7 +5469,10 @@ impl StandaloneAdminAuth {
     /// for mutating routes and one for read routes. See
     /// [`crate::api_rate_limit`].
     #[must_use]
-    pub fn with_rate_limit(mut self, rate_limit: crate::api_rate_limit::ApiRateLimit) -> Self {
+    pub const fn with_rate_limit(
+        mut self,
+        rate_limit: crate::api_rate_limit::ApiRateLimit,
+    ) -> Self {
         self.rate_limit = Some(rate_limit);
         self
     }

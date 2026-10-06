@@ -627,7 +627,10 @@ impl HarvestPlugin {
     ///
     /// Default off: with no limiter the router is byte-for-byte unchanged.
     #[must_use]
-    pub fn with_api_rate_limit(mut self, rate_limit: crate::api_rate_limit::ApiRateLimit) -> Self {
+    pub const fn with_api_rate_limit(
+        mut self,
+        rate_limit: crate::api_rate_limit::ApiRateLimit,
+    ) -> Self {
         self.api_rate_limit = Some(rate_limit);
         self
     }

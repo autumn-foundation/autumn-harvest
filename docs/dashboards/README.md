@@ -192,7 +192,9 @@ samples the same shared DB-derived value (`harvest_queue_depth`,
 per-key concurrency / rate-limit gauges) — aggregate with `max`, never `sum`, to avoid replica
 double-counting. **Replica-local** gauges, where each replica owns its own
 value (`harvest_worker_slots_in_use` / `_available`), sum correctly across
-the fleet; the per-replica slot panels legend the `instance` label instead.
+the fleet; the per-replica slot panels legend the `instance` label instead. The API
+rate limiter keeps its buckets per replica, so `harvest_api_rate_limited_total`
+sums across the fleet (issue #1827).
 
 ## Lint Validation
 

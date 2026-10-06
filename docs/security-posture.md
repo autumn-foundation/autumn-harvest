@@ -370,6 +370,8 @@ identically to a route-minted one (shared core hashing helper).
   `enable_api_tokens()` as the only auth, any `hvst_` bearer triggers one indexed
   lookup before authentication (inherent to any bearer scheme). Front the API
   with a per-source rate-limiting proxy to bound unauthenticated lookup floods.
+  The built-in [API rate limiter](#api-rate-limiting) runs after this lookup,
+  so it does not bound these floods.
 - **Rotation needs `admin`.** `harvest token rotate` mints through
   `POST /admin/tokens`, so only an `admin` token can rotate.
 - **A compromised `admin` token can mint replacement tokens.** Give `admin` to
@@ -505,6 +507,111 @@ A deny row costs one insert. A token scope deny comes only from a valid token,
 so its author is known. The hook can also deny a caller with no credential.
 For such a request, return `Allow` and let `require_admin` answer `401` with
 no audit write. Keep the rate-limiting proxy advice above.
+
+---
+
+## API rate limiting
+
+Issue #1827. One client or one leaked token can flood the start, signal and
+query routes (OWASP API4, Unrestricted Resource Consumption). Harvest has an
+optional in-process rate limiter for the management API. It is off by default.
+**Turn it on in production.**
+
+### Enabling it
+
+```rust
+use autumn_harvest_plugin::api_rate_limit::{ApiRateLimit, BucketRate};
+
+// Plugin mount.
+let plugin = HarvestPlugin::new(/* … */)
+    .enable_api_tokens()
+    .with_api_rate_limit(ApiRateLimit::default());
+
+// Standalone mount.
+let auth = StandaloneAdminAuth::new()
+    .with_api_tokens()
+    .with_rate_limit(ApiRateLimit::new(
+        BucketRate::per_second(10).with_burst(20), // mutating routes
+        BucketRate::per_second(50).with_burst(100), // read routes
+    ));
+```
+
+`ApiRateLimit::default()` allows 20 mutating requests a second (burst 40) and
+100 read requests a second (burst 200) for each client.
+
+### How it counts
+
+- **Client.** A verified API token is the client. Without a token, the
+  client IP address is the client. An IPv6 address counts by its /64 prefix.
+- **Buckets.** Each client has one token bucket for mutating routes and one
+  for read routes. Reads cannot use up the budget for writes.
+- **Route class.** The class comes from `CLASSIFIED_ROUTES`. A route with no
+  class, such as a Vantage page, counts by its method. `GET` and `HEAD` are
+  reads.
+- **Exempt.** `PublicSafe` routes, such as the health probes, and `OPTIONS`
+  requests are never limited.
+- **Answer.** A client over its limit gets `429 Too Many Requests` with a
+  `Retry-After` header in whole seconds. The value is never zero. The body is
+  `{"error": "rate limited", "route_class", "retry_after_secs"}`.
+
+### Layer order
+
+The limiter runs directly inside the token layer. It keys a bucket on the
+verified token id, so a random `hvst_` bearer cannot open a new bucket. It
+runs before the read-only, authorizer and `require_admin` layers, so a
+refused request does no more work. The request order is: embedder auth ->
+token layer -> rate limiter -> read-only layer -> authorizer ->
+`require_admin` -> handler.
+
+### Client address
+
+The limiter reads the autumn-web `ClientAddr`. That value applies your
+`[security.trusted_proxies]` settings. Without it, the limiter reads the
+socket peer address. Behind a proxy, configure trusted proxies. Otherwise all
+anonymous callers share the bucket of the proxy address. A request with no
+address at all shares one `unknown` bucket.
+
+### Memory bound
+
+The limiter keeps at most 10,000 buckets. Change the cap with
+`with_max_clients`. At the cap, the limiter first drops idle buckets. A
+bucket is idle when it is full and counts no rejections in a live window. If
+no bucket is idle, each new client shares one overflow bucket per route class.
+
+### Metric and audit
+
+- Each `429` increments `harvest.api.rate_limited`, with the labels
+  `route_class` and `client_kind` (`token`, `ip`, `unknown` or `overflow`).
+  The token id and the address are never labels. See
+  [telemetry](./telemetry.md).
+- Sustained rejections write an `api.rate_limit_sustained` audit row. The
+  default is 100 rejections of one bucket in 60 seconds. Change it with
+  `with_sustained_audit`. The limiter writes at most one row per bucket per
+  window, and at most 100 rows per window in total. The write runs off the
+  request path, so a `429` never waits on the database.
+
+| Column | Value |
+|---|---|
+| `operation` | `api.rate_limit_sustained` |
+| `status` | `failed` |
+| `actor` | `token:{id}` for a token, else `anonymous` |
+| `route_or_command` | `METHOD path` of the request that crossed the threshold |
+| `error_summary` | `rate limit sustained: N rejections in Ws on <class> routes from <client>`. The client is `token <id>`, `ip <address>`, `ip <prefix>/64`, `a client with no address` or `the overflow bucket`. |
+
+### Limits
+
+- **Per replica.** Each replica keeps its own buckets. With N replicas, a
+  client can send N times the limit. For one fleet-wide limit, also turn on
+  the autumn-web `[security.rate_limit]` layer with its Redis backend.
+- **Invalid tokens.** The token layer rejects an unknown `hvst_` bearer with
+  `401` before the limiter runs. Each such request still costs one token
+  lookup. Keep the rate-limiting proxy advice in
+  [operational caveats](#operational-caveats).
+- **Scope denies.** The token layer refuses a route outside the token scope
+  with `403` and writes an `authz.deny` row. This also happens before the
+  limiter runs.
+- **Other surfaces.** The limiter covers the management API and Vantage. It
+  does not cover the MCP tool routes or webhook receivers.
 
 ---
 
@@ -917,7 +1024,14 @@ Authentication middleware applies uniformly across all shards because it wraps
 the router layer, not individual handlers. No extra configuration is needed for
 multi-shard deployments.
 
-### 6. Payloads that carry PII are encrypted
+### 6. The API rate limiter is on
+
+Turn on the [API rate limiter](#api-rate-limiting) with
+`with_api_rate_limit` or `StandaloneAdminAuth::with_rate_limit`. Configure
+`[security.trusted_proxies]` when a proxy fronts the API. Check that a burst
+from one client gets `429` with `Retry-After`.
+
+### 7. Payloads that carry PII are encrypted
 
 If a workflow carries PII or secrets, register an `AeadCodec` with
 `aead_payload_codec_key`. Load the key from a `KeyProvider`, never from

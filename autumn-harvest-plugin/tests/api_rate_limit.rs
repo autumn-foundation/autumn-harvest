@@ -22,7 +22,7 @@ const START: &str = "/api/harvest/workflows/billing/start";
 const READ: &str = "/api/harvest/workflows/registered";
 
 /// Ten mutating and ten read requests a second, with a burst of ten.
-fn ten_per_second() -> ApiRateLimit {
+const fn ten_per_second() -> ApiRateLimit {
     ApiRateLimit::new(BucketRate::per_second(10), BucketRate::per_second(10))
 }
 

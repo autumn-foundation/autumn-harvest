@@ -129,7 +129,7 @@ fn limited_app(pool: &DbPool, metrics: Arc<CapturingMetrics>, limit: ApiRateLimi
         .mount(harvest_api_router(state.clone()), &state)
 }
 
-fn ten_per_second() -> ApiRateLimit {
+const fn ten_per_second() -> ApiRateLimit {
     ApiRateLimit::new(BucketRate::per_second(10), BucketRate::per_second(10))
 }
 

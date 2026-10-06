@@ -220,11 +220,11 @@ pub(crate) struct ApiRateLimiter {
 #[derive(Debug)]
 struct Inner {
     config: ApiRateLimit,
-    state: Mutex<Buckets>,
+    state: Mutex<LimiterState>,
 }
 
 #[derive(Debug, Default)]
-struct Buckets {
+struct LimiterState {
     buckets: HashMap<(ClientKey, LimitClass), Bucket>,
     /// The last time a full map was pruned. Pruning walks every bucket, so it
     /// runs at most once per [`PRUNE_INTERVAL`].
@@ -301,14 +301,16 @@ impl Bucket {
         Some(self.window_rejections)
     }
 
-    /// A full bucket past its window holds no state worth keeping.
+    /// A full bucket holds no state worth keeping, unless it counts
+    /// rejections in a live window.
     fn is_idle(&self, rate: BucketRate, now: Instant, window: Duration) -> bool {
         self.tokens_at(rate, now) >= f64::from(rate.burst)
-            && now.saturating_duration_since(self.window_start) >= window
+            && (self.window_rejections == 0
+                || now.saturating_duration_since(self.window_start) >= window)
     }
 }
 
-impl Buckets {
+impl LimiterState {
     /// The key to charge. At the bucket cap, a new client is charged to the
     /// overflow bucket, unless a prune frees room.
     fn admit(
@@ -346,6 +348,7 @@ impl Buckets {
             self.audits_in_window = 0;
         }
         if self.audits_in_window >= MAX_SUSTAINED_AUDITS_PER_WINDOW {
+            // Count one past the cap, so the warning logs once per window.
             if self.audits_in_window == MAX_SUSTAINED_AUDITS_PER_WINDOW {
                 tracing::warn!(
                     budget = MAX_SUSTAINED_AUDITS_PER_WINDOW,
@@ -365,7 +368,7 @@ impl ApiRateLimiter {
         Self {
             inner: Arc::new(Inner {
                 config,
-                state: Mutex::new(Buckets::default()),
+                state: Mutex::new(LimiterState::default()),
             }),
         }
     }
@@ -398,6 +401,7 @@ impl ApiRateLimiter {
         let sustained = bucket
             .count_rejection(now, config.sustained_rejections, config.sustained_window)
             .filter(|_| state.take_audit(now, config.sustained_window));
+        drop(state);
         Decision::Reject {
             key,
             retry_after_secs,
@@ -444,9 +448,8 @@ pub(crate) fn limit_class(method: &Method, path: &str) -> Option<LimitClass> {
     match crate::api::classified_route(method, path) {
         Some(RouteClass::PublicSafe) => None,
         Some(RouteClass::ReadOnly) => Some(LimitClass::Read),
-        Some(RouteClass::Mutating) => Some(LimitClass::Mutating),
         None if matches!(*method, Method::GET | Method::HEAD) => Some(LimitClass::Read),
-        None => Some(LimitClass::Mutating),
+        Some(RouteClass::Mutating) | None => Some(LimitClass::Mutating),
     }
 }
 
@@ -499,7 +502,8 @@ pub(crate) async fn enforce_api_rate_limit(
                     .record_api_rate_limited(class.as_str(), key.kind());
             }
             if let Some(rejections) = sustained {
-                audit_sustained(&api_state, &request, &limiter, key, class, rejections);
+                let window = limiter.config().sustained_window;
+                audit_sustained(&api_state, &request, key, class, rejections, window);
             }
             rate_limited_response(class, retry_after_secs)
         }
@@ -541,14 +545,14 @@ fn describe(key: ClientKey) -> String {
 fn audit_sustained(
     api_state: &HarvestApiState,
     request: &Request,
-    limiter: &ApiRateLimiter,
     key: ClientKey,
     class: LimitClass,
     rejections: u32,
+    window: Duration,
 ) {
     let summary = format!(
         "rate limit sustained: {rejections} rejections in {}s on {} routes from {}",
-        limiter.config().sustained_window.as_secs(),
+        window.as_secs(),
         class.as_str(),
         describe(key),
     );
@@ -834,6 +838,28 @@ mod tests {
             Decision::Allow => panic!("a bucket of one rejects its second request"),
         }
         assert_eq!(limiter.bucket_count(), 1);
+    }
+
+    #[test]
+    fn a_full_bucket_with_no_rejections_is_pruned_inside_its_window() {
+        let limiter = ApiRateLimiter::new(
+            ApiRateLimit::new(BucketRate::per_second(10), BucketRate::per_second(10))
+                .with_max_clients(2)
+                .with_sustained_audit(1, Duration::from_secs(60)),
+        );
+        let start = Instant::now();
+        // Two one-shot clients refill within 0.1 s and never reject.
+        limiter.check(token(), LimitClass::Mutating, start);
+        limiter.check(token(), LimitClass::Mutating, start);
+        let later = start + Duration::from_secs(2);
+        let fresh = token();
+        for _ in 0..10 {
+            limiter.check(fresh, LimitClass::Mutating, later);
+        }
+        match limiter.check(fresh, LimitClass::Mutating, later) {
+            Decision::Reject { key, .. } => assert_eq!(key, fresh, "no overflow after a prune"),
+            Decision::Allow => panic!("a bucket of ten rejects its eleventh request"),
+        }
     }
 
     #[test]
