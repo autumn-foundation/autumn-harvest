@@ -64,6 +64,26 @@ cluster-wide in-flight count without provisioning a dedicated worker. Share
 the budget across activities by giving them the same `concurrency_key`.
 Inspect live counts with `harvest concurrency status`.
 
+**Adaptive concurrency limits.** A fixed `max_concurrent` needs a number you
+know in advance. When a dependency's capacity is unknown or changes, let the
+worker find the cap. The adaptive limit grows the cap while the handler
+latency stays near its no-load value. It shrinks the cap when the latency
+inflates or retryable failures rise. It is off by default:
+
+```rust
+let limits = AdaptiveLimitConfig::disabled()
+    .with_activity("charge_card", Some(AdaptiveLimitPolicy::new(1, 100)));
+
+WorkerConfig::default().with_adaptive_limit(limits)
+```
+
+The cap is per worker and per activity type. A type at its cap is not
+claimed, so its tasks wait in the queue instead of overloading the
+dependency. Run `cargo run --example adaptive_concurrency_limit` to see the
+cap follow a simulated dependency. See
+[the adaptive-limit runbook](../runbooks/activity-concurrency-limit.md) for
+the policy fields, the metrics and tuning.
+
 **Local activities.** Mark trivial in-process work with
 `#[activity(local = true)]` to skip the task-queue round-trip. Local
 activities still record `LocalActivityScheduled` / `LocalActivityCompleted`
