@@ -1539,6 +1539,35 @@ async fn pruned_markers_leave_a_tombstone_on_every_pool() {
     }
 }
 
+/// A policy update re-ids a retained ramp (issue #1814). The guard can
+/// abort that new generation on another pool. The update then applies the
+/// new base and drops the ramp, so it never installs the aborted generation.
+#[tokio::test]
+async fn a_policy_update_drops_a_retained_ramp_whose_new_generation_was_aborted() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    // This pool missed the first policy fan-out, so it still ramps from A.
+    set_ramp_with_id(&mut conn, uuid::Uuid::new_v4()).await;
+    // The fan-out moved the base to C on another pool. The guard aborted the
+    // new generation there, pruned its markers and left a tombstone here.
+    let fan_out = uuid::Uuid::new_v4();
+    let aborted = ramp_generation_id(fan_out, QUEUE, BUILD_C, BUILD_B);
+    assert!(
+        record_abort_report(&mut conn, QUEUE, aborted)
+            .await
+            .expect("tombstone")
+    );
+
+    // The retried fan-out reaches this pool.
+    let policy = set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, fan_out)
+        .await
+        .expect("policy update");
+    assert_eq!(policy.build_id, BUILD_C, "the new base applies");
+    assert_eq!(policy.target_build_id, None, "the aborted ramp is dropped");
+    assert_eq!(policy.ramp_percent, None);
+    assert_eq!(policy_ramp_id(&mut conn).await, None);
+}
+
 /// A guard can stop after its clear commits and before its report. A later
 /// pass reports that abort once, from the marker, after the report grace.
 #[tokio::test]

@@ -247,6 +247,12 @@ The guard fails safe: when it cannot read, it does not abort.
 - A base-build change through `set_build_policy` keeps an active ramp and
   starts a new step. It gives the ramp a fresh `ramp_id`, so no old marker
   matches it.
+- A policy write never re-ids a kept ramp to a generation that the guard
+  aborted. A retried policy fan-out can reach a pool that the first attempt
+  missed, after the guard aborted the new generation on another pool. That
+  pool then gets the new base and loses the ramp, as the abort decided. The
+  write reads the row's abort markers and the local ledger with its
+  tombstones.
 - Each ramp write and each policy write with a ramp id is idempotent. A row
   that already holds the same write is left as is, and its step stays. So
   two logical shards on one pool cannot split the ramp identity.

@@ -407,6 +407,13 @@ fn ramp_generation_id_sql(id: &str, queue: &str, base: &str, target: &str) -> St
 /// and deployment is left as is, and its step stays. So a retried fan-out, or
 /// two logical shards on one pool, cannot split the ramp identity.
 ///
+/// The write never re-ids a retained ramp to a generation that the ramp
+/// guard aborted. A retried fan-out can reach a pool that the first attempt
+/// missed, after the guard aborted the new generation on another pool. The
+/// write then applies the new base and drops the ramp, as the abort did on
+/// the other pools. The check reads the abort markers of the row and the
+/// report ledger of this database.
+///
 /// # Errors
 ///
 /// Returns `HarvestError::Database` on failure.
@@ -424,13 +431,19 @@ pub async fn set_build_policy_with_ramp_id(
         "EXCLUDED.build_id",
         "harvest_build_policies.target_build_id",
     );
+    let aborted = generation_aborted_sql(&derived);
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "INSERT INTO harvest_build_policies (id, queue_name, build_id, deployment_name) \
          VALUES ($1, $2, $3, $4) \
          ON CONFLICT (queue_name) DO UPDATE \
              SET build_id = EXCLUDED.build_id, \
                  deployment_name = EXCLUDED.deployment_name, \
+                 target_build_id = CASE WHEN {aborted} THEN NULL \
+                                        ELSE harvest_build_policies.target_build_id END, \
+                 ramp_percent = CASE WHEN {aborted} THEN NULL \
+                                     ELSE harvest_build_policies.ramp_percent END, \
                  ramp_id = CASE WHEN harvest_build_policies.target_build_id IS NULL THEN NULL \
+                                WHEN {aborted} THEN NULL \
                                 ELSE {derived} END, \
                  updated_at = NOW() \
              WHERE harvest_build_policies.target_build_id IS NULL \
