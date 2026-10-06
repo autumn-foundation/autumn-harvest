@@ -1000,6 +1000,17 @@ impl PayloadCodecs {
         self.keys_read().keys.keys().cloned().collect()
     }
 
+    /// The registered key ids, sorted, and the active key id, read under one
+    /// lock (issue #1815).
+    ///
+    /// `register_key` changes both under one write lock. Two separate reads can
+    /// see the old key set with the new active key, a pair that never existed.
+    #[must_use]
+    pub fn key_ids(&self) -> (Vec<String>, String) {
+        let guard = self.keys_read();
+        (guard.keys.keys().cloned().collect(), guard.active.clone())
+    }
+
     /// Whether any keyed codec is registered (issue #948).
     ///
     /// `false` on every deployment that has not adopted rotation, which is what
@@ -3538,6 +3549,26 @@ mod tests {
         codecs
             .retire_key_local("k1")
             .expect("retirable once both pins are released");
+    }
+
+    /// Issue #1815: `key_ids` returns the key set and the active key together.
+    #[test]
+    fn key_ids_returns_the_registered_and_active_keys() {
+        let codecs = PayloadCodecs::default();
+        assert_eq!(
+            codecs.key_ids(),
+            (Vec::new(), CODEC_LEGACY_KEY_ID.to_owned())
+        );
+        for key in ["k2", "k1"] {
+            codecs
+                .register_key(key, Arc::new(IdentityCodec))
+                .expect("register a key");
+        }
+        codecs.set_active_key("k2").expect("activate k2");
+        assert_eq!(
+            codecs.key_ids(),
+            (vec!["k1".to_owned(), "k2".to_owned()], "k2".to_owned())
+        );
     }
 
     /// The `any_keys` mirror must be published **under** the map lock.

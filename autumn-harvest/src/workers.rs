@@ -848,15 +848,14 @@ impl OutlierProbe {
                     "default_codec_id".to_owned(),
                     serde_json::json!(codecs.default_codec_id()),
                 );
-                key.insert(
-                    "codec_key_ids".to_owned(),
-                    serde_json::json!(codecs.registered_key_ids()),
-                );
                 // The active key encodes new payloads, so an activation
-                // changes how this worker runs a task.
+                // changes how this worker runs a task. One read gives a pair
+                // that the registry held at one time.
+                let (key_ids, active_key_id) = codecs.key_ids();
+                key.insert("codec_key_ids".to_owned(), serde_json::json!(key_ids));
                 key.insert(
                     "active_codec_key_id".to_owned(),
-                    serde_json::json!(codecs.active_key_id()),
+                    serde_json::json!(active_key_id),
                 );
                 serde_json::Value::Object(key).to_string()
             }
@@ -4225,6 +4224,26 @@ mod tests {
             probe.cohort_key(),
             "an activation changes the cohort"
         );
+    }
+
+    /// Issue #1815: the key set and the active key come from one read.
+    ///
+    /// `register_key` changes both under one write lock. Two reads could pair
+    /// an empty key set with a new active key. Each window clear then restarts
+    /// detection. The race is a few instructions wide, so this checks the
+    /// source rather than timing.
+    #[test]
+    fn the_cohort_key_reads_the_codec_keys_under_one_lock() {
+        let src = include_str!("workers.rs");
+        let start = src
+            .find("pub fn cohort_key(&self)")
+            .expect("cohort_key exists");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("cohort_key ends")];
+        assert!(body.contains("codecs.key_ids()"), "one snapshot read");
+        for split in ["registered_key_ids()", "active_key_id()"] {
+            assert!(!body.contains(split), "no separate read: {split}");
+        }
     }
 
     /// Issue #1815: the heartbeat seeds the window with the cohort at start.
