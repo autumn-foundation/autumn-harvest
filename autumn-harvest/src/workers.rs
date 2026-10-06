@@ -827,9 +827,10 @@ impl OutlierProbe {
     /// The cohort key this tick writes and reads (issue #1815).
     ///
     /// It is [`OutlierProbe::cohort`] with the codecs' registered key ids
-    /// added. A worker cannot decode a payload under a key id it lacks, so
-    /// the ids are part of the cohort. A reload can register or retire a key
-    /// while the worker runs, so they are read now, not at startup.
+    /// and active key id added. A worker cannot decode a payload under a key
+    /// id it lacks, so the ids are part of the cohort. The active key encodes
+    /// new payloads. A reload can register, retire or activate a key while the
+    /// worker runs, so they are read now, not at startup.
     #[must_use]
     pub fn cohort_key(&self) -> String {
         let Some(codecs) = &self.codecs else {
@@ -850,6 +851,12 @@ impl OutlierProbe {
                 key.insert(
                     "codec_key_ids".to_owned(),
                     serde_json::json!(codecs.registered_key_ids()),
+                );
+                // The active key encodes new payloads, so an activation
+                // changes how this worker runs a task.
+                key.insert(
+                    "active_codec_key_id".to_owned(),
+                    serde_json::json!(codecs.active_key_id()),
                 );
                 serde_json::Value::Object(key).to_string()
             }
@@ -4010,6 +4017,33 @@ mod tests {
             ..probe
         };
         assert_eq!(without.cohort_key(), without.cohort);
+    }
+
+    /// Issue #1815: the active key decides which codec encodes new payloads.
+    /// Workers with different active keys are in different cohorts, and an
+    /// activation restarts the window.
+    #[test]
+    fn the_cohort_key_follows_the_active_codec_key() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        for key in ["k1", "k2"] {
+            codecs
+                .register_key(key, std::sync::Arc::new(IdentityCodec))
+                .expect("register a key");
+        }
+        codecs.set_active_key("k1").expect("activate k1");
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        };
+        let on_k1 = probe.cohort_key();
+        codecs.set_active_key("k2").expect("activate k2");
+        assert_ne!(
+            on_k1,
+            probe.cohort_key(),
+            "an activation changes the cohort"
+        );
     }
 
     /// Issue #1815: the heartbeat seeds the window with the cohort at start.

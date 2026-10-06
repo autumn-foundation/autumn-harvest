@@ -90,7 +90,7 @@ heartbeat check only. A worker that was alive but sick passed that check.
   module-host policy, each workflow's effective input cap and DAG
   classification, the declarative query and update handlers, and the workflow
   log policy), the registered payload codec ids and default codec, and
-  the registered codec key ids, which the
+  the registered and active codec key ids, which the
   heartbeat reads on every tick because a reload can change them, with
   fresh stats. The cohort is
   keyed on every claim setting in one place, `workers::CohortPolicy`. Those decide which tasks a worker can claim. A
