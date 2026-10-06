@@ -118,6 +118,19 @@ async fn boundary_mutex_waiter(
     Ok(serde_json::json!("acquired"))
 }
 
+/// Waits for `go`, then for the held mutex in `key`.
+#[workflow]
+async fn boundary_mutex_plain(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    let key = input["key"].as_str().unwrap_or("k").to_string();
+    let guard = ctx.mutex(key).acquire().await.map_err(|e| e.to_string())?;
+    guard.release();
+    Ok(serde_json::json!("acquired"))
+}
+
 /// The database the run pauses itself through, and whether it did so.
 static PAUSE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PAUSE_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -197,6 +210,7 @@ fn registry(policy: WorkflowHistoryPolicy, decisions: Arc<DecisionCount>) -> Arc
                 boundary_mutex_holder_info(),
                 boundary_mutex_waiter_info(),
                 boundary_pause_inline_info(),
+                boundary_mutex_plain_info(),
             ],
             activities![boundary_step],
             autumn_harvest::context::empty_shared_state(),
@@ -556,6 +570,61 @@ async fn a_pause_before_persist_keeps_the_boundary_of_inline_writes() {
         vec![(BUILD_ID.to_string(), worker_id)],
         "{:?}",
         type_names(&events)
+    );
+}
+
+#[tokio::test]
+async fn a_contended_acquire_reserves_no_boundary_against_the_cap() {
+    // The cap estimate counts one event for an acquire, because a grant
+    // writes one. A contended acquire only enqueues and writes nothing. So
+    // the estimate's slot also covers the boundary of a grant, and the
+    // acquire reserves no second slot.
+    //
+    // Under cap 4 the holder's grant leaves 3 events, and its self-wake
+    // counts 3. The waiter's acquire loads 2 events and counts 3, so it
+    // parks. A second slot made it 4, and the cap failed the run.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("mutexcap");
+    let key = format!("k1833-{}", Uuid::new_v4().simple());
+    let policy = boundaries_on().with_event_hard_cap(4);
+    let running = Running::start(&queue, &pool, policy);
+    let mut conn = connect(&url).await;
+    let holder = seed(
+        &mut conn,
+        "boundary_mutex_holder",
+        &queue,
+        serde_json::json!({ "key": key }),
+    )
+    .await;
+    // The grant, then the self-wake that the grant requests.
+    running.wait_parked_after(&mut conn, holder, 2).await;
+    let waiter = seed(
+        &mut conn,
+        "boundary_mutex_plain",
+        &queue,
+        serde_json::json!({ "key": key }),
+    )
+    .await;
+    running.wait_parked_after(&mut conn, waiter, 3).await;
+    autumn_harvest::signal::send_signal(&mut conn, waiter, "go", serde_json::json!(1))
+        .await
+        .expect("send go");
+    running.wait_parked_after(&mut conn, waiter, 4).await;
+    running.stop().await;
+
+    for exec_id in [holder, waiter] {
+        let events = history(&url, exec_id).await;
+        assert!(
+            !type_names(&events).contains(&"WorkflowFailed"),
+            "{:?}",
+            type_names(&events)
+        );
+    }
+    assert_eq!(
+        type_names(&history(&url, waiter).await),
+        ["WorkflowStarted", "SignalReceived"],
+        "the contended acquire writes nothing"
     );
 }
 

@@ -25221,6 +25221,14 @@ async fn process_workflow_task(
     let inline_appends = next_event_id > decision_start_event_id;
     let stays_running = matches!(&outcome, WorkflowOutcome::Suspended { .. });
     let decision_appends = inline_appends || pending_durable_event_count > 0 || !stays_running;
+    // A contended mutex acquire only enqueues and writes nothing. The
+    // estimate still counts one event for a grant. That slot also holds the
+    // boundary of a grant, so the acquire alone reserves no second slot.
+    let estimated_only = match &outcome {
+        WorkflowOutcome::Suspended { commands } if should_handle_mutex_acquire(commands) => 1,
+        _ => 0,
+    };
+    let certainly_appends = inline_appends || pending_durable_event_count > estimated_only;
     // The preflight never counts the terminal event. So it also skips the
     // boundary after a terminal, and reserves it only for a running run.
     let current_history_event_count = u64::try_from(history_events.len())
@@ -25228,7 +25236,7 @@ async fn process_workflow_task(
         .saturating_add(pending_durable_event_count)
         .saturating_add(decision_boundary_reserve(
             registry,
-            decision_appends && stays_running,
+            certainly_appends && stays_running,
         ));
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
