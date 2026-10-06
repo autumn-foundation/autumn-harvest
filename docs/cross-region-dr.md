@@ -213,7 +213,9 @@ a claim checks the pin of every logical shard on that database. A fence on
 any one of them stops claims for all of them. This holds across processes
 too: a process pins the rows of other logical shards that it finds on its
 database at startup. Provision every row before the first process starts.
-A row created later is not pinned by a process that is already running.
+A process that finds a row it did not pin stops its claims and background
+writes on that database, and logs why. It cannot tell whether that shard
+was fenced. Restart it to pin the row.
 
 **Shard identity.** A pin needs a shard number. A worker takes it from its
 sharded pool or from `with_shard_assignments`. With neither, the process
@@ -377,10 +379,11 @@ Three limits, stated plainly:
   pass or a rebalance at once, with an error. An admin write or a webhook
   answers `503`. A write already in flight can still race a bump for up to
   one second.
-- The check reads every pinned shard on each admin write. If one shard
-  cannot be read, every admin write on the node answers `503`. That fails
-  closed. A node that has lost authority on one shard has lost it on the
-  failover the runbook performs for all shards.
+- The check reads every shard of the storage pool, and every pinned shard
+  colocated with one, on each admin write. If one cannot be read, every
+  admin write on the node answers `503`. That fails closed. A node that has
+  lost authority on one shard has lost it on the failover the runbook
+  performs for all shards.
 - `--expect-generation N` covers every `--shard` in a command. After the
   runbook, all shards share one generation. Shards at different generations
   take `--expect-generation <ID>=<N>`, once per shard. A per-shard value

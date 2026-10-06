@@ -1054,10 +1054,12 @@ mod scanner {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(interval) => {}
                 }
-                // A held shard gets no write until the resolver releases it (issue #1823).
-                if crate::replication::shard_writes_held(shard) {
+                // Issue #1823: the tick holds a fence barrier on this shard and on
+                // every pinned shard colocated with it. A held or fenced shard
+                // skips the tick, and a lost barrier stops it.
+                let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
                     continue;
-                }
+                };
                 // Selected against `cancel` (issue #1426). A pool may have no
                 // deadpool `Timeouts`, so `pool.get()` alone can park this task
                 // indefinitely on an exhausted shard pool. The top-of-loop select
@@ -1071,15 +1073,19 @@ mod scanner {
                 };
                 match get_result {
                     Ok(mut conn) => {
-                        match reclaim_orphaned_tasks(
-                            &mut conn,
-                            threshold,
-                            worker_stale_secs,
-                            stuck_running_secs,
-                            &*telemetry.metrics,
-                            &payload_codecs,
+                        match crate::replication::run_fenced_pass(
+                            &fence,
+                            Box::pin(reclaim_orphaned_tasks(
+                                &mut conn,
+                                threshold,
+                                worker_stale_secs,
+                                stuck_running_secs,
+                                &*telemetry.metrics,
+                                &payload_codecs,
+                            )),
                         )
                         .await
+                        .and_then(|done| done)
                         {
                             Ok(summary) if summary.total() > 0 => {
                                 tracing::warn!(

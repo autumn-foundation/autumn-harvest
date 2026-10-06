@@ -27316,7 +27316,9 @@ async fn sample_one_shard(
         // same condition.
         return ShardSample::Continue;
     };
-    match crate::replication::assert_fence(&mut conn, shard_id).await {
+    // The group covers every pinned shard colocated with this one (issue
+    // #1823), so a bump of a colocated peer stops this worker too.
+    match crate::replication::assert_fence_group(&mut conn, shard_id).await {
         Ok(()) => {}
         Err(crate::error::HarvestError::ShardFenced {
             shard_id: fenced,
@@ -27911,10 +27913,12 @@ fn spawn_pause_auto_resumer(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            // A held shard gets no write until the resolver releases it (issue #1823).
-            if crate::replication::shard_writes_held(shard) {
+            // Issue #1823: the tick holds a fence barrier on this shard and on
+            // every pinned shard colocated with it. A held or fenced shard
+            // skips the tick, and a lost barrier stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
                 continue;
-            }
+            };
 
             // Selected against `cancel` (issue #1426). See the comment
             // above `spawn_worker_heartbeat`'s own `pool.get()` call for
@@ -27926,12 +27930,16 @@ fn spawn_pause_auto_resumer(
             };
             match get_result {
                 Ok(mut conn) => {
-                    match crate::execution::auto_resume_expired_pauses(
-                        &mut conn,
-                        max_pause_duration,
-                        &*telemetry.metrics,
+                    match crate::replication::run_fenced_pass(
+                        &fence,
+                        Box::pin(crate::execution::auto_resume_expired_pauses(
+                            &mut conn,
+                            max_pause_duration,
+                            &*telemetry.metrics,
+                        )),
                     )
                     .await
+                    .and_then(|done| done)
                     {
                         Ok(n) if n > 0 => {
                             tracing::warn!(resumed = n, "auto-resumed over-long paused executions");

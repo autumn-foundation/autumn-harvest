@@ -384,10 +384,12 @@ pub fn spawn_session_slot_reconciler(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            // A held shard gets no write until the resolver releases it (issue #1823).
-            if crate::replication::shard_writes_held(shard) {
+            // Issue #1823: the tick holds a fence barrier on this shard and on
+            // every pinned shard colocated with it. A held or fenced shard
+            // skips the tick, and a lost barrier stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
                 continue;
-            }
+            };
             // Selected against `cancel` (issue #1426). A pool may have no
             // deadpool `Timeouts`, so `pool.get()` alone can park this task
             // indefinitely on an exhausted shard pool. The top-of-loop select
@@ -399,7 +401,13 @@ pub fn spawn_session_slot_reconciler(
                 result = pool.get() => result,
             };
             match get_result {
-                Ok(mut conn) => match reconcile_local_sessions(&mut conn, &registry).await {
+                Ok(mut conn) => match crate::replication::run_fenced_pass(
+                    &fence,
+                    Box::pin(reconcile_local_sessions(&mut conn, &registry)),
+                )
+                .await
+                .and_then(|done| done)
+                {
                     Ok(released) if released > 0 => {
                         tracing::warn!(
                             released,

@@ -1377,15 +1377,18 @@ pub fn claim_task_query_fenced() -> &'static str {
 /// single-row claim and the batched claim both use this splice. So one probe
 /// text guards every claim path.
 fn splice_dr_fence(base: &str, shard_bind: &str, generation_bind: &str) -> String {
-    // One row when every listed shard is at its pinned generation, and none
-    // otherwise. The lists hold the claim's shard and its colocated peers.
+    // One row when every listed shard is at its pinned generation and the
+    // database holds no other row, and none otherwise. The lists hold the
+    // claim's shard and its colocated peers. A row this process did not pin
+    // can be a shard that was fenced, so it fails closed.
     let fence_cte = format!(
         "WITH fence AS MATERIALIZED ( \
              SELECT 1 AS ok FROM harvest_shard_generation g \
-             JOIN unnest({shard_bind}::int4[], {generation_bind}::int8[]) \
+             LEFT JOIN unnest({shard_bind}::int4[], {generation_bind}::int8[]) \
                  AS p(shard_id, generation) \
                  ON g.shard_id = p.shard_id AND g.generation = p.generation \
              HAVING count(*) = cardinality({shard_bind}::int4[]) \
+                AND count(p.shard_id) = count(*) \
          ), "
     );
     #[expect(clippy::expect_used, reason = "every claim query is a constant")]
@@ -9025,9 +9028,10 @@ mod tests {
         let unspliced = fenced
             .replacen(
                 "WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation g \
-                 JOIN unnest($13::int4[], $14::int8[]) AS p(shard_id, generation) \
+                 LEFT JOIN unnest($13::int4[], $14::int8[]) AS p(shard_id, generation) \
                  ON g.shard_id = p.shard_id AND g.generation = p.generation \
-                 HAVING count(*) = cardinality($13::int4[]) ), ",
+                 HAVING count(*) = cardinality($13::int4[]) \
+                 AND count(p.shard_id) = count(*) ), ",
                 "WITH ",
                 1,
             )
@@ -9041,9 +9045,10 @@ mod tests {
         let unspliced = claim_task_query_fenced()
             .replacen(
                 "WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation g \
-                 JOIN unnest($7::int4[], $8::int8[]) AS p(shard_id, generation) \
+                 LEFT JOIN unnest($7::int4[], $8::int8[]) AS p(shard_id, generation) \
                  ON g.shard_id = p.shard_id AND g.generation = p.generation \
-                 HAVING count(*) = cardinality($7::int4[]) ), ",
+                 HAVING count(*) = cardinality($7::int4[]) \
+                 AND count(p.shard_id) = count(*) ), ",
                 "WITH ",
                 1,
             )

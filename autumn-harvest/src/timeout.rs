@@ -5183,10 +5183,12 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                     // Check for timed out tasks
                 }
             }
-            // A held shard gets no write until the resolver releases it (issue #1823).
-            if crate::replication::shard_writes_held(pool_shard) {
+            // Issue #1823: the tick holds a fence barrier on this shard and on
+            // every pinned shard colocated with it. A held or fenced shard
+            // skips the tick, and a lost barrier stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, pool_shard).await else {
                 continue;
-            }
+            };
 
             // Bounded to `interval`. Unbounded pool contention here would
             // silently stretch this loop's actual period past `interval`,
@@ -5211,20 +5213,24 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 result = tokio::time::timeout(interval, pool.get()) => result,
             };
             match get_result {
-                Ok(Ok(mut conn)) => match enforce_timeouts_once_on_conn_shard(
-                    &mut conn,
-                    pool_shard,
-                    &*telemetry.metrics,
-                    unknown_target_grace_window,
-                    &sharded_pool,
-                    &shard_assignments,
-                    Some(&circuit_breakers),
-                    max_workflow_history_events,
-                    session_worker_stale_secs,
-                    &payload_codecs,
-                    codec_rotation_batch_size,
+                Ok(Ok(mut conn)) => match crate::replication::run_fenced_pass(
+                    &fence,
+                    Box::pin(enforce_timeouts_once_on_conn_shard(
+                        &mut conn,
+                        pool_shard,
+                        &*telemetry.metrics,
+                        unknown_target_grace_window,
+                        &sharded_pool,
+                        &shard_assignments,
+                        Some(&circuit_breakers),
+                        max_workflow_history_events,
+                        session_worker_stale_secs,
+                        &payload_codecs,
+                        codec_rotation_batch_size,
+                    )),
                 )
                 .await
+                .and_then(|done| done)
                 {
                     Ok(enforced_count) if enforced_count > 0 => {
                         tracing::warn!(enforced_count, "enforced timed-out tasks");

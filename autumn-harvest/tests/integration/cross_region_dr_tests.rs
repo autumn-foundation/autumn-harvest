@@ -3354,6 +3354,62 @@ async fn a_split_database_claim_stops_when_the_peer_shard_is_bumped() {
     );
 }
 
+/// A generation row that appears after startup stops this process's claims
+/// and background ticks (issue #1823). The process did not pin it, so it
+/// cannot tell whether that shard was fenced. A restart pins it.
+#[tokio::test]
+async fn a_late_peer_row_fails_claims_and_ticks_closed() {
+    use autumn_harvest::queue::claim_task_on_shard;
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("latepeer");
+    let pool = dr_pool(&url);
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(0)]),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    pin_worker_fence(
+        DrFencing::Enabled,
+        DR_PREFIX,
+        targets,
+        &pool,
+        &[ShardId::new(0)],
+    )
+    .await
+    .expect("shard 0 pins");
+    let mut conn = connect(&url).await;
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-late",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+
+    // Another process for shard 1 starts later on the same database.
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .unwrap();
+    let queues = ["q-dr-late".to_string()];
+    let claimed = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    let tick = autumn_harvest::replication::begin_fenced_group(&pool, ShardId::new(0)).await;
+
+    assert!(claimed.is_none(), "an unpinned row must stop the claim");
+    assert!(tick.is_err(), "an unpinned row must stop a background tick");
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

@@ -5731,18 +5731,15 @@ pub(crate) async fn run_dr_fenced(
 /// Refuse an admin write when this process lost write authority (issue #1823).
 ///
 /// Every route that [`admit_mutation`] gates runs this after authentication:
-/// the classified management API, Vantage and the MCP tools. It runs
-/// [`autumn_harvest::replication::assert_fence`] for each shard this process
-/// pinned. A failover bumps the generation, so a stale node refuses each admin
-/// write before its handler runs. A process that pinned nothing pays one
-/// atomic load.
+/// the classified management API, Vantage and the MCP tools. It opens a fence
+/// barrier on each shard of the storage pool, and on every pinned shard
+/// colocated with it, through
+/// [`autumn_harvest::replication::begin_fenced_tick`]. Each barrier is opened
+/// on the database where its row lives. A failover bumps the generation, so a
+/// stale node refuses each admin write before its handler runs. A process
+/// that pinned nothing pays one atomic load.
 ///
-/// The checks run concurrently, each with a bounded pool acquire. So one slow
-/// shard cannot hang every admin write. A shard that cannot be checked fails
-/// closed with `503`.
-///
-/// `pool_for` falls back to the default pool on purpose. On a single-database
-/// node, that pool is the database of whichever shard the node pinned.
+/// A shard that cannot be checked fails closed with `503`.
 ///
 /// The caller holds the returned guards until its handler returns. Each is
 /// a commit-order barrier: a bump cannot commit while the handler writes.
@@ -5750,21 +5747,15 @@ pub(crate) async fn run_dr_fenced(
 pub(crate) async fn enforce_dr_fence(
     api_state: &HarvestApiState,
 ) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, AutumnError> {
-    use autumn_harvest::replication::{FenceRegistry, begin_fenced_pass};
+    use autumn_harvest::replication::{FenceRegistry, begin_fenced_tick};
 
     if !FenceRegistry::is_enabled() {
         return Ok(Vec::new());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let checks = FenceRegistry::snapshot().into_iter().map(|(shard, _)| {
-        let shard_pool = pool.pool_for(shard).clone();
-        async move { begin_fenced_pass(&shard_pool, shard).await }
-    });
-    let mut guards = Vec::new();
-    for checked in futures::future::join_all(checks).await {
-        guards.extend(checked.map_err(map_error)?);
-    }
-    Ok(guards)
+    begin_fenced_tick(pool.sharded_pool())
+        .await
+        .map_err(map_error)
 }
 
 /// Whether the mutation gate admits a caller (issue #1802).

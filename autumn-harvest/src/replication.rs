@@ -1566,6 +1566,55 @@ mod db {
         begin_fenced_pass_at(pool, resolved, pinned).await.map(Some)
     }
 
+    /// Open the fence for one tick of a per-shard background loop (issue
+    /// #1823), or `None` to skip the tick.
+    ///
+    /// A held shard skips the tick: it can be an unpromoted standby. A
+    /// fenced shard skips it too, and the log names the reason. Otherwise
+    /// the caller runs the tick under [`run_fenced_pass`] with the guards.
+    /// With no pin, this opens no connection.
+    pub async fn begin_shard_tick(
+        pool: &crate::worker::DbPool,
+        shard: Option<ShardId>,
+    ) -> Option<Vec<FencePassGuard>> {
+        if super::shard_writes_held(shard) {
+            return None;
+        }
+        let key = shard.unwrap_or(ShardId::UNENCODED);
+        match begin_fenced_group(pool, key).await {
+            Ok(guards) => Some(guards),
+            Err(error) => {
+                tracing::warn!(
+                    shard_id = key.as_i32(),
+                    error = %error,
+                    "background tick skipped: this process is fenced on this shard"
+                );
+                None
+            }
+        }
+    }
+
+    /// [`assert_fence`] for `shard` and each pinned shard colocated with it
+    /// (issue #1823). The sampler uses it, so a bump of a colocated peer
+    /// stops this process too.
+    ///
+    /// # Errors
+    ///
+    /// As [`assert_fence`].
+    pub async fn assert_fence_group(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+    ) -> HarvestResult<()> {
+        let bindings = FenceRegistry::claim_bindings(shard).unwrap_or_default();
+        for (pinned, generation) in &bindings {
+            assert_generation(conn, *pinned, *generation).await?;
+        }
+        if !bindings.is_empty() {
+            assert_no_unpinned_rows(conn, &bindings).await?;
+        }
+        Ok(())
+    }
+
     /// Open a [`FencePassGuard`] for `shard` and each pinned shard colocated
     /// with it on `pool` (issue #1823). A pass whose work is not filtered by
     /// shard holds them all. See [`FenceRegistry::claim_bindings`].
@@ -1577,11 +1626,50 @@ mod db {
         pool: &crate::worker::DbPool,
         shard: ShardId,
     ) -> HarvestResult<Vec<FencePassGuard>> {
+        let bindings = FenceRegistry::claim_bindings(shard).unwrap_or_default();
         let mut guards = Vec::new();
-        for (pinned, generation) in FenceRegistry::claim_bindings(shard).unwrap_or_default() {
-            guards.push(begin_fenced_pass_at(pool, pinned, generation).await?);
+        for (index, (pinned, generation)) in bindings.iter().enumerate() {
+            // The first guard also checks for rows this process did not pin.
+            let allowed = if index == 0 { &bindings[..] } else { &[] };
+            guards.push(begin_checked_pass(pool, *pinned, *generation, allowed).await?);
         }
         Ok(guards)
+    }
+
+    /// Fail when the database holds a generation row that this process did
+    /// not pin at startup (issue #1823).
+    ///
+    /// Such a row belongs to a logical shard that started on this database
+    /// later. This process cannot tell whether that shard was fenced, and its
+    /// database-wide work reaches that shard's rows. So it stops writing here
+    /// until a restart pins the row.
+    async fn assert_no_unpinned_rows(
+        conn: &mut AsyncPgConnection,
+        pinned: &[(ShardId, ShardGeneration)],
+    ) -> HarvestResult<()> {
+        #[derive(diesel::QueryableByName)]
+        struct ShardRow {
+            #[diesel(sql_type = Integer)]
+            shard_id: i32,
+        }
+        let rows: Vec<ShardRow> =
+            diesel::sql_query("SELECT shard_id FROM harvest_shard_generation")
+                .load(conn)
+                .await
+                .map_err(database_error)?;
+        let unpinned: Vec<i32> = rows
+            .into_iter()
+            .map(|row| row.shard_id)
+            .filter(|row| !pinned.iter().any(|(shard, _)| shard.as_i32() == *row))
+            .collect();
+        if unpinned.is_empty() {
+            return Ok(());
+        }
+        Err(crate::error::HarvestError::Config(format!(
+            "this database holds generation rows for shard(s) {unpinned:?} that this process \
+             did not pin at startup. It cannot tell whether those shards were fenced, so it \
+             stops writing here. Restart the process to pin them."
+        )))
     }
 
     /// Open a [`FencePassGuard`] for each shard of `pool` that this process
@@ -1609,12 +1697,18 @@ mod db {
         let mut guards = Vec::new();
         for (shard, shard_pool) in pool.iter_shards() {
             let key = if single { ShardId::UNENCODED } else { shard };
-            for (pinned, generation) in FenceRegistry::claim_bindings(key).unwrap_or_default() {
-                if guarded.contains(&pinned) {
+            let bindings = FenceRegistry::claim_bindings(key).unwrap_or_default();
+            let mut checked = false;
+            for (pinned, generation) in &bindings {
+                if guarded.contains(pinned) {
                     continue;
                 }
-                guarded.push(pinned);
-                guards.push(begin_fenced_pass_at(shard_pool, pinned, generation).await?);
+                guarded.push(*pinned);
+                // The first guard on this database also checks for rows this
+                // process did not pin.
+                let allowed = if checked { &[][..] } else { &bindings[..] };
+                checked = true;
+                guards.push(begin_checked_pass(shard_pool, *pinned, *generation, allowed).await?);
             }
         }
         Ok(guards)
@@ -1631,6 +1725,19 @@ mod db {
         shard: ShardId,
         expected: ShardGeneration,
     ) -> HarvestResult<FencePassGuard> {
+        begin_checked_pass(pool, shard, expected, &[]).await
+    }
+
+    /// [`begin_fenced_pass_at`], and fail when the database holds a row
+    /// outside `allowed` (issue #1823). An empty `allowed` skips that check.
+    /// The check runs on the guard's own connection, so it never waits for
+    /// a pool connection.
+    async fn begin_checked_pass(
+        pool: &crate::worker::DbPool,
+        shard: ShardId,
+        expected: ShardGeneration,
+        allowed: &[(ShardId, ShardGeneration)],
+    ) -> HarvestResult<FencePassGuard> {
         use deadpool::managed::Manager as _;
         let conn = tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
             .await
@@ -1640,7 +1747,7 @@ mod db {
                 )
             })?
             .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
-        begin_fenced_pass_on(conn, shard, expected).await
+        begin_pass_on(conn, shard, expected, allowed).await
     }
 
     /// [`begin_fenced_pass_at`] on a connection the caller opened (issue
@@ -1651,9 +1758,19 @@ mod db {
     ///
     /// As [`begin_fenced_pass`].
     pub async fn begin_fenced_pass_on(
+        conn: AsyncPgConnection,
+        shard: ShardId,
+        expected: ShardGeneration,
+    ) -> HarvestResult<FencePassGuard> {
+        begin_pass_on(conn, shard, expected, &[]).await
+    }
+
+    /// The guard itself. See [`begin_checked_pass`] for `allowed`.
+    async fn begin_pass_on(
         mut conn: AsyncPgConnection,
         shard: ShardId,
         expected: ShardGeneration,
+        allowed: &[(ShardId, ShardGeneration)],
     ) -> HarvestResult<FencePassGuard> {
         use diesel_async::SimpleAsyncConnection as _;
         conn.batch_execute("BEGIN").await.map_err(database_error)?;
@@ -1685,6 +1802,9 @@ mod db {
             .await
             .map_err(database_error)?;
         assert_generation(&mut conn, shard, expected).await?;
+        if !allowed.is_empty() {
+            assert_no_unpinned_rows(&mut conn, allowed).await?;
+        }
         conn.batch_execute("ROLLBACK TO SAVEPOINT harvest_fence_check")
             .await
             .map_err(database_error)?;
@@ -3182,10 +3302,10 @@ mod db {
 #[cfg(feature = "db")]
 pub use db::{
     FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority, assert_fence,
-    begin_fenced_group, begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on,
-    begin_fenced_tick, bump_generation, current_generation, ensure_generation_row, measure_rpo,
-    pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
-    record_replication_heartbeat, resolve_held, run_fenced_pass,
+    assert_fence_group, begin_fenced_group, begin_fenced_pass, begin_fenced_pass_at,
+    begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
+    ensure_generation_row, measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers,
+    query_replication_status, record_replication_heartbeat, resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]

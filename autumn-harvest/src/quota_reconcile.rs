@@ -587,10 +587,12 @@ pub fn spawn_quota_key_reconciler_for_shard(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            // A held shard gets no write until the resolver releases it (issue #1823).
-            if crate::replication::shard_writes_held(shard) {
+            // Issue #1823: the tick holds a fence barrier on this shard and on
+            // every pinned shard colocated with it. A held or fenced shard
+            // skips the tick, and a lost barrier stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
                 continue;
-            }
+            };
             // Selected against `cancel` (issue #1426). A pool may have no
             // deadpool `Timeouts`, so `pool.get()` alone can park this task
             // indefinitely on an exhausted shard pool. The top-of-loop select
@@ -603,7 +605,15 @@ pub fn spawn_quota_key_reconciler_for_shard(
             };
             match get_result {
                 Ok(mut conn) => {
-                    match reconcile_quota_keys_from(&mut conn, batch_size, cursor, shard).await {
+                    match crate::replication::run_fenced_pass(
+                        &fence,
+                        Box::pin(reconcile_quota_keys_from(
+                            &mut conn, batch_size, cursor, shard,
+                        )),
+                    )
+                    .await
+                    .and_then(|done| done)
+                    {
                         Ok((summary, next_cursor)) => {
                             cursor = next_cursor;
                             if summary.backfilled > 0 {
