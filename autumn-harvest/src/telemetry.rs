@@ -1294,6 +1294,13 @@ pub const METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT: &str = "harvest.activity.concur
 /// gauge keeps its last value.
 pub const METRIC_ACTIVITY_LATENCY_BASELINE: &str = "harvest.activity.latency_baseline_seconds";
 
+/// Counter: claimed attempts that the adaptive limit deferred (issue #1836).
+///
+/// Labeled by `activity`. The claim skips a type at its cap, so this counts
+/// only the claims that raced past the cap. A steady rate means churn.
+/// Prometheus exports it as `harvest_activity_concurrency_deferred_total`.
+pub const METRIC_ACTIVITY_CONCURRENCY_DEFERRED: &str = "harvest.activity.concurrency_deferred";
+
 /// Counter: incremented on each scheduler tick-loop fire attempt for a due schedule slot.
 ///
 /// Labels:
@@ -2981,6 +2988,15 @@ pub trait MetricsRecorder: Send + Sync {
         baseline_secs: Option<f64>,
     ) {
         let _ = (activity, limit, in_flight, baseline_secs);
+    }
+
+    /// Record one claimed attempt that the adaptive limit deferred (issue
+    /// #1836).
+    ///
+    /// Maps to the counter `harvest.activity.concurrency_deferred{activity}`.
+    /// The `activity` argument is the registered activity name.
+    fn record_activity_concurrency_deferred(&self, activity: &str) {
+        let _ = activity;
     }
 
     /// Current number of entries in the dead-letter queue on one shard.

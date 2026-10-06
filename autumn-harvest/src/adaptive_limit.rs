@@ -199,8 +199,12 @@ struct Window {
     latency_sum: Duration,
     /// Highest in-flight count at the start of a sampled attempt.
     max_in_flight: u32,
-    /// A retryable failure is in the window.
-    overloaded: bool,
+    /// Retryable failures in the window, from any epoch.
+    failures: u32,
+    /// Completions in the window, from any epoch. The failure share uses
+    /// it, so the drain of older attempts after a probe does not inflate
+    /// the share.
+    completions: u32,
 }
 
 impl Window {
@@ -235,7 +239,7 @@ impl Limiter {
     fn new(policy: AdaptiveLimitPolicy) -> Self {
         let mut limiter = Self {
             policy,
-            limit: 0.0,
+            limit: QUEUE_SIZE.clamp(f64::from(policy.min_limit), f64::from(policy.max_limit)),
             in_flight: 0,
             baseline: None,
             epoch: 0,
@@ -273,11 +277,13 @@ impl Limiter {
 
     /// Drop the cap and forget the baseline. The attempts in flight started
     /// at a high concurrency, so their answers do not count. The probe
-    /// window then measures the baseline at a low concurrency.
+    /// window then measures the baseline at a low concurrency. A probe never
+    /// raises a cap that is already below [`QUEUE_SIZE`].
     fn start_probe(&mut self) {
-        let probe_cap = QUEUE_SIZE.clamp(self.floor(), self.ceiling());
-        self.resume_limit = self.limit.max(probe_cap);
-        self.limit = probe_cap;
+        self.resume_limit = self.limit;
+        self.limit = QUEUE_SIZE
+            .min(self.limit)
+            .clamp(self.floor(), self.ceiling());
         self.epoch += 1;
         self.baseline = None;
         self.samples = 0;
@@ -286,10 +292,20 @@ impl Limiter {
     }
 
     /// Add one sample to the window, and close the window when it is full.
+    ///
+    /// A failure from an older epoch counts as a failure. Overload is
+    /// overload. It does not fill the window, so it cannot close a probe
+    /// window before a fresh sample arrives. Every completion, of any epoch,
+    /// counts toward the failure share.
     fn on_sample(&mut self, epoch: u64, latency: Duration, in_flight: u32, outcome: SampleOutcome) {
+        self.window.completions = self.window.completions.saturating_add(1);
         match outcome {
-            // A failure counts whatever its epoch. Overload is overload.
-            SampleOutcome::Overloaded => self.window.overloaded = true,
+            SampleOutcome::Overloaded => {
+                self.window.failures += 1;
+                if epoch != self.epoch {
+                    return;
+                }
+            }
             SampleOutcome::Answered if epoch == self.epoch => {
                 self.window.answers += 1;
                 self.window.latency_sum = self.window.latency_sum.saturating_add(latency);
@@ -307,24 +323,35 @@ impl Limiter {
 
     /// Move the cap once for a full window.
     ///
-    /// The probe window restores the cap from before the probe. A retryable
-    /// failure in the window cuts the cap by `backoff_ratio`. Otherwise the
-    /// cap moves toward `limit * gradient + QUEUE_SIZE`. The gradient is
+    /// A window is overloaded when the share of retryable failures in its
+    /// completions passes `error_threshold`. An overloaded window cuts the cap by
+    /// `backoff_ratio`. The probe window ends only with an answer, and then
+    /// restores the cap from before the probe. Otherwise the cap moves
+    /// toward `limit * gradient + QUEUE_SIZE`. The gradient is
     /// `tolerance * baseline / mean latency`, in the range from 0.5 to 1.
     fn close_window(&mut self, window: &Window) {
         let mean = window.mean_latency();
         if let Some(mean) = mean {
             self.baseline = Some(self.baseline.map_or(mean, |b| b.min(mean)));
         }
-        let probe_window = std::mem::take(&mut self.probing);
-        if probe_window {
+        let overloaded = f64::from(window.failures)
+            > self.policy.error_threshold * f64::from(window.completions);
+        if self.probing {
+            if overloaded {
+                self.resume_limit =
+                    (self.resume_limit * self.policy.backoff_ratio).max(self.floor());
+                self.limit = self.limit.min(self.resume_limit);
+            }
+            // The probe needs one answer for its baseline.
+            if mean.is_none() {
+                return;
+            }
+            self.probing = false;
             self.limit = self.resume_limit;
-        }
-        if window.overloaded {
-            self.limit = (self.limit * self.policy.backoff_ratio).max(self.floor());
             return;
         }
-        if probe_window {
+        if overloaded {
+            self.limit = (self.limit * self.policy.backoff_ratio).max(self.floor());
             return;
         }
         if self.samples >= self.policy.probe_interval {
@@ -355,7 +382,11 @@ impl Limiter {
     /// The delay for a task that found the type at its cap. A slot frees in
     /// about one handler latency, so the delay is one to two baselines.
     fn defer_delay(&self) -> Duration {
-        let base = self.baseline.unwrap_or(MIN_LIMIT_DEFER);
+        // Cap the base first, so the product cannot overflow.
+        let base = self
+            .baseline
+            .unwrap_or(MIN_LIMIT_DEFER)
+            .min(MAX_LIMIT_DEFER);
         base.mul_f64(1.0 + rand::random::<f64>())
             .clamp(MIN_LIMIT_DEFER, MAX_LIMIT_DEFER)
     }
@@ -596,6 +627,7 @@ mod tests {
             max_limit: 0,
             tolerance: f64::NAN,
             backoff_ratio: f64::NAN,
+            error_threshold: f64::NAN,
             probe_interval: 0,
         }
         .sanitized();
@@ -603,6 +635,7 @@ mod tests {
         assert_eq!(p.max_limit, 1);
         assert!((p.tolerance - 1.0).abs() < f64::EPSILON);
         assert!((p.backoff_ratio - AdaptiveLimitPolicy::DEFAULT_BACKOFF_RATIO).abs() < 1e-12);
+        assert!((p.error_threshold - AdaptiveLimitPolicy::DEFAULT_ERROR_THRESHOLD).abs() < 1e-12);
         assert_eq!(p.probe_interval, AdaptiveLimitPolicy::MIN_PROBE_INTERVAL);
         let low = AdaptiveLimitPolicy {
             backoff_ratio: 0.0,
@@ -718,7 +751,8 @@ mod tests {
         assert!(after >= 1);
     }
 
-    /// One retryable failure in a window cuts the cap by the ratio.
+    /// A window whose failure share passes the threshold cuts the cap by the
+    /// ratio.
     #[test]
     fn a_retryable_failure_backs_off_by_the_ratio() {
         let reg = registry(AdaptiveLimitPolicy::default());
@@ -726,7 +760,7 @@ mod tests {
         let before = limit(&reg, A);
         let held: Vec<LimitPermit> = (0..before).map(|_| permit(&reg, A)).collect();
         for (i, p) in held.into_iter().enumerate() {
-            let outcome = if i == 0 {
+            let outcome = if i % 4 == 0 {
                 SampleOutcome::Overloaded
             } else {
                 SampleOutcome::Answered
@@ -814,6 +848,83 @@ mod tests {
                 "{retry_after:?}"
             );
         }
+    }
+
+    /// A rare failure is noise, not overload. It must not cut the cap.
+    #[test]
+    fn a_failure_share_under_the_threshold_does_not_cut_the_cap() {
+        let reg = registry(AdaptiveLimitPolicy::default());
+        busy_rounds(&reg, A, 30, MS_100);
+        let before = limit(&reg, A);
+        assert!(before > 20, "limit {before}");
+        let held: Vec<LimitPermit> = (0..before).map(|_| permit(&reg, A)).collect();
+        for (i, p) in held.into_iter().enumerate() {
+            let outcome = if i == 0 {
+                SampleOutcome::Overloaded
+            } else {
+                SampleOutcome::Answered
+            };
+            p.complete(MS_100, outcome);
+        }
+        assert!(limit(&reg, A) >= before, "{before} -> {}", limit(&reg, A));
+    }
+
+    /// Failures of attempts from before a probe do not close the probe
+    /// window. The baseline still comes from answers after the probe.
+    #[test]
+    fn stale_failures_do_not_close_the_probe_window() {
+        let policy = AdaptiveLimitPolicy {
+            probe_interval: AdaptiveLimitPolicy::MIN_PROBE_INTERVAL,
+            ..AdaptiveLimitPolicy::default()
+        };
+        let mut limiter = Limiter::new(policy);
+        let old = limiter.epoch;
+        limiter.limit = 20.0;
+        limiter.start_probe();
+        for _ in 0..6 {
+            limiter.on_sample(old, MS_100, 20, SampleOutcome::Overloaded);
+        }
+        assert!(limiter.probing, "stale failures closed the probe window");
+        assert_eq!(limiter.baseline, None);
+        let fresh = limiter.epoch;
+        for _ in 0..4 {
+            limiter.on_sample(fresh, MS_100, 4, SampleOutcome::Answered);
+        }
+        assert!(!limiter.probing);
+        assert_eq!(limiter.baseline, Some(MS_100));
+        assert!(limiter.cap() < 20, "the failures still cut the cap");
+    }
+
+    /// A probe window with no answer cannot set a baseline, so the probe
+    /// goes on.
+    #[test]
+    fn a_probe_window_without_answers_keeps_probing() {
+        let mut limiter = Limiter::new(AdaptiveLimitPolicy::default());
+        let epoch = limiter.epoch;
+        for _ in 0..4 {
+            limiter.on_sample(epoch, MS_100, 4, SampleOutcome::Overloaded);
+        }
+        assert!(limiter.probing);
+        assert_eq!(limiter.baseline, None);
+        assert!(limiter.cap() < 4, "the failures cut the cap");
+    }
+
+    /// A probe never raises a cap that is already below the probe cap.
+    #[test]
+    fn a_probe_never_raises_a_low_cap() {
+        let mut limiter = Limiter::new(AdaptiveLimitPolicy::default());
+        limiter.limit = 1.0;
+        limiter.start_probe();
+        assert_eq!(limiter.cap(), 1);
+        assert!((limiter.resume_limit - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// A huge baseline cannot overflow the delay arithmetic.
+    #[test]
+    fn the_defer_delay_survives_a_huge_baseline() {
+        let mut limiter = Limiter::new(AdaptiveLimitPolicy::default());
+        limiter.baseline = Some(Duration::MAX);
+        assert_eq!(limiter.defer_delay(), MAX_LIMIT_DEFER);
     }
 
     /// Records every limit sample, in order.
@@ -909,6 +1020,8 @@ mod simulation {
 
     struct Downstream {
         knee: u32,
+        /// Share of calls that fail with a retryable error whatever the load.
+        error_rate: f64,
         base: Duration,
         /// Relative latency noise, uniform in `[-noise, +noise]`.
         noise: f64,
@@ -943,7 +1056,8 @@ mod simulation {
                 let load = (f64::from(n) / f64::from(downstream.knee)).max(1.0);
                 let jitter = downstream.noise.mul_add(rng.unit().mul_add(2.0, -1.0), 1.0);
                 let latency = downstream.base.mul_f64(load * jitter);
-                let outcome = if downstream.fail_above_knee && n > downstream.knee {
+                let noisy = rng.unit() < downstream.error_rate;
+                let outcome = if noisy || (downstream.fail_above_knee && n > downstream.knee) {
                     SampleOutcome::Overloaded
                 } else {
                     SampleOutcome::Answered
@@ -985,6 +1099,7 @@ mod simulation {
             knee,
             base: Duration::from_millis(100),
             noise: 0.0,
+            error_rate: 0.0,
             fail_above_knee: false,
         };
         let trace = simulate(policy, &downstream, 20_000);
@@ -1011,6 +1126,7 @@ mod simulation {
             knee,
             base: Duration::from_millis(100),
             noise: 0.2,
+            error_rate: 0.0,
             fail_above_knee: false,
         };
         let trace = simulate(policy, &downstream, 20_000);
@@ -1032,6 +1148,7 @@ mod simulation {
             knee,
             base: Duration::from_millis(100),
             noise: 0.1,
+            error_rate: 0.0,
             fail_above_knee: false,
         };
         let trace = simulate(policy, &downstream, 100_000);
@@ -1058,6 +1175,7 @@ mod simulation {
             knee,
             base: Duration::from_millis(100),
             noise: 0.0,
+            error_rate: 0.0,
             fail_above_knee: true,
         };
         let trace = simulate(
@@ -1073,6 +1191,31 @@ mod simulation {
             f64::from(settled) >= 0.7 * f64::from(knee)
                 && f64::from(settled) <= 1.2 * f64::from(knee),
             "settled at {settled}; knee {knee}"
+        );
+    }
+
+    /// A healthy dependency with a 1 % background error rate keeps about
+    /// the cap of an error-free run. Only overload, not noise, may throttle
+    /// it.
+    #[test]
+    fn background_errors_do_not_throttle_a_healthy_dependency() {
+        let policy = AdaptiveLimitPolicy::default();
+        let run = |error_rate| {
+            let downstream = Downstream {
+                knee: 1_000,
+                error_rate,
+                base: Duration::from_millis(100),
+                noise: 0.0,
+                fail_above_knee: false,
+            };
+            let trace = simulate(policy, &downstream, 40_000);
+            median(&trace.limits[20_000..])
+        };
+        let clean = run(0.0);
+        let noisy = run(0.01);
+        assert!(
+            f64::from(noisy) >= 0.9 * f64::from(clean),
+            "1 % errors cut the cap from {clean} to {noisy}"
         );
     }
 }

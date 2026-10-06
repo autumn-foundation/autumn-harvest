@@ -152,6 +152,7 @@ type LimitSample = (u32, u32, Option<f64>);
 struct LimitMetrics {
     last: Mutex<HashMap<String, LimitSample>>,
     peak_in_flight: Mutex<HashMap<String, u32>>,
+    deferred: Mutex<HashMap<String, u64>>,
 }
 
 impl LimitMetrics {
@@ -161,6 +162,15 @@ impl LimitMetrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(activity)
             .copied()
+    }
+
+    fn deferred(&self, activity: &str) -> u64 {
+        self.deferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(activity)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn peak_in_flight(&self, activity: &str) -> u32 {
@@ -192,6 +202,15 @@ impl MetricsRecorder for LimitMetrics {
         let peak = peaks.entry(activity.to_owned()).or_default();
         *peak = (*peak).max(in_flight);
         drop(peaks);
+    }
+
+    fn record_activity_concurrency_deferred(&self, activity: &str) {
+        *self
+            .deferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(activity.to_owned())
+            .or_default() += 1;
     }
 }
 
@@ -625,11 +644,12 @@ async fn the_limit_settles_near_the_knee_of_a_real_dependency() {
     assert_eq!(metrics.last(ACTIVITY).map(|m| m.0), Some(limit));
 }
 
-/// A row with capability requirements skips the claim-time exclusion, so
-/// the worker can claim it at the cap. The dispatch gate must then defer
-/// it. The deferral uses no attempt, and every run still completes.
+/// A row with capability requirements skips the ineligible-activity gate of
+/// the claim. The claim must still skip a type at its cap, or each poll
+/// claims a row only to defer it again. A rare race may still defer a
+/// claim. That deferral uses no attempt, and every run completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_claim_past_the_cap_is_deferred_without_using_an_attempt() {
+async fn a_capability_type_at_its_cap_is_not_claimed() {
     const ACTIVITY: &str = "al_capability_slow";
     let (url, _container) = setup_db().await;
     let queue = unique_queue("al-backstop");
@@ -638,8 +658,14 @@ async fn a_claim_past_the_cap_is_deferred_without_using_an_attempt() {
     let config = AdaptiveLimitConfig::disabled()
         .with_activity(ACTIVITY, Some(AdaptiveLimitPolicy::new(2, 2)));
     let labels = HashMap::from([("gpu".to_owned(), "true".to_owned())]);
-    run_with_labels(&url, &queue, vec![activity], Some(config), 12, labels).await;
+    let (metrics, _) =
+        run_with_labels(&url, &queue, vec![activity], Some(config), 12, labels).await;
 
+    let deferred = metrics.deferred(ACTIVITY);
+    assert!(
+        deferred <= 3,
+        "{deferred} claims churned through a deferral"
+    );
     let g = gauge(ACTIVITY);
     assert_eq!(g.done(), 12, "each run calls the handler once");
     assert!(g.peak() <= 2, "the type ran {} attempts at once", g.peak());

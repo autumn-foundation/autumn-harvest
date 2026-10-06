@@ -15637,18 +15637,18 @@ const fn limit_sample_outcome(
     use crate::circuit_breaker::AttemptOutcome;
     match outcome {
         Some(AttemptOutcome::RetryableFailure) => Some(SampleOutcome::Overloaded),
-        Some(AttemptOutcome::Success | AttemptOutcome::NonRetryableFailure) => {
-            Some(SampleOutcome::Answered)
-        }
-        None => None,
+        Some(AttemptOutcome::Success) => Some(SampleOutcome::Answered),
+        Some(AttemptOutcome::NonRetryableFailure) | None => None,
     }
 }
 
 /// The activity names that a claim must skip (issue #1836).
 ///
 /// These are the names with unmet requirements, plus the types at their
-/// adaptive limit. The common case has no saturated type and allocates
-/// nothing.
+/// adaptive limit. A saturated type carries
+/// [`queue::SATURATED_ACTIVITY_MARKER`], so the claim skips it even on a row
+/// with capability requirements. The common case has no saturated type and
+/// allocates nothing.
 fn claim_exclusions(
     ineligible: &[String],
     saturated: Vec<String>,
@@ -15657,7 +15657,11 @@ fn claim_exclusions(
         return std::borrow::Cow::Borrowed(ineligible);
     }
     let mut names = ineligible.to_vec();
-    names.extend(saturated);
+    names.extend(
+        saturated
+            .into_iter()
+            .map(|name| format!("{}{name}", queue::SATURATED_ACTIVITY_MARKER)),
+    );
     std::borrow::Cow::Owned(names)
 }
 
@@ -15698,8 +15702,9 @@ mod adaptive_limit_gate_tests {
         assert!(!adaptive_limit_gates(None));
     }
 
-    /// Only a retryable failure signals overload. A bad-input failure
-    /// proves that the dependency answered.
+    /// Only a retryable failure signals overload. A bad-input failure is
+    /// often fast, and its latency would pull the baseline down, so it gives
+    /// no sample.
     #[test]
     fn breaker_outcomes_map_to_limit_samples() {
         assert_eq!(
@@ -15708,7 +15713,7 @@ mod adaptive_limit_gate_tests {
         );
         assert_eq!(
             limit_sample_outcome(Some(AttemptOutcome::NonRetryableFailure)),
-            Some(SampleOutcome::Answered)
+            None
         );
         assert_eq!(
             limit_sample_outcome(Some(AttemptOutcome::RetryableFailure)),
@@ -15725,13 +15730,15 @@ mod adaptive_limit_gate_tests {
         assert_eq!(out.as_ref(), ineligible.as_slice());
     }
 
+    /// A saturated type carries the marker, so the claim skips it even on
+    /// a row with capability requirements.
     #[test]
-    fn claim_exclusions_add_the_saturated_types() {
+    fn claim_exclusions_add_the_saturated_types_with_the_marker() {
         let ineligible = vec!["gpu_job".to_owned()];
         let out = claim_exclusions(&ineligible, vec!["charge_card".to_owned()]);
         assert_eq!(
             out.as_ref(),
-            ["gpu_job".to_owned(), "charge_card".to_owned()].as_slice()
+            ["gpu_job".to_owned(), "\u{1}charge_card".to_owned()].as_slice()
         );
     }
 }
@@ -16906,7 +16913,14 @@ async fn process_activity_task(
                     circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
                 }
                 let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-                defer_for_adaptive_limit(&mut conn, task, activity, retry_after).await?;
+                if defer_for_adaptive_limit(&mut conn, task, activity, retry_after).await? {
+                    // Count only a deferral that persisted, as the retry
+                    // budget does.
+                    registry
+                        .telemetry()
+                        .metrics
+                        .record_activity_concurrency_deferred(activity_name);
+                }
                 return Ok(());
             }
         }

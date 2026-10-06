@@ -477,9 +477,13 @@ pub struct AdaptiveLimitPolicy {
     /// At 1.25, the cap stops growing when latency is 25 % above the
     /// baseline. At least 1.
     pub tolerance: f64,
-    /// Factor that a retryable failure applies to the cap. It is in the
+    /// Factor that an overloaded window applies to the cap. It is in the
     /// range from 0.5 to 1.
     pub backoff_ratio: f64,
+    /// Share of retryable failures above which a window is overloaded. It
+    /// is in the range from 0 to 1. At 0, one failure cuts the cap. A higher
+    /// value keeps rare failures from throttling a healthy dependency.
+    pub error_threshold: f64,
     /// Samples between two baseline probes. At least
     /// [`AdaptiveLimitPolicy::MIN_PROBE_INTERVAL`].
     pub probe_interval: u32,
@@ -492,8 +496,10 @@ impl AdaptiveLimitPolicy {
     pub const DEFAULT_MAX_LIMIT: u32 = 200;
     /// Default latency tolerance.
     pub const DEFAULT_TOLERANCE: f64 = 1.25;
-    /// Default backoff factor for a retryable failure.
+    /// Default backoff factor for an overloaded window.
     pub const DEFAULT_BACKOFF_RATIO: f64 = 0.9;
+    /// Default failure share above which a window is overloaded.
+    pub const DEFAULT_ERROR_THRESHOLD: f64 = 0.05;
     /// Default samples between two baseline probes.
     pub const DEFAULT_PROBE_INTERVAL: u32 = 1_000;
     /// Fewest samples between two baseline probes.
@@ -516,6 +522,7 @@ impl AdaptiveLimitPolicy {
     /// `min_limit` becomes at least 1, and `max_limit` at least `min_limit`.
     /// A non-finite or low `tolerance` becomes 1. A `backoff_ratio` outside
     /// the range from 0.5 to 1 is clamped, and NaN becomes the default.
+    /// `error_threshold` follows the same rule in the range from 0 to 1.
     #[must_use]
     pub fn sanitized(self) -> Self {
         let min_limit = self.min_limit.max(1);
@@ -529,11 +536,17 @@ impl AdaptiveLimitPolicy {
         } else {
             self.backoff_ratio.clamp(0.5, 1.0)
         };
+        let error_threshold = if self.error_threshold.is_nan() {
+            Self::DEFAULT_ERROR_THRESHOLD
+        } else {
+            self.error_threshold.clamp(0.0, 1.0)
+        };
         Self {
             min_limit,
             max_limit: self.max_limit.max(min_limit),
             tolerance,
             backoff_ratio,
+            error_threshold,
             probe_interval: self.probe_interval.max(Self::MIN_PROBE_INTERVAL),
         }
     }
@@ -546,6 +559,7 @@ impl Default for AdaptiveLimitPolicy {
             max_limit: Self::DEFAULT_MAX_LIMIT,
             tolerance: Self::DEFAULT_TOLERANCE,
             backoff_ratio: Self::DEFAULT_BACKOFF_RATIO,
+            error_threshold: Self::DEFAULT_ERROR_THRESHOLD,
             probe_interval: Self::DEFAULT_PROBE_INTERVAL,
         }
     }
