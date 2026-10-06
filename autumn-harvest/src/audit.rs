@@ -237,6 +237,12 @@ pub const OP_TOKEN_REVOKE: &str = "token.revoke";
 pub const OP_LOAD_SHED_TRIP: &str = "load_shed.trip";
 /// Audit operation: a queue stopped shedding new starts (issue #1794).
 pub const OP_LOAD_SHED_CLEAR: &str = "load_shed.clear";
+/// Audit operation: an operator's `harvest shard rebalance` or
+/// `rebalance-resume` stepped a shard migration (issue #964).
+///
+/// The CLI writes it, not a route. So no `ALL_MUTATION_ROUTES` entry exists
+/// for it.
+pub const OP_SHARD_REBALANCE_MIGRATE: &str = "shard.rebalance.migrate";
 /// Audit operation: the rebalance-resume scanner settled a shard migration
 /// that stalled after its cutover (issue #1839).
 ///
@@ -958,8 +964,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // writes these rows.
     OP_LOAD_SHED_TRIP,
     OP_LOAD_SHED_CLEAR,
-    // Automatic rebalance resume (issue #1839). No route entry: the scanner
-    // writes these rows.
+    // Shard rebalancing (issues #964 and #1839). No route entry: the CLI and
+    // the rebalance-resume scanner write these rows.
+    OP_SHARD_REBALANCE_MIGRATE,
     OP_SHARD_REBALANCE_AUTO_RESUME,
 ];
 

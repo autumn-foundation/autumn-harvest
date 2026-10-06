@@ -665,7 +665,8 @@ outstanding:
 
 Only `VERIFIED → COMMITTED` changes who is authoritative, and it is a single
 statement on one database. Run `harvest shard rebalance-resume` after any crash.
-For a `COMMITTED` row, the worker also does this for you (see below).
+A worker also settles a `COMMITTED` row on its own. See
+[automatic resume](#automatic-resume-after-a-stalled-cutover-issue-1839).
 
 **Why the cutover re-checks the history and not only quiescence.** Verification
 proves the copy matches the source *as of the copy*. On the end-to-end path the
@@ -694,28 +695,38 @@ rebalance-resume scanner per assigned shard, when a `ShardedDbPool` is
 configured.
 
 - A pass finds each `COMMITTED` record whose `updated_at` is older than
-  `ScannerConfig::rebalance_stall_after` (default 30 s). It activates the
-  target, as `rebalance-resume` does, and moves the record to `DONE`.
-- Passes run every `ScannerConfig::rebalance_resume_interval` (default 5 s).
-  The run is claimable again at most one grace period plus one interval after
-  the crash.
+  `ScannerConfig::rebalance_stall_after`. The default is 30 s, and the floor
+  is 5 s. The pass activates the target, as `rebalance-resume` does, and moves
+  the record to `DONE`.
+- Passes run every `ScannerConfig::rebalance_resume_interval` (default 5 s),
+  with the scanner jitter. The run is claimable again at most one grace
+  period plus one interval after the crash.
 - Each settled record writes one `shard.rebalance.auto_resume` audit row on the
   source shard: actor `system`, source `cli`, route
   `background.rebalance_resume_scanner <from> -> <to>`. The audit table accepts
-  only the sources `api`, `cli` and `ui`. The rebalance surface is the CLI.
+  only the sources `api`, `cli` and `ui`. So `cli` is the nearest value, not
+  the real origin. The actor and the route mark the row as automatic.
 - The scanner never touches a record before the cutover. There the source is
-  still claimable, so no liveness gap exists, and a cutover is the operator's
-  decision. Use `harvest shard rebalance-resume` for those records.
-- One statement claims each record and sets its `updated_at`. So many replicas
-  can run the scanner, and each settlement writes one audit row. When the
-  target is down, the retries come one grace period apart, and each failed
-  step counts in `attempts`.
-- The grace period lets a live `harvest shard rebalance` finish its own
-  activation first. Do not set it below a few seconds in production.
+  still claimable, so no liveness gap exists. A cutover is the operator's
+  decision, so use `harvest shard rebalance-resume` for those records.
+- Each statement claims one record and sets its `updated_at`. So many replicas
+  can run the scanner, and one settlement writes one audit row. Only an
+  activation that outlasts the grace period can be claimed twice. Activation
+  is idempotent, so the cost is a second audit row. A record that
+  another driver settles first gets no audit row from the scanner. After a
+  claim, `updated_at` no longer shows the time of the cutover.
+- A replica claims only records whose target shard is in its pool.
+- When the target is down, the step fails. The record stays `COMMITTED`, its
+  `attempts` and `last_error` record the failure, and the worker logs an
+  error. The next try comes one grace period later.
+- When the DR fence is enabled (`replication::FenceRegistry`), the claim and
+  the activation check it first.
+- Set `ScannerConfig::rebalance_resume_enabled` to `false` to turn the scanner
+  off. Then only `harvest shard rebalance-resume` settles a stalled record.
 
 The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
-`harvest.scanner.tick`. GET /admin/config shows `rebalance_resume_interval_ms`
-and `rebalance_stall_after_ms`.
+`harvest.scanner.tick`. `GET /admin/config` shows `rebalance_resume_enabled`,
+`rebalance_resume_interval_ms` and `rebalance_stall_after_ms`.
 
 ### What migrates, and what does not (the dedupe scopes)
 
@@ -833,6 +844,11 @@ serving the API has no reason to hold a pool for both. Possession of both DSNs i
 the admin gate, and every non-dry-run attempt writes a
 `shard.rebalance.migrate` row to the source shard's `harvest_audit_log` naming
 the actor, the execution, and the outcome.
+
+A worker with a `ShardedDbPool` also writes to two shards: its
+rebalance-resume scanner finishes a cutover that an operator already committed
+(see [automatic resume](#automatic-resume-after-a-stalled-cutover-issue-1839)).
+It never starts a migration and never commits a cutover.
 
 **Run the migration before deploying the binary.** `db_conn_for_execution` now
 performs a forwarding lookup on multi-shard deployments, so a node running the

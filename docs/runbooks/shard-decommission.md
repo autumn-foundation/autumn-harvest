@@ -186,7 +186,8 @@ Deploy fleet-wide and verify with the config diff from step 1 before step 5.
 Only after step 4 is deployed everywhere:
 
 - **Export the audit trail first.** Every migration wrote its
-  `shard.rebalance.migrate` rows to *this* shard's `harvest_audit_log`, so
+  `shard.rebalance.migrate` and `shard.rebalance.auto_resume` rows to *this*
+  shard's `harvest_audit_log`, so
   retiring the database retires the record of the drill. Ship them off-box with
   the audit exporter (issue #953) before going further.
 - **Settle your erasure obligations on this shard before it leaves reach.** The

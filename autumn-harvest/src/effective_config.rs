@@ -261,10 +261,12 @@ pub struct WorkerConfigView {
     /// Most rows per timeout reason that one timeout pass enforces, as
     /// configured. The checker raises 0 to 1.
     pub timeout_scan_batch_size: u32,
+    /// Whether the worker runs the rebalance-resume scanner (issue #1839).
+    pub rebalance_resume_enabled: bool,
     /// Time between rebalance-resume passes, in milliseconds (issue #1839).
     pub rebalance_resume_interval_ms: u64,
     /// Age of a `COMMITTED` shard migration before the rebalance-resume
-    /// scanner settles it, in milliseconds (issue #1839).
+    /// scanner settles it, in milliseconds, after the floor (issue #1839).
     pub rebalance_stall_after_ms: u64,
     /// Retry budget policy for activity types without an override
     /// (issue #1793). `null` = no default budget.
@@ -505,7 +507,10 @@ impl WorkerConfigView {
             rebalance_resume_interval_ms: dur_ms(crate::scanner_lease::scanner_interval(
                 scanner.rebalance_resume_interval,
             )),
-            rebalance_stall_after_ms: dur_ms(scanner.rebalance_stall_after),
+            rebalance_resume_enabled: scanner.rebalance_resume_enabled,
+            rebalance_stall_after_ms: dur_ms(crate::scanner_lease::rebalance_stall_after(
+                scanner.rebalance_stall_after,
+            )),
             retry_budget_default: retry_budget.default_policy(),
             retry_budget_overrides: retry_budget.overrides(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,

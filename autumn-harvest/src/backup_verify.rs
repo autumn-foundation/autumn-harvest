@@ -1883,7 +1883,8 @@ mod probes {
                     "could not determine the harvest_events layout, so the \
                      dangling-event invariant was skipped (it does not hold on the \
                      partitioned layout, where orphan event rows are reclaimed by \
-                     the partition sweeper): {e}"
+                     the partition sweeper), and so was the duplicate-event-id \
+                     probe (it applies to the partitioned layout only): {e}"
                 ));
                 None
             }

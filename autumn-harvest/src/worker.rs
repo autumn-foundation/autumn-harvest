@@ -31196,12 +31196,13 @@ impl Worker {
         // One rebalance-resume scanner per assigned shard (issue #1839). A
         // migration record lives on its source shard, and its target can be
         // any shard, so the scanner needs the whole sharded pool. Without a
-        // sharded pool no migration can exist.
+        // sharded pool no migration can exist. The operator can turn it off.
         #[cfg(feature = "db")]
         let rebalance_resumers: Vec<_> = self
             .config
             .sharded_pool
             .as_ref()
+            .filter(|_| self.config.scanner.rebalance_resume_enabled)
             .map(|sharded| {
                 shard_pools_for_monitors
                     .iter()

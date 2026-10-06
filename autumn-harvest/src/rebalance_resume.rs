@@ -7,28 +7,35 @@
 //! #1839, only a manual `harvest shard rebalance-resume` closed that gap.
 //!
 //! This scanner closes it automatically. Each worker runs one scanner per
-//! assigned shard. A pass calls
+//! assigned shard, unless `ScannerConfig::rebalance_resume_enabled` is
+//! `false`. A pass calls
 //! [`crate::shard_rebalance::resume_stalled_cutovers`], which settles each
 //! `COMMITTED` record older than a grace period and writes a
 //! `shard.rebalance.auto_resume` audit row.
 //!
 //! The scanner does not use a scanner lease. The pass claims each record in
-//! one statement, so many replicas can run it. In the steady state the pass
-//! is one probe of an empty partial index.
+//! one statement, so many replicas can run it. The claim reads the partial
+//! index of unsettled records. That index is empty when no rebalance runs.
+//! During a drain it also holds the records before the cutover, which the
+//! claim reads and skips.
 
 use std::time::Duration;
 
 /// Settings for one rebalance-resume scanner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RebalanceResumeConfig {
     /// Time between passes. Kept within
     /// [`crate::scanner_lease::MIN_SCANNER_INTERVAL`] and
     /// [`crate::scanner_lease::MAX_SCANNER_INTERVAL`].
     pub interval: Duration,
-    /// Age of a `COMMITTED` record before the scanner settles it.
+    /// Age of a `COMMITTED` record before the scanner settles it. Raised to
+    /// at least [`crate::scanner_lease::MIN_REBALANCE_STALL_AFTER`].
     pub stall_after: Duration,
     /// Most records that one pass settles. At least 1.
     pub batch_size: u32,
+    /// Random spread of each sleep, as a fraction of the interval. Clamped
+    /// like [`crate::scanner_lease::ScannerConfig::jitter`].
+    pub jitter: f64,
 }
 
 /// Default for [`RebalanceResumeConfig::batch_size`].
@@ -42,6 +49,7 @@ impl RebalanceResumeConfig {
             interval: scanner.rebalance_resume_interval,
             stall_after: scanner.rebalance_stall_after,
             batch_size: DEFAULT_REBALANCE_RESUME_BATCH_SIZE,
+            jitter: scanner.jitter,
         }
     }
 }
@@ -53,6 +61,7 @@ impl RebalanceResumeConfig {
 /// safe: each step is idempotent, and an open transaction makes the pool
 /// discard its connection.
 #[cfg(feature = "db")]
+#[must_use = "dropping the handle detaches the scanner; join it at shutdown"]
 pub fn spawn_rebalance_resume_scanner(
     pool: crate::shard::ShardedDbPool,
     shard: crate::types::ShardId,
@@ -63,18 +72,21 @@ pub fn spawn_rebalance_resume_scanner(
     let interval = crate::scanner_lease::scanner_interval(config.interval);
     let limit = i64::from(config.batch_size.max(1));
     // Register before the first tick, so `scanner_liveness` expects this loop
-    // and gives it boot grace (issue #797).
+    // and gives it boot grace (issue #797). The longest sleep is the period.
     let owner = crate::scanner_health::register_scanner_for_shard(
         &*telemetry.metrics,
         crate::scanner_health::Scanner::RebalanceResume,
-        interval,
+        crate::scanner_lease::max_jittered_interval(interval, config.jitter),
         Some(shard),
     );
     crate::dispatch::spawn_bound(async move {
         loop {
+            // Jitter keeps the replicas of a restarted fleet out of step.
+            let sleep =
+                crate::scanner_lease::jittered_interval(interval, config.jitter, rand::random());
             tokio::select! {
                 () = cancel.cancelled() => break,
-                () = tokio::time::sleep(interval) => {}
+                () = tokio::time::sleep(sleep) => {}
             }
 
             // Selected against `cancel` (issue #1426). A pool can have no
@@ -155,6 +167,24 @@ mod tests {
         });
         assert_eq!(tuned.interval, Duration::from_millis(200));
         assert_eq!(tuned.stall_after, Duration::ZERO);
+    }
+
+    #[test]
+    fn the_grace_period_has_a_floor() {
+        use crate::scanner_lease::{MIN_REBALANCE_STALL_AFTER, rebalance_stall_after};
+        assert_eq!(
+            rebalance_stall_after(Duration::ZERO),
+            MIN_REBALANCE_STALL_AFTER
+        );
+        assert_eq!(
+            rebalance_stall_after(DEFAULT_REBALANCE_STALL_AFTER),
+            DEFAULT_REBALANCE_STALL_AFTER
+        );
+    }
+
+    #[test]
+    fn the_scanner_is_on_by_default() {
+        assert!(ScannerConfig::default().rebalance_resume_enabled);
     }
 
     #[test]

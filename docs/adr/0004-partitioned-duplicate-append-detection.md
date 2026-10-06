@@ -18,7 +18,7 @@ true:
 - Neither append is committed when the other runs its check.
 - A cohort boundary falls between the two insert instants.
 
-The window is some microseconds per cohort. The migration
+The window is a few microseconds per cohort. The migration
 `20260901115500_harvest_event_partitioning` and
 [`partitioned-events.md`](../partitioned-events.md) record it as a known limit.
 
@@ -27,7 +27,7 @@ Issue #1839 asks for one of two choices: fix it, or detect it.
 ## Options
 
 1. **Lock every append.** Take an advisory lock on the execution id for each
-   append. This serialises the append hot path. The admission and mutex paths
+   append. This serializes the append hot path. The admission and mutex paths
    already take advisory locks, so a new lock order can deadlock.
 2. **Lock near a boundary only.** Take the lock in a short window around each
    cohort boundary. The window comes from the clock, and clock skew between

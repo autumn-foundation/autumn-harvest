@@ -38,7 +38,11 @@
 //! [`a_worker_resumes_a_stalled_cutover_without_an_operator`],
 //! [`the_scanner_leaves_a_fresh_cutover_to_its_operator`],
 //! [`the_scanner_never_drives_a_pre_cutover_migration`],
-//! [`concurrent_scanner_passes_settle_a_stalled_cutover_once`].
+//! [`concurrent_scanner_passes_settle_a_stalled_cutover_once`],
+//! [`a_worker_with_the_scanner_off_leaves_a_stalled_cutover_alone`],
+//! [`a_record_settled_by_an_operator_is_not_reported_by_the_scanner`],
+//! [`a_down_target_is_retried_one_grace_period_later`],
+//! [`a_replica_without_the_target_pool_does_not_claim_the_record`].
 //!
 //! Runs against `HARVEST_TEST_DATABASE_URL` when set (each test gets two
 //! throwaway databases), otherwise against per-test Postgres containers.
@@ -2014,6 +2018,13 @@ async fn resume_finishes_a_migration_killed_after_the_cutover() {
         .await
         .expect("resume twice");
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+    // The operator's resume keeps its own audit operation (issue #1839), and
+    // the second sweep settles nothing, so it writes no second row.
+    assert_eq!(
+        audits_of(&mut source, "shard.rebalance.migrate", exec_id).await,
+        1
+    );
+    assert_eq!(auto_resume_audits(&mut source, exec_id).await, 0);
 }
 
 #[tokio::test]
@@ -8204,11 +8215,10 @@ async fn interrupt_after_cutover(shards: &TwoShards, workflow_id: &str) -> Execu
             .await
             .expect("cutover")
     );
-    let record = load_migration(&mut source, exec_id)
-        .await
-        .expect("load")
-        .expect("row");
-    assert_eq!(record.phase, MigrationPhase::Committed);
+    assert_eq!(
+        phase_of(&mut source, exec_id).await,
+        MigrationPhase::Committed
+    );
     assert!(
         authoritative_shards(shards, exec_id).await.is_empty(),
         "the gap: after the cutover and before activation, no shard can claim the run"
@@ -8217,30 +8227,76 @@ async fn interrupt_after_cutover(shards: &TwoShards, workflow_id: &str) -> Execu
 }
 
 /// Move a migration record's `updated_at` back by `secs`.
-async fn age_migration(conn: &mut AsyncPgConnection, exec_id: ExecutionId, secs: i64) {
+///
+/// A crash leaves the record as old as the time since the crash.
+async fn age_migration(conn: &mut AsyncPgConnection, exec_id: ExecutionId, secs: i32) {
     diesel::sql_query(
         "UPDATE harvest_shard_migrations \
             SET updated_at = NOW() - make_interval(secs => $2) \
           WHERE execution_id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .bind::<diesel::sql_types::Double, _>(secs as f64)
+    .bind::<diesel::sql_types::Double, _>(f64::from(secs))
     .execute(conn)
     .await
     .expect("age the migration record");
 }
 
-/// The scanner's audit rows for one execution.
-async fn auto_resume_audits(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
-    count(
-        conn,
+/// Every audit row of one operation for one execution, whatever its fields.
+async fn audits_of(conn: &mut AsyncPgConnection, operation: &str, exec_id: ExecutionId) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        value: i64,
+    }
+    diesel::sql_query(
         "SELECT count(*)::BIGINT AS value FROM harvest_audit_log \
-          WHERE operation = 'shard.rebalance.auto_resume' \
-            AND target_id = $1::text AND actor = 'system' \
-            AND status = 'succeeded' AND shard_id = 0",
-        exec_id,
+          WHERE operation = $1 AND target_id = $2::text",
     )
+    .bind::<diesel::sql_types::Text, _>(operation)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<Count>(conn)
     .await
+    .expect("count audit rows")
+    .value
+}
+
+/// The scanner's audit rows for one execution, whatever their fields.
+async fn auto_resume_audits(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    audits_of(conn, "shard.rebalance.auto_resume", exec_id).await
+}
+
+/// Assert the fields of the one scanner audit row for `exec_id`.
+async fn assert_auto_resume_audit_row(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        actor: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        source: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        route_or_command: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        status: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+        shard_id: Option<i32>,
+    }
+    let row: Row = diesel::sql_query(
+        "SELECT actor, source, route_or_command, status, shard_id FROM harvest_audit_log \
+          WHERE operation = 'shard.rebalance.auto_resume' AND target_id = $1::text",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(conn)
+    .await
+    .expect("exactly one scanner audit row");
+    assert_eq!(row.actor, "system");
+    assert_eq!(row.source, "cli");
+    assert_eq!(
+        row.route_or_command,
+        "background.rebalance_resume_scanner 0 -> 1"
+    );
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.shard_id, Some(SOURCE.as_i32()));
 }
 
 async fn phase_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> MigrationPhase {
@@ -8251,12 +8307,23 @@ async fn phase_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Migrati
         .phase
 }
 
+async fn attempts_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i32 {
+    load_migration(conn, exec_id)
+        .await
+        .expect("load")
+        .expect("row")
+        .attempts
+}
+
 /// Issue #1839 AC 1. A rebalance interrupted after its cutover resumes on its
-/// own, within one scanner interval.
+/// own, within one scanner interval of the stall.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_scanner_resumes_a_rebalance_interrupted_after_cutover_within_its_interval() {
     let shards = setup_two_shards().await;
     let exec_id = interrupt_after_cutover(&shards, "entity-auto-resume").await;
+    let mut source = shards.source().await;
+    // The crash happened one minute ago, so the record is already stalled.
+    age_migration(&mut source, exec_id, 60).await;
 
     let interval = std::time::Duration::from_secs(1);
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -8266,17 +8333,17 @@ async fn the_scanner_resumes_a_rebalance_interrupted_after_cutover_within_its_in
         SOURCE,
         RebalanceResumeConfig {
             interval,
-            stall_after: std::time::Duration::ZERO,
+            stall_after: std::time::Duration::from_secs(30),
             batch_size: 10,
+            jitter: 0.0,
         },
         cancel.clone(),
         std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
     );
 
-    // The first pass runs one interval after the start. A second interval
-    // would mean that the first pass missed the row.
+    // The first pass runs one interval after the start. A second pass cannot
+    // end before two intervals, so a pass before the deadline is the first.
     let deadline = started + interval * 2;
-    let mut source = shards.source().await;
     loop {
         let phase = phase_of(&mut source, exec_id).await;
         if phase == MigrationPhase::Done {
@@ -8288,6 +8355,8 @@ async fn the_scanner_resumes_a_rebalance_interrupted_after_cutover_within_its_in
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    // Later passes leave the settled record alone.
+    tokio::time::sleep(interval * 2).await;
     cancel.cancel();
     scanner.await.expect("the scanner stops on cancel");
 
@@ -8297,6 +8366,7 @@ async fn the_scanner_resumes_a_rebalance_interrupted_after_cutover_within_its_in
         1,
         "the automatic resume writes exactly one audit row"
     );
+    assert_auto_resume_audit_row(&mut source, exec_id).await;
 }
 
 /// The worker starts the scanner on its own. No operator runs a command.
@@ -8312,10 +8382,11 @@ async fn a_worker_resumes_a_stalled_cutover_without_an_operator() {
     let _global_pool_guard = GLOBAL_SHARDED_POOL_TEST_LOCK.lock().await;
     let shards = setup_two_shards().await;
     let exec_id = interrupt_after_cutover(&shards, "entity-worker-resume").await;
+    let mut source = shards.source().await;
+    age_migration(&mut source, exec_id, 60).await;
 
     let scanner = ScannerConfig {
         rebalance_resume_interval: std::time::Duration::from_millis(200),
-        rebalance_stall_after: std::time::Duration::ZERO,
         ..ScannerConfig::default()
     };
     let built = HarvestBuilder::new()
@@ -8343,7 +8414,6 @@ async fn a_worker_resumes_a_stalled_cutover_without_an_operator() {
     let handle = tokio::spawn(async move { runner.run(&default_pool).await });
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut source = shards.source().await;
     while phase_of(&mut source, exec_id).await != MigrationPhase::Done {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -8352,9 +8422,76 @@ async fn a_worker_resumes_a_stalled_cutover_without_an_operator() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     worker.shutdown();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("the worker stops, its rebalance-resume scanner included")
+        .expect("the worker task does not panic");
 
     assert_eq!(auto_resume_audits(&mut source, exec_id).await, 1);
+    assert_auto_resume_audit_row(&mut source, exec_id).await;
+    let mut target = shards.target().await;
+    assert_ne!(
+        state_of(&mut target, exec_id).await.as_deref(),
+        Some("MIGRATING"),
+        "the target copy is live"
+    );
+}
+
+/// The off switch leaves a stalled cutover to the operator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_with_the_scanner_off_leaves_a_stalled_cutover_alone() {
+    use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
+    use autumn_harvest::scanner_lease::ScannerConfig;
+    use autumn_harvest::worker::{Worker, WorkerRuntimeConfig};
+
+    let _global_pool_guard = GLOBAL_SHARDED_POOL_TEST_LOCK.lock().await;
+    let shards = setup_two_shards().await;
+    let exec_id = interrupt_after_cutover(&shards, "entity-worker-off").await;
+    let mut source = shards.source().await;
+    age_migration(&mut source, exec_id, 60).await;
+
+    let scanner = ScannerConfig {
+        rebalance_resume_enabled: false,
+        rebalance_resume_interval: std::time::Duration::from_millis(100),
+        ..ScannerConfig::default()
+    };
+    let built = HarvestBuilder::new()
+        .worker(
+            WorkerConfig::default()
+                .with_shard_assignments(vec![SOURCE, TARGET])
+                .with_scanner_config(scanner),
+        )
+        .build();
+    let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+    let mut runtime: WorkerRuntimeConfig = worker_config.into();
+    runtime.worker_id = "w-rebalance-resume-off".to_string();
+    runtime.poll_interval = std::time::Duration::from_millis(50);
+    runtime.shutdown_timeout = std::time::Duration::from_secs(2);
+    runtime.sharded_pool = Some(shards.pool.clone());
+    let worker = std::sync::Arc::new(
+        Worker::new(runtime, std::sync::Arc::new(registry)).expect("worker builds"),
+    );
+    let default_pool = shards
+        .pool
+        .exact_pool_for(SOURCE)
+        .expect("source pool")
+        .clone();
+    let runner = std::sync::Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&default_pool).await });
+
+    // Ten intervals: an enabled scanner would settle the record in one.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    worker.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("the worker stops")
+        .expect("the worker task does not panic");
+
+    assert_eq!(
+        phase_of(&mut source, exec_id).await,
+        MigrationPhase::Committed
+    );
+    assert_eq!(auto_resume_audits(&mut source, exec_id).await, 0);
 }
 
 /// A cutover younger than the grace period belongs to the operator who is
@@ -8379,6 +8516,16 @@ async fn the_scanner_leaves_a_fresh_cutover_to_its_operator() {
     );
     assert_eq!(auto_resume_audits(&mut source, exec_id).await, 0);
 
+    // A zero grace period is raised to the floor, so a fresh record still
+    // waits.
+    let outcomes = resume_stalled_cutovers(&shards.pool, SOURCE, std::time::Duration::ZERO, 10)
+        .await
+        .expect("pass");
+    assert!(
+        outcomes.is_empty(),
+        "the floor protects a fresh cutover: {outcomes:?}"
+    );
+
     // Past the grace period, the same pass settles it.
     age_migration(&mut source, exec_id, 7200).await;
     let outcomes = resume_stalled_cutovers(&shards.pool, SOURCE, grace, 10)
@@ -8394,6 +8541,11 @@ async fn the_scanner_leaves_a_fresh_cutover_to_its_operator() {
     assert_eq!(phase_of(&mut source, exec_id).await, MigrationPhase::Done);
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
     assert_eq!(auto_resume_audits(&mut source, exec_id).await, 1);
+    assert_eq!(
+        audits_of(&mut source, "shard.rebalance.migrate", exec_id).await,
+        0,
+        "the scanner never writes the operator's audit operation"
+    );
 }
 
 /// Before the cutover the source is still claimable, so no liveness gap
@@ -8429,35 +8581,155 @@ async fn the_scanner_never_drives_a_pre_cutover_migration() {
         Some("MIGRATING")
     );
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+    assert_eq!(auto_resume_audits(&mut source, exec_id).await, 0);
 }
 
 /// Many replicas run the scanner. One stalled row still settles once, with
-/// one audit row.
+/// one audit row, also when a replica sets a zero grace period.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_scanner_passes_settle_a_stalled_cutover_once() {
+    for grace in [
+        std::time::Duration::from_secs(60),
+        std::time::Duration::ZERO,
+    ] {
+        let shards = setup_two_shards().await;
+        let exec_id = interrupt_after_cutover(&shards, "entity-concurrent-resume").await;
+        let mut source = shards.source().await;
+        age_migration(&mut source, exec_id, 7200).await;
+
+        let passes: Vec<_> = (0..4)
+            .map(|_| {
+                let pool = shards.pool.clone();
+                tokio::spawn(async move { resume_stalled_cutovers(&pool, SOURCE, grace, 10).await })
+            })
+            .collect();
+        let mut migrated = 0;
+        for pass in passes {
+            let outcomes = pass.await.expect("join").expect("pass");
+            migrated += outcomes
+                .iter()
+                .filter(|o| matches!(o, MigrationOutcome::Migrated { .. }))
+                .count();
+        }
+
+        assert_eq!(
+            migrated, 1,
+            "exactly one pass claims the stalled row (grace {grace:?})"
+        );
+        assert_eq!(phase_of(&mut source, exec_id).await, MigrationPhase::Done);
+        assert_eq!(auto_resume_audits(&mut source, exec_id).await, 1);
+        assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+    }
+}
+
+/// A record settled by another driver after the claim gets no outcome and no
+/// audit row from the scanner.
+#[tokio::test]
+async fn a_record_settled_by_an_operator_is_not_reported_by_the_scanner() {
     let shards = setup_two_shards().await;
-    let exec_id = interrupt_after_cutover(&shards, "entity-concurrent-resume").await;
+    let exec_id = interrupt_after_cutover(&shards, "entity-operator-first").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+    assert!(
+        activate_target(&mut source, &mut target, exec_id)
+            .await
+            .expect("the operator activates")
+    );
+    assert!(
+        !activate_target(&mut source, &mut target, exec_id)
+            .await
+            .expect("a second activation is a no-op"),
+        "a second activation reports that it settled nothing"
+    );
+    assert_eq!(phase_of(&mut source, exec_id).await, MigrationPhase::Done);
+    age_migration(&mut source, exec_id, 7200).await;
+
+    let outcomes = resume_stalled_cutovers(&shards.pool, SOURCE, std::time::Duration::ZERO, 10)
+        .await
+        .expect("pass");
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+    assert_eq!(auto_resume_audits(&mut source, exec_id).await, 0);
+}
+
+/// A target that is down fails the step. The record stays `COMMITTED`, counts
+/// an attempt and gets no audit row. The claim spaces out the next try.
+#[tokio::test]
+async fn a_down_target_is_retried_one_grace_period_later() {
+    let shards = setup_two_shards().await;
+    let exec_id = interrupt_after_cutover(&shards, "entity-target-down").await;
     let mut source = shards.source().await;
     age_migration(&mut source, exec_id, 7200).await;
+
+    // The same shards, but the target pool points at a closed port.
+    let dead_target: ShardedDbPool = ShardedDbPool::from_map(
+        [
+            (SOURCE, build_pool(&shards.source_url)),
+            (
+                TARGET,
+                build_pool("postgres://postgres:postgres@127.0.0.1:1/none"),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        SOURCE,
+    );
     let grace = std::time::Duration::from_secs(60);
 
-    let passes: Vec<_> = (0..4)
-        .map(|_| {
-            let pool = shards.pool.clone();
-            tokio::spawn(async move { resume_stalled_cutovers(&pool, SOURCE, grace, 10).await })
-        })
-        .collect();
-    let mut migrated = 0;
-    for pass in passes {
-        let outcomes = pass.await.expect("join").expect("pass");
-        migrated += outcomes
-            .iter()
-            .filter(|o| matches!(o, MigrationOutcome::Migrated { .. }))
-            .count();
-    }
+    let outcomes = resume_stalled_cutovers(&dead_target, SOURCE, grace, 10)
+        .await
+        .expect("pass");
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [MigrationOutcome::Aborted { execution_id, .. }] if *execution_id == exec_id
+        ),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        phase_of(&mut source, exec_id).await,
+        MigrationPhase::Committed
+    );
+    assert_eq!(attempts_of(&mut source, exec_id).await, 1);
+    assert_eq!(auto_resume_audits(&mut source, exec_id).await, 0);
 
-    assert_eq!(migrated, 1, "exactly one pass claims the stalled row");
+    // The claim moved `updated_at`, so an immediate second pass waits.
+    let outcomes = resume_stalled_cutovers(&shards.pool, SOURCE, grace, 10)
+        .await
+        .expect("pass");
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+
+    // One grace period later a healthy pool settles it.
+    age_migration(&mut source, exec_id, 7200).await;
+    let outcomes = resume_stalled_cutovers(&shards.pool, SOURCE, grace, 10)
+        .await
+        .expect("pass");
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     assert_eq!(phase_of(&mut source, exec_id).await, MigrationPhase::Done);
     assert_eq!(auto_resume_audits(&mut source, exec_id).await, 1);
-    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+}
+
+/// A replica with no pool for the target does not claim the record, so a
+/// replica that can reach the target settles it at once.
+#[tokio::test]
+async fn a_replica_without_the_target_pool_does_not_claim_the_record() {
+    let shards = setup_two_shards().await;
+    let exec_id = interrupt_after_cutover(&shards, "entity-no-target-pool").await;
+    let mut source = shards.source().await;
+    age_migration(&mut source, exec_id, 7200).await;
+
+    let source_only: ShardedDbPool = ShardedDbPool::from_map(
+        std::iter::once((SOURCE, build_pool(&shards.source_url))).collect(),
+        SOURCE,
+    );
+    let grace = std::time::Duration::from_secs(60);
+    let outcomes = resume_stalled_cutovers(&source_only, SOURCE, grace, 10)
+        .await
+        .expect("pass");
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+    assert_eq!(attempts_of(&mut source, exec_id).await, 0);
+
+    let outcomes = resume_stalled_cutovers(&shards.pool, SOURCE, grace, 10)
+        .await
+        .expect("pass");
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(phase_of(&mut source, exec_id).await, MigrationPhase::Done);
 }

@@ -1,6 +1,7 @@
 # Close the documented residual windows (issue #1839)
 
-**Status**: plan, written before the code.
+**Status**: implemented. Written before the code. Section 6 records the
+review changes.
 
 **Scope**: three items from issue #1839.
 
@@ -51,8 +52,8 @@ Ideas for item 2 (two in-flight appends of one `event_id` in two cohorts):
 | Harm | Guard |
 |---|---|
 | It discards the staged copy of a live `harvest shard rebalance` run. | It reads `COMMITTED` rows only. Before the cutover it does nothing. |
-| It races a live CLI between cutover and activation. | A grace period (`rebalance_stall_after`, 30 s). Activation is idempotent if the race still occurs. |
-| Many replicas audit one row many times. | One `UPDATE ... FOR UPDATE SKIP LOCKED` claims the row and moves `updated_at`. Other replicas skip it for one grace period. |
+| It races a live CLI between cutover and activation. | A grace period (`rebalance_stall_after`, 30 s, floor 5 s). Activation is idempotent if the race still occurs. |
+| Many replicas audit one row many times. | One `UPDATE ... FOR UPDATE SKIP LOCKED` claims one row and moves `updated_at`. Other replicas skip it for one grace period. |
 | A target outage makes it spin. | The claim moves `updated_at`, so a retry waits one grace period. A failed step counts in `attempts`. |
 | It blocks shutdown on a full pool. | The pass is selected against the cancel token. An open transaction marks the connection broken, so the pool discards it. |
 | It hides a stall from operators. | It writes a `shard.rebalance.auto_resume` audit row and a `warn` log. |
@@ -120,4 +121,23 @@ separate decision.
 | `the_scanner_leaves_a_fresh_cutover_to_its_operator` | The grace period. |
 | `the_scanner_never_drives_a_pre_cutover_migration` | Pre-cutover rows stay with the operator. |
 | `concurrent_scanner_passes_settle_a_stalled_cutover_once` | The claim fences the audit row. |
-| `backup_verify_reports_a_duplicate_event_id_on_the_partitioned_layout` | Item 2 detection. |
+| `detects_a_duplicate_event_id_on_the_partitioned_layout` | Item 2 detection. |
+
+## 6. Review changes
+
+A review from three angles (correctness, tests, operations) found no defect
+of high severity in the claim or the refactor. These changes came from it:
+
+- A pass claims one record per statement. A batch claim could expire while
+  earlier records of the batch still ran.
+- `rebalance_stall_after` has a 5 s floor. A zero grace let two passes claim
+  one record.
+- `activate_target` returns whether it settled the record. A record that
+  another driver settled first gets no outcome and no audit row.
+- A replica claims only records whose target is in its pool.
+- The claim and the activation check the DR fence when it is enabled.
+- `rebalance_resume_enabled` turns the scanner off. The sleep uses the
+  scanner jitter.
+- Deferred: a metric for a record that never settles. Today the record's
+  `attempts` and `last_error`, and an error log per try, show it.
+

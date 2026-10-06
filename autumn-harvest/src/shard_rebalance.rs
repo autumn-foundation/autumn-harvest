@@ -2786,6 +2786,9 @@ mod db {
     /// 1's outcome. `DONE` is terminal, so no future abort can restore a
     /// marker left unfinalized here.
     ///
+    /// Returns `true` when this call moved the record to `DONE`, and `false`
+    /// when another driver settled it first (issue #1839).
+    ///
     /// # Errors
     ///
     /// [`HarvestError::Database`] on failure.
@@ -2795,7 +2798,7 @@ mod db {
         source: &mut AsyncPgConnection,
         target: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-    ) -> HarvestResult<()> {
+    ) -> HarvestResult<bool> {
         // `staged_task`, captured verbatim at stage time and restored here.
         let staged: ActivationRow = diesel::sql_query(
             "SELECT staged_task AS payload FROM harvest_shard_migrations \
@@ -2955,7 +2958,7 @@ mod db {
         // payload. Once the target holds it there is no reason to keep a third
         // copy on the source in a table neither `erase.rs` nor the retention
         // janitor knows about, so the settling UPDATE clears it.
-        diesel::sql_query(
+        let settled = diesel::sql_query(
             "UPDATE harvest_shard_migrations \
                 SET phase = 'DONE', staged_task = NULL, updated_at = NOW() \
               WHERE execution_id = $1 AND phase = 'COMMITTED'",
@@ -2965,7 +2968,7 @@ mod db {
         .await
         .map_err(database_error)?;
 
-        Ok(())
+        Ok(settled > 0)
     }
 
     /// Abandon a pre-cutover migration, leaving the source exactly as it was.
@@ -3553,6 +3556,7 @@ mod db {
         // before the window is exhausted. The report must count only the
         // candidates the loop actually reached, never the wider fetch.
         let fetched = candidates.len();
+        let driver = MigrationDriver::Operator(actor);
         let mut outcomes = Vec::new();
         let mut moved = 0usize;
         // The cursor for the NEXT call must name the last candidate this one
@@ -3579,7 +3583,7 @@ mod db {
                     let mut source = checkout(pool, source_shard).await?;
                     record_migration_audit(
                         &mut source,
-                        MigrationDriver::Operator(actor),
+                        driver,
                         source_shard,
                         target_shard,
                         &outcome,
@@ -3636,14 +3640,8 @@ mod db {
             // already sealed its source — the one record an operator most needs.
             {
                 let mut source = checkout(pool, source_shard).await?;
-                record_migration_audit(
-                    &mut source,
-                    MigrationDriver::Operator(actor),
-                    source_shard,
-                    target_shard,
-                    &outcome,
-                )
-                .await?;
+                record_migration_audit(&mut source, driver, source_shard, target_shard, &outcome)
+                    .await?;
             }
             outcomes.push(outcome);
         }
@@ -3674,9 +3672,6 @@ mod db {
         })
     }
 
-    /// The audit operation of a migration step that an operator drives.
-    const OP_SHARD_REBALANCE_MIGRATE: &str = "shard.rebalance.migrate";
-
     /// Who drives a migration step. The audit row names it.
     #[derive(Debug, Clone, Copy)]
     enum MigrationDriver<'a> {
@@ -3686,8 +3681,9 @@ mod db {
         /// The rebalance-resume scanner (issue #1839).
         ///
         /// The audit row has actor `system` and source `cli`. The audit table
-        /// accepts only `api`, `cli` and `ui`. The rebalance surface is the
-        /// CLI, and the `background.*` route marks the row as automatic.
+        /// accepts only `api`, `cli` and `ui`, so `cli` is the nearest value,
+        /// not the real origin. The `background.*` route marks the row as
+        /// automatic.
         Scanner,
     }
 
@@ -3728,9 +3724,11 @@ mod db {
         };
         let exec_id = outcome.execution_id().to_string();
         let (actor, operation, command) = match driver {
-            MigrationDriver::Operator(actor) => {
-                (actor, OP_SHARD_REBALANCE_MIGRATE, "shard rebalance")
-            }
+            MigrationDriver::Operator(actor) => (
+                actor,
+                crate::audit::OP_SHARD_REBALANCE_MIGRATE,
+                "shard rebalance",
+            ),
             MigrationDriver::Scanner => (
                 "system",
                 crate::audit::OP_SHARD_REBALANCE_AUTO_RESUME,
@@ -3753,7 +3751,7 @@ mod db {
             status,
             error_summary: error_summary.as_deref(),
             shard_id: Some(source_shard.as_i32()),
-            source: "cli",
+            source: crate::audit::SOURCE_CLI,
         };
         crate::audit::insert_audit(conn, &record).await?;
         Ok(())
@@ -3862,8 +3860,8 @@ mod db {
             Err(error) => {
                 let reason =
                     format!("could not check out a connection to resume this migration: {error}");
-                // Best-effort: bumps `attempts` so the ORDER BY above sinks
-                // this record behind less-tried ones on the next sweep.
+                // Best-effort: bumps `attempts`, so the `attempts ASC` order of
+                // both sweeps sinks this record behind less-tried ones.
                 // `record.source_shard` is usually the same pool already
                 // used to read this record's own table. A fresh checkout
                 // of it typically succeeds even when the record's TARGET
@@ -3941,7 +3939,19 @@ mod db {
                         }
                     }
                     MigrationAction::ActivateTarget => {
-                        activate_target(&mut source, &mut target, exec_id).await?;
+                        // An unattended writer checks the DR fence (issue
+                        // #1839). An operator command does not need it.
+                        if matches!(driver, MigrationDriver::Scanner)
+                            && crate::replication::FenceRegistry::is_enabled()
+                        {
+                            crate::replication::assert_fence(&mut target, record.target_shard)
+                                .await?;
+                        }
+                        // Another driver can settle the record first. Then
+                        // this call did no work and reports no outcome.
+                        if !activate_target(&mut source, &mut target, exec_id).await? {
+                            return Ok(None);
+                        }
                         collapse_forward_chain(
                             pool,
                             exec_id,
@@ -4028,62 +4038,56 @@ mod db {
     /// such records and activates their targets, as `rebalance-resume` does.
     ///
     /// A record is stalled when its `updated_at` is at least `stall_after`
-    /// old. The grace period lets a live `harvest shard rebalance` finish its
-    /// own activation first.
+    /// old. The value is raised to at least
+    /// [`crate::scanner_lease::MIN_REBALANCE_STALL_AFTER`]. The grace period
+    /// lets a live `harvest shard rebalance` finish its own activation first.
     ///
     /// Records before the cutover are not touched. There the source is still
     /// claimable, so no liveness gap exists. A cutover is the operator's
-    /// decision.
+    /// decision. A record whose target has no pool in `pool` is not touched
+    /// either, so a replica that can reach the target settles it.
     ///
-    /// One statement claims each record and sets its `updated_at`. Other
+    /// Each statement claims one record and sets its `updated_at`. Other
     /// passes then skip it for one grace period. So many replicas can run
-    /// this pass, and each record gets one audit row per settlement. The
-    /// claim also spaces out the retries when a target is down.
+    /// this pass, and one settlement writes one audit row. The claim also
+    /// spaces out the retries when a target is down. A record that another
+    /// driver settles first gets no outcome and no audit row.
+    ///
+    /// When the DR fence is enabled, the claim and the activation each check
+    /// it first.
     ///
     /// # Errors
     ///
-    /// [`HarvestError::Database`] when the claim fails, and
-    /// [`HarvestError::ShardUnavailable`] when `source_shard` has no pool. A
-    /// record that cannot be advanced records its error and does not fail the
-    /// pass.
+    /// [`HarvestError::Database`] when a claim fails,
+    /// [`HarvestError::ShardUnavailable`] when `source_shard` has no pool, and
+    /// the fence error when this node may not write to `source_shard`. A
+    /// record that cannot be advanced records its error and does not fail
+    /// the pass.
     pub async fn resume_stalled_cutovers(
         pool: &ShardedDbPool,
         source_shard: ShardId,
         stall_after: std::time::Duration,
         limit: i64,
     ) -> HarvestResult<Vec<MigrationOutcome>> {
-        let stalled: Vec<MigrationRecord> = {
-            let mut source = checkout(pool, source_shard).await?;
-            // `SKIP LOCKED` skips a record that another pass claims now. A
-            // record that another pass claimed before has a new `updated_at`,
-            // so the stall filter drops it.
-            let rows: Vec<MigrationRow> = diesel::sql_query(format!(
-                "UPDATE harvest_shard_migrations \
-                    SET updated_at = NOW() \
-                  WHERE execution_id IN ( \
-                        SELECT execution_id FROM harvest_shard_migrations \
-                         WHERE phase = 'COMMITTED' \
-                           AND updated_at <= NOW() - make_interval(secs => $1) \
-                         ORDER BY attempts ASC, created_at ASC \
-                         LIMIT $2 \
-                           FOR UPDATE SKIP LOCKED) \
-                RETURNING {MIGRATION_COLUMNS}"
-            ))
-            .bind::<diesel::sql_types::Double, _>(stall_after.as_secs_f64())
-            .bind::<BigInt, _>(limit)
-            .load(&mut *source)
-            .await
-            .map_err(database_error)?;
-            rows.into_iter()
-                .map(MigrationRow::into_record)
-                .collect::<HarvestResult<Vec<_>>>()?
-        };
-
+        let stall_after = crate::scanner_lease::rebalance_stall_after(stall_after);
+        let targets: Vec<i32> = pool
+            .shard_ids()
+            .into_iter()
+            .filter(|shard| *shard != source_shard)
+            .map(ShardId::as_i32)
+            .collect();
         // Past the cutover the only step is the activation. It decodes no
         // payload, so the default codecs are enough.
         let codecs = PayloadCodecs::default();
         let mut outcomes = Vec::new();
-        for record in stalled {
+        // One claim per record. A claim made for a whole batch could expire
+        // while earlier records of the batch still run.
+        for _ in 0..limit.max(1) {
+            let Some(record) =
+                claim_stalled_cutover(pool, source_shard, stall_after, &targets).await?
+            else {
+                break;
+            };
             drive_migration(
                 pool,
                 record,
@@ -4094,6 +4098,47 @@ mod db {
             .await?;
         }
         Ok(outcomes)
+    }
+
+    /// Claim the oldest stalled `COMMITTED` record on `source_shard` whose
+    /// target is in `targets` (issue #1839).
+    async fn claim_stalled_cutover(
+        pool: &ShardedDbPool,
+        source_shard: ShardId,
+        stall_after: std::time::Duration,
+        targets: &[i32],
+    ) -> HarvestResult<Option<MigrationRecord>> {
+        let mut source = checkout(pool, source_shard).await?;
+        let targets = targets.to_vec();
+        let row: Option<MigrationRow> =
+            Box::pin(source.transaction::<_, HarvestError, _>(async |conn| {
+                if crate::replication::FenceRegistry::is_enabled() {
+                    crate::replication::assert_fence(conn, source_shard).await?;
+                }
+                // `SKIP LOCKED` skips a record that another pass claims now. A
+                // record that another pass claimed before has a new
+                // `updated_at`, so the stall filter drops it.
+                diesel::sql_query(format!(
+                    "UPDATE harvest_shard_migrations \
+                        SET updated_at = NOW() \
+                      WHERE execution_id IN ( \
+                            SELECT execution_id FROM harvest_shard_migrations \
+                             WHERE phase = 'COMMITTED' \
+                               AND updated_at <= NOW() - make_interval(secs => $1) \
+                               AND target_shard = ANY($2) \
+                             ORDER BY attempts ASC, created_at ASC \
+                             LIMIT 1 \
+                               FOR UPDATE SKIP LOCKED) \
+                    RETURNING {MIGRATION_COLUMNS}"
+                ))
+                .bind::<diesel::sql_types::Double, _>(stall_after.as_secs_f64())
+                .bind::<diesel::sql_types::Array<Integer>, _>(&targets)
+                .get_result(conn)
+                .await
+                .optional_row()
+            }))
+            .await?;
+        row.map(MigrationRow::into_record).transpose()
     }
 
     // ── Forwarding ───────────────────────────────────────────────────────────
