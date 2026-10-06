@@ -1023,9 +1023,10 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 /// - `circuit_breakers`: each activity with a breaker policy, with that
 ///   policy. Such an activity skips the claim-time rate-limit gate, and its
 ///   breaker fails it fast while open. The open state stays out of the key.
-/// - `dispatch_channel`: a channel orders delivery by priority and ignores
-///   `queue_weights`. The Postgres claim applies the weights. So the two
-///   routes give two task mixes under load.
+/// - `dispatch_channel`: the shards whose claims a dispatch channel serves.
+///   A channel orders delivery by priority and ignores `queue_weights`. The
+///   Postgres claim applies the weights. A multi-shard worker can use a
+///   channel on some shards only. So each route set gives its own task mix.
 /// - `retry_budgets`: the retry-budget policy of each registered activity. A
 ///   tighter budget defers more retries, so the worker runs fewer of them.
 /// - `outcome_window_ms` and `peer_stale_secs`: both follow the heartbeat
@@ -1093,7 +1094,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "workflows": sorted_names(registered_workflows),
         "activities": sorted_names(registered_activities),
         "circuit_breakers": breaker_policies(circuit_breakers),
-        "dispatch_channel": dispatch_channel,
+        "dispatch_channel": sorted_shards(dispatch_channel),
         "retry_budgets": budgets,
         "outcome_window": duration_key(*outcome_window),
         "peer_stale_secs": peer_stale_secs,
@@ -1149,6 +1150,14 @@ pub(crate) fn duration_key(duration: std::time::Duration) -> serde_json::Value {
     serde_json::json!([duration.as_secs(), duration.subsec_nanos()])
 }
 
+/// `shards`, sorted and deduplicated, for a cohort key.
+fn sorted_shards(shards: &[i32]) -> Vec<i32> {
+    let mut shards = shards.to_vec();
+    shards.sort_unstable();
+    shards.dedup();
+    shards
+}
+
 /// `names`, sorted and deduplicated, for a cohort key.
 fn sorted_names(names: &[String]) -> Vec<&str> {
     let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -1194,8 +1203,9 @@ pub struct CohortPolicy<'a> {
     pub registered_activities: &'a [String],
     /// The worker's circuit breakers. Only their policies enter the key.
     pub circuit_breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
-    /// Whether the worker reads task references from a dispatch channel.
-    pub dispatch_channel: bool,
+    /// The shards on which the worker reads task references from a dispatch
+    /// channel. The Postgres claim serves every other shard.
+    pub dispatch_channel: &'a [i32],
     /// The worker's retry budgets. The key holds the policy of each
     /// registered activity.
     pub retry_budgets: &'a crate::retry_budget::RetryBudgetConfig,
@@ -3341,7 +3351,7 @@ mod tests {
             registered_workflows: &[],
             registered_activities: &[],
             circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
-            dispatch_channel: false,
+            dispatch_channel: &[],
             retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
             outcome_window: std::time::Duration::from_secs(300),
             peer_stale_secs: 120,
@@ -3372,7 +3382,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
@@ -3408,7 +3418,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
@@ -3450,7 +3460,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
@@ -3486,7 +3496,7 @@ mod tests {
                 registered_workflows: workflows,
                 registered_activities: activities,
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
@@ -3615,7 +3625,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: breakers,
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
@@ -3677,7 +3687,10 @@ mod tests {
                 payload: super::PayloadPolicy::default(),
             })
         };
-        assert_ne!(cohort(true), cohort(false));
+        assert_ne!(cohort(&[0]), cohort(&[]));
+        // A multi-shard worker can use a channel on some shards only.
+        assert_ne!(cohort(&[1]), cohort(&[2]));
+        assert_eq!(cohort(&[2, 1]), cohort(&[1, 2, 2]));
     }
 
     /// Issue #1815: a retry budget defers retries, and a deferred retry does
@@ -3706,7 +3719,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &activities,
                 circuit_breakers: &breakers,
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: budgets,
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
@@ -3756,7 +3769,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &breakers,
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &budgets,
                 outcome_window,
                 peer_stale_secs,
@@ -3803,7 +3816,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &breakers,
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &budgets,
                 outcome_window,
                 peer_stale_secs: 120,
@@ -3882,7 +3895,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &breakers,
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &budgets,
                 outcome_window: Duration::from_secs(300),
                 peer_stale_secs: 120,
@@ -4046,7 +4059,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &breakers,
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &budgets,
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
@@ -4257,7 +4270,7 @@ mod tests {
                 registered_workflows: &[],
                 registered_activities: &[],
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
-                dispatch_channel: false,
+                dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,

@@ -1306,7 +1306,8 @@ impl HandlerRegistry {
     /// Each entry holds the effective input cap, which the worker applies when
     /// it builds a task context and resolves a continue-as-new input. It also
     /// holds whether the workflow is a unified DAG. A continue-as-new into a
-    /// DAG is refused. Deadlines and start-time policies stay out: they shape
+    /// DAG is refused. It also holds the quota, which a detached child start
+    /// and a continue-as-new enforce inside the task. Deadlines and start-time policies stay out: they shape
     /// a later run, not the task that this worker runs.
     fn workflow_policies(&self) -> Vec<(String, serde_json::Value)> {
         let mut policies: Vec<(String, serde_json::Value)> = self
@@ -1319,6 +1320,14 @@ impl HandlerRegistry {
                         self.max_workflow_input_bytes,
                     ),
                     "dag": self.dag_workflow_names.contains(name),
+                    // A detached child start and a continue-as-new enforce
+                    // the quota inside the task.
+                    "quota": info.quota.map(|quota| serde_json::json!([
+                        quota.key_expr,
+                        quota.max_active_executions,
+                        quota.max_history_bytes,
+                        quota.max_dead_letters,
+                    ])),
                 });
                 (name.clone(), policy)
             })
@@ -30641,13 +30650,27 @@ impl Worker {
             .map(|installed| Arc::clone(&installed.channel))
     }
 
-    /// Whether this worker reads task references from a dispatch channel
-    /// (issue #1815). The poll loop uses a per-shard channel, or the global
-    /// binding when the span allows it. The run boundary has bound the global
-    /// channel before the heartbeat asks.
-    fn claims_through_dispatch(&self) -> bool {
-        !self.shard_dispatch.is_empty()
-            || (self.global_dispatch_binding().is_some() && self.dispatch_span_allowed())
+    /// The shards whose claims a dispatch channel serves, for the cohort key
+    /// (issue #1815).
+    ///
+    /// The poll loop uses a per-shard channel on its own shard. It uses the
+    /// global binding when the span allows it, for the one assigned shard or
+    /// shard 0. The run boundary has bound the global channel before the
+    /// heartbeat asks.
+    fn dispatch_channel_shards(&self) -> Vec<i32> {
+        let mut shards: Vec<i32> = self
+            .shard_dispatch
+            .keys()
+            .map(|shard| shard.as_i32())
+            .collect();
+        if self.global_dispatch_binding().is_some() && self.dispatch_span_allowed() {
+            // UFCS: diesel's `first` shadows the slice method here.
+            shards.push(
+                <[crate::types::ShardId]>::first(&self.config.shard_assignments)
+                    .map_or(0, |shard| shard.as_i32()),
+            );
+        }
+        shards
     }
 
     /// Whether this worker's span allows the single-shard channel.
@@ -32627,7 +32650,7 @@ impl Worker {
                     registered_workflows: &registered_workflows,
                     registered_activities: &registered_activities,
                     circuit_breakers: &self.registry.circuit_breakers(),
-                    dispatch_channel: self.claims_through_dispatch(),
+                    dispatch_channel: &self.dispatch_channel_shards(),
                     retry_budgets: self.registry.retry_budgets().config(),
                     outcome_window: crate::worker_outlier::window_max_age(
                         self.config.worker_heartbeat_interval,
@@ -38745,6 +38768,23 @@ mod tests {
             .payload_policy();
         assert_ne!(plain, larger_cap, "a larger per-workflow input cap");
         assert_ne!(plain, dag, "the same workflow registered as a DAG");
+        let quota = |policy| {
+            HandlerRegistry::new(
+                vec![WorkflowInfo {
+                    quota: Some(policy),
+                    ..wf(None)
+                }],
+                vec![],
+            )
+            .payload_policy()
+        };
+        let tenant = crate::quota::QuotaPolicy::new("tenant_id");
+        assert_ne!(plain, quota(tenant), "a workflow quota");
+        assert_ne!(
+            quota(tenant.with_max_active_executions(1)),
+            quota(tenant.with_max_active_executions(2)),
+            "a different quota cap"
+        );
         assert_eq!(
             plain,
             HandlerRegistry::new(vec![wf(None)], vec![]).payload_policy()

@@ -77,7 +77,7 @@ heartbeat check only. A worker that was alive but sick passed that check.
   slots per task kind (or the same slot-tuner band and tuner policy),
   session capacity, priority aging, activity eligibility, shards, registered
   handlers, circuit-breaker policies, retry-budget policies, dispatch route
-  (a dispatch channel or the Postgres claim), outcome window and peer
+  per shard (a dispatch channel or the Postgres claim), outcome window and peer
   freshness limit (both follow the heartbeat interval), and execution policy
   (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`,
   `workflow_task_timeout`, `max_local_activity_start_to_close`,
@@ -89,8 +89,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   caps, local flag, rate limit, concurrency limit and WASM binding, a local
   activity's own retry and start-to-close defaults, the registry's
   local-activity defaults and retry-after ceiling, the hot-code-swap
-  module-host policy, each workflow's effective input cap and DAG
-  classification, the declarative query and update handlers, and the workflow
+  module-host policy, each workflow's effective input cap, DAG
+  classification and quota, the declarative query and update handlers, and the workflow
   log policy), the registered payload codec ids and default codec, and
   the registered and active codec key ids, which the
   heartbeat reads on every tick because a reload can change them, with

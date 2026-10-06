@@ -3412,8 +3412,8 @@ do the shards and the registered handlers, because a task without a handler is
 released and never counts. So do the circuit-breaker policies, because an
 activity with a breaker skips the claim-time rate-limit gate. The open state
 of a breaker is left out, because it is the worker's own health. So does the
-dispatch route, because a dispatch channel ignores `queue_weights` and the
-Postgres claim applies them. So do the retry-budget policies, because a
+dispatch route on each shard, because a dispatch channel ignores
+`queue_weights` and the Postgres claim applies them. So do the retry-budget policies, because a
 tighter budget defers more retries. So do the outcome window and the peer
 freshness limit, which both follow `worker_heartbeat_interval`. Workers with
 two intervals would compare two time ranges. So do the workflow cache
@@ -3425,8 +3425,8 @@ payload offloader, the registered payload codecs and default codec, the
 registered and active codec keys, the activity interceptor chain
 and each activity's own caps, rate and concurrency limits and WASM binding.
 So do the defaults a local activity runs with, because it has no task row,
-the hot-code-swap module host's policy, each workflow's input cap and DAG
-classification, the declarative query and update handlers, and the workflow
+the hot-code-swap module host's policy, each workflow's input cap, DAG
+classification and quota, the declarative query and update handlers, and the workflow
 log policy. Each heartbeat reads the codec keys afresh, because a reload can
 register, retire or activate one. A
 worker with the cache off replays full histories, a shorter budget times out
