@@ -1,0 +1,48 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": null,
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000960",
+        "name": "slow",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000961",
+        "name": "fast",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityFailed",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000961",
+        "error": "boom",
+        "attempt": 1,
+        "error_type": "Error",
+        "non_retryable": true
+      }
+    },
+    {
+      "type": "WorkflowFailed",
+      "data": {
+        "error": "boom"
+      }
+    }
+  ]
+}
