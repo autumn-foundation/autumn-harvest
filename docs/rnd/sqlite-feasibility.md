@@ -70,7 +70,7 @@ Plus **122 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**64 of the 126 core modules** exhibit at least one mechanism — a shade over
+**64 of the 128 core modules** exhibit at least one mechanism — a shade over
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
