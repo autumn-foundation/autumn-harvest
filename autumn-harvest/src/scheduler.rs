@@ -1254,7 +1254,7 @@ pub async fn tick_once_sharded(
 
 /// The fence a scheduler shard pass holds (issue #1823).
 #[cfg(feature = "db")]
-type PassFence = Option<crate::replication::FencePassGuard>;
+type PassFence = Vec<crate::replication::FencePassGuard>;
 #[cfg(not(feature = "db"))]
 type PassFence = ();
 
@@ -1268,9 +1268,7 @@ async fn under_pass_fence<T>(
     fence: &PassFence,
     pass: impl std::future::Future<Output = T>,
 ) -> Option<T> {
-    crate::replication::run_fenced_pass(fence.as_ref(), pass)
-        .await
-        .ok()
+    crate::replication::run_fenced_pass(fence, pass).await.ok()
 }
 #[cfg(not(feature = "db"))]
 async fn under_pass_fence<T>(
@@ -1299,8 +1297,10 @@ async fn scheduler_fence(pool: &DbPool, shard: ShardId, single_pool: bool) -> Op
     }
     #[cfg(feature = "db")]
     {
-        match crate::replication::begin_fenced_pass(pool, fence_key).await {
-            Ok(guard) => Some(guard),
+        // The firing pass is not filtered by shard, so the pass guards every
+        // pinned shard colocated on this database too.
+        match crate::replication::begin_fenced_group(pool, fence_key).await {
+            Ok(guards) => Some(guards),
             Err(error) => {
                 tracing::error!(
                     shard_id = shard.as_i32(),

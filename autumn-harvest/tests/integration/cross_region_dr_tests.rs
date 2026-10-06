@@ -3248,6 +3248,53 @@ async fn a_failed_publish_releases_its_holds() {
     );
 }
 
+/// A background tick on a database that several logical shards share holds
+/// a barrier for each of them (issue #1823). The tick's work is not filtered
+/// by shard, so a bump of any of them must wait for it.
+#[tokio::test]
+async fn a_background_tick_guards_every_colocated_shard() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("tickcoloc");
+    let pool = dr_pool(&url);
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_shard_assignments([ShardId::new(0), ShardId::new(1)]),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    let assigned = [ShardId::new(0), ShardId::new(1)];
+    pin_worker_fence(DrFencing::Enabled, DR_PREFIX, targets, &pool, &assigned)
+        .await
+        .expect("both colocated shards pin");
+
+    let pools = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+    let guards = autumn_harvest::replication::begin_fenced_tick(&pools)
+        .await
+        .expect("a pinned process ticks");
+    let bump_url = url.clone();
+    let bump = tokio::spawn(async move {
+        let mut conn = connect(&bump_url).await;
+        bump_generation(&mut conn, ShardId::new(1), "failover", "test").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let waited = !bump.is_finished();
+    let count = guards.len();
+    drop(guards);
+    let _ = bump.await;
+
+    assert_eq!(count, 2, "one barrier per colocated shard");
+    assert!(waited, "a bump of a colocated shard waits for the tick");
+
+    // A scheduler pass on that database takes the same group.
+    let group = autumn_harvest::replication::begin_fenced_group(&pool, ShardId::UNENCODED).await;
+    assert!(
+        matches!(
+            group,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "the bumped colocated shard fences the scheduler pass too"
+    );
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

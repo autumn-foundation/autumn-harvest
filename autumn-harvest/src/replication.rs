@@ -1564,12 +1564,33 @@ mod db {
         begin_fenced_pass_at(pool, resolved, pinned).await.map(Some)
     }
 
+    /// Open a [`FencePassGuard`] for `shard` and each pinned shard colocated
+    /// with it on `pool` (issue #1823). A pass whose work is not filtered by
+    /// shard holds them all. See [`FenceRegistry::claim_bindings`].
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_pass`]. A held shard counts as fenced.
+    pub async fn begin_fenced_group(
+        pool: &crate::worker::DbPool,
+        shard: ShardId,
+    ) -> HarvestResult<Vec<FencePassGuard>> {
+        let mut guards = Vec::new();
+        for (pinned, generation) in FenceRegistry::claim_bindings(shard).unwrap_or_default() {
+            guards.push(begin_fenced_pass_at(pool, pinned, generation).await?);
+        }
+        Ok(guards)
+    }
+
     /// Open a [`FencePassGuard`] for each shard of `pool` that this process
     /// pins (issue #1823). A background tick holds them, so a bump cannot
     /// commit while the tick writes.
     ///
     /// A single pool names its shard through the default pin, as the
-    /// scheduler does. With no pin, this opens no connection.
+    /// scheduler does. A tick's work is not filtered by shard, so each pool
+    /// also guards every pinned shard colocated on it. See
+    /// [`FenceRegistry::claim_bindings`]. With no pin, this opens no
+    /// connection.
     ///
     /// # Errors
     ///
@@ -1582,10 +1603,17 @@ mod db {
             return Ok(Vec::new());
         }
         let single = pool.len() == 1;
+        let mut guarded: Vec<ShardId> = Vec::new();
         let mut guards = Vec::new();
         for (shard, shard_pool) in pool.iter_shards() {
             let key = if single { ShardId::UNENCODED } else { shard };
-            guards.extend(begin_fenced_pass(shard_pool, key).await?);
+            for (pinned, generation) in FenceRegistry::claim_bindings(key).unwrap_or_default() {
+                if guarded.contains(&pinned) {
+                    continue;
+                }
+                guarded.push(pinned);
+                guards.push(begin_fenced_pass_at(shard_pool, pinned, generation).await?);
+            }
         }
         Ok(guards)
     }
@@ -3125,10 +3153,10 @@ mod db {
 #[cfg(feature = "db")]
 pub use db::{
     FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority, assert_fence,
-    begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on, begin_fenced_tick,
-    bump_generation, current_generation, ensure_generation_row, measure_rpo, pin_process_fence,
-    pin_worker_fence, probe_dr_markers, query_replication_status, record_replication_heartbeat,
-    resolve_held, run_fenced_pass,
+    begin_fenced_group, begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on,
+    begin_fenced_tick, bump_generation, current_generation, ensure_generation_row, measure_rpo,
+    pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
+    record_replication_heartbeat, resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]
