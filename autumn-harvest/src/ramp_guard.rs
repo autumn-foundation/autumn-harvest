@@ -1648,9 +1648,12 @@ struct PendingAbort {
     report_id: uuid::Uuid,
     /// The pools that did not clear.
     steps: Vec<PendingStep>,
-    /// The abort, while no clear of this guard has succeeded yet. The guard
-    /// reports it when a retry clears a pool.
+    /// The abort, while no report of it has committed. Without `elected`,
+    /// the guard reports it when a retry clears a pool.
     unreported: Option<RampAbort>,
+    /// This guard cleared a pool, so it owns the report. A failed report is
+    /// then retried on each pass, whatever the pending clears do.
+    elected: bool,
 }
 
 /// The build ramp guard, with the clears that it must still retry.
@@ -1911,6 +1914,7 @@ impl RampGuard {
                     report_id,
                     steps: failed.clone(),
                     unreported,
+                    elected: false,
                 },
             );
         }
@@ -1926,7 +1930,15 @@ impl RampGuard {
                     bound,
                 )
                 .await;
-                if outcome != ReportOutcome::Failed {
+                if outcome == ReportOutcome::Failed {
+                    // A pool that stays pending keeps the live ramp, so marker
+                    // recovery cannot report the abort. The pending entry
+                    // retries the report instead.
+                    if let Some(entry) = self.pending.get_mut(&(key.clone(), ramp_id)) {
+                        entry.unreported = Some(abort.clone());
+                        entry.elected = true;
+                    }
+                } else {
                     let all: Vec<usize> = (0..pools.len()).collect();
                     mark_reported(pools, &all, &key.0, Some(report_id), bound, cancel).await;
                 }
@@ -1995,6 +2007,7 @@ impl RampGuard {
                     report_id,
                     steps: failed,
                     unreported: None,
+                    elected: false,
                 },
             );
         }
@@ -2054,8 +2067,14 @@ impl RampGuard {
                 outcomes.push(outcome);
             }
             let mut unreported = entry.unreported;
+            let mut elected = entry.elected;
             if let Some(mut abort) = unreported.take() {
-                match disposition(&outcomes) {
+                let decision = if elected {
+                    Disposition::Report
+                } else {
+                    disposition(&outcomes)
+                };
+                match decision {
                     Disposition::Report => {
                         abort.incomplete = !still_failed.is_empty();
                         let failed_pools: Vec<usize> =
@@ -2069,7 +2088,10 @@ impl RampGuard {
                             bound,
                         )
                         .await;
-                        if outcome != ReportOutcome::Failed {
+                        if outcome == ReportOutcome::Failed {
+                            unreported = Some(abort);
+                            elected = true;
+                        } else {
                             let all: Vec<usize> = (0..pools.len()).collect();
                             mark_reported(
                                 pools,
@@ -2080,9 +2102,9 @@ impl RampGuard {
                                 cancel,
                             )
                             .await;
-                        }
-                        if outcome == ReportOutcome::Recorded {
-                            reported.push(abort);
+                            if outcome == ReportOutcome::Recorded {
+                                reported.push(abort);
+                            }
                         }
                     }
                     Disposition::Defer => unreported = Some(abort),
@@ -2097,6 +2119,7 @@ impl RampGuard {
                         report_id: entry.report_id,
                         steps: still_failed,
                         unreported,
+                        elected,
                     },
                 );
             }

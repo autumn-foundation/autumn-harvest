@@ -198,6 +198,10 @@ The guard fails safe: when it cannot read, it does not abort.
   status `failed` and names the pending pools by index.
   A pending clear blocks only its own ramp generation. A newer ramp with
   the same builds is still judged on its own counts.
+- A guard that cleared a pool owns the report. When its audit write fails
+  while another pool is still pending, the next pass retries the report.
+  The retry does not wait for the pending clear, so a pool that keeps
+  rejecting the clear does not leave the abort unaudited.
 - When no clear of a pass succeeds, the guard reports nothing yet. It reports
   the abort when a retry clears a pool.
 - A failed audit write logs a warning and does not undo the clear.
@@ -254,6 +258,13 @@ The guard fails safe: when it cannot read, it does not abort.
   one generation. A retry without a key gets a new caller id. The pools that
   the first request reached keep the old id, so the ramp splits into two
   generations. Use a new key for each new ramp.
+- A keyed ramp never restores a generation that the guard aborted. A retry
+  after an abort, for example after a lost response, gets `409 Conflict`
+  and changes no pool. Before any write, each pool checks its abort markers
+  for the generation id of its own base. The audit pool then checks the
+  report ledger, which outlives the markers. The pool write runs the same
+  check in its `UPDATE`, so an abort that lands between the check and the
+  write is also refused. Send a new key to ramp again.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported, older than `report_grace`, and whose ramp no

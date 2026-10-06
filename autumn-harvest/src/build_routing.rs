@@ -536,9 +536,16 @@ pub async fn set_build_ramp(
 /// is, and its step stays. So a retried fan-out, or two logical shards on
 /// one pool, cannot split the ramp identity.
 ///
+/// The write never installs a generation that the ramp guard aborted. A
+/// keyed retry derives the same `ramp_id`, so without this check a retry
+/// after an abort would bring the aborted ramp back. The check reads the
+/// abort markers of the row and the report ledger of this database, as
+/// [`ramp_generation_aborted`] does.
+///
 /// # Errors
 ///
-/// The same as [`set_build_ramp`].
+/// The same as [`set_build_ramp`], and `HarvestError::Config` when the ramp
+/// guard aborted this generation.
 #[cfg(feature = "db")]
 pub async fn set_build_ramp_with_id(
     conn: &mut AsyncPgConnection,
@@ -550,6 +557,7 @@ pub async fn set_build_ramp_with_id(
     validate_ramp_percent(percent)?;
 
     let derived = ramp_generation_id_sql("$4", "$1", "build_id", "$2");
+    let aborted = generation_aborted_sql(&derived);
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "UPDATE harvest_build_policies \
          SET target_build_id = $2, ramp_percent = $3, ramp_id = {derived}, updated_at = NOW() \
@@ -557,6 +565,7 @@ pub async fn set_build_ramp_with_id(
            AND (ramp_id IS DISTINCT FROM {derived} \
                 OR target_build_id IS DISTINCT FROM $2 \
                 OR ramp_percent IS DISTINCT FROM $3) \
+           AND NOT {aborted} \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
@@ -570,14 +579,89 @@ pub async fn set_build_ramp_with_id(
     if let Some(row) = rows.into_iter().next() {
         return Ok(BuildPolicy::from(row));
     }
-    // Either the row already held this ramp, so the write is a repeat, or
+    // The row already held this ramp, the guard aborted this generation, or
     // the queue has no base policy yet.
-    get_build_policy(conn, queue_name).await?.ok_or_else(|| {
+    let policy = get_build_policy(conn, queue_name).await?.ok_or_else(|| {
         HarvestError::Config(format!(
             "cannot set a build ramp for queue '{queue_name}': no base build policy is \
              registered for this queue yet — call set_build_policy first"
         ))
-    })
+    })?;
+    let stored = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
+    if ramp_generation_aborted(conn, queue_name, &[stored]).await? {
+        return Err(aborted_generation_error(queue_name, target_build_id));
+    }
+    Ok(policy)
+}
+
+/// The SQL test that the ramp guard aborted the generation `{id}`, for the
+/// row of `harvest_build_policies` in scope.
+///
+/// It reads the abort markers of the row and the report ledger of this
+/// database. The guard prunes markers after a while, but the ledger keeps
+/// the id of every reported abort.
+#[cfg(feature = "db")]
+fn generation_aborted_sql(id: &str) -> String {
+    format!(
+        "(harvest_build_policies.ramp_aborted \
+              @> jsonb_build_array(jsonb_build_object('id', ({id})::text)) \
+          OR EXISTS (SELECT 1 FROM harvest_ramp_abort_reports r WHERE r.ramp_id = {id}))"
+    )
+}
+
+/// The error for a ramp write that would install an aborted generation.
+///
+/// The management API returns it as `409 Conflict`.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn aborted_generation_error(queue_name: &str, target_build_id: &str) -> HarvestError {
+    HarvestError::Config(format!(
+        "the ramp guard aborted this ramp of queue '{queue_name}' to build \
+         '{target_build_id}'; a retry does not restore it — send a new Idempotency-Key \
+         to ramp again"
+    ))
+}
+
+/// Whether the ramp guard aborted one of the stored ramp generations `ids`
+/// of `queue_name`, as far as this database knows (issue #1814).
+///
+/// An id is aborted when an abort marker of the queue's row holds it, or
+/// when the report ledger of this database holds it. Pass the ids that
+/// [`ramp_generation_id`] gives for each shard's base. Call it on each shard
+/// and on the audit pool, which holds the ledger.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
+pub async fn ramp_generation_aborted(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    ids: &[Uuid],
+) -> HarvestResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        aborted: bool,
+    }
+    if ids.is_empty() {
+        return Ok(false);
+    }
+    let row: Row = diesel::sql_query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM harvest_build_policies p, unnest($2::uuid[]) AS g(id) \
+             WHERE p.queue_name = $1 \
+               AND p.ramp_aborted @> jsonb_build_array(jsonb_build_object('id', g.id::text)) \
+         ) OR EXISTS ( \
+             SELECT 1 FROM harvest_ramp_abort_reports WHERE ramp_id = ANY($2::uuid[]) \
+         ) AS aborted",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+    .get_result(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(row.aborted)
 }
 
 /// Clear a queue's percentage ramp, immediately stopping new starts from

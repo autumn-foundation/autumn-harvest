@@ -442,3 +442,130 @@ async fn a_reused_key_with_a_changed_ramp_keeps_one_ramp_id_on_every_shard() {
     assert!(ids[0].is_some(), "shard A keeps an id: {ids:?}");
     assert_eq!(ids[0], ids[1], "both shards hold one generation");
 }
+
+/// Abort the ramp on `pool` the way the ramp guard does, and return the
+/// marker id: the stored `ramp_id`.
+async fn auto_abort(pool: &DbPool, target: &str) -> uuid::Uuid {
+    use autumn_harvest::build_routing::get_build_policy;
+
+    let mut conn = pool.get().await.expect("get conn");
+    let policy = get_build_policy(&mut conn, "default")
+        .await
+        .expect("read policy")
+        .expect("policy exists");
+    autumn_harvest::ramp_guard::abort_ramp(
+        &mut conn,
+        "default",
+        &policy.build_id,
+        target,
+        policy.updated_at,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("abort")
+    .expect("the abort cleared the ramp")
+}
+
+async fn ramp_is_active(pool: &DbPool) -> bool {
+    use autumn_harvest::build_routing::get_build_policy;
+
+    let mut conn = pool.get().await.expect("get conn");
+    get_build_policy(&mut conn, "default")
+        .await
+        .expect("read policy")
+        .expect("policy exists")
+        .target_build_id
+        .is_some()
+}
+
+/// A client retries a keyed ramp after the ramp guard aborted it, for
+/// example because the first response was lost. The retry must not bring
+/// the aborted ramp back (issue #1814). The abort marker records it.
+#[tokio::test]
+async fn a_keyed_retry_does_not_restore_an_aborted_ramp() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let mut conn = pool.get().await.expect("get conn");
+    set_build_policy(&mut conn, "default", "base-v1", None)
+        .await
+        .expect("seed base policy");
+    drop(conn);
+    let app = build_ramp_app(pool.clone());
+    let ramp =
+        json!({ "queue_name": "default", "target_build_id": "canary-v2", "ramp_percent": 10 });
+
+    let (status, body) = post_json_with_key(
+        &app,
+        "/admin/build-routing/ramp",
+        ramp.clone(),
+        Some("k-abort"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    auto_abort(&pool, "canary-v2").await;
+
+    let (status, body) = post_json_with_key(
+        &app,
+        "/admin/build-routing/ramp",
+        ramp.clone(),
+        Some("k-abort"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(!ramp_is_active(&pool).await, "the aborted ramp stays off");
+
+    // A new key is a new ramp.
+    let (status, body) =
+        post_json_with_key(&app, "/admin/build-routing/ramp", ramp, Some("k-new")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(ramp_is_active(&pool).await);
+}
+
+/// The guard prunes abort markers after a while. The report ledger keeps
+/// the aborted id, so a late keyed retry is still refused (issue #1814).
+#[tokio::test]
+async fn a_keyed_retry_after_marker_pruning_does_not_restore_an_aborted_ramp() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let mut conn = pool.get().await.expect("get conn");
+    set_build_policy(&mut conn, "default", "base-v1", None)
+        .await
+        .expect("seed base policy");
+    drop(conn);
+    let app = build_ramp_app(pool.clone());
+    let ramp =
+        json!({ "queue_name": "default", "target_build_id": "canary-v2", "ramp_percent": 10 });
+
+    let (status, body) = post_json_with_key(
+        &app,
+        "/admin/build-routing/ramp",
+        ramp.clone(),
+        Some("k-late"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let aborted = auto_abort(&pool, "canary-v2").await;
+    // The guard reported the abort and later pruned its markers.
+    let mut conn = pool.get().await.expect("get conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_ramp_abort_reports (ramp_id, queue_name) VALUES ($1, 'default')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(aborted)
+    .execute(&mut conn)
+    .await
+    .expect("ledger row");
+    diesel::sql_query(
+        "UPDATE harvest_build_policies SET ramp_aborted = '[]'::jsonb WHERE queue_name = 'default'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("prune markers");
+    drop(conn);
+
+    let (status, body) =
+        post_json_with_key(&app, "/admin/build-routing/ramp", ramp, Some("k-late")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(!ramp_is_active(&pool).await, "the aborted ramp stays off");
+}

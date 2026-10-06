@@ -913,6 +913,116 @@ async fn a_pending_clear_blocks_only_its_own_generation() {
     assert!(!ramp_is_active(&mut conn_2).await, "and cleared");
 }
 
+/// A guard that cleared one pool owes the report, even while another pool
+/// stays pending. A failed audit write is retried on the next pass, so a
+/// pool that keeps rejecting the clear does not leave the abort unaudited.
+#[tokio::test]
+async fn a_failed_report_of_a_partial_abort_is_retried() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut locker = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect locker");
+    let ramp_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_ramp_with_id(conn, ramp_id).await;
+    }
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock pool 2 policy row");
+    // No server listens on port 1, so the first audit write fails.
+    let dead_audit = build_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let mut guard = RampGuard::new(guard_config());
+    let aborts = guard.pass(&pools, &dead_audit, None, &never).await;
+    assert!(aborts.is_empty(), "the report failed: {aborts:?}");
+    assert!(!ramp_is_active(&mut conn_1).await, "pool 1 cleared");
+    assert_eq!(guard.pending_clears(), 1, "pool 2 is pending");
+
+    // Pool 2 still rejects the clear. The audit database is back.
+    let aborts = guard.pass(&pools, &pool_1, None, &never).await;
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert_eq!(aborts.len(), 1, "the report is retried: {aborts:?}");
+    assert!(aborts[0].incomplete, "pool 2 has not cleared");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+}
+
+/// A ramp write with the `ramp_id` of an aborted generation changes
+/// nothing. The abort marker refuses it, and after the markers are pruned
+/// the report ledger refuses it.
+#[tokio::test]
+async fn a_ramp_write_does_not_restore_an_aborted_generation() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    let stored = abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+        .await
+        .expect("clear")
+        .expect("cleared");
+
+    let refused = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id).await;
+    assert!(
+        matches!(refused, Err(autumn_harvest::HarvestError::Config(_))),
+        "the marker refuses it: {refused:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+
+    diesel::sql_query(
+        "INSERT INTO harvest_ramp_abort_reports (ramp_id, queue_name) VALUES ($1, $2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(stored)
+    .bind::<Text, _>(QUEUE)
+    .execute(&mut conn)
+    .await
+    .expect("ledger row");
+    diesel::sql_query("UPDATE harvest_build_policies SET ramp_aborted = '[]'::jsonb")
+        .execute(&mut conn)
+        .await
+        .expect("prune markers");
+    let refused = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id).await;
+    assert!(
+        matches!(refused, Err(autumn_harvest::HarvestError::Config(_))),
+        "the ledger refuses it: {refused:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+
+    // Another id is another generation.
+    set_build_ramp_with_id(
+        &mut conn,
+        QUEUE,
+        BUILD_B,
+        RAMP_PERCENT,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .expect("a new ramp");
+    assert!(ramp_is_active(&mut conn).await);
+}
+
 /// With the base build promoted to the target, the ramp is not a ramp.
 #[tokio::test]
 async fn a_ramp_to_its_own_base_build_is_skipped() {

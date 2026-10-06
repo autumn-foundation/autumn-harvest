@@ -48079,6 +48079,55 @@ fn fan_out_ramp_id(
     Ok(derived_ramp_id(&parts))
 }
 
+/// Refuse a keyed ramp whose generation the ramp guard aborted (issue
+/// #1814).
+///
+/// A keyed retry derives the same `ramp_id`. A retry after an abort, for
+/// example after a lost response, would otherwise restore the aborted ramp.
+/// The check runs before any write, so no shard gets the ramp back. Each
+/// shard checks its abort markers for the generation id of its own base.
+/// The audit pool then checks its report ledger, which outlives the
+/// markers. A shard that cannot be read is left to the write, which runs
+/// the same check on that shard in its UPDATE.
+#[allow(clippy::result_large_err)]
+async fn refuse_aborted_ramp(
+    pool: &HarvestDbPool,
+    queue_name: &str,
+    target_build_id: &str,
+    ramp_id: uuid::Uuid,
+) -> Result<(), axum::response::Response> {
+    use autumn_harvest::build_routing::{
+        aborted_generation_error, get_build_policy, ramp_generation_aborted, ramp_generation_id,
+    };
+
+    let refused = || conflict_from(aborted_generation_error(queue_name, target_build_id));
+    let mut generations = Vec::new();
+    for (_, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let Ok(Some(policy)) = get_build_policy(&mut conn, queue_name).await else {
+            continue;
+        };
+        let generation = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
+        if matches!(
+            ramp_generation_aborted(&mut conn, queue_name, &[generation]).await,
+            Ok(true)
+        ) {
+            return Err(refused().into_response());
+        }
+        generations.push(generation);
+    }
+    let mut conn = acquire_conn(pool.default_pool())
+        .await
+        .map_err(axum::response::IntoResponse::into_response)?;
+    match ramp_generation_aborted(&mut conn, queue_name, &generations).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(refused().into_response()),
+        Err(e) => Err(map_error(e).into_response()),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SetBuildRampBody {
     queue_name: String,
@@ -48131,6 +48180,12 @@ async fn set_build_ramp_handler(
         Ok(id) => id,
         Err(response) => return response,
     };
+    if headers.contains_key(HEADER_IDEMPOTENCY_KEY)
+        && let Err(response) =
+            refuse_aborted_ramp(&pool, queue_name, target_build_id, ramp_id).await
+    {
+        return response;
+    }
 
     let mut last_policy = None;
     let mut last_conflict = None;
