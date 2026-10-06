@@ -401,9 +401,9 @@ fn a_join_branch_continues_where_its_wait_ended() {
 /// The mirror puts these continuations in their branch too, but replay
 /// stops early today. `scan_activity_terminal` stops at a `MutexGranted` or
 /// an external-activity event, so it never finds the completion of the
-/// sibling activity. A fail-fast fan-out resolves at once on replay, so the
-/// next command meets the wrong recorded schedule. A fix in the replayer
-/// flips these verdicts.
+/// sibling activity. A fan-out whose items already settled resolves at once
+/// on replay, so the next command meets the wrong recorded schedule. A fix
+/// in the replayer flips these verdicts.
 #[test]
 fn a_join_branch_that_hits_an_engine_gap_keeps_its_shape() {
     let expected = [
@@ -421,6 +421,16 @@ fn a_join_branch_that_hits_an_engine_gap_keeps_its_shape() {
             "engine-gap-fail-fast-fan-out-late-item-in-join.json",
             "join(slow, seq(fan out fail fast, cleanup, next)); complete",
             "expected: \"ActivityScheduled(cleanup)\"",
+        ),
+        (
+            "engine-gap-windowed-fan-out-in-join.json",
+            "join(fan out window 2 fail fast, audit); complete",
+            "actual: \"ActivityScheduled(audit)\"",
+        ),
+        (
+            "engine-gap-windowed-fan-out-refills-before-sibling.json",
+            "join(fan out window 2 fail fast, slow); complete",
+            "actual: \"ActivityScheduled(slow)\"",
         ),
     ];
     let cases = seed("engine-gap-");

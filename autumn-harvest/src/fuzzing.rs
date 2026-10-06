@@ -1377,42 +1377,83 @@ impl FanOutGroup {
 
 /// How many schedules of the run right after a fan-out marker belong to the
 /// group. A sibling command in the same `join!` can follow the first wave in
-/// that run. The next wave shows the window. When it is the last wave, the
-/// first one held `count - next`. When a later wave follows, the window is
-/// `next`. With no next wave, the whole run counts.
+/// that run. Each first-wave size `k` predicts refill waves of `k` items,
+/// the last one maybe shorter, at most `count` items in all. The size whose
+/// waves explain the most items wins, and the larger size wins a tie. With
+/// no refill wave, the whole run counts.
 fn first_wave_cap(history: &[WorkflowEvent], start: usize, count: usize) -> usize {
-    let is_schedule = |e: &WorkflowEvent| {
-        matches!(
-            e,
-            WorkflowEvent::ActivityScheduled { .. } | WorkflowEvent::ChildWorkflowStarted { .. }
-        )
-    };
-    let is_signal = |e: &WorkflowEvent| matches!(e, WorkflowEvent::SignalReceived { .. });
     let rest = &history[start.min(history.len())..];
-    let first = rest.iter().take_while(|e| is_schedule(e) || is_signal(e));
-    let run = first.filter(|e| is_schedule(e)).count();
-    // A wave starts only once every scheduled item settled. A schedule while
-    // an item still runs is the caller's own command, such as a follow-up
-    // after a fail-fast error.
-    let mut open: HashSet<Pending> = rest
+    let run = rest
         .iter()
         .take_while(|e| is_schedule(e) || is_signal(e))
-        .filter_map(pending_key)
-        .collect();
+        .filter(|e| is_schedule(e))
+        .count();
+    // The first run holds every item, so no refill wave follows. A later
+    // schedule is the caller's own.
+    if run >= count {
+        return count;
+    }
+    let mut best = (run, 0);
+    for k in (1..=run).rev() {
+        let Some(waves) = refill_waves(rest, k, count) else {
+            continue;
+        };
+        let full = waves
+            .split_last()
+            .is_none_or(|(last, before)| *last <= k && before.iter().all(|wave| *wave == k));
+        let items = k + waves.iter().sum::<usize>();
+        if full && items <= count && items > best.1 {
+            best = (k, items);
+        }
+    }
+    best.0
+}
+
+/// True for a command that a fan-out item can be.
+const fn is_schedule(event: &WorkflowEvent) -> bool {
+    matches!(
+        event,
+        WorkflowEvent::ActivityScheduled { .. } | WorkflowEvent::ChildWorkflowStarted { .. }
+    )
+}
+
+/// True for a buffered signal, which can arrive between a group's items.
+const fn is_signal(event: &WorkflowEvent) -> bool {
+    matches!(event, WorkflowEvent::SignalReceived { .. })
+}
+
+/// The refill waves that follow a first wave of `k` items, up to `count`
+/// items in all. `rest` starts after the marker. The other schedules of the
+/// first run are siblings.
+///
+/// A wave starts only once every scheduled item settled. While an item
+/// still runs, a schedule right after a sibling's outcome is that sibling's
+/// next command, and any other schedule is the caller's own. Once the waves
+/// hold every item, a later schedule is the caller's own too. A wave that
+/// runs past `count` shows that `k` is wrong, so the result is `None`.
+fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<usize>> {
+    let first = rest.iter().take_while(|e| is_schedule(e) || is_signal(e));
+    // The first `k` schedules are the group. Any outcome of another
+    // command is a sibling's.
+    let mut open: HashSet<Pending> = first.filter_map(pending_key).take(k).collect();
     let mut waves = Vec::new();
     let mut current = 0;
+    let mut items = k;
+    let mut sibling_turn = false;
     for event in rest.iter().skip_while(|e| is_schedule(e) || is_signal(e)) {
         match event {
+            e if is_schedule(e) && items >= count && current > 0 => return None,
+            e if is_schedule(e) && items >= count => break,
+            e if is_schedule(e) && current == 0 && !open.is_empty() && sibling_turn => {}
             e if is_schedule(e) && current == 0 && !open.is_empty() => break,
             e if is_schedule(e) => {
                 current += 1;
+                items += 1;
                 open.extend(pending_key(e));
             }
             e if is_signal(e) => {}
             e if activity_outcome(e).is_some() || child_outcome(e).is_some() => {
-                if let Some(key) = settled_key(e) {
-                    open.remove(&key);
-                }
+                sibling_turn = !settled_key(e).is_some_and(|key| open.remove(&key));
                 if current > 0 {
                     waves.push(current);
                     current = 0;
@@ -1424,16 +1465,7 @@ fn first_wave_cap(history: &[WorkflowEvent], start: usize, count: usize) -> usiz
     if current > 0 {
         waves.push(current);
     }
-    match waves.as_slice() {
-        // The first run holds every item, so no refill wave follows. A later
-        // schedule is the caller's own.
-        _ if run >= count => count,
-        [next, _, ..] if *next < run => *next,
-        [next] if count.saturating_sub(*next) < run && count.saturating_sub(*next) >= *next => {
-            count - next
-        }
-        _ => run,
-    }
+    Some(waves)
 }
 
 /// True when `rest` holds a run of at least `need` schedules once the group's
