@@ -36,7 +36,11 @@ on:
       - "fuzz/**"
       - ".github/workflows/fuzz-nightly.yml"
       # `fuzz_replay` drives the replayer, the payload codecs and stores and
-      # the workflow context. So any change to the crate source runs it.
+      # the workflow context. So any change to the crate source runs it. The
+      # root manifest and lockfile set its dependencies, and the build copies
+      # the root lockfile.
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "autumn-harvest/Cargo.toml"
       - "autumn-harvest/src/**"
       - "autumn-harvest-macros/**"

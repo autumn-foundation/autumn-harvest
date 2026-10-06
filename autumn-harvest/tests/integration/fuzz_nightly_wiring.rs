@@ -340,7 +340,8 @@ fn rust_files(dir: &str) -> Vec<String> {
 
 /// The fuzz targets link the whole `autumn-harvest` crate. `fuzz_replay`
 /// drives the replayer, the codecs and the workflow context. So a change to
-/// any of its source files must run the PR campaign.
+/// any of its source files, or to the manifests that set its dependencies,
+/// must run the PR campaign.
 #[test]
 fn a_change_to_the_crate_source_runs_the_pr_campaign() {
     let doc = parse_workflow(NIGHTLY);
@@ -355,6 +356,13 @@ fn a_change_to_the_crate_source_runs_the_pr_campaign() {
         missed.is_empty(),
         "{NIGHTLY} `on.pull_request.paths` must cover {missed:?}"
     );
+    // The root manifest and lockfile set the crate's dependencies.
+    for manifest in ["Cargo.toml", "Cargo.lock", "autumn-harvest/Cargo.toml"] {
+        assert!(
+            covers(&paths, manifest),
+            "{NIGHTLY} `on.pull_request.paths` must cover {manifest}"
+        );
+    }
 }
 
 /// Self-test: the path check reads both entry shapes, and the old filter

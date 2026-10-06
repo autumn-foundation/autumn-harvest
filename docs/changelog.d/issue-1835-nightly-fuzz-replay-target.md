@@ -9,8 +9,9 @@ each night for 600 seconds, one job per target. A run artifact keeps each
 corpus for 30 days. Each run downloads the newest corpus of this repository
 and uploads its own, also after a crash. The actions cache is not used,
 because the CI build caches made GitHub evict a corpus within minutes. A failed scheduled run uploads the crash input and
-opens an issue. A pull request that changes the harness or the
-`autumn-harvest` source runs each target for 60 seconds. The manual `fuzz-smoke` job in `ci.yml` is gone, because the new
+opens an issue. A pull request that changes the harness, the
+`autumn-harvest` source or the root manifests runs each target for 60
+seconds. The manual `fuzz-smoke` job in `ci.yml` is gone, because the new
 workflow runs on demand too. The guard `fuzz_nightly_wiring.rs` checks the
 cron, the corpus cycle, the alert job and the target lists.
 

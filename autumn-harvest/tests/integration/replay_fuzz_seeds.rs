@@ -466,6 +466,11 @@ fn a_join_branch_that_hits_an_engine_gap_keeps_its_shape() {
             "reserve; hold; join(saga unwind 2, side effect trace); complete",
             "expected: \"ActivityScheduled(unhold)\"",
         ),
+        (
+            "engine-gap-windowed-collect-all-beside-sibling.json",
+            "join(fan out window 2 collect, slow); complete",
+            "actual: \"ActivityScheduled(slow)\"",
+        ),
     ];
     let cases = seed("engine-gap-");
     for (name, want, stop) in expected {

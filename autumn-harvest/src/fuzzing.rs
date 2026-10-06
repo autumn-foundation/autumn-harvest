@@ -1328,12 +1328,7 @@ fn mirror_fan_out(
             WorkflowEvent::ActivityFailed { activity_id, .. }
             | WorkflowEvent::ActivityTimedOut { activity_id, .. }
                 if group.activity_ids.contains(activity_id)
-                    && (group.collect
-                        || next_wave_is_full(
-                            &history[index + 1..],
-                            &group.activity_ids,
-                            group.first_wave_len.min(count - group.activities.len()),
-                        )) =>
+                    && group.goes_on_after_failure(&history[index + 1..], &siblings, count) =>
             {
                 group.collect = true;
                 first_wave = false;
@@ -1371,6 +1366,18 @@ struct FanOutGroup {
 }
 
 impl FanOutGroup {
+    /// True when the group goes on after a failed item, as a collect-all
+    /// group does. Its next wave is then a full run of schedules.
+    fn goes_on_after_failure(
+        &self,
+        rest: &[WorkflowEvent],
+        siblings: &HashSet<Pending>,
+        count: usize,
+    ) -> bool {
+        let need = self.first_wave_len.min(count - self.activities.len());
+        self.collect || next_wave_is_full(rest, &self.activity_ids, siblings, need)
+    }
+
     /// The op that replays the group. `rest` starts after the marker.
     fn into_op(self, rest: &[WorkflowEvent], count: usize) -> Op {
         if !self.children.is_empty() {
@@ -1501,10 +1508,17 @@ fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<us
 }
 
 /// True when `rest` holds a run of at least `need` schedules once the group's
-/// own progress and terminal events are passed over. A collect-all group
+/// own progress and terminal events are passed over. The events of a known
+/// sibling in the same `join!`, signals and immediate commands are passed
+/// over too. A collect-all group
 /// schedules such a wave after a failed item. A fail-fast caller that catches
 /// the error schedules its own work instead, which is seldom a full wave.
-fn next_wave_is_full(rest: &[WorkflowEvent], group: &HashSet<ActivityExecId>, need: usize) -> bool {
+fn next_wave_is_full(
+    rest: &[WorkflowEvent],
+    group: &HashSet<ActivityExecId>,
+    siblings: &HashSet<Pending>,
+    need: usize,
+) -> bool {
     let of_group = |event: &WorkflowEvent| match event {
         WorkflowEvent::ActivityStarted { activity_id, .. }
         | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
@@ -1516,7 +1530,10 @@ fn next_wave_is_full(rest: &[WorkflowEvent], group: &HashSet<ActivityExecId>, ne
     let wave = rest
         .iter()
         .skip_while(|event| {
-            of_group(event) || matches!(event, WorkflowEvent::SignalReceived { .. })
+            of_group(event)
+                || is_signal(event)
+                || is_immediate_command(event)
+                || sibling_key(event).is_some_and(|key| siblings.contains(&key))
         })
         .take_while(|event| matches!(event, WorkflowEvent::ActivityScheduled { .. }))
         .count();
