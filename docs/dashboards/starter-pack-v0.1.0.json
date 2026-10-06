@@ -2398,9 +2398,18 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (activity_name) (increase(harvest_activity_circuit_deferred_total[1h]))",
+              "legendFormat": "{{activity_name}} deferred",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
             }
           ],
-          "description": "Per-activity circuit breakers opened in the last hour (issue #369)."
+          "description": "Per-activity circuit breakers opened in the last hour (issue #369), and dispatches that an open breaker deferred (issue #1809)."
         },
         {
           "id": 41,
@@ -7428,6 +7437,64 @@
         }
       ],
       "description": "Rate of activity heartbeat flushes that failed, per reason. The flusher keeps the payload and tries again on the next tick. A run of failures longer than heartbeat_timeout fails a healthy activity. See docs/operations/postgres-timeouts.md."
+    },
+    {
+      "id": 182200,
+      "type": "timeseries",
+      "title": "Transaction conflict retries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 216
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (site, reason) (rate(harvest_db_transaction_retry_total[$__rate_interval]))",
+          "legendFormat": "retry {{site}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (site, reason) (rate(harvest_db_transaction_retry_exhausted_total[$__rate_interval]))",
+          "legendFormat": "exhausted {{site}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of transaction retries after a Postgres abort (retry), and of conflicts that remained after the last retry (exhausted). Per site (persist, workflow_task, claim or scanner) and reason (deadlock or serialization_failure). A steady deadlock rate points to a lock-order defect. Any exhausted rate reaches callers. See docs/operations/postgres-timeouts.md."
     }
   ]
 }

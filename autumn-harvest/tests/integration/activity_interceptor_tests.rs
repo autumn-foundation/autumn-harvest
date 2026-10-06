@@ -1286,11 +1286,11 @@ async fn interceptor_error_feeds_circuit_breaker_like_a_handler_error() {
             echo_activity,
             false,
             Some(RetryPolicy::fixed(5, Duration::from_millis(30))),
-            Some(CircuitBreakerPolicy::new(
-                2,
-                Duration::from_secs(30),
-                Duration::from_secs(60),
-            )),
+            // Fail-fast, so the open breaker ends the activity (issue #1809).
+            Some(
+                CircuitBreakerPolicy::new(2, Duration::from_secs(30), Duration::from_secs(60))
+                    .with_open_mode(autumn_harvest::policy::CircuitOpenMode::FailFast),
+            ),
         )],
         vec![Arc::new(ErrorInterceptor {
             attempts: attempts.clone(),
