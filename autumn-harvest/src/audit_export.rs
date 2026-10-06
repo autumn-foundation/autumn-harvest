@@ -4060,16 +4060,38 @@ pub fn spawn_audit_export_checker_for_shard(
                 registered_interval = desired_interval;
             }
 
-            if let Err(error) = export_once_via_pool(
-                &pool,
-                shard_id,
-                &*telemetry.metrics,
-                &cancel,
-                config_snapshot,
-                index_build_dsn.as_deref(),
+            // Issue #1823: the tick claims and moves the export cursor, so
+            // it holds a fence barrier on its shard and every pinned shard
+            // colocated there. A fenced process skips the tick. A lost
+            // barrier stops it before its next write.
+            let fence_key = shard.unwrap_or(crate::types::ShardId::UNENCODED);
+            let fence = match crate::replication::begin_fenced_group(&pool, fence_key).await {
+                Ok(guards) => guards,
+                Err(error) => {
+                    tracing::warn!(
+                        shard = shard_id,
+                        error = %error,
+                        "[audit_export] tick skipped: this process is fenced"
+                    );
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+                    continue;
+                }
+            };
+            let exported = crate::replication::run_fenced_pass(
+                &fence,
+                Box::pin(export_once_via_pool(
+                    &pool,
+                    shard_id,
+                    &*telemetry.metrics,
+                    &cancel,
+                    config_snapshot,
+                    index_build_dsn.as_deref(),
+                )),
             )
             .await
-            {
+            .and_then(|done| done);
+            drop(fence);
+            if let Err(error) = exported {
                 tracing::error!(
                     shard = shard_id,
                     error = %error,

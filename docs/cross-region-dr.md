@@ -210,7 +210,10 @@ The log line says which rule it broke, and what to change:
 **Colocated shards.** Several logical shards can share one database, and
 one claim scan there serves them all. The scan is not filtered by shard, so
 a claim checks the pin of every logical shard on that database. A fence on
-any one of them stops claims for all of them.
+any one of them stops claims for all of them. This holds across processes
+too: a process pins the rows of other logical shards that it finds on its
+database at startup. Provision every row before the first process starts.
+A row created later is not pinned by a process that is already running.
 
 **Shard identity.** A pin needs a shard number. A worker takes it from its
 sharded pool or from `with_shard_assignments`. With neither, the process

@@ -2331,6 +2331,25 @@ mod db {
             let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
             pins.push((*shard, ensure_generation_row(&mut conn, *shard).await?));
         }
+        // A database that another process's logical shards share holds
+        // their rows too. A claim scan there is not filtered by shard, so
+        // this process pins those rows as it finds them. A bump of any of
+        // them then stops this process too. Each peer is (row, target).
+        let mut peers: Vec<(ShardId, ShardId)> = Vec::new();
+        for ((shard, pool), markers) in targets.iter().zip(&probed) {
+            for row in markers.iter().flat_map(|m| m.generation_shards.iter()) {
+                if pins.iter().any(|(pinned, _)| pinned == row)
+                    || targets.iter().any(|(target, _)| target == row)
+                {
+                    continue;
+                }
+                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+                if let Some(generation) = current_generation(&mut conn, *row).await? {
+                    pins.push((*row, generation));
+                    peers.push((*row, *shard));
+                }
+            }
+        }
         // Held first, so the default shard is never briefly unpinned.
         if !held_shards.is_empty() {
             FenceRegistry::hold(&held_shards, default_shard)
@@ -2347,13 +2366,21 @@ mod db {
         }
         // Logical shards that share one database share one claim scan.
         for (shard, pool) in &targets {
-            let peers: Vec<ShardId> = targets
+            let group: Vec<ShardId> = targets
                 .iter()
                 .filter(|(_, peer_pool)| same_pool(peer_pool, pool))
                 .map(|(peer, _)| *peer)
                 .collect();
-            if peers.len() > 1 && peers[0] == *shard {
-                FenceRegistry::colocate(&peers);
+            if group[0] != *shard {
+                continue;
+            }
+            let rows = peers
+                .iter()
+                .filter(|(_, target)| group.contains(target))
+                .map(|(row, _)| *row);
+            let group: Vec<ShardId> = group.iter().copied().chain(rows).collect();
+            if group.len() > 1 {
+                FenceRegistry::colocate(&group);
             }
         }
         for (shard, generation) in &pins {
