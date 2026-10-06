@@ -31,131 +31,64 @@ ROOT = Path(__file__).resolve().parents[2]
 SKIP_DIRS = ("plans", "changelog.d", "rnd", "assays", "perf-artifacts", "adr")
 SKIP_FILES = ("docs/shipped-work.md",)
 
-# A total count of the enum only: "WorkflowEvent enum (41 variants",
-# "WorkflowEvent has 41 variants" or "there are 41 WorkflowEvent variants."
-# A count with another subject or a qualifier is not a total: "gains 2
-# variants", "the session feature has 2 WorkflowEvent variants", "there are 2
-# WorkflowEvent variants for sessions". The pattern can cross a line wrap.
-NOT_ADDITIVE = r"(?!\s+(?:added|introduced|removed)\b)"
+# A total count of the enum only: "WorkflowEvent enum (41 variants,",
+# "WorkflowEvent has 41 variants." or "there are 41 WorkflowEvent variants."
+# Only end punctuation or "in total" may follow the count. A qualified count
+# is not a total: "has 2 variants for sessions", "2 variants added". The
+# pattern can cross a line wrap.
+TOTAL = r"(?=\s*(?:in\s+total\b|[.,;:)]|$))"
 VARIANT_COUNT_RE = re.compile(
-    r"WorkflowEvent`?\s+(?:enum\s+\(|(?:enum\s+)?(?:now\s+)?has\s+)(\d[\d,]*)\s+variants\b"
-    + NOT_ADDITIVE
+    r"WorkflowEvent`?\s+(?:enum\s+\(|(?:enum\s+)?(?:now\s+)?has\s+)(\d[\d,]*)\s+variants"
+    + TOTAL
     + r"|(?i:\bthere\s+are)\s+(\d[\d,]*)\s+`?WorkflowEvent`?\s+variants"
-    + r"(?=\s*(?:in\s+total\b|[.,;:)]|$))"
+    + TOTAL
 )
 VERSION_HEADING_RE = re.compile(r"^##\s+\[?v?(\d+\.\d+\.\d+[^\]\s]*)\]?", re.MULTILINE)
 FENCE_RE = re.compile(r"^(```|~~~).*?^\1", re.MULTILINE | re.DOTALL)
 CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 
-# A quote of the old claim, as history, starts with a quotation mark.
-NOT_QUOTED = r"(?<![\"“])"
-REBALANCING = (
-    r"(?i)" + NOT_QUOTED + r"\bcross-shard\s+rebalancing(\s+of\s+existing\s+workflows)?"
-    r"\s+is\s+(out\s+of\s+scope|not\s+supported)"
-)
-
-
-
-COMPETITOR_RE = re.compile(r"\b(?:Temporal|DBOS|Inngest|Hatchet|Restate)\b")
-HARVEST_RE = re.compile(r"(?i)harvest")
-# A clause ends at end punctuation before a space, at a blank line, before a
-# heading, a table row or a list item, at a semicolon, or at a comma before
-# "while", "whereas", "but" or "and".
-SENTENCE_BREAK_RE = re.compile(
-    r"(?<=[.!?;])[ \t]+|\n(?:[ \t]*\n|(?=[ \t]*(?:#|\||- |\* )))"
-    r"|,\s+(?=(?:while|whereas|but|and)\b)"
-)
-
-
-def blank_competitor_sentences(text):
-    """Blank each clause that names a competitor and not harvest."""
-    out, start = [], 0
-    for m in [*SENTENCE_BREAK_RE.finditer(text), None]:
-        end = m.start() if m else len(text)
-        sentence = text[start:end]
-        if COMPETITOR_RE.search(sentence) and not HARVEST_RE.search(sentence):
-            sentence = re.sub(r"[^\n]", " ", sentence)
-        out.append(sentence)
-        if m:
-            out.append(m.group())
-            start = m.end()
-    return "".join(out)
-
-
-def harvest_scope(text):
-    """Blank the text about competitors in a multi-vendor page.
-
-    A table with one row per engine keeps the autumn-harvest row only. A
-    table with one column per engine keeps the label and autumn-harvest
-    cells only. In prose, a clause that names a competitor and not harvest
-    goes. A clause ends at a sentence end, at a semicolon, or at a comma
-    before "while", "whereas", "but" or "and". All other text stays, so a
-    stale claim still matches.
-    Blank lines keep the line numbers of the findings.
-    """
-    kept, table_col = [], None
-    for line in text.split("\n"):
-        if not line.startswith("|"):
-            table_col = None
-            kept.append(line)
-            continue
-        cells = [c.strip() for c in CELL_SPLIT_RE.split(line)[1:-1]]
-        if table_col is None:
-            # The header row decides the table's shape.
-            table_col = next(
-                (k for k, c in enumerate(cells) if k and c.strip("*") == "autumn-harvest"), 0
-            )
-        if table_col:
-            keep = cells[:1] + cells[table_col : table_col + 1]
-            kept.append("| " + " | ".join(keep) + " |")
-        elif cells and cells[0].strip("*") == "autumn-harvest":
-            kept.append(line)
-        else:
-            kept.append("")
-    return blank_competitor_sentences("\n".join(kept))
-
-
-# (path, pattern, the fact that makes the claim false[, scope]). A scope
-# function selects the text that the pattern checks.
+# (path, pattern, the fact that makes the claim false)
+#
+# Each pattern pins the exact wording that a shipped change made false, as a
+# regression check. A pattern does not try to judge new prose: a general
+# phrase such as "no cross-region failover" is true of some competitors and
+# of running workflows. `\s+` lets a pin match across a line wrap.
 STALE_CLAIMS = [
     (
         "docs/comparison.md",
-        r"(?i)\bplanned\b[^\n]{0,120}?#954\b",
+        r"\*\*Planned:\*\*\s+cross-region\s+DR|Planned\s+R&D:\s+\[#954\]",
         "cross-region DR shipped (issue #954), see docs/cross-region-dr.md",
-        harvest_scope,
     ),
     (
         "docs/comparison.md",
-        r"(?i)\bno\s+(built-in\s+)?(multi|cross)-region\s+(DR|replication)"
-        r"\s+or\s+(replication|failover)\b",
+        r"no\s+built-in\s+multi-region\s+replication\s+or\s+failover\s+today"
+        r"|Single-region\s+—\s+no\s+multi-region\s+DR\s+or\s+replication",
         "cross-region DR shipped (issue #954), see docs/cross-region-dr.md",
-        harvest_scope,
     ),
     (
         "docs/comparison.md",
-        r"(?i)\bno\s+cross-shard\s+workflows\b"
-        r"|\bcross-shard\s+workflows\s+(are\s+)?(explicitly\s+)?out\s+of\s+scope",
+        r"\*\*No\s+cross-shard\s+workflows\.\*\*"
+        r"|cross-shard\s+workflows\s+are\s+(explicitly\s+)?out\s+of\s+scope",
         "cross-shard child placement shipped (issue #956)",
-        harvest_scope,
     ),
     (
         "docs/architecture.md",
-        REBALANCING,
+        r"Cross-shard\s+rebalancing\s+of\s+existing\s+workflows\s+is\s+out\s+of\s+scope\.",
         "shard rebalancing shipped (issue #964), see shard_rebalance.rs",
     ),
     (
         "docs/sharding.md",
-        REBALANCING,
+        r"\(cross-shard\s+rebalancing\s+is\s+not\s+supported\)",
         "shard rebalancing shipped (issue #964), see shard_rebalance.rs",
     ),
     (
         "docs/architecture.md",
-        r"(?i)\bcross-shard\s+child\s+fan-out\s+is\s+out\s+of\s+scope",
+        r"cross-shard\s+child\s+fan-out\s+is\s+out\s+of\s+scope",
         "the `_placed` fan-out variants take a ChildPlacement (issue #956)",
     ),
     (
         "docs/sharding.md",
-        r"(?i)out of scope[^\n]*cross-region failover",
+        r"geo-replication\s*/\s*cross-region\s+failover",
         "cross-region DR shipped (issue #954), see docs/cross-region-dr.md",
     ),
     (
@@ -309,13 +242,11 @@ def release_notes_findings(notes, cargo_toml):
 def stale_claim_findings(read, claims):
     """read(path) returns the text, or None for a missing file."""
     found = []
-    for path, pattern, fact, *scope in claims:
+    for path, pattern, fact in claims:
         text = read(path)
         if text is None:
             found.append(f"{path}: missing. Move or drop its STALE_CLAIMS entry.")
             continue
-        if scope:
-            text = scope[0](text)
         for m in re.finditer(pattern, text):
             found.append(f"{path}:{line_of(text, m.start())}: stale claim. Fact: {fact}.")
     return found
@@ -412,6 +343,7 @@ def self_test():
         "l.md": "`WorkflowEvent` now has 3 variants introduced by #140.",
         "m.md": "The session feature has 2 `WorkflowEvent` variants for acquire/release.",
         "n.md": "There are 2 WorkflowEvent variants for sessions.",
+        "o.md": "`WorkflowEvent` has 2 variants for session support.",
     }
     found = variant_count_findings(docs, 5)
     assert [m.split(":")[0] for m in found] == ["b.md", "e.md", "f.md", "g.md"], found
@@ -437,54 +369,51 @@ def self_test():
     found = release_notes_findings("<!-- -->\n## [0.4.0] - x\n", cargo)
     assert len(found) == 1 and "0.4.0" in found[0], found
 
-    planned, region = STALE_CLAIMS[0][1], STALE_CLAIMS[1][1]
-    files = {
-        "d.md": "**Planned:** cross-region DR ([#954](u)).",
-        "e.md": "Unplanned failover is in [#954](u). Planned windows.\n\nSee [#954](u).",
-        "f.md": "There is no built-in cross-region replication\n  or failover.",
-        "g.md": "Watch for no cross-region replication lag.",
-        "h.md": 'It ended at *"cross-shard rebalancing of existing\nworkflows is out of scope"*.',
-        "i.md": "Cross-shard rebalancing of existing\nworkflows is out of scope.",
-        "j.md": "Online rebalancing of a running workflow is not supported.",
+    old_claims = {
+        "docs/comparison.md": (
+            "**Planned:** cross-region DR via logical replication.\n"
+            "  Planned R&D: [#954](u)\n"
+            "There is no built-in multi-region replication or failover today.\n"
+            "- **Single-region — no multi-region DR or replication.** Text.\n"
+            "cross-shard workflows are explicitly out of scope per the contract.\n"
+            "and cross-shard workflows are out of\n  scope by design.\n"
+            "- **No cross-shard workflows.** A single workflow's state.\n"
+        ),
+        "docs/architecture.md": (
+            "Cross-shard rebalancing of existing workflows is out of scope.\n"
+            "(cross-shard child fan-out is out of scope, consistent with it).\n"
+        ),
+        "docs/sharding.md": (
+            "out of scope (cross-shard rebalancing is not supported).\n"
+            "per-shard worker assignment, geo-replication / cross-region failover, and\n"
+        ),
     }
-    claims = [
-        ("d.md", planned, "shipped"),
-        ("e.md", planned, "shipped"),
-        ("f.md", region, "shipped"),
-        ("g.md", region, "shipped"),
-        ("h.md", REBALANCING, "shipped"),
-        ("i.md", REBALANCING, "shipped"),
-        ("j.md", REBALANCING, "shipped"),
-        ("gone.md", r"x", "y"),
-    ]
-    found = stale_claim_findings(files.get, claims)
-    assert [m.split(":")[0] for m in found] == ["d.md", "f.md", "i.md", "gone.md"], found
-    assert "shipped" in found[0] and "missing" in found[3], found
+    claims = [c for c in STALE_CLAIMS if c[0] in old_claims]
+    found = stale_claim_findings(old_claims.get, claims)
+    assert len(found) == 11, found
 
-    page = (
-        "# Comparing autumn-harvest\n\n"
-        "Intro. **Planned:** cross-region DR ([#954](u)).\n\n"
-        "| Dimension | autumn-harvest | DBOS |\n|---|---|---|\n"
-        "| **HA** | Shipped | Planned via [#954](u) |\n\n"
-        "## Dimension-by-dimension\n\n"
-        "| Engine | Story |\n|---|---|\n"
-        "| **autumn-harvest** | There is no built-in multi-region replication or failover. |\n"
-        "| DBOS | DBOS has no cross-region replication or failover. |\n\n"
-        "Neutral prose: harvest has no multi-region DR or replication.\n\n"
-        "## Choose something else if\n\n"
-        "**Choose DBOS if** you want\nno cross-region replication or failover.\n\n"
-        "DBOS has no cross-region replication or failover. Restate is\nsimilar.\n"
-        "Temporal is ahead. Here there is no built-in multi-region\n"
-        "replication or failover.\n\n"
-        "Harvest has operator-driven DR, while DBOS has no cross-region replication or failover.\n"
-        "DBOS is fine; harvest has no cross-region replication or failover.\n"
-    )
-    claims = [("p.md", planned, "shipped", harvest_scope), ("p.md", region, "shipped", harvest_scope)]
-    found = stale_claim_findings({"p.md": page}.get, claims)
-    assert [m.split(":")[1] for m in found] == ["3", "13", "16", "25", "29"], found
+    # True statements that a pin must not match.
+    current = {
+        "docs/comparison.md": (
+            "| DBOS | DBOS has no cross-region replication or failover. |\n"
+            "Unlike Harvest, DBOS has no cross-region replication or failover.\n"
+            "Unplanned failover is covered by [#954](u).\n"
+            "There is no automatic regional failover.\n"
+            "Cross-shard composition is limited.\n"
+        ),
+        "docs/architecture.md": (
+            "Cross-shard rebalancing is not supported for running workflows.\n"
+            'It ended at *"cross-shard rebalancing of existing\nworkflows is out of scope"*.\n'
+        ),
+        "docs/sharding.md": "A running workflow cannot move. Cross-region failover is in cross-region-dr.md.\n",
+    }
+    assert stale_claim_findings(current.get, claims) == []
+
+    found = stale_claim_findings({}.get, [("gone.md", r"x", "y")])
+    assert len(found) == 1 and "missing" in found[0], found
 
     # Every real pattern compiles.
-    for _, pattern, *_ in STALE_CLAIMS:
+    for _, pattern, _ in STALE_CLAIMS:
         re.compile(pattern)
 
     print("doc-claim-drift self-test: OK")

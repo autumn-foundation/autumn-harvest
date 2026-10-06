@@ -38,7 +38,7 @@ the fields are read.
 
 **Test evidence.** Each audit's `--self-test` covers its rules with fixtures.
 Against the pre-change tree, `tracked-artifacts.py` reports 3 findings and
-`doc-claim-drift.py` reports 16. Both report 0 after the change. `cargo
+`doc-claim-drift.py` reports 17. Both report 0 after the change. `cargo
 clippy -p autumn-harvest --all-features --tests -- -D warnings` passes
 without the `#[allow(dead_code)]` attributes.
 
