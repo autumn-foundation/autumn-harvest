@@ -762,6 +762,18 @@ mod db {
         pool: &ShardedDbPool,
         config: &BatchExecutorConfig,
     ) -> HarvestResult<()> {
+        // Issue #1823: the tick holds a fence barrier on each pinned shard,
+        // so a bump cannot commit while it claims or updates a job. A lost
+        // barrier stops the tick before its next write.
+        let fence = crate::replication::begin_fenced_tick(pool).await?;
+        crate::replication::run_fenced_pass(&fence, Box::pin(executor_pass(pool, config))).await?
+    }
+
+    /// One executor pass over every shard. See [`run_executor_once`].
+    async fn executor_pass(
+        pool: &ShardedDbPool,
+        config: &BatchExecutorConfig,
+    ) -> HarvestResult<()> {
         // Discover open jobs from every shard. The same job_id may live on
         // every shard's workflow table; the row itself is per-shard so we
         // process each shard's view independently and merge counters via

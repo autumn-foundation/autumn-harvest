@@ -3090,6 +3090,72 @@ async fn a_fenced_pass_does_not_block_another_shards_bump() {
     );
 }
 
+/// A background tick holds a barrier on each pinned shard, and a fenced
+/// process gets no tick (issue #1823). Retention and the batch executor use
+/// this.
+#[tokio::test]
+async fn a_background_tick_holds_the_fence_and_refuses_when_fenced() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("tickfence");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let pools = autumn_harvest::shard::ShardedDbPool::single(dr_pool(&url));
+    let unpinned = autumn_harvest::replication::begin_fenced_tick(&pools)
+        .await
+        .expect("an unpinned process ticks");
+    assert!(unpinned.is_empty(), "no pin, no barrier");
+
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    let guards = autumn_harvest::replication::begin_fenced_tick(&pools)
+        .await
+        .expect("a pinned process ticks");
+    assert_eq!(guards.len(), 1, "one barrier per pinned shard");
+    let bump_url = url.clone();
+    let bump = tokio::spawn(async move {
+        let mut conn = connect(&bump_url).await;
+        bump_generation(&mut conn, ShardId::new(0), "failover", "test").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let waited = !bump.is_finished();
+    drop(guards);
+    bump.await
+        .expect("bump task")
+        .expect("the bump commits after the tick");
+    assert!(waited, "a bump waits for the tick");
+
+    let refused = autumn_harvest::replication::begin_fenced_tick(&pools).await;
+    assert!(
+        matches!(
+            refused,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a fenced process gets no tick"
+    );
+}
+
+/// A worker on a plain database refuses to start in a process that already
+/// pins DR shards (issue #1823). The registry is process-wide, so the worker
+/// would check its writes against another database's pins.
+#[tokio::test]
+async fn an_unfenced_worker_refuses_to_join_a_pinned_process() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("mixedworker");
+    FenceRegistry::publish(
+        &[(ShardId::new(5), ShardGeneration::new(2))],
+        ShardId::new(5),
+    )
+    .expect("another worker pins first");
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    let refused = pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &[]).await;
+    assert!(
+        refused.is_err(),
+        "an unfenced worker must not share a pinned process"
+    );
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

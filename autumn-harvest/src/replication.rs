@@ -1344,7 +1344,7 @@ mod db {
                 // before the bump. The wait comes before the table lock, so a
                 // pass's own `FOR SHARE` checks never queue behind this bump.
                 diesel::sql_query(FENCE_PASS_LOCK_EXCLUSIVE)
-                    .bind::<Integer, _>(shard_id)
+                    .bind::<BigInt, _>(fence_pass_lock_key(shard_id))
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
@@ -1381,13 +1381,24 @@ mod db {
     }
 
     /// Take one shard's pass lock shared, for a fenced pass (issue #1823).
-    /// `$1` is the shard id. Shards on one database have separate locks, so
-    /// a pass on one shard does not block a bump of another.
-    const FENCE_PASS_LOCK_SHARED: &str =
-        "SELECT pg_advisory_xact_lock_shared(hashtext('harvest:dr_fence_pass:v1'), $1)";
+    /// `$1` is [`fence_pass_lock_key`]. Shards on one database have separate
+    /// locks, so a pass on one shard does not block a bump of another.
+    const FENCE_PASS_LOCK_SHARED: &str = "SELECT pg_advisory_xact_lock_shared($1)";
     /// Take one shard's pass lock exclusive, for a bump (issue #1823).
-    const FENCE_PASS_LOCK_EXCLUSIVE: &str =
-        "SELECT pg_advisory_xact_lock(hashtext('harvest:dr_fence_pass:v1'), $1)";
+    const FENCE_PASS_LOCK_EXCLUSIVE: &str = "SELECT pg_advisory_xact_lock($1)";
+
+    /// The single-argument advisory key for a shard's fence pass lock
+    /// (issue #1823).
+    ///
+    /// The key uses the single-argument form for the reason that
+    /// [`heartbeat_lock_key`] gives: `queue_pause` owns the two-argument
+    /// form. The issue number fills the high word, so the key is outside
+    /// the `hashtext` range and differs from the heartbeat key. The shard id
+    /// fills the low word.
+    #[allow(clippy::cast_sign_loss)]
+    pub(super) const fn fence_pass_lock_key(shard_id: i32) -> i64 {
+        (1823_i64 << 32) | (shard_id as u32 as i64)
+    }
     /// The error a pass gets when its fence guard loses its session.
     const FENCE_PASS_LOST: &str = "the DR fence session ended, so the pass stopped. A fence \
                                    bump can commit after that point. Run the pass again.";
@@ -1494,6 +1505,32 @@ mod db {
         begin_fenced_pass_at(pool, resolved, pinned).await.map(Some)
     }
 
+    /// Open a [`FencePassGuard`] for each shard of `pool` that this process
+    /// pins (issue #1823). A background tick holds them, so a bump cannot
+    /// commit while the tick writes.
+    ///
+    /// A single pool names its shard through the default pin, as the
+    /// scheduler does. With no pin, this opens no connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_pass`]. A held shard counts as fenced, because it
+    /// can be an unpromoted standby.
+    pub async fn begin_fenced_tick(
+        pool: &crate::shard::ShardedDbPool,
+    ) -> HarvestResult<Vec<FencePassGuard>> {
+        if !FenceRegistry::is_enabled() {
+            return Ok(Vec::new());
+        }
+        let single = pool.len() == 1;
+        let mut guards = Vec::new();
+        for (shard, shard_pool) in pool.iter_shards() {
+            let key = if single { ShardId::UNENCODED } else { shard };
+            guards.extend(begin_fenced_pass(shard_pool, key).await?);
+        }
+        Ok(guards)
+    }
+
     /// [`begin_fenced_pass`] at an explicit generation, for a process that
     /// pins nothing (issue #1823). The CLI states the epoch an operator gave.
     ///
@@ -1548,7 +1585,7 @@ mod db {
         .await
         .map_err(database_error)?;
         diesel::sql_query(FENCE_PASS_LOCK_SHARED)
-            .bind::<Integer, _>(shard.as_i32())
+            .bind::<BigInt, _>(fence_pass_lock_key(shard.as_i32()))
             .execute(&mut conn)
             .await
             .map_err(database_error)?;
@@ -2065,6 +2102,18 @@ mod db {
         let fence = mode
             .resolve(dr_configured)
             .map_err(crate::error::HarvestError::Config)?;
+        // This process already fences another database. The registry is
+        // process-wide, so an unfenced worker here would resolve its shards
+        // through those pins. Run it in its own process instead.
+        if !fence && FenceRegistry::has_real_pin() {
+            return Err(crate::error::HarvestError::Config(
+                "this process already pins DR shard generations, but this worker's databases \
+                 carry no DR marker. The fence registry is process-wide, so the worker would \
+                 check its writes against another database's pins. Run it in its own process, \
+                 or set DrFencing::Enabled to fence its databases too."
+                    .to_string(),
+            ));
+        }
         if !fence {
             if !held.is_empty() {
                 let default_shard = targets
@@ -2999,10 +3048,10 @@ mod db {
 #[cfg(feature = "db")]
 pub use db::{
     FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority, assert_fence,
-    begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on, bump_generation,
-    current_generation, ensure_generation_row, measure_rpo, pin_process_fence, pin_worker_fence,
-    probe_dr_markers, query_replication_status, record_replication_heartbeat, resolve_held,
-    run_fenced_pass,
+    begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on, begin_fenced_tick,
+    bump_generation, current_generation, ensure_generation_row, measure_rpo, pin_process_fence,
+    pin_worker_fence, probe_dr_markers, query_replication_status, record_replication_heartbeat,
+    resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]
@@ -3435,6 +3484,22 @@ mod tests {
         assert_ne!(
             super::db::heartbeat_lock_key(0),
             super::db::heartbeat_lock_key(1)
+        );
+    }
+
+    /// The fence pass key sits outside the `hashtext` range, differs per
+    /// shard, and never equals a heartbeat key (issue #1823).
+    #[cfg(feature = "db")]
+    #[test]
+    fn fence_pass_lock_keys_are_distinct_and_outside_the_hashtext_range() {
+        for shard in [0_i32, 1, 7, 255, i32::MAX] {
+            let key = super::db::fence_pass_lock_key(shard);
+            assert!(key > i64::from(i32::MAX), "shard {shard} key {key}");
+            assert_ne!(key, super::db::heartbeat_lock_key(shard));
+        }
+        assert_ne!(
+            super::db::fence_pass_lock_key(0),
+            super::db::fence_pass_lock_key(1)
         );
     }
 

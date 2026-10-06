@@ -242,6 +242,10 @@ shard is plain:
   The worker must use the pool that took the pin. A worker on another pool
   refuses to start: that pool can reach another database, such as a
   logical standby.
+- A process that pins DR shards refuses a worker whose databases carry no
+  DR marker. The pins are process-wide, so that worker would check its
+  writes against another database. Run it in its own process, or set
+  `DrFencing::Enabled`.
 - A fenced worker with an assigned shard it cannot reach refuses to start.
   It cannot pin that shard.
 - A fenced worker holds an unassigned shard it cannot reach, and it serves
@@ -325,6 +329,9 @@ Admin writes go through the same check as worker writes (issue #1823).
   carries no DDL, so the partitioned layout must be built on both sides.
 - **In-process partition maintenance.** Each pass on a shard holds a fence
   barrier for its whole run, across its several transactions.
+- **Retention and the batch executor.** Each retention tick and each batch
+  executor tick holds a fence barrier on every pinned shard. A fenced or
+  held shard skips the whole tick, and the log names the reason.
 - **The scheduler.** Each scheduler pass on a shard holds the same barrier
   while it writes `harvest_schedules` and fires. A fenced or held shard gets
   no write, and the log names it.
