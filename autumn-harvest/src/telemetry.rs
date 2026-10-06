@@ -929,6 +929,12 @@ pub const METRIC_CIRCUIT_TRIPPED: &str = "harvest.activity.circuit.tripped";
 /// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_CIRCUIT_CLOSED: &str = "harvest.activity.circuit.closed";
 
+/// Counter: incremented each time an open circuit breaker defers a claimed
+/// task back to `PENDING` (issue #1809, `CircuitOpenMode::Defer`).
+///
+/// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_CIRCUIT_DEFERRED: &str = "harvest.activity.circuit.deferred";
+
 /// Counter: incremented each time an activity handler **panics** (unwinds)
 /// instead of returning a clean `Err`, and the engine contains the panic as a
 /// retryable typed `HandlerPanic` failure (issue #782).
@@ -3557,6 +3563,14 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.activity.circuit.closed{activity.name}`.
     fn record_circuit_closed(&self, activity_name: &str) {
+        let _ = activity_name;
+    }
+
+    /// An open circuit breaker deferred a claimed task back to `PENDING`
+    /// (issue #1809).
+    ///
+    /// Maps to the counter `harvest.activity.circuit.deferred{activity.name}`.
+    fn record_circuit_deferred(&self, activity_name: &str) {
         let _ = activity_name;
     }
 

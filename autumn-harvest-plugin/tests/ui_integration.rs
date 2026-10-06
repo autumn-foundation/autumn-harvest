@@ -7806,7 +7806,8 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
         .with_timezone(&chrono::Utc);
 
     // Activity retried twice (attempt 1 and 2 fail, then attempt 3 completes),
-    // so `derive_timeline` reports attempt = 2 → a "×2" badge. Plus a durable timer.
+    // so `derive_timeline` counts the 3 starts (issue #1809) → a "×3" badge.
+    // Plus a durable timer.
     let a = autumn_harvest::ActivityExecId::new();
     let t_id = "wait_gate";
     let events = vec![
@@ -7841,7 +7842,7 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
     assert_eq!(status, StatusCode::OK, "timeline renders: {html}");
     assert!(html.contains("<svg"), "inline svg present");
     assert!(html.contains("charge_card"), "activity span present");
-    assert!(html.contains("×2"), "retry attempt badge visible: {html}");
+    assert!(html.contains("×3"), "retry attempt badge visible: {html}");
     assert!(html.contains("wait_gate"), "timer span present");
     assert!(html.contains("Timer"), "timer lane label present");
     // Pause band + reason/actor.

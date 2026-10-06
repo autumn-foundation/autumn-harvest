@@ -2398,9 +2398,18 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (activity_name) (increase(harvest_activity_circuit_deferred_total[1h]))",
+              "legendFormat": "{{activity_name}} deferred",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
             }
           ],
-          "description": "Per-activity circuit breakers opened in the last hour (issue #369)."
+          "description": "Per-activity circuit breakers opened in the last hour (issue #369), and dispatches that an open breaker deferred (issue #1809)."
         },
         {
           "id": 41,
