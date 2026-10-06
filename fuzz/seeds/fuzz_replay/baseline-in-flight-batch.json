@@ -1,0 +1,35 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": {
+          "order": 13
+        },
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000f1",
+        "name": "reserve",
+        "input": {
+          "sku": "b"
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "SideEffectRecorded",
+      "data": {
+        "kind": "Custom",
+        "name": "trace-id",
+        "value": null
+      }
+    }
+  ]
+}

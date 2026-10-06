@@ -15,7 +15,7 @@
 name: CI
 
 on:
-  # Manual trigger for the opt-in fuzz-smoke job (see the `fuzz-smoke` job).
+  # Manual trigger. Fuzzing has its own workflow: fuzz-nightly.yml (issue #1835).
   workflow_dispatch:
   push:
     branches: [trunk, trunk-dev]

@@ -1,0 +1,65 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": null,
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000106",
+        "name": "reserve",
+        "input": {
+          "sku": "a"
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000106",
+        "output": {
+          "hold": 7
+        }
+      }
+    },
+    {
+      "type": "MarkerRecorded",
+      "data": {
+        "name": "saga_compensated:1",
+        "details": 1
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000107",
+        "name": "release",
+        "input": {
+          "hold": 7
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000107",
+        "output": null
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": null
+      }
+    }
+  ]
+}

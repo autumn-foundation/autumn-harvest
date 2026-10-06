@@ -6,12 +6,13 @@ the property-testing workstream:
 - **Property tests** ([`proptest`]) — fast, deterministic-seeded, run on every
   push. They assert *invariants* of pure functions (totality, monotonicity,
   bounds, round-trips) over structured, strategy-generated inputs.
-- **Fuzz targets** ([`cargo-fuzz`] / libFuzzer) — coverage-guided, raw-bytes,
-  nightly-only, opt-in. They hammer parsers/deserializers with byte-level
-  adversarial input that property strategies never construct.
+- **Fuzz targets** ([`cargo-fuzz`] / libFuzzer) — coverage-guided, nightly
+  toolchain, run every night with a persisted corpus. They hammer
+  parsers/deserializers with byte-level adversarial input that property
+  strategies never construct, and drive the replayer with structured histories.
 
 Neither replaces the other: property tests are a CI regression net; fuzzing is a
-manual/soak tool for the handful of functions that eat untrusted bytes.
+soak tool for the functions that eat untrusted bytes or stored data.
 
 ---
 
@@ -131,8 +132,16 @@ self-tests at the end of the file.
 
 ### Requirements
 
-- A **nightly** toolchain (libFuzzer needs `-Z` flags): `rustup toolchain install nightly`
+- The **pinned nightly** toolchain (libFuzzer needs `-Z` flags):
+  `rustup toolchain install nightly-2026-08-14`
 - **cargo-fuzz**: `cargo install cargo-fuzz`
+
+The pin is `env.FUZZ_TOOLCHAIN` in `.github/workflows/fuzz-nightly.yml`.
+The 1.100 nightlies that were tested (2026-09-01 and later) fail to build the
+`db` feature: E0275, a recursion-limit error or an ICE in the diesel
+transaction futures. Move the pin forward, in the workflow and in
+`fuzz/smoke.sh`, once a newer nightly compiles the crate. The guard
+`fuzz_toolchain_pins_agree` keeps the two pins equal.
 
 The harness lives in `fuzz/` — a crate deliberately **excluded** from the root
 workspace (root `Cargo.toml` `[workspace] exclude`, and its own empty
@@ -147,22 +156,93 @@ touches these nightly-only, libFuzzer-only binaries.
 | `fuzz_det_check_source` | `det_check::check_source` | Highest-value target: a hand-rolled line/brace scanner over arbitrary Rust source, with a history of parity churn against the proc-macro lint. Runs over user code in CI/editors. Invariant: total, never panics. |
 | `fuzz_validate_target_url` | `completion_callback::validate_target_url` | SSRF security boundary (issue #605): drives the `url` parser + IPv4/IPv6 literal classification with the most permissive policy so the deepest branches are reached. Invariant: never panics. |
 | `fuzz_failure_signature` | `dlq::failure_signature` | Normalizes unbounded, adversarial error text (unicode, multi-byte boundaries) into a shard-stable key. `db`-gated (the `fuzz` crate enables the `db` feature). Invariants: never panics; output `<= SIGNATURE_MAX_LEN` chars. |
+| `fuzz_replay` | write path, read path and `WorkflowReplayer` | Structure-aware (issue #1835). See below. |
 
 Each target converts fuzzer bytes to the input the function wants
 (`String::from_utf8_lossy` for the source/URL/error targets; the raw slice for
 the deserializer) and keeps the body minimal.
 
+### The replay target (issue #1835)
+
+`fuzz_replay` feeds an arbitrary `Vec<WorkflowEvent>` to the replayer. The
+`fuzzing` feature of `autumn-harvest` derives `arbitrary::Arbitrary` for
+`WorkflowEvent` and its field types. The feature is not a stable API and is
+not covered by semver. Clippy runs with `--all-features`, so these edits fail
+the `lint` job until they are made:
+
+- A new `serde_json::Value` field needs a `crate::fuzzing::value` attribute.
+- A new variant needs an arm in `fuzzing::mirror`. A variant that a command
+  records also needs an `Op`, so that replay can pass it.
+
+The JSON generator builds the reserved `_harvest_*` shapes on purpose: codec
+envelopes, offload references, erasure tombstones and undecodable markers.
+Plain random JSON almost never has those shapes. Issues #1253 and #1758 were
+replay corruption from such data.
+
+`autumn_harvest::fuzzing::check_case` runs each case twice through the
+write path (codec encode, then offload), the read path (inflate, then codec
+decode) and the replayer. The replayed workflow issues the commands that
+the history records, so replay goes past the first event. `fuzzing::mirror`
+models join batches, races, fan-outs (fail-fast and collect-all), saga
+unwinds, DAG skips, worker sessions, cancellable timers, signal and child
+timeouts, deadline probes, version and patch markers, and redrives. A
+history that the mirror does not model still runs.
+It ends at an early mismatch, which costs coverage but no oracle. The
+oracles:
+
+1. Nothing panics.
+2. A history that the write path stores reads back unchanged, through the
+   strict read and through the lossy read of history export. A write error
+   or a read error on such a history is a failure too.
+3. Both runs give the same report.
+
+The oracle compares after a JSON text round trip. Storage keeps text, and
+serde_json parses some floats back one digit off. That loss is not a
+pipeline defect. A history with a NUL character is skipped, because
+Postgres `jsonb` cannot store it.
+
+The replayer's own inflate path is not fuzzed. `replay_from_db` decodes
+before it inflates, the reverse of the worker's read order.
+
+Input that starts with `{` is a JSON case, not `arbitrary` bytes. The seeds
+in `fuzz/seeds/fuzz_replay/` use this form, so they stay valid when the
+generator changes. The seed corpus holds the #1253 and #1758 reproducers.
+`tests/integration/replay_fuzz_seeds.rs` runs every seed, and the generator
+over fixed bytes, on stable Rust in CI:
+
+```bash
+cargo test -p autumn-harvest --no-default-features --features fuzzing \
+  --test integration replay_fuzz_seeds::
+```
+
+To add a reproducer, write the JSON case to `fuzz/seeds/fuzz_replay/` with
+the issue number in its name. Check that the seed fails with the fix
+reverted. A codec or offload setting can hide the bug.
+
+A raw crash input decodes through `arbitrary`, so it stops reproducing when
+the generator changes. Convert it to a JSON case before you commit it:
+
+```bash
+FUZZ_REPLAY_PRINT_JSON=1 cargo +nightly-2026-08-14 fuzz run fuzz_replay path/to/crash-<hash>
+```
+
 ### Running them
 
 ```bash
 # Build all targets (nightly + libFuzzer):
-cd fuzz && cargo +nightly fuzz build
+cd fuzz && cargo +nightly-2026-08-14 fuzz build
 
 # Run one target (Ctrl-C to stop; grows a corpus under fuzz/corpus/<target>/):
-cargo +nightly fuzz run fuzz_det_check_source
+cargo +nightly-2026-08-14 fuzz run fuzz_det_check_source
+
+# Run with the committed seeds as a second, read-only corpus:
+cargo +nightly-2026-08-14 fuzz run fuzz_replay corpus/fuzz_replay seeds/fuzz_replay
+
+# Reproduce a crash input from a CI artifact:
+cargo +nightly-2026-08-14 fuzz run fuzz_replay path/to/crash-<hash>
 
 # Time-boxed run of one target:
-cargo +nightly fuzz run fuzz_det_check_source -- -max_total_time=300
+cargo +nightly-2026-08-14 fuzz run fuzz_det_check_source -- -max_total_time=300
 
 # Quick smoke of every target (~15s each) — the manual/local helper:
 ./fuzz/smoke.sh
@@ -172,11 +252,32 @@ MAX_TOTAL_TIME=60 ./fuzz/smoke.sh
 
 ### CI
 
-There is an **opt-in `fuzz-smoke` job** in `.github/workflows/ci.yml`, gated on
-`github.event_name == 'workflow_dispatch'` — it **never** runs on push or PR
-(Actions minutes are tight and fuzzing needs nightly). Trigger it manually from
-the Actions tab ("Run workflow") for a 30s-per-target smoke. Real campaigns run
-locally with a larger `-max_total_time`.
+`.github/workflows/fuzz-nightly.yml` runs every target each night for 600
+seconds, one job per target (issue #1835).
+
+- **Corpus.** Each run uploads each target's corpus as the artifact
+  `fuzz-corpus-<target>`, also after a crash. `cargo fuzz cmin` keeps it
+  small. The next run downloads the newest one from a run of this
+  repository. It prefers its own branch, then the default branch, and never
+  takes a fork's corpus. An artifact stays 30 days, or 7 days for a pull
+  request. With none left, the fuzzer starts again from the seeds.
+- **Why not the actions cache.** The CI build caches fill the repository's
+  cache budget. In a test on the pull request, GitHub evicted every corpus
+  entry within 11 minutes, so a nightly corpus would never survive a day.
+- **Crash.** The crash input is uploaded as `fuzz-artifacts-<target>`. A
+  failed scheduled run opens the issue "Fuzz nightly: a scheduled run
+  failed", or comments on the open one. Fix the bug and commit the input to
+  `fuzz/seeds/<target>/`. For `fuzz_replay`, commit the JSON form (see above).
+- **Manual run.** Run the workflow from the Actions tab. The `seconds`
+  input sets the time per target.
+- **Pull request.** A change under `fuzz/`, to the workflow, to
+  `rust-toolchain.toml`, to the root `Cargo.toml` or `Cargo.lock`, or to the
+  source of `autumn-harvest` or its macros runs each target for 60 seconds. `fuzz_replay` reaches most of the engine,
+  so a narrower filter would miss a replayer change. A draft PR skips it.
+
+The guard `fuzz_nightly_wiring.rs` keeps the target lists of
+`fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow equal. It also checks
+the cron, the corpus cycle and the alert job.
 
 ---
 
@@ -230,8 +331,6 @@ harness.
   (the bounded-caps validator is a natural totality target).
 - `dlq::DlqAggregateParams::from_query_pairs` / other query-string parsers
   (raw bytes → structured params).
-- `history_export` / read-path payload-codec envelope parsing over arbitrary
-  JSON (the `_harvest_*` envelope discriminators).
 
 ### Production follow-ups surfaced by this workstream
 
