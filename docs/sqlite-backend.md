@@ -391,11 +391,11 @@ second runtime in the same process.
   mount gives a second path, and so a second lock. Open the database through
   one path.
 - A read-only inspector connection still works. It never touches the lock.
-- A private in-memory database (`:memory:`, `file::memory:`) takes no lock. A
-  named in-memory URI, such as `file:name?mode=memory&cache=shared` or
-  `file:/name?vfs=memdb`, takes an in-process lock on its decoded name.
-  Other connections in the process can open it. The rule fails closed: any
-  named URI takes the lock.
+- An in-memory database has no file, so its lock is an owner row inside the
+  database (`harvest_memory_writer_lock`). Several URI forms share one such
+  database, such as `cache=shared` or `vfs=memdb`. `SQLite` decides which
+  connections reach it, so no URI alias can split the lock. A private
+  `:memory:` database starts empty and never conflicts.
 
 The lock file stays on disk after the runtime drops. **Do not delete it** while
 a runtime runs: a second process could then lock a new file. On Unix the lock

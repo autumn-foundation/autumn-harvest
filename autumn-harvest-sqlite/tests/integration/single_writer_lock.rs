@@ -364,3 +364,14 @@ fn a_decoded_nul_ends_a_uri_component() {
         .expect("a value ends at its first NUL");
     assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
 }
+
+/// `SQLite` ignores a `localhost` authority. Every alias that reaches one
+/// in-memory database must meet the same lock.
+#[test]
+fn a_localhost_authority_alias_shares_the_lock() {
+    let _first = SqliteRuntime::open("file:/meml_1834?mode=memory&cache=shared").unwrap();
+    let err = SqliteRuntime::open("file://localhost/meml_1834?mode=memory&cache=shared")
+        .err()
+        .expect("a localhost authority names the same database");
+    assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
+}

@@ -211,9 +211,17 @@ pub struct SqliteRuntime {
     /// drivers bypass it entirely (they take a caller-fixed timestamp — the
     /// deterministic-simulation seam).
     now_fn: NowFn,
-    /// The single-writer lock (issue #1834). `None` for an in-memory database.
-    /// It is released when the runtime drops.
-    _writer_lock: Option<WriterLock>,
+    /// The single-writer lock (issue #1834). It is released when the runtime
+    /// drops.
+    writer_lock: Option<WriterLock>,
+}
+
+impl Drop for SqliteRuntime {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.writer_lock {
+            lock.release(&self.conn);
+        }
+    }
 }
 
 /// A wall-clock source for the public drivers — see [`SqliteRuntime::set_clock`].
@@ -255,7 +263,8 @@ impl SqliteRuntime {
     /// created or the schema cannot be applied.
     pub fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn, None)
+        let writer_lock = lock::acquire(&conn, Path::new(":memory:"))?;
+        Self::from_connection(conn, writer_lock)
     }
 
     fn from_connection(conn: Connection, writer_lock: Option<WriterLock>) -> SqliteResult<Self> {
@@ -295,7 +304,7 @@ impl SqliteRuntime {
             activities: HashMap::new(),
             workflow_panic_strikes: HashMap::new(),
             now_fn: std::sync::Arc::new(Utc::now),
-            _writer_lock: writer_lock,
+            writer_lock,
         })
     }
 

@@ -23,11 +23,16 @@
 //! On Unix the lock file takes the database file's read and write bits. `flock`
 //! needs only an open file, so a user who can open the lock file can hold it.
 //! Matching the database keeps that set to the users who can reach the data.
+//!
+//! An in-memory database has no file. Several URI forms still share one by
+//! name, such as `cache=shared` or `vfs=memdb`. Its lock is therefore an owner
+//! row inside the database itself. `SQLite` decides which connections reach
+//! the same database, so no alias can split the lock. A private database starts
+//! empty, so it never conflicts. The whole database dies with its process, so
+//! a crash leaves no stale row.
 
-use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
 
 use rusqlite::Connection;
 
@@ -46,31 +51,30 @@ const LOCK_ATTEMPTS: u32 = 5;
 /// The pause between two lock attempts.
 const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// The named in-memory databases that a runtime in this process holds, keyed
-/// by decoded name.
-///
-/// `SQLite` reports no file for such a database, so no OS lock applies. Every
-/// connection in the process can still open it, so this set stands in.
-static SHARED_MEMORY: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// The table that holds the owner row of an in-memory database.
+const MEMORY_LOCK_TABLE: &str = "harvest_memory_writer_lock";
 
-/// An acquired single-writer lock. Dropping it releases the lock.
+/// An acquired single-writer lock.
 #[derive(Debug)]
 pub enum WriterLock {
     /// An OS lock on the sidecar file. Dropping the file releases it.
     // Held only for its drop, which releases the OS lock.
     #[allow(dead_code)]
     File(File),
-    /// An entry in [`SHARED_MEMORY`]. Drop removes it.
-    SharedMemory(String),
+    /// The owner row of an in-memory database, by its token.
+    /// [`release`](Self::release) deletes it.
+    Memory(String),
 }
 
-impl Drop for WriterLock {
-    fn drop(&mut self) {
-        if let Self::SharedMemory(name) = self {
-            SHARED_MEMORY
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(name);
+impl WriterLock {
+    /// Release a lock that needs the connection. The runtime calls this when it
+    /// drops. A file lock releases itself.
+    pub fn release(&self, conn: &Connection) {
+        if let Self::Memory(token) = self {
+            let sql = format!("DELETE FROM {MEMORY_LOCK_TABLE} WHERE token = ?1");
+            if let Err(err) = conn.execute(&sql, [token]) {
+                tracing::warn!(error = %err, "could not release the in-memory writer lock");
+            }
         }
     }
 }
@@ -80,18 +84,17 @@ impl Drop for WriterLock {
 /// `requested` is the path the caller passed to `open`. It is the fallback when
 /// `SQLite` reports no path, which happens for a non-UTF-8 path.
 ///
-/// Returns `None` when `SQLite` reports an empty path for a private database:
-/// `:memory:` or a temporary file. A named in-memory URI, such as
-/// `file:name?mode=memory&cache=shared` or `file:/name?vfs=memdb`, takes an
-/// in-process lock instead.
+/// An in-memory or temporary database, which `SQLite` reports with an empty
+/// path, takes the owner-row lock instead of a file lock.
 ///
 /// # Errors
 ///
 /// Returns [`SqliteError::DatabaseLocked`] when another runtime holds the lock.
 /// Returns [`SqliteError::Io`] when the lock file cannot be opened or locked.
+/// Returns [`SqliteError::Sqlite`] when the owner row cannot be written.
 pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<WriterLock>> {
     let db_path = match conn.path() {
-        Some("") => return acquire_shared_memory(requested),
+        Some("") => return acquire_memory(conn, requested),
         Some(reported) => Path::new(reported),
         None => requested,
     };
@@ -132,83 +135,24 @@ pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<Write
     }
 }
 
-/// Lock a named in-memory database in this process. A private one needs no
-/// lock.
-///
-/// The URI is read as `SQLite` reads it. The name is the part before `?`.
-/// Every query key and value has its `%HH` escapes decoded.
-///
-/// The rule fails closed. Several URI forms share one database by name, for
-/// example `cache=shared` or `vfs=memdb`. So every `file:` URI takes the lock,
-/// keyed by its decoded name. Only an empty or `:memory:` name without
-/// `cache=shared` is provably private and takes none. Two runtimes on one
-/// private named URI in one process therefore conflict. That is safe.
-fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
-    let uri = requested.to_string_lossy();
-    let Some(rest) = uri
-        .get(..5)
-        .filter(|scheme| scheme.eq_ignore_ascii_case("file:"))
-        .map(|_| &uri[5..])
-    else {
-        // Not a URI, such as `:memory:` or an empty name: always private.
-        return Ok(None);
-    };
-    let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
-    let (raw_name, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let params: Vec<(String, String)> = query
-        .split('&')
-        .filter(|param| !param.is_empty())
-        .map(|param| {
-            let (key, value) = param.split_once('=').unwrap_or((param, ""));
-            (percent_decode(key), percent_decode(value))
-        })
-        .collect();
-    let cache_shared = params
-        .iter()
-        .any(|(key, value)| key == "cache" && value.eq_ignore_ascii_case("shared"));
-    let name = percent_decode(raw_name);
-    if !cache_shared && (name.is_empty() || name == ":memory:") {
-        return Ok(None);
-    }
-    // The key is the name alone. A VFS has several spellings, such as an
-    // omitted default and `vfs=unix`. One name under two VFSes then conflicts,
-    // which is safe.
-    let inserted = SHARED_MEMORY
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(name.clone());
-    if !inserted {
+/// Take the owner row of an in-memory database. A second runtime that reaches
+/// the same database finds the row and fails.
+fn acquire_memory(conn: &Connection, requested: &Path) -> SqliteResult<Option<WriterLock>> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {MEMORY_LOCK_TABLE} \
+         (id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL);"
+    ))?;
+    let token = uuid::Uuid::new_v4().to_string();
+    let inserted = conn.execute(
+        &format!("INSERT OR IGNORE INTO {MEMORY_LOCK_TABLE} (id, token) VALUES (1, ?1)"),
+        [&token],
+    )?;
+    if inserted == 0 {
         return Err(SqliteError::DatabaseLocked {
             path: requested.to_path_buf(),
         });
     }
-    Ok(Some(WriterLock::SharedMemory(name)))
-}
-
-/// Decode `%HH` escapes as `SQLite` does for a URI component. A malformed
-/// escape stays as it is. A decoded NUL ends the component, as in `SQLite`.
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let hex = bytes
-            .get(i + 1..i + 3)
-            .and_then(|pair| std::str::from_utf8(pair).ok())
-            .and_then(|pair| u8::from_str_radix(pair, 16).ok());
-        match (bytes[i], hex) {
-            (b'%', Some(0)) => break,
-            (b'%', Some(byte)) => {
-                out.push(byte);
-                i += 3;
-            }
-            (byte, _) => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    Ok(Some(WriterLock::Memory(token)))
 }
 
 /// The canonical form of the database path.
