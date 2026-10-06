@@ -204,6 +204,18 @@ fn text(u: &mut Unstructured<'_>) -> arbitrary::Result<String> {
     }
 }
 
+fn fan_out_items(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<(String, Value, String)>> {
+    let len = u.int_in_range(0..=MAX_ITEMS)?;
+    (0..len)
+        .map(|_| Ok((text(u)?, value(u)?, text(u)?)))
+        .collect()
+}
+
+fn child_fan_out_items(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<(String, Value)>> {
+    let len = u.int_in_range(0..=MAX_ITEMS)?;
+    (0..len).map(|_| Ok((text(u)?, value(u)?))).collect()
+}
+
 /// One command of the replayed workflow.
 #[derive(Debug, Clone, Serialize, Deserialize, Arbitrary)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -244,6 +256,20 @@ pub enum Op {
     NewUuid,
     /// `ctx.random_u64`.
     Random,
+    /// `ctx.random_f64`.
+    RandomF64,
+    /// `ctx.execute_activity_fan_out_raw` over `(name, input, queue)` items.
+    FanOut {
+        /// The activities of the group.
+        #[arbitrary(with = fan_out_items)]
+        activities: Vec<(String, Value, String)>,
+    },
+    /// `ctx.spawn_child_workflow_fan_out_raw` over `(name, input)` items.
+    ChildFanOut {
+        /// The children of the group.
+        #[arbitrary(with = child_fan_out_items)]
+        children: Vec<(String, Value)>,
+    },
     /// `ctx.patched`.
     Patched {
         /// Patch id.
@@ -695,6 +721,7 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         .iter()
         .rposition(|event| matches!(event, WorkflowEvent::WorkflowRedriven { .. }));
     let mut race_timers: HashSet<&str> = HashSet::new();
+    let mut consumed: HashSet<usize> = HashSet::new();
     let mut program = Vec::new();
     let mut batch = Vec::new();
     let mut index = 0;
@@ -702,6 +729,16 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         let event = &history[index];
         index += 1;
         let op = match event {
+            WorkflowEvent::MarkerRecorded { name, details } if name.starts_with("fan_out:") => {
+                let count = details.as_u64().and_then(|n| usize::try_from(n).ok());
+                Some(mirror_fan_out(
+                    history,
+                    index,
+                    count.unwrap_or(0),
+                    &mut consumed,
+                ))
+            }
+            _ if consumed.remove(&(index - 1)) => None,
             WorkflowEvent::MarkerRecorded { name, .. } if race_seq(name).is_some() => {
                 let (race, next) = mirror_race(history, index, name, &mut race_timers);
                 index = next;
@@ -727,6 +764,43 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     }
     flush_batch(&mut program, &mut batch);
     program
+}
+
+/// Builds the fan-out op that a `fan_out:{n}` marker opens. The next `count`
+/// activity schedules, or child starts, are its items. Their indexes go to
+/// `consumed`, so the main loop does not mirror them again.
+fn mirror_fan_out(
+    history: &[WorkflowEvent],
+    start: usize,
+    count: usize,
+    consumed: &mut HashSet<usize>,
+) -> Op {
+    let mut activities = Vec::new();
+    let mut children = Vec::new();
+    for (index, event) in history.iter().enumerate().skip(start) {
+        if activities.len() + children.len() >= count {
+            break;
+        }
+        match event {
+            WorkflowEvent::ActivityScheduled {
+                name, input, queue, ..
+            } if children.is_empty() => {
+                activities.push((name.clone(), input.clone(), queue.clone()));
+            }
+            WorkflowEvent::ChildWorkflowStarted {
+                workflow_name,
+                input,
+                ..
+            } if activities.is_empty() => children.push((workflow_name.clone(), input.clone())),
+            _ => continue,
+        }
+        consumed.insert(index);
+    }
+    if children.is_empty() {
+        Op::FanOut { activities }
+    } else {
+        Op::ChildFanOut { children }
+    }
 }
 
 /// The `{seq}` of a `race:{seq}` marker. A `race_winner:` marker has none.
@@ -831,6 +905,7 @@ impl Op {
             Self::Now
                 | Self::NewUuid
                 | Self::Random
+                | Self::RandomF64
                 | Self::Patched { .. }
                 | Self::SideEffect { .. }
                 | Self::DetachedChild { .. }
@@ -884,10 +959,11 @@ fn mirror_event(event: &WorkflowEvent, armed_timer: bool) -> Option<Op> {
         WorkflowEvent::SignalReceived { signal_name, .. } => Some(Op::Signal {
             name: signal_name.clone(),
         }),
-        WorkflowEvent::SideEffectRecorded { kind, name, .. } => match kind {
+        WorkflowEvent::SideEffectRecorded { kind, name, value } => match kind {
             SideEffectKind::Now => Some(Op::Now),
             SideEffectKind::Uuid => Some(Op::NewUuid),
-            SideEffectKind::Random => Some(Op::Random),
+            SideEffectKind::Random if value.is_u64() => Some(Op::Random),
+            SideEffectKind::Random => Some(Op::RandomF64),
             SideEffectKind::Custom => name.clone().map(|name| Op::SideEffect { name }),
         },
         WorkflowEvent::MarkerRecorded { name, details } => marker_op(name, details),
@@ -1069,6 +1145,15 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
         }
         Op::Random => {
             let _ = ctx.random_u64();
+        }
+        Op::RandomF64 => {
+            let _ = ctx.random_f64();
+        }
+        Op::FanOut { activities } => {
+            let _ = ctx.execute_activity_fan_out_raw(activities).await;
+        }
+        Op::ChildFanOut { children } => {
+            let _ = ctx.spawn_child_workflow_fan_out_raw(children).await;
         }
         // An empty patch id is a documented caller panic.
         Op::Patched { id } if id.is_empty() => {}

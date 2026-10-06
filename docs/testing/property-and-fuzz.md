@@ -182,7 +182,11 @@ replay corruption from such data.
 `autumn_harvest::fuzzing::check_case` runs each case twice through the
 write path (codec encode, then offload), the read path (inflate, then codec
 decode) and the replayer. The replayed workflow issues the commands that
-the history records, so replay goes past the first event. The oracles:
+the history records, so replay goes past the first event. `fuzzing::mirror`
+models join batches, races, fan-outs, cancellable timers, version and patch
+markers, and redrives. A history that the mirror does not model still runs.
+It ends at an early mismatch, which costs coverage but no oracle. The
+oracles:
 
 1. Nothing panics.
 2. A history that the write path stores reads back unchanged, through the
