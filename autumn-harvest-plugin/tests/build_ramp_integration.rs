@@ -399,6 +399,45 @@ async fn a_retried_policy_update_with_one_idempotency_key_keeps_one_ramp_id() {
     assert_eq!(ids[0], ids[1], "one key gives one ramp id");
 }
 
+/// A later keyed policy write supersedes an earlier one that kept the same
+/// ramp. A late retry of the earlier write gets `409` and leaves the newer
+/// ramp (issue #1814).
+#[tokio::test]
+async fn a_stale_keyed_policy_retry_is_refused_and_keeps_the_newer_ramp() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let mut conn = pool.get().await.expect("get conn");
+    set_build_policy(&mut conn, "default", "base-v1", None)
+        .await
+        .expect("seed base policy");
+    set_build_ramp(&mut conn, "default", "canary-v2", 25)
+        .await
+        .expect("seed ramp");
+    drop(conn);
+    let app = build_ramp_app(pool.clone());
+    let policy = |deployment: &str| json!({ "queue_name": "default", "build_id": "base-v1", "deployment_name": deployment });
+    for (deployment, key) in [("one", "policy-a"), ("two", "policy-b")] {
+        let (status, body) = post_json_with_key(
+            &app,
+            "/admin/build-routing/policies",
+            policy(deployment),
+            Some(key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+    }
+
+    let (status, body) = post_json_with_key(
+        &app,
+        "/admin/build-routing/policies",
+        policy("one"),
+        Some("policy-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(ramp_is_active(&pool).await, "the newer ramp stays");
+}
+
 /// A client reuses an `Idempotency-Key` with a changed ramp. The first
 /// request reached shard A only. The retry with a new percentage reaches
 /// both shards. Both must store one `ramp_id` (issue #1814). With the old

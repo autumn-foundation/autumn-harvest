@@ -436,9 +436,14 @@ pub(crate) fn ramp_generation_id_sql(id: &str, queue: &str, base: &str, target: 
 /// the other pools. The check reads the abort markers of the row and the
 /// report ledger of this database.
 ///
+/// A later writer can supersede this request on the pool. It then retires
+/// the request's `ramp_id`. A late retry of the request is refused, so it
+/// cannot drop or re-id the newer ramp of that writer.
+///
 /// # Errors
 ///
-/// Returns `HarvestError::Database` on failure.
+/// Returns `HarvestError::Database` on failure, and `HarvestError::Config`
+/// when a later write superseded this request on the pool.
 #[cfg(feature = "db")]
 pub async fn set_build_policy_with_ramp_id(
     conn: &mut AsyncPgConnection,
@@ -451,6 +456,9 @@ pub async fn set_build_policy_with_ramp_id(
         .read_committed()
         .run(async |conn| {
             lock_ramp_generations(conn, queue_name).await?;
+            if request_retired(conn, queue_name, ramp_id).await? {
+                return Err(superseded_policy_error(queue_name));
+            }
             let old = current_ramp_id(conn, queue_name).await?;
             let policy = upsert_build_policy_with_ramp_id(
                 conn,
@@ -814,6 +822,48 @@ fn generation_aborted_sql(id: &str, caller_target: &str) -> String {
                      WHERE x.queue_name = harvest_build_policies.queue_name \
                        AND x.ramp_id IN ({id}, {caller_target})))"
     )
+}
+
+/// Whether a writer retired the request id `ramp_id` of `queue_name` on this
+/// pool (issue #1814).
+///
+/// A writer retires the raw request id only when it replaces or clears what
+/// that request wrote. The guard retires another id, the
+/// [`ramp_caller_target_id`]. So a hit means a later write superseded the
+/// request here.
+#[cfg(feature = "db")]
+async fn request_retired(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    ramp_id: Uuid,
+) -> HarvestResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        retired: bool,
+    }
+    let row: Row = diesel::sql_query(
+        "SELECT EXISTS (SELECT 1 FROM harvest_ramp_retired_ids \
+                        WHERE queue_name = $1 AND ramp_id = $2) AS retired",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
+    .get_result(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(row.retired)
+}
+
+/// The error for a policy write that a later write superseded on the pool.
+///
+/// The management API returns it as `409 Conflict`.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn superseded_policy_error(queue_name: &str) -> HarvestError {
+    HarvestError::Config(format!(
+        "this policy write for queue '{queue_name}' was superseded by a later write; a retry \
+         does not repeat it — send a new Idempotency-Key to write again"
+    ))
 }
 
 /// The error for a ramp write that would install an aborted generation.

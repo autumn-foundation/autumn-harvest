@@ -298,10 +298,13 @@ The guard fails safe: when it cannot read, it does not abort.
   pool. A late retry of the request that set that id gets `409 Conflict`,
   by the same checks as an aborted id. The retired row holds the queue, so
   a caller id that a library reuses on another queue is not refused there.
-- The key protects the ramp only. `PUT /admin/build-routing/policy` stays
-  last-writer-wins for the base build, as before #1814. A late retry of an
-  old policy request sets its base again. Only the ramp that it carries is
-  refused.
+- A keyed `POST /admin/build-routing/policies` that kept a ramp stores its
+  request id on the pool. A later write that replaces or clears that ramp
+  retires the id. A late retry of the earlier request then gets `409 Conflict`
+  and changes nothing there, so it cannot drop or re-id the newer ramp.
+- Otherwise the policy route stays last-writer-wins for the base build, as
+  before #1814. A late retry of a request that kept no ramp sets its base
+  again.
 - A conflict on one pool while another pool takes the ramp gives `207`.
   The refusing pool is listed in `shard_errors`.
 - The pool also keeps the request's own id in

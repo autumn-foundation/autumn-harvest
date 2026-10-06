@@ -2352,6 +2352,43 @@ async fn a_retry_of_an_aborted_ramp_after_a_base_change_is_refused() {
     assert!(!ramp_is_active(&mut conn).await);
 }
 
+/// A later policy write that keeps the ramp supersedes an earlier one. A
+/// late retry of the earlier write is refused and leaves the newer ramp.
+#[tokio::test]
+async fn a_stale_policy_retry_does_not_drop_a_newer_ramp() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_ramp_with_id(&mut conn, uuid::Uuid::new_v4()).await;
+    let first = uuid::Uuid::new_v4();
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("one"), first)
+        .await
+        .expect("first policy write");
+    let second = uuid::Uuid::new_v4();
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("two"), second)
+        .await
+        .expect("second policy write");
+
+    let retry = set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("one"), first).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "the stale retry is refused: {retry:?}"
+    );
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert_eq!(policy.deployment_name.as_deref(), Some("two"));
+    assert_eq!(
+        policy.target_build_id.as_deref(),
+        Some(BUILD_B),
+        "the newer ramp stays"
+    );
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(second, QUEUE, BUILD_A, BUILD_B))
+    );
+}
+
 /// A guard can stop after its clear commits and before its report. A later
 /// pass reports that abort once, from the marker, after the report grace.
 #[tokio::test]

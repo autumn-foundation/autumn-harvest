@@ -47981,6 +47981,8 @@ async fn set_build_policy_handler(
         Err(response) => return response,
     };
     let mut last_policy = None;
+    let mut last_conflict = None;
+    let mut shard_conflicts: Vec<String> = Vec::new();
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -47992,14 +47994,27 @@ async fn set_build_policy_handler(
         };
         match set_build_policy_with_ramp_id(&mut conn, queue_name, build_id, deployment, ramp_id)
             .await
-            .map_err(map_error)
         {
             Ok(p) => last_policy = Some(p),
+            Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                shard_conflicts.push(format!("shard {}: {e}", shard_id.as_i32()));
+                last_conflict = Some(e);
+            }
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {}: {}", shard_id.as_i32(), map_error(e)));
             }
         }
     }
+
+    // A later write superseded this keyed request on every shard that holds
+    // it (issue #1814). That is a conflict, not an outage.
+    if last_policy.is_none()
+        && shard_errors.is_empty()
+        && let Some(conflict) = last_conflict
+    {
+        return conflict_from(conflict).into_response();
+    }
+    shard_errors.extend(shard_conflicts);
 
     // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
