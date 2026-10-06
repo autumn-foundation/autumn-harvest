@@ -14,11 +14,12 @@ Status: implementation plan (TDD: red, green, refactor).
 3. **Alert: a new issue for each failed run.** Rejected. A daily cron then opens
    one issue a day. The script comments on the open issue instead and closes it
    after a clean run.
-4. **SHA pins: a Rust test that parses the workflows.** Rejected. YAML parsers
-   drop comments, so a test cannot see the version comment.
-5. **SHA pins: a line-based `docs/audits/` lint.** Chosen. It reads raw lines,
-   so it checks the version comment. It runs in the `lint` job, which also
-   runs on a docs-only change.
+4. **SHA pins: a line-based lint only.** Rejected. A flow mapping or an escaped
+   key hides a `uses` key from a line scan.
+5. **SHA pins: a `docs/audits/` lint that parses the YAML, then reads the raw
+   line for the comment.** Chosen. The parser finds every key, and the line
+   gives the version comment. It runs in the `lint` job, which also runs on a
+   docs-only change.
 6. **Renovate.** Rejected. It needs a GitHub App. Dependabot needs a file only,
    and it updates a SHA pin and its version comment together.
 7. **Sign each archive in its build job.** Rejected. The build runs third-party
@@ -38,8 +39,8 @@ close" model.
   Foreclosed: `workflow-yaml-parse.py` and a Rust test parse the new file. A
   `pull_request` run on the scan files proves one green run before merge.
 - **R2. A red scheduled run is silent.** GitHub tells only the last cron editor.
-  Foreclosed: the script opens an issue. A failed setup step reports on the same
-  issue.
+  Foreclosed: the script opens an issue. A red run with no `reported=true`
+  output reports on the same issue. That covers a step timeout too.
 - **R3. A hung step cancels the job, so the report step does not run.**
   Foreclosed: each step has a timeout, and the timeouts sum to less than the job
   timeout (the issue #1790 lesson).
@@ -49,8 +50,9 @@ close" model.
   script quotes only the tail of the scan output.
 - **R6. A pull request run opens an issue.** Foreclosed: the workflow enables the
   alert on `schedule` only.
-- **R7. A pin in an unusual form passes the lint.** Foreclosed: any line with a
-  `uses:` key that does not match the strict form is a finding (fail closed).
+- **R7. A pin in an unusual form passes the lint.** Foreclosed: the lint finds
+  each `uses` key in the parsed YAML tree. A key that is not in the plain
+  one-line form is a finding (fail closed).
 - **R8. A SHA pin drops the action input that the tag gave.**
   `dtolnay/rust-toolchain@stable` takes its toolchain from the ref. Foreclosed:
   each pin of that action sets `toolchain:` explicitly. A test checks it.
@@ -66,6 +68,11 @@ close" model.
 - **R13. The SBOM describes a different build.** Foreclosed: the SBOM uses the
   same package, features and target as the build. The SBOM is attested against
   the archive digest.
+- **R14. A dry run attestation verifies like a release.** Foreclosed: a dry run
+  writes no attestation. The docs pass `--source-ref` and `--signer-workflow`.
+- **R15. Third-party code runs with a write token.** Foreclosed: `binaries` and
+  `client` hold read-only tokens. The `release` job runs no build and keeps no
+  credentials on disk.
 
 ## 3. Six hats
 
@@ -96,7 +103,9 @@ close" model.
 - `.github/ci/advisory-scan.sh`: runs `cargo deny --all-features check
   advisories`. With `ADVISORY_ALERT=true`, a failed scan opens or comments on
   the alert issue, and a clean scan closes it. The exit code is the scan's.
-- `advisory-scan.sh setup-failed` reports a failed setup step.
+  After it reports, it sets the step output `reported=true`.
+- `advisory-scan.sh run-failed` reports a red run with no report: a failed
+  setup step, a step timeout or a lost `gh` call.
 
 ### 4.2 SHA pins
 
@@ -107,20 +116,25 @@ close" model.
 
 ### 4.3 Dependabot
 
-- `.github/dependabot.yml`: `cargo` on `/` and `/fuzz`, `github-actions` on `/`.
-  Weekly. `target-branch: trunk-dev`. Minor and patch updates are grouped.
+- `.github/dependabot.yml`: `cargo` and `github-actions` on `/`. Weekly.
+  `target-branch: trunk-dev`. Minor and patch updates are grouped. `/fuzz` has
+  no lockfile and no default CI build, so it is not listed.
 
 ### 4.4 Release
 
 - `binaries` (matrix: Linux x86_64, macOS arm64, Windows x86_64):
-  `cargo auditable build`, an archive, and a CycloneDX SBOM. No token
-  permissions.
-- `sign` (same matrix): `cosign sign-blob` keyless, `cosign verify-blob`,
-  `attest-build-provenance` and `attest-sbom`.
-- `release`: a tag push only. It uploads the archives, SBOMs and bundles.
+  `cargo auditable build`, an archive, and a CycloneDX SBOM. The token is
+  read-only.
+- `sign` (same matrix): `cosign sign-blob` keyless and `cosign verify-blob`.
+  On a tag push only, `attest-build-provenance`, and `attest` with the SBOM.
+- `client`: the TypeScript client, with a read-only token, because `npm` runs
+  third-party install scripts.
+- `release`: a tag push only. It uploads the archives, SBOMs and bundles. Its
+  checkout keeps no credentials.
 - A dry run (`workflow_dispatch`, or a pull request that changes
   `release.yml`) runs `binaries` and `sign`, and uploads the result as a
-  workflow artifact.
+  workflow artifact. It writes no attestation, because `gh attestation verify
+  --repo` alone accepts any run of this repository.
 
 ### 4.5 Tests mapped to acceptance criteria
 

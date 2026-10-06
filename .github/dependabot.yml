@@ -6,16 +6,15 @@
 # comment. Dependabot updates the SHA and the comment together.
 # docs/audits/action-sha-pin.py rejects a pin with no SHA.
 #
-# cargo: `/` is the workspace. `/fuzz` is its own workspace, outside the root
-# one. The CI `msrv` job catches an update that needs a newer rustc.
+# cargo: `/` is the workspace. The CI `msrv` job catches an update that needs
+# a newer rustc. `/fuzz` is not listed. It has no lockfile, so Dependabot
+# could open only major bumps there, and no CI job builds it by default.
 #
 # Security updates are a repository setting, not part of this file.
 version: 2
 updates:
   - package-ecosystem: cargo
-    directories:
-      - "/"
-      - "/fuzz"
+    directory: "/"
     target-branch: trunk-dev
     schedule:
       interval: weekly

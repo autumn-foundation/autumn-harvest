@@ -9,12 +9,14 @@
 # script also writes to the alert issue:
 #
 # - A failed scan opens the alert issue, or comments on the open one. The body
-#   lists each RUSTSEC id and quotes the tail of the scan output.
+#   lists each RUSTSEC id in the output and quotes the tail of the output.
 # - A clean scan closes the open alert issue.
 #
-# `advisory-scan.sh setup-failed` reports a run that failed before the scan.
-# GitHub tells only the last editor of a cron about a failed scheduled run, so
-# that run is otherwise silent.
+# After it writes the alert or the clean result, the script sets the step
+# output `reported=true`. Any other red run has no report.
+# `advisory-scan.sh run-failed` reports such a run. GitHub tells only the last
+# editor of a cron about a failed scheduled run, so that run is otherwise
+# silent.
 #
 # A failed `gh` call stops the script with a non-zero exit. An API error then
 # never reads as "no open alert".
@@ -35,10 +37,13 @@ max_quote=60000
 
 # Prints the number of the open issue with title $1, or nothing. It reads
 # every page of the REST listing, because the search index can lag a
-# just-opened issue. The listing also holds pull requests, so jq drops them
-# and keeps only an exact title match.
+# just-opened issue. Only issues that this workflow opened count, so an issue
+# that a person opens with the same title is not commented on or closed. The
+# listing also holds pull requests, so jq drops them and keeps only an exact
+# title match.
 open_issue_titled() {
   gh api --paginate -X GET "repos/${repo}/issues" -f state=open -f per_page=100 \
+    -f "creator=github-actions[bot]" \
     | jq -rs --arg title "$1" \
       '(add // []) | map(select(.pull_request == null and .title == $title))
        | .[0].number // empty'
@@ -57,13 +62,28 @@ post_alert() {
   fi
 }
 
+# Sets the step output that tells the workflow this run has reported.
+mark_reported() {
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "reported=true" >>"$GITHUB_OUTPUT"
+  fi
+}
+
+case "${1:-}" in
+  "" | run-failed) ;;
+  *)
+    echo "advisory-scan: unknown argument: $1" >&2
+    exit 2
+    ;;
+esac
+
 body="$(mktemp)"
 log="$(mktemp)"
 trap 'rm -f "$body" "$log"' EXIT
 
-if [ "${1:-}" = setup-failed ]; then
+if [ "${1:-}" = run-failed ]; then
   cat >"$body" <<EOF
-The advisory scan failed before \`cargo deny\` ran: ${run_url}
+The advisory scan failed before it reported a result: ${run_url}
 
 Until it is fixed, nothing checks for new RUSTSEC advisories.
 
@@ -88,6 +108,7 @@ if [ "$status" -eq 0 ]; then
       --comment "A later scan found no advisory: ${run_url}"
     echo "advisory-scan: closed #${issue}"
   fi
+  mark_reported
   exit 0
 fi
 
@@ -95,7 +116,7 @@ ids="$({ grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$log" || true; } | sort -u | past
 {
   echo "\`cargo deny check advisories\` failed with exit code ${status}: ${run_url}"
   echo
-  echo "Advisories: ${ids:-none named. Read the output below.}"
+  echo "RUSTSEC ids in the output: ${ids:-none. Read the output below.}"
   echo
   echo "Fix each finding, or add a reasoned \`ignore\` entry to \`deny.toml\`."
   echo
@@ -106,4 +127,5 @@ ids="$({ grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$log" || true; } | sort -u | past
   echo "$footer"
 } >"$body"
 post_alert "$body"
+mark_reported
 exit "$status"

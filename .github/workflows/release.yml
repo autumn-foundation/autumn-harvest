@@ -8,13 +8,18 @@
 #   for the same package and target. It holds no write or OIDC permission,
 #   because the build runs third-party `build.rs` code.
 # - `sign` signs each archive and SBOM with Sigstore keyless signing, then
-#   verifies each bundle against this workflow's identity. It attests build
-#   provenance and the SBOM with GitHub artifact attestations. It runs no
-#   repository code.
+#   verifies each bundle against this workflow's identity. On a tag push it
+#   also attests build provenance and the SBOM with GitHub artifact
+#   attestations. It runs no repository code.
+# - `client` builds the TypeScript client with read-only permissions, because
+#   `npm` runs third-party install scripts.
 # - `release` runs on a tag push only. It publishes the signed files.
 #
 # A manual run or a pull request that changes this file is a dry run. It runs
-# `binaries` and `sign`, and keeps the result as a workflow artifact.
+# `binaries` and `sign`, and keeps the result as a workflow artifact. A dry run
+# writes no attestation. `gh attestation verify --repo` accepts any workflow
+# run of this repository, so a dry-run attestation would verify like a
+# release.
 name: Release
 
 on:
@@ -23,6 +28,8 @@ on:
       - "v[0-9]+.*"
   workflow_dispatch:
   pull_request:
+    # `ready_for_review` runs the dry run that a draft skipped.
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [trunk, trunk-dev]
     paths:
       - .github/workflows/release.yml
@@ -59,6 +66,8 @@ jobs:
 
   meta:
     name: Release version
+    # A draft pull request does not run the three release builds.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -134,7 +143,7 @@ jobs:
             "target/${TARGET}/release/harvest-replay${ext}" \
             README.md "dist/${NAME}/"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
-          rm -rf "dist/${NAME}"
+          rm -rf "dist/${NAME:?}"
       # The SBOM describes the package, features and target of the build.
       # `cargo cyclonedx` writes one file per workspace member. Keep the CLI
       # file only.
@@ -158,9 +167,19 @@ jobs:
 
   sign:
     name: Sign and attest (${{ matrix.target }})
-    needs: [meta, binaries]
-    # A fork pull request gets no OIDC token, so it cannot sign.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # On a tag push, a failed `validate` stops signing, so no Rekor entry or
+    # attestation names a release that never ships. A dry run skips
+    # `validate`.
+    needs: [meta, binaries, validate]
+    # A fork pull request gets no OIDC token, so it cannot sign. A Dependabot
+    # pull request gets a read-only token, so it skips signing too.
+    if: >-
+      !cancelled() &&
+      needs.binaries.result == 'success' &&
+      (needs.validate.result == 'success' || needs.validate.result == 'skipped') &&
+      (github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -206,10 +225,13 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               "$file"
           done
+      # Tag push only. See the header for why a dry run writes no attestation.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: github.event_name == 'push'
         with:
           subject-path: dist/${{ env.NAME }}.tar.gz
-      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: github.event_name == 'push'
         with:
           subject-path: dist/${{ env.NAME }}.tar.gz
           sbom-path: dist/${{ env.NAME }}.cdx.json
@@ -219,9 +241,53 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # Issue #1616. Build the client before the release exists, so a broken
+  # client stops the release. The package version must equal the tag.
+  client:
+    name: Build the TypeScript client
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      tarball: ${{ steps.client.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - name: Build the TypeScript client
+        id: client
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version clients/typescript/package.json)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::clients/typescript/package.json is ${version}, the tag is ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          # The script logs to stderr. Its stdout is the tarball path only.
+          tarball="$(scripts/build-typescript-client.sh)"
+          if [ "$(basename "${tarball}")" != "autumn-harvest-client-${version}.tgz" ]; then
+            echo "::error::the client packed as $(basename "${tarball}"), not autumn-harvest-client-${version}.tgz"
+            exit 1
+          fi
+          mkdir -p client-dist
+          cp "${tarball}" client-dist/
+          echo "tarball=$(basename "${tarball}")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: typescript-client
+          path: client-dist/${{ steps.client.outputs.tarball }}
+          if-no-files-found: error
+
+  # The only job with `contents: write`. It runs no npm and no build, and its
+  # checkout keeps no credentials on disk.
   release:
     name: Create GitHub Release
-    needs: [meta, validate, sign]
+    needs: [meta, validate, sign, client]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -230,6 +296,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install git-cliff
         uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
@@ -247,27 +314,10 @@ jobs:
         run: |
           git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
           perl -0pi -e 's/\n+\z/\n/' RELEASE_NOTES.md
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          node-version: "22"
-      # Issue #1616. Build the client before the release exists, so a broken
-      # client stops the release. The package version must equal the tag.
-      - name: Build the TypeScript client
-        id: client
-        run: |
-          set -euo pipefail
-          version="$(jq -r .version clients/typescript/package.json)"
-          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
-            echo "::error::clients/typescript/package.json is ${version}, the tag is ${GITHUB_REF_NAME}"
-            exit 1
-          fi
-          # The script logs to stderr. Its stdout is the tarball path only.
-          tarball="$(scripts/build-typescript-client.sh)"
-          if [ "$(basename "${tarball}")" != "autumn-harvest-client-${version}.tgz" ]; then
-            echo "::error::the client packed as $(basename "${tarball}"), not autumn-harvest-client-${version}.tgz"
-            exit 1
-          fi
-          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          name: typescript-client
+          path: client-dist
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: signed-*
@@ -279,7 +329,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
-            ${{ steps.client.outputs.tarball }}
+            client-dist/${{ needs.client.outputs.tarball }}
             dist/*.tar.gz
             dist/*.cdx.json
             dist/*.sigstore.json

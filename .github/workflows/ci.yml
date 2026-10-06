@@ -718,7 +718,8 @@ jobs:
 
       # Supply-chain pin lint (issue #1826, docs/audits/action-sha-pin.py).
       # A tag or branch ref can move to new code. Each `uses:` must pin a
-      # commit SHA with a `# <tag>` comment. The self-test runs first.
+      # commit SHA with a `# <tag>` comment. The self-test runs first. Runs
+      # after the PyYAML install above, because the script parses YAML.
       - name: Action SHA pins (docs/audits/action-sha-pin.py)
         run: |
           python3 docs/audits/action-sha-pin.py --self-test

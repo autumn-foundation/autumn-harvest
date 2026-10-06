@@ -11,8 +11,9 @@
 //!   signature and GitHub artifact attestations.
 //!
 //! The scan behaviour tests run `.github/ci/advisory-scan.sh` with a stub
-//! `cargo` and a stub `gh` first on `PATH`. They run on Linux only, as the
-//! chaos watchdog tests do.
+//! `cargo` and a stub `gh` first on `PATH`. The script reads the stub JSON
+//! with the real `jq`, so the tests also check its filters. They run on Linux
+//! only, as the chaos watchdog tests do.
 
 use super::ci_run_coverage::{parse_workflow, repo_root, workflow_crons, workflow_run_commands};
 use serde_yaml::Value;
@@ -162,7 +163,8 @@ fn advisory_scan_has_least_privilege() {
 }
 
 /// The scan step runs the script. It alerts on the cron run only, so a pull
-/// request run never opens an issue.
+/// request run never opens an issue. A pull request run gets no token, so
+/// its script cannot write one either.
 #[test]
 fn advisory_scan_alerts_on_scheduled_runs_only() {
     let doc = parse_workflow(SCAN_WORKFLOW);
@@ -181,6 +183,14 @@ fn advisory_scan_alerts_on_scheduled_runs_only() {
         alert, "${{ github.event_name == 'schedule' }}",
         "the scan step must set ADVISORY_ALERT from the event name"
     );
+    let token = scan
+        .get("env")
+        .and_then(|e| text(e, "GH_TOKEN"))
+        .unwrap_or_default();
+    assert_eq!(
+        token, "${{ github.event_name == 'schedule' && github.token || '' }}",
+        "only a scheduled run may hand the script a token"
+    );
     assert_eq!(
         text(scan, "id"),
         Some("scan"),
@@ -188,10 +198,12 @@ fn advisory_scan_alerts_on_scheduled_runs_only() {
     );
 }
 
-/// A failed setup step stops the scan before the script runs. The script
-/// then reports nothing, so a final step must report it.
+/// A red run that the script did not report must still reach the issue. That
+/// covers a failed setup step, a step timeout and a lost `gh` call. A step
+/// timeout is a step failure, so `steps.scan.outcome` cannot tell these apart
+/// from a reported finding. The script's `reported` output can.
 #[test]
-fn advisory_scan_reports_a_failed_setup() {
+fn advisory_scan_reports_an_unreported_failure() {
     let doc = parse_workflow(SCAN_WORKFLOW);
     let steps = job_steps(&doc, SCAN_WORKFLOW, "scan");
     let reports = steps.iter().any(|step| {
@@ -199,14 +211,14 @@ fn advisory_scan_reports_a_failed_setup() {
         let run = text(step, "run").unwrap_or_default();
         cond.contains("failure()")
             && cond.contains("github.event_name == 'schedule'")
-            && cond.contains("steps.scan.outcome != 'failure'")
+            && cond.contains("steps.scan.outputs.reported != 'true'")
             && run.contains(SCAN_SCRIPT)
-            && run.contains("setup-failed")
+            && run.contains("run-failed")
     });
     assert!(
         reports,
         "{SCAN_WORKFLOW} must have an `if: failure()` step for scheduled runs that runs \
-         `{SCAN_SCRIPT} setup-failed` when the scan step itself did not fail"
+         `{SCAN_SCRIPT} run-failed` when the scan step did not report"
     );
 }
 
@@ -273,6 +285,8 @@ struct Stub {
     alert: bool,
     /// The script argument, if any.
     arg: Option<&'static str>,
+    /// When true, each `gh issue` write fails as an API error does.
+    write_fails: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -293,6 +307,7 @@ impl Stub {
             issues: Some("[]".to_string()),
             alert: true,
             arg: None,
+            write_fails: false,
         }
     }
 
@@ -314,6 +329,8 @@ struct Outcome {
     cargo: Vec<String>,
     /// The last `--body-file` content passed to `gh`.
     body: String,
+    /// The step outputs that the script wrote to `GITHUB_OUTPUT`.
+    outputs: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -326,6 +343,11 @@ impl Outcome {
         ["issue create", "issue comment", "issue close"]
             .iter()
             .any(|p| self.called(p))
+    }
+
+    /// True when the script told the workflow that it reported this run.
+    fn reported(&self) -> bool {
+        self.outputs.lines().any(|l| l == "reported=true")
     }
 }
 
@@ -366,6 +388,7 @@ if [ "$1" = api ]; then
   if [ "$STUB_ISSUES_FAIL" = 1 ]; then echo "HTTP 502" >&2; exit 1; fi
   printf '%s\n' "$STUB_ISSUES"
 fi
+if [ "$1" = issue ] && [ "$STUB_WRITE_FAIL" = 1 ]; then echo "HTTP 502" >&2; exit 1; fi
 "#,
     );
 
@@ -392,6 +415,8 @@ fi
             "STUB_ISSUES_FAIL",
             if stub.issues.is_none() { "1" } else { "0" },
         )
+        .env("STUB_WRITE_FAIL", if stub.write_fails { "1" } else { "0" })
+        .env("GITHUB_OUTPUT", dir.path().join("outputs.txt"))
         .output()
         .expect("run bash");
     let lines = |name: &str| -> Vec<String> {
@@ -407,6 +432,7 @@ fi
         gh: lines("gh.log"),
         cargo: lines("cargo.log"),
         body: std::fs::read_to_string(dir.path().join("body.txt")).unwrap_or_default(),
+        outputs: std::fs::read_to_string(dir.path().join("outputs.txt")).unwrap_or_default(),
     }
 }
 
@@ -434,6 +460,43 @@ fn scan_is_silent_when_clean_and_no_alert_is_open() {
     let out = run_scan(&Stub::scheduled(0));
     assert_eq!(out.code, Some(0), "gh: {:?}", out.gh);
     assert!(!out.wrote_an_issue(), "gh: {:?}", out.gh);
+    assert!(out.reported(), "outputs: {:?}", out.outputs);
+}
+
+/// The lookup reads every page and counts only issues that this workflow
+/// opened. A person can open an issue with the same title, and the script
+/// must not comment on it or close it.
+#[cfg(target_os = "linux")]
+#[test]
+fn scan_looks_up_only_its_own_open_issues() {
+    let out = run_scan(&Stub::scheduled(1));
+    let api = out
+        .gh
+        .iter()
+        .find(|c| c.starts_with("api "))
+        .unwrap_or_else(|| panic!("no issue lookup; gh: {:?}", out.gh));
+    for needle in [
+        "--paginate",
+        "repos/owner/repo/issues",
+        "state=open",
+        "creator=github-actions[bot]",
+    ] {
+        assert!(api.contains(needle), "lookup lacks {needle:?}: {api}");
+    }
+}
+
+/// The issue listing also holds pull requests. A pull request with the alert
+/// title is not the alert.
+#[cfg(target_os = "linux")]
+#[test]
+fn scan_ignores_a_pull_request_with_the_alert_title() {
+    let mut stub = Stub::scheduled(1);
+    stub.issues = Some(format!(
+        r#"[{{"number":9,"title":"{ALERT_TITLE}","pull_request":{{}}}}]"#
+    ));
+    let out = run_scan(&stub);
+    assert!(out.called("issue create"), "gh: {:?}", out.gh);
+    assert!(!out.called("issue comment 9"), "gh: {:?}", out.gh);
 }
 
 /// A stale open alert would teach people to ignore the next one.
@@ -442,7 +505,16 @@ fn scan_is_silent_when_clean_and_no_alert_is_open() {
 fn scan_closes_the_open_alert_after_a_clean_run() {
     let out = run_scan(&Stub::scheduled(0).with_issue(31, ALERT_TITLE));
     assert_eq!(out.code, Some(0), "gh: {:?}", out.gh);
-    assert!(out.called("issue close 31"), "gh: {:?}", out.gh);
+    let close = out
+        .gh
+        .iter()
+        .find(|c| c.starts_with("issue close 31"))
+        .unwrap_or_else(|| panic!("no close; gh: {:?}", out.gh));
+    assert!(
+        close.contains("actions/runs/4242"),
+        "link the clean run: {close}"
+    );
+    assert!(out.reported(), "outputs: {:?}", out.outputs);
 }
 
 /// A finding opens an issue that names each advisory once and links the run.
@@ -469,6 +541,7 @@ fn scan_opens_an_issue_for_a_finding() {
         "the body must quote the scan: {}",
         out.body
     );
+    assert!(out.reported(), "outputs: {:?}", out.outputs);
 }
 
 /// A second finding goes on the open issue, so one problem gives one issue.
@@ -519,7 +592,43 @@ fn scan_fails_closed_when_the_issue_query_fails() {
         let out = run_scan(&stub);
         assert_ne!(out.code, Some(0), "gh: {:?}", out.gh);
         assert!(!out.wrote_an_issue(), "gh: {:?}", out.gh);
+        assert!(!out.reported(), "a lost lookup is not a report");
     }
+}
+
+/// A failed issue write must turn the run red and leave `reported` unset.
+/// The workflow's report step then tries again.
+#[cfg(target_os = "linux")]
+#[test]
+fn scan_fails_closed_when_an_issue_write_fails() {
+    let cases = [
+        ("create", Stub::scheduled(1)),
+        ("comment", Stub::scheduled(1).with_issue(31, ALERT_TITLE)),
+        ("close", Stub::scheduled(0).with_issue(31, ALERT_TITLE)),
+    ];
+    for (write, mut stub) in cases {
+        stub.write_fails = true;
+        let out = run_scan(&stub);
+        assert_ne!(out.code, Some(0), "{write}: gh: {:?}", out.gh);
+        assert!(
+            out.called(&format!("issue {write}")),
+            "{write}: gh: {:?}",
+            out.gh
+        );
+        assert!(!out.reported(), "{write}: a lost write is not a report");
+    }
+}
+
+/// A typo in the mode must not run a full scan in its place.
+#[cfg(target_os = "linux")]
+#[test]
+fn scan_rejects_an_unknown_argument() {
+    let mut stub = Stub::scheduled(0);
+    stub.arg = Some("run-faild");
+    let out = run_scan(&stub);
+    assert_eq!(out.code, Some(2), "gh: {:?}", out.gh);
+    assert!(out.cargo.is_empty(), "no scan: {:?}", out.cargo);
+    assert!(out.gh.is_empty(), "no gh call: {:?}", out.gh);
 }
 
 /// GitHub caps an issue body at 65536 characters. The script quotes the tail
@@ -542,25 +651,25 @@ fn scan_truncates_a_long_report() {
     );
 }
 
-/// In `setup-failed` mode the script reports a red run on the alert issue.
-/// It does not scan, because the setup that failed installs the scanner.
+/// In `run-failed` mode the script reports a red run on the alert issue.
+/// It does not scan, because the scan or its setup is what failed.
 #[cfg(target_os = "linux")]
 #[test]
-fn scan_setup_failed_mode_reports_the_run() {
+fn scan_run_failed_mode_reports_the_run() {
     let mut stub = Stub::scheduled(0);
-    stub.arg = Some("setup-failed");
+    stub.arg = Some("run-failed");
     let out = run_scan(&stub);
     assert_eq!(out.code, Some(0), "gh: {:?}", out.gh);
     assert!(
         out.cargo.is_empty(),
-        "no scan in setup-failed mode: {:?}",
+        "no scan in run-failed mode: {:?}",
         out.cargo
     );
     assert!(out.called("issue create"), "gh: {:?}", out.gh);
     assert!(out.body.contains("actions/runs/4242"), "{}", out.body);
 
     let out = run_scan(&Stub {
-        arg: Some("setup-failed"),
+        arg: Some("run-failed"),
         ..Stub::scheduled(0).with_issue(31, ALERT_TITLE)
     });
     assert!(out.called("issue comment 31"), "gh: {:?}", out.gh);
@@ -656,10 +765,6 @@ fn dependabot_watches_cargo_and_actions_on_trunk_dev() {
     assert!(
         cargo.contains(&"/".to_string()),
         "cargo must watch `/`: {cargo:?}"
-    );
-    assert!(
-        cargo.contains(&"/fuzz".to_string()),
-        "cargo must watch `/fuzz`, its own workspace: {cargo:?}"
     );
     let actions = dirs_of("github-actions");
     assert!(
@@ -760,7 +865,9 @@ fn release_builds_auditable_binaries_and_an_sbom() {
 }
 
 /// Signing is keyless and verified in the same job. Provenance and the SBOM
-/// are attested against the archive digest.
+/// are attested against the archive digest, on a tag push only.
+/// `gh attestation verify --repo` accepts any run of this repository, so a
+/// dry-run attestation would verify like a release.
 #[test]
 fn release_signs_verifies_and_attests_each_archive() {
     let doc = parse_workflow(RELEASE_WORKFLOW);
@@ -778,18 +885,39 @@ fn release_signs_verifies_and_attests_each_archive() {
         "sign must cover every built target"
     );
     let cond = text(sign, "if").unwrap_or_default();
-    assert!(
-        cond.contains("github.event.pull_request.head.repo.full_name == github.repository"),
-        "a fork pull request has no OIDC token, so sign must skip it: {cond}"
-    );
+    for needle in [
+        "github.event.pull_request.head.repo.full_name == github.repository",
+        "github.actor != 'dependabot[bot]'",
+        "needs.validate.result == 'success'",
+    ] {
+        assert!(
+            cond.contains(needle),
+            "sign must gate on `{needle}`: {cond}"
+        );
+    }
     let steps = job_steps(&doc, RELEASE_WORKFLOW, "sign");
     assert!(steps.iter().any(|s| uses(s, "sigstore/cosign-installer")));
-    assert!(
-        steps
+    for action in ["actions/attest-build-provenance", "actions/attest"] {
+        let step = steps
             .iter()
-            .any(|s| uses(s, "actions/attest-build-provenance"))
+            .find(|s| uses(s, action))
+            .unwrap_or_else(|| panic!("sign must use {action}"));
+        assert_eq!(
+            text(step, "if"),
+            Some("github.event_name == 'push'"),
+            "{action} must run on a tag push only"
+        );
+    }
+    let sbom = steps
+        .iter()
+        .find(|s| uses(s, "actions/attest"))
+        .expect("attest");
+    assert!(
+        sbom.get("with")
+            .and_then(|w| text(w, "sbom-path"))
+            .is_some(),
+        "actions/attest must attest the SBOM"
     );
-    assert!(steps.iter().any(|s| uses(s, "actions/attest-sbom")));
     let joined: String = steps
         .iter()
         .filter_map(|s| text(s, "run"))
@@ -826,12 +954,33 @@ fn release_publishes_only_on_a_tag_push() {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
-    for need in ["validate", "sign"] {
+    for need in ["validate", "sign", "client"] {
         assert!(
             needs.contains(&need),
             "release must need `{need}`: {needs:?}"
         );
     }
+    let checkout = job_steps(&doc, RELEASE_WORKFLOW, "release")
+        .iter()
+        .find(|s| uses(s, "actions/checkout"))
+        .expect("a checkout step");
+    assert_eq!(
+        checkout
+            .get("with")
+            .and_then(|w| w.get("persist-credentials"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "the `contents: write` token must not stay in .git/config"
+    );
+    let runs = job_steps(&doc, RELEASE_WORKFLOW, "release")
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !runs.contains("npm") && !runs.contains("build-typescript-client"),
+        "the job with `contents: write` must not run npm"
+    );
     let publish = job_steps(&doc, RELEASE_WORKFLOW, "release")
         .iter()
         .find(|s| uses(s, "softprops/action-gh-release"))
@@ -846,4 +995,25 @@ fn release_publishes_only_on_a_tag_push() {
             "the release must ship `{needle}`: {files}"
         );
     }
+}
+
+/// `npm` runs third-party install scripts, so the client builds in a job
+/// that cannot write the repository.
+#[test]
+fn release_builds_the_client_without_a_write_token() {
+    let doc = parse_workflow(RELEASE_WORKFLOW);
+    let client = job(&doc, RELEASE_WORKFLOW, "client");
+    assert_eq!(permission(client, "contents"), Some("read"));
+    for key in ["id-token", "attestations"] {
+        assert_eq!(permission(client, key), None, "client: `{key}`");
+    }
+    let runs = job_steps(&doc, RELEASE_WORKFLOW, "client")
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        runs.contains("scripts/build-typescript-client.sh"),
+        "{runs}"
+    );
 }

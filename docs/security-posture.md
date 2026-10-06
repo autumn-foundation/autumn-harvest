@@ -866,6 +866,9 @@ Each release archive ships with a CycloneDX SBOM (`.cdx.json`) and a Sigstore
 bundle (`.sigstore.json`) for each file. The binaries are built with
 `cargo auditable`, so each binary holds its own dependency list.
 
+The bundles are the trust anchor. `SHA256SUMS` is not signed. Use it only to
+check a download for damage.
+
 Verify the signature. Replace the version in each name:
 
 ```sh
@@ -876,21 +879,30 @@ cosign verify-blob \
   harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-Verify the build provenance and the SBOM attestation:
+Verify the build provenance and the SBOM attestation. Always pass the tag
+and the workflow. `--repo` alone accepts an attestation from any workflow
+run of this repository.
 
 ```sh
 gh attestation verify harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz \
-  --repo autumn-foundation/autumn-harvest
+  --repo autumn-foundation/autumn-harvest \
+  --source-ref refs/tags/v0.8.0 \
+  --signer-workflow autumn-foundation/autumn-harvest/.github/workflows/release.yml
 gh attestation verify harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo autumn-foundation/autumn-harvest \
+  --source-ref refs/tags/v0.8.0 \
+  --signer-workflow autumn-foundation/autumn-harvest/.github/workflows/release.yml \
   --predicate-type https://cyclonedx.org/bom
 ```
 
 Scan an extracted binary for advisories with `cargo audit bin <path>`.
 
 A manual run of the Release workflow is a dry run. So is a pull request that
-changes `release.yml`. A dry run builds, signs and attests, but publishes
-nothing. Its files are in the `signed-<target>` workflow artifacts.
+changes `release.yml`. A dry run builds, writes the SBOM and signs, but
+writes no attestation and publishes nothing. Its files are in the
+`signed-<target>` workflow artifacts. A fork or Dependabot pull request gets
+no OIDC token, so its dry run does not sign. It keeps the `unsigned-<target>`
+artifacts only.
 
 ## Production-readiness checklist
 
