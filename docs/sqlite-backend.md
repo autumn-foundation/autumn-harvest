@@ -393,7 +393,7 @@ second runtime in the same process.
 - A read-only inspector connection still works. It never touches the lock.
 - A private in-memory database (`:memory:`, `file::memory:`) takes no lock. A
   named in-memory URI, such as `file:name?mode=memory&cache=shared` or
-  `file:/name?vfs=memdb`, takes an in-process lock on its decoded name and VFS.
+  `file:/name?vfs=memdb`, takes an in-process lock on its decoded name.
   Other connections in the process can open it. The rule fails closed: any
   named URI takes the lock.
 

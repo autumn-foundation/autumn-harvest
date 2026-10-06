@@ -334,3 +334,16 @@ fn a_memdb_vfs_database_takes_the_lock() {
     let _a = SqliteRuntime::open("file::memory:").unwrap();
     let _b = SqliteRuntime::open("file::memory:").unwrap();
 }
+
+/// Naming the default VFS explicitly opens the same database. The lock key
+/// therefore ignores the VFS.
+#[cfg(unix)]
+#[test]
+fn an_explicit_default_vfs_shares_the_lock() {
+    let _first = SqliteRuntime::open("file:memv_1834?mode=memory&cache=shared").unwrap();
+
+    let err = SqliteRuntime::open("file:memv_1834?mode=memory&cache=shared&vfs=unix")
+        .err()
+        .expect("the default VFS named explicitly is the same database");
+    assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
+}

@@ -47,7 +47,7 @@ const LOCK_ATTEMPTS: u32 = 5;
 const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// The named in-memory databases that a runtime in this process holds, keyed
-/// by VFS and decoded name.
+/// by decoded name.
 ///
 /// `SQLite` reports no file for such a database, so no OS lock applies. Every
 /// connection in the process can still open it, so this set stands in.
@@ -140,7 +140,7 @@ pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<Write
 ///
 /// The rule fails closed. Several URI forms share one database by name, for
 /// example `cache=shared` or `vfs=memdb`. So every `file:` URI takes the lock,
-/// keyed by its decoded name and VFS. Only an empty or `:memory:` name without
+/// keyed by its decoded name. Only an empty or `:memory:` name without
 /// `cache=shared` is provably private and takes none. Two runtimes on one
 /// private named URI in one process therefore conflict. That is safe.
 fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
@@ -170,22 +170,19 @@ fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
     if !cache_shared && (name.is_empty() || name == ":memory:") {
         return Ok(None);
     }
-    let vfs = params
-        .iter()
-        .rev()
-        .find(|(key, _)| key == "vfs")
-        .map_or("", |(_, value)| value.as_str());
-    let key = format!("{vfs}\0{name}");
+    // The key is the name alone. A VFS has several spellings, such as an
+    // omitted default and `vfs=unix`. One name under two VFSes then conflicts,
+    // which is safe.
     let inserted = SHARED_MEMORY
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(key.clone());
+        .insert(name.clone());
     if !inserted {
         return Err(SqliteError::DatabaseLocked {
             path: requested.to_path_buf(),
         });
     }
-    Ok(Some(WriterLock::SharedMemory(key)))
+    Ok(Some(WriterLock::SharedMemory(name)))
 }
 
 /// Decode `%HH` escapes as `SQLite` does for a URI path. A malformed escape
