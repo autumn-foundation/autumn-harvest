@@ -214,7 +214,8 @@ moment — none of them is aware of, or adjusts, the others:
   activity type. The cap follows the handler latency and the retryable
   failures, not the permit wait. Use it when a dependency is the
   bottleneck. The tuner grows on waits, and more calls then only add
-  latency. See [design decision 12](../architecture.md#key-design-decisions).
+  latency. See [design decision 12](../architecture.md#key-design-decisions)
+  and [the adaptive-limit runbook](../runbooks/activity-concurrency-limit.md).
 
 ## Scope and cadence
 
