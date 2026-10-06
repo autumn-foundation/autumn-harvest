@@ -985,19 +985,14 @@ async fn warm_decisions_resume_the_resident_workflow() {
     let history = store::load_history(&mut conn, exec_id)
         .await
         .expect("load history");
-    // A decision boundary (issue #1833) follows the terminal.
-    let terminal = history
-        .events
-        .iter()
-        .rev()
-        .find(|e| !e.is_decision_boundary());
     assert!(
         matches!(
-            terminal,
+            history.events.last(),
             Some(WorkflowEvent::WorkflowCompleted { output })
                 if *output == serde_json::json!([{ "step": 1 }, "one", "two"])
         ),
-        "the resident run must complete with the right output: {terminal:?}",
+        "the resident run must complete with the right output: {:?}",
+        history.events.last()
     );
 
     worker.shutdown();

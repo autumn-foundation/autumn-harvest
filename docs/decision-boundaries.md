@@ -93,25 +93,29 @@ recording from before the upgrade compares clean with the same run after it.
 
 ## Rollout
 
-Boundaries are on by default. A process older than this release cannot
-decode a boundary, so the default is a breaking change for a rolling upgrade.
-An old worker fails the execution. An old timeout leader cannot enforce its
-activity timeouts. An old API node or CLI cannot show, export or cancel it.
-See [the upgrade guide](upgrading/0.8.0.md#11-each-decision-records-a-boundary-event--breaking-default).
+Boundaries are off by default in this release. A process of the previous
+release cannot decode a boundary. The [rolling-deploy
+contract](upgrading/README.md) forbids writing a new event variant by
+default, so a later release turns them on.
 
-During a rolling upgrade, turn boundaries off on the new workers:
+Turn boundaries on when every process that reads history runs this
+release:
 
 ```rust
 let harvest = HarvestBuilder::new()
-    .record_decision_boundaries(false)
+    .record_decision_boundaries(true)
     // ... the rest of your configuration
     .build();
 ```
 
-When every process that reads history runs this release, remove the call.
-
 `WorkflowHistoryPolicy::with_decision_boundaries` sets the same switch on a
 `HandlerRegistry`.
+
+After a worker writes a boundary, an older process fails on that history.
+An old worker fails the execution. An old timeout leader cannot enforce its
+activity timeouts. An old API node or CLI cannot show, export or cancel it.
+So do not roll back past this release after you turn boundaries on. See
+[the upgrade guide](upgrading/0.8.0.md#11-decision-boundaries-are-opt-in).
 
 ## Storage overhead
 

@@ -23,7 +23,6 @@ use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, enqueue_started_workflow_task,
     insert_workflow_execution, load_child_executions_from_url, load_history_from_url,
     setup_test_database_url_or_env, spawn_test_worker, wait_for_execution_state,
-    without_boundaries,
 };
 
 /// Parent workflow: spawns a child and folds its own (absent) parent id plus the
@@ -189,17 +188,9 @@ async fn worker_threads_parent_execution_id_into_child_ctx_info() {
     );
 
     // Sanity: no unexpected events; ctx.info() left no footprint.
-    // Decision boundaries (issue #1833) are attribution, not footprint. The
-    // parent makes two decisions, so it holds exactly two.
     let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
-    let boundaries = parent_history
-        .events
-        .iter()
-        .filter(|e| e.is_decision_boundary())
-        .count();
-    assert_eq!(boundaries, 2, "{:?}", parent_history.events);
     assert!(matches!(
-        without_boundaries(&parent_history.events).as_slice(),
+        parent_history.events.as_slice(),
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ChildWorkflowStarted { .. },
@@ -213,7 +204,7 @@ async fn worker_threads_parent_execution_id_into_child_ctx_info() {
     )
     .await;
     assert!(matches!(
-        without_boundaries(&child_history.events).as_slice(),
+        child_history.events.as_slice(),
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::WorkflowCompleted { .. },

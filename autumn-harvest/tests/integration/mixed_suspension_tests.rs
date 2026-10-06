@@ -911,8 +911,7 @@ async fn three_way_activity_timer_signal_mixed_batch() {
         history.events
     );
     // AC3: zero new event variants — the whole three-way batch composes only
-    // events that already existed before this issue. The decision boundary
-    // of issue #1833 closes each decision and is not part of the batch.
+    // events that already existed before this issue.
     assert!(
         history.events.iter().all(|e| matches!(
             e,
@@ -925,7 +924,6 @@ async fn three_way_activity_timer_signal_mixed_batch() {
                 | WorkflowEvent::TimerFired { .. }
                 | WorkflowEvent::SignalReceived { .. }
                 | WorkflowEvent::WorkflowCompleted { .. }
-                | WorkflowEvent::DecisionCommitted { .. }
         )),
         "the mixed batch must compose only pre-existing event variants: {:?}",
         history.events

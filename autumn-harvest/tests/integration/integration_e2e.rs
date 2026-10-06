@@ -532,16 +532,6 @@ async fn load_task_from_url(database_url: &str, task_id: Uuid) -> TaskQueueItem 
         .expect("failed to reload task queue row")
 }
 
-/// The events of a live history without its decision boundaries
-/// (issue #1833). A shape check reads the workflow events only.
-pub(crate) fn without_boundaries(events: &[WorkflowEvent]) -> Vec<WorkflowEvent> {
-    events
-        .iter()
-        .filter(|event| !event.is_decision_boundary())
-        .cloned()
-        .collect()
-}
-
 pub(crate) async fn load_history_from_url(
     database_url: &str,
     exec_id: ExecutionId,
@@ -2591,7 +2581,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
 
     let history = load_history_from_url(&database_url, exec_id).await;
     assert!(matches!(
-        without_boundaries(&history.events).last(),
+        history.events.last(),
         Some(WorkflowEvent::WorkflowCompleted { output }) if *output == workflow_input
     ));
 
@@ -2738,7 +2728,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 
     let history = load_history_from_url(&database_url, exec_id).await;
     assert!(matches!(
-        without_boundaries(&history.events).last(),
+        history.events.last(),
         Some(WorkflowEvent::WorkflowFailed { error, .. }) if error.contains("workflow exploded")
     ));
 
@@ -2907,7 +2897,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 
     let history = load_history_from_url(&database_url, exec_id).await;
     assert!(matches!(
-        without_boundaries(&history.events).as_slice(),
+        history.events.as_slice(),
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ActivityScheduled { .. },
@@ -3472,7 +3462,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
     // fail the task first, so `ActivityStarted` never appends. Both shapes
     // are correct engine behavior; accept either.
     let history = load_history_from_url(&database_url, exec_id).await;
-    match without_boundaries(&history.events).as_slice() {
+    match history.events.as_slice() {
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ActivityScheduled { .. },
@@ -3637,7 +3627,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
 
     let history = load_history_from_url(&database_url, exec_id).await;
     assert!(matches!(
-        without_boundaries(&history.events).as_slice(),
+        history.events.as_slice(),
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::TimerStarted { .. },
@@ -3847,7 +3837,7 @@ async fn worker_completes_parent_workflow_after_child_workflow_round_trip() {
 
     let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
     assert!(matches!(
-        without_boundaries(&parent_history.events).as_slice(),
+        parent_history.events.as_slice(),
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ChildWorkflowStarted { .. },
@@ -3879,7 +3869,7 @@ async fn worker_completes_parent_workflow_after_child_workflow_round_trip() {
     )
     .await;
     assert!(matches!(
-        without_boundaries(&child_history.events).as_slice(),
+        child_history.events.as_slice(),
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::WorkflowCompleted { .. },
@@ -4035,7 +4025,7 @@ async fn child_continue_as_new_rejection_wakes_parent_with_child_failure() {
     let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
     assert!(
         matches!(
-            without_boundaries(&parent_history.events).as_slice(),
+            parent_history.events.as_slice(),
             [
                 WorkflowEvent::WorkflowStarted { .. },
                 WorkflowEvent::ChildWorkflowStarted { .. },
@@ -4073,7 +4063,7 @@ async fn child_continue_as_new_rejection_wakes_parent_with_child_failure() {
     let child_history = load_history_from_url(&database_url, child_failure.0).await;
     assert!(
         matches!(
-            without_boundaries(&child_history.events).as_slice(),
+            child_history.events.as_slice(),
             [
                 WorkflowEvent::WorkflowStarted { .. },
                 WorkflowEvent::WorkflowFailed { .. },
@@ -4543,7 +4533,7 @@ async fn worker_records_every_dispatched_child_when_the_cycle_fails() {
     );
     assert!(
         matches!(
-            without_boundaries(&parent_history.events).last(),
+            parent_history.events.last(),
             Some(WorkflowEvent::WorkflowFailed { .. })
         ),
         "the terminal failure must still be the last event: {:?}",
@@ -5633,7 +5623,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
     let history = load_history_from_url(&database_url, exec_id).await;
     assert!(
         matches!(
-            without_boundaries(&history.events).as_slice(),
+            history.events.as_slice(),
             [
                 WorkflowEvent::WorkflowStarted { .. },
                 WorkflowEvent::SignalReceived { .. },
@@ -6358,7 +6348,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
     let new_history = load_history_from_url(&database_url, new_exec_id).await;
     assert!(
         matches!(
-            without_boundaries(&new_history.events).as_slice(),
+            new_history.events.as_slice(),
             [
                 WorkflowEvent::WorkflowStarted { .. },
                 WorkflowEvent::WorkflowCompleted { .. },

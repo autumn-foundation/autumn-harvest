@@ -826,13 +826,8 @@ async fn workflow_handler_panic_is_re_dispatched_then_terminal_within_budget() {
 
     // The re-dispatch never appended an intermediate event: history is exactly
     // WorkflowStarted → WorkflowFailed (proves state stayed RUNNING with no
-    // durable footprint from the panicked cycles). The terminal decision then
-    // closes with its one decision boundary (issue #1833).
-    assert!(
-        matches!(history.last(), Some(e) if e.is_decision_boundary()),
-        "the terminal decision must end with its boundary; history={history:?}"
-    );
-    let non_lifecycle: Vec<_> = history[..history.len() - 1]
+    // durable footprint from the panicked cycles).
+    let non_lifecycle: Vec<_> = history
         .iter()
         .filter(|e| {
             !matches!(

@@ -21,13 +21,14 @@ A history now shows which build and which worker made each decision.
   two traces, so a recording without boundaries compares clean with one
   that has them. `TraceDivergence::step_index` counts the compared steps.
   Vantage and the Mermaid diagram label each boundary.
-- **BREAKING DEFAULT:** boundaries are on by default. A process older than
-  this release cannot decode one: an old worker fails the execution, an old
-  timeout leader cannot enforce its activity timeouts, and an old API node or
-  CLI cannot show, export or cancel it.
-  `HarvestBuilder::record_decision_boundaries(false)` and
-  `WorkflowHistoryPolicy::with_decision_boundaries(false)` turn boundaries off
-  until every process that reads history runs this release. See
+- **Opt-in:** boundaries are off by default, as the rolling-deploy
+  contract requires. Every process of this release reads them.
+  `HarvestBuilder::record_decision_boundaries(true)` and
+  `WorkflowHistoryPolicy::with_decision_boundaries(true)` turn them on. Turn
+  them on only when no older process reads history. An older worker fails
+  an execution that holds one, an older timeout leader cannot enforce its
+  activity timeouts, and an older API node or CLI cannot show, export or
+  cancel it. A later release turns boundaries on by default. See
   `docs/upgrading/0.8.0.md` §1.1.
 - **Storage and limits:** each boundary adds about 131 bytes of
   `event_data`. With indexes, it adds about 438 bytes on disk. A boundary
@@ -41,5 +42,5 @@ A history now shows which build and which worker made each decision.
   `resident::tests::a_decision_boundary_in_the_delta_is_skipped`,
   `reset::tests::last_workflow_task_skips_a_decision_boundary_after_the_terminal`,
   `decision_boundary_replay_tests` (pre-#1833 fixture),
-  `decision_boundary_db_tests` (live worker, opt-out, storage measurement),
+  `decision_boundary_db_tests` (live worker, default off, storage measurement),
   `debugger_tests`, `debug_cli` and the Vantage label test.

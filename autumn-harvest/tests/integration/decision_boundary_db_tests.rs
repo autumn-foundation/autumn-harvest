@@ -259,6 +259,11 @@ impl Running {
     }
 }
 
+/// The default history policy with boundaries turned on.
+fn boundaries_on() -> WorkflowHistoryPolicy {
+    WorkflowHistoryPolicy::default().with_decision_boundaries(true)
+}
+
 /// A queue name no earlier run used. A shared database can keep old rows.
 fn unique(label: &str) -> String {
     format!("q1833-{label}-{}", Uuid::new_v4().simple())
@@ -406,8 +411,7 @@ async fn completed_two_steps(
 async fn each_decision_ends_with_one_boundary_naming_build_and_worker() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
-    let (_, events, worker_id) =
-        completed_two_steps(&url, &pool, WorkflowHistoryPolicy::default()).await;
+    let (_, events, worker_id) = completed_two_steps(&url, &pool, boundaries_on()).await;
 
     assert_eq!(
         type_names(&events),
@@ -435,7 +439,7 @@ async fn a_wake_that_appends_nothing_records_no_boundary() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
     let queue = unique("signal");
-    let running = Running::start(&queue, &pool, WorkflowHistoryPolicy::default());
+    let running = Running::start(&queue, &pool, boundaries_on());
     let mut conn = connect(&url).await;
     let exec_id = seed(
         &mut conn,
@@ -487,7 +491,7 @@ async fn a_contended_acquire_records_no_boundary_after_a_foreign_write() {
     let pool = build_test_pool(&url);
     let queue = unique("mutex");
     let key = format!("k1833-{}", Uuid::new_v4().simple());
-    let running = Running::start(&queue, &pool, WorkflowHistoryPolicy::default());
+    let running = Running::start(&queue, &pool, boundaries_on());
     let mut conn = connect(&url).await;
     let holder = seed(
         &mut conn,
@@ -530,7 +534,7 @@ async fn a_pause_before_persist_keeps_the_boundary_of_inline_writes() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
     let queue = unique("pause");
-    let running = Running::start(&queue, &pool, WorkflowHistoryPolicy::default());
+    let running = Running::start(&queue, &pool, boundaries_on());
     let worker_id = running.worker_id.clone();
     PAUSE_URL.set(url.clone()).expect("one test sets the URL");
     let mut conn = connect(&url).await;
@@ -556,11 +560,13 @@ async fn a_pause_before_persist_keeps_the_boundary_of_inline_writes() {
 }
 
 #[tokio::test]
-async fn the_opt_out_records_no_boundary() {
+async fn the_default_records_no_boundary() {
+    // Boundaries are opt-in in this release. A process of the previous
+    // release cannot decode one, and the rolling-deploy contract forbids
+    // writing a new event variant by default.
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
-    let policy = WorkflowHistoryPolicy::default().with_decision_boundaries(false);
-    let (_, events, _) = completed_two_steps(&url, &pool, policy).await;
+    let (_, events, _) = completed_two_steps(&url, &pool, WorkflowHistoryPolicy::default()).await;
     assert!(boundaries(&events).is_empty(), "{:?}", type_names(&events));
     assert_eq!(events.len(), 9);
 }
@@ -569,8 +575,7 @@ async fn the_opt_out_records_no_boundary() {
 async fn a_recorded_history_with_boundaries_replays_clean() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
-    let (exec_id, events, _) =
-        completed_two_steps(&url, &pool, WorkflowHistoryPolicy::default()).await;
+    let (exec_id, events, _) = completed_two_steps(&url, &pool, boundaries_on()).await;
     assert_eq!(boundaries(&events).len(), 3);
 
     let mut conn = connect(&url).await;
@@ -607,7 +612,7 @@ struct SizeRow {
 async fn measure_boundary_storage_overhead() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
-    let (exec_id, _, _) = completed_two_steps(&url, &pool, WorkflowHistoryPolicy::default()).await;
+    let (exec_id, _, _) = completed_two_steps(&url, &pool, boundaries_on()).await;
 
     let mut conn = connect(&url).await;
     let rows: Vec<SizeRow> = diesel::sql_query(
