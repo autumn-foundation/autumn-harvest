@@ -1414,18 +1414,26 @@ async fn run_terminal_task_pass(
 /// fenced shard is reported as failed.
 #[cfg(feature = "db")]
 async fn partition_pass_fence(
-    pool: &crate::worker::DbPool,
+    pools: &ShardedDbPool,
     shard: crate::types::ShardId,
     monitor_task: &RetentionMonitor,
     tick_fenced: bool,
-) -> Option<Option<crate::replication::FencePassGuard>> {
+) -> Option<Vec<crate::replication::FencePassGuard>> {
     // Inside a retention tick, the tick's barrier covers this pass. A second
     // guard here could queue behind a waiting bump and stall it.
     if tick_fenced {
-        return Some(None);
+        return Some(Vec::new());
     }
-    match crate::replication::begin_fenced_pass(pool, shard).await {
-        Ok(guard) => Some(guard),
+    // The pass changes tables that every logical shard on this database
+    // shares, so it guards every pin colocated here too. A single pool names
+    // its shard through the default pin, as `begin_fenced_tick` does.
+    let fence_key = if pools.len() == 1 {
+        crate::types::ShardId::UNENCODED
+    } else {
+        shard
+    };
+    match crate::replication::begin_fenced_group(pools.pool_for(shard), fence_key).await {
+        Ok(guards) => Some(guards),
         Err(error) => {
             tracing::warn!(
                 shard = %shard,
@@ -1535,7 +1543,8 @@ async fn run_partition_maintenance_pass(
         };
         // Held until this shard's pass ends, so a bump cannot commit while
         // the pass writes. See `crate::replication::FencePassGuard`.
-        let Some(fence) = partition_pass_fence(pool, shard, monitor_task, tick_fenced).await else {
+        let Some(fence) = partition_pass_fence(pools, shard, monitor_task, tick_fenced).await
+        else {
             continue;
         };
         // Review finding: a standalone probe used to run here, before
@@ -1591,7 +1600,7 @@ async fn run_partition_maintenance_pass(
         // A lost fence session stops the pass. See
         // `crate::replication::run_fenced_pass`.
         let maintained = crate::replication::run_fenced_pass(
-            fence.as_ref(),
+            &fence,
             crate::partition::maintain_with_progress(
                 &mut conn,
                 now,

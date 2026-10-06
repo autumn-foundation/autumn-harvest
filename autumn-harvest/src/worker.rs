@@ -35148,10 +35148,16 @@ pub fn dr_fence_targets(
                 .collect();
             return Some((targets, *first));
         }
-        let targets: Vec<(crate::types::ShardId, DbPool)> = sp
-            .iter_shards()
-            .map(|(id, pool)| (id, pool.clone()))
+        // Shards in one physical pool group share one pool here, even when
+        // `from_dsns` built a pool per DSN alias. The fence sees them as one
+        // database by pool identity, so a claim checks every pin there
+        // (issue #1823).
+        let mut targets: Vec<(crate::types::ShardId, DbPool)> = sp
+            .pool_groups()
+            .into_iter()
+            .flat_map(|(pool, shards)| shards.into_iter().map(|id| (id, pool.clone())))
             .collect();
+        targets.sort_by_key(|(id, _)| *id);
         if targets.is_empty() {
             return None;
         }

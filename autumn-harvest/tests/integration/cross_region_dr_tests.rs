@@ -3435,6 +3435,85 @@ async fn a_fenced_worker_refuses_to_join_an_unfenced_process() {
     assert!(!FenceRegistry::is_enabled(), "nothing is published");
 }
 
+/// Two DSN aliases of one database are one database to the fence (issue
+/// #1823). `from_dsns` builds a pool per alias, but groups them as one
+/// physical pool. The worker must start twice, and a bump of either shard
+/// must stop a claim on the other.
+#[tokio::test]
+async fn dsn_aliases_of_one_database_are_colocated() {
+    use autumn_harvest::queue::claim_task_on_shard;
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("dsnalias");
+    let sharded = autumn_harvest::shard::ShardedDbPool::from_dsns(
+        [
+            (ShardId::new(0), url.clone()),
+            (ShardId::new(1), url.clone()),
+        ],
+        ShardId::new(0),
+        4,
+    )
+    .expect("two aliases of one database");
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default(),
+    );
+    config.sharded_pool = Some(sharded);
+    let fallback = dr_pool(&url);
+    for start in 0..2 {
+        FenceRegistry::clear();
+        let targets = autumn_harvest::worker::dr_fence_targets(&config, &fallback);
+        let pinned = pin_worker_fence(DrFencing::Enabled, DR_PREFIX, targets, &fallback, &[]).await;
+        assert!(pinned.is_ok(), "start {start} must pin: {:?}", pinned.err());
+    }
+
+    let mut conn = connect(&url).await;
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-alias",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+    let queues = ["q-dr-alias".to_string()];
+    let before = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("claim");
+    assert!(before.is_some(), "the current epoch claims normally");
+    diesel::sql_query("UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    bump_generation(&mut conn, ShardId::new(1), "promote", "oncall")
+        .await
+        .unwrap();
+    let claimed = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    assert!(
+        claimed.is_none(),
+        "a bump of an aliased shard must stop the claim"
+    );
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]
