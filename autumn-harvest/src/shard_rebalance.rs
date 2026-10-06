@@ -2792,13 +2792,51 @@ mod db {
     /// # Errors
     ///
     /// [`HarvestError::Database`] on failure.
-    #[allow(clippy::too_many_lines)] // One target transaction, gated as a
-    // whole on `activated > 0`: splitting it would scatter that gate.
     pub async fn activate_target(
         source: &mut AsyncPgConnection,
         target: &mut AsyncPgConnection,
         exec_id: ExecutionId,
     ) -> HarvestResult<bool> {
+        activate_target_inner(source, target, exec_id, None).await
+    }
+
+    /// How a resume step settles its record (issue #1839).
+    struct Settle<'a> {
+        driver: MigrationDriver<'a>,
+        source_shard: ShardId,
+        target_shard: ShardId,
+        /// The outcome that the audit row records.
+        outcome: &'a MigrationOutcome,
+    }
+
+    /// [`activate_target`] for a resume step (issue #1839).
+    ///
+    /// The `DONE` update and the audit row commit in one source transaction.
+    /// So a settled record always has its audit row, and a failed audit
+    /// leaves the record `COMMITTED` for the next try. For the scanner, the
+    /// DR fence check runs inside each writing transaction, so its lock
+    /// holds until the write commits.
+    async fn activate_target_and_settle(
+        source: &mut AsyncPgConnection,
+        target: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        settle: &Settle<'_>,
+    ) -> HarvestResult<bool> {
+        activate_target_inner(source, target, exec_id, Some(settle)).await
+    }
+
+    #[allow(clippy::too_many_lines)] // One target transaction, gated as a
+    // whole on `activated > 0`: splitting it would scatter that gate.
+    async fn activate_target_inner(
+        source: &mut AsyncPgConnection,
+        target: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        settle: Option<&Settle<'_>>,
+    ) -> HarvestResult<bool> {
+        // Only an unattended writer checks the DR fence. An operator command
+        // does not need it.
+        let fenced = settle.is_some_and(|s| matches!(s.driver, MigrationDriver::Scanner))
+            && crate::replication::FenceRegistry::is_enabled();
         // `staged_task`, captured verbatim at stage time and restored here.
         let staged: ActivationRow = diesel::sql_query(
             "SELECT staged_task AS payload FROM harvest_shard_migrations \
@@ -2817,6 +2855,9 @@ mod db {
         let staged_task: Option<Value> = staged.payload;
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
+            if fenced && let Some(settle) = settle {
+                crate::replication::assert_fence(conn, settle.target_shard).await?;
+            }
             let staged_task = staged_task.clone();
             {
                 // `migrated_from_shards` is NOT touched here. `stage_copy`
@@ -2958,17 +2999,35 @@ mod db {
         // payload. Once the target holds it there is no reason to keep a third
         // copy on the source in a table neither `erase.rs` nor the retention
         // janitor knows about, so the settling UPDATE clears it.
-        let settled = diesel::sql_query(
-            "UPDATE harvest_shard_migrations \
-                SET phase = 'DONE', staged_task = NULL, updated_at = NOW() \
-              WHERE execution_id = $1 AND phase = 'COMMITTED'",
-        )
-        .bind::<SqlUuid, _>(exec_id.as_uuid())
-        .execute(source)
-        .await
-        .map_err(database_error)?;
+        let settled = Box::pin(source.transaction::<bool, HarvestError, _>(async |conn| {
+            if fenced && let Some(settle) = settle {
+                crate::replication::assert_fence(conn, settle.source_shard).await?;
+            }
+            let settled = diesel::sql_query(
+                "UPDATE harvest_shard_migrations \
+                    SET phase = 'DONE', staged_task = NULL, updated_at = NOW() \
+                  WHERE execution_id = $1 AND phase = 'COMMITTED'",
+            )
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?
+                > 0;
+            if settled && let Some(settle) = settle {
+                record_migration_audit(
+                    conn,
+                    settle.driver,
+                    settle.source_shard,
+                    settle.target_shard,
+                    settle.outcome,
+                )
+                .await?;
+            }
+            Ok(settled)
+        }))
+        .await?;
 
-        Ok(settled > 0)
+        Ok(settled)
     }
 
     /// Abandon a pre-cutover migration, leaving the source exactly as it was.
@@ -3899,6 +3958,9 @@ mod db {
                 break;
             }
 
+            // The activation writes its own audit row, in the transaction
+            // that settles the record (issue #1839).
+            let mut audited = false;
             let stepped: HarvestResult<Option<MigrationOutcome>> = async {
                 match action {
                     MigrationAction::StageCopy => {
@@ -3939,19 +4001,24 @@ mod db {
                         }
                     }
                     MigrationAction::ActivateTarget => {
-                        // An unattended writer checks the DR fence (issue
-                        // #1839). An operator command does not need it.
-                        if matches!(driver, MigrationDriver::Scanner)
-                            && crate::replication::FenceRegistry::is_enabled()
-                        {
-                            crate::replication::assert_fence(&mut target, record.target_shard)
-                                .await?;
-                        }
+                        let migrated = MigrationOutcome::Migrated {
+                            execution_id: exec_id,
+                            fingerprint: record.verified_fingerprint.clone().unwrap_or_default(),
+                        };
+                        let settle = Settle {
+                            driver,
+                            source_shard: record.source_shard,
+                            target_shard: record.target_shard,
+                            outcome: &migrated,
+                        };
                         // Another driver can settle the record first. Then
                         // this call did no work and reports no outcome.
-                        if !activate_target(&mut source, &mut target, exec_id).await? {
+                        if !activate_target_and_settle(&mut source, &mut target, exec_id, &settle)
+                            .await?
+                        {
                             return Ok(None);
                         }
+                        audited = true;
                         collapse_forward_chain(
                             pool,
                             exec_id,
@@ -3959,10 +4026,7 @@ mod db {
                             record.target_shard,
                         )
                         .await;
-                        Ok(Some(MigrationOutcome::Migrated {
-                            execution_id: exec_id,
-                            fingerprint: record.verified_fingerprint.clone().unwrap_or_default(),
-                        }))
+                        Ok(Some(migrated))
                     }
                     MigrationAction::Abort => {
                         abort_migration(
@@ -3989,14 +4053,16 @@ mod db {
                     // so it is audited exactly like the batch path; without this
                     // a migration completed by `rebalance-resume` would leave no
                     // audit record at all.
-                    record_migration_audit(
-                        &mut source,
-                        driver,
-                        record.source_shard,
-                        record.target_shard,
-                        &outcome,
-                    )
-                    .await?;
+                    if !audited {
+                        record_migration_audit(
+                            &mut source,
+                            driver,
+                            record.source_shard,
+                            record.target_shard,
+                            &outcome,
+                        )
+                        .await?;
+                    }
                     outcomes.push(outcome);
                 }
                 Ok(None) => {}

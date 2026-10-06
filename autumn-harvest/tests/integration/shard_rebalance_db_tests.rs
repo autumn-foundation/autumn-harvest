@@ -42,7 +42,8 @@
 //! [`a_worker_with_the_scanner_off_leaves_a_stalled_cutover_alone`],
 //! [`a_record_settled_by_an_operator_is_not_reported_by_the_scanner`],
 //! [`a_down_target_is_retried_one_grace_period_later`],
-//! [`a_replica_without_the_target_pool_does_not_claim_the_record`].
+//! [`a_replica_without_the_target_pool_does_not_claim_the_record`],
+//! [`a_failed_audit_insert_leaves_the_record_for_the_next_pass`].
 //!
 //! Runs against `HARVEST_TEST_DATABASE_URL` when set (each test gets two
 //! throwaway databases), otherwise against per-test Postgres containers.
@@ -8732,4 +8733,59 @@ async fn a_replica_without_the_target_pool_does_not_claim_the_record() {
         .expect("pass");
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     assert_eq!(phase_of(&mut source, exec_id).await, MigrationPhase::Done);
+}
+
+/// The `DONE` update and the audit row commit together. A failed audit
+/// insert leaves the record `COMMITTED`, so the next pass settles it and
+/// writes the row.
+#[tokio::test]
+async fn a_failed_audit_insert_leaves_the_record_for_the_next_pass() {
+    let shards = setup_two_shards().await;
+    let exec_id = interrupt_after_cutover(&shards, "entity-audit-fails").await;
+    let mut source = shards.source().await;
+    age_migration(&mut source, exec_id, 7200).await;
+
+    source
+        .batch_execute(
+            "CREATE FUNCTION reject_auto_resume_audit() RETURNS trigger \
+               LANGUAGE plpgsql AS $$ BEGIN \
+                 RAISE EXCEPTION 'audit insert rejected by the test'; \
+               END $$; \
+             CREATE TRIGGER reject_auto_resume_audit BEFORE INSERT ON harvest_audit_log \
+               FOR EACH ROW WHEN (NEW.operation = 'shard.rebalance.auto_resume') \
+               EXECUTE FUNCTION reject_auto_resume_audit();",
+        )
+        .await
+        .expect("install the rejecting trigger");
+
+    let grace = std::time::Duration::from_secs(60);
+    let outcomes = resume_stalled_cutovers(&shards.pool, SOURCE, grace, 10)
+        .await
+        .expect("pass");
+    assert!(
+        matches!(outcomes.as_slice(), [MigrationOutcome::Aborted { .. }]),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        phase_of(&mut source, exec_id).await,
+        MigrationPhase::Committed,
+        "without its audit row the record is not settled"
+    );
+    assert_eq!(auto_resume_audits(&mut source, exec_id).await, 0);
+
+    source
+        .batch_execute("DROP TRIGGER reject_auto_resume_audit ON harvest_audit_log;")
+        .await
+        .expect("drop the trigger");
+    age_migration(&mut source, exec_id, 7200).await;
+    let outcomes = resume_stalled_cutovers(&shards.pool, SOURCE, grace, 10)
+        .await
+        .expect("pass");
+    assert!(
+        matches!(outcomes.as_slice(), [MigrationOutcome::Migrated { .. }]),
+        "{outcomes:?}"
+    );
+    assert_eq!(phase_of(&mut source, exec_id).await, MigrationPhase::Done);
+    assert_eq!(auto_resume_audits(&mut source, exec_id).await, 1);
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
 }
