@@ -295,16 +295,26 @@ short queries, so it holds no long snapshot. It returns a `ChainReport`:
 | Finding | Meaning |
 |---|---|
 | `Tampered` | The row does not match its own `chain_hash`. Its content changed. |
-| `LinkMismatch` | `chain_prev` does not match the row before it. |
+| `LinkMismatch` | `chain_prev` or `chain_newest_before` does not match the row before it. |
 | `Unchained` | A row at or after the chain start has no hash. |
 | `Gap` | Sequence numbers are missing. Rows were deleted. |
 | `HeadMismatch` | The newest chained row is not the checkpoint head. The newest rows were deleted, or their links were removed. |
 | `CheckpointMissing` | Chained rows exist, but the cursor has no signed checkpoint. Someone rebuilt or edited the cursor. The exporter stops the chain until you re-anchor. |
-| `CheckpointInvalid` | The checkpoint MAC does not verify. Someone edited the cursor, or you passed the wrong key. |
+| `CheckpointInvalid` | The checkpoint MAC does not verify, or only some checkpoint columns are set. Someone edited the cursor, or you passed the wrong key. |
+| `RolledBack` | The chain ends before the `known_head`. Someone restored an older state of the table and the cursor. |
+| `KnownLinkMismatch` | The row at the `known_head` sequence has another link. Someone replaced the chain after a rollback. |
 
 Rows sequenced before you set the key are an `unchained_prefix`, not a
 finding. `last_seq` and `last_hash` name the newest link. Compare them with
 the SIEM copy.
+
+**Keep the newest link outside the database.** A signed checkpoint proves
+that the key signed it, not that it is the newest one. A writer can save the
+table and the cursor, and restore them later. The database then looks
+intact. To detect that, store `last_seq` and `last_hash` from each report
+outside the database, or take them from the SIEM copy. Pass them as
+`ChainVerifyOptions::known_head` on the next run. The verifier then reports
+`RolledBack` or `KnownLinkMismatch`.
 
 **Retention.** Retention deletes old rows, so it leaves gaps. It keeps some
 old rows, such as the `audit_export.decommission` and
@@ -356,6 +366,8 @@ The canonical encoding always uses six digits. Then check that the HMAC of
   looks unchained. A writer can also delete rows that every row chained before
   them shows are within one hour of the retention cutoff. Retention deletes
   those rows within the hour anyway. Only the SIEM copy detects these cases.
+- Without a `known_head`, the verifier cannot detect a restored older state
+  of the table and the cursor.
 - A re-anchor accepts the stored rows. It hides any deletion at the tail that
   happened before it. Compare with the SIEM copy before you re-anchor.
 - Each sequenced row is written twice: once for `export_seq`, once for the

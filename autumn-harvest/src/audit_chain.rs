@@ -32,6 +32,10 @@
 //! A MAC under the chain key covers all four. A writer without the key cannot move the checkpoint.
 //! So the verifier finds a stripped row and a deleted tail.
 //!
+//! A valid MAC does not prove that a checkpoint is the newest one. A writer
+//! can restore an older table and cursor. Pass the newest link that an
+//! earlier check saw as [`ChainVerifyOptions::known_head`] to detect that.
+//!
 //! The exporter extends only a checkpoint that its key accepts. Otherwise a
 //! writer could move the head and have the exporter sign it. A missing or
 //! invalid checkpoint stops the chain until [`reanchor_shard_chain`] runs.
@@ -346,8 +350,33 @@ pub enum ChainFinding {
     },
     /// Chained rows exist, but the cursor holds no complete checkpoint.
     CheckpointMissing,
-    /// The checkpoint MAC does not verify under any key.
+    /// The checkpoint MAC does not verify under any key, or the checkpoint
+    /// is partly missing.
     CheckpointInvalid,
+    /// The chain ends before the known head. Someone restored an older
+    /// state of the table and the cursor.
+    RolledBack {
+        /// The `seq` of the known head.
+        known_seq: i64,
+        /// The newest chained `seq` the database holds, if any.
+        head_seq: Option<i64>,
+    },
+    /// The row at the known head's `seq` has another link. Someone replaced
+    /// the chain after that point.
+    KnownLinkMismatch {
+        /// The `seq` of the known head.
+        seq: i64,
+    },
+}
+
+/// A link that a check outside the database saw: an earlier verification or
+/// the SIEM copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownLink {
+    /// The link's `export_seq`.
+    pub seq: i64,
+    /// The link's `chain_hash`.
+    pub hash: ChainHash,
 }
 
 /// The result of a chain verification.
@@ -386,6 +415,7 @@ pub struct ChainVerifier<'k> {
     report: ChainReport,
     /// The previous row, once the chain starts. See [`Previous`].
     previous: Option<Previous>,
+    known_head: Option<KnownLink>,
 }
 
 /// The verifier state for the previous row.
@@ -415,7 +445,19 @@ impl<'k> ChainVerifier<'k> {
             retention_cutoff: None,
             report: ChainReport::default(),
             previous: None,
+            known_head: None,
         }
+    }
+
+    /// Require the chain to reach `known` and to hold it.
+    ///
+    /// `known` is the newest link that a check outside the database saw. A
+    /// signed checkpoint cannot prove that it is the newest one. So only this
+    /// check detects a restored older state.
+    #[must_use]
+    pub const fn with_known_head(mut self, known: Option<KnownLink>) -> Self {
+        self.known_head = known;
+        self
     }
 
     /// Treat a gap at the old end of the chain as retention. `cutoff` is
@@ -488,6 +530,14 @@ impl<'k> ChainVerifier<'k> {
             Some(_) => {}
         }
 
+        if let Some(known) = self.known_head
+            && known.seq == seq
+            && row.hash != Some(known.hash)
+        {
+            self.report
+                .findings
+                .push(ChainFinding::KnownLinkMismatch { seq });
+        }
         if row.hash.is_none() {
             self.report.findings.push(ChainFinding::Unchained { seq });
             self.previous = Some(Previous {
@@ -541,12 +591,26 @@ impl<'k> ChainVerifier<'k> {
     /// it count as retention only when the checkpoint's newest time is old.
     #[must_use]
     pub fn finish(mut self, checkpoint: Option<&ChainCheckpoint>) -> ChainReport {
-        let Some(checkpoint) = checkpoint else {
-            return self.report;
-        };
+        if let Some(checkpoint) = checkpoint {
+            self.check_head(checkpoint);
+        }
+        let head_seq = checkpoint.map(|c| c.head_seq).or(self.report.last_seq);
+        if let Some(known) = self.known_head
+            && head_seq.is_none_or(|head| head < known.seq)
+        {
+            self.report.findings.push(ChainFinding::RolledBack {
+                known_seq: known.seq,
+                head_seq,
+            });
+        }
+        self.report
+    }
+
+    /// Check that the newest chained row is the checkpoint head.
+    fn check_head(&mut self, checkpoint: &ChainCheckpoint) {
         let found = self.report.last_seq.zip(self.report.last_hash);
         if found == Some((checkpoint.head_seq, checkpoint.head)) {
-            return self.report;
+            return;
         }
         let tail_purged = found.is_none_or(|(seq, _)| seq < checkpoint.head_seq)
             && self.is_old(checkpoint.newest_at);
@@ -562,7 +626,6 @@ impl<'k> ChainVerifier<'k> {
                 found_seq: self.report.last_seq,
             });
         }
-        self.report
     }
 }
 
@@ -726,12 +789,7 @@ pub(crate) async fn chain_anchor(
             newest_at: Some(checkpoint.newest_at),
         }));
     }
-    let partial = cursor.chain_head.is_some()
-        || cursor.chain_start_seq.is_some()
-        || cursor.chain_head_seq.is_some()
-        || cursor.chain_newest_at.is_some()
-        || cursor.chain_mac.is_some();
-    if partial || any_chained_row(conn, cursor.last_assigned_seq).await? {
+    if has_checkpoint_column(cursor) || any_chained_row(conn, cursor.last_assigned_seq).await? {
         return Ok(None);
     }
     Ok(Some(ChainAnchor::default()))
@@ -936,6 +994,10 @@ pub struct ChainVerifyOptions<'a> {
     /// The audit retention cutoff, `now - audit_retention_days`. `None` when
     /// retention does not run. Rows missing before it count as retention.
     pub retention_cutoff: Option<DateTime<Utc>>,
+    /// The newest link a check outside the database saw. A signed checkpoint
+    /// cannot prove that it is the newest one. So only this link detects a
+    /// restored older state.
+    pub known_head: Option<KnownLink>,
 }
 
 /// Verify the chain on `shard_id` with `key`, with no retention cutoff.
@@ -951,6 +1013,7 @@ pub async fn verify_shard_chain(
     let options = ChainVerifyOptions {
         keys: std::slice::from_ref(key),
         retention_cutoff: None,
+        known_head: None,
     };
     verify_shard_chain_with(conn, shard_id, &options).await
 }
@@ -984,24 +1047,14 @@ pub async fn verify_shard_chain_with(
         .optional()
         .map_err(crate::error::database_error)?;
     let bound = cursor.as_ref().map_or(i64::MAX, |c| c.last_assigned_seq);
-    let (checkpoint, checkpoint_finding) = match cursor.as_ref().map(stored_checkpoint) {
-        Some(Some((checkpoint, mac))) => {
-            if options
-                .keys
-                .iter()
-                .any(|key| checkpoint.mac(key, shard_id) == mac)
-            {
-                (Some(checkpoint), None)
-            } else {
-                (None, Some(ChainFinding::CheckpointInvalid))
-            }
-        }
-        _ => (None, None),
-    };
+    let (checkpoint, checkpoint_finding) = cursor.as_ref().map_or((None, None), |cursor| {
+        verified_checkpoint(cursor, options.keys)
+    });
 
     let mut verifier = ChainVerifier::with_keys(options.keys)
         .with_retention_cutoff(options.retention_cutoff)
-        .with_start_seq(checkpoint.map(|c| c.start_seq));
+        .with_start_seq(checkpoint.map(|c| c.start_seq))
+        .with_known_head(options.known_head);
     let mut after_seq = 0_i64;
     loop {
         let rows: Vec<crate::models::AuditExportRow> = log::harvest_audit_log
@@ -1039,6 +1092,37 @@ pub async fn verify_shard_chain_with(
         report.findings.insert(0, ChainFinding::CheckpointMissing);
     }
     Ok(report)
+}
+
+/// The checkpoint on `cursor` that one of `keys` signed, or the finding.
+#[cfg(feature = "db")]
+fn verified_checkpoint(
+    cursor: &crate::models::AuditExportCursor,
+    keys: &[CallbackSecret],
+) -> (Option<ChainCheckpoint>, Option<ChainFinding>) {
+    match stored_checkpoint(cursor) {
+        Some((checkpoint, mac))
+            if keys
+                .iter()
+                .any(|key| checkpoint.mac(key, cursor.shard_id) == mac) =>
+        {
+            (Some(checkpoint), None)
+        }
+        Some(_) => (None, Some(ChainFinding::CheckpointInvalid)),
+        // A partial checkpoint is an edit, not an absent checkpoint.
+        None if has_checkpoint_column(cursor) => (None, Some(ChainFinding::CheckpointInvalid)),
+        None => (None, None),
+    }
+}
+
+/// `true` when any checkpoint column is set.
+#[cfg(feature = "db")]
+const fn has_checkpoint_column(cursor: &crate::models::AuditExportCursor) -> bool {
+    cursor.chain_head.is_some()
+        || cursor.chain_start_seq.is_some()
+        || cursor.chain_head_seq.is_some()
+        || cursor.chain_newest_at.is_some()
+        || cursor.chain_mac.is_some()
 }
 
 /// The checkpoint and its stored MAC, when every column is set.
@@ -1334,6 +1418,40 @@ mod tests {
                 ChainFinding::LinkMismatch { seq: 3 },
                 ChainFinding::Tampered { seq: 3 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_known_head_detects_a_rolled_back_or_replaced_chain() {
+        let rows = chain(&[1, 2, 3]);
+        let known = KnownLink {
+            seq: 3,
+            hash: rows[2].hash.unwrap_or(GENESIS),
+        };
+        let key = key();
+        let run = |rows: &[ChainRow], cp: Option<ChainCheckpoint>| {
+            let mut verifier = ChainVerifier::new(&key)
+                .with_start_seq(Some(1))
+                .with_known_head(Some(known));
+            for row in rows {
+                verifier.push(row);
+            }
+            verifier.finish(cp.as_ref()).findings
+        };
+        assert_eq!(run(&rows, checkpoint(&rows)), Vec::new());
+        assert_eq!(
+            run(&rows[..2], checkpoint(&rows[..2])),
+            vec![ChainFinding::RolledBack {
+                known_seq: 3,
+                head_seq: Some(2),
+            }]
+        );
+        let mut records: Vec<AuditExportRecord> = rows.into_iter().map(|row| row.record).collect();
+        records[2].actor = "mallory".into();
+        let replaced = chain_records(records);
+        assert_eq!(
+            run(&replaced, checkpoint(&replaced)),
+            vec![ChainFinding::KnownLinkMismatch { seq: 3 }]
         );
     }
 

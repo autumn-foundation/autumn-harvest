@@ -75,6 +75,9 @@ that the exporter sequences.
   ends. Rotate in two steps with an accept key.
 - A re-anchor accepts the stored rows. An operator compares them with the
   SIEM copy first.
+- A signed checkpoint does not prove that it is the newest one. A writer can
+  restore an older table and cursor. The verifier detects that only with a
+  `known_head`: the newest link that an earlier check or the SIEM saw.
 
 **Declined:**
 

@@ -18,7 +18,9 @@ checkpoint stops the chain until an operator calls
 adds a key for a two-step rotation. With a retention cutoff, a gap goes to
 `retention_gaps` only when the keyed `chain_newest_before` after it is old.
 Exported records carry `chain_prev`, `chain_newest_before` and `chain_hash`.
-These fields are omitted when absent. A key shorter than 32 bytes fails `try_build` with
+These fields are omitted when absent. `ChainVerifyOptions::known_head` takes
+the newest link from an earlier check or the SIEM, so a restored older table
+reports `RolledBack`. A key shorter than 32 bytes fails `try_build` with
 `AuditChainKeyTooShort`. The runtime config and `claim_shard_chained` take an
 `audit_chain::AuditChainKey`, which only `AuditChainKey::new` can build, so a
 short key cannot reach the stamp path by any route.
@@ -53,7 +55,7 @@ these functions, must change:
   `BuiltHarvest::wasm_module_registrations`.
 
 New APIs: `audit_chain` (`AuditChainKey`, `ChainVerifier`, `ChainVerifyOptions`,
-`ChainCheckpoint`, `verify_shard_chain_with`, `reanchor_shard_chain`),
+`ChainCheckpoint`, `KnownLink`, `verify_shard_chain_with`, `reanchor_shard_chain`),
 `HarvestBuilder::audit_export_chain_accept_key`, `audit_export::claim_shard_chained`,
 `AuditExportRuntimeConfig::claim`, `audit_export::runtime_chain_key`,
 `AuditExportRecord::from_row`,

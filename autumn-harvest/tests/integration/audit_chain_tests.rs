@@ -7,8 +7,8 @@
 
 use autumn_harvest::audit::{self, OP_WORKFLOW_CANCEL, STATUS_SUCCEEDED, TARGET_WORKFLOW};
 use autumn_harvest::audit_chain::{
-    AuditChainKey, ChainFinding, ChainVerifyOptions, MIN_CHAIN_KEY_BYTES, reanchor_shard_chain,
-    verify_shard_chain, verify_shard_chain_with,
+    AuditChainKey, ChainFinding, ChainReport, ChainVerifyOptions, KnownLink, MIN_CHAIN_KEY_BYTES,
+    reanchor_shard_chain, verify_shard_chain, verify_shard_chain_with,
 };
 use autumn_harvest::audit_export::{
     ExportBackoff, RewindRequest, SinkAttempt, apply_outcome, claim_shard, claim_shard_chained,
@@ -468,6 +468,7 @@ async fn retention_gaps_verify_with_the_cutoff_and_fail_without_it() {
     let options = ChainVerifyOptions {
         keys: std::slice::from_ref(&key),
         retention_cutoff: Some(chrono::Utc::now() - chrono::TimeDelta::days(90)),
+        known_head: None,
     };
     let report = verify_shard_chain_with(&mut conn, SHARD, &options)
         .await
@@ -505,6 +506,7 @@ async fn a_rotated_key_verifies_with_both_keys() {
     let options = ChainVerifyOptions {
         keys: &ring,
         retention_cutoff: None,
+        known_head: None,
     };
     let report = verify_shard_chain_with(&mut conn, SHARD, &options)
         .await
@@ -672,6 +674,7 @@ async fn a_new_key_without_the_old_one_does_not_extend_the_chain() {
     let options = ChainVerifyOptions {
         keys: &ring,
         retention_cutoff: None,
+        known_head: None,
     };
     let report = verify_shard_chain_with(&mut conn, SHARD, &options)
         .await
@@ -738,6 +741,7 @@ async fn verify_with_retention(
     let options = ChainVerifyOptions {
         keys: std::slice::from_ref(&key),
         retention_cutoff: Some(chrono::Utc::now() - chrono::TimeDelta::days(90)),
+        known_head: None,
     };
     verify_shard_chain_with(conn, SHARD, &options)
         .await
@@ -803,5 +807,85 @@ async fn a_deleted_recent_tail_is_not_retention() {
             found_seq: Some(1),
         }],
         "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_checkpoint_over_stripped_rows_is_invalid() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+    conn.batch_execute(
+        "UPDATE harvest_audit_log SET chain_prev = NULL, chain_newest_before = NULL, \
+             chain_hash = NULL; \
+         UPDATE harvest_audit_export_cursor SET chain_mac = NULL",
+    )
+    .await
+    .expect("strip");
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(report.findings, vec![ChainFinding::CheckpointInvalid]);
+}
+
+/// Verify against `known`, a link kept outside the database.
+async fn verify_against(conn: &mut AsyncPgConnection, known: KnownLink) -> ChainReport {
+    let key = key();
+    let options = ChainVerifyOptions {
+        keys: std::slice::from_ref(&key),
+        retention_cutoff: None,
+        known_head: Some(known),
+    };
+    verify_shard_chain_with(conn, SHARD, &options)
+        .await
+        .expect("verify")
+}
+
+#[tokio::test]
+async fn a_replayed_checkpoint_fails_against_the_known_head() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+    conn.batch_execute("CREATE TABLE saved_cursor AS SELECT * FROM harvest_audit_export_cursor")
+        .await
+        .expect("save the cursor");
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    let known = KnownLink {
+        seq: report.last_seq.expect("a head"),
+        hash: report.last_hash.expect("a head"),
+    };
+    assert!(verify_against(&mut conn, known).await.is_intact());
+
+    // Delete rows 4 and 5, and put back the signed checkpoint at seq 3.
+    conn.batch_execute(
+        "DELETE FROM harvest_audit_log WHERE export_seq > 3; \
+         DELETE FROM harvest_audit_export_cursor; \
+         INSERT INTO harvest_audit_export_cursor SELECT * FROM saved_cursor",
+    )
+    .await
+    .expect("replay the checkpoint");
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "the database alone cannot see a replay");
+    assert_eq!(
+        verify_against(&mut conn, known).await.findings,
+        vec![ChainFinding::RolledBack {
+            known_seq: 5,
+            head_seq: Some(3),
+        }]
+    );
+
+    // The exporter then reissues seq 4 and 5 to new rows.
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    assert_eq!(
+        verify_against(&mut conn, known).await.findings,
+        vec![ChainFinding::KnownLinkMismatch { seq: 5 }]
     );
 }
