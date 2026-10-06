@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use autumn_harvest::fuzzing::{Op, ReplayCase, Verdict, check_case};
+use autumn_harvest::fuzzing::{MAX_OP_DEPTH, Op, ReplayCase, Verdict, check_case};
 
 fn seed_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fuzz/seeds/fuzz_replay")
@@ -208,6 +208,49 @@ fn generated_programs_round_trip_through_json() {
         assert_eq!(back.len(), program.len(), "input {seed}");
     }
     assert!(programs >= 50, "only {programs} inputs carried a program");
+}
+
+/// The nesting depth of `Concurrent` and `Race` ops in a program.
+fn op_depth(ops: &[Op]) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            Op::Concurrent { ops } | Op::Race { branches: ops } => 1 + op_depth(ops),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Generated programs stay within `MAX_OP_DEPTH`. A deeper program can pass
+/// `serde_json`'s recursion limit. Its JSON header then does not read back,
+/// and the harness reports a false engine panic.
+#[test]
+fn generated_programs_stay_shallow() {
+    let mut deepest = 0;
+    for seed in 0..2000 {
+        let Some(case) = ReplayCase::from_fuzz_bytes(&bytes(seed, 4096)) else {
+            continue;
+        };
+        let depth = op_depth(case.program.as_deref().unwrap_or_default());
+        assert!(depth <= MAX_OP_DEPTH, "input {seed}: depth {depth}");
+        deepest = deepest.max(depth);
+    }
+    assert!(deepest >= 2, "the generator never nested ops ({deepest})");
+}
+
+/// A program deeper than `MAX_OP_DEPTH`, built in code, is refused before it
+/// runs. Its JSON header would pass `serde_json`'s recursion limit.
+#[test]
+fn an_over_deep_program_is_refused_not_a_crash() {
+    let (_, mut case) = seed("baseline-continue-as-new").remove(0);
+    let mut program = vec![Op::Complete {
+        output: serde_json::Value::Null,
+    }];
+    for _ in 0..200 {
+        program = vec![Op::Concurrent { ops: program }];
+    }
+    case.program = Some(program);
+    assert!(matches!(check_case(&case), Verdict::Unstorable(_)));
 }
 
 /// The generator reaches every `WorkflowEvent` variant. A variant it cannot

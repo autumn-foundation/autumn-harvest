@@ -52,6 +52,39 @@ const MAX_DEPTH: u32 = 6;
 /// The most items that the generator puts in one array or object.
 const MAX_ITEMS: usize = 4;
 
+/// The deepest nesting of [`Op::Concurrent`] and [`Op::Race`] that the
+/// generator builds. The workflow reads its program back from JSON, and
+/// `serde_json` stops at 128 levels, so a deeper program would not parse.
+pub const MAX_OP_DEPTH: usize = 4;
+
+std::thread_local! {
+    static OP_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The nesting depth of [`Op::Concurrent`] and [`Op::Race`] in `ops`.
+fn op_depth(ops: &[Op]) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            Op::Concurrent { ops } | Op::Race { branches: ops } => 1 + op_depth(ops),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Generates the ops nested in a [`Op::Concurrent`] or [`Op::Race`]. Past
+/// [`MAX_OP_DEPTH`] it returns none.
+fn nested_ops(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<Op>> {
+    let depth = OP_DEPTH.with(std::cell::Cell::get);
+    if depth >= MAX_OP_DEPTH {
+        return Ok(Vec::new());
+    }
+    OP_DEPTH.with(|d| d.set(depth + 1));
+    let ops = Vec::<Op>::arbitrary(u);
+    OP_DEPTH.with(|d| d.set(depth));
+    ops
+}
+
 /// The context header that carries the program to the replayed workflow.
 const PROGRAM_HEADER: &str = "harvest-fuzz-program";
 
@@ -417,11 +450,13 @@ pub enum Op {
     /// Only activity, child, timer and signal ops are branches.
     Race {
         /// The branches.
+        #[arbitrary(with = nested_ops)]
         branches: Vec<Self>,
     },
     /// Runs the ops concurrently, as `join!` does.
     Concurrent {
         /// The ops of one command batch.
+        #[arbitrary(with = nested_ops)]
         ops: Vec<Self>,
     },
     /// Return `Ok(output)`.
@@ -540,7 +575,8 @@ impl ReplayCase {
 /// The outcome of a case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// The history has no stable JSON form, so storage cannot hold it.
+    /// The history or the program has no stable JSON form, so storage or
+    /// the program header cannot hold it.
     Unstorable(String),
     /// The read path refused the stored rows.
     Unreadable(String),
@@ -558,6 +594,10 @@ pub fn check_case(case: &ReplayCase) -> Verdict {
     let Some(history) = normalize(&case.history) else {
         return Verdict::Unstorable("the history has no stable JSON form".to_string());
     };
+    // The generator stays within the limit. A program built in code may not.
+    if case.program.as_deref().map_or(0, op_depth) > MAX_OP_DEPTH {
+        return Verdict::Unstorable("the program nests deeper than MAX_OP_DEPTH".to_string());
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
