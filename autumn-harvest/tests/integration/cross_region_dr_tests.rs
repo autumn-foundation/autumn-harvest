@@ -3998,6 +3998,85 @@ async fn a_group_larger_than_the_guard_cap_gets_a_guard() {
     assert_eq!(tick.len(), 1);
 }
 
+/// A tick over several databases takes one guard slot, not one per database
+/// (issue #1823). Taking slots one by one while holding the earlier ones
+/// lets concurrent ticks split the slots and both wait until they time out.
+#[tokio::test]
+async fn a_tick_over_two_databases_needs_one_guard_slot() {
+    let _serial = registry_guard().await;
+    let (first_url, _first) = require_db!("slotone");
+    let (second_url, _second) = require_db!("slottwo");
+    let (first, second) = (ShardId::new(0), ShardId::new(1));
+    let first_pool = dr_pool(&first_url);
+    let second_pool = dr_pool(&second_url);
+    let mut pins = Vec::new();
+    for (shard, url) in [(first, &first_url), (second, &second_url)] {
+        let mut conn = connect(url).await;
+        pins.push((
+            shard,
+            ensure_generation_row(&mut conn, shard).await.unwrap(),
+        ));
+    }
+    FenceRegistry::publish(&pins, first).expect("pin");
+    // Every slot but one is busy.
+    let mut busy = Vec::new();
+    for _ in 1..autumn_harvest::replication::FENCE_GUARD_LIMIT {
+        busy.push(
+            autumn_harvest::replication::begin_fenced_group(&first_pool, first)
+                .await
+                .expect("hold a slot"),
+        );
+    }
+    let pools = autumn_harvest::shard::ShardedDbPool::from_map(
+        [(first, first_pool.clone()), (second, second_pool.clone())]
+            .into_iter()
+            .collect(),
+        first,
+    );
+
+    let tick = guard_count(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            autumn_harvest::replication::begin_fenced_tick(&pools),
+        )
+        .await,
+    );
+    // A cross-shard relay fences its source and its target the same way.
+    let groups = guard_count(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            autumn_harvest::replication::begin_fenced_groups(&[
+                (&first_pool, first),
+                (&second_pool, second),
+            ]),
+        )
+        .await,
+    );
+    drop(busy);
+
+    assert_eq!(tick, Ok(2), "a tick over two databases needs one free slot");
+    assert_eq!(
+        groups,
+        Ok(2),
+        "a relay over two databases needs one free slot"
+    );
+}
+
+/// How many guards an attempt opened, or why it opened none. The guards drop
+/// here, so the next attempt can take their slot.
+fn guard_count(
+    attempt: Result<
+        autumn_harvest::error::HarvestResult<Vec<autumn_harvest::replication::FencePassGuard>>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Result<usize, String> {
+    match attempt {
+        Ok(Ok(guards)) => Ok(guards.len()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("timed out waiting for a guard slot".to_string()),
+    }
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

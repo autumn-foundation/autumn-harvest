@@ -1332,24 +1332,25 @@ impl DeferredTriggerStart {
             // Issue #1823: this relay runs detached, after its caller's fence
             // ends. It writes the source and the target shard, so it holds the
             // fence of both while it writes. A fenced or held shard leaves the
-            // outbox row for the scanner.
-            let mut fence = Vec::new();
-            for (shard, shard_pool) in [
-                (self.source_shard, &source_pool),
-                (self.target_shard, &pool),
-            ] {
-                match crate::replication::begin_fenced_group(shard_pool, shard).await {
-                    Ok(guards) => fence.extend(guards),
-                    Err(error) => {
-                        tracing::warn!(
-                            shard_id = shard.as_i32(),
-                            %error,
-                            "[completion_trigger] the DR fence forbids this relay; leaving the outbox row for the scanner"
-                        );
-                        return;
-                    }
+            // outbox row for the scanner. Both guards share one slot, so the
+            // relay never waits for a slot while it holds one.
+            let fence = match crate::replication::begin_fenced_groups(&[
+                (&source_pool, self.source_shard),
+                (&pool, self.target_shard),
+            ])
+            .await
+            {
+                Ok(guards) => guards,
+                Err(error) => {
+                    tracing::warn!(
+                        source_shard = self.source_shard.as_i32(),
+                        target_shard = self.target_shard.as_i32(),
+                        %error,
+                        "[completion_trigger] the DR fence forbids this relay; leaving the outbox row for the scanner"
+                    );
+                    return;
                 }
-            }
+            };
             let relayed = crate::replication::run_fenced_pass(
                 &fence,
                 Box::pin(relay_gate_checked_start(

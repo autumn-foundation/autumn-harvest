@@ -1702,21 +1702,28 @@ mod db {
     pub struct FencePassGuard {
         lost: tokio_util::sync::CancellationToken,
         keepalive: tokio::task::JoinHandle<()>,
-        /// A slot of [`FENCE_GUARD_SLOTS`]. It is held only to be freed when
-        /// the guard drops. It is boxed as `dyn Send`. The guard then keeps
-        /// the drop behaviour it had before the slot. Callers hold a guard
-        /// for a whole pass on purpose.
+        /// A share of one slot of [`FENCE_GUARD_SLOTS`]. Every guard of one
+        /// operation shares that slot, and it frees when the last of them
+        /// drops. It is boxed as `dyn Send`. The guard then keeps the drop
+        /// behaviour it had before the slot. Callers hold a guard for a
+        /// whole pass on purpose.
         #[allow(dead_code)]
         slot: Option<Box<dyn Send + Sync>>,
     }
 
-    /// How many guard sessions this process may hold at once (issue #1823).
+    /// How many fenced operations this process may run at once (issue #1823).
     ///
-    /// A guard opens its own connection outside the pool, and an admin write
-    /// holds one for each pinned shard until its handler returns. Without a
-    /// cap, heavy admin traffic could open sessions without limit and use up
-    /// the server's connections. A guard past the cap waits for a free slot,
-    /// for at most [`FENCE_PASS_CONNECT_TIMEOUT`], then fails closed.
+    /// A guard opens its own connection outside the pool. An admin write
+    /// holds one guard for each database it fences, until its handler
+    /// returns. Without a cap, heavy admin traffic could open sessions
+    /// without limit and use up the server's connections.
+    ///
+    /// One operation takes one slot, however many databases it guards. It
+    /// takes the slot before it opens any guard. It therefore never waits for
+    /// a slot while it holds one, so concurrent operations cannot split the
+    /// slots and stall each other. An operation past the cap waits for a
+    /// free slot, for at most [`FENCE_PASS_CONNECT_TIMEOUT`], then fails
+    /// closed.
     pub const FENCE_GUARD_LIMIT: usize = 64;
 
     /// The slots behind [`FENCE_GUARD_LIMIT`].
@@ -1724,6 +1731,31 @@ mod db {
         std::sync::LazyLock::new(|| {
             std::sync::Arc::new(tokio::sync::Semaphore::new(FENCE_GUARD_LIMIT))
         });
+
+    /// One slot of [`FENCE_GUARD_LIMIT`], shared by every guard of one
+    /// operation.
+    type GuardSlot = std::sync::Arc<tokio::sync::OwnedSemaphorePermit>;
+
+    /// Take one slot of [`FENCE_GUARD_LIMIT`] for an operation (issue #1823).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Database`] when no slot frees within
+    /// [`FENCE_PASS_CONNECT_TIMEOUT`].
+    async fn guard_slot() -> HarvestResult<GuardSlot> {
+        let slot = tokio::time::timeout(
+            FENCE_PASS_CONNECT_TIMEOUT,
+            std::sync::Arc::clone(&FENCE_GUARD_SLOTS).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            crate::error::HarvestError::Database(format!(
+                "all {FENCE_GUARD_LIMIT} DR fence guard slots stayed busy; try again"
+            ))
+        })?
+        .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+        Ok(std::sync::Arc::new(slot))
+    }
 
     impl FencePassGuard {
         /// Whether the guard's session has ended (issue #1823).
@@ -1921,13 +1953,51 @@ mod db {
         pool: &crate::worker::DbPool,
         shard: ShardId,
     ) -> HarvestResult<Vec<FencePassGuard>> {
-        let bindings = FenceRegistry::claim_bindings(shard).unwrap_or_default();
-        if bindings.is_empty() {
+        begin_fenced_groups(&[(pool, shard)]).await
+    }
+
+    /// [`begin_fenced_group`] for each `(pool, shard)` in `groups`, as one
+    /// operation (issue #1823).
+    ///
+    /// Every guard shares one slot of [`FENCE_GUARD_LIMIT`]. The operation
+    /// takes it before it opens any guard, so it never waits for a slot
+    /// while it holds one. A shard that an earlier group already guards is
+    /// not guarded twice. With no pin, this opens no connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_group`].
+    pub async fn begin_fenced_groups(
+        groups: &[(&crate::worker::DbPool, ShardId)],
+    ) -> HarvestResult<Vec<FencePassGuard>> {
+        let mut guarded: Vec<ShardId> = Vec::new();
+        let mut plan = Vec::new();
+        for (pool, shard) in groups {
+            let bindings = FenceRegistry::claim_bindings(*shard).unwrap_or_default();
+            let fresh: Vec<(ShardId, ShardGeneration)> = bindings
+                .iter()
+                .filter(|(pinned, _)| !guarded.contains(pinned))
+                .copied()
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            guarded.extend(fresh.iter().map(|(pinned, _)| *pinned));
+            plan.push((*pool, fresh, bindings));
+        }
+        if plan.is_empty() {
             return Ok(Vec::new());
         }
-        // One guard holds the barrier of every shard in the group, on one
-        // connection. It also checks for rows this process did not pin.
-        Ok(vec![begin_checked_pass(pool, &bindings, &bindings).await?])
+        let slot = guard_slot().await?;
+        let mut guards = Vec::with_capacity(plan.len());
+        for (pool, fresh, bindings) in plan {
+            // One guard per database holds the barrier of every shard there,
+            // and checks for rows this process did not pin.
+            guards.push(
+                open_checked_pass(pool, &fresh, &bindings, std::sync::Arc::clone(&slot)).await?,
+            );
+        }
+        Ok(guards)
     }
 
     /// Fail when the database holds a generation row that this process did
@@ -1987,25 +2057,14 @@ mod db {
             return Ok(Vec::new());
         }
         let single = pool.len() == 1;
-        let mut guarded: Vec<ShardId> = Vec::new();
-        let mut guards = Vec::new();
-        for (shard, shard_pool) in pool.iter_shards() {
-            let key = if single { ShardId::UNENCODED } else { shard };
-            let bindings = FenceRegistry::claim_bindings(key).unwrap_or_default();
-            let fresh: Vec<(ShardId, ShardGeneration)> = bindings
-                .iter()
-                .filter(|(pinned, _)| !guarded.contains(pinned))
-                .copied()
-                .collect();
-            if fresh.is_empty() {
-                continue;
-            }
-            guarded.extend(fresh.iter().map(|(pinned, _)| *pinned));
-            // One guard per database holds the barrier of every shard there,
-            // and checks for rows this process did not pin.
-            guards.push(begin_checked_pass(shard_pool, &fresh, &bindings).await?);
-        }
-        Ok(guards)
+        let groups: Vec<(&crate::worker::DbPool, ShardId)> = pool
+            .iter_shards()
+            .map(|(shard, shard_pool)| {
+                (shard_pool, if single { ShardId::UNENCODED } else { shard })
+            })
+            .collect();
+        // One slot for the whole tick. See `FENCE_GUARD_LIMIT`.
+        begin_fenced_groups(&groups).await
     }
 
     /// [`begin_fenced_pass`] at an explicit generation, for a process that
@@ -2034,18 +2093,18 @@ mod db {
         shards: &[(ShardId, ShardGeneration)],
         allowed: &[(ShardId, ShardGeneration)],
     ) -> HarvestResult<FencePassGuard> {
+        let slot = guard_slot().await?;
+        open_checked_pass(pool, shards, allowed, slot).await
+    }
+
+    /// [`begin_checked_pass`] under a slot the caller already holds.
+    async fn open_checked_pass(
+        pool: &crate::worker::DbPool,
+        shards: &[(ShardId, ShardGeneration)],
+        allowed: &[(ShardId, ShardGeneration)],
+        slot: GuardSlot,
+    ) -> HarvestResult<FencePassGuard> {
         use deadpool::managed::Manager as _;
-        let slot = tokio::time::timeout(
-            FENCE_PASS_CONNECT_TIMEOUT,
-            std::sync::Arc::clone(&FENCE_GUARD_SLOTS).acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            crate::error::HarvestError::Database(format!(
-                "all {FENCE_GUARD_LIMIT} DR fence guard slots stayed busy; try again"
-            ))
-        })?
-        .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
         let conn = tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
             .await
             .map_err(|_| {
@@ -3708,12 +3767,13 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority,
-    assert_database_fence, assert_fence, assert_fence_group, begin_fenced_group, begin_fenced_pass,
-    begin_fenced_pass_at, begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick,
-    bump_generation, current_generation, ensure_generation_row, freeze_generation_rows_on,
-    measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
-    record_replication_heartbeat, resolve_held, run_fenced_pass,
+    FENCE_GUARD_LIMIT, FencePassGuard, advance_sequences_after_promotion,
+    assert_admin_write_authority, assert_database_fence, assert_fence, assert_fence_group,
+    begin_fenced_group, begin_fenced_groups, begin_fenced_pass, begin_fenced_pass_at,
+    begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
+    ensure_generation_row, freeze_generation_rows_on, measure_rpo, pin_process_fence,
+    pin_worker_fence, probe_dr_markers, query_replication_status, record_replication_heartbeat,
+    resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]
