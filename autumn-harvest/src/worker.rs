@@ -15814,6 +15814,8 @@ const DRAIN_BEFORE_START_ERROR: &str = "the handler never started";
 /// claim is a no-op. An applied release counts one enqueued retry in the
 /// metrics, as the normal retry path does. When the handler was never
 /// polled, the release also refunds the attempt's rate-limit debit.
+///
+/// Returns whether the release applied under this claim (issue #1809).
 async fn release_drained_activity(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -15821,14 +15823,15 @@ async fn release_drained_activity(
     activity_name: &str,
     metrics: &dyn crate::telemetry::MetricsRecorder,
     handler_started: bool,
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
     let claim = claim_of_task(task)?;
     let message = crate::failure::parse_error_payload_full(payload).message;
     let error = format!("{WORKER_SHUTDOWN_ERROR}: {message}");
     let write =
         queue::requeue_claimed_task_for_retry(conn, &claim, chrono::Duration::zero(), &error)
             .await?;
-    if write == queue::ClaimWrite::Applied {
+    let applied = write == queue::ClaimWrite::Applied;
+    if applied {
         // The release enqueues a retry, as the normal retry path does.
         metrics.record_activity_retried(activity_name, &task.queue_name);
         tracing::info!(
@@ -15852,7 +15855,7 @@ async fn release_drained_activity(
             "failed to refund the rate-limit token of an attempt that never started"
         );
     }
-    Ok(())
+    Ok(applied)
 }
 
 /// How a running activity's handler ended (issue #1813).
@@ -17827,7 +17830,11 @@ async fn process_activity_task(
     // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
     probe_guard.disarm();
     let circuit_outcome = if was_cancelled {
-        if let Some(token) = circuit_token {
+        // A drained run still holds its claim here. It settles after its own
+        // write instead, because a timeout can take the claim before it.
+        if let Some(token) = circuit_token
+            && !drained
+        {
             // The claim watcher cancels on any lost claim (issue #1809). Only a
             // timeout counts against the downstream. `on_claim_lost` counts
             // one that another process enforced, and releases the slot of any
@@ -17950,20 +17957,49 @@ async fn process_activity_task(
     // for an immediate retry (issue #1813). A non-retryable error takes the
     // normal path below. A handler that never started always goes back: a
     // retry policy must not fail an activity that never ran.
+    //
+    // A drained run settles its breaker entry after its own write (issue
+    // #1809). Only that write tells whether a timeout took the claim first.
+    let settle_drained = |applied: Option<bool>| {
+        let breakers = &circuit_breakers;
+        let telemetry = &telemetry;
+        async move {
+            let (_, lost_to_timeout) = settle_result_write(pool, task, applied).await;
+            if let Some(token) = circuit_token
+                && breakers.on_claim_lost(
+                    activity_name,
+                    token,
+                    claim_key,
+                    lost_to_timeout && breakers.has_policy(activity_name),
+                    std::time::Instant::now(),
+                ) == Some(crate::circuit_breaker::CircuitTransition::Tripped)
+            {
+                telemetry.metrics.record_circuit_tripped(activity_name);
+            }
+            lost_to_timeout
+        }
+    };
     if drained
         && let Err(payload) = &activity_result
         && (!started || !failure_is_non_retryable(payload, retry_policy.as_ref()))
     {
-        let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
-        return release_drained_activity(
-            &mut conn,
-            task,
-            payload,
-            activity_name,
-            registry.telemetry().metrics.as_ref(),
-            started,
-        )
-        .await;
+        let released =
+            match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
+                Ok(mut conn) => {
+                    release_drained_activity(
+                        &mut conn,
+                        task,
+                        payload,
+                        activity_name,
+                        registry.telemetry().metrics.as_ref(),
+                        started,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+        attempt_metrics.counted_by_enforcer = settle_drained(released.as_ref().ok().copied()).await;
+        return released.map(|_| ());
     }
     let attempt = ActivityAttempt {
         task,
@@ -17983,7 +18019,11 @@ async fn process_activity_task(
     // A failed write still releases an admitted probe, without a trip. A
     // lost claim counts only when a timeout took it (see `on_claim_lost`).
     let mut applied = finalized.as_ref().ok().copied();
-    // A cancelled attempt took its record above, and reports no outcome.
+    // A cancelled attempt took its record above, and reports no outcome. A
+    // drained one takes it now, after its write.
+    if drained && circuit_outcome.is_none() {
+        attempt_metrics.counted_by_enforcer = settle_drained(applied).await;
+    }
     if circuit_outcome.is_some() {
         (applied, attempt_metrics.counted_by_enforcer) =
             settle_result_write(pool, task, applied).await;
