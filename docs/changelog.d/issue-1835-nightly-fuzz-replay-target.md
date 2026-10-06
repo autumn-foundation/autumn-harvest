@@ -5,9 +5,10 @@ the replayer with structured histories. There is no new `WorkflowEvent`
 variant, no migration and no change to engine behavior.
 
 **Nightly job.** `.github/workflows/fuzz-nightly.yml` runs all five targets
-each night for 600 seconds, one job per target. The actions cache keeps each
-corpus. Each run restores the newest corpus and saves its own under a new
-key, also after a crash. A failed scheduled run uploads the crash input and
+each night for 600 seconds, one job per target. A run artifact keeps each
+corpus for 30 days. Each run downloads the newest corpus of this repository
+and uploads its own, also after a crash. The actions cache is not used,
+because the CI build caches made GitHub evict a corpus within minutes. A failed scheduled run uploads the crash input and
 opens an issue. A pull request that changes the harness runs each target for
 60 seconds. The manual `fuzz-smoke` job in `ci.yml` is gone, because the new
 workflow runs on demand too. The guard `fuzz_nightly_wiring.rs` checks the

@@ -253,11 +253,15 @@ MAX_TOTAL_TIME=60 ./fuzz/smoke.sh
 `.github/workflows/fuzz-nightly.yml` runs every target each night for 600
 seconds, one job per target (issue #1835).
 
-- **Corpus.** The actions cache keeps each target's corpus. A cache key is
-  immutable, so each run saves under a new key. The next run restores the
-  newest one through `restore-keys`. The save runs also after a crash.
-  `cargo fuzz cmin` keeps the corpus small. GitHub evicts a cache that no
-  run reads for 7 days; the fuzzer then starts again from the seeds.
+- **Corpus.** Each run uploads each target's corpus as the artifact
+  `fuzz-corpus-<target>`, also after a crash. `cargo fuzz cmin` keeps it
+  small. The next run downloads the newest one from a run of this
+  repository. It prefers its own branch, then the default branch, and never
+  takes a fork's corpus. An artifact stays 30 days, or 7 days for a pull
+  request. With none left, the fuzzer starts again from the seeds.
+- **Why not the actions cache.** The CI build caches fill the repository's
+  cache budget. In a test on the pull request, GitHub evicted every corpus
+  entry within 11 minutes, so a nightly corpus would never survive a day.
 - **Crash.** The crash input is uploaded as `fuzz-artifacts-<target>`. A
   failed scheduled run opens the issue "Fuzz nightly: a scheduled run
   failed", or comments on the open one. Fix the bug and commit the input to

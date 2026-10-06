@@ -2,17 +2,17 @@
 #
 # Each fuzz target runs in its own job, for 600 seconds by default.
 #
-# - `corpus`: the actions cache keeps each target's corpus. A key is
-#   immutable, so each run saves under a new key. The next run restores the
-#   newest key through `restore-keys`. The save runs also after a crash.
-#   GitHub evicts a cache that no run reads for 7 days. The fuzzer then
-#   starts again from the seeds.
+# - `corpus`: each run uploads each target's corpus as an artifact, also
+#   after a crash. The next run downloads the newest one. The actions cache
+#   is not used: the CI build caches fill it, so GitHub evicted a corpus
+#   entry within minutes. An artifact stays for its retention period.
+#   With no artifact left, the fuzzer starts again from the seeds.
 # - `seeds`: `fuzz/seeds/<target>/` is read too. It holds the committed
 #   reproducers, such as the #1253 and #1758 envelope look-alikes.
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. The crash input is a run artifact.
 # - `pull_request`: a change to the fuzz harness runs each target for 60
-#   seconds. That checks the wiring and the cache before the merge.
+#   seconds. That checks the wiring and the corpus cycle before the merge.
 #
 # `autumn-harvest/tests/integration/fuzz_nightly_wiring.rs` guards this
 # file. `docs/testing/property-and-fuzz.md` tells how to reproduce a crash.
@@ -64,6 +64,10 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # `actions: read` lists and downloads the corpus artifacts.
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -100,11 +104,33 @@ jobs:
           cp ../Cargo.lock Cargo.lock
           cargo +"${FUZZ_TOOLCHAIN}" fuzz build "${TARGET}"
       - name: Restore the corpus
-        uses: actions/cache/restore@v4
-        with:
-          path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: fuzz-corpus-${{ matrix.target }}-
+        # The newest corpus artifact of this target, from a run of this
+        # repository. Runs of a fork are skipped, so a fork cannot seed the
+        # nightly. A run prefers its own branch, then the default branch.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_ID: ${{ github.repository_id }}
+          OWN_BRANCH: ${{ github.head_ref || github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          dest="fuzz/corpus/${TARGET}"
+          mkdir -p "${dest}"
+          run_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=fuzz-corpus-${TARGET}&per_page=100" --jq '
+            [.artifacts[]
+             | select(.expired | not)
+             | select(.workflow_run.head_repository_id == ($ENV.REPO_ID | tonumber))
+             | select(.workflow_run.head_branch == $ENV.OWN_BRANCH
+                 or .workflow_run.head_branch == $ENV.DEFAULT_BRANCH)]
+            | (map(select(.workflow_run.head_branch == $ENV.OWN_BRANCH)) + .)
+            | .[0].workflow_run.id // empty')"
+          if [ -z "${run_id}" ]; then
+            echo "no corpus artifact; the fuzzer starts from the seeds"
+            exit 0
+          fi
+          gh run download "${run_id}" --repo "${GITHUB_REPOSITORY}" \
+            --name "fuzz-corpus-${TARGET}" --dir "${dest}"
+          echo "restored the corpus of run ${run_id}"
       - name: Fuzz
         id: fuzz
         working-directory: fuzz
@@ -129,10 +155,13 @@ jobs:
           echo "corpus size after: $(find "corpus/${TARGET}" -type f | wc -l)"
       - name: Save the corpus
         if: always() && hashFiles(format('fuzz/corpus/{0}/**', matrix.target)) != ''
-        uses: actions/cache/save@v4
+        uses: actions/upload-artifact@v4
         with:
+          name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # A re-run attempt replaces the corpus of the earlier attempt.
+          overwrite: true
+          retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
       - name: Upload the crash input
         if: failure()
         uses: actions/upload-artifact@v4

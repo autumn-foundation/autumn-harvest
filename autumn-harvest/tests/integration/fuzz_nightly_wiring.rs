@@ -1,7 +1,8 @@
 //! Guard for the nightly fuzz workflow (issue #1835). No DB, no feature gate.
 //!
 //! `fuzz-nightly.yml` must fuzz every target on a cron. It must restore the
-//! corpus before the run and save it after the run, also after a crash. A
+//! corpus artifact before the run and upload it after the run, also after a
+//! crash. A
 //! failed scheduled run must open an issue. The target lists in
 //! `fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow must agree, and so
 //! must the nightly toolchain that the two files pin.
@@ -14,8 +15,14 @@ const FUZZ_CARGO_TOML: &str = include_str!("../../../fuzz/Cargo.toml");
 const FUZZ_SMOKE_SH: &str = include_str!("../../../fuzz/smoke.sh");
 const NIGHTLY: &str = ".github/workflows/fuzz-nightly.yml";
 
-/// The path that both cache steps must name.
+/// The path that the upload step must name.
 const CORPUS_PATH: &str = "fuzz/corpus/${{ matrix.target }}";
+
+/// The artifact name that the upload step must use.
+const CORPUS_ARTIFACT: &str = "fuzz-corpus-${{ matrix.target }}";
+
+/// The same artifact name, as the restore script spells it.
+const CORPUS_ARTIFACT_SH: &str = "fuzz-corpus-${TARGET}";
 
 /// The `name` of each `[[bin]]` in `fuzz/Cargo.toml`.
 fn cargo_targets(toml: &str) -> BTreeSet<String> {
@@ -83,21 +90,28 @@ fn str_at<'a>(node: &'a serde_yaml::Value, path: &[&str]) -> &'a str {
 
 /// True when a job restores the corpus before it fuzzes and saves it after.
 ///
-/// The restore step must fall back to the newest earlier corpus through
-/// `restore-keys`, and the save key must start with that prefix. The save
-/// key must be unique to the run, because a cache key is immutable. The save
-/// must run also after a failed step, so a crash does not discard the corpus
-/// that the run grew. The fuzz step must not hide its own failure.
+/// The corpus lives in a run artifact, not in the actions cache. The CI
+/// build caches fill the cache, and GitHub evicted a corpus entry within
+/// minutes. The restore script downloads the newest artifact of the same
+/// name. It must skip artifacts of a fork run, so a fork cannot seed the
+/// nightly, and it needs `actions: read`. The upload must run also after a
+/// failed step, so a crash does not discard the corpus that the run grew. It
+/// must overwrite, so a re-run attempt can upload again. The fuzz step must
+/// not hide its own failure.
 fn persists_the_corpus(job: &serde_yaml::Value) -> bool {
     let steps = steps(job);
-    let find = |uses: &str| {
-        steps.iter().position(|s| {
-            str_at(s, &["uses"]).starts_with(uses) && str_at(s, &["with", "path"]) == CORPUS_PATH
-        })
-    };
-    let (Some(r), Some(sv)) = (find("actions/cache/restore@"), find("actions/cache/save@")) else {
-        return false;
-    };
+    let restore = steps.iter().position(|s| {
+        let run = str_at(s, &["run"]);
+        run.contains("gh run download")
+            && run.contains(CORPUS_ARTIFACT_SH)
+            && run.contains("fuzz/corpus/${TARGET}")
+            && run.contains("head_repository_id")
+    });
+    let save = steps.iter().position(|s| {
+        str_at(s, &["uses"]).starts_with("actions/upload-artifact@")
+            && str_at(s, &["with", "path"]) == CORPUS_PATH
+            && str_at(s, &["with", "name"]) == CORPUS_ARTIFACT
+    });
     let fuzz = steps.iter().position(|s| {
         let run = str_at(s, &["run"]);
         ungated(s)
@@ -105,14 +119,19 @@ fn persists_the_corpus(job: &serde_yaml::Value) -> bool {
             && run.contains("corpus/")
             && run.contains("seeds/")
     });
-    let (restore, save) = (steps[r], steps[sv]);
-    let prefix = str_at(restore, &["with", "restore-keys"]);
-    let key = str_at(save, &["with", "key"]);
-    !prefix.is_empty()
-        && key.starts_with(prefix)
-        && key == str_at(restore, &["with", "key"])
-        && key.contains("${{ github.run_id }}")
-        && str_at(save, &["if"]).contains("always()")
+    let (Some(r), Some(sv)) = (restore, save) else {
+        return false;
+    };
+    let upload = steps[sv];
+    let overwrites = upload
+        .get("with")
+        .and_then(|w| w.get("overwrite"))
+        .and_then(serde_yaml::Value::as_bool)
+        == Some(true);
+    str_at(job, &["env", "TARGET"]) == "${{ matrix.target }}"
+        && str_at(job, &["permissions", "actions"]) == "read"
+        && str_at(upload, &["if"]).contains("always()")
+        && overwrites
         && fuzz.is_some_and(|f| r < f && f < sv)
 }
 
@@ -208,8 +227,9 @@ fn fuzz_nightly_runs_on_a_cron_with_a_persisted_corpus() {
     );
     assert!(
         persists_the_corpus(fuzz),
-        "the `fuzz` job must restore {CORPUS_PATH}, fuzz with corpus/ and seeds/, \
-         then save it under a run-unique key with `if: always()`"
+        "the `fuzz` job must download the {CORPUS_ARTIFACT} artifact of a run of this \
+         repository, fuzz with corpus/ and seeds/, then upload {CORPUS_PATH} with \
+         `if: always()` and `overwrite: true`"
     );
     assert!(
         alerts_on_scheduled_failure(&doc["jobs"]["alert"], "fuzz"),
@@ -220,55 +240,57 @@ fn fuzz_nightly_runs_on_a_cron_with_a_persisted_corpus() {
 /// Self-test: each missing part of the corpus cycle fails the check.
 #[test]
 fn corpus_check_rejects_a_broken_cycle() {
-    let restore = "      - uses: actions/cache/restore@v4\n        with:\n          path: \
-                   fuzz/corpus/${{ matrix.target }}\n          key: k-${{ github.run_id }}\n          \
-                   restore-keys: k-\n";
+    let head =
+        "    env:\n      TARGET: ${{ matrix.target }}\n    permissions:\n      actions: read\n";
+    let restore = "      - run: |\n          id=$(gh api x --jq 'select(.head_repository_id)')\n          \
+                   gh run download \"$id\" --name fuzz-corpus-${TARGET} --dir fuzz/corpus/${TARGET}\n";
     let fuzz = "      - run: cargo +nightly fuzz run t corpus/t seeds/t\n";
-    let save = "      - uses: actions/cache/save@v4\n        if: always()\n        with:\n          \
-                path: fuzz/corpus/${{ matrix.target }}\n          key: k-${{ github.run_id }}\n";
-    let job = |steps: &str| {
-        let text = format!("jobs:\n  fuzz:\n    runs-on: x\n    steps:\n{steps}");
+    let save = "      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          \
+                name: fuzz-corpus-${{ matrix.target }}\n          path: fuzz/corpus/${{ matrix.target }}\n          \
+                overwrite: true\n";
+    let job = |head: &str, steps: &str| {
+        let text = format!("jobs:\n  fuzz:\n    runs-on: x\n{head}    steps:\n{steps}");
         let doc = parse_workflow_text(&text).expect("synthetic workflow must parse");
         persists_the_corpus(&doc["jobs"]["fuzz"])
     };
-    assert!(job(&format!("{restore}{fuzz}{save}")));
-    assert!(!job(&format!("{fuzz}{save}")), "no restore");
-    assert!(!job(&format!("{restore}{fuzz}")), "no save");
-    assert!(!job(&format!("{save}{fuzz}{restore}")), "wrong order");
-    let no_fallback = restore.replace("          restore-keys: k-\n", "");
+    assert!(job(head, &format!("{restore}{fuzz}{save}")));
+    assert!(!job(head, &format!("{fuzz}{save}")), "no restore");
+    assert!(!job(head, &format!("{restore}{fuzz}")), "no save");
+    assert!(!job(head, &format!("{save}{fuzz}{restore}")), "wrong order");
+    let no_read = head.replace("    permissions:\n      actions: read\n", "");
     assert!(
-        !job(&format!("{no_fallback}{fuzz}{save}")),
-        "no restore-keys"
+        !job(&no_read, &format!("{restore}{fuzz}{save}")),
+        "no `actions: read`"
     );
-    let fixed_key = save.replace("k-${{ github.run_id }}", "k-fixed");
+    let trusts_forks = restore.replace("select(.head_repository_id)", "true");
     assert!(
-        !job(&format!("{restore}{fuzz}{fixed_key}")),
-        "an immutable key"
+        !job(head, &format!("{trusts_forks}{fuzz}{save}")),
+        "a restore that takes a fork's corpus"
+    );
+    let other_name = save.replace("name: fuzz-corpus-", "name: corpus-");
+    assert!(
+        !job(head, &format!("{restore}{fuzz}{other_name}")),
+        "an upload name that the restore never reads"
     );
     let skipped_on_crash = save.replace("        if: always()\n", "");
     assert!(
-        !job(&format!("{restore}{fuzz}{skipped_on_crash}")),
-        "a save that a crash skips"
+        !job(head, &format!("{restore}{fuzz}{skipped_on_crash}")),
+        "an upload that a crash skips"
+    );
+    let no_overwrite = save.replace("          overwrite: true\n", "");
+    assert!(
+        !job(head, &format!("{restore}{fuzz}{no_overwrite}")),
+        "an upload that a re-run attempt cannot repeat"
     );
     let no_seeds = fuzz.replace(" seeds/t", "");
     assert!(
-        !job(&format!("{restore}{no_seeds}{save}")),
+        !job(head, &format!("{restore}{no_seeds}{save}")),
         "no seed corpus"
     );
     let soft_fuzz = format!("{fuzz}        continue-on-error: true\n");
     assert!(
-        !job(&format!("{restore}{soft_fuzz}{save}")),
+        !job(head, &format!("{restore}{soft_fuzz}{save}")),
         "a fuzz step that hides a crash"
-    );
-    let other_prefix = restore.replace("restore-keys: k-", "restore-keys: other-");
-    assert!(
-        !job(&format!("{other_prefix}{fuzz}{save}")),
-        "a save key that restore-keys never matches"
-    );
-    let other_key = save.replace("key: k-", "key: k-x-");
-    assert!(
-        !job(&format!("{restore}{fuzz}{other_key}")),
-        "restore and save keys that differ"
     );
 }
 
