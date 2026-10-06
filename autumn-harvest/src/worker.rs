@@ -570,6 +570,9 @@ pub struct HandlerRegistry {
     circuit_breakers: Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
     /// Per-activity-type retry budgets (issue #1793). On by default.
     retry_budgets: Arc<crate::retry_budget::RetryBudgetRegistry>,
+    /// Per-activity-type adaptive concurrency limits (issue #1836). Off by
+    /// default.
+    adaptive_limits: Arc<crate::adaptive_limit::AdaptiveLimitRegistry>,
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
@@ -803,6 +806,7 @@ impl HandlerRegistry {
             crate::retry_budget::RetryBudgetRegistry::default()
                 .with_metrics(Arc::clone(&telemetry.metrics)),
         );
+        let adaptive_limits = Arc::new(crate::adaptive_limit::AdaptiveLimitRegistry::default());
         Self {
             workflows,
             activities,
@@ -822,6 +826,7 @@ impl HandlerRegistry {
                 circuit_policies,
             )),
             retry_budgets,
+            adaptive_limits,
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
@@ -1217,6 +1222,22 @@ impl HandlerRegistry {
         Arc::clone(&self.retry_budgets)
     }
 
+    /// Set the per-activity-type adaptive concurrency limits (issue #1836).
+    ///
+    /// Mirrors [`crate::builder::WorkerConfig::with_adaptive_limit`]. The
+    /// default limits no type.
+    #[must_use]
+    pub fn with_adaptive_limit(self, _config: crate::adaptive_limit::AdaptiveLimitConfig) -> Self {
+        self
+    }
+
+    /// Access the per-activity-type adaptive concurrency limits (issue
+    /// #1836).
+    #[must_use]
+    pub fn adaptive_limits(&self) -> Arc<crate::adaptive_limit::AdaptiveLimitRegistry> {
+        Arc::clone(&self.adaptive_limits)
+    }
+
     /// History-size guardrails applied to workflow contexts run by this registry.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -1493,6 +1514,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("workflow_log_policy", &self.workflow_log_policy)
             .field("circuit_breakers", &self.circuit_breakers)
             .field("retry_budgets", &self.retry_budgets)
+            .field("adaptive_limits", &self.adaptive_limits)
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
@@ -15566,6 +15588,112 @@ mod retry_budget_gate_tests {
         let (_, probe) = tokens();
         assert!(!retry_budget_gates(Some(probe), true));
         assert!(retry_budget_gates(Some(probe), false));
+    }
+}
+
+/// Whether the adaptive limit gates this attempt (issue #1836).
+///
+/// A `None` token is a circuit short-circuit. It never reaches the
+/// dependency, so it takes no slot. A half-open probe is the breaker's
+/// recovery signal, so the limit never defers it.
+const fn adaptive_limit_gates(_circuit_token: Option<crate::circuit_breaker::DispatchToken>) -> bool {
+    false
+}
+
+/// The adaptive limit sample for one breaker outcome (issue #1836).
+///
+/// `None` is a cancelled attempt. It says nothing about the dependency, so
+/// it gives no sample.
+const fn limit_sample_outcome(
+    _outcome: Option<crate::circuit_breaker::AttemptOutcome>,
+) -> Option<crate::adaptive_limit::SampleOutcome> {
+    None
+}
+
+/// The activity names that a claim must skip (issue #1836).
+///
+/// These are the names with unmet requirements, plus the types at their
+/// adaptive limit. The common case has no saturated type and allocates
+/// nothing.
+fn claim_exclusions(
+    ineligible: &[String],
+    _saturated: Vec<String>,
+) -> std::borrow::Cow<'_, [String]> {
+    std::borrow::Cow::Borrowed(ineligible)
+}
+
+#[cfg(test)]
+mod adaptive_limit_gate_tests {
+    use super::{adaptive_limit_gates, claim_exclusions, limit_sample_outcome};
+    use crate::adaptive_limit::SampleOutcome;
+    use crate::circuit_breaker::{
+        AttemptOutcome, CircuitBreakerRegistry, DispatchDecision, DispatchToken,
+    };
+    use crate::policy::CircuitBreakerPolicy;
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// A normal token, and a half-open probe token from a tripped breaker.
+    fn tokens() -> (DispatchToken, DispatchToken) {
+        let policy = CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(5));
+        let reg = CircuitBreakerRegistry::new(HashMap::from([("act".to_owned(), policy)]));
+        let t0 = Instant::now();
+        let DispatchDecision::Allow { token: normal } = reg.on_dispatch("act", t0) else {
+            panic!("a closed breaker allows");
+        };
+        let _ = reg.on_result("act", AttemptOutcome::RetryableFailure, normal, t0);
+        let DispatchDecision::Allow { token: probe } =
+            reg.on_dispatch("act", t0 + Duration::from_secs(6))
+        else {
+            panic!("the cooldown admits a probe");
+        };
+        (normal, probe)
+    }
+
+    #[test]
+    fn only_a_real_non_probe_call_takes_a_slot() {
+        let (normal, probe) = tokens();
+        assert!(adaptive_limit_gates(Some(normal)));
+        assert!(!adaptive_limit_gates(Some(probe)));
+        assert!(!adaptive_limit_gates(None));
+    }
+
+    /// Only a retryable failure signals overload. A bad-input failure
+    /// proves that the dependency answered.
+    #[test]
+    fn breaker_outcomes_map_to_limit_samples() {
+        assert_eq!(
+            limit_sample_outcome(Some(AttemptOutcome::Success)),
+            Some(SampleOutcome::Answered)
+        );
+        assert_eq!(
+            limit_sample_outcome(Some(AttemptOutcome::NonRetryableFailure)),
+            Some(SampleOutcome::Answered)
+        );
+        assert_eq!(
+            limit_sample_outcome(Some(AttemptOutcome::RetryableFailure)),
+            Some(SampleOutcome::Overloaded)
+        );
+        assert_eq!(limit_sample_outcome(None), None);
+    }
+
+    #[test]
+    fn claim_exclusions_borrow_when_no_type_is_saturated() {
+        let ineligible = vec!["gpu_job".to_owned()];
+        let out = claim_exclusions(&ineligible, Vec::new());
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), ineligible.as_slice());
+    }
+
+    #[test]
+    fn claim_exclusions_add_the_saturated_types() {
+        let ineligible = vec!["gpu_job".to_owned()];
+        let out = claim_exclusions(&ineligible, vec!["charge_card".to_owned()]);
+        assert_eq!(
+            out.as_ref(),
+            ["gpu_job".to_owned(), "charge_card".to_owned()].as_slice()
+        );
     }
 }
 
@@ -37310,6 +37438,7 @@ mod tests {
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
             retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
+            adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

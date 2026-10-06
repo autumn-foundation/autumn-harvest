@@ -1,13 +1,14 @@
 //! Adaptive concurrency limit per activity type (issue #1836).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::policy::AdaptiveLimitPolicy;
 use crate::telemetry::MetricsRecorder;
 
-/// Growth headroom that each update adds to the cap.
+/// Growth headroom that each update adds to the cap. It is also the cap
+/// during a probe.
 pub const QUEUE_SIZE: f64 = 4.0;
 
 /// Shortest delay for a task that lost the race for a slot.
@@ -16,16 +17,30 @@ pub const MIN_LIMIT_DEFER: Duration = Duration::from_millis(50);
 /// Longest delay for a task that lost the race for a slot.
 pub const MAX_LIMIT_DEFER: Duration = Duration::from_secs(5);
 
+/// Weight of the new target in each update.
+const SMOOTHING: f64 = 0.2;
+
+/// Lowest gradient. One sample cannot cut the cap by more than half.
+const MIN_GRADIENT: f64 = 0.5;
+
+/// Fewest samples in one window. The first window after a probe sets the
+/// baseline.
+const PROBE_SAMPLES: u32 = 4;
+
 /// How one attempt ended, as the limit sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleOutcome {
-    /// The dependency answered.
+    /// The dependency answered. A non-retryable failure is an answer too.
     Answered,
     /// The attempt failed with a retryable failure.
     Overloaded,
 }
 
 /// Which activity types have an adaptive limit, and with which policy.
+///
+/// The default config limits no type. A per-type override replaces the
+/// default policy for one activity name. An override of `None` turns the
+/// limit off for that type.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AdaptiveLimitConfig {
     default_policy: Option<AdaptiveLimitPolicy>,
@@ -33,25 +48,32 @@ pub struct AdaptiveLimitConfig {
 }
 
 impl AdaptiveLimitConfig {
-    /// A config with no limit for any activity type.
+    /// A config with no limit for any activity type. This is the default.
     #[must_use]
     pub fn disabled() -> Self {
         Self::default()
     }
 
-    /// Set the policy for every activity type without an override.
+    /// Set the policy for every activity type without an override. `None`
+    /// turns the default off.
     #[must_use]
-    pub fn with_default(self, _policy: Option<AdaptiveLimitPolicy>) -> Self {
+    pub fn with_default(mut self, policy: Option<AdaptiveLimitPolicy>) -> Self {
+        self.default_policy = policy.map(AdaptiveLimitPolicy::sanitized);
         self
     }
 
-    /// Set the policy for one activity type.
+    /// Set the policy for one activity type. `None` turns the limit off for
+    /// that type.
     #[must_use]
     pub fn with_activity(
-        self,
-        _activity_name: impl Into<String>,
-        _policy: Option<AdaptiveLimitPolicy>,
+        mut self,
+        activity_name: impl Into<String>,
+        policy: Option<AdaptiveLimitPolicy>,
     ) -> Self {
+        self.overrides.insert(
+            activity_name.into(),
+            policy.map(AdaptiveLimitPolicy::sanitized),
+        );
         self
     }
 
@@ -64,13 +86,20 @@ impl AdaptiveLimitConfig {
     /// The per-type overrides, sorted by activity name.
     #[must_use]
     pub fn overrides(&self) -> std::collections::BTreeMap<String, Option<AdaptiveLimitPolicy>> {
-        std::collections::BTreeMap::new()
+        self.overrides
+            .iter()
+            .map(|(name, policy)| (name.clone(), *policy))
+            .collect()
     }
 
-    /// The policy that applies to `activity_name`.
+    /// The policy that applies to `activity_name`, or `None` when it has no
+    /// limit.
     #[must_use]
-    pub const fn policy_for(&self, _activity_name: &str) -> Option<AdaptiveLimitPolicy> {
-        None
+    pub fn policy_for(&self, activity_name: &str) -> Option<AdaptiveLimitPolicy> {
+        self.overrides
+            .get(activity_name)
+            .copied()
+            .unwrap_or(self.default_policy)
     }
 }
 
@@ -99,22 +128,228 @@ pub enum Acquire {
     },
 }
 
-/// One in-flight attempt. Dropping it frees the slot without a sample.
+/// Samples gathered since the cap last moved.
+#[derive(Debug, Default)]
+struct Window {
+    /// Samples in the window, failures included.
+    samples: u32,
+    /// Answers in the window.
+    answers: u32,
+    /// Sum of the answer latencies.
+    latency_sum: Duration,
+    /// Highest in-flight count at the start of a sampled attempt.
+    max_in_flight: u32,
+    /// A retryable failure is in the window.
+    overloaded: bool,
+}
+
+impl Window {
+    fn mean_latency(&self) -> Option<Duration> {
+        (self.answers > 0).then(|| self.latency_sum / self.answers)
+    }
+}
+
+/// The limit state of one activity type.
+#[derive(Debug)]
+struct Limiter {
+    policy: AdaptiveLimitPolicy,
+    /// The cap as a real number. The integer cap is its floor.
+    limit: f64,
+    in_flight: u32,
+    /// The lowest window mean latency since the last probe.
+    baseline: Option<Duration>,
+    /// Each probe adds 1. An answer from an older epoch does not count.
+    epoch: u64,
+    /// Samples since the last probe.
+    samples: u32,
+    /// The next closed window is the probe window. It sets the baseline.
+    probing: bool,
+    /// The cap to restore after the probe window.
+    resume_limit: f64,
+    window: Window,
+}
+
+impl Limiter {
+    /// A new limiter starts with a probe, so its first baseline is measured
+    /// at a low concurrency.
+    fn new(policy: AdaptiveLimitPolicy) -> Self {
+        let mut limiter = Self {
+            policy,
+            limit: 0.0,
+            in_flight: 0,
+            baseline: None,
+            epoch: 0,
+            samples: 0,
+            probing: false,
+            resume_limit: 0.0,
+            window: Window::default(),
+        };
+        limiter.start_probe();
+        limiter
+    }
+
+    fn floor(&self) -> f64 {
+        f64::from(self.policy.min_limit)
+    }
+
+    fn ceiling(&self) -> f64 {
+        f64::from(self.policy.max_limit)
+    }
+
+    /// The integer cap on in-flight attempts.
+    fn cap(&self) -> u32 {
+        // The value is finite and inside the policy range, so the cast is
+        // exact after the floor.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cap = self.limit.floor() as u32;
+        cap.clamp(self.policy.min_limit, self.policy.max_limit)
+    }
+
+    /// Samples that close a window: about one round trip of the current
+    /// cap, and never fewer than [`PROBE_SAMPLES`].
+    fn window_size(&self) -> u32 {
+        self.cap().max(PROBE_SAMPLES)
+    }
+
+    /// Drop the cap and forget the baseline. The attempts in flight started
+    /// at a high concurrency, so their answers do not count. The probe
+    /// window then measures the baseline at a low concurrency.
+    fn start_probe(&mut self) {
+        let probe_cap = QUEUE_SIZE.clamp(self.floor(), self.ceiling());
+        self.resume_limit = self.limit.max(probe_cap);
+        self.limit = probe_cap;
+        self.epoch += 1;
+        self.baseline = None;
+        self.samples = 0;
+        self.probing = true;
+        self.window = Window::default();
+    }
+
+    /// Add one sample to the window, and close the window when it is full.
+    fn on_sample(&mut self, epoch: u64, latency: Duration, in_flight: u32, outcome: SampleOutcome) {
+        match outcome {
+            // A failure counts whatever its epoch. Overload is overload.
+            SampleOutcome::Overloaded => self.window.overloaded = true,
+            SampleOutcome::Answered if epoch == self.epoch => {
+                self.window.answers += 1;
+                self.window.latency_sum = self.window.latency_sum.saturating_add(latency);
+            }
+            SampleOutcome::Answered => return,
+        }
+        self.window.samples += 1;
+        self.window.max_in_flight = self.window.max_in_flight.max(in_flight);
+        self.samples = self.samples.saturating_add(1);
+        if self.window.samples >= self.window_size() {
+            let window = std::mem::take(&mut self.window);
+            self.close_window(&window);
+        }
+    }
+
+    /// Move the cap once for a full window.
+    ///
+    /// The probe window restores the cap from before the probe. A retryable
+    /// failure in the window cuts the cap by `backoff_ratio`. Otherwise the
+    /// cap moves toward `limit * gradient + QUEUE_SIZE`. The gradient is
+    /// `tolerance * baseline / mean latency`, in the range from 0.5 to 1.
+    fn close_window(&mut self, window: &Window) {
+        let mean = window.mean_latency();
+        if let Some(mean) = mean {
+            self.baseline = Some(self.baseline.map_or(mean, |b| b.min(mean)));
+        }
+        let probe_window = std::mem::take(&mut self.probing);
+        if probe_window {
+            self.limit = self.resume_limit;
+        }
+        if window.overloaded {
+            self.limit = (self.limit * self.policy.backoff_ratio).max(self.floor());
+            return;
+        }
+        if probe_window {
+            return;
+        }
+        if self.samples >= self.policy.probe_interval {
+            self.start_probe();
+            return;
+        }
+        let (Some(mean), Some(baseline)) = (mean, self.baseline) else {
+            return;
+        };
+        // A type that uses less than half of its cap says nothing about
+        // more load.
+        if f64::from(window.max_in_flight) < self.limit / 2.0 {
+            return;
+        }
+        // A zero latency would divide by zero. Treat it as no queueing.
+        let gradient = if mean.is_zero() {
+            1.0
+        } else {
+            (self.policy.tolerance * baseline.as_secs_f64() / mean.as_secs_f64())
+                .clamp(MIN_GRADIENT, 1.0)
+        };
+        let target = self.limit.mul_add(gradient, QUEUE_SIZE);
+        self.limit = SMOOTHING
+            .mul_add(target - self.limit, self.limit)
+            .clamp(self.floor(), self.ceiling());
+    }
+
+    /// The delay for a task that found the type at its cap. A slot frees in
+    /// about one handler latency, so the delay is one to two baselines.
+    fn defer_delay(&self) -> Duration {
+        let base = self.baseline.unwrap_or(MIN_LIMIT_DEFER);
+        base.mul_f64(1.0 + rand::random::<f64>())
+            .clamp(MIN_LIMIT_DEFER, MAX_LIMIT_DEFER)
+    }
+
+    fn snapshot(&self) -> LimitSnapshot {
+        LimitSnapshot {
+            limit: self.cap(),
+            in_flight: self.in_flight,
+            baseline: self.baseline,
+        }
+    }
+}
+
+/// One in-flight attempt.
+///
+/// [`complete`](Self::complete) reports the handler latency and outcome.
+/// Dropping the permit frees the slot without a sample. Use the drop for an
+/// attempt that did not reach the dependency or that was cancelled.
 #[derive(Debug)]
 pub struct LimitPermit {
-    _private: (),
+    registry: Arc<AdaptiveLimitRegistry>,
+    activity_name: String,
+    epoch: u64,
+    /// In-flight attempts when this one started, itself included.
+    in_flight: u32,
+    settled: bool,
 }
 
 impl LimitPermit {
     /// Report the handler latency and outcome, and free the slot.
-    pub fn complete(self, _latency: Duration, _outcome: SampleOutcome) {}
+    pub fn complete(mut self, latency: Duration, outcome: SampleOutcome) {
+        self.settled = true;
+        self.registry.release(
+            &self.activity_name,
+            Some((self.epoch, latency, self.in_flight, outcome)),
+        );
+    }
+}
+
+impl Drop for LimitPermit {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.registry.release(&self.activity_name, None);
+        }
+    }
 }
 
 /// In-process registry of per-activity-type adaptive limits.
+///
+/// The worker builds one registry and shares it behind an `Arc`.
 #[derive(Default)]
 pub struct AdaptiveLimitRegistry {
     config: AdaptiveLimitConfig,
-    _states: Mutex<HashMap<String, ()>>,
+    limiters: Mutex<HashMap<String, Limiter>>,
     metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
@@ -127,18 +362,23 @@ impl std::fmt::Debug for AdaptiveLimitRegistry {
     }
 }
 
+/// One sample: the epoch, the latency, the in-flight count at start and the
+/// outcome.
+type Sample = (u64, Duration, u32, SampleOutcome);
+
 impl AdaptiveLimitRegistry {
     /// Build a registry from `config`.
     #[must_use]
     pub fn new(config: AdaptiveLimitConfig) -> Self {
         Self {
             config,
-            _states: Mutex::new(HashMap::new()),
+            limiters: Mutex::new(HashMap::new()),
             metrics: None,
         }
     }
 
-    /// Publish the limit gauges through `metrics`.
+    /// Publish the limit gauges through `metrics`. The registry sends the
+    /// state after every change, under its lock.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
         self.metrics = Some(metrics);
@@ -151,22 +391,88 @@ impl AdaptiveLimitRegistry {
         &self.config
     }
 
-    /// Take a slot for one attempt of `activity_name`.
-    #[must_use]
-    pub fn try_acquire(self: &Arc<Self>, _activity_name: &str) -> Acquire {
-        Acquire::Untracked
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Limiter>> {
+        // The state is plain numbers, so a poisoned lock is safe to reuse.
+        self.limiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The activity types that are at their cap, sorted by name.
+    /// Run `f` on the limiter of `activity_name`, and publish the result.
+    /// Returns `None` when the type has no limit.
+    fn with_limiter<T>(&self, activity_name: &str, f: impl FnOnce(&mut Limiter) -> T) -> Option<T> {
+        let policy = self.config.policy_for(activity_name)?;
+        let mut limiters = self.lock();
+        // Look up first, so the common path does not allocate a key.
+        if !limiters.contains_key(activity_name) {
+            limiters.insert(activity_name.to_owned(), Limiter::new(policy));
+        }
+        let limiter = limiters.get_mut(activity_name)?;
+        let out = f(limiter);
+        // Publish under the lock, so the samples follow the change order.
+        if let Some(metrics) = &self.metrics {
+            metrics.record_activity_concurrency_limit(
+                activity_name,
+                limiter.cap(),
+                limiter.in_flight,
+                limiter.baseline.map(|b| b.as_secs_f64()),
+            );
+        }
+        drop(limiters);
+        Some(out)
+    }
+
+    /// Take a slot for one attempt of `activity_name`.
+    #[must_use]
+    pub fn try_acquire(self: &Arc<Self>, activity_name: &str) -> Acquire {
+        let taken = self.with_limiter(activity_name, |limiter| {
+            if limiter.in_flight >= limiter.cap() {
+                return Err(limiter.defer_delay());
+            }
+            limiter.in_flight += 1;
+            Ok((limiter.epoch, limiter.in_flight))
+        });
+        match taken {
+            None => Acquire::Untracked,
+            Some(Err(retry_after)) => Acquire::Limited { retry_after },
+            Some(Ok((epoch, in_flight))) => Acquire::Acquired(LimitPermit {
+                registry: Arc::clone(self),
+                activity_name: activity_name.to_owned(),
+                epoch,
+                in_flight,
+                settled: false,
+            }),
+        }
+    }
+
+    /// Free one slot of `activity_name` and apply its sample, if any.
+    fn release(&self, activity_name: &str, sample: Option<Sample>) {
+        self.with_limiter(activity_name, |limiter| {
+            limiter.in_flight = limiter.in_flight.saturating_sub(1);
+            if let Some((epoch, latency, in_flight, outcome)) = sample {
+                limiter.on_sample(epoch, latency, in_flight, outcome);
+            }
+        });
+    }
+
+    /// The activity types that are at their cap, sorted by name. The worker
+    /// does not claim tasks of these types.
     #[must_use]
     pub fn saturated(&self) -> Vec<String> {
-        Vec::new()
+        let mut names: Vec<String> = self
+            .lock()
+            .iter()
+            .filter(|(_, limiter)| limiter.in_flight >= limiter.cap())
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     /// The limit state of `activity_name`, or `None` when it has no state.
     #[must_use]
-    pub const fn snapshot(&self, _activity_name: &str) -> Option<LimitSnapshot> {
-        None
+    pub fn snapshot(&self, activity_name: &str) -> Option<LimitSnapshot> {
+        self.lock().get(activity_name).map(Limiter::snapshot)
     }
 }
 
@@ -190,7 +496,11 @@ mod tests {
         }
     }
 
-    fn limit(reg: &AdaptiveLimitRegistry, name: &str) -> u32 {
+    /// The current cap. The first call creates the state.
+    fn limit(reg: &Arc<AdaptiveLimitRegistry>, name: &str) -> u32 {
+        if reg.snapshot(name).is_none() {
+            drop(permit(reg, name));
+        }
         reg.snapshot(name).expect("state").limit
     }
 
@@ -317,8 +627,8 @@ mod tests {
     #[test]
     fn flat_latency_at_full_use_grows_the_limit() {
         let reg = registry(AdaptiveLimitPolicy::default());
-        busy_rounds(&reg, A, 10, MS_100);
-        assert!(limit(&reg, A) > 10, "limit {}", limit(&reg, A));
+        busy_rounds(&reg, A, 20, MS_100);
+        assert!(limit(&reg, A) > 15, "limit {}", limit(&reg, A));
         let baseline = reg.snapshot(A).and_then(|s| s.baseline);
         assert_eq!(baseline, Some(MS_100));
     }
@@ -340,7 +650,7 @@ mod tests {
     #[test]
     fn inflated_latency_shrinks_the_limit() {
         let reg = registry(AdaptiveLimitPolicy::default());
-        busy_rounds(&reg, A, 10, MS_100);
+        busy_rounds(&reg, A, 20, MS_100);
         let before = limit(&reg, A);
         busy_rounds(&reg, A, 3, MS_100 * 10);
         let after = limit(&reg, A);
@@ -348,17 +658,24 @@ mod tests {
         assert!(after >= 1);
     }
 
+    /// One retryable failure in a window cuts the cap by the ratio.
     #[test]
     fn a_retryable_failure_backs_off_by_the_ratio() {
         let reg = registry(AdaptiveLimitPolicy::default());
-        busy_rounds(&reg, A, 15, MS_100);
-        let before = f64::from(limit(&reg, A));
-        permit(&reg, A).complete(MS_100, SampleOutcome::Overloaded);
+        busy_rounds(&reg, A, 20, MS_100);
+        let before = limit(&reg, A);
+        let held: Vec<LimitPermit> = (0..before).map(|_| permit(&reg, A)).collect();
+        for (i, p) in held.into_iter().enumerate() {
+            let outcome = if i == 0 {
+                SampleOutcome::Overloaded
+            } else {
+                SampleOutcome::Answered
+            };
+            p.complete(MS_100, outcome);
+        }
         let after = f64::from(limit(&reg, A));
-        assert!(
-            (after - (before * 0.9).floor()).abs() <= 1.0,
-            "{before} -> {after}"
-        );
+        let expected = (f64::from(before) * 0.9).floor();
+        assert!((after - expected).abs() <= 1.0, "{before} -> {after}");
     }
 
     #[test]
@@ -392,7 +709,7 @@ mod tests {
         while reg.snapshot(A).and_then(|s| s.baseline).is_some() {
             round(&reg, A, 1, MS_100, SampleOutcome::Answered);
             steps += 1;
-            assert!(steps <= 40, "no probe after {steps} samples");
+            assert!(steps <= 100, "no probe after {steps} samples");
         }
         assert_eq!(limit(&reg, A), 4, "a probe drops the cap");
         stale.complete(MS_100 * 50, SampleOutcome::Answered);

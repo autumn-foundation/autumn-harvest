@@ -265,6 +265,38 @@ fn record_retry_budget_available_bridges_gauge_with_activity_label() {
     assert_eq!(labels, vec![("activity", "charge_card")], "issue #1793");
 }
 
+/// The adaptive limit state is three gauges, each labeled by `activity`
+/// (issue #1836).
+#[test]
+fn record_activity_concurrency_limit_bridges_three_gauges() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_activity_concurrency_limit("charge_card", 12, 7, Some(0.25));
+    });
+    for name in [
+        "harvest.activity.concurrency_limit",
+        "harvest.activity.concurrency_in_flight",
+        "harvest.activity.latency_baseline_seconds",
+    ] {
+        let key = find_key(&keys, name, InstrumentKind::Gauge);
+        assert_eq!(labels_of(key), vec![("activity", "charge_card")], "{name}");
+    }
+}
+
+/// With no baseline estimate, the baseline gauge is not touched.
+#[test]
+fn record_activity_concurrency_limit_skips_an_unknown_baseline() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_activity_concurrency_limit("charge_card", 4, 0, None);
+    });
+    assert!(
+        !keys
+            .iter()
+            .any(|(kind, key)| *kind == InstrumentKind::Gauge
+                && key.name() == "harvest.activity.latency_baseline_seconds"),
+        "an unknown baseline must not set the gauge"
+    );
+}
+
 #[test]
 fn record_retry_budget_exhausted_bridges_counter_with_activity_label() {
     let keys = captured_keys(|| {
