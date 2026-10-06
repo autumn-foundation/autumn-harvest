@@ -1534,9 +1534,11 @@ fn parse_http_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 
 /// Parse an RFC 850 date, for example `Sunday, 06-Nov-94 08:49:37 GMT`.
 ///
-/// The two-digit year is in the century of `now`. A year more than 50 years
-/// after `now` moves back 100 years (RFC 9110 section 5.6.7). Chrono's `%y`
-/// uses a fixed pivot instead, so this code sets the century itself.
+/// The two-digit year is in the century of `now`. A date more than 50 years
+/// after `now` moves back 100 years (RFC 9110 section 5.6.7). The cutoff
+/// compares the full timestamp, not only the year. Chrono's `%y` uses a
+/// fixed pivot instead, so this code sets the century itself. The weekday
+/// must match the date that results.
 fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let (weekday, rest) = value.split_once(", ")?;
     let (date, time) = rest.split_once(' ')?;
@@ -1545,15 +1547,23 @@ fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         return None;
     }
     let yy: i32 = two_digit_year.parse().ok()?;
-    let now_year = chrono::Datelike::year(&now);
-    let mut year = now_year - now_year.rem_euclid(100) + yy;
-    if year > now_year + 50 {
-        year -= 100;
-    }
-    let full = format!("{weekday}, {day_month}-{year} {time}");
-    chrono::NaiveDateTime::parse_from_str(&full, "%A, %d-%b-%Y %H:%M:%S GMT")
+    let at_year = |year: i32| {
+        chrono::NaiveDateTime::parse_from_str(
+            &format!("{day_month}-{year} {time}"),
+            "%d-%b-%Y %H:%M:%S GMT",
+        )
         .ok()
         .map(|naive| naive.and_utc())
+    };
+    let now_year = chrono::Datelike::year(&now);
+    let century = now_year - now_year.rem_euclid(100);
+    let cutoff = now.checked_add_months(chrono::Months::new(50 * 12))?;
+    let mut at = at_year(century + yy)?;
+    if at > cutoff {
+        at = at_year(century + yy - 100)?;
+    }
+    let weekday: chrono::Weekday = weekday.parse().ok()?;
+    (chrono::Datelike::weekday(&at) == weekday).then_some(at)
 }
 
 #[cfg(test)]
@@ -1639,6 +1649,23 @@ mod deliverer_trait_tests {
             parse_retry_after("Saturday, 01-Jan-77 00:00:00 GMT", now()),
             Some(std::time::Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn parse_retry_after_applies_the_rfc_850_cutoff_to_the_full_date() {
+        // The cutoff is 50 years after `now` to the second, not to the year.
+        let now = DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 2076-10-07 is past the cutoff, so `76` means 1976.
+        assert_eq!(
+            parse_retry_after("Thursday, 07-Oct-76 00:00:00 GMT", now),
+            Some(std::time::Duration::ZERO)
+        );
+        // 2076-10-05 is inside the cutoff, so `76` means 2076.
+        let ahead =
+            parse_retry_after("Monday, 05-Oct-76 00:00:00 GMT", now).expect("a valid RFC 850 date");
+        assert!(ahead > std::time::Duration::from_secs(49 * 365 * 86_400));
     }
 
     #[test]
