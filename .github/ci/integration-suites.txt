@@ -267,6 +267,7 @@ linux        autumn-harvest-plugin  workflow_reset_integration       -          
 linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -
 linux        autumn-harvest-redis   dispatch_redis                   -                          -
 linux        autumn-harvest-redis   integration_redis                -                          -
+linux        autumn-harvest-redis   tls_redis                        -                          -
 linux        autumn-harvest-redis   worker_dispatch_e2e              -                          -
 linux        standalone-runner      acceptance                       -                          -
 linuxpart    autumn-harvest         integration                      -                          append_only_guard_tests

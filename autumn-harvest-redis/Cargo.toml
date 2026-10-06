@@ -30,6 +30,11 @@ tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# TLS support (issue #1834). The `redis` client builds its rustls config
+# with `ClientConfig::builder()`, which needs a process crypto provider. This
+# crate installs `ring` when none is set. `rustls::pki_types` also checks
+# caller-supplied PEM before any network I/O.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
@@ -43,6 +48,10 @@ testcontainers-modules = { workspace = true }
 # build still depends on `autumn-harvest` with default features off.
 autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", features = ["db", "testing", "chaos"] }
 diesel = { workspace = true }
+# Mints a throwaway CA and certificates for the TLS container suite
+# (tests/tls_redis.rs, issue #1834). Nothing secret is committed.
+rcgen = "0.14"
+tempfile = "3"
 diesel-async = { workspace = true }
 deadpool = { workspace = true }
 
