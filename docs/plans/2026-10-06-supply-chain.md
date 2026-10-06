@@ -127,8 +127,9 @@ close" model.
   read-only.
 - `sign` (same matrix): `cosign sign-blob` keyless and `cosign verify-blob`.
   On a tag push only, `attest-build-provenance`, and `attest` with the SBOM.
-- `client`: the TypeScript client, with a read-only token, because `npm` runs
-  third-party install scripts.
+- `client`: the TypeScript client and its `npm sbom` SBOM, with a read-only
+  token, because `npm` runs third-party install scripts. `sign-client` signs
+  and attests the tarball.
 - `release`: a tag push only. It uploads the archives, SBOMs and bundles. Its
   checkout keeps no credentials.
 - A dry run (`workflow_dispatch`, or a pull request that changes

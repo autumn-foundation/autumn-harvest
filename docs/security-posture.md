@@ -863,8 +863,9 @@ together.
 ### Verifying a release
 
 Each release archive ships with a CycloneDX SBOM (`.cdx.json`) and a Sigstore
-bundle (`.sigstore.json`) for each file. The binaries are built with
-`cargo auditable`, so each binary holds its own dependency list.
+bundle (`.sigstore.json`) for each file. The TypeScript client tarball
+(`.tgz`) ships the same way. The binaries are built with `cargo auditable`, so
+each binary holds its own dependency list.
 
 The bundles are the trust anchor. `SHA256SUMS` is not signed. Use it only to
 check a download for damage.

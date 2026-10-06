@@ -954,7 +954,7 @@ fn release_publishes_only_on_a_tag_push() {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
-    for need in ["validate", "sign", "client"] {
+    for need in ["validate", "sign", "client", "sign-client"] {
         assert!(
             needs.contains(&need),
             "release must need `{need}`: {needs:?}"
@@ -1015,5 +1015,59 @@ fn release_builds_the_client_without_a_write_token() {
     assert!(
         runs.contains("scripts/build-typescript-client.sh"),
         "{runs}"
+    );
+}
+
+/// The client tarball is a release file too. It gets an SBOM, a verified
+/// Sigstore signature and attestations, in a job that runs no npm.
+#[test]
+fn release_signs_and_attests_the_client_tarball() {
+    let doc = parse_workflow(RELEASE_WORKFLOW);
+    let client_runs = job_steps(&doc, RELEASE_WORKFLOW, "client")
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        client_runs.contains("npm sbom --sbom-format cyclonedx"),
+        "the client job must write a CycloneDX SBOM:\n{client_runs}"
+    );
+    let sign = job(&doc, RELEASE_WORKFLOW, "sign-client");
+    assert_eq!(permission(sign, "id-token"), Some("write"));
+    assert_eq!(permission(sign, "attestations"), Some("write"));
+    assert_ne!(permission(sign, "contents"), Some("write"));
+    let steps = job_steps(&doc, RELEASE_WORKFLOW, "sign-client");
+    assert!(
+        !steps.iter().any(|s| uses(s, "actions/checkout")),
+        "sign-client must run no repository code"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| uses(s, "actions/attest-build-provenance"))
+    );
+    assert!(steps.iter().any(|s| uses(s, "actions/attest")));
+    let runs = steps
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "cosign sign-blob --yes --bundle",
+        "cosign verify-blob --bundle",
+    ] {
+        assert!(
+            runs.contains(needle),
+            "sign-client must run `{needle}`:\n{runs}"
+        );
+    }
+    let sums = job_steps(&doc, RELEASE_WORKFLOW, "release")
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .find(|r| r.contains("SHA256SUMS"))
+        .expect("a SHA256SUMS step");
+    assert!(
+        sums.contains("*.tgz"),
+        "SHA256SUMS must list the client: {sums}"
     );
 }

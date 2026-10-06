@@ -1014,14 +1014,14 @@ fn the_release_pipeline_builds_and_attaches_the_client() {
     );
     let job = without_comments(job_block(&release, "release"));
     assert!(
-        job.contains("needs: [meta, validate, sign, client]"),
+        job.contains("needs: [meta, validate, sign, client, sign-client]"),
         "the release must wait for the client build"
     );
     let create = job
         .find("softprops/action-gh-release")
         .expect("the release job must create the GitHub release");
     assert!(
-        job[create..].contains("client-dist/${{ needs.client.outputs.tarball }}"),
+        job[create..].contains("dist/${{ needs.client.outputs.tarball }}"),
         "the release step must attach the client tarball"
     );
 }
