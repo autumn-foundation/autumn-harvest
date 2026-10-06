@@ -5606,6 +5606,11 @@ pub(crate) struct AdminAuthLayers {
 /// layer. It runs after both built-in gates, so it can only deny. It sees the
 /// `TokenPrincipal` the token layer sets.
 ///
+/// Issue #1827: the rate-limit layer is installed directly INSIDE the token
+/// layer. It keys a bucket on the verified `TokenPrincipal`, so an unverified
+/// bearer cannot open a new bucket. It runs before the read-only and
+/// authorizer layers, so a refused request does no further work.
+///
 /// No layer is installed unless asked for, so a deployment that declares none
 /// does an identical amount of work as before.
 pub(crate) fn apply_admin_auth_layers(
@@ -5622,6 +5627,15 @@ pub(crate) fn apply_admin_auth_layers(
     }
     if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
+    }
+    if let Some(rate_limit) = &layers.rate_limit {
+        router = router.layer(middleware::from_fn_with_state(
+            (
+                api_state.clone(),
+                crate::api_rate_limit::ApiRateLimiter::new(rate_limit.clone()),
+            ),
+            crate::api_rate_limit::enforce_api_rate_limit,
+        ));
     }
     if layers.api_tokens {
         router = router.layer(middleware::from_fn_with_state(
@@ -6066,7 +6080,16 @@ fn route_class_matchers() -> &'static RouteMatchers<RouteClass> {
 /// read class rather than fail closed to `Mutating` and 403 a read-only
 /// dashboard's existence/size probe.
 pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
-    match_route(route_class_matchers(), method, path).map_or(RouteClass::Mutating, |m| *m.value)
+    classified_route(method, path).unwrap_or(RouteClass::Mutating)
+}
+
+/// The `CLASSIFIED_ROUTES` class of a request, or `None` for an unclassified
+/// route.
+///
+/// The API rate limiter (issue #1827) reads `None` by method. Use
+/// [`classify_route`] for an access decision, which fails closed.
+pub(crate) fn classified_route(method: &axum::http::Method, path: &str) -> Option<RouteClass> {
+    match_route(route_class_matchers(), method, path).map(|m| *m.value)
 }
 
 /// Path prefixes under which every mutation is admin-only (issue #1803).

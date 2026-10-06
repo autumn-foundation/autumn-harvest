@@ -9,12 +9,23 @@
 //! See `docs/security-posture.md#api-rate-limiting`.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use autumn_harvest::audit::{OP_API_RATE_LIMIT_SUSTAINED, RouteClass};
+use autumn_web::extract::ClientAddr;
+use autumn_web::reexports::axum::Json;
+use autumn_web::reexports::axum::extract::{ConnectInfo, Request, State};
+use autumn_web::reexports::axum::http::header::RETRY_AFTER;
+use autumn_web::reexports::axum::http::{HeaderValue, Method, StatusCode};
+use autumn_web::reexports::axum::middleware::Next;
+use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use tokio::time::Instant;
 use uuid::Uuid;
+
+use crate::api::HarvestApiState;
+use crate::api_token::{TOKEN_ACTOR_PREFIX, TokenPrincipal};
 
 /// The refill rate and burst of one token bucket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,18 +220,144 @@ pub(crate) struct ApiRateLimiter {
 #[derive(Debug)]
 struct Inner {
     config: ApiRateLimit,
-    state: Mutex<State>,
+    state: Mutex<Buckets>,
 }
 
 #[derive(Debug, Default)]
-struct State {
+struct Buckets {
     buckets: HashMap<(ClientKey, LimitClass), Bucket>,
+    /// The last time a full map was pruned. Pruning walks every bucket, so it
+    /// runs at most once per [`PRUNE_INTERVAL`].
+    last_prune: Option<Instant>,
+    /// The audit budget window (see [`MAX_SUSTAINED_AUDITS_PER_WINDOW`]).
+    audit_window_start: Option<Instant>,
+    audits_in_window: u32,
 }
+
+/// The shortest time between two prune passes over a full bucket map.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The most sustained-rejection audit rows that all buckets together write in
+/// one window.
+///
+/// Many clients can become sustained at once. Each audit row needs a pool
+/// connection, so this cap stops a wide flood from starving real work.
+const MAX_SUSTAINED_AUDITS_PER_WINDOW: u32 = 100;
 
 #[derive(Debug)]
 struct Bucket {
     tokens: f64,
     refilled_at: Instant,
+    window_start: Instant,
+    window_rejections: u32,
+    window_reported: bool,
+}
+
+impl Bucket {
+    fn full(rate: BucketRate, now: Instant) -> Self {
+        Self {
+            tokens: f64::from(rate.burst),
+            refilled_at: now,
+            window_start: now,
+            window_rejections: 0,
+            window_reported: false,
+        }
+    }
+
+    /// The tokens the bucket holds at `now`, capped at the burst.
+    fn tokens_at(&self, rate: BucketRate, now: Instant) -> f64 {
+        let elapsed = now
+            .saturating_duration_since(self.refilled_at)
+            .as_secs_f64();
+        (elapsed.mul_add(f64::from(rate.per_second), self.tokens)).min(f64::from(rate.burst))
+    }
+
+    fn refill(&mut self, rate: BucketRate, now: Instant) {
+        self.tokens = self.tokens_at(rate, now);
+        self.refilled_at = now;
+    }
+
+    /// Whole seconds until the bucket holds one token, rounded up, at least 1.
+    fn retry_after_secs(&self, rate: BucketRate) -> u64 {
+        let wait = (1.0 - self.tokens) / f64::from(rate.per_second);
+        let wait = Duration::try_from_secs_f64(wait).unwrap_or(Duration::from_secs(1));
+        let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+        secs.max(1)
+    }
+
+    /// Count one rejection. Return the count when the bucket first reaches
+    /// `threshold` in the current window.
+    fn count_rejection(&mut self, now: Instant, threshold: u32, window: Duration) -> Option<u32> {
+        if now.saturating_duration_since(self.window_start) >= window {
+            self.window_start = now;
+            self.window_rejections = 0;
+            self.window_reported = false;
+        }
+        self.window_rejections = self.window_rejections.saturating_add(1);
+        if self.window_reported || self.window_rejections < threshold {
+            return None;
+        }
+        self.window_reported = true;
+        Some(self.window_rejections)
+    }
+
+    /// A full bucket past its window holds no state worth keeping.
+    fn is_idle(&self, rate: BucketRate, now: Instant, window: Duration) -> bool {
+        self.tokens_at(rate, now) >= f64::from(rate.burst)
+            && now.saturating_duration_since(self.window_start) >= window
+    }
+}
+
+impl Buckets {
+    /// The key to charge. At the bucket cap, a new client is charged to the
+    /// overflow bucket, unless a prune frees room.
+    fn admit(
+        &mut self,
+        key: ClientKey,
+        class: LimitClass,
+        now: Instant,
+        config: &ApiRateLimit,
+    ) -> ClientKey {
+        if self.buckets.len() < config.max_clients || self.buckets.contains_key(&(key, class)) {
+            return key;
+        }
+        let prune_due = self
+            .last_prune
+            .is_none_or(|at| now.saturating_duration_since(at) >= PRUNE_INTERVAL);
+        if prune_due {
+            self.last_prune = Some(now);
+            self.buckets.retain(|(_, class), bucket| {
+                !bucket.is_idle(config.rate_for(*class), now, config.sustained_window)
+            });
+            if self.buckets.len() < config.max_clients {
+                return key;
+            }
+        }
+        ClientKey::Overflow
+    }
+
+    /// Take one audit row from the shared budget.
+    fn take_audit(&mut self, now: Instant, window: Duration) -> bool {
+        let expired = self
+            .audit_window_start
+            .is_none_or(|at| now.saturating_duration_since(at) >= window);
+        if expired {
+            self.audit_window_start = Some(now);
+            self.audits_in_window = 0;
+        }
+        if self.audits_in_window >= MAX_SUSTAINED_AUDITS_PER_WINDOW {
+            if self.audits_in_window == MAX_SUSTAINED_AUDITS_PER_WINDOW {
+                tracing::warn!(
+                    budget = MAX_SUSTAINED_AUDITS_PER_WINDOW,
+                    "harvest: api rate limit audit budget spent for this window"
+                );
+                self.audits_in_window += 1;
+            }
+            return false;
+        }
+        self.audits_in_window += 1;
+        true
+    }
 }
 
 impl ApiRateLimiter {
@@ -228,21 +365,44 @@ impl ApiRateLimiter {
         Self {
             inner: Arc::new(Inner {
                 config,
-                state: Mutex::new(State::default()),
+                state: Mutex::new(Buckets::default()),
             }),
         }
     }
 
+    /// The configuration this limiter enforces.
+    pub(crate) fn config(&self) -> &ApiRateLimit {
+        &self.inner.config
+    }
+
     /// Charge one request to the bucket of `key` and `class` at `now`.
     pub(crate) fn check(&self, key: ClientKey, class: LimitClass, now: Instant) -> Decision {
-        let _ = (key, class, now, &self.inner.config);
-        drop(
-            self.inner
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        Decision::Allow
+        let config = &self.inner.config;
+        let rate = config.rate_for(class);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let key = state.admit(key, class, now, config);
+        let bucket = state
+            .buckets
+            .entry((key, class))
+            .or_insert_with(|| Bucket::full(rate, now));
+        bucket.refill(rate, now);
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            return Decision::Allow;
+        }
+        let retry_after_secs = bucket.retry_after_secs(rate);
+        let sustained = bucket
+            .count_rejection(now, config.sustained_rejections, config.sustained_window)
+            .filter(|_| state.take_audit(now, config.sustained_window));
+        Decision::Reject {
+            key,
+            retry_after_secs,
+            sustained,
+        }
     }
 
     /// The number of buckets the limiter holds.
@@ -258,14 +418,198 @@ impl ApiRateLimiter {
 }
 
 /// The client key for an address. An IPv6 address keeps its /64 prefix only.
+///
+/// One host often owns a whole /64, so a per-address key would let it mint
+/// new buckets without limit. An IPv4-mapped address maps back to IPv4.
 pub(crate) fn ip_key(addr: IpAddr) -> ClientKey {
+    let addr = match addr {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+            IpAddr::V4,
+        ),
+    };
     ClientKey::Ip(addr)
 }
+
+/// The bucket class of a request, or `None` when the request is exempt.
+///
+/// `OPTIONS` and `PublicSafe` routes, such as the health probes, are exempt. A
+/// route outside `CLASSIFIED_ROUTES`, such as a Vantage page, counts by its
+/// method.
+pub(crate) fn limit_class(method: &Method, path: &str) -> Option<LimitClass> {
+    if *method == Method::OPTIONS {
+        return None;
+    }
+    match crate::api::classified_route(method, path) {
+        Some(RouteClass::PublicSafe) => None,
+        Some(RouteClass::ReadOnly) => Some(LimitClass::Read),
+        Some(RouteClass::Mutating) => Some(LimitClass::Mutating),
+        None if matches!(*method, Method::GET | Method::HEAD) => Some(LimitClass::Read),
+        None => Some(LimitClass::Mutating),
+    }
+}
+
+/// The client a request is charged to.
+///
+/// A verified token comes first. Next is the autumn-web `ClientAddr`, which
+/// applies `[security.trusted_proxies]`. Next is the socket peer. A request
+/// with none of these shares the `unknown` bucket.
+fn client_key(request: &Request, client_addr: Option<ClientAddr>) -> ClientKey {
+    let extensions = request.extensions();
+    if let Some(principal) = extensions.get::<TokenPrincipal>() {
+        return ClientKey::Token(principal.id);
+    }
+    if let Some(addr) = client_addr {
+        return ip_key(addr.ip());
+    }
+    if let Some(ConnectInfo(peer)) = extensions.get::<ConnectInfo<SocketAddr>>() {
+        return ip_key(peer.ip());
+    }
+    ClientKey::Unknown
+}
+
+/// Refuse a request over its client's limit with `429` (issue #1827).
+///
+/// The layer runs inside the token layer, so a verified token is known. It
+/// runs before the read-only, authorizer and admin layers, so a refused
+/// request does no further work.
+pub(crate) async fn enforce_api_rate_limit(
+    State((api_state, limiter)): State<(HarvestApiState, ApiRateLimiter)>,
+    client_addr: Option<ClientAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(class) = limit_class(request.method(), request.uri().path()) else {
+        return next.run(request).await;
+    };
+    let key = client_key(&request, client_addr);
+    match limiter.check(key, class, Instant::now()) {
+        Decision::Allow => next.run(request).await,
+        Decision::Reject {
+            key,
+            retry_after_secs,
+            sustained,
+        } => {
+            if let Ok(runtime) = api_state.runtime() {
+                runtime
+                    .registry()
+                    .telemetry()
+                    .metrics
+                    .record_api_rate_limited(class.as_str(), key.kind());
+            }
+            if let Some(rejections) = sustained {
+                audit_sustained(&api_state, &request, &limiter, key, class, rejections);
+            }
+            rate_limited_response(class, retry_after_secs)
+        }
+    }
+}
+
+/// The `429` answer: `Retry-After` in whole seconds and a JSON body.
+fn rate_limited_response(class: LimitClass, retry_after_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "rate limited",
+            "route_class": class.as_str(),
+            "retry_after_secs": retry_after_secs,
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
+    response
+}
+
+/// The client named in a sustained-rejection summary. It never holds a secret.
+fn describe(key: ClientKey) -> String {
+    match key {
+        ClientKey::Token(id) => format!("token {id}"),
+        ClientKey::Ip(IpAddr::V6(v6)) => format!("ip {v6}/64"),
+        ClientKey::Ip(IpAddr::V4(v4)) => format!("ip {v4}"),
+        ClientKey::Unknown => "a client with no address".to_owned(),
+        ClientKey::Overflow => "the overflow bucket".to_owned(),
+    }
+}
+
+/// Log a sustained client and write one `api.rate_limit_sustained` row.
+///
+/// The write runs on its own task, so the `429` never waits on the database.
+/// A failed write is logged.
+fn audit_sustained(
+    api_state: &HarvestApiState,
+    request: &Request,
+    limiter: &ApiRateLimiter,
+    key: ClientKey,
+    class: LimitClass,
+    rejections: u32,
+) {
+    let summary = format!(
+        "rate limit sustained: {rejections} rejections in {}s on {} routes from {}",
+        limiter.config().sustained_window.as_secs(),
+        class.as_str(),
+        describe(key),
+    );
+    tracing::warn!(
+        route_class = class.as_str(),
+        client_kind = key.kind(),
+        rejections,
+        "harvest: {summary}"
+    );
+    let actor = match key {
+        ClientKey::Token(id) => format!("{TOKEN_ACTOR_PREFIX}{id}"),
+        _ => ANONYMOUS_ACTOR.to_owned(),
+    };
+    let (_, source, request_id) = crate::api::audit_context(request.headers(), api_state);
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let Ok(pool) = api_state.storage_pool() else {
+        tracing::error!(path = %path, "harvest: no audit store for api rate limit");
+        return;
+    };
+    tokio::spawn(async move {
+        let write = async {
+            let mut conn = crate::api::acquire_conn(pool.default_pool())
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::authz::audit_route_event(
+                &mut conn,
+                OP_API_RATE_LIMIT_SUSTAINED,
+                &crate::authz::DenyAudit {
+                    actor: &actor,
+                    method: &method,
+                    path: &path,
+                    request_id: request_id.as_deref(),
+                    source: &source,
+                    shard: None,
+                    summary: &summary,
+                },
+            )
+            .await;
+            Ok::<(), String>(())
+        };
+        match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(error = %error, "harvest: failed to audit api rate limit");
+            }
+            Err(_) => tracing::error!("harvest: api rate limit audit write timed out"),
+        }
+    });
+}
+
+/// The actor of a sustained row with no verified token.
+const ANONYMOUS_ACTOR: &str = "anonymous";
+
+/// The longest a sustained-rejection audit write may take.
+const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv4Addr;
 
     fn token() -> ClientKey {
         ClientKey::Token(Uuid::new_v4())

@@ -44,10 +44,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, ConnectorOutcome, METRIC_LABEL_ACTIVITY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
-    METRIC_LABEL_OUTCOME, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD,
-    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
-    MetricsRecorder, PoisonReason, SlotType, WorkflowStatus,
+    ActivityStatus, ConnectorOutcome, METRIC_LABEL_ACTIVITY, METRIC_LABEL_CLIENT_KIND,
+    METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_OUTCOME, METRIC_LABEL_QUEUE,
+    METRIC_LABEL_REASON, METRIC_LABEL_ROUTE_CLASS, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
+    METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, MetricsRecorder, PoisonReason,
+    SlotType, WorkflowStatus,
 };
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
@@ -188,6 +189,8 @@ struct Inner {
     // discards both of them.
     notify_send_failures: Gauge,
     notify_queue_usage: Gauge,
+    // Issue #1827: the plugin's own API rate limiter records here.
+    api_rate_limited: Counter,
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
@@ -476,6 +479,12 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .connector_poisoned
             .incr(vec![source.to_owned(), reason.as_str().to_owned()], 1);
+    }
+
+    fn record_api_rate_limited(&self, route_class: &str, client_kind: &str) {
+        self.0
+            .api_rate_limited
+            .incr(vec![route_class.to_owned(), client_kind.to_owned()], 1);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -771,12 +780,24 @@ fn push_connector_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     );
 }
 
+/// The API rate limiter family (issue #1827).
+fn push_api_rate_limit_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
+    push_counter(
+        families,
+        "harvest_api_rate_limited_total",
+        "Total number of API requests the rate limiter refused with 429, per route class and client kind",
+        &[METRIC_LABEL_ROUTE_CLASS, METRIC_LABEL_CLIENT_KIND],
+        inner.api_rate_limited.snapshot(),
+    );
+}
+
 impl MetricsSource for HarvestMetricsRecorder {
     fn collect(&self) -> Vec<MetricFamily> {
         let mut families = Vec::new();
         push_catalogue_metrics(&mut families, &self.0);
         push_sampler_adjacent_metrics(&mut families, &self.0);
         push_connector_metrics(&mut families, &self.0);
+        push_api_rate_limit_metrics(&mut families, &self.0);
         families
     }
 }
@@ -1108,6 +1129,31 @@ mod tests {
         assert_eq!(f.samples.len(), 1);
         assert_eq!(f.samples[0].labels.len(), 0);
         assert_eq!(f.samples[0].value, 0.5);
+    }
+
+    #[test]
+    fn api_rate_limit_rejections_reach_the_built_in_scrape_endpoint() {
+        // Issue #1827: without an override, the scrape drops every rejection.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_api_rate_limited("mutating", "token");
+        recorder.record_api_rate_limited("mutating", "token");
+        recorder.record_api_rate_limited("read", "ip");
+
+        let families = recorder.collect();
+
+        let limited = family(&families, "harvest_api_rate_limited_total");
+        assert_eq!(limited.kind, MetricKind::Counter);
+        assert_eq!(
+            sample_value(
+                limited,
+                &[("route_class", "mutating"), ("client_kind", "token")]
+            ),
+            2.0
+        );
+        assert_eq!(
+            sample_value(limited, &[("route_class", "read"), ("client_kind", "ip")]),
+            1.0
+        );
     }
 
     #[test]
