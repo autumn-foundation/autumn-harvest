@@ -32542,8 +32542,37 @@ struct BulkDlqApiBody {
     limit: Option<u32>,
     #[serde(default)]
     dry_run: bool,
+}
+
+/// The replay-only fields of a `POST /dead-letters/replay` JSON body.
+///
+/// Discard shares [`BulkDlqApiBody`] and has no use for `spread_secs`
+/// (issue #1832). So the replay route reads this second view of its body.
+#[derive(Debug, Deserialize)]
+struct ReplayOnlyApiBody {
     #[serde(default)]
     spread_secs: Option<u64>,
+}
+
+/// Read `spread_secs` from a bulk-replay JSON body (issue #1832).
+fn replay_spread_secs(body: &[u8]) -> Result<Option<u64>, AutumnError> {
+    serde_json::from_slice::<ReplayOnlyApiBody>(body)
+        .map(|replay| replay.spread_secs)
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))
+}
+
+/// [`parse_bulk_dlq_request`] plus the replay-only `spread_secs` field.
+///
+/// A form body sets `spread_secs` in `parse_bulk_dlq_form` already.
+fn parse_bulk_replay_request(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<ParsedBulkDlqRequest, AutumnError> {
+    let mut request = parse_bulk_dlq_request(headers, body)?;
+    if !is_form_urlencoded(headers) {
+        request.selector.filter.spread_secs = replay_spread_secs(body)?;
+    }
+    Ok(request)
 }
 
 impl BulkDlqApiBody {
@@ -32574,7 +32603,7 @@ impl BulkDlqApiBody {
                 failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
-                spread_secs: self.spread_secs,
+                spread_secs: None,
             },
             dead_letter_id: self.dead_letter_id,
             task_type,
@@ -32691,10 +32720,22 @@ mod dlq_spread_body_tests {
 
     #[test]
     fn bulk_replay_body_carries_spread_secs() {
+        let body = br#"{"queue_name":"q","spread_secs":90}"#;
+        assert_eq!(replay_spread_secs(body).expect("valid body"), Some(90));
+        assert_eq!(
+            replay_spread_secs(br#"{"queue_name":"q"}"#).expect("valid"),
+            None
+        );
+        assert!(replay_spread_secs(br#"{"spread_secs":"soon"}"#).is_err());
+    }
+
+    #[test]
+    fn the_shared_bulk_body_leaves_spread_secs_to_replay() {
+        // Discard shares this body, so it never sets `spread_secs`.
         let body: BulkDlqApiBody =
             serde_json::from_str(r#"{"queue_name":"q","spread_secs":90}"#).expect("valid body");
         let selector = body.into_selector().expect("valid selector");
-        assert_eq!(selector.filter.spread_secs, Some(90));
+        assert_eq!(selector.filter.spread_secs, None);
     }
 
     #[test]
@@ -33027,7 +33068,7 @@ async fn bulk_replay_dead_letters_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let request = match parse_bulk_replay_request(&headers, &body) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
