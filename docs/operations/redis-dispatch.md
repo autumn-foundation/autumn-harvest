@@ -123,11 +123,25 @@ The connection is plaintext by default. A `redis://` URL sends the password
 in cleartext, and every reference travels in the clear. Use `rediss://` on any
 network you do not control.
 
-This release carries no TLS transport, so `RedisDispatch::connect` rejects a
-`rediss://` URL with an error that says so. The `redis` client's TLS stack
-depends on an unmaintained crate that the dependency ledger refuses. Issue
-#1429 tracks TLS support. Until then, keep Redis on a private network or
-behind a TLS tunnel that terminates on the host.
+A `rediss://` URL connects over TLS through rustls (issue #1834). The client
+always verifies the server certificate and its host name. There is no option
+to turn verification off.
+
+| To trust | Do this |
+|---|---|
+| A public CA | Nothing. The client reads the platform trust store. |
+| A private CA, from the plugin | Set `SSL_CERT_FILE` (a PEM bundle) or `SSL_CERT_DIR` in the process environment. Either one replaces the platform store. |
+| A private CA, from code | Pass `RedisTlsOptions { ca_cert_pem, .. }` to `RedisDispatch::connect_with_tls`. The bundle replaces the platform store. |
+| Mutual TLS, from code | Also set `client_cert_pem` and `client_key_pem` (PEM). Set both or neither. |
+
+`connect_with_tls` checks the PEM before any network I/O. It rejects a plain
+`redis://` URL, because certificates on a plaintext connection protect
+nothing. `RedisTaskQueue::connect_with_tls` takes the same options. A failed
+handshake fails startup with its reason, for example
+`invalid peer certificate: UnknownIssuer`.
+
+The plugin config has no certificate keys yet. Mutual TLS therefore needs a
+code-level `connect_with_tls`.
 
 ## Key layout
 
@@ -248,7 +262,7 @@ wrapper, so the two cases do not share one failure mode.
 | A reference names a row that is absent | Three short releases, then an ack | No error; this covers a publish that raced its own transaction |
 | `[harvest.redis] url` set on a build without the `redis` feature | Startup fails at config validation | An error naming the `redis` cargo feature |
 | `[harvest.redis] url` set on a runtime with more than one shard pool | Startup fails before the channel is installed | An error naming the shard-pool count and issue #1312; run one process per shard instead |
-| `rediss://` URL | Startup fails at connect | An error stating that this release carries no TLS transport (issue #1429) |
+| `rediss://` URL whose server certificate does not verify | Startup fails at connect | An error naming the certificate failure, for example `invalid peer certificate: UnknownIssuer` |
 | `key_prefix` or `consumer_group` empty | Startup fails at config validation | An error naming the empty key |
 | A worker queue name is empty or holds a `:` | Startup fails before the channel is installed; `Worker::new` repeats the check | An error naming the queue and the rule |
 | A core caller installs the channel after `Worker::new` | The worker checks the span and every queue name when it starts to run. It uses the channel only when both checks pass. Otherwise it claims through Postgres. An install after the run starts does not reach the worker | One error naming the reason and issue #1431 |
