@@ -1028,6 +1028,41 @@ pub(crate) async fn count_history_events(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+/// Stored bytes of the events with `from <= event_id < to` (issue #1804).
+///
+/// The measure is `pg_column_size(event_data)`, the same as the tenant
+/// `max_history_bytes` quota. The upper bound keeps a concurrent append out of
+/// the sum, so an incremental caller never counts one event twice.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
+pub(crate) async fn sum_history_bytes_between(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    from_event_id: i32,
+    to_event_id: i32,
+) -> HarvestResult<u64> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::BigInt;
+
+    if from_event_id >= to_event_id {
+        return Ok(0);
+    }
+    let bytes: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.ge(from_event_id))
+        .filter(harvest_events::event_id.lt(to_event_id))
+        .select(sql::<BigInt>(
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::bigint",
+        ))
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(u64::try_from(bytes).unwrap_or(0))
+}
+
 /// Durably admit an update into a workflow's event history.
 ///
 /// Opens a transaction, acquires a row-level `FOR UPDATE` lock on the
@@ -1571,6 +1606,63 @@ pub async fn load_history_inflated(
         events,
         next_event_id,
     })
+}
+
+/// [`load_history_inflated`] that also returns the stored history bytes
+/// (issue #1804).
+///
+/// The bytes are the sum of `pg_column_size(event_data)` over the loaded rows.
+/// The worker's cold path reads them here, so the byte cap needs no second
+/// scan of the history.
+///
+/// # Errors
+///
+/// Same as [`load_history_inflated`].
+#[cfg(feature = "db")]
+pub(crate) async fn load_history_inflated_with_bytes(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> HarvestResult<(EventHistory, u64)> {
+    use crate::models::HarvestEvent;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Integer;
+
+    let rows: Vec<(HarvestEvent, i32)> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .select((
+            HarvestEvent::as_select(),
+            sql::<Integer>("pg_column_size(event_data)"),
+        ))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows
+        .last()
+        .map_or(0, |(row, _)| row.event_id.saturating_add(1));
+
+    let mut bytes = 0_u64;
+    let mut events = Vec::with_capacity(rows.len());
+    for (row, size) in rows {
+        bytes = bytes.saturating_add(u64::try_from(size).unwrap_or(0));
+        let mut data = row.event_data;
+        if let Some(offloader) = offloader {
+            offloader.inflate_event_value(&mut data).await?;
+        }
+        events.push(codecs.decode_event(data)?);
+    }
+
+    Ok((
+        EventHistory {
+            exec_id,
+            events,
+            next_event_id,
+        },
+        bytes,
+    ))
 }
 
 /// Load only events appended since a known event-id cursor.

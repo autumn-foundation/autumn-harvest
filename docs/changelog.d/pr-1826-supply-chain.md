@@ -1,0 +1,11 @@
+## CI — supply chain: advisory scan, SHA pins, Dependabot, signed releases (issue #1826)
+
+**Daily advisory scan.** `.github/workflows/advisory-scan.yml` runs `cargo deny check advisories` every day. `.github/ci/advisory-scan.sh` opens an alert issue for a finding, comments on the open one, and closes it after a clean scan. A red run that the script did not report (a failed setup step, a step timeout, a lost `gh` call) reports on the same issue. The `dependency-audit` CI job now installs `cargo-deny` 0.20.2 directly, the version that `cargo-deny-action` v2.1.1 bundled. A test checks that the scan and the gate use the same version.
+
+**SHA pins.** Each `uses:` pins a commit SHA with a `# <tag>` comment. Each pin stays on its current major version. `dtolnay/rust-toolchain` and `taiki-e/install-action` now name the toolchain and the tool as inputs, because the SHA no longer carries them. `docs/audits/action-sha-pin.py` finds each `uses` key in the parsed YAML and checks its raw line, in the `lint` job.
+
+**Dependabot.** `.github/dependabot.yml` opens weekly pull requests against `trunk-dev` for `cargo` and `github-actions`. Minor and patch updates are grouped.
+
+**Release.** `release.yml` now builds the `harvest` and `harvest-replay` binaries for Linux x86_64, macOS arm64 and Windows x86_64 with `cargo auditable`. Each archive gets a CycloneDX SBOM. A separate job signs each file with Sigstore keyless signing and verifies each bundle. On a tag push it also writes GitHub build-provenance and SBOM attestations. The build job holds no write or OIDC permission. The TypeScript client now builds in its own read-only job, so `npm` never runs with `contents: write`. Its tarball gets an `npm sbom` CycloneDX SBOM, a Sigstore signature and attestations from a separate `sign-client` job. A manual run, or a pull request that changes `release.yml`, is a dry run that signs but writes no attestation and publishes nothing. `docs/security-posture.md` shows how to verify a release.
+
+Tests: `supply_chain_ci` (no DB) covers the workflow shapes and runs the scan script against a stub `cargo` and `gh`. `action-sha-pin.py --self-test` runs 37 fixtures, including flow-mapping, escaped-key and folded-value forms that a line scan alone misses.

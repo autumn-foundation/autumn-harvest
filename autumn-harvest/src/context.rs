@@ -48,6 +48,19 @@ pub fn empty_shared_state() -> SharedState {
 /// Default soft history-size threshold for recommending `continue_as_new`.
 pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
 
+/// Default hard cap on durable history events per run (issue #1804).
+///
+/// A run that reaches this count fails and moves to the DLQ with
+/// `HistoryCapExceeded`. Temporal terminates at 51,200 events.
+pub const DEFAULT_HISTORY_EVENT_HARD_CAP: u64 = 50_000;
+
+/// Default hard cap on stored history bytes per run (issue #1804): 50 MiB.
+///
+/// The worker measures `pg_column_size(event_data)`, the same measure as the
+/// tenant `max_history_bytes` quota. A run that reaches the cap fails and moves
+/// to the DLQ with `HistoryBytesCapExceeded`.
+pub const DEFAULT_HISTORY_BYTE_HARD_CAP: u64 = 50 * 1024 * 1024;
+
 /// Default deadline-fraction trigger for [`WorkflowContext::should_continue_as_new`]
 /// (issue #772).
 ///
@@ -60,11 +73,16 @@ pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
 /// Default fraction of [`WorkflowHistoryPolicy::event_hard_cap`] at which the
 /// operator early-warning soft threshold fires (issue #704).
 ///
-/// `0.75` means a still-running execution is warned once it has accumulated
-/// 75% of the configured hard-cap event count -- giving an operator a window
-/// to intervene (e.g. trigger a manual `continue_as_new`, or investigate a
-/// runaway loop) before the hard cap terminally fails the workflow.
-pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
+/// `0.2048` warns a still-running execution at 20.48% of the hard cap. Under
+/// the default cap that is 10,240 events, the same as Temporal's warning
+/// point (issue #1804). The gap gives an operator time to act before the cap
+/// fails the run.
+///
+/// The warning sits above the default `continue_as_new` threshold of 10,000.
+/// [`WorkflowContext::should_continue_as_new`] turns true only past that
+/// threshold. A warning at exactly 10,000 would page every run that rotates
+/// on the advisory. The 240-event margin covers the rotating decision.
+pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.2048;
 
 /// Upper clamp for [`WorkflowContext::with_history_bloat_warn_fraction`]
 /// (issue #704, PR #1139 review, P2).
@@ -86,16 +104,44 @@ pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
 /// `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`), which -- absent a further
 /// fix -- would collapse the promised "warn before the hard cap" window into
 /// "warn on the same decision cycle as the hard cap" for small caps (PR
-/// #1139 review, a later round). The actual below-`cap` guarantee is
-/// enforced in `worker.rs`'s `history_bloat_threshold_crossed`, which clamps
-/// its computed threshold to `cap - 1` unconditionally of what `fraction`
-/// resolves to -- that clamp is what keeps the signal functional for every
-/// `(cap, fraction)` combination the public builder API can produce. This
+/// #1139 review, a later round). [`history_bloat_warn_threshold`] holds the
+/// real below-`cap` guarantee. It clamps the threshold to `cap - 1` for any
+/// `fraction`. That clamp keeps the signal working for every
+/// `(cap, fraction)` pair the public builder API can build. This
 /// constant's `< 1.0` ceiling remains as an independent, secondary safety
 /// margin (and a reasonable API choice on its own: a fraction of exactly
 /// `1.0` is a confusing "wait until literally the entire cap" configuration
 /// regardless of the below-cap clamp).
 pub const MAX_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.999;
+
+/// The event count at which the history-bloat warning fires (issue #704).
+///
+/// Returns `None` when `fraction <= 0.0`, the disabled sentinel. Otherwise
+/// the threshold is `ceil(cap * fraction)`, clamped to `cap - 1`.
+///
+/// The ceiling rounds up, not down. For cap 10 and fraction 0.75 the product
+/// is 7.5. A truncating cast warns at 7 events, which is 70% of the cap. The
+/// warning must fire at or past the configured fraction, so it fires at 8.
+///
+/// The clamp keeps at least one event of warning room below the hard cap.
+/// [`MAX_HISTORY_BLOAT_WARN_FRACTION`] limits `fraction` alone and cannot see
+/// `cap`. For cap 100, `ceil(100 * 0.999)` is 100, which equals the cap. The
+/// warning would then fire in the same decision as the hard cap, with no time
+/// to act. Only a clamp that sees both values prevents that, for every
+/// `(cap, fraction)` pair the public API can build.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub fn history_bloat_warn_threshold(cap: u64, fraction: f64) -> Option<u64> {
+    if fraction <= 0.0 {
+        return None;
+    }
+    let raw_threshold = (cap as f64 * fraction).ceil() as u64;
+    Some(raw_threshold.min(cap.saturating_sub(1)))
+}
 
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
@@ -169,6 +215,8 @@ const fn encode_progress_seq(epoch: u64, local_index: u64) -> u64 {
 pub struct WorkflowHistoryPolicy {
     continue_as_new_threshold: u64,
     event_hard_cap: Option<u64>,
+    /// Hard cap on stored history bytes (issue #1804). `None` is unlimited.
+    byte_hard_cap: Option<u64>,
     /// Fraction of `execution_timeout` consumed at which
     /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
     /// checkpoint (issue #772). Clamped into `[0.0, 1.0]`.
@@ -190,7 +238,8 @@ impl Default for WorkflowHistoryPolicy {
     fn default() -> Self {
         Self {
             continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
-            event_hard_cap: None,
+            event_hard_cap: Some(DEFAULT_HISTORY_EVENT_HARD_CAP),
+            byte_hard_cap: Some(DEFAULT_HISTORY_BYTE_HARD_CAP),
             continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
             history_bloat_warn_fraction: DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
             decision_boundaries: true,
@@ -205,7 +254,8 @@ impl WorkflowHistoryPolicy {
         self.continue_as_new_threshold
     }
 
-    /// Optional hard cap that moves an execution to the DLQ when exceeded.
+    /// Hard cap that moves an execution to the DLQ when reached. Defaults to
+    /// [`DEFAULT_HISTORY_EVENT_HARD_CAP`]; `None` is unlimited.
     #[must_use]
     pub const fn event_hard_cap(self) -> Option<u64> {
         self.event_hard_cap
@@ -227,10 +277,39 @@ impl WorkflowHistoryPolicy {
         self
     }
 
-    /// Override the optional hard cap.
+    /// Override the event hard cap.
     #[must_use]
     pub const fn with_event_hard_cap(mut self, cap: u64) -> Self {
         self.event_hard_cap = Some(cap);
+        self
+    }
+
+    /// Remove the event hard cap (issue #1804). This also turns off the
+    /// history-bloat warning, because the warning is a fraction of the cap.
+    #[must_use]
+    pub const fn without_event_hard_cap(mut self) -> Self {
+        self.event_hard_cap = None;
+        self
+    }
+
+    /// Hard cap on stored history bytes (issue #1804). Defaults to
+    /// [`DEFAULT_HISTORY_BYTE_HARD_CAP`]; `None` is unlimited.
+    #[must_use]
+    pub const fn byte_hard_cap(self) -> Option<u64> {
+        self.byte_hard_cap
+    }
+
+    /// Override the stored-history byte cap (issue #1804).
+    #[must_use]
+    pub const fn with_byte_hard_cap(mut self, cap: u64) -> Self {
+        self.byte_hard_cap = Some(cap);
+        self
+    }
+
+    /// Remove the stored-history byte cap (issue #1804).
+    #[must_use]
+    pub const fn without_byte_hard_cap(mut self) -> Self {
+        self.byte_hard_cap = None;
         self
     }
 
@@ -269,6 +348,15 @@ impl WorkflowHistoryPolicy {
     pub const fn with_decision_boundaries(mut self, enabled: bool) -> Self {
         self.decision_boundaries = enabled;
         self
+    }
+
+    /// The event count at which the history-bloat warning fires (issue
+    /// #1804). `None` when the event cap is unlimited or the fraction is
+    /// `0.0`. See [`history_bloat_warn_threshold`].
+    #[must_use]
+    pub fn history_bloat_warn_threshold(self) -> Option<u64> {
+        self.event_hard_cap
+            .and_then(|cap| history_bloat_warn_threshold(cap, self.history_bloat_warn_fraction))
     }
 
     /// Override the history-bloat soft-warning fraction (issue #704). The
@@ -17394,6 +17482,52 @@ mod tests {
         assert!(under.continue_as_new_deadline_fraction().abs() < f64::EPSILON);
         let mid = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.6);
         assert!((mid.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
+    }
+
+    // ── Default history caps (issue #1804) ──────────────────────────────────
+
+    #[test]
+    fn workflow_history_policy_ships_default_hard_caps() {
+        let policy = WorkflowHistoryPolicy::default();
+        assert_eq!(DEFAULT_HISTORY_EVENT_HARD_CAP, 50_000);
+        assert_eq!(DEFAULT_HISTORY_BYTE_HARD_CAP, 50 * 1024 * 1024);
+        assert_eq!(
+            policy.event_hard_cap(),
+            Some(DEFAULT_HISTORY_EVENT_HARD_CAP)
+        );
+        assert_eq!(policy.byte_hard_cap(), Some(DEFAULT_HISTORY_BYTE_HARD_CAP));
+    }
+
+    #[test]
+    fn workflow_history_policy_default_warning_lands_at_10240_events() {
+        // 50,000 * 0.2048 = 10,240: the default soft threshold.
+        let policy = WorkflowHistoryPolicy::default();
+        assert_eq!(policy.history_bloat_warn_threshold(), Some(10_240));
+        assert_eq!(
+            policy
+                .without_event_hard_cap()
+                .history_bloat_warn_threshold(),
+            None
+        );
+        assert_eq!(
+            policy
+                .with_history_bloat_warn_fraction(0.0)
+                .history_bloat_warn_threshold(),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_history_policy_caps_accept_unlimited() {
+        let policy = WorkflowHistoryPolicy::default()
+            .without_event_hard_cap()
+            .without_byte_hard_cap();
+        assert_eq!(policy.event_hard_cap(), None);
+        assert_eq!(policy.byte_hard_cap(), None);
+
+        let capped = policy.with_event_hard_cap(7).with_byte_hard_cap(9);
+        assert_eq!(capped.event_hard_cap(), Some(7));
+        assert_eq!(capped.byte_hard_cap(), Some(9));
     }
 
     // ── Operator early-warning for history bloat (issue #704) ────────────────

@@ -1,25 +1,31 @@
-//! Redis Streams task queue adapter for `autumn-harvest`.
+//! Redis Streams dispatch channel and standalone task queue for `autumn-harvest`.
 //!
-//! This crate provides a high-throughput "escape hatch" for the
-//! `autumn-harvest` workflow engine. The default Postgres-backed queue (using
-//! `SELECT ... FOR UPDATE SKIP LOCKED`) is operationally simple but its
-//! measured claim throughput (`docs/performance.md`) falls well short of the
-//! "ten thousand task claims per second" figure once cited here — see
-//! `docs/assays/0001-redis-adapter-throughput-ceiling.md` for this crate's own
-//! measured standalone throughput and how it compares. Moving the ephemeral
-//! task queue onto Redis Streams raises that ceiling substantially, while
-//! leaving Postgres as the sole source of truth for workflow state and event
-//! history.
+//! The crate has two parts. The worker uses only the first.
+//!
+//! - [`RedisDispatch`] is a dispatch channel for the worker (issue #1312). A
+//!   stream entry carries a task reference only. Postgres keeps every
+//!   `harvest_task_queue` row and stays the source of truth. See *Worker
+//!   integration* below.
+//! - [`RedisTaskQueue`] is a standalone task queue on Redis Streams. The
+//!   worker does not use it. See *Standalone adapter* below.
+//!
+//! The default Postgres queue claims with `SELECT ... FOR UPDATE SKIP LOCKED`.
+//! It is simple to operate, but its claim throughput has a ceiling
+//! (`docs/performance.md`). The dispatch channel takes read load off that
+//! claim path, and Postgres stays the source of truth. For the measured
+//! throughput of the standalone adapter, see
+//! `docs/assays/0001-redis-adapter-throughput-ceiling.md`.
 //!
 //! ## Scope
 //!
-//! - **In scope**: enqueue, claim, complete, fail, retry-with-delay, heartbeat,
-//!   and visibility-timeout based recovery for the task queue.
-//! - **Out of scope**: workflow state, event history, signals, timers,
-//!   schedules, the DAG runtime. These continue to live on Postgres exactly as
-//!   they do today.
+//! - **In scope, dispatch channel**: publish, read, ack and release task
+//!   references.
+//! - **In scope, standalone adapter**: enqueue, claim, complete, fail,
+//!   retry-with-delay, heartbeat, and recovery after a visibility timeout.
+//! - **Out of scope for both parts**: workflow state, event history, signals,
+//!   timers, schedules and the DAG runtime. These stay on Postgres.
 //!
-//! ## Usage sketch
+//! ## Standalone usage sketch
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -96,11 +102,14 @@
 //!   a large backlog should `SCAN` for the old `{prefix}:dispatch:*`
 //!   pattern and `DEL` what it finds. Do that once no old worker is still
 //!   running.
-//! - **No TLS.** A `rediss://` URL is rejected at `connect` with a message
-//!   that says so. The `redis` client's TLS stack depends on an unmaintained
-//!   crate that the dependency ledger refuses. This is not one of issue
-//!   #1429's ten items; it needs its own follow-up issue. A plain
-//!   `redis://` URL sends the password in cleartext.
+//! - **TLS through rustls (issue #1834).** A `rediss://` URL connects over
+//!   TLS and verifies the server against the platform trust store.
+//!   `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces that store with a private CA
+//!   bundle.
+//!   [`RedisDispatch::connect_with_tls`] takes a private CA and a client
+//!   certificate for mutual TLS (see [`RedisTlsOptions`]). There is no
+//!   option to skip verification. A plain `redis://` URL still sends the
+//!   password in cleartext.
 //! - **One channel per shard, not one channel that spans shards.** A single
 //!   [`RedisDispatch`] instance still addresses one key family and expects
 //!   every reference it carries to belong to one database. A multi-shard
@@ -133,6 +142,7 @@ mod envelope;
 mod error;
 mod naming;
 mod redis_queue;
+mod tls;
 
 pub use adapter::{ClaimedTask, TaskQueueAdapter};
 pub use dispatch::{RedisDispatch, RedisDispatchConfig};
@@ -143,3 +153,4 @@ pub use naming::{
     scheduled_payloads_key, scheduled_zset_key, stream_key,
 };
 pub use redis_queue::{RedisTaskQueue, RedisTaskQueueConfig};
+pub use tls::RedisTlsOptions;

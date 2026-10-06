@@ -1,6 +1,8 @@
 # Dependency ledger harness (Ballast). Run locally with `cargo deny check`;
 # CI runs the same command in .github/workflows/ci.yml's `dependency-audit`
 # job on every push/PR that touches Cargo.toml/Cargo.lock/this file.
+# .github/workflows/advisory-scan.yml also runs the advisory check every day,
+# because a new advisory needs no code change (issue #1826).
 #
 # Every `ignore`/`exceptions` entry below is a documented pin: it carries the
 # reason it's deferred and the trigger that should bring it back for review.
@@ -267,6 +269,13 @@ external-default-features = "allow"
 deny = []
 skip = []
 skip-tree = []
+
+# Issue #1834: the Redis TLS client must always verify the server. These
+# `redis` features add a way to turn certificate checks off (the
+# `#insecure` URL fragment, `danger_accept_invalid_hostnames`). Keep them out.
+[[bans.features]]
+crate = "redis"
+deny = ["tls-rustls-insecure", "tls-native-tls"]
 
 [sources]
 unknown-registry = "deny"
