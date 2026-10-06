@@ -2084,6 +2084,45 @@ async fn a_later_guard_converges_on_a_partial_stamp() {
     assert_eq!(policy_ramp_id(&mut conns[0]).await, stamped);
 }
 
+/// A ramp write with the `ramp_id` of a ramp that an operator cleared or
+/// replaced changes nothing (issue #1814). A late retry of the first
+/// request therefore cannot undo the operator's change.
+#[tokio::test]
+async fn a_ramp_write_does_not_restore_a_superseded_ramp() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    // An operator clears the ramp.
+    let cleared = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, cleared).await;
+    clear_build_ramp(&mut conn, QUEUE).await.expect("clear");
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, cleared).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "a retry after a clear is refused: {retry:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+
+    // An operator replaces the ramp with another one.
+    let replaced = uuid::Uuid::new_v4();
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, replaced)
+        .await
+        .expect("first ramp");
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, 50, uuid::Uuid::new_v4())
+        .await
+        .expect("operator ramp");
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, replaced).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "a retry after a replace is refused: {retry:?}"
+    );
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert_eq!(policy.ramp_percent, Some(50), "the operator ramp stays");
+}
+
 /// A guard can stop after its clear commits and before its report. A later
 /// pass reports that abort once, from the marker, after the report grace.
 #[tokio::test]

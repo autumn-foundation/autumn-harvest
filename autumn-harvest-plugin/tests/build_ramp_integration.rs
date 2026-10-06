@@ -605,3 +605,34 @@ async fn a_keyed_ramp_writes_nothing_when_a_shard_cannot_be_checked() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
     assert!(!ramp_is_active(&live).await, "no shard gets the ramp");
 }
+
+/// A late keyed retry does not undo an operator's clear (issue #1814).
+#[tokio::test]
+async fn a_keyed_retry_does_not_undo_a_manual_clear() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let mut conn = pool.get().await.expect("get conn");
+    set_build_policy(&mut conn, "default", "base-v1", None)
+        .await
+        .expect("seed base policy");
+    drop(conn);
+    let app = build_ramp_app(pool.clone());
+    let ramp =
+        json!({ "queue_name": "default", "target_build_id": "canary-v2", "ramp_percent": 10 });
+
+    let (status, body) = post_json_with_key(
+        &app,
+        "/admin/build-routing/ramp",
+        ramp.clone(),
+        Some("k-manual"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (status, body) = delete_json(&app, "/admin/build-routing/ramp/default").await;
+    assert!(status.is_success(), "clear: {status} {body}");
+
+    let (status, body) =
+        post_json_with_key(&app, "/admin/build-routing/ramp", ramp, Some("k-manual")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(!ramp_is_active(&pool).await, "the cleared ramp stays off");
+}

@@ -290,6 +290,11 @@ The guard fails safe: when it cannot read, it does not abort.
   write is also refused. Send a new key to ramp again. The check fails
   closed: when it cannot read a pool, the request gets `503` and changes
   no pool. Retry it when the pool is back.
+- A keyed ramp also never undoes an operator's change. A ramp write, a
+  policy write and `DELETE /admin/build-routing/ramp/{queue_name}` record
+  the `ramp_id` that they remove in `harvest_ramp_retired_ids`, on that
+  pool. A late retry of the request that set that id gets `409 Conflict`,
+  by the same checks as an aborted id.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported, older than `report_grace`, and whose ramp no

@@ -429,7 +429,13 @@ pub async fn set_build_policy_with_ramp_id(
 
     conn.transaction(async |conn| {
         lock_ramp_generations(conn, queue_name).await?;
-        upsert_build_policy_with_ramp_id(conn, queue_name, build_id, deployment_name, ramp_id).await
+        let old = current_ramp_id(conn, queue_name).await?;
+        let policy =
+            upsert_build_policy_with_ramp_id(conn, queue_name, build_id, deployment_name, ramp_id)
+                .await?;
+        let new = current_ramp_id(conn, queue_name).await?;
+        retire_replaced_ramp_id(conn, queue_name, old, new).await?;
+        Ok(policy)
     })
     .await
 }
@@ -591,7 +597,12 @@ pub async fn set_build_ramp_with_id(
     validate_ramp_percent(percent)?;
     conn.transaction(async |conn| {
         lock_ramp_generations(conn, queue_name).await?;
-        update_build_ramp_with_id(conn, queue_name, target_build_id, percent, ramp_id).await
+        let old = current_ramp_id(conn, queue_name).await?;
+        let policy =
+            update_build_ramp_with_id(conn, queue_name, target_build_id, percent, ramp_id).await?;
+        let new = current_ramp_id(conn, queue_name).await?;
+        retire_replaced_ramp_id(conn, queue_name, old, new).await?;
+        Ok(policy)
     })
     .await
 }
@@ -674,18 +685,72 @@ pub async fn lock_ramp_generations(
     Ok(())
 }
 
-/// The SQL test that the ramp guard aborted the generation `{id}`, for the
-/// row of `harvest_build_policies` in scope.
+/// The `ramp_id` that the row of `queue_name` holds, locked for the write.
+#[cfg(feature = "db")]
+async fn current_ramp_id(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+) -> HarvestResult<Option<Uuid>> {
+    use diesel::OptionalExtension;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        ramp_id: Option<Uuid>,
+    }
+    let row: Option<Row> = diesel::sql_query(
+        "SELECT ramp_id FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .get_result(conn)
+    .await
+    .optional()
+    .map_err(database_error)?;
+    Ok(row.and_then(|row| row.ramp_id))
+}
+
+/// Record `old` as retired when a write replaced it with `new` (issue
+/// #1814). A later write of `old` is then refused, so a stale retry of the
+/// request that set it cannot undo the change.
+#[cfg(feature = "db")]
+async fn retire_replaced_ramp_id(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    old: Option<Uuid>,
+    new: Option<Uuid>,
+) -> HarvestResult<()> {
+    let Some(old) = old else {
+        return Ok(());
+    };
+    if new == Some(old) {
+        return Ok(());
+    }
+    diesel::sql_query(
+        "INSERT INTO harvest_ramp_retired_ids (ramp_id, queue_name) VALUES ($1, $2) \
+         ON CONFLICT (ramp_id) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(old)
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .execute(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
+
+/// The SQL test that the generation `{id}` must not come back, for the row
+/// of `harvest_build_policies` in scope.
 ///
-/// It reads the abort markers of the row and the report ledger of this
-/// database. The guard prunes markers after a while, but the ledger keeps
-/// the id of every reported abort.
+/// It reads the abort markers of the row, the report ledger of this
+/// database and its retired ids. The guard prunes markers after a while,
+/// but the ledger keeps the id of every reported abort. A ramp writer or a
+/// manual clear records each id that it removes as retired.
 #[cfg(feature = "db")]
 fn generation_aborted_sql(id: &str) -> String {
     format!(
         "(harvest_build_policies.ramp_aborted \
               @> jsonb_build_array(jsonb_build_object('id', ({id})::text)) \
-          OR EXISTS (SELECT 1 FROM harvest_ramp_abort_reports r WHERE r.ramp_id = {id}))"
+          OR EXISTS (SELECT 1 FROM harvest_ramp_abort_reports r WHERE r.ramp_id = {id}) \
+          OR EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x WHERE x.ramp_id = {id}))"
     )
 }
 
@@ -696,9 +761,9 @@ fn generation_aborted_sql(id: &str) -> String {
 #[must_use]
 pub fn aborted_generation_error(queue_name: &str, target_build_id: &str) -> HarvestError {
     HarvestError::Config(format!(
-        "the ramp guard aborted this ramp of queue '{queue_name}' to build \
-         '{target_build_id}'; a retry does not restore it — send a new Idempotency-Key \
-         to ramp again"
+        "this ramp of queue '{queue_name}' to build '{target_build_id}' was aborted by the \
+         ramp guard, or cleared or replaced since; a retry does not restore it — send a new \
+         Idempotency-Key to ramp again"
     ))
 }
 
@@ -706,7 +771,8 @@ pub fn aborted_generation_error(queue_name: &str, target_build_id: &str) -> Harv
 /// of `queue_name`, as far as this database knows (issue #1814).
 ///
 /// An id is aborted when an abort marker of the queue's row holds it, or
-/// when the report ledger of this database holds it. Pass the ids that
+/// when the report ledger of this database holds it. An id that an
+/// operator cleared or replaced counts too: its retired row holds it. Pass the ids that
 /// [`ramp_generation_id`] gives for each shard's base. Call it on each shard
 /// and on the audit pool, which holds the ledger.
 ///
@@ -734,6 +800,8 @@ pub async fn ramp_generation_aborted(
                AND p.ramp_aborted @> jsonb_build_array(jsonb_build_object('id', g.id::text)) \
          ) OR EXISTS ( \
              SELECT 1 FROM harvest_ramp_abort_reports WHERE ramp_id = ANY($2::uuid[]) \
+         ) OR EXISTS ( \
+             SELECT 1 FROM harvest_ramp_retired_ids WHERE ramp_id = ANY($2::uuid[]) \
          ) AS aborted",
     )
     .bind::<diesel::sql_types::Text, _>(queue_name)
@@ -759,18 +827,28 @@ pub async fn clear_build_ramp(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
 ) -> HarvestResult<Option<BuildPolicy>> {
-    let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
-        "UPDATE harvest_build_policies \
-         SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, updated_at = NOW() \
-         WHERE queue_name = $1 \
-         RETURNING {BUILD_POLICY_COLUMNS}"
-    ))
-    .bind::<diesel::sql_types::Text, _>(queue_name)
-    .load(conn)
-    .await
-    .map_err(database_error)?;
+    use diesel_async::AsyncConnection as _;
 
-    Ok(rows.into_iter().next().map(BuildPolicy::from))
+    // The clear retires the ramp's id, so a stale keyed retry of the request
+    // that set it cannot restore the ramp (issue #1814).
+    conn.transaction(async |conn| {
+        lock_ramp_generations(conn, queue_name).await?;
+        let old = current_ramp_id(conn, queue_name).await?;
+        let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
+            "UPDATE harvest_build_policies \
+             SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, \
+                 updated_at = NOW() \
+             WHERE queue_name = $1 \
+             RETURNING {BUILD_POLICY_COLUMNS}"
+        ))
+        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        retire_replaced_ramp_id(conn, queue_name, old, None).await?;
+        Ok(rows.into_iter().next().map(BuildPolicy::from))
+    })
+    .await
 }
 
 /// Declare that workers running `build_id` are compatible with executions
