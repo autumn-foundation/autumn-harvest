@@ -229,3 +229,14 @@ fn accepts_unpinned_excludes_reserved_and_drained_shards() {
         "a pin still reaches it"
     );
 }
+
+/// No shard is writable, and the default shard is not readable. Reserving
+/// every readable shard would leave DAG placement only cell shards. Boot
+/// refuses it.
+#[test]
+#[should_panic(expected = "leaves no readable shard for unpinned work")]
+fn reserving_every_readable_shard_panics_at_boot() {
+    let readable = vec![ShardId::new(1), ShardId::new(2)];
+    let _ = ShardRouter::new(readable.clone(), Vec::new(), ShardId::new(0))
+        .with_reserved_shards(readable);
+}

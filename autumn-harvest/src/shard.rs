@@ -533,8 +533,8 @@ impl ShardRouter {
     /// Panics if a reserved shard is not in `readable_shards`. Panics if the
     /// default shard is reserved: workflow schedules and unencoded ids resolve
     /// to it without a pin. Panics if the reservation leaves no writable
-    /// shard for unpinned starts. All three fail at boot, like the other
-    /// router builders.
+    /// shard for unpinned starts, or no readable one. All fail at boot, like
+    /// the other router builders.
     #[must_use]
     pub fn with_reserved_shards(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
         let mut reserved: Vec<ShardId> = shards.into_iter().collect();
@@ -559,6 +559,17 @@ impl ShardRouter {
             shared_writable || self.writable_shards.is_empty(),
             "reserving {reserved:?} leaves no writable shard for unpinned starts; \
              keep at least one writable shard unreserved"
+        );
+        // A fully drained router places DAGs over the readable set, so one
+        // readable shard must also stay unreserved.
+        let shared_readable = self
+            .readable_shards
+            .iter()
+            .any(|shard| !reserved.contains(shard));
+        assert!(
+            shared_readable,
+            "reserving {reserved:?} leaves no readable shard for unpinned work; \
+             keep at least one readable shard unreserved"
         );
         self.reserved_shards = reserved;
         self
@@ -918,10 +929,11 @@ impl ShardRouter {
             return rendezvous_pick(primary, dag_name, "");
         }
         let candidates = self.without_reserved(primary);
-        // Empty only when no shard is writable and all readable shards are
-        // reserved. The pick then keeps the pre-#1837 behaviour.
+        // `with_reserved_shards` keeps one readable and one writable shard
+        // free, so this is not empty. The default shard is never reserved,
+        // so it is the safe fallback.
         if candidates.is_empty() {
-            return rendezvous_pick(primary, dag_name, "");
+            return self.default_shard;
         }
         rendezvous_pick(&candidates, dag_name, "")
     }
