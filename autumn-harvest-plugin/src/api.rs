@@ -8454,6 +8454,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         (
@@ -8469,6 +8470,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         (
@@ -8484,6 +8486,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         ("GET", "/admin/queues/scaling", None),
