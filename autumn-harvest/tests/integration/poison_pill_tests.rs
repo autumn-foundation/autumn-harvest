@@ -957,6 +957,39 @@ async fn absent_worker_row_waits_the_full_confirm_window() {
     assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");
 }
 
+/// Issue #1879: a new claim of the same task by the same worker is a new
+/// sighting. A workflow-task reset keeps `crash_strikes`, so only `attempt`
+/// and `started_at` tell the claims apart.
+#[tokio::test]
+async fn new_attempt_by_the_same_worker_restarts_the_witness() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-new-attempt").await;
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "dead-worker", 2).await;
+    insert_worker_with_heartbeat_age(&mut conn, "dead-worker", DEAD_SECS).await;
+    let metrics = RecordingMetrics::default();
+    let mut witness = OrphanWitness::default();
+
+    let first = witnessed_sweep(&mut conn, &mut witness, None, &metrics).await;
+    assert_eq!(first.held, 1, "setup: the first sight holds the row");
+
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET attempt = attempt + 1, started_at = NOW() WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("reset and claim the task again with the same worker and strikes");
+
+    let second = witnessed_sweep(&mut conn, &mut witness, None, &metrics).await;
+    assert_eq!(
+        (second.quarantined, second.held),
+        (0, 1),
+        "the new claim is a first sight, not a second one"
+    );
+    let (state, strikes, _) = task_state(&mut conn, task_id).await;
+    assert_eq!((state.as_str(), strikes), ("RUNNING", 2));
+}
+
 /// Issue #1879: a worker that is late but not silent for two stale windows
 /// is not confirmed dead, however many sweeps see it.
 #[tokio::test]

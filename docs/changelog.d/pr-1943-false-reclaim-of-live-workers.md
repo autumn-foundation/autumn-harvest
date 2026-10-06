@@ -22,7 +22,9 @@ heartbeat from a dead worker. A strike is permanent, and a quarantine is
 terminal. So the reclaimer loop holds the last strike until two conditions
 are true:
 
-- Two sweeps in a row saw the same claim (`OrphanWitness`). One sweep right
+- Two sweeps in a row saw the same claim (`OrphanWitness`). The claim key
+  holds the task, worker, strikes, attempt and start time, so a new claim
+  of the same task starts again from the first sight. One sweep right
   after a database pause sees every heartbeat as old. The next sweep sees the
   heartbeats of the live workers again.
 - The worker wrote no heartbeat for two stale windows
@@ -75,7 +77,8 @@ No migration. No new `WorkflowEvent` variant. `harvest_events` is not touched.
 - Unit tests for `OrphanWitness`, `quarantine_confirm_secs` and the
   database-clock sighting query.
 - DB tests: the last strike waits for a second sweep; it waits while the
-  worker is only late; a worker with no row waits the full window; a late worker that heartbeats again keeps its task;
+  worker is only late; a worker with no row waits the full window; a new
+  attempt by the same worker restarts the witness; a late worker that heartbeats again keeps its task;
   the stuck pass skips a held row; a requeue stays immediate; the heartbeat
   write returns the status; the tick still detects a remote drain.
 - A DB test of the spawned reclaimer loop: it holds a late worker's task, then

@@ -86,8 +86,10 @@ impl ReclaimSummary {
 
 /// One claim of an orphaned task, as a reclaim sweep saw it (issue #1879).
 ///
-/// A claim by another worker, or a claim after a requeue, has a different
-/// key.
+/// Each new claim of a task has a different key. A workflow-task reset keeps
+/// `crash_strikes`, and the same worker can claim the row again. A deferral
+/// can also restore `attempt`. So the key also holds `attempt` and
+/// `started_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrphanClaim {
     /// The orphaned task.
@@ -96,6 +98,10 @@ pub struct OrphanClaim {
     pub worker_id: String,
     /// The strike count of the claim, before this reclaim.
     pub crash_strikes: i32,
+    /// The attempt of the claim.
+    pub attempt: i32,
+    /// The start time of the claim.
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The orphan claims that one reclaimer saw, and when it first saw each one
@@ -1105,6 +1111,8 @@ mod scanner {
             task_id: task.id,
             worker_id,
             crash_strikes: task.crash_strikes,
+            attempt: task.attempt,
+            started_at: task.started_at,
         })
     }
 
@@ -1493,6 +1501,8 @@ mod tests {
             task_id: uuid::Uuid::from_u128(task),
             worker_id: worker.to_owned(),
             crash_strikes: strikes,
+            attempt: 1,
+            started_at: None,
         }
     }
 
