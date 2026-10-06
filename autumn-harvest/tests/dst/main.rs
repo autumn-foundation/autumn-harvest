@@ -191,6 +191,16 @@ fn golden_traces_are_equal_on_every_platform() {
 }
 
 #[test]
+fn max_steps_bounds_the_startup_beats_too() {
+    let config = SimConfig {
+        max_steps: 1,
+        ..SimConfig::new(0)
+    };
+    let report = dst::run(&config);
+    assert_eq!(report.steps.len(), 1, "{:?}", report.trace);
+}
+
+#[test]
 fn distinct_seeds_give_distinct_runs() {
     let a = dst::run(&SimConfig::new(1));
     let b = dst::run(&SimConfig::new(2));

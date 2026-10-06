@@ -293,7 +293,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
     }
 
     fn run(mut self) -> SimReport {
-        for w in 0..self.workers.len() {
+        for w in 0..self.workers.len().min(self.config.max_steps) {
             self.beat(w);
             self.step += 1;
         }
