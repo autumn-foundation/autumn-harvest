@@ -105,11 +105,18 @@ about once per round trip.
 5. **Low demand.** A window that used less than half of the cap leaves it
    unchanged. Little traffic says nothing about the dependency.
 6. **Probe.** After `probe_interval` samples, the next window that is not
-   overloaded starts a probe. The cap drops to 4 for one window, so the
-   limit can measure the baseline again. The probe cap stays in
-   `[min_limit, max_limit]`, and a cap below 4 is not raised. Then the cap
-   returns to its value from before the probe. If the probe window is
-   overloaded, that value is first cut by `backoff_ratio`.
+   overloaded starts a probe. The cap drops to 4, so the limit can measure
+   the baseline again. The probe cap stays in `[min_limit, max_limit]`, and
+   a cap below 4 is not raised. The probe ends with the first window that
+   has at least one successful answer. Then the cap returns to its value
+   from before the probe. Each overloaded probe window first cuts that value
+   by `backoff_ratio`.
+
+   A probe window with only failures, as in a hard outage, does not end the
+   probe. The cap stays at the probe cap, and the value that it returns to
+   falls with each such window, down to `min_limit`. When the dependency
+   answers again, the cap returns to that reduced value and grows from
+   there.
 
 A new type starts at 4. Against a dependency that slows down in proportion
 to the load above a knee, the cap settles near `tolerance × knee + 4`. The
@@ -178,9 +185,14 @@ harvest_activity_concurrency_in_flight >= harvest_activity_concurrency_limit
 
 ## Troubleshooting
 
-**The cap stays at 4.** The type does not get enough traffic. The limit does
-not grow a cap that a window does not use, so a quiet type stays at its
-start value. This is expected. The cap grows when demand grows.
+**The cap stays at 4.** There are two common causes:
+
+- The type does not get enough traffic. The limit does not grow a cap that
+  a window does not use, so a quiet type stays at its start value. This is
+  expected. The cap grows when demand grows.
+- The dependency returns only failures during a probe. The probe then waits
+  for a successful answer, and the cap stays at the probe cap. Check
+  `harvest.activity.failed` for the type, and see the probe rule above.
 
 **The cap falls and the type builds a backlog.** The limit is working: the
 dependency is slower, or it returns retryable errors. Check the latency
