@@ -260,3 +260,55 @@ async fn an_unregistered_activity_does_not_seal_the_run() {
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::Completed(ref v) if v.as_i64() == Some(2)));
 }
+
+/// Races a quick activity against a long timer. The activity wins, and the
+/// same cycle meets an unsupported child. The cycle's loser cancellation rolls
+/// back with it, so only the seal can remove the timer row.
+#[workflow]
+async fn races_then_spawns_child(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+    ctx.race()
+        .activity_raw("quick", json!(1), "default")
+        .timer(std::time::Duration::from_secs(3600))
+        .run()
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.spawn_child_workflow_raw("child", json!({}))
+        .await
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+/// A sealed run is terminal, and this backend has no retention pass. The seal
+/// therefore removes the run's PENDING tasks, unfired timers and staged
+/// signals, as the `TerminateIfRunning` seal does. Nothing can ever use them.
+#[tokio::test]
+async fn sealing_removes_the_runs_outstanding_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&races_then_spawns_child_info());
+    rt.register_activity_raw("quick", ActivitySpec::new(1, Ok));
+    let exec = rt
+        .start_workflow("races_then_spawns_child", json!(0))
+        .unwrap();
+
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
+    assert_sealed_unsupported(&rt, exec, "StartChildWorkflow");
+
+    let inspector = rusqlite::Connection::open(&path).unwrap();
+    let count = |sql: &str| -> i64 {
+        inspector
+            .query_row(sql, [exec.to_string()], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM harvest_timers WHERE exec_id = ?1 AND fired = 0"),
+        0,
+        "the lost race's timer must not outlive the sealed run"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'"),
+        0
+    );
+}

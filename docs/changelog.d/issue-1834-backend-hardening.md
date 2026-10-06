@@ -10,8 +10,9 @@ lock when its process exits, so a crash leaves no stale lock. The lock path
 comes from the canonical database path, so a symlink maps to the same lock. A
 hard link or a bind mount gives a second lock. On Unix the lock file takes the
 database file's read and write bits. A read-only inspector connection still
-works. A non-UTF-8 path still takes the lock. An in-memory database takes no
-lock. The open retries the lock for about 100 ms, so a lock that a forking
+works. A non-UTF-8 path still takes the lock. A private in-memory database
+takes no lock. A shared-cache in-memory URI takes an in-process lock on its
+name. The open retries the lock for about 100 ms, so a lock that a forking
 thread or a lagging release holds for a moment does not fail it. A new
 `SqliteError::Io` reports a lock file that cannot be opened.
 
@@ -20,8 +21,10 @@ thread or a lagging release holds for a moment does not fail it. A new
 and seals the run in a new transaction. The `WorkflowFailed` event carries
 `error_type = "UnsupportedFeature"` (`UNSUPPORTED_FEATURE_ERROR_TYPE`),
 `details = {"feature": <stable token>, "message": <full text>}` and
-`non_retryable = true`. If the seal itself fails, the drive logs it and still
-returns the original error. The sealing drive still
+`non_retryable = true`. The seal also removes the run's pending tasks,
+unfired timers and staged signals, because the cycle's own cleanup rolled
+back. If the seal itself fails, the drive logs it and still returns the
+original error. The sealing drive still
 returns `SqliteError::Unsupported`. A later drive returns `RunState::Failed` and
 does not run the handler again. Other errors (unregistered workflow or
 activity, replay divergence, contained panic under budget, failed task) still

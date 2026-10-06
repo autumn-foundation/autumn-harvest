@@ -1181,7 +1181,8 @@ impl SqliteRuntime {
         result
     }
 
-    /// Seal `exec` `FAILED` with the typed unsupported-feature reason.
+    /// Seal `exec` `FAILED` with the typed unsupported-feature reason, and
+    /// remove its pending tasks, unfired timers and staged signals.
     ///
     /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`]
     /// and `non_retryable = true`. A retry would meet the same feature again.
@@ -1203,6 +1204,12 @@ impl SqliteRuntime {
         let tx = self.conn.transaction()?;
         store::append_event(&tx, exec, &event)?;
         store::set_failed(&tx, exec, &message)?;
+        // The cycle's own cleanup, such as a race's loser cancellation, rolled
+        // back with the cycle. This backend has no retention pass, so remove
+        // the work no one can use any more, as the `TerminateIfRunning` seal does.
+        queue::delete_pending_tasks_for_execution(&tx, exec)?;
+        queue::delete_unfired_timers_for_execution(&tx, exec)?;
+        queue::delete_undelivered_signals_for_execution(&tx, exec)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
         Ok(())

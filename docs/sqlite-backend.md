@@ -391,7 +391,9 @@ second runtime in the same process.
   mount gives a second path, and so a second lock. Open the database through
   one path.
 - A read-only inspector connection still works. It never touches the lock.
-- An in-memory database takes no lock.
+- A private in-memory database (`:memory:`) takes no lock. A shared-cache
+  in-memory URI (`file:name?mode=memory&cache=shared`) takes an in-process
+  lock on its name, because every connection in the process can open it.
 
 The lock file stays on disk after the runtime drops. **Do not delete it** while
 a runtime runs: a second process could then lock a new file. On Unix the lock
@@ -435,6 +437,9 @@ transaction, with a typed `WorkflowFailed` event:
 | `details` | `{"feature": "<stable token>", "message": "<full text>"}`. The token is a command or field name, such as `StartChildWorkflow` or `ScheduleActivity.session_id`. |
 | `non_retryable` | `true` |
 | `error` | The `SqliteError::Unsupported` message |
+
+The seal also removes the run's pending tasks, unfired timers and staged
+signals. The cycle's own cleanup rolled back, and nothing can use them now.
 
 That drive still returns `SqliteError::Unsupported`, so the caller sees the
 reason. A later drive returns `RunState::Failed` and does not run the handler

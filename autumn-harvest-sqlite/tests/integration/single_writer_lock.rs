@@ -265,3 +265,23 @@ fn the_lock_file_takes_the_database_file_mode() {
         "lock mode {mode:o} must not open to others"
     );
 }
+
+/// A shared-cache in-memory URI names one database that every connection in
+/// the process can open. `SQLite` reports no file for it, so it needs its own
+/// in-process lock.
+#[test]
+fn a_shared_cache_memory_database_takes_an_in_process_lock() {
+    let uri = "file:harvest_lock_1834?mode=memory&cache=shared";
+    let first = SqliteRuntime::open(uri).unwrap();
+
+    let err = SqliteRuntime::open(uri)
+        .err()
+        .expect("two runtimes on one shared-cache database are two writers");
+    assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
+
+    // A different shared name is a different database.
+    let _other = SqliteRuntime::open("file:harvest_lock_1834_b?mode=memory&cache=shared").unwrap();
+
+    drop(first);
+    SqliteRuntime::open(uri).expect("a dropped runtime releases its in-process lock");
+}
