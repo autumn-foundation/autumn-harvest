@@ -316,7 +316,9 @@ fn shape(ops: &[Op]) -> String {
 /// A command right after the outcome of one `join!` branch continues that
 /// branch. A start or a heartbeat of a member does not end the batch. A
 /// received signal settles its own branch. So does the outcome of an
-/// external operation, or the signal that wins a signal timeout.
+/// external operation, or the signal that wins a signal timeout or a race.
+/// The record of a race does not end the batch. A branch that resumed can
+/// continue as new while a sibling still waits.
 #[test]
 fn a_join_branch_continues_where_its_wait_ended() {
     let expected = [
@@ -351,6 +353,18 @@ fn a_join_branch_continues_where_its_wait_ended() {
         (
             "baseline-join-branch-continues-after-external-await.json",
             "join(slow, seq(await_external, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-after-race-activity.json",
+            "join(slow, seq(race, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-after-race-signal.json",
+            "join(slow, seq(race, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-into-continue-as-new.json",
+            "join(slow, seq(fast, continue_as_new))",
         ),
     ];
     let cases = seed("baseline-join-branch-continues");

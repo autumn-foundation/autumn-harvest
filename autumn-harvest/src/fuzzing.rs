@@ -878,6 +878,10 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         let event = &history[index];
         index += 1;
         let claimed_before = claimed.clone();
+        let silenced_before = silenced.clone();
+        // An event that a group op took, such as a race's winner marker, is
+        // that op's own record. It does not end the batch.
+        let mut absorbed = false;
         let op = match event {
             _ if superseded.contains(&(index - 1)) => continue,
             WorkflowEvent::MarkerRecorded { name, details } if name.starts_with("fan_out:") => {
@@ -888,7 +892,10 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                 Some(mirror_fan_out(history, index, count, &mut claimed))
             }
             _ if claimed.remove(&(index - 1)) => continue,
-            _ if silenced.remove(&(index - 1)) => None,
+            _ if silenced.remove(&(index - 1)) => {
+                absorbed = true;
+                None
+            }
             WorkflowEvent::MarkerRecorded { name, details } if race_seq(name).is_some() => {
                 let count = details.as_u64().and_then(|n| usize::try_from(n).ok());
                 let race = RaceOpen {
@@ -905,37 +912,24 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
             WorkflowEvent::TimerCancelled { timer_id }
                 if race_timers.contains(timer_id.as_str()) =>
             {
+                absorbed = true;
                 None
             }
             _ => match paired_op(history, index, &mut claimed, &mut timeouts) {
-                Paired::Mapped(op) => op,
+                Paired::Mapped(op) => {
+                    absorbed = op.is_none();
+                    op
+                }
                 Paired::Other => mirror_event(event, armed.contains(&(index - 1))),
             },
         };
         match op {
             Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => {
-                // A group op waits for the commands that it claimed.
-                let mut keys: HashSet<Pending> = pending_key(event).into_iter().collect();
-                for i in claimed.difference(&claimed_before) {
-                    keys.extend(pending_key(&history[*i]));
-                }
-                // A signal timeout also settles when its signal wins.
-                if let Op::SignalTimeout { name, .. } = &op {
-                    keys.insert(Pending::SignalWait(name.clone()));
-                }
-                let any = matches!(
-                    op,
-                    Op::Race { .. } | Op::ChildTimeout { .. } | Op::SignalTimeout { .. }
-                );
-                let fail_fast = matches!(
-                    op,
-                    Op::FanOut { collect: false, .. } | Op::ChildFanOut { collect: false, .. }
-                );
-                let waits = (!keys.is_empty()).then_some(Waits {
-                    keys,
-                    any,
-                    fail_fast,
-                });
+                let taken = claimed
+                    .difference(&claimed_before)
+                    .chain(silenced.difference(&silenced_before))
+                    .map(|i| &history[*i]);
+                let waits = waits_of(&op, event, taken);
                 // The event of a signal or a mutex grant is the outcome of
                 // its wait, so its branch goes on with the next command.
                 let arrived = matches!(op, Op::Signal { .. } | Op::Mutex { .. });
@@ -944,7 +938,13 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                     batch.resume_last();
                 }
             }
+            // A branch that resumed can end the run, as when it continues
+            // as new while a sibling still waits.
+            Some(op @ Op::ContinueAsNew { .. }) if batch.resumed_with_waiting() => {
+                batch.push(op, None);
+            }
             None if batch.settle(event) => {}
+            None if absorbed && batch.waiting() => {}
             other => {
                 batch.flush(&mut program);
                 program.extend(other);
@@ -953,6 +953,44 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     }
     batch.flush(&mut program);
     program
+}
+
+/// What the op that `event` mirrors waits for in a batch. `taken` holds the
+/// events that the op claimed or silenced, such as the commands of a group
+/// op and the signal that won a race.
+fn waits_of<'h>(
+    op: &Op,
+    event: &WorkflowEvent,
+    taken: impl Iterator<Item = &'h WorkflowEvent>,
+) -> Option<Waits> {
+    let mut keys: HashSet<Pending> = pending_key(event).into_iter().collect();
+    for taken in taken {
+        match taken {
+            // The signal that won a race settles the race.
+            WorkflowEvent::SignalReceived { signal_name, .. } => {
+                keys.insert(Pending::SignalWait(signal_name.clone()));
+            }
+            // A group op waits for the commands that it claimed.
+            other => keys.extend(pending_key(other)),
+        }
+    }
+    // A signal timeout also settles when its signal wins.
+    if let Op::SignalTimeout { name, .. } = op {
+        keys.insert(Pending::SignalWait(name.clone()));
+    }
+    let any = matches!(
+        op,
+        Op::Race { .. } | Op::ChildTimeout { .. } | Op::SignalTimeout { .. }
+    );
+    let fail_fast = matches!(
+        op,
+        Op::FanOut { collect: false, .. } | Op::ChildFanOut { collect: false, .. }
+    );
+    (!keys.is_empty()).then_some(Waits {
+        keys,
+        any,
+        fail_fast,
+    })
 }
 
 /// What a batch member waits for: the outcome of an activity, a child, a
@@ -1083,6 +1121,16 @@ impl Batch {
             self.branches.push(vec![op]);
             self.pending.push(waits_for);
         }
+    }
+
+    /// True while a member still waits.
+    fn waiting(&self) -> bool {
+        self.pending.iter().any(Option::is_some)
+    }
+
+    /// True when a branch resumed while another member still waits.
+    fn resumed_with_waiting(&self) -> bool {
+        self.resumed.is_some() && self.waiting()
     }
 
     /// Lets the branch that the last push touched go on with the next
