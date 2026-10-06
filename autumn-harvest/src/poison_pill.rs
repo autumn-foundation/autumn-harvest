@@ -121,15 +121,12 @@ impl OrphanWitness {
         let watched = self
             .last_sweep
             .is_some_and(|last| now.saturating_duration_since(last) <= hold);
-        let mut seen = std::mem::take(&mut self.first_seen);
-        if !watched {
-            seen.clear();
-        }
+        let seen = std::mem::take(&mut self.first_seen);
         self.first_seen = claims
             .into_iter()
             .map(|claim| {
-                let first = seen.get(&claim).copied().unwrap_or(now);
-                (claim, first)
+                let first = seen.get(&claim).filter(|_| watched).copied();
+                (claim, first.unwrap_or(now))
             })
             .collect();
         self.last_sweep = Some(now);
@@ -1421,7 +1418,8 @@ mod tests {
         let t0 = std::time::Instant::now();
         witness.observe([claim(1, "w", 2)], t0, HOLD);
         assert!(!witness.confirmed(&claim(1, "w", 2), t0, HOLD));
-        let early = t0 + HOLD - std::time::Duration::from_millis(1);
+        // One millisecond short of one hold.
+        let early = t0 + std::time::Duration::from_millis(9_999);
         witness.observe([claim(1, "w", 2)], early, HOLD);
         assert!(!witness.confirmed(&claim(1, "w", 2), early, HOLD));
         witness.observe([claim(1, "w", 2)], t0 + HOLD, HOLD);

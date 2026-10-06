@@ -293,7 +293,8 @@ restart therefore does not change any URL. These tests ignore
 shared database.
 
 Workers use a 500 ms heartbeat, so the lease TTL (the stale threshold) is 1 s.
-The latency test is the exception, see the known bugs below.
+The latency test also raises the workflow-task budget to 60 s, because a
+decision cycle takes more than 10 s at that latency.
 
 | Scenario | Test | Fault | Proof the fault landed |
 |---|---|---|---|
@@ -345,9 +346,11 @@ event, an `ActivityCompleted`.
 - #1876: Postgres keeps the open transaction of a partitioned worker until
   TCP keepalive ends the session. That transaction keeps its row locks.
   Orphan reclaim blocks on such a lock, so no orphan is reclaimed.
-- #1879: the heartbeat period is the interval plus the tick latency. When a
-  tick takes longer than one interval, a live worker looks dead. False
-  reclaims then count crash strikes and quarantine healthy work.
+- #1879: the heartbeat period was the interval plus the tick latency. When a
+  tick took longer than one interval, a live worker looked dead. False
+  reclaims then counted crash strikes and quarantined healthy work. The fix
+  makes the heartbeat fixed-rate. The reclaimer also holds the last strike
+  until it saw the orphan for one more stale window.
 
 Each test works around a bug only where the bug applies:
 
@@ -366,9 +369,6 @@ Each test works around a bug only where the bug applies:
   a `WorkflowFailed` for the timeout.
 - For #1876, the partition test sets `idle_in_transaction_session_timeout =
   5s` on the server to end the session.
-- For #1879, the latency test uses a 2 s heartbeat. A decision cycle also
-  takes more than 10 s at that latency, so it keeps the default 60 s
-  workflow-task budget.
 
 When a fix for a bug merges, remove its workaround.
 

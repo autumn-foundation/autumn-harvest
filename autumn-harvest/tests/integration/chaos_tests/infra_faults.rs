@@ -64,12 +64,12 @@ const FAST: Tuning = Tuning {
 
 /// The tuning of the latency test.
 ///
-/// A heartbeat tick must take less than one interval. At [`HEARTBEAT`], the
-/// latency toxic breaks that rule, and bug #1879 then quarantines healthy
-/// work. A decision cycle also takes more than 10 s at this latency. So the
-/// test keeps the default 60 s cap, which gives a 60 s budget.
+/// The test uses [`HEARTBEAT`]. At this latency a heartbeat tick can take
+/// longer than one interval, so it is a regression test for #1879. A
+/// decision cycle also takes more than 10 s at this latency. So the test
+/// keeps the default 60 s cap, which gives a 60 s budget.
 const SLOW_NETWORK: Tuning = Tuning {
-    heartbeat: Duration::from_secs(2),
+    heartbeat: HEARTBEAT,
     local_activity_cap: Duration::from_secs(60),
 };
 
