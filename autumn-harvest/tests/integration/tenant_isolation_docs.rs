@@ -117,8 +117,12 @@ fn sharding_guide_documents_cells() {
         guide.contains("## Tenant cells (issue #1837)"),
         "{SHARDING} lacks the tenant cells section"
     );
+    let out_of_scope = guide
+        .lines()
+        .filter(|line| line.contains("**Out of scope**"))
+        .find(|line| line.contains("per-shard worker assignment,"));
     assert!(
-        !guide.contains("per-shard worker assignment, geo-replication"),
+        out_of_scope.is_none(),
         "{SHARDING} still lists per-shard worker assignment as out of scope"
     );
 }

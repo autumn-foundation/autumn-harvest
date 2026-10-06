@@ -121,6 +121,8 @@ mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
 mod drain_release_tests;
+#[cfg(feature = "db")]
+mod dst_differential_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 mod event_batch_tests;
@@ -139,6 +141,8 @@ mod history_ceiling_claim_tests;
 mod history_checker;
 #[cfg(feature = "db")]
 mod history_crash_tests;
+#[cfg(feature = "db")]
+mod history_default_caps_tests;
 mod host_clock_skew_tests;
 mod hot_code_swap_docs;
 #[cfg(all(feature = "hot-code-swap", feature = "testing"))]
