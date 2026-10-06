@@ -32,8 +32,9 @@ Key attribute options:
 
 Long-running activities should periodically call `ctx.heartbeat()` to:
 
-1. **Report liveness** — the `heartbeat_timeout` scanner marks an activity
-   failed if no heartbeat arrives within the configured window.
+1. **Report liveness** — the `heartbeat_timeout` scanner times out an
+   attempt that sends no heartbeat in the window. The attempt retries per
+   the retry policy. The last attempt fails the activity.
 2. **Checkpoint progress** — the payload is persisted to the database; the
    next retry attempt can read it back via `ctx.heartbeat_details::<T>()`.
 3. **Receive cancellation signals** — `heartbeat()` returns

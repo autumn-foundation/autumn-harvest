@@ -182,9 +182,10 @@ Alert when the rate stays above zero:
 sum by (reason) (rate(harvest_heartbeat_flush_failed_total[5m])) > 0
 ```
 
-A run of failures that is longer than an activity's `heartbeat_timeout` lets
-that timeout fail the activity. Make the pool larger, or find the connection
-that holds it.
+A run of failures that is longer than an activity's `heartbeat_timeout` times
+out the attempt. The attempt retries if attempts are left. The last attempt
+fails the activity. Make the pool larger, or find the connection that holds
+it.
 
 ## Alert on old transactions
 

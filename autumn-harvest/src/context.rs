@@ -15570,8 +15570,8 @@ impl ActivityContext {
     ///
     /// The drain cancel stops the auto-heartbeat ticker and fails each manual
     /// heartbeat. A handler that ignores the cancel keeps its claim. Without
-    /// pings, the heartbeat-timeout scanner fails the task, and a retry then
-    /// runs next to the live handler.
+    /// pings, the heartbeat-timeout scanner times out the attempt. With
+    /// attempts left, a retry then runs next to the live handler.
     ///
     /// This future re-sends the last payload at `heartbeat_timeout / 3`, as
     /// [`Self::start_auto_heartbeat_default`] does. The checkpoint therefore

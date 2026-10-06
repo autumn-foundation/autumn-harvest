@@ -40,7 +40,9 @@ that declares a `schedule_to_close` or a `heartbeat_timeout`, because each
 already bounds a running attempt. The `schedule_to_close` scanner skips a
 paused execution, so a hung attempt there waits for the resume. A timeout
 follows the retry policy, as a retryable error does (issue #1870). Only the
-last attempt fails the activity call. Give a long activity its own
+last attempt fails the activity call. With no retry policy, an activity has
+three attempts. Set `RetryPolicy::fixed(1, ..)` to keep one attempt. Give a
+long activity its own
 `start_to_close`, or raise the floor. Call
 `without_default_activity_start_to_close()` to remove it. At build time,
 `HarvestBuilder::try_build` logs one warning that names each regular activity
@@ -188,8 +190,8 @@ time with a clear error). Local activities are fast in-process work; use
 `start_to_close` + a low retry count instead.
 
 **Soft SLA — page before the customer notices (`#[workflow(sla = "…")]`).**
-Every knob above is a *hard* deadline: when it fires it terminates, fails, or
-skips the work. But the most common production question is softer — *"this run
+Every knob above is a *hard* deadline: when it fires it terminates, fails,
+retries or skips the work. But the most common production question is softer — *"this run
 is healthy and still making progress, but it's far slower than it should be —
 alert me **before** it's a problem."* That's the soft SLA:
 

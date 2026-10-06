@@ -346,7 +346,7 @@ Use the workflow detail page at `/workflows/{exec_id}` to investigate a workflow
 
 ### Scenario 5 — Timed-out activity (activity exceeded its start-to-close timeout)
 
-**Symptoms**: The workflow has an `ActivityTimedOut` event in the event timeline. The workflow may be retrying or may be stuck in `FAILED`.
+**Symptoms**: The workflow has an `ActivityTimedOut` event in the event timeline. The workflow may be retrying or may be stuck in `FAILED`. A `StartToClose` or `Heartbeat` `ActivityTimedOut` event means the last attempt timed out. Earlier timed-out attempts retried and left no event (issue #1870).
 
 **Steps**:
 1. Open the detail page and find the `ActivityTimedOut` event in the **Event history** timeline. Use "view payload" to read the `activity_id` and timeout type.

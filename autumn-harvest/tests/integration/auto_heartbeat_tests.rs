@@ -678,8 +678,9 @@ async fn auto_heartbeat_activity_still_reclaimed_by_start_to_close() {
         }
     });
 
-    // The wedge is reclaimed by start_to_close (~2s) and the workflow fails; a
-    // generous ceiling for CI.
+    // start_to_close (~2s) reclaims each attempt. With no retry policy the task
+    // has 3 attempts (issue #1870), so the workflow fails after about 9s. The
+    // ceiling is generous for CI.
     let execution = wait_for_state(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
 
     scanner_stop.notify_one();

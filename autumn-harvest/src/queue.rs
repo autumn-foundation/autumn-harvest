@@ -3887,7 +3887,7 @@ async fn requeue_for_retry_inner(
         ),
     ))
     .into_boxed();
-    let Some((queue_name, priority, task_type, next_run)) = fence(update, claim)
+    let requeued = fence(update, claim)
         .returning((
             dsl::queue_name,
             dsl::priority,
@@ -3897,8 +3897,96 @@ async fn requeue_for_retry_inner(
         .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
         .await
         .optional()
-        .map_err(crate::error::database_error)?
-    else {
+        .map_err(crate::error::database_error)?;
+    announce_requeue(conn, task_id, requeued).await
+}
+
+/// Columns that a timeout requeue resets (issue #1870).
+///
+/// A timeout does not prove that the handler ran to an end. A worker crash
+/// looks the same. So, unlike [`PendingRequeueChangeset`], this changeset
+/// keeps `crash_strikes` and the capability-miss counters. A crash loop then
+/// still reaches the poison-pill threshold.
+#[derive(AsChangeset)]
+#[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
+struct TimeoutRequeueChangeset {
+    state: &'static str,
+    worker_id: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    error: Option<String>,
+}
+
+/// Requeue a `RUNNING` activity task after a timed-out attempt (issue #1870).
+///
+/// The next attempt is due after `delay`. `previous_error` goes to the
+/// `error` column for `ActivityContext::previous_failure()`. The heartbeat
+/// checkpoint, `crash_strikes` and the capability-miss counters stay.
+///
+/// This write is not fenced. The timeout sweeper calls it with the task row
+/// locked.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// running, and [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_timed_out_task(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let changeset = TimeoutRequeueChangeset {
+        state: "PENDING",
+        worker_id: None,
+        started_at: None,
+        last_heartbeat_at: None,
+        error: Some(previous_error.to_string()),
+    };
+    let requeued = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+    ))
+    .returning((
+        dsl::queue_name,
+        dsl::priority,
+        dsl::task_type,
+        dsl::scheduled_at,
+    ))
+    .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?;
+    if !announce_requeue(conn, task_id, requeued).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
+    Ok(())
+}
+
+/// Announce a requeued task to dispatch. Return false when no row changed.
+///
+/// `requeued` is the `RETURNING` row of the requeue `UPDATE`.
+async fn announce_requeue(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    requeued: Option<(String, i32, String, chrono::DateTime<Utc>)>,
+) -> HarvestResult<bool> {
+    let Some((queue_name, priority, task_type, next_run)) = requeued else {
         return Ok(false);
     };
 

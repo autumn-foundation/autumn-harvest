@@ -1163,6 +1163,7 @@ more than 10 minutes or if DLQ entries are accumulating rapidly.
 2. Check the retry rate trend: is it growing, stable, or receding?
 3. Run `harvest dlq list --limit 25` to determine whether retries are eventually succeeding or tipping into the DLQ.
 4. Check `harvest.activity.failed{activity=<name>,error.type=<type>}` to identify the failure class driving retries.
+   A timeout retry (issue #1870) does not count in `harvest.activity.failed`. If that counter is flat, check the task row `error` for a `StartToClose` or `Heartbeat` timeout.
 5. Inspect circuit breaker state: `GET /api/harvest/admin/circuits/<activity_name>`.
    If the breaker is closed and failures are consistent, consider force-opening it to stop flooding: `POST /api/harvest/admin/circuits/{activity_name}/force-open`.
 
@@ -1170,7 +1171,8 @@ more than 10 minutes or if DLQ entries are accumulating rapidly.
 
 Intermittent downstream degradation that recovers before retry exhaustion, too-aggressive retry
 policy (high max_attempts or very short backoff), cascading failure across many parallel workflow
-executions, or a transient infrastructure event (restart, rebalance, network blip).
+executions, a transient infrastructure event (restart, rebalance, network blip), or a hung
+downstream that reaches `start_to_close` or `heartbeat_timeout` on each attempt.
 
 ### False positives
 

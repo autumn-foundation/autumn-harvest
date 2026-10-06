@@ -1341,18 +1341,22 @@ pub(crate) async fn task_state_for_update(
 /// against the row's current value under the execution row lock, not the
 /// scan-time snapshot.
 ///
-/// The read also returns the row's `attempt`. [`attempt_superseded`] compares
-/// it with the scan (issue #1870).
+/// The read also returns the row's claim. [`claim_superseded`] compares it
+/// with the scan (issue #1870).
 async fn task_state_and_deadline_for_update(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
-) -> HarvestResult<Option<(String, Option<chrono::DateTime<Utc>>, i32)>> {
+) -> HarvestResult<Option<(String, Option<chrono::DateTime<Utc>>, ClaimStamp)>> {
     use crate::schema::harvest_task_queue::dsl;
 
     dsl::harvest_task_queue
         .find(task_id)
         .for_update()
-        .select((dsl::state, dsl::schedule_to_close_at, dsl::attempt))
+        .select((
+            dsl::state,
+            dsl::schedule_to_close_at,
+            (dsl::attempt, dsl::started_at),
+        ))
         .first(conn)
         .await
         .optional()
@@ -1554,57 +1558,78 @@ fn pause_suppresses_timeout_enforcement(
     }
 }
 
-/// The retry delay for an activity attempt that timed out (issue #1870).
+/// What to do with an activity attempt that timed out (issue #1870).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimeoutVerdict {
+    /// Requeue the task. The next attempt is due after the delay.
+    Retry(chrono::Duration),
+    /// End the activity call. Record a timeout of this type.
+    Terminal(TimeoutReason),
+}
+
+/// Decide whether an activity attempt that timed out retries (issue #1870).
 ///
-/// `None` means the timeout is terminal. The rules are those of a retryable
-/// `Err` in the worker, so a timeout and an error use the same attempts.
+/// The rules are those of a retryable `Err` in the worker. A timeout and an
+/// error share one attempt budget.
 ///
-/// - Only `Heartbeat` and `StartToClose` bound one attempt. A queue wait or
-///   the total budget does not improve on a new attempt.
-/// - A policy that does not parse makes the timeout terminal. An error here
-///   would make the sweeper try the same row on each pass.
-/// - A retry that cannot start before `schedule_to_close_at` is terminal.
-///   Otherwise the row waits in the queue for the deadline scanner.
+/// - Only `Heartbeat` and `StartToClose` bound one attempt. A new attempt
+///   does not help a queue wait or an expired total budget.
+/// - A policy that does not parse, a delay that does not convert, or a policy
+///   that marks the error non-retryable makes the timeout terminal. An error
+///   here would make the sweeper try the same row on each pass.
+/// - A retry that cannot start before `schedule_to_close_at` records a
+///   `ScheduleToClose` timeout, as the worker does. Otherwise the row would
+///   wait in the queue for the deadline scanner.
 /// - A pause stops the `schedule_to_close` clock (issue #609). The resume
 ///   moves the deadline, so the deadline check does not apply.
-fn activity_timeout_retry_delay(
+fn timeout_verdict(
     task: &TaskQueueItem,
     reason: &TimeoutReason,
     error: &str,
     row_schedule_to_close_at: Option<chrono::DateTime<Utc>>,
     now: chrono::DateTime<Utc>,
     execution_paused: bool,
-) -> Option<chrono::Duration> {
+) -> TimeoutVerdict {
+    let terminal = || TimeoutVerdict::Terminal(reason.clone());
     if !matches!(
         reason,
         TimeoutReason::Heartbeat | TimeoutReason::StartToClose
     ) {
-        return None;
+        return terminal();
     }
-    let policy = crate::worker::configured_retry_policy(task).ok()?;
-    let delay = crate::worker::next_retry_delay(
+    let Ok(policy) = crate::worker::configured_retry_policy(task) else {
+        return terminal();
+    };
+    let Ok(Some(delay)) = crate::worker::next_retry_delay(
         task,
         error,
         policy.as_ref(),
         crate::builder::DEFAULT_RETRY_AFTER_CEILING,
-    )
-    .ok()??;
+    ) else {
+        return terminal();
+    };
     if !execution_paused
         && crate::worker::deadline_would_be_exceeded(row_schedule_to_close_at, now, delay)
     {
-        return None;
+        return TimeoutVerdict::Terminal(TimeoutReason::ScheduleToClose);
     }
-    Some(delay)
+    TimeoutVerdict::Retry(delay)
 }
 
-/// True when the row holds a later attempt than the scan saw (issue #1870).
+/// One claim of a task row: its `attempt` and its `started_at`.
+type ClaimStamp = (i32, Option<chrono::DateTime<Utc>>);
+
+/// True when the row holds a different claim than the scan saw (issue #1870).
 ///
-/// A timeout can requeue a task, and a worker can then claim the next
-/// attempt. A second sweeper with the old scan would then find a `RUNNING`
-/// row again. `Heartbeat` and `StartToClose` bound one attempt, so they must
-/// not apply to a different one. `ScheduleToStart` re-reads its deadline under
-/// the lock, and `ScheduleToClose` bounds every attempt.
-const fn attempt_superseded(reason: &TimeoutReason, scanned: i32, current: i32) -> bool {
+/// A timeout can requeue a task, and a worker can then claim it again. A
+/// second sweeper with the old scan would then find a `RUNNING` row again.
+/// `Heartbeat` and `StartToClose` bound one claim, so they must not apply to
+/// a different one. `ScheduleToStart` re-reads its deadline under the lock,
+/// and `ScheduleToClose` bounds every attempt.
+///
+/// The check compares `started_at` too. Some releases lower `attempt`, so a
+/// later claim can reuse an attempt number. Each claim sets a new `started_at`.
+fn claim_superseded(reason: &TimeoutReason, scanned: ClaimStamp, current: ClaimStamp) -> bool {
     matches!(
         reason,
         TimeoutReason::Heartbeat | TimeoutReason::StartToClose
@@ -1879,11 +1904,12 @@ async fn commit_workflow_execution_timeout(
 /// What [`enforce_activity_timeout`] did with a timed-out task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityTimeoutOutcome {
-    /// The task moved on, or a hold protects it. Nothing changed.
+    /// No timeout applies. The task moved on, or a hold protects it. A task
+    /// with no pending activity fails with no event.
     Skipped,
-    /// The attempt timed out with attempts left. The task is requeued.
+    /// The attempt timed out with attempts left. The sweeper requeues the task.
     Retried,
-    /// The activity call timed out. `ActivityTimedOut` is appended.
+    /// The sweeper appends `ActivityTimedOut` and fails the task.
     TimedOut,
 }
 
@@ -1922,9 +1948,8 @@ pub async fn enforce_activity_timeout_for_task(
     .await
 }
 
-// The `dispatch::buffered_settled` wrap (issue #1429) added two lines over
-// the 100-line cap. The transaction below is one atomic unit; splitting it
-// would only move lines around, not shrink the function.
+// This function is over the 100-line cap. The transaction below is one
+// atomic unit. Splitting it would only move lines around, not shrink it.
 #[allow(clippy::too_many_lines)]
 async fn enforce_activity_timeout(
     conn: &mut AsyncPgConnection,
@@ -2071,13 +2096,13 @@ async fn enforce_activity_timeout(
 
             let (execution, history) =
                 lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
-            let Some((state, row_schedule_to_close_at, row_attempt)) =
+            let Some((state, row_schedule_to_close_at, row_claim)) =
                 task_state_and_deadline_for_update(conn, task.id).await?
             else {
                 return Ok(ActivityTimeoutOutcome::Skipped);
             };
             if !expected_task_states_for_timeout(reason).contains(&state.as_str())
-                || attempt_superseded(reason, task.attempt, row_attempt)
+                || claim_superseded(reason, (task.attempt, task.started_at), row_claim)
             {
                 return Ok(ActivityTimeoutOutcome::Skipped);
             }
@@ -2159,11 +2184,11 @@ async fn enforce_activity_timeout(
                         return Ok(ActivityTimeoutOutcome::Skipped);
                     }
                 };
-            // An attempt with attempts left retries, as a retryable `Err` does
-            // (issue #1870). The task row is locked and `RUNNING`, so the
-            // requeue applies. It keeps the heartbeat checkpoint.
+            // A timed-out attempt with attempts left retries, as a retryable
+            // `Err` does (issue #1870). The task row is locked and `RUNNING`,
+            // so the requeue cannot return `NotFound`.
             let now = queue::db_clock_now(conn).await?;
-            if let Some(delay) = activity_timeout_retry_delay(
+            let recorded = match timeout_verdict(
                 task,
                 reason,
                 &error,
@@ -2171,12 +2196,16 @@ async fn enforce_activity_timeout(
                 now,
                 execution.state == "PAUSED",
             ) {
-                queue::requeue_for_retry(conn, task.id, delay, &error).await?;
-                return Ok(ActivityTimeoutOutcome::Retried);
-            }
+                TimeoutVerdict::Retry(delay) => {
+                    queue::requeue_timed_out_task(conn, task.id, delay, &error).await?;
+                    return Ok(ActivityTimeoutOutcome::Retried);
+                }
+                TimeoutVerdict::Terminal(recorded) => recorded,
+            };
+            let error = timeout_error(activity_name, &recorded);
             let timeout_event = WorkflowEvent::ActivityTimedOut {
                 activity_id,
-                timeout_type: reason.timeout_type(),
+                timeout_type: recorded.timeout_type(),
             };
             store::append_events_with_codecs(
                 conn,
@@ -6606,14 +6635,14 @@ mod tests {
         task
     }
 
-    fn retry_delay(
+    fn verdict(
         task: &TaskQueueItem,
         reason: &TimeoutReason,
         deadline: Option<chrono::DateTime<Utc>>,
         paused: bool,
-    ) -> Option<chrono::Duration> {
+    ) -> TimeoutVerdict {
         let error = timeout_error("charge", reason);
-        activity_timeout_retry_delay(task, reason, &error, deadline, Utc::now(), paused)
+        timeout_verdict(task, reason, &error, deadline, Utc::now(), paused)
     }
 
     #[test]
@@ -6621,8 +6650,8 @@ mod tests {
         let task = with_fixed_policy(1, 3, Duration::from_millis(200));
         for reason in [TimeoutReason::StartToClose, TimeoutReason::Heartbeat] {
             assert_eq!(
-                retry_delay(&task, &reason, None, false),
-                Some(chrono::Duration::milliseconds(200)),
+                verdict(&task, &reason, None, false),
+                TimeoutVerdict::Retry(chrono::Duration::milliseconds(200)),
                 "{reason}"
             );
         }
@@ -6632,7 +6661,10 @@ mod tests {
     fn a_timed_out_last_attempt_is_terminal() {
         let task = with_fixed_policy(3, 3, Duration::from_millis(200));
         for reason in [TimeoutReason::StartToClose, TimeoutReason::Heartbeat] {
-            assert_eq!(retry_delay(&task, &reason, None, false), None, "{reason}");
+            assert_eq!(
+                verdict(&task, &reason, None, false),
+                TimeoutVerdict::Terminal(reason.clone())
+            );
         }
     }
 
@@ -6643,36 +6675,47 @@ mod tests {
             TimeoutReason::ScheduleToStart,
             TimeoutReason::ScheduleToClose,
         ] {
-            assert_eq!(retry_delay(&task, &reason, None, false), None, "{reason}");
+            assert_eq!(
+                verdict(&task, &reason, None, false),
+                TimeoutVerdict::Terminal(reason.clone())
+            );
         }
     }
 
     #[test]
     fn a_task_without_a_policy_retries_up_to_max_attempts() {
         let reason = TimeoutReason::StartToClose;
-        let delay = retry_delay(&running_activity(1, 3), &reason, None, false)
-            .expect("attempt 1 of 3 must retry");
+        let TimeoutVerdict::Retry(delay) = verdict(&running_activity(1, 3), &reason, None, false)
+        else {
+            panic!("attempt 1 of 3 must retry");
+        };
         assert!(
             delay >= chrono::Duration::zero() && delay <= chrono::Duration::seconds(1),
             "the fallback delay is a jittered 1s: {delay}"
         );
         assert_eq!(
-            retry_delay(&running_activity(1, 1), &reason, None, false),
-            None
+            verdict(&running_activity(1, 1), &reason, None, false),
+            TimeoutVerdict::Terminal(reason)
         );
     }
 
     #[test]
-    fn a_retry_that_cannot_start_before_schedule_to_close_is_terminal() {
+    fn a_retry_that_cannot_start_before_schedule_to_close_records_that_deadline() {
         let task = with_fixed_policy(1, 3, Duration::from_secs(60));
         let deadline = Some(Utc::now() + chrono::Duration::seconds(30));
-        let reason = TimeoutReason::StartToClose;
-        assert_eq!(retry_delay(&task, &reason, deadline, false), None);
-        // A pause stops the deadline clock (issue #609), so the retry goes on.
-        assert_eq!(
-            retry_delay(&task, &reason, deadline, true),
-            Some(chrono::Duration::seconds(60))
-        );
+        for reason in [TimeoutReason::StartToClose, TimeoutReason::Heartbeat] {
+            assert_eq!(
+                verdict(&task, &reason, deadline, false),
+                TimeoutVerdict::Terminal(TimeoutReason::ScheduleToClose),
+                "{reason}"
+            );
+            // A pause stops the deadline clock (issue #609), so the retry goes on.
+            assert_eq!(
+                verdict(&task, &reason, deadline, true),
+                TimeoutVerdict::Retry(chrono::Duration::seconds(60)),
+                "{reason}"
+            );
+        }
     }
 
     #[test]
@@ -6680,22 +6723,38 @@ mod tests {
         let task = with_fixed_policy(1, 3, Duration::from_secs(1));
         let deadline = Some(Utc::now() + chrono::Duration::hours(1));
         assert_eq!(
-            retry_delay(&task, &TimeoutReason::StartToClose, deadline, false),
-            Some(chrono::Duration::seconds(1))
+            verdict(&task, &TimeoutReason::StartToClose, deadline, false),
+            TimeoutVerdict::Retry(chrono::Duration::seconds(1))
         );
     }
 
     #[test]
-    fn a_per_attempt_timeout_never_applies_to_a_later_attempt() {
+    fn a_per_attempt_timeout_never_applies_to_a_later_claim() {
+        let started = Some(Utc::now());
+        let restarted = started.map(|t| t + chrono::Duration::seconds(5));
         for reason in [TimeoutReason::StartToClose, TimeoutReason::Heartbeat] {
-            assert!(attempt_superseded(&reason, 1, 2), "{reason}");
-            assert!(!attempt_superseded(&reason, 2, 2), "{reason}");
+            assert!(
+                !claim_superseded(&reason, (2, started), (2, started)),
+                "{reason}"
+            );
+            assert!(
+                claim_superseded(&reason, (1, started), (2, restarted)),
+                "{reason}"
+            );
+            // A release lowers `attempt`, so a later claim can reuse it.
+            assert!(
+                claim_superseded(&reason, (2, started), (2, restarted)),
+                "{reason}"
+            );
         }
         for reason in [
             TimeoutReason::ScheduleToStart,
             TimeoutReason::ScheduleToClose,
         ] {
-            assert!(!attempt_superseded(&reason, 1, 2), "{reason}");
+            assert!(
+                !claim_superseded(&reason, (1, started), (2, restarted)),
+                "{reason}"
+            );
         }
     }
 
@@ -6703,9 +6762,10 @@ mod tests {
     fn a_task_with_an_invalid_policy_times_out_terminally() {
         let mut task = running_activity(1, 3);
         task.retry_policy = Some(serde_json::json!({"max_attempts": "three"}));
+        let reason = TimeoutReason::StartToClose;
         assert_eq!(
-            retry_delay(&task, &TimeoutReason::StartToClose, None, false),
-            None
+            verdict(&task, &reason, None, false),
+            TimeoutVerdict::Terminal(reason.clone())
         );
     }
 

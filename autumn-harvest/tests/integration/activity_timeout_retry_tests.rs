@@ -13,19 +13,21 @@
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
+use autumn_harvest::circuit_breaker::CircuitBreakerRegistry;
 use autumn_harvest::error::TimeoutType;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::payload_codec::PayloadCodecs;
-use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
+use autumn_harvest::policy::{CircuitBreakerPolicy, JitterPolicy, RetryPolicy};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
-use autumn_harvest::telemetry::NoOpMetrics;
+use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::timeout::{self, TimeoutReason};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -101,14 +103,47 @@ fn started(name: &str, attempt: u32) -> bool {
         .is_some_and(|s| s.contains(&(name.to_string(), attempt)))
 }
 
-/// Attempt 1 never returns and never heartbeats. A later attempt succeeds.
+/// What a retry saw: the heartbeat checkpoint and the previous failure.
+type Seen = (Option<serde_json::Value>, Option<String>);
+
+/// What attempt 2 saw, by activity name.
+static SEEN_BY_RETRY: Mutex<Option<HashMap<String, Seen>>> = Mutex::new(None);
+
+fn seen_by_retry(name: &str) -> Option<Seen> {
+    SEEN_BY_RETRY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(name).cloned())
+}
+
+/// The checkpoint that attempt 1 sends before it hangs.
+fn checkpoint() -> serde_json::Value {
+    serde_json::json!({"step": 7})
+}
+
+/// Attempt 1 sends one checkpoint, then never returns. A later attempt
+/// records what it sees, then succeeds.
 fn hang_first(ctx: &autumn_harvest::ActivityContext, _input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
         let info = ctx.info();
-        record_start(&info.activity_type, info.attempt);
         if info.attempt == 1 {
+            ctx.heartbeat(checkpoint())
+                .await
+                .map_err(|e| e.to_string())?;
+            record_start(&info.activity_type, info.attempt);
             std::future::pending::<()>().await;
         }
+        let details = ctx
+            .heartbeat_details::<serde_json::Value>()
+            .map_err(|e| e.to_string())?;
+        let previous = ctx.previous_failure().map(str::to_string);
+        SEEN_BY_RETRY
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(info.activity_type.clone(), (details, previous));
+        record_start(&info.activity_type, info.attempt);
         Ok(serde_json::json!("done"))
     })
 }
@@ -182,13 +217,13 @@ struct Bounds {
 fn activity_info(
     name: &'static str,
     handler: autumn_harvest::info::ActivityHandlerFn,
-    retry: RetryPolicy,
+    retry: Option<RetryPolicy>,
     bounds: Bounds,
 ) -> ActivityInfo {
     ActivityInfo {
         name,
         module: "activity_timeout_retry_tests",
-        default_retry_policy: Some(retry),
+        default_retry_policy: retry,
         default_start_to_close: bounds.start_to_close,
         default_heartbeat_timeout: bounds.heartbeat_timeout,
         default_schedule_to_start: None,
@@ -252,7 +287,12 @@ fn build_worker(queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 workflow_task_timeout: Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
                 labels: HashMap::new(),
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                // Only the test sweeps. The worker scanner waits the longest
+                // interval, so a test controls which sweep enforces.
+                scanner: autumn_harvest::scanner_lease::ScannerConfig {
+                    timeout_interval: Some(autumn_harvest::scanner_lease::MAX_SCANNER_INTERVAL),
+                    ..autumn_harvest::scanner_lease::ScannerConfig::default()
+                },
                 queue_weights: HashMap::new(),
                 max_workflow_pause_duration: Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
@@ -442,28 +482,84 @@ async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, want
 }
 
 /// Make the attempt look `secs` old. Clear the heartbeat stamp too, so the
-/// heartbeat scan reads `started_at`.
-async fn backdate(conn: &mut AsyncPgConnection, task_id: Uuid, secs: i64) {
-    diesel::sql_query(
-        "UPDATE harvest_task_queue \
-         SET started_at = NOW() - ($2 * INTERVAL '1 second'), last_heartbeat_at = NULL \
-         WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<diesel::sql_types::BigInt, _>(secs)
-    .execute(conn)
-    .await
-    .expect("backdate the attempt");
+/// heartbeat scan reads `started_at`. Return the row as a scan reads it.
+async fn backdate(conn: &mut AsyncPgConnection, task_id: Uuid, secs: i64) -> TaskQueueItem {
+    diesel::update(harvest_task_queue::table.find(task_id))
+        .set((
+            harvest_task_queue::started_at.eq(Some(Utc::now() - chrono::Duration::seconds(secs))),
+            harvest_task_queue::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+        ))
+        .returning(TaskQueueItem::as_returning())
+        .get_result(conn)
+        .await
+        .expect("backdate the attempt")
 }
 
-async fn sweep(conn: &mut AsyncPgConnection) {
+/// Record crash strikes on the task, as the orphan reclaimer does.
+async fn set_crash_strikes(conn: &mut AsyncPgConnection, task_id: Uuid, strikes: i32) {
+    diesel::update(harvest_task_queue::table.find(task_id))
+        .set(harvest_task_queue::crash_strikes.eq(strikes))
+        .execute(conn)
+        .await
+        .expect("set crash strikes");
+}
+
+/// Wait until the heartbeat flusher writes the checkpoint of attempt 1.
+async fn wait_for_checkpoint(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while activity_task(conn, exec_id).await.heartbeat_details != Some(checkpoint()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the checkpoint of attempt 1 must reach the task row within 30s"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Counts the metrics that a timeout retry records.
+#[derive(Default)]
+struct Counts {
+    retried: AtomicUsize,
+    tripped: AtomicUsize,
+}
+
+impl MetricsRecorder for Counts {
+    fn record_activity_retried(&self, _activity: &str, _queue: &str) {
+        self.retried.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_circuit_tripped(&self, _activity: &str) {
+        self.tripped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Read a counter. `AtomicUsize::load` clashes with Diesel's `load`.
+fn read(counter: &AtomicUsize) -> usize {
+    AtomicUsize::load(counter, Ordering::SeqCst)
+}
+
+/// A breaker that trips on the first failure of `activity`.
+fn one_failure_breaker(activity: &str) -> CircuitBreakerRegistry {
+    let policy = CircuitBreakerPolicy {
+        failure_threshold: 1,
+        window: Duration::from_secs(60),
+        cooldown: Duration::from_secs(60),
+    };
+    CircuitBreakerRegistry::new(HashMap::from([(activity.to_string(), policy)]))
+}
+
+async fn sweep_with(
+    conn: &mut AsyncPgConnection,
+    metrics: &Counts,
+    breakers: Option<&CircuitBreakerRegistry>,
+) {
     timeout::enforce_timeouts_once(
         conn,
-        &NoOpMetrics,
+        metrics,
         Duration::from_secs(60),
         &None,
         &[ShardId::new(0)],
-        None,
+        breakers,
         None,
         60,
         &PayloadCodecs::default(),
@@ -473,21 +569,24 @@ async fn sweep(conn: &mut AsyncPgConnection) {
     .expect("timeout sweep");
 }
 
-/// Count `ActivityTimedOut` events of `timeout_type` and `ActivityCompleted`
-/// events.
-async fn outcomes(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    timeout_type: TimeoutType,
-) -> (usize, usize) {
+async fn sweep(conn: &mut AsyncPgConnection) {
+    sweep_with(conn, &Counts::default(), None).await;
+}
+
+/// The timeout types of all `ActivityTimedOut` events, and the number of
+/// `ActivityCompleted` events.
+async fn outcomes(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> (Vec<TimeoutType>, usize) {
     let history = store::load_history(conn, exec_id)
         .await
         .expect("load history")
         .events;
     let timed_out = history
         .iter()
-        .filter(|e| matches!(e, WorkflowEvent::ActivityTimedOut { timeout_type: t, .. } if *t == timeout_type))
-        .count();
+        .filter_map(|e| match e {
+            WorkflowEvent::ActivityTimedOut { timeout_type, .. } => Some(timeout_type.clone()),
+            _ => None,
+        })
+        .collect();
     let completed = history
         .iter()
         .filter(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
@@ -500,9 +599,13 @@ const PAST_LIMIT_SECS: i64 = 31;
 
 /// Run attempt 1 of `activity` into a timeout with attempts left. Attempt 2
 /// must then complete the workflow.
+///
+/// Attempt 2 must see the checkpoint and the timeout of attempt 1. The
+/// requeue must keep the crash strikes, count one retry and feed the breaker.
 async fn timeout_then_complete(
     label: &str,
     activity: &'static str,
+    retry: Option<RetryPolicy>,
     bounds: Bounds,
     timeout_type: TimeoutType,
 ) {
@@ -510,17 +613,25 @@ async fn timeout_then_complete(
     let queue = &unique_queue(label);
     let mut conn = connect(&url).await;
     let exec_id = seed_workflow(&mut conn, queue, activity).await;
-    let info = activity_info(
-        activity,
-        hang_first,
-        exact_policy(3, Duration::from_millis(50)),
-        bounds,
+    let worker = Running::spawn(
+        &url,
+        queue,
+        activity_info(activity, hang_first, retry, bounds),
     );
-    let worker = Running::spawn(&url, queue, info);
 
     let first = wait_for_attempt(&mut conn, exec_id, activity, 1).await;
+    wait_for_checkpoint(&mut conn, exec_id).await;
+    set_crash_strikes(&mut conn, first.id, 1).await;
     backdate(&mut conn, first.id, PAST_LIMIT_SECS).await;
-    sweep(&mut conn).await;
+    let counts = Counts::default();
+    let breakers = one_failure_breaker(activity);
+    sweep_with(&mut conn, &counts, Some(&breakers)).await;
+    assert_eq!(read(&counts.retried), 1, "one retry");
+    assert_eq!(
+        read(&counts.tripped),
+        1,
+        "a retried timeout feeds the breaker"
+    );
 
     wait_for_state(&mut conn, exec_id, "COMPLETED").await;
     worker.stop().await;
@@ -528,9 +639,24 @@ async fn timeout_then_complete(
     let task = activity_task(&mut conn, exec_id).await;
     assert_eq!(task.attempt, 2, "the timeout must start attempt 2");
     assert_eq!(
-        outcomes(&mut conn, exec_id, timeout_type).await,
-        (0, 1),
+        task.crash_strikes, 1,
+        "a timeout does not prove a clean run, so it keeps the crash strikes"
+    );
+    assert_eq!(
+        outcomes(&mut conn, exec_id).await,
+        (Vec::new(), 1),
         "a retried timeout appends no ActivityTimedOut"
+    );
+    let (details, previous) = seen_by_retry(activity).expect("attempt 2 must run");
+    assert_eq!(
+        details,
+        Some(checkpoint()),
+        "the retry keeps the checkpoint"
+    );
+    let previous = previous.unwrap_or_default();
+    assert!(
+        previous.contains(&timeout_type.to_string()),
+        "attempt 2 must see the timeout of attempt 1, got {previous:?}"
     );
 }
 
@@ -545,13 +671,9 @@ async fn start_to_close_timeout_with_attempts_left_runs_another_attempt() {
         start_to_close: Some(LIMIT),
         ..Bounds::default()
     };
-    timeout_then_complete(
-        "stc",
-        "act_1870_stc_retry",
-        bounds,
-        TimeoutType::StartToClose,
-    )
-    .await;
+    let retry = Some(exact_policy(3, Duration::from_millis(50)));
+    let timeout_type = TimeoutType::StartToClose;
+    timeout_then_complete("stc", "act_1870_stc_retry", retry, bounds, timeout_type).await;
 }
 
 /// A `Heartbeat` timeout with attempts left retries.
@@ -561,7 +683,21 @@ async fn heartbeat_timeout_with_attempts_left_runs_another_attempt() {
         heartbeat_timeout: Some(LIMIT),
         ..Bounds::default()
     };
-    timeout_then_complete("hb", "act_1870_hb_retry", bounds, TimeoutType::Heartbeat).await;
+    let retry = Some(exact_policy(3, Duration::from_millis(50)));
+    let timeout_type = TimeoutType::Heartbeat;
+    timeout_then_complete("hb", "act_1870_hb_retry", retry, bounds, timeout_type).await;
+}
+
+/// With no retry policy, a task has the default `max_attempts` of 3. A
+/// timeout of attempt 1 then retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_without_a_retry_policy_retries_at_the_default_attempts() {
+    let bounds = Bounds {
+        start_to_close: Some(LIMIT),
+        ..Bounds::default()
+    };
+    let timeout_type = TimeoutType::StartToClose;
+    timeout_then_complete("none", "act_1870_no_policy", None, bounds, timeout_type).await;
 }
 
 /// The timeout of the last attempt fails the activity call.
@@ -579,7 +715,7 @@ async fn timeout_on_the_last_attempt_fails_the_activity() {
     let info = activity_info(
         activity,
         hang_always,
-        exact_policy(2, Duration::from_millis(50)),
+        Some(exact_policy(2, Duration::from_millis(50))),
         bounds,
     );
     let worker = Running::spawn(&url, queue, info);
@@ -596,14 +732,15 @@ async fn timeout_on_the_last_attempt_fails_the_activity() {
     let task = activity_task(&mut conn, exec_id).await;
     assert_eq!((task.state.as_str(), task.attempt), ("FAILED", 2));
     assert_eq!(
-        outcomes(&mut conn, exec_id, TimeoutType::StartToClose).await,
-        (1, 0),
+        outcomes(&mut conn, exec_id).await,
+        (vec![TimeoutType::StartToClose], 0),
         "only the last attempt appends ActivityTimedOut"
     );
 }
 
 /// A retry that cannot start before `schedule_to_close` is terminal at once.
-/// It does not wait in the queue for the deadline scanner.
+/// It records a `ScheduleToClose` timeout, as a worker retry does. It does
+/// not wait in the queue for the deadline scanner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_retry_past_schedule_to_close_fails_the_activity() {
     let (url, _container) = setup_db().await;
@@ -619,7 +756,7 @@ async fn timeout_retry_past_schedule_to_close_fails_the_activity() {
     let info = activity_info(
         activity,
         hang_always,
-        exact_policy(3, Duration::from_secs(7200)),
+        Some(exact_policy(3, Duration::from_secs(7200))),
         bounds,
     );
     let worker = Running::spawn(&url, queue, info);
@@ -634,8 +771,8 @@ async fn timeout_retry_past_schedule_to_close_fails_the_activity() {
     let task = activity_task(&mut conn, exec_id).await;
     assert_eq!((task.state.as_str(), task.attempt), ("FAILED", 1));
     assert_eq!(
-        outcomes(&mut conn, exec_id, TimeoutType::StartToClose).await,
-        (1, 0)
+        outcomes(&mut conn, exec_id).await,
+        (vec![TimeoutType::ScheduleToClose], 0)
     );
 }
 
@@ -658,13 +795,14 @@ async fn a_stale_snapshot_does_not_time_out_the_next_attempt() {
     let info = activity_info(
         activity,
         hang_always,
-        exact_policy(2, Duration::from_millis(50)),
+        Some(exact_policy(2, Duration::from_millis(50))),
         bounds,
     );
     let worker = Running::spawn(&url, queue, info);
 
-    let first = wait_for_attempt(&mut conn, exec_id, activity, 1).await;
-    backdate(&mut conn, first.id, PAST_LIMIT_SECS).await;
+    let running = wait_for_attempt(&mut conn, exec_id, activity, 1).await;
+    // The snapshot a second sweeper would hold: the expired attempt 1.
+    let first = backdate(&mut conn, running.id, PAST_LIMIT_SECS).await;
     sweep(&mut conn).await;
     wait_for_attempt(&mut conn, exec_id, activity, 2).await;
 
@@ -680,9 +818,6 @@ async fn a_stale_snapshot_does_not_time_out_the_next_attempt() {
     let task = activity_task(&mut conn, exec_id).await;
     worker.stop().await;
     assert_eq!((task.state.as_str(), task.attempt), ("RUNNING", 2));
-    assert_eq!(
-        outcomes(&mut conn, exec_id, TimeoutType::StartToClose).await,
-        (0, 0)
-    );
+    assert_eq!(outcomes(&mut conn, exec_id).await, (Vec::new(), 0));
     assert_eq!(execution_state(&mut conn, exec_id).await, "RUNNING");
 }

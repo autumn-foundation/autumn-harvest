@@ -1321,12 +1321,12 @@ async fn checkpointing_activity_loses_zero_completed_work() {
 
     // --- Negative control: same work, no deadline guard. ---
     //
-    // Without the guard the `start_to_close` scanner kills the attempt. The
-    // control has one attempt, so the timeout is terminal and the run fails.
-    // A timeout with attempts left retries (issue #1870). Then the next
-    // attempt resumes from the heartbeat, and the control loses only the item
-    // in flight. This is what makes the guarded result above attributable to
-    // `ctx.is_expiring_within` rather than to luck.
+    // Without the guard the `start_to_close` scanner kills the attempt. With
+    // attempts left, a timeout retries (issue #1870), and the next attempt
+    // resumes from the last flushed checkpoint. The control therefore declares
+    // one attempt, so the timeout ends the run. It shows the failure mode of
+    // one attempt with no guard. This is what makes the guarded result above
+    // attributable to `ctx.is_expiring_within` rather than to luck.
     let (exec2, _) = seed_workflow(&mut conn, "unguarded_wf", serde_json::json!({})).await;
     let (registry2, observed2) = build_registry(
         vec![workflow_info("unguarded_wf", wf_unguarded)],
@@ -1360,10 +1360,10 @@ async fn checkpointing_activity_loses_zero_completed_work() {
     assert_control_work_was_discarded(&url, &mut conn, exec2, &control_state, &observed2).await;
 }
 
-/// The contrast that makes the guard load-bearing: the guarded run reached
-/// COMPLETED with every item durably accounted for exactly once, while the
-/// unguarded one — doing the same work at the same cost under the same budget —
-/// had its work DISCARDED when the deadline killed it.
+/// The contrast that makes the guard load-bearing. The guarded run reached
+/// COMPLETED with every item durably accounted for exactly once. The unguarded
+/// run did the same work at the same cost, in one attempt. The deadline killed
+/// it, and its work was DISCARDED.
 async fn assert_control_work_was_discarded(
     url: &str,
     conn: &mut AsyncPgConnection,
