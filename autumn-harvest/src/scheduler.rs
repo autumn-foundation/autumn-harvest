@@ -1258,17 +1258,26 @@ type PassFence = Option<crate::replication::FencePassGuard>;
 #[cfg(not(feature = "db"))]
 type PassFence = ();
 
-/// Whether this shard pass lost its fence barrier (issue #1823). The pass
-/// then stops before it fires. The guard already logged the lost session.
+/// Run one shard pass under its fence barrier (issue #1823), or `None` when
+/// the barrier is lost first. The pass then stops before its next write.
+/// The guard already logged the lost session. The pool discards a
+/// connection that the pass left in a transaction, so the server rolls the
+/// transaction back.
 #[cfg(feature = "db")]
-fn pass_fence_lost(fence: &PassFence) -> bool {
-    fence
-        .as_ref()
-        .is_some_and(crate::replication::FencePassGuard::is_lost)
+async fn under_pass_fence<T>(
+    fence: &PassFence,
+    pass: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    crate::replication::run_fenced_pass(fence.as_ref(), pass)
+        .await
+        .ok()
 }
 #[cfg(not(feature = "db"))]
-const fn pass_fence_lost(_fence: &PassFence) -> bool {
-    false
+async fn under_pass_fence<T>(
+    _fence: &PassFence,
+    pass: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    Some(pass.await)
 }
 
 /// Open the fence for one scheduler shard pass, or `None` to skip the shard
@@ -1388,79 +1397,92 @@ pub async fn tick_once_sharded_with_backoff(
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
 
-        // Issue #1157: on a converged shard this pass is read-only — no
-        // transaction, no advisory lock, no UPDATE. Only a schedule that
-        // genuinely needs a write opens a transaction and contends for the
-        // fleet-wide registration lock, and a per-schedule failure is collected
-        // and backed off rather than aborting the rest of the pass.
-        register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
-        let firing = register_workflow_schedules_for_shard(
-            &mut conn,
-            workflow_schedules.as_ref(),
-            &router,
-            shard,
-            backoff,
-        )
-        .await?;
+        // The whole pass runs under the barrier. A lost barrier stops it.
+        let pass = async {
+            // Issue #1157: on a converged shard this pass is read-only — no
+            // transaction, no advisory lock, no UPDATE. Only a schedule that
+            // genuinely needs a write opens a transaction and contends for the
+            // fleet-wide registration lock, and a per-schedule failure is collected
+            // and backed off rather than aborting the rest of the pass.
+            register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
+            let firing = register_workflow_schedules_for_shard(
+                &mut conn,
+                workflow_schedules.as_ref(),
+                &router,
+                shard,
+                backoff,
+            )
+            .await?;
 
-        // Issue #1157: neither firing pass below filters by target shard, so a
-        // stale row this pass could not collect would be fired here *and* by the
-        // shard that now owns it. Stand this shard down for the tick rather than
-        // duplicate the run; the owning shard is unaffected and still fires it
-        // exactly once, and the next tick re-attempts the collection.
-        if firing == ShardFiringDecision::SuppressedUncollectedStaleRows {
-            tracing::warn!(
-                shard_id = shard.as_i32(),
-                "harvest: suppressing schedule firing on this shard for this tick; \
+            // Issue #1157: neither firing pass below filters by target shard, so a
+            // stale row this pass could not collect would be fired here *and* by the
+            // shard that now owns it. Stand this shard down for the tick rather than
+            // duplicate the run; the owning shard is unaffected and still fires it
+            // exactly once, and the next tick re-attempts the collection.
+            if firing == ShardFiringDecision::SuppressedUncollectedStaleRows {
+                tracing::warn!(
+                    shard_id = shard.as_i32(),
+                    "harvest: suppressing schedule firing on this shard for this tick; \
                  stale schedule rows left behind by a routing change could not be \
                  collected, and firing them here would duplicate the owning shard's run"
-            );
-            continue;
-        }
-        if pass_fence_lost(&fence) {
-            continue;
-        }
+                );
+                return Ok(());
+            }
 
-        // Drain buffered slots BEFORE evaluating newly-due firings so that
-        // capacity freed by a just-completed run is consumed by the oldest
-        // pending slot first, not by the freshest next_run_at firing.
-        #[cfg(feature = "db")]
-        if let Err(error) = drain_buffered_schedule_runs(
-            &mut conn,
-            shard,
-            dags.as_ref(),
-            registry.as_ref(),
-            &metrics,
-            &active_gates,
-        )
-        .await
-        {
-            tracing::warn!(
-                error = %error,
-                shard_id = shard.as_i32(),
-                "harvest: buffered schedule drain error"
-            );
-        }
-
-        if let Err(error) = tick_workflow_schedules(
-            &mut conn,
-            shard,
-            dags.as_ref(),
-            registry.as_ref(),
-            &metrics,
-            &active_gates,
-        )
-        .await
-        {
-            tracing::warn!(
-                error = %error,
-                shard_id = shard.as_i32(),
-                "harvest workflow-schedule tick error"
-            );
+            fire_shard_schedules(
+                &mut conn,
+                shard,
+                dags.as_ref(),
+                registry.as_ref(),
+                &metrics,
+                &active_gates,
+            )
+            .await;
+            Ok::<(), HarvestError>(())
+        };
+        // Boxed: the pass is large, and inline it would bloat this future.
+        if let Some(result) = under_pass_fence(&fence, Box::pin(pass)).await {
+            result?;
         }
     }
 
     Ok(())
+}
+
+/// Fire one shard's due schedules: drain buffered slots, then tick.
+///
+/// Each step logs its own error, so one failure does not stop the other.
+async fn fire_shard_schedules(
+    conn: &mut AsyncPgConnection,
+    shard: ShardId,
+    dags: &DagCatalog,
+    registry: &HandlerRegistry,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+    active_gates: &[crate::admission_gate::AdmissionGate],
+) {
+    // Drain buffered slots BEFORE evaluating newly-due firings so that
+    // capacity freed by a just-completed run is consumed by the oldest
+    // pending slot first, not by the freshest next_run_at firing.
+    #[cfg(feature = "db")]
+    if let Err(error) =
+        drain_buffered_schedule_runs(conn, shard, dags, registry, metrics, active_gates).await
+    {
+        tracing::warn!(
+            error = %error,
+            shard_id = shard.as_i32(),
+            "harvest: buffered schedule drain error"
+        );
+    }
+
+    if let Err(error) =
+        tick_workflow_schedules(conn, shard, dags, registry, metrics, active_gates).await
+    {
+        tracing::warn!(
+            error = %error,
+            shard_id = shard.as_i32(),
+            "harvest workflow-schedule tick error"
+        );
+    }
 }
 
 /// Trigger a DAG run as a workflow execution (issue #256 Step 5).
