@@ -43,8 +43,8 @@ pub use crate::interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
 };
 pub use crate::policy::{
-    AdaptiveLimitPolicy, CircuitBreakerPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy,
-    RetryBudgetPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
+    AdaptiveLimitPolicy, CircuitBreakerPolicy, CircuitOpenMode, JitterPolicy, MapFailurePolicy,
+    OverlapPolicy, RetryBudgetPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
     WorkflowSchedule,
 };
 pub use crate::query::QueryRegistry;
