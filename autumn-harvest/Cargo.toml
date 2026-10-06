@@ -157,6 +157,12 @@ path = "tests/integration/mod.rs"
 name = "property"
 path = "tests/property/mod.rs"
 
+# Deterministic simulation sweeps (issue #1830). Needs no database, so the
+# no-db CI job runs it. `HARVEST_DST_SEEDS` sets the sweep size.
+[[test]]
+name = "dst"
+path = "tests/dst/main.rs"
+
 [[bench]]
 name = "metrics_noop"
 harness = false

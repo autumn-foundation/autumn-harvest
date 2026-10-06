@@ -15,7 +15,7 @@
     }
   },
   "info": {
-    "description": "Generated from `docs/api-contract.json` (contract version 2). Do not edit by hand. Regenerate with `scripts/regenerate-openapi.sh`.\n\nEvery path is relative to the prefix the embedder passes to `HarvestPlugin::api`, `/api/harvest` by convention.\n\nAuth: Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
+    "description": "Generated from `docs/api-contract.json` (contract version 2). Do not edit by hand. Regenerate with `scripts/regenerate-openapi.sh`.\n\nEvery path is relative to the prefix the embedder passes to `HarvestPlugin::api`, `/api/harvest` by convention.\n\nAuth: Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate. The optional API rate limiter (issue #1827) can answer 429 with a Retry-After header in whole seconds on any route that is not PublicSafe. Its body is {\"error\": \"rate limited\", \"route_class\", \"retry_after_secs\"}. See docs/security-posture.md#api-rate-limiting.",
     "summary": "Control-plane HTTP API for autumn-harvest durable workflows.",
     "title": "Harvest management API",
     "version": "0.7.0",

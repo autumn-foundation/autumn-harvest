@@ -256,15 +256,33 @@ default threshold is `10_000` events.
 let harvest = HarvestBuilder::new()
     .workflows(workflows![polling_loop])
     .history_continue_as_new_threshold(5_000)
-    .history_event_hard_cap(20_000)
+    .history_event_hard_cap(40_000)
     .try_build()?;
 ```
 
-The optional hard cap is a last-resort guardrail. If an execution reaches
-`history_event_hard_cap` and the workflow does not issue `continue_as_new`, the
-worker fails the execution and moves it to the DLQ with a typed
-`HistoryCapExceeded { count, cap, workflow_type }` reason. No new workflow event
-variant is used for this guardrail.
+Two hard caps are on by default (issue #1804). They are last-resort
+guardrails against a runaway loop:
+
+| Cap | Default | Builder override | Typed DLQ reason |
+|---|---|---|---|
+| Durable events per run | `50_000` | `history_event_hard_cap(n)` | `HistoryCapExceeded { count, cap, workflow_type }` |
+| Stored history bytes per run | 50 MiB | `history_byte_hard_cap(n)` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
+
+A run that reaches a cap fails unless it calls `continue_as_new`. The worker
+moves it to the DLQ with the typed reason. The guardrail adds no workflow
+event variant. The byte measure is `pg_column_size(event_data)`, the
+same measure as the tenant `max_history_bytes` quota. The Postgres worker
+enforces both caps. The SQLite backend does not.
+
+`harvest.workflow.history_bloat` fires once per run at 20.48% of the event
+cap, so at `10_240` events by default. The worker also logs a warning. Set
+`history_bloat_warn_fraction(..)` to move the threshold. Keep the warning
+point above `history_continue_as_new_threshold`, or healthy runs warn before
+the advisory turns true. `try_build` logs a warning when they do.
+
+To remove a cap, call `history_event_hard_cap_unlimited()` or
+`history_byte_hard_cap_unlimited()`. With no event cap there is no
+history-bloat warning either.
 
 Harvest emits `harvest.workflow.history_size` for terminal executions and
 `harvest.workflow.continue_as_new` when a workflow rotates. Both metrics use
@@ -1203,11 +1221,11 @@ cannot connect **fails startup**, in every mode, with an error naming the
 endpoint. A process that came up without its channel would look healthy and
 publish nothing, so the failure is loud instead.
 
-The connection is plaintext, and `redis://` sends the password in cleartext.
-This release carries no TLS transport: a `rediss://` URL is rejected at
-startup, and issue #1429 tracks TLS support. Keep Redis on a private network
-or behind a TLS tunnel that terminates on the host. v1 targets a single Redis
-instance and a single-shard runtime; Redis Cluster is not supported.
+A `redis://` URL is plaintext and sends the password in cleartext. Use
+`rediss://` for TLS (issue #1834). The client verifies the server against the
+platform trust store. `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces that store
+with a private CA bundle. v1 targets a single Redis instance and a
+single-shard runtime. Redis Cluster is not supported.
 
 See [`docs/operations/redis-dispatch.md`](docs/operations/redis-dispatch.md)
 for the key layout, the crash matrix, the failure modes and the v1 limits.

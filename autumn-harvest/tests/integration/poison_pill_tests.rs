@@ -342,6 +342,9 @@ async fn orphan_at_threshold_is_quarantined() {
         DeadLetterReason::HistoryCapExceeded { .. } => {
             panic!("expected PoisonPill reason, got HistoryCapExceeded")
         }
+        DeadLetterReason::HistoryBytesCapExceeded { .. } => {
+            panic!("expected PoisonPill reason, got HistoryBytesCapExceeded")
+        }
         DeadLetterReason::WorkflowTaskTimeout { .. } => {
             panic!("expected PoisonPill reason, got WorkflowTaskTimeout")
         }

@@ -10,9 +10,9 @@ sitting, without cross-referencing five vendors' marketing pages.
 It is deliberately not a sales page. Every harvest capability claimed as
 _shipped_ links to the phase entry or GitHub issue that landed it, so any cell is
 falsifiable against the repository. Planned work is labelled **planned** and
-cites an open issue. And harvest's genuine gaps — no non-Rust SDK, single-region,
-no managed cloud — get their own section named plainly, because a comparison that
-hides its author's weaknesses is not worth reading.
+cites an open issue. Harvest's genuine gaps get their own section: no non-Rust
+SDK, no automatic regional failover, no managed cloud. A comparison that hides
+its author's weaknesses is not worth reading.
 
 > **Competitor facts accurate as of 2026-07-14.** Competitor rows are sourced
 > from each vendor's public documentation (linked inline) and phrased neutrally.
@@ -152,7 +152,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Story |
 |---|---|
-| **autumn-harvest** | HA-safe scheduler ticks under multi-replica deployments ([#350](https://github.com/autumn-foundation/autumn-harvest/issues/350)); horizontal scale via Postgres [sharding](sharding.md). **Single-region**: each shard is one Postgres, and cross-shard workflows are explicitly out of scope per the sharding contract. There is no built-in multi-region replication or failover today. **Planned:** cross-region DR via logical replication with fenced failover ([#954](https://github.com/autumn-foundation/autumn-harvest/issues/954)) and explicit shard pinning for data-residency placement ([#697](https://github.com/autumn-foundation/autumn-harvest/issues/697)). |
+| **autumn-harvest** | HA-safe scheduler ticks under multi-replica deployments ([#350](https://github.com/autumn-foundation/autumn-harvest/issues/350)); horizontal scale via Postgres [sharding](sharding.md). Each shard is one Postgres, and a workflow's own state stays on its shard. **Cross-region DR** ships ([#954](https://github.com/autumn-foundation/autumn-harvest/issues/954)): each shard replicates to a standby region with stock Postgres replication, and an operator runs a fenced failover ([cross-region DR](cross-region-dr.md)). There is no automatic promotion, no active-active writing and no zero-RPO mode. Explicit shard pinning for data residency ships ([#697](https://github.com/autumn-foundation/autumn-harvest/issues/697)). |
 | Temporal | Self-host multi-cluster replication (Global Namespaces). Temporal Cloud offers 2-region replication (active/passive, automatic failover, 99.99% target; same continent + same cloud, async replication). ([docs](https://docs.temporal.io/cloud/high-availability)) |
 | DBOS | HA via Conductor — on worker crash/failure, workflows recover to a compatible live worker. Explicit self-host multi-region topology **(unverified)**; DBOS Cloud handles hosting. ([docs](https://www.dbos.dev/dbos-conductor)) |
 | Inngest | Managed cloud is HA across multiple regions. Self-host HA requires you to run HA Postgres/Redis/queue backends; multi-region self-host is your responsibility. ([docs](https://www.inngest.com/docs/self-hosting)) |
@@ -259,14 +259,12 @@ where one exists.
   [#959](https://github.com/autumn-foundation/autumn-harvest/issues/959) (TypeScript
   activity-worker SDK), [#955](https://github.com/autumn-foundation/autumn-harvest/issues/955)
   (TypeScript + Python management-API clients).
-- **Single-region — no multi-region DR or replication.** Sharding scales harvest
-  horizontally within a region, but there is no built-in cross-region replication
-  or failover, and cross-shard workflows are out of scope by design. Temporal
+- **DR is operator-driven, not automatic.** Each shard replicates to a standby
+  region, and an operator runs a fenced failover
+  ([cross-region DR](cross-region-dr.md),
+  [#954](https://github.com/autumn-foundation/autumn-harvest/issues/954)). There is
+  no automatic promotion, no active-active writing and no zero-RPO mode. Temporal
   (Global Namespaces / Cloud 2-region) and the managed clouds are ahead here.
-  Planned R&D: [#954](https://github.com/autumn-foundation/autumn-harvest/issues/954)
-  (cross-region DR with fenced failover),
-  [#697](https://github.com/autumn-foundation/autumn-harvest/issues/697) (data-residency
-  shard pinning).
 - **No managed cloud.** There is no hosted harvest — every competitor in this set
   offers a first-party managed tier. This is a deliberate positioning choice
   (embed + self-host Postgres), but if you want someone else to run the control
@@ -291,11 +289,17 @@ where one exists.
   integrations, and a much smaller hiring pool than Temporal in particular. Some
   competitor cells above are marked **(unverified)** precisely because this is a
   young market moving fast.
-- **No cross-shard workflows.** A single workflow's state (events, tasks, timers,
-  signals, DLQ) is pinned to one shard; there is no cross-shard transaction or
-  cross-shard workflow composition — an explicit scope boundary in the
-  [sharding contract](sharding.md), not a bug, but a limit to know before you
-  design around shards.
+- **Cross-shard composition is limited.** A workflow's own state (events, tasks,
+  timers, signals, DLQ) stays on one shard, and there is no cross-shard
+  transaction. A child can run on another shard only when its spawn opts in
+  ([cross-shard child placement](sharding.md#cross-shard-child-placement-issue-956),
+  [#956](https://github.com/autumn-foundation/autumn-harvest/issues/956)). Its start
+  and its terminal wake are each one scanner tick away, or longer after a failed
+  attempt. Delivery is at least once with dedupe, so the parent sees one terminal
+  event. An operator can move quiescent workflows between shards
+  ([shard rebalancing](sharding.md#shard-rebalancing--migrating-quiescent-workflows-issue-964),
+  [#964](https://github.com/autumn-foundation/autumn-harvest/issues/964)), but not
+  running ones.
 - **No cross-engine benchmark on equal hardware.** harvest now publishes its
   own reproducible end-to-end numbers and the harness that produces them
   ([`benchmarks.md`](benchmarks.md),

@@ -5,6 +5,8 @@ tools for harvest, and the resulting adoption decisions. The companions
 [`loom.md`](loom.md) and [`shuttle.md`](shuttle.md) document the two tools in
 use. [`formal-methods.md`](formal-methods.md) covers the TLA+ models of the
 Postgres-coordinated protocols and the Kani proofs (issue #1819).
+[`simulation.md`](simulation.md) covers the seeded simulation of the activity
+claim protocol (issue #1830).
 
 The single most important framing fact, repeated throughout: **the large
 majority of harvest's concurrency is coordinated through Postgres** — `SELECT
@@ -98,15 +100,28 @@ Turmoil to model; its capability doesn't intersect harvest's architecture. If a
 future feature introduces genuine worker-to-worker networking (it does not exist
 today), revisit.
 
+## Deterministic simulation — adopted (issue #1830)
+
+None of the three tools above can model Postgres. The simulator in
+`autumn_harvest::dst` does not try to. It replaces the store with an
+in-memory oracle and drives workers and the orphan reclaimer from a seed on
+one thread. A differential test replays each run on Postgres and requires
+equal outcomes and rows. A seed thus fixes the order of the
+Postgres-coordinated operations, which real tokio and a real database do
+not. [ADR 0004](../adr/0004-deterministic-simulation-testing.md) records the
+choice, and [`simulation.md`](simulation.md) describes the harness.
+
 ## Recommendation matrix
 
 | Tool | What it models | Coverage of harvest's concurrency **here** | Decision |
 |------|----------------|--------------------------------------------|----------|
 | **loom** | In-process locks/atomics, exhaustive interleavings | `circuit_breaker` generation fence + single probe; `sessions` slot bound/balance. Cannot reach async (`slot_tuner`, `heartbeat`) or any Postgres-coordinated race. | **Adopted** (issue #1800; runs on every PR) |
 | **Shuttle** | In-process locks **+ async/futures**, randomized PCT (scales past loom) | Everything loom reaches, **plus** `slot_tuner.rs` semaphore accounting and `heartbeat.rs` mpsc ordering that loom structurally cannot. Still cannot model Postgres. | **Adopted** (issue #1800; runs on every PR) |
+| **DST** (`autumn_harvest::dst`) | Seeded single-thread interleavings of Postgres-coordinated store operations | The activity claim protocol, checked against Postgres by a differential test. Not the `worker.rs` loop. | **Adopted** (issue #1830; per PR and nightly) |
 | **Turmoil** | Simulated peer TCP/UDP networks, partitions/latency | ~none — harvest has no custom peer networking; it coordinates through Postgres, which Turmoil cannot simulate. | **No** |
 
 **Bottom line.** loom for in-process locks, Shuttle for async primitives,
-Turmoil not at all. Both loom and Shuttle run on every PR. And none of the
+DST for seeded orderings of the activity claim protocol, Turmoil not at all.
+loom, Shuttle and DST run on every PR. And none of the
 three substitutes for the Docker-backed integration tests that exercise
 harvest's Postgres-coordinated concurrency — the bulk of the real surface.

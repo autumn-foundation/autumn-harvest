@@ -84,7 +84,10 @@ A complete, runnable version is in
 - **Single-writer contract (`BEGIN IMMEDIATE`).** One writer process owns one
   SQLite file. A task claim takes the database write lock up front and flips the
   oldest ready task to `RUNNING` — exactly-once by construction, replacing
-  Postgres's `SELECT … FOR UPDATE SKIP LOCKED`.
+  Postgres's `SELECT … FOR UPDATE SKIP LOCKED`. `open` enforces the contract
+  (issue #1834): it locks `<database>.lock`, and a second runtime on the same
+  file fails fast with `SqliteError::DatabaseLocked`. The lock dies with its
+  process, so a crash leaves no stale lock.
 - **Polling drive model.** SQLite has no push notification, so instead of
   `LISTEN`/`NOTIFY` you *drive* the runtime: `poll_once` / `run_until_blocked` /
   `run_until_idle` drain all ready work and re-run the workflow until every run
@@ -111,7 +114,8 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
 - Child workflows, external signals/cancels, local activities, updates,
   search attributes, and `continue_as_new` — a workflow reaching one of these is
-  rejected **loudly, by name**, never silently dropped.
+  rejected **loudly, by name**, never silently dropped. The run then ends
+  `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
 
 ## Learn more
 
