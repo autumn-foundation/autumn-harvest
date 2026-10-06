@@ -545,6 +545,7 @@ pub mod worker;
 #[cfg(feature = "db")]
 pub mod workers;
 
+pub use adaptive_limit::AdaptiveLimitConfig;
 pub use admission_gate::{
     AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateMode, GateScope,
     MAX_ACTIVE_GATES, ProducerContractEntry, ProducerGateStatus, StartProducer, check_admission,
@@ -675,8 +676,9 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    AdaptiveLimitPolicy, CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
-    Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    AdaptiveLimitPolicy, CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy,
+    RetryBudgetPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
+    WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
@@ -701,7 +703,6 @@ pub use retention::{
     set_legal_hold,
 };
 pub use retry_budget::RetryBudgetConfig;
-pub use adaptive_limit::AdaptiveLimitConfig;
 pub use run_chain::{
     RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };

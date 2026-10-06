@@ -727,9 +727,21 @@ mod tests {
     #[test]
     fn limited_delay_follows_the_baseline() {
         let reg = registry(AdaptiveLimitPolicy::new(1, 1));
-        round(&reg, A, 1, Duration::from_millis(400), SampleOutcome::Answered);
+        round(
+            &reg,
+            A,
+            1,
+            Duration::from_millis(400),
+            SampleOutcome::Answered,
+        );
         for _ in 0..3 {
-            round(&reg, A, 1, Duration::from_millis(400), SampleOutcome::Answered);
+            round(
+                &reg,
+                A,
+                1,
+                Duration::from_millis(400),
+                SampleOutcome::Answered,
+            );
         }
         let _held = permit(&reg, A);
         for _ in 0..50 {
@@ -737,7 +749,8 @@ mod tests {
                 panic!("expected Limited");
             };
             assert!(
-                retry_after >= Duration::from_millis(400) && retry_after <= Duration::from_millis(800),
+                retry_after >= Duration::from_millis(400)
+                    && retry_after <= Duration::from_millis(800),
                 "{retry_after:?}"
             );
         }
@@ -769,8 +782,7 @@ mod tests {
         let log = Arc::new(LimitLog::default());
         let reg = Arc::new(
             AdaptiveLimitRegistry::new(
-                AdaptiveLimitConfig::disabled()
-                    .with_default(Some(AdaptiveLimitPolicy::new(1, 64))),
+                AdaptiveLimitConfig::disabled().with_default(Some(AdaptiveLimitPolicy::new(1, 64))),
             )
             .with_metrics(log.clone()),
         );
@@ -945,8 +957,7 @@ mod simulation {
         let settled = median(&trace.limits[10_000..]);
         let fixed_point = policy.tolerance.mul_add(f64::from(knee), QUEUE_SIZE);
         assert!(
-            f64::from(settled) >= 0.75 * f64::from(knee)
-                && f64::from(settled) <= fixed_point + 2.0,
+            f64::from(settled) >= 0.75 * f64::from(knee) && f64::from(settled) <= fixed_point + 2.0,
             "settled at {settled}; knee {knee}; fixed point {fixed_point}"
         );
     }

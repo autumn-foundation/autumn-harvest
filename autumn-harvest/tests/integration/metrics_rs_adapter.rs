@@ -289,10 +289,8 @@ fn record_activity_concurrency_limit_skips_an_unknown_baseline() {
         MetricsRsRecorder.record_activity_concurrency_limit("charge_card", 4, 0, None);
     });
     assert!(
-        !keys
-            .iter()
-            .any(|(kind, key)| *kind == InstrumentKind::Gauge
-                && key.name() == "harvest.activity.latency_baseline_seconds"),
+        !keys.iter().any(|(kind, key)| *kind == InstrumentKind::Gauge
+            && key.name() == "harvest.activity.latency_baseline_seconds"),
         "an unknown baseline must not set the gauge"
     );
 }

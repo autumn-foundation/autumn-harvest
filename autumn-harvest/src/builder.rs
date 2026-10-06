@@ -1330,7 +1330,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_start_to_close,
         )
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
-        .with_retry_budget(self.worker_config.retry_budget.clone());
+        .with_retry_budget(self.worker_config.retry_budget.clone())
+        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1431,7 +1432,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_start_to_close,
         )
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
-        .with_retry_budget(self.worker_config.retry_budget.clone());
+        .with_retry_budget(self.worker_config.retry_budget.clone())
+        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(

@@ -855,8 +855,14 @@ mod tests {
         let view = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
         let json = serde_json::to_value(&view).expect("serialize");
         assert_eq!(json["adaptive_limit_default"], serde_json::Value::Null);
-        assert_eq!(json["adaptive_limit_overrides"]["charge_card"]["min_limit"], 2);
-        assert_eq!(json["adaptive_limit_overrides"]["charge_card"]["max_limit"], 32);
+        assert_eq!(
+            json["adaptive_limit_overrides"]["charge_card"]["min_limit"],
+            2
+        );
+        assert_eq!(
+            json["adaptive_limit_overrides"]["charge_card"]["max_limit"],
+            32
+        );
     }
 
     #[test]

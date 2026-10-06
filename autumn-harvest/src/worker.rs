@@ -806,7 +806,10 @@ impl HandlerRegistry {
             crate::retry_budget::RetryBudgetRegistry::default()
                 .with_metrics(Arc::clone(&telemetry.metrics)),
         );
-        let adaptive_limits = Arc::new(crate::adaptive_limit::AdaptiveLimitRegistry::default());
+        let adaptive_limits = Arc::new(
+            crate::adaptive_limit::AdaptiveLimitRegistry::default()
+                .with_metrics(Arc::clone(&telemetry.metrics)),
+        );
         Self {
             workflows,
             activities,
@@ -1226,8 +1229,26 @@ impl HandlerRegistry {
     ///
     /// Mirrors [`crate::builder::WorkerConfig::with_adaptive_limit`]. The
     /// default limits no type.
+    ///
+    /// An override for a name that this registry does not register has no
+    /// effect. The call logs a warning for each such name.
     #[must_use]
-    pub fn with_adaptive_limit(self, _config: crate::adaptive_limit::AdaptiveLimitConfig) -> Self {
+    pub fn with_adaptive_limit(
+        mut self,
+        config: crate::adaptive_limit::AdaptiveLimitConfig,
+    ) -> Self {
+        for name in config.overrides().keys() {
+            if !self.activities.contains_key(name) {
+                tracing::warn!(
+                    activity_name = %name,
+                    "adaptive limit override names an activity that is not registered; it has no effect"
+                );
+            }
+        }
+        self.adaptive_limits = Arc::new(
+            crate::adaptive_limit::AdaptiveLimitRegistry::new(config)
+                .with_metrics(Arc::clone(&self.telemetry.metrics)),
+        );
         self
     }
 
@@ -15596,8 +15617,13 @@ mod retry_budget_gate_tests {
 /// A `None` token is a circuit short-circuit. It never reaches the
 /// dependency, so it takes no slot. A half-open probe is the breaker's
 /// recovery signal, so the limit never defers it.
-const fn adaptive_limit_gates(_circuit_token: Option<crate::circuit_breaker::DispatchToken>) -> bool {
-    false
+const fn adaptive_limit_gates(
+    circuit_token: Option<crate::circuit_breaker::DispatchToken>,
+) -> bool {
+    match circuit_token {
+        Some(token) => !token.is_probe(),
+        None => false,
+    }
 }
 
 /// The adaptive limit sample for one breaker outcome (issue #1836).
@@ -15605,9 +15631,17 @@ const fn adaptive_limit_gates(_circuit_token: Option<crate::circuit_breaker::Dis
 /// `None` is a cancelled attempt. It says nothing about the dependency, so
 /// it gives no sample.
 const fn limit_sample_outcome(
-    _outcome: Option<crate::circuit_breaker::AttemptOutcome>,
+    outcome: Option<crate::circuit_breaker::AttemptOutcome>,
 ) -> Option<crate::adaptive_limit::SampleOutcome> {
-    None
+    use crate::adaptive_limit::SampleOutcome;
+    use crate::circuit_breaker::AttemptOutcome;
+    match outcome {
+        Some(AttemptOutcome::RetryableFailure) => Some(SampleOutcome::Overloaded),
+        Some(AttemptOutcome::Success | AttemptOutcome::NonRetryableFailure) => {
+            Some(SampleOutcome::Answered)
+        }
+        None => None,
+    }
 }
 
 /// The activity names that a claim must skip (issue #1836).
@@ -15617,9 +15651,14 @@ const fn limit_sample_outcome(
 /// nothing.
 fn claim_exclusions(
     ineligible: &[String],
-    _saturated: Vec<String>,
+    saturated: Vec<String>,
 ) -> std::borrow::Cow<'_, [String]> {
-    std::borrow::Cow::Borrowed(ineligible)
+    if saturated.is_empty() {
+        return std::borrow::Cow::Borrowed(ineligible);
+    }
+    let mut names = ineligible.to_vec();
+    names.extend(saturated);
+    std::borrow::Cow::Owned(names)
 }
 
 #[cfg(test)]
@@ -15798,17 +15837,7 @@ async fn defer_retry_for_budget(
     wake_at: std::time::Instant,
     reservation: &mut Option<crate::retry_budget::SlotReservation>,
 ) -> HarvestResult<bool> {
-    if activity.circuit_breaker.is_none()
-        && let Some(key) = task.rate_limit_key.as_deref()
-        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
-    {
-        tracing::warn!(
-            task_id = %task.id,
-            rate_limit_key = %key,
-            %error,
-            "failed to refund the rate-limit token for a retry-budget deferral"
-        );
-    }
+    refund_claim_rate_limit_token(conn, task, activity, "retry-budget deferral").await;
     // The delay runs on the database clock. See `defer_claimed_retry_for_budget`.
     let delay = budgets.wake_delay(
         activity_name,
@@ -15816,12 +15845,68 @@ async fn defer_retry_for_budget(
         reservation,
         std::time::Instant::now(),
     );
+    defer_unstarted_claim(conn, task, delay, "retry-budget deferral").await
+}
+
+/// Defer a claimed activity that the adaptive limit did not admit (issue
+/// #1836).
+///
+/// The claim skips a type at its cap, so this runs only when a claim raced
+/// past the cap. The write is the retry-budget deferral. It lowers `attempt`
+/// again, keeps `error` and `crash_strikes`, and appends no event. The
+/// claim-time rate-limit token goes back, as for a budget deferral.
+///
+/// Returns `false` when the lease was lost, so the write changed nothing.
+async fn defer_for_adaptive_limit(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    activity: &ActivityInfo,
+    delay: Duration,
+) -> HarvestResult<bool> {
+    refund_claim_rate_limit_token(conn, task, activity, "adaptive-limit deferral").await;
+    defer_unstarted_claim(conn, task, delay, "adaptive-limit deferral").await
+}
+
+/// Put a claimed activity that did not start back to `PENDING`, `delay`
+/// past the database clock. See `queue::defer_claimed_retry_for_budget`.
+///
+/// Returns `false` when the lease was lost, so the write changed nothing.
+async fn defer_unstarted_claim(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    delay: Duration,
+    write_name: &str,
+) -> HarvestResult<bool> {
     let delay = chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(1));
     let write = queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?;
     if write == queue::ClaimWrite::LeaseLost {
-        log_lease_lost(task, "retry-budget deferral");
+        log_lease_lost(task, write_name);
     }
     Ok(write == queue::ClaimWrite::Applied)
+}
+
+/// Give back the claim-time rate-limit token of an activity that does not
+/// run. Only an activity without a circuit breaker debits at claim. The
+/// function logs a refund failure and does not return it, like a
+/// capability-miss refund.
+async fn refund_claim_rate_limit_token(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    activity: &ActivityInfo,
+    write_name: &str,
+) {
+    if activity.circuit_breaker.is_none()
+        && let Some(key) = task.rate_limit_key.as_deref()
+        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
+    {
+        tracing::warn!(
+            task_id = %task.id,
+            rate_limit_key = %key,
+            write = write_name,
+            %error,
+            "failed to refund the rate-limit token of a deferred activity"
+        );
+    }
 }
 
 /// The prefix of the error a drain-released activity carries into its next
@@ -16806,6 +16891,27 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
 
+    // Adaptive limit (issue #1836). The claim skips a type at its cap, so
+    // this gate catches only a claim that raced past the cap. It runs before
+    // the retry budget, so its deferral spends no budget token. Every return
+    // before the handler drops the permit, which frees the slot without a
+    // sample.
+    let mut limit_permit = None;
+    if adaptive_limit_gates(circuit_token) {
+        match registry.adaptive_limits().try_acquire(activity_name) {
+            crate::adaptive_limit::Acquire::Untracked => {}
+            crate::adaptive_limit::Acquire::Acquired(permit) => limit_permit = Some(permit),
+            crate::adaptive_limit::Acquire::Limited { retry_after } => {
+                if let Some(token) = circuit_token {
+                    circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+                }
+                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+                defer_for_adaptive_limit(&mut conn, task, activity, retry_after).await?;
+                return Ok(());
+            }
+        }
+    }
+
     // Retry budget (issue #1793). See `retry_budget_gates` for which
     // attempts it gates. The gate runs before ActivityStarted, so a deferred
     // retry leaves no event.
@@ -17466,7 +17572,8 @@ async fn process_activity_task(
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
 
-    let duration_secs = attempt_clock_start.elapsed().as_secs_f64();
+    let attempt_latency = attempt_clock_start.elapsed();
+    let duration_secs = attempt_latency.as_secs_f64();
     let status = if committed_transactionally || activity_result.is_ok() {
         ActivityStatus::Completed
     } else {
@@ -17567,6 +17674,14 @@ async fn process_activity_task(
             Err(_) => crate::circuit_breaker::AttemptOutcome::RetryableFailure,
         })
     };
+    // Adaptive limit (issue #1836): report the handler latency and outcome,
+    // and free the slot. A cancelled attempt frees it without a sample.
+    if let Some(permit) = limit_permit.take() {
+        match limit_sample_outcome(circuit_outcome) {
+            Some(outcome) => permit.complete(attempt_latency, outcome),
+            None => drop(permit),
+        }
+    }
     // `circuit_token` is always `Some` here: the short-circuit path returned
     // early above, so reaching this point means the attempt was dispatched.
     if let Some(transition) = circuit_token
@@ -32197,6 +32312,7 @@ impl Worker {
         };
 
         let circuit_breakers = self.registry.circuit_breakers();
+        let exclusions = self.claim_exclusions();
         let claimed = queue::claim_task_by_id_on_shard(
             &mut conn,
             lease.task_id,
@@ -32205,7 +32321,7 @@ impl Worker {
             &self.config.build_id,
             self.config.priority_aging_secs,
             circuit_breakers.tracked_activity_names(),
-            &self.ineligible_activities,
+            &exclusions,
             shard,
         )
         .await;
@@ -33165,6 +33281,15 @@ impl Worker {
         }
     }
 
+    /// The activity names that a claim must skip: the names with unmet
+    /// requirements, plus the types at their adaptive limit (issue #1836).
+    fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
+        claim_exclusions(
+            &self.ineligible_activities,
+            self.registry.adaptive_limits().saturated(),
+        )
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Claims one task of a kind with a free permit and dispatches it. Returns
@@ -33226,6 +33351,7 @@ impl Worker {
         // still atomically reserves a token. The set is static.
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
+        let exclusions = self.claim_exclusions();
 
         // --- Weighted queue selection (issue #515) ---
         //
@@ -33263,7 +33389,7 @@ impl Worker {
                     &self.config.build_id,
                     self.config.priority_aging_secs,
                     circuit_breaker_activities,
-                    &self.ineligible_activities,
+                    &exclusions,
                     shard,
                     kind,
                 )
@@ -33307,7 +33433,7 @@ impl Worker {
             &self.config.build_id,
             self.config.priority_aging_secs,
             circuit_breaker_activities,
-            &self.ineligible_activities,
+            &exclusions,
             shard,
             kind,
         )

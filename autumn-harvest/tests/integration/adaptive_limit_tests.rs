@@ -89,6 +89,8 @@ struct Gauge {
     now: AtomicU32,
     peak: AtomicU32,
     done: AtomicU32,
+    /// Highest attempt number a handler saw.
+    max_attempt: AtomicU32,
 }
 
 static GAUGES: LazyLock<Mutex<HashMap<String, Arc<Gauge>>>> =
@@ -127,6 +129,10 @@ impl Gauge {
 
     fn done(&self) -> u32 {
         AtomicU32::load(&self.done, Ordering::SeqCst)
+    }
+
+    fn max_attempt(&self) -> u32 {
+        AtomicU32::load(&self.max_attempt, Ordering::SeqCst)
     }
 }
 
@@ -194,6 +200,10 @@ type BoxFut<'a> =
 /// Takes 150 ms whatever the load.
 fn slow_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
     let (running, _) = Running::start(ctx.activity_type());
+    running
+        .0
+        .max_attempt
+        .fetch_max(ctx.attempt(), Ordering::SeqCst);
     Box::pin(async move {
         tokio::time::sleep(Duration::from_millis(150)).await;
         drop(running);
@@ -292,6 +302,7 @@ fn build_worker(
     activities: Vec<ActivityInfo>,
     metrics: Arc<LimitMetrics>,
     limit: Option<AdaptiveLimitConfig>,
+    labels: HashMap<String, String>,
 ) -> (Arc<Worker>, Arc<HandlerRegistry>) {
     let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
     let mut registry = HandlerRegistry::with_state_and_telemetry(
@@ -332,7 +343,7 @@ fn build_worker(
                 capability_miss_max_redeliveries: 5,
                 workflow_task_timeout: Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
-                labels: HashMap::new(),
+                labels,
                 queue_weights: HashMap::new(),
                 max_workflow_pause_duration: Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
@@ -443,7 +454,6 @@ where
     .unwrap_or_else(|_| panic!("timed out after {timeout:?} waiting for {what}"));
 }
 
-
 fn unique_queue(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
@@ -456,6 +466,18 @@ async fn run_to_completion(
     limit: Option<AdaptiveLimitConfig>,
     per_type: u32,
 ) -> (Arc<LimitMetrics>, Arc<HandlerRegistry>) {
+    run_with_labels(url, queue, activities, limit, per_type, HashMap::new()).await
+}
+
+/// [`run_to_completion`] on a worker with the given capability labels.
+async fn run_with_labels(
+    url: &str,
+    queue: &str,
+    activities: Vec<ActivityInfo>,
+    limit: Option<AdaptiveLimitConfig>,
+    per_type: u32,
+    labels: HashMap<String, String>,
+) -> (Arc<LimitMetrics>, Arc<HandlerRegistry>) {
     let names: Vec<&'static str> = activities.iter().map(|a| a.name).collect();
     let metrics = Arc::new(LimitMetrics::default());
     let (worker, registry) = build_worker(
@@ -464,6 +486,7 @@ async fn run_to_completion(
         activities,
         Arc::clone(&metrics),
         limit,
+        labels,
     );
     let pool = build_pool(url);
     let mut conn = connect(url).await;
@@ -537,7 +560,10 @@ async fn the_worker_caps_in_flight_attempts_of_a_limited_type() {
     assert_eq!(metrics.peak_in_flight(LIMITED), 3);
     assert!(metrics.last(FREE).is_none(), "a free type has no gauges");
     assert_eq!(
-        registry.adaptive_limits().snapshot(LIMITED).map(|s| s.limit),
+        registry
+            .adaptive_limits()
+            .snapshot(LIMITED)
+            .map(|s| s.limit),
         Some(3)
     );
 }
@@ -592,4 +618,25 @@ async fn the_limit_settles_near_the_knee_of_a_real_dependency() {
         "the dependency saw {peak} calls at once"
     );
     assert_eq!(metrics.last(ACTIVITY).map(|m| m.0), Some(limit));
+}
+
+/// A row with capability requirements skips the claim-time exclusion, so
+/// the worker can claim it at the cap. The dispatch gate must then defer
+/// it. The deferral uses no attempt, and every run still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_past_the_cap_is_deferred_without_using_an_attempt() {
+    const ACTIVITY: &str = "al_capability_slow";
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("al-backstop");
+    let mut activity = act_info(ACTIVITY, slow_call);
+    activity.requires = Some("gpu=true");
+    let config = AdaptiveLimitConfig::disabled()
+        .with_activity(ACTIVITY, Some(AdaptiveLimitPolicy::new(2, 2)));
+    let labels = HashMap::from([("gpu".to_owned(), "true".to_owned())]);
+    run_with_labels(&url, &queue, vec![activity], Some(config), 12, labels).await;
+
+    let g = gauge(ACTIVITY);
+    assert_eq!(g.done(), 12, "each run calls the handler once");
+    assert!(g.peak() <= 2, "the type ran {} attempts at once", g.peak());
+    assert_eq!(g.max_attempt(), 1, "a deferral must not use an attempt");
 }
