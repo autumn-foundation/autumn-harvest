@@ -1474,11 +1474,11 @@ impl DeliveryAttempt {
 
     /// `true` for a 4xx status that a retry cannot fix (issue #1832).
     ///
-    /// 408, 425 and 429 are transient. RFC 9110, RFC 8470 and RFC 6585 let
+    /// 408, 421, 425 and 429 are transient. RFC 9110, RFC 8470 and RFC 6585 let
     /// a client retry them. Every other 4xx is permanent.
     #[must_use]
     pub fn is_permanent_failure(&self) -> bool {
-        matches!(self.status, Some(s) if (400..500).contains(&s) && !matches!(s, 408 | 425 | 429))
+        matches!(self.status, Some(s) if (400..500).contains(&s) && !matches!(s, 408 | 421 | 425 | 429))
     }
 }
 
@@ -1922,8 +1922,8 @@ mod classify_outcome_tests {
 
     #[test]
     fn transient_4xx_still_backs_off() {
-        // 408, 425 and 429 invite a retry (RFC 9110, RFC 8470, RFC 6585).
-        for status in [408_u16, 425, 429] {
+        // 408, 421, 425 and 429 invite a retry (RFC 9110, RFC 8470, RFC 6585).
+        for status in [408_u16, 421, 425, 429] {
             let outcome = DeliveryAttempt::success(status);
             let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
             assert!(

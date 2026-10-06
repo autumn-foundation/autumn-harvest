@@ -156,7 +156,7 @@ retry/backoff/DLQ machinery rather than inventing new machinery:
 - **Permanent 4xx dead-letters at once (issue #1832).** A retry cannot fix
   a 4xx such as 400, 401, 404 or 422. The scanner dead-letters it on the
   first attempt, with the same typed reason as exhaustion and `attempts: 1`.
-  408, 425 and 429 are transient. They take the normal backoff.
+  408, 421, 425 and 429 are transient. They take the normal backoff.
 - **Receiver misconfiguration.** A rotated HMAC secret, a WAF that returns
   403 or an ingress that returns 404 during a deploy dead-letters every
   completion in that time. Fix the receiver first. Then run `harvest dlq
