@@ -50,8 +50,11 @@ Design decisions:
   warm mark can drift. Every 64 warm decisions the worker sums the full
   history again. An incremental sum at or above the cap never fails a run
   alone: the worker sums the full history first.
-- A failed byte measure skips the byte check for that decision only. It
-  logs a warning and does not fail the task.
+- A failed byte measure fails the decision closed, before any side effect.
+  The error releases the claim, and the retry loads the history cold. A cold
+  decision takes its sum from the full history load, so it runs no separate
+  byte query. A skipped check would let a measure that always fails bypass
+  the cap.
 - The history-bloat `COUNT(*)` now runs only when the in-memory prospective
   count crosses the threshold. Small runs pay no extra query now that the
   warning is on by default. The prospective count usually over-counts. When

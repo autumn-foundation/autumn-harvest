@@ -22708,32 +22708,26 @@ async fn process_workflow_task(
 
     // Issue #1804: stored history bytes at the start of this decision. The
     // byte cap stops inline local activities and the hard-cap preflight below.
-    // A failed measure skips the byte check for this decision only.
-    let history_bytes = if let Some(cap) = registry.history_policy().byte_hard_cap() {
-        match measure_history_bytes(
-            conn,
-            prepared.exec_id,
-            prepared.next_event_id,
-            prepared.cold_history_bytes,
-            // A warm hit takes its mark together with the cache entry.
-            prepared.cached_history_bytes,
-            cap,
-        )
-        .await
-        {
-            Ok(mark) => Some(mark),
-            Err(error) => {
-                tracing::warn!(
-                    exec_id = %prepared.exec_id,
-                    %error,
-                    "failed to measure stored history bytes; skipping the byte cap \
-                     for this decision"
-                );
-                None
-            }
-        }
-    } else {
-        None
+    //
+    // A failed measure fails the decision closed, before any side effect.
+    // Skipping the check instead lets a measure that always fails bypass the
+    // cap. The error releases the claim (issue #1459). This decision took the
+    // warm cache entry, so the retry loads cold. A cold decision gets its sum
+    // from the full history load and runs no separate byte query.
+    let history_bytes = match registry.history_policy().byte_hard_cap() {
+        Some(cap) => Some(
+            measure_history_bytes(
+                conn,
+                prepared.exec_id,
+                prepared.next_event_id,
+                prepared.cold_history_bytes,
+                // A warm hit takes its mark together with the cache entry.
+                prepared.cached_history_bytes,
+                cap,
+            )
+            .await?,
+        ),
+        None => None,
     };
     let byte_cap_breach =
         history_bytes_breach(registry.history_policy().byte_hard_cap(), history_bytes);
