@@ -18892,6 +18892,13 @@ async fn handle_suspended_workflow(
     .await
 }
 
+/// The boundary row a decision adds to its history, for the history-size
+/// counts (issue #1833). `appends` is `true` when the decision grows the
+/// history, because only such a decision writes a boundary.
+fn decision_boundary_reserve(registry: &HandlerRegistry, appends: bool) -> u64 {
+    u64::from(appends && registry.history_policy().decision_boundaries())
+}
+
 /// Appends the boundary of this decision when the policy allows it
 /// (issue #1833).
 ///
@@ -23115,8 +23122,10 @@ async fn process_workflow_task(
                             }
                         };
                         history_events.extend(new_events);
-                        let current_history_event_count =
-                            u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                        // The decision also appends its boundary (issue #1833).
+                        let current_history_event_count = u64::try_from(history_events.len())
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(decision_boundary_reserve(registry, true));
                         if let Some(cap) = registry.history_policy().event_hard_cap()
                             && current_history_event_count >= cap
                         {
@@ -23299,8 +23308,10 @@ async fn process_workflow_task(
                 history_events.extend(new_events);
                 // Issue #1247: no emit_update_result_metrics call here either
                 // — see the comment on the HistoryCapReached arm above.
-                let current_history_event_count =
-                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                // The decision also appends its boundary (issue #1833).
+                let current_history_event_count = u64::try_from(history_events.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(decision_boundary_reserve(registry, true));
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
@@ -23464,8 +23475,10 @@ async fn process_workflow_task(
                     }
                 };
                 history_events.extend(new_events.clone());
-                let current_history_event_count =
-                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                // The decision also appends its boundary (issue #1833).
+                let current_history_event_count = u64::try_from(history_events.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(decision_boundary_reserve(registry, true));
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
@@ -23747,8 +23760,10 @@ async fn process_workflow_task(
                 resolved_inline_external = resolved_external_ids(&new_events);
                 let remaining_commands_with_unresolved = remaining_commands;
                 history_events.extend(new_events);
-                let current_history_event_count =
-                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
+                // The decision also appends its boundary (issue #1833).
+                let current_history_event_count = u64::try_from(history_events.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(decision_boundary_reserve(registry, true));
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
@@ -24202,9 +24217,14 @@ async fn process_workflow_task(
         // Issue #1797: returned at the gate above; it appends no event.
         WorkflowOutcome::TaskFailed { .. } => 0,
     };
+    // The decision also appends its boundary when it grows the history
+    // (issue #1833).
+    let decision_appends =
+        pending_durable_event_count > 0 || next_event_id > decision_start_event_id;
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
-        .saturating_add(pending_durable_event_count);
+        .saturating_add(pending_durable_event_count)
+        .saturating_add(decision_boundary_reserve(registry, decision_appends));
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
         && current_history_event_count >= cap
@@ -24273,7 +24293,8 @@ async fn process_workflow_task(
                 &pending_cmds,
                 resolved_abandoned_dispatch_event_count,
             )
-            .saturating_add(terminal_parent_close_cascade_events),
+            .saturating_add(terminal_parent_close_cascade_events)
+            .saturating_add(decision_boundary_reserve(registry, true)),
         )
     } else {
         None

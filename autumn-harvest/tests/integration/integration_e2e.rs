@@ -532,6 +532,16 @@ async fn load_task_from_url(database_url: &str, task_id: Uuid) -> TaskQueueItem 
         .expect("failed to reload task queue row")
 }
 
+/// The events of a live history without its decision boundaries
+/// (issue #1833). A shape check reads the workflow events only.
+pub(crate) fn without_boundaries(events: &[WorkflowEvent]) -> Vec<WorkflowEvent> {
+    events
+        .iter()
+        .filter(|event| !event.is_decision_boundary())
+        .cloned()
+        .collect()
+}
+
 pub(crate) async fn load_history_from_url(
     database_url: &str,
     exec_id: ExecutionId,
