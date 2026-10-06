@@ -1231,6 +1231,34 @@ async fn record_abort_tombstones(
     }
 }
 
+/// The report id of an abort of a ramp with no `ramp_id` (issue #1814).
+///
+/// The id derives from the queue, the base, the target and the step of each
+/// pool that holds the ramp, in pool order. Every replica reads the same
+/// rows, so every replica derives the same id with no coordination. Two
+/// replicas therefore cannot stamp two ids on different pools. A later
+/// ramp with the same builds has new steps and so a new id, and no old
+/// marker matches it. Each part has a length prefix, as in
+/// [`crate::build_routing::ramp_generation_id`].
+#[cfg(feature = "db")]
+fn id_less_report_id(
+    (queue, base, target): &RampKey,
+    steps: &[(usize, chrono::DateTime<chrono::Utc>)],
+) -> uuid::Uuid {
+    use std::fmt::Write as _;
+
+    let mut name = format!(
+        "harvest-ramp-abort/{}:{queue}/{}:{base}/{}:{target}",
+        queue.len(),
+        base.len(),
+        target.len()
+    );
+    for (index, step) in steps {
+        let _ = write!(name, "/{index}@{}", step.timestamp_micros());
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
+}
+
 /// Give the ramp of one pool step the report id, when it has no `ramp_id`,
 /// within `bound`.
 ///
@@ -2086,10 +2114,11 @@ impl RampGuard {
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<RampAbort> {
-        let mut report_id = ramp_id.unwrap_or_else(uuid::Uuid::new_v4);
+        let mut report_id = ramp_id.unwrap_or_else(|| id_less_report_id(&key, steps));
         if ramp_id.is_none() {
-            // The first id on a row wins. A guard that lost the race on the
-            // first pool stamps the other pools with the winner's id.
+            // Every replica derives the same id, so a stamp normally finds
+            // no other id. The first id on a row still wins, so a guard that
+            // meets another id adopts it for the other pools.
             let mut adopted = None;
             for &(index, step) in steps {
                 if cancel.is_cancelled() {

@@ -220,15 +220,16 @@ The guard fails safe: when it cannot read, it does not abort.
   match uses ids, not database clocks, so clock skew between pools does not
   matter. An operator ramp set after the abort has a new `ramp_id`, so the
   guard does not clear it. A ramp set before the migration has no id. The
-  guard picks a report id for its abort and writes it as the `ramp_id` of
-  every pool that still holds the ramp, before any clear. The clear writes
-  its marker under the same id. So a later guard can finish a pool that did
-  not clear, also after a restart, and a failed report stays recoverable.
-  A pool that rejects that write keeps no id, and the guard cannot finish
-  it after a restart. Two replicas can abort the same ramp with no id. The
-  first id on a row wins, and the other replica adopts it for its clear,
-  report and mark, so the ledger reports the abort once. Only when no pool
-  takes an id do the two replicas report the abort twice.
+  guard derives a report id for its abort from the queue, the builds and
+  the step of each pool that holds the ramp. Every replica reads the same
+  rows, so every replica derives the same id, and the ledger reports the
+  abort once. Before any clear, the guard writes that id as the `ramp_id`
+  of every pool that still holds the ramp. The clear writes its marker
+  under the same id. So a later guard can finish a pool that did not
+  clear, also after a restart, and a failed report stays recoverable. A
+  pool that rejects that write keeps no id, and the guard cannot finish it
+  after a restart. A later ramp with the same builds has new steps, so an
+  old marker never matches it.
 - A pool can hold an abort marker and a newer operator ramp at the same time.
   The guard reads the marker anyway. It clears only the pools whose `ramp_id`
   matches a marker. The newer ramp stays, and the next pass judges it on its
