@@ -9,7 +9,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   from the deadpool status of each shard pool. A new in-memory sampler reads
   them on the `poll_interval` cadence. No query runs. When runtimes in one
   process share a metrics sink with separate pools for one shard, `in_use` is
-  their sum and `idle` reads 0 while any of them is exhausted.
+  their sum and `idle` reads 0 while any of them is exhausted. A worker
+  without a sharded pool claims every assigned shard through its one pool,
+  so it reports that pool under each assigned shard label.
 - `harvest.db.pool.wait_duration{shard}`: histogram of the wait for a pooled
   connection. The claim path, the timeout scanner and the activity heartbeat
   flush record it. A failed or timed-out wait counts too.

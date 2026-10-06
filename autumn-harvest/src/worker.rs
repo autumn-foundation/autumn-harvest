@@ -6475,6 +6475,22 @@ pub fn capability_miss_fleet_stale_secs(heartbeat_interval: Duration) -> i64 {
 /// `pub(crate)` so every metric-emitting module shares one shard-label
 /// convention rather than growing its own fallback (issue #1307).
 #[must_use]
+/// The `shard` labels of a worker's one pool when it has no sharded pool
+/// (issue #1815).
+///
+/// Every assigned shard claims through that pool under its own label. So the
+/// pool gauges report it under each label, and a shard-filtered dashboard
+/// finds its pool state. A worker with no assignment uses shard 0.
+fn single_pool_shard_labels(assignments: &[crate::types::ShardId]) -> Vec<u16> {
+    let mut labels: Vec<u16> = assignments.iter().map(|s| shard_metric_label(*s)).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    if labels.is_empty() {
+        labels.push(0);
+    }
+    labels
+}
+
 pub(crate) fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
     let raw = shard.as_i32();
     debug_assert!(
@@ -32379,10 +32395,10 @@ impl Worker {
         #[cfg(feature = "db")]
         let pool_shards: Vec<(u16, DbPool)> = self.config.sharded_pool.as_ref().map_or_else(
             || {
-                // UFCS: diesel's `first` shadows the slice method here.
-                let shard = <[crate::types::ShardId]>::first(&self.config.shard_assignments)
-                    .map_or(0, |s| shard_metric_label(*s));
-                vec![(shard, pool.clone())]
+                single_pool_shard_labels(&self.config.shard_assignments)
+                    .into_iter()
+                    .map(|shard| (shard, pool.clone()))
+                    .collect()
             },
             |sp| {
                 sp.iter_shards()
@@ -38591,6 +38607,18 @@ mod tests {
         assert_ne!(
             policy(Duration::from_micros(1_100)),
             policy(Duration::from_micros(1_900))
+        );
+    }
+
+    /// Issue #1815: a worker without a sharded pool claims every assigned
+    /// shard through its one pool, so the pool gauges carry each shard label.
+    #[test]
+    fn a_single_pool_reports_under_every_assigned_shard() {
+        use crate::types::ShardId;
+        assert_eq!(single_pool_shard_labels(&[]), vec![0]);
+        assert_eq!(
+            single_pool_shard_labels(&[ShardId::new(3), ShardId::new(1), ShardId::new(3)]),
+            vec![1, 3]
         );
     }
 
