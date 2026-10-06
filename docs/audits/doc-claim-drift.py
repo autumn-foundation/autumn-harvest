@@ -38,7 +38,7 @@ COUNT_RE = re.compile(
 # punctuation after it, such as "## 0.7.0: notes", is not part of it.
 SEMVER_ID = r"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*"
 VERSION_HEADING_RE = re.compile(
-    rf"^##\s+\[?v?(\d+\.\d+\.\d+(?:-{SEMVER_ID})?(?:\+{SEMVER_ID})?)", re.MULTILINE
+    rf"^ {{0,3}}##\s+\[?v?(\d+\.\d+\.\d+(?:-{SEMVER_ID})?(?:\+{SEMVER_ID})?)", re.MULTILINE
 )
 # A CommonMark fence: up to 3 spaces, then 3 or more backticks or tildes.
 FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
@@ -111,17 +111,25 @@ def line_of(text, offset):
     return text.count("\n", 0, offset) + 1
 
 
+CODE_SPAN_RE = re.compile(r"(`+)(?!`).*?(?<!`)\1(?!`)")
+
+
 def strip_html_comments(line, in_comment):
-    """Return the visible part of a line, and whether a comment stays open."""
+    """Return the visible part of a line, and whether a comment stays open.
+
+    A delimiter inside a code span, such as `<!--`, is text, not a comment.
+    """
+    # Search a copy with code spans masked, and slice the real line.
+    masked = CODE_SPAN_RE.sub(lambda m: " " * len(m.group()), line)
     out, i = [], 0
     while i < len(line):
         if in_comment:
-            end = line.find("-->", i)
+            end = masked.find("-->", i)
             if end < 0:
                 return "".join(out), True
             i, in_comment = end + 3, False
         else:
-            start = line.find("<!--", i)
+            start = masked.find("<!--", i)
             if start < 0:
                 out.append(line[i:])
                 break
@@ -206,7 +214,9 @@ def event_row_count_findings(path, text):
         for n, cells in table:
             if cells[0] != EVENT_ROW_CELL:
                 continue
-            for m in COUNT_RE.finditer(" | ".join(cells)):
+            # Emphasis and code marks do not change a rendered count.
+            plain = re.sub(r"[`*_~]", "", " | ".join(cells))
+            for m in COUNT_RE.finditer(plain):
                 found.append(
                     f"{path}:{n}: the `event.rs` row states \"{m.group()}\". "
                     "Drop the count: it drifts from event.rs."
@@ -332,6 +342,13 @@ def self_test():
     assert event_row_count_findings("x.md", hidden) == []
     assert duplicate_row_findings("x.md", hidden) == []
     assert list(markdown_lines(hidden))[-1] == (7, "a  c")
+    spans = "Use `<!--` to start one.\n| M | P |\n|---|---|\n| `event.rs` | 9 variants |\n"
+    assert len(event_row_count_findings("x.md", spans)) == 1
+    formatted = (
+        "| M | P |\n|---|---|\n| `event.rs` | Variants: **49** |\n"
+        "| `event.rs` | `50` variants |\n| `event.rs` | `last_error` field |\n"
+    )
+    assert [m.split(":")[1] for m in event_row_count_findings("x.md", formatted)] == ["3", "4"]
 
     cargo = (
         '[workspace]\nmembers = []\n\n[workspace.package]\n'
@@ -343,6 +360,8 @@ def self_test():
     assert release_notes_findings("```\n## [0.1.0]\n```\n## 0.7.0\n", cargo) == []
     assert release_notes_findings("````\n```\n## [0.1.0]\n````\n## 0.7.0\n", cargo) == []
     assert release_notes_findings("## 0.7.0: Release notes\n", cargo) == []
+    assert len(release_notes_findings("   ## [0.6.0]\n", cargo)) == 1
+    assert release_notes_findings("    ## [0.6.0]\n", cargo) == []
     assert release_notes_findings("## v0.7.0.\n", cargo) == []
     found = release_notes_findings("## [0.7.0-rc.1+b.5] - x\n", cargo)
     assert len(found) == 1 and "0.7.0-rc.1+b.5" in found[0], found
