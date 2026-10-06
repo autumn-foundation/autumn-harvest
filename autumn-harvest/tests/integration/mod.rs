@@ -238,6 +238,7 @@ mod retry_chain_routing_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;
 mod saga_tests;
+mod scanner_lease_tests;
 mod scanner_liveness_tests;
 mod scanner_tick_db_tests;
 mod schedule_decisions;

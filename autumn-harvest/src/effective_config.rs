@@ -247,6 +247,20 @@ pub struct WorkerConfigView {
     /// *identifiers* and per-key rows-remaining are served by
     /// `GET /admin/codec/rotation`.
     pub codec_rotation_batch_size: i64,
+    /// Whether one replica per shard runs the timeout checker (issue #1795).
+    pub scanner_election: bool,
+    /// Scanner lease TTL in milliseconds, as configured. The checker caps it
+    /// and applies the three-tick floor.
+    pub scanner_lease_ttl_ms: u64,
+    /// Random spread of each scanner sleep, as the checker uses it. A
+    /// configured value is clamped to `[0, 0.9]`, and a non-finite one is 0.
+    pub scanner_jitter: f64,
+    /// Mean time between timeout-checker ticks, in milliseconds. `None`
+    /// means the worker poll interval.
+    pub timeout_scan_interval_ms: Option<u64>,
+    /// Most rows per timeout reason that one timeout pass enforces, as
+    /// configured. The checker raises 0 to 1.
+    pub timeout_scan_batch_size: u32,
     /// Retry budget policy for activity types without an override
     /// (issue #1793). `null` = no default budget.
     pub retry_budget_default: Option<crate::policy::RetryBudgetPolicy>,
@@ -413,6 +427,7 @@ impl WorkerConfigView {
             max_concurrent_sessions,
             workflow_panic_max_attempts,
             codec_rotation_batch_size,
+            scanner,
             retry_budget,
             // REDACTED — the registry holds live codec handles that may close
             // over key material. Only the operator-chosen key IDENTIFIERS are
@@ -477,6 +492,11 @@ impl WorkerConfigView {
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
             codec_rotation_batch_size: *codec_rotation_batch_size,
+            scanner_election: scanner.elect,
+            scanner_lease_ttl_ms: dur_ms(scanner.lease_ttl),
+            scanner_jitter: crate::scanner_lease::clamp_jitter(scanner.jitter),
+            timeout_scan_interval_ms: scanner.timeout_interval.map(dur_ms),
+            timeout_scan_batch_size: scanner.timeout_batch_size,
             retry_budget_default: retry_budget.default_policy(),
             retry_budget_overrides: retry_budget.overrides(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
@@ -884,6 +904,35 @@ mod tests {
         );
         assert_eq!(view.poll_interval_ms, expected_ms);
         assert_eq!(expected_ms, 500);
+    }
+
+    /// The view reports the jitter the scanner uses (issue #1795). A
+    /// non-finite or out-of-range setting is clamped, so the JSON holds a
+    /// number, never `null`.
+    #[test]
+    fn scanner_jitter_reports_the_clamped_value() {
+        for (set, used) in [
+            (f64::NAN, 0.0),
+            (f64::INFINITY, 0.0),
+            (-1.0, 0.0),
+            (5.0, 0.9),
+            (0.2, 0.2),
+        ] {
+            let worker = WorkerConfig {
+                scanner: crate::scanner_lease::ScannerConfig {
+                    jitter: set,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let view = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
+            let json = serde_json::to_value(&view).expect("serialize");
+            assert_eq!(
+                json["scanner_jitter"],
+                serde_json::json!(used),
+                "jitter {set}"
+            );
+        }
     }
 
     #[test]

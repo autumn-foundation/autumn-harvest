@@ -316,11 +316,29 @@ pub fn derive_timeline(
 /// over a `Uuid` newtype rather than a formatted `String` — hashing a
 /// 16-byte value needs no allocation and no `SipHash` pass over a variable-
 /// length buffer, unlike the `format!("act:{id}")`-style key this replaces.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AccKey {
     Activity(ActivityExecId),
     LocalActivity(ActivityExecId),
     Child(ExecutionId),
+}
+
+impl std::hash::Hash for AccKey {
+    /// Feed `SipHash` one 128-bit write per key.
+    ///
+    /// The derived impl writes the variant tag, a slice length prefix and the
+    /// UUID bytes as three separate `write` calls. The namespace tag is folded
+    /// into the low bits of the id instead. Keys that differ only in namespace
+    /// still compare unequal through `Eq`, so a hash collision is harmless.
+    /// The hasher stays the keyed `RandomState` one.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let (tag, id) = match self {
+            Self::Activity(id) => (0_u128, id.as_uuid()),
+            Self::LocalActivity(id) => (1, id.as_uuid()),
+            Self::Child(id) => (2, id.as_uuid()),
+        };
+        state.write_u128(id.as_u128() ^ tag);
+    }
 }
 
 /// Scan the ordered history into one [`Acc`] per orchestration unit.

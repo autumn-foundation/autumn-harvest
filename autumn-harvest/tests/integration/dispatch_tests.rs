@@ -288,6 +288,7 @@ fn shared_state_with(log: Arc<ActivityLog>) -> autumn_harvest::context::SharedSt
 fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
         codec_rotation_batch_size: 0,
+        scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: uuid::Uuid::new_v4().to_string(),
         queues: vec![queue.to_string()],
