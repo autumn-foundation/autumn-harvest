@@ -199,6 +199,8 @@ pub fn test_partitioned_layout_requested() -> bool {
 
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
+/// Adaptive concurrency limit per activity type (issue #1836).
+pub mod adaptive_limit;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
 /// AES-256-GCM payload codec and data-key providers (issue #1825).
@@ -547,6 +549,7 @@ pub mod worker;
 #[cfg(feature = "db")]
 pub mod workers;
 
+pub use adaptive_limit::AdaptiveLimitConfig;
 pub use admission_gate::{
     AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateMode, GateScope,
     MAX_ACTIVE_GATES, ProducerContractEntry, ProducerGateStatus, StartProducer, check_admission,
@@ -678,8 +681,9 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
-    Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    AdaptiveLimitPolicy, CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy,
+    RetryBudgetPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
+    WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;

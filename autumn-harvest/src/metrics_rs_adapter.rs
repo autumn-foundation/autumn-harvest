@@ -45,7 +45,9 @@ use metrics::{Key, Label, counter, gauge, histogram};
 
 use crate::telemetry::{
     ActivityPauseAction, ActivityStatus, BUILD_ID_LABEL_NONE, ConnectorOutcome,
-    METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED,
+    METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_CONCURRENCY_DEFERRED,
+    METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT, METRIC_ACTIVITY_CONCURRENCY_LIMIT,
+    METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_ACTIVITY_LATENCY_BASELINE,
     METRIC_ACTIVITY_PANIC, METRIC_ACTIVITY_PAUSE_ACTIONS, METRIC_ACTIVITY_RETRIES,
     METRIC_ADMISSION_BLOCKED, METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE,
     METRIC_API_RATE_LIMITED, METRIC_BUILD_RAMP_ABORTED, METRIC_CANARY_FAILURE,
@@ -940,6 +942,39 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_retry_budget_exhausted(&self, activity: &str) {
         counter!(
             METRIC_RETRY_BUDGET_EXHAUSTED,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_activity_concurrency_limit(
+        &self,
+        activity: &str,
+        state: &crate::adaptive_limit::LimitSnapshot,
+    ) {
+        gauge!(
+            METRIC_ACTIVITY_CONCURRENCY_LIMIT,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .set(f64::from(state.limit));
+        gauge!(
+            METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .set(f64::from(state.in_flight));
+        // No estimate yet: keep the last published baseline.
+        if let Some(baseline) = state.baseline {
+            gauge!(
+                METRIC_ACTIVITY_LATENCY_BASELINE,
+                METRIC_LABEL_ACTIVITY => activity.to_owned(),
+            )
+            .set(baseline.as_secs_f64());
+        }
+    }
+
+    fn record_activity_concurrency_deferred(&self, activity: &str) {
+        counter!(
+            METRIC_ACTIVITY_CONCURRENCY_DEFERRED,
             METRIC_LABEL_ACTIVITY => activity.to_owned(),
         )
         .increment(1);

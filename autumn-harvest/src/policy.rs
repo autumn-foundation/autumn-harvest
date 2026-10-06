@@ -451,6 +451,121 @@ impl Default for RetryBudgetPolicy {
     }
 }
 
+/// Adaptive concurrency limit for one activity type (issue #1836).
+///
+/// The worker caps the in-flight attempts of the type. The cap follows the
+/// handler latency and the retryable failures. See [`crate::adaptive_limit`]
+/// for the rules.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::policy::AdaptiveLimitPolicy;
+///
+/// // Let the cap move between 2 and 64 in-flight attempts.
+/// let policy = AdaptiveLimitPolicy::new(2, 64);
+/// assert_eq!(policy.max_limit, 64);
+/// assert_eq!(AdaptiveLimitPolicy::default().min_limit, 1);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveLimitPolicy {
+    /// Lowest cap. At least 1.
+    pub min_limit: u32,
+    /// Highest cap. At least `min_limit`.
+    pub max_limit: u32,
+    /// Latency inflation over the no-load baseline that the limit accepts.
+    /// At 1.25, the gradient stays at 1 until latency is 25 % above the
+    /// baseline. Above that, the cap grows more slowly and settles. At
+    /// least 1.
+    pub tolerance: f64,
+    /// Factor that an overloaded window applies to the cap. It is in the
+    /// range from 0.5 to 1.
+    pub backoff_ratio: f64,
+    /// Share of retryable failures above which a window is overloaded. It
+    /// is in the range from 0 to 1. At 0, one failure cuts the cap. A higher
+    /// value keeps rare failures from throttling a healthy dependency.
+    pub error_threshold: f64,
+    /// Samples between two baseline probes. At least
+    /// [`AdaptiveLimitPolicy::MIN_PROBE_INTERVAL`].
+    pub probe_interval: u32,
+}
+
+impl AdaptiveLimitPolicy {
+    /// Default lowest cap.
+    pub const DEFAULT_MIN_LIMIT: u32 = 1;
+    /// Default highest cap.
+    pub const DEFAULT_MAX_LIMIT: u32 = 200;
+    /// Default latency tolerance.
+    pub const DEFAULT_TOLERANCE: f64 = 1.25;
+    /// Default backoff factor for an overloaded window.
+    pub const DEFAULT_BACKOFF_RATIO: f64 = 0.9;
+    /// Default failure share above which a window is overloaded.
+    pub const DEFAULT_ERROR_THRESHOLD: f64 = 0.05;
+    /// Default samples between two baseline probes.
+    pub const DEFAULT_PROBE_INTERVAL: u32 = 1_000;
+    /// Fewest samples between two baseline probes.
+    pub const MIN_PROBE_INTERVAL: u32 = 10;
+
+    /// Construct a policy with the given cap range and default tuning.
+    #[must_use]
+    pub fn new(min_limit: u32, max_limit: u32) -> Self {
+        Self {
+            min_limit,
+            max_limit,
+            ..Self::default()
+        }
+        .sanitized()
+    }
+
+    /// Apply the field rules. The fields are public, so a caller can set a
+    /// NaN or an inverted range directly.
+    ///
+    /// `min_limit` becomes at least 1, and `max_limit` at least `min_limit`.
+    /// A non-finite or low `tolerance` becomes 1. A `backoff_ratio` outside
+    /// the range from 0.5 to 1 is clamped, and NaN becomes the default.
+    /// `error_threshold` follows the same rule in the range from 0 to 1.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let min_limit = self.min_limit.max(1);
+        let tolerance = if self.tolerance.is_finite() {
+            self.tolerance.max(1.0)
+        } else {
+            1.0
+        };
+        let backoff_ratio = if self.backoff_ratio.is_nan() {
+            Self::DEFAULT_BACKOFF_RATIO
+        } else {
+            self.backoff_ratio.clamp(0.5, 1.0)
+        };
+        let error_threshold = if self.error_threshold.is_nan() {
+            Self::DEFAULT_ERROR_THRESHOLD
+        } else {
+            self.error_threshold.clamp(0.0, 1.0)
+        };
+        Self {
+            min_limit,
+            max_limit: self.max_limit.max(min_limit),
+            tolerance,
+            backoff_ratio,
+            error_threshold,
+            probe_interval: self.probe_interval.max(Self::MIN_PROBE_INTERVAL),
+        }
+    }
+}
+
+impl Default for AdaptiveLimitPolicy {
+    fn default() -> Self {
+        Self {
+            min_limit: Self::DEFAULT_MIN_LIMIT,
+            max_limit: Self::DEFAULT_MAX_LIMIT,
+            tolerance: Self::DEFAULT_TOLERANCE,
+            backoff_ratio: Self::DEFAULT_BACKOFF_RATIO,
+            error_threshold: Self::DEFAULT_ERROR_THRESHOLD,
+            probe_interval: Self::DEFAULT_PROBE_INTERVAL,
+        }
+    }
+}
+
 /// Failure semantics for mapped nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

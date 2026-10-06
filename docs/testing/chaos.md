@@ -338,8 +338,9 @@ event, an `ActivityCompleted`.
 
 - #1871: the worker did not retry the activity result write after a DB
   error. The result was lost, and only `start_to_close` recovered the task.
-  #1788 fixed #1871. The worker now writes the result again, up to 10 times,
-  and gets a new connection after a lost one.
+  #1788 fixed #1871 for a session that the server ends. The worker now
+  writes the result again, up to 10 times, and gets a new connection after
+  a lost one.
 - #1870: a `StartToClose` timeout ignores the retry policy and fails the
   workflow.
 - #1876: Postgres keeps the open transaction of a partitioned worker until
