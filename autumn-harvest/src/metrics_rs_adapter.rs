@@ -45,11 +45,13 @@ use metrics::{Key, Label, counter, gauge, histogram};
 
 use crate::telemetry::{
     ActivityPauseAction, ActivityStatus, ConnectorOutcome, METRIC_ACTIVITY_ATTEMPTS,
-    METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_ACTIVITY_PANIC,
-    METRIC_ACTIVITY_PAUSE_ACTIONS, METRIC_ACTIVITY_RETRIES, METRIC_ADMISSION_BLOCKED,
-    METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE, METRIC_API_RATE_LIMITED,
-    METRIC_CANARY_FAILURE, METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED,
-    METRIC_CIRCUIT_TRIPPED, METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
+    METRIC_ACTIVITY_CONCURRENCY_DEFERRED, METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT,
+    METRIC_ACTIVITY_CONCURRENCY_LIMIT, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED,
+    METRIC_ACTIVITY_LATENCY_BASELINE, METRIC_ACTIVITY_PANIC, METRIC_ACTIVITY_PAUSE_ACTIONS,
+    METRIC_ACTIVITY_RETRIES, METRIC_ADMISSION_BLOCKED, METRIC_ADMISSION_BYPASSED,
+    METRIC_ADMISSION_GATES_ACTIVE, METRIC_API_RATE_LIMITED, METRIC_CANARY_FAILURE,
+    METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_TRIPPED,
+    METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
     METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED,
     METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
     METRIC_CONNECTOR_RECEIVED, METRIC_DB_POOL_ACQUIRE_TIMEOUT, METRIC_DEBOUNCE_FIRED,
@@ -854,6 +856,39 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_retry_budget_exhausted(&self, activity: &str) {
         counter!(
             METRIC_RETRY_BUDGET_EXHAUSTED,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_activity_concurrency_limit(
+        &self,
+        activity: &str,
+        state: &crate::adaptive_limit::LimitSnapshot,
+    ) {
+        gauge!(
+            METRIC_ACTIVITY_CONCURRENCY_LIMIT,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .set(f64::from(state.limit));
+        gauge!(
+            METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .set(f64::from(state.in_flight));
+        // No estimate yet: keep the last published baseline.
+        if let Some(baseline) = state.baseline {
+            gauge!(
+                METRIC_ACTIVITY_LATENCY_BASELINE,
+                METRIC_LABEL_ACTIVITY => activity.to_owned(),
+            )
+            .set(baseline.as_secs_f64());
+        }
+    }
+
+    fn record_activity_concurrency_deferred(&self, activity: &str) {
+        counter!(
+            METRIC_ACTIVITY_CONCURRENCY_DEFERRED,
             METRIC_LABEL_ACTIVITY => activity.to_owned(),
         )
         .increment(1);
