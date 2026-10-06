@@ -1095,7 +1095,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "circuit_breakers": breaker_policies(circuit_breakers),
         "dispatch_channel": dispatch_channel,
         "retry_budgets": budgets,
-        "outcome_window_ms": outcome_window.as_millis(),
+        "outcome_window": duration_key(*outcome_window),
         "peer_stale_secs": peer_stale_secs,
         "execution": execution.key(),
         "payload": payload.key(),
@@ -1121,7 +1121,7 @@ fn budget_policies(
 }
 
 /// Each activity with a circuit-breaker policy and that policy, sorted by
-/// name, for a cohort key. Durations are in nanoseconds.
+/// name, for a cohort key.
 fn breaker_policies(
     registry: &crate::circuit_breaker::CircuitBreakerRegistry,
 ) -> Vec<serde_json::Value> {
@@ -1133,12 +1133,20 @@ fn breaker_policies(
                 serde_json::json!([
                     name,
                     policy.failure_threshold,
-                    policy.window.as_nanos(),
-                    policy.cooldown.as_nanos(),
+                    duration_key(policy.window),
+                    duration_key(policy.cooldown),
                 ])
             })
         })
         .collect()
+}
+
+/// `duration` for a cohort key, as `[secs, subsec_nanos]` (issue #1815).
+///
+/// A deadline decides an outcome to the nanosecond, so the key keeps the full
+/// duration. The pair cannot overflow, unlike a single nanosecond count.
+pub(crate) fn duration_key(duration: std::time::Duration) -> serde_json::Value {
+    serde_json::json!([duration.as_secs(), duration.subsec_nanos()])
 }
 
 /// `names`, sorted and deduplicated, for a cohort key.
@@ -1334,11 +1342,11 @@ impl Default for ExecutionPolicy {
 impl ExecutionPolicy {
     fn key(self) -> serde_json::Value {
         serde_json::json!({
-            "sticky_timeout_ms": self.sticky_timeout.as_millis(),
+            "sticky_timeout": duration_key(self.sticky_timeout),
             "workflow_cache_size": self.workflow_cache_size,
             "resident_workflows": self.resident_workflows,
-            "workflow_task_timeout_ms": self.workflow_task_timeout.as_millis(),
-            "max_local_activity_ms": self.max_local_activity_start_to_close.as_millis(),
+            "workflow_task_timeout": duration_key(self.workflow_task_timeout),
+            "max_local_activity": duration_key(self.max_local_activity_start_to_close),
             "workflow_panic_max_attempts": self.workflow_panic_max_attempts,
             // Every threshold at or below 0 turns quarantine off, so they are
             // one setting.
@@ -3766,6 +3774,85 @@ mod tests {
             cohort(five_minutes, 120),
             cohort(five_minutes, 1200),
             "another freshness limit"
+        );
+    }
+
+    /// Issue #1815: a deadline decides an outcome to the nanosecond. Two
+    /// workers whose budgets differ below a millisecond are in different
+    /// cohorts.
+    #[test]
+    fn the_cohort_key_keeps_sub_millisecond_durations() {
+        use super::ExecutionPolicy;
+        use std::time::Duration;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |execution, outcome_window| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: false,
+                retry_budgets: &budgets,
+                outcome_window,
+                peer_stale_secs: 120,
+                execution,
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let short = Duration::from_micros(1_100);
+        let long = Duration::from_micros(1_900);
+        let window = Duration::from_secs(300);
+        let base = ExecutionPolicy::default();
+        for (a, b) in [
+            (
+                ExecutionPolicy {
+                    sticky_timeout: short,
+                    ..base
+                },
+                ExecutionPolicy {
+                    sticky_timeout: long,
+                    ..base
+                },
+            ),
+            (
+                ExecutionPolicy {
+                    workflow_task_timeout: short,
+                    ..base
+                },
+                ExecutionPolicy {
+                    workflow_task_timeout: long,
+                    ..base
+                },
+            ),
+            (
+                ExecutionPolicy {
+                    max_local_activity_start_to_close: short,
+                    ..base
+                },
+                ExecutionPolicy {
+                    max_local_activity_start_to_close: long,
+                    ..base
+                },
+            ),
+        ] {
+            assert_ne!(cohort(a, window), cohort(b, window), "{a:?}");
+        }
+        assert_ne!(
+            cohort(base, window + short),
+            cohort(base, window + long),
+            "the outcome window"
         );
     }
 

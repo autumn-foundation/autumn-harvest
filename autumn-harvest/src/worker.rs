@@ -1259,10 +1259,10 @@ impl HandlerRegistry {
             activities: self.activity_policies(),
             local_activity_defaults: serde_json::json!({
                 "retry_policy": self.default_activity_retry_policy,
-                "start_to_close_ms": self
+                "start_to_close": self
                     .default_activity_start_to_close
-                    .map(|timeout| timeout.as_millis()),
-                "retry_after_ceiling_ms": self.retry_after_ceiling.as_millis(),
+                    .map(crate::workers::duration_key),
+                "retry_after_ceiling": crate::workers::duration_key(self.retry_after_ceiling),
             }),
             #[cfg(feature = "hot-code-swap")]
             module_host: self
@@ -1351,7 +1351,9 @@ impl HandlerRegistry {
                         "allow_env": binding.capabilities.allow_env,
                         "memory_bytes": binding.limits.memory_bytes,
                         "fuel": binding.limits.fuel,
-                        "max_wall_clock_ms": binding.limits.max_wall_clock.as_millis(),
+                        "max_wall_clock": crate::workers::duration_key(
+                            binding.limits.max_wall_clock
+                        ),
                     })
                 });
                 #[cfg(not(feature = "wasm-activities"))]
@@ -1375,9 +1377,9 @@ impl HandlerRegistry {
                 let mut policy = policy;
                 if info.is_local {
                     policy["retry_policy"] = serde_json::json!(info.default_retry_policy);
-                    policy["start_to_close_ms"] = serde_json::json!(
+                    policy["start_to_close"] = serde_json::json!(
                         info.default_start_to_close
-                            .map(|timeout| timeout.as_millis())
+                            .map(crate::workers::duration_key)
                     );
                 }
                 (name.clone(), policy)
@@ -28047,7 +28049,7 @@ fn module_host_policy(host: &crate::hot_swap::ModuleHost) -> serde_json::Value {
         "allow_env": host.capabilities.allow_env,
         "memory_bytes": host.limits.memory_bytes,
         "fuel": host.limits.fuel,
-        "max_wall_clock_ms": host.limits.max_wall_clock.as_millis(),
+        "max_wall_clock": crate::workers::duration_key(host.limits.max_wall_clock),
         "allowed_activities": host.allowed_activities,
         "allow_queue_override": host.allow_queue_override,
     })
@@ -38575,6 +38577,21 @@ mod tests {
         );
         // worker_id should be a valid UUID
         assert!(uuid::Uuid::parse_str(&runtime_cfg.worker_id).is_ok());
+    }
+
+    /// Issue #1815: a worker's local-activity defaults decide an outcome to
+    /// the nanosecond, so the payload policy keeps them exact.
+    #[test]
+    fn payload_policy_keeps_sub_millisecond_durations() {
+        let policy = |ceiling: Duration| {
+            let mut registry = HandlerRegistry::new(vec![], vec![]);
+            registry.retry_after_ceiling = ceiling;
+            registry.payload_policy()
+        };
+        assert_ne!(
+            policy(Duration::from_micros(1_100)),
+            policy(Duration::from_micros(1_900))
+        );
     }
 
     /// Issue #1815: a worker with workflow logs on persists each log line in
