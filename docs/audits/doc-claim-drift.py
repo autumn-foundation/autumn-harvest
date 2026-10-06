@@ -55,21 +55,42 @@ REBALANCING = (
 
 
 
+COMPETITOR_RE = re.compile(r"\b(?:Temporal|DBOS|Inngest|Hatchet|Restate)\b")
+HARVEST_RE = re.compile(r"(?i)harvest")
+# A sentence ends at end punctuation before a space, at a blank line, or
+# before a heading, a table row or a list item.
+SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])[ \t]+|\n(?:[ \t]*\n|(?=[ \t]*(?:#|\||- |\* )))")
+
+
+def blank_competitor_sentences(text):
+    """Blank each sentence that names a competitor and not harvest."""
+    out, start = [], 0
+    for m in [*SENTENCE_BREAK_RE.finditer(text), None]:
+        end = m.start() if m else len(text)
+        sentence = text[start:end]
+        if COMPETITOR_RE.search(sentence) and not HARVEST_RE.search(sentence):
+            sentence = re.sub(r"[^\n]", " ", sentence)
+        out.append(sentence)
+        if m:
+            out.append(m.group())
+            start = m.end()
+    return "".join(out)
+
+
 def harvest_scope(text):
     """Blank the text about competitors in a multi-vendor page.
 
     A table with one row per engine keeps the autumn-harvest row only. A
     table with one column per engine keeps the label and autumn-harvest
-    cells only. A "**Choose X if**" paragraph is about a competitor, so it
-    goes. All other prose stays, so a stale claim in neutral text still
-    matches. Blank lines keep the line numbers of the findings.
+    cells only. In prose, a sentence that names a competitor and not
+    harvest goes. All other text stays, so a stale claim still matches.
+    Blank lines keep the line numbers of the findings.
     """
-    kept, table_col, in_choose = [], None, False
+    kept, table_col = [], None
     for line in text.split("\n"):
         if not line.startswith("|"):
             table_col = None
-            in_choose = (in_choose and line.strip() != "") or line.startswith("**Choose ")
-            kept.append("" if in_choose else line)
+            kept.append(line)
             continue
         cells = [c.strip() for c in CELL_SPLIT_RE.split(line)[1:-1]]
         if table_col is None:
@@ -78,13 +99,13 @@ def harvest_scope(text):
                 (k for k, c in enumerate(cells) if k and c.strip("*") == "autumn-harvest"), 0
             )
         if table_col:
-            keep = cells[: 1] + cells[table_col : table_col + 1]
+            keep = cells[:1] + cells[table_col : table_col + 1]
             kept.append("| " + " | ".join(keep) + " |")
         elif cells and cells[0].strip("*") == "autumn-harvest":
             kept.append(line)
         else:
             kept.append("")
-    return "\n".join(kept)
+    return blank_competitor_sentences("\n".join(kept))
 
 
 # (path, pattern, the fact that makes the claim false[, scope]). A scope
@@ -442,11 +463,14 @@ def self_test():
         "| DBOS | DBOS has no cross-region replication or failover. |\n\n"
         "Neutral prose: harvest has no multi-region DR or replication.\n\n"
         "## Choose something else if\n\n"
-        "**Choose DBOS if** you want\nno cross-region replication or failover.\n"
+        "**Choose DBOS if** you want\nno cross-region replication or failover.\n\n"
+        "DBOS has no cross-region replication or failover. Restate is\nsimilar.\n"
+        "Temporal is ahead. Here there is no built-in multi-region\n"
+        "replication or failover.\n"
     )
     claims = [("p.md", planned, "shipped", harvest_scope), ("p.md", region, "shipped", harvest_scope)]
     found = stale_claim_findings({"p.md": page}.get, claims)
-    assert [m.split(":")[1] for m in found] == ["3", "13", "16"], found
+    assert [m.split(":")[1] for m in found] == ["3", "13", "16", "25"], found
 
     # Every real pattern compiles.
     for _, pattern, *_ in STALE_CLAIMS:
