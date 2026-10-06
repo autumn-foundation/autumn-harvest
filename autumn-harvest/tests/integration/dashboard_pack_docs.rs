@@ -91,6 +91,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_concurrency_residual_over_limit_total",
     "harvest_quota_supersede_credit_not_shed_total",
     "harvest_scanner_tick_total",
+    "harvest_scanner_pass_total",
     "harvest_db_pool_acquire_timeout_total",
     "harvest_heartbeat_flush_failed_total",
     "harvest_saga_compensated_total",
@@ -329,6 +330,8 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     // Background control-loop liveness heartbeat (issue #797). Bounded
     // `scanner` label; no execution/workflow identity exists at this layer.
     ("harvest_scanner_tick", &["scanner", "shard"]),
+    // Scanner election role per tick (issue #1795). Bounded labels.
+    ("harvest_scanner_pass", &["scanner", "shard", "role"]),
     ("harvest_db_pool_acquire_timeout", &["site"]),
     ("harvest_heartbeat_flush_failed", &["reason"]),
     ("harvest_mutex_wait_duration", &["workflow"]),

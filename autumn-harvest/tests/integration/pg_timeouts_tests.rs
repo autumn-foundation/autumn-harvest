@@ -302,6 +302,7 @@ fn build_worker_with(
                 workflow_task_timeout: Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
                 labels: HashMap::new(),
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 queue_weights: HashMap::new(),
                 max_workflow_pause_duration: Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,

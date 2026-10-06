@@ -1492,6 +1492,21 @@ pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
 /// `GET /admin/preflight` for deployments without a metrics pipeline.
 pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 
+/// Counter: one per-shard scanner tick that reached the database, by role
+/// (issue #1795).
+///
+/// Labels: `scanner`, `shard`, and `role`. A `role` is one of:
+///
+/// - `leader`: this replica holds the lease and ran the pass.
+/// - `standby`: another replica holds the lease. This replica skipped the
+///   pass.
+/// - `unelected`: election is off. This replica ran the pass.
+/// - `fail_open`: the lease query failed. This replica ran the pass anyway.
+///
+/// The sum of the three running roles across the fleet is the scan load.
+/// The `role` label is [`METRIC_LABEL_ROLE`].
+pub const METRIC_SCANNER_PASS: &str = "harvest.scanner.pass";
+
 /// Counter: a pool acquire hit its bound (issue #1788).
 ///
 /// Labelled `{site}`: `claim` or `heartbeat_flush`. A steady rate means the
@@ -1954,6 +1969,11 @@ pub const METRIC_LABEL_ACTION: &str = "action";
 /// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
 /// variants — a call site passes the enum's `as_str()`, never a free string.
 pub const METRIC_LABEL_SCANNER: &str = "scanner";
+/// Metric label: what a scanner tick did under election (issue #1795).
+///
+/// Bounded by construction to the
+/// [`ScannerRole`](crate::scanner_lease::ScannerRole) variants.
+pub const METRIC_LABEL_ROLE: &str = "role";
 
 /// Metric label: the code path that hit a pool acquire bound (issue #1788).
 ///
@@ -2808,6 +2828,14 @@ pub trait MetricsRecorder: Send + Sync {
     /// existing implementor breaks.
     fn record_scanner_tick(&self, scanner: &str, shard: &str) {
         let _ = (scanner, shard);
+    }
+
+    /// A per-shard scanner tick ended in `role` (issue #1795).
+    ///
+    /// See [`METRIC_SCANNER_PASS`] for the role values. All labels are
+    /// bounded. Additive with a no-op default.
+    fn record_scanner_pass(&self, scanner: &str, shard: &str, role: &str) {
+        let _ = (scanner, shard, role);
     }
 
     /// A background control loop registered itself, before its first
