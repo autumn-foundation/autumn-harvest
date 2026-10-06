@@ -1737,6 +1737,6 @@ Harvest's value proposition is operational simplicity: one Rust binary, one Post
 
 1. **Workflow versioning.** When a workflow's code changes while executions are in-flight, replay will fail due to non-determinism. Temporal solves this with versioning APIs (`workflow.GetVersion()`). Harvest needs an equivalent — likely a `ctx.version("change-id", min_version, max_version)` call that records version markers in the event history.
 
-2. **Multi-tenancy.** Should Harvest support namespace isolation (like Temporal namespaces) for multi-tenant deployments? Initial answer: no, keep it simple. Namespaces can be added later by prefixing all table queries with a `namespace` column.
+2. **Multi-tenancy.** Should Harvest support namespace isolation (like Temporal namespaces) for multi-tenant deployments? Initial answer: no, keep it simple. Namespaces can be added later by prefixing all table queries with a `namespace` column. Resolved by [ADR 0004](adr/0004-tenant-isolation-cells.md) (issue #1837): no namespaces; isolate a tenant in a cell instead.
 
 3. **Exactly-once semantics.** Activity execution is at-least-once by design (retries after failure). For operations that must not be duplicated (e.g., charging a credit card), users must implement idempotency keys in their activity code. Should Harvest provide built-in idempotency key management? Initial answer: provide a `ctx.idempotency_key()` helper that generates a deterministic key from the workflow ID + activity ID + attempt number, but leave enforcement to the activity implementation.

@@ -338,13 +338,15 @@ event, an `ActivityCompleted`.
 
 - #1871: the worker did not retry the activity result write after a DB
   error. The result was lost, and only `start_to_close` recovered the task.
-  #1788 fixed #1871. The worker now writes the result again, up to 10 times,
-  and gets a new connection after a lost one.
+  #1788 fixed #1871 for a session that the server ends. The worker now
+  writes the result again, up to 10 times, and gets a new connection after
+  a lost one.
 - #1870: a `StartToClose` timeout ignores the retry policy and fails the
   workflow.
 - #1876: Postgres keeps the open transaction of a partitioned worker until
   TCP keepalive ends the session. That transaction keeps its row locks.
-  Orphan reclaim blocks on such a lock, so no orphan is reclaimed.
+  Orphan reclaim blocked on such a lock, so no orphan was reclaimed. The
+  #1876 fix makes reclaim skip a locked row and reclaim the other rows.
 - #1879: the heartbeat period is the interval plus the tick latency. When a
   tick takes longer than one interval, a live worker looks dead. False
   reclaims then count crash strikes and quarantine healthy work.
@@ -364,8 +366,10 @@ Each test works around a bug only where the bug applies:
   instance claimed. Each accepted `FAILED` must have the exact history: one
   activity terminal event, a `StartToClose` timeout, and one terminal event,
   a `WorkflowFailed` for the timeout.
-- For #1876, the partition test sets `idle_in_transaction_session_timeout =
-  5s` on the server to end the session.
+- The partition test sets `idle_in_transaction_session_timeout = 5s` on the
+  server. This setting is no longer a #1876 workaround. A row that the
+  cut-off session locks stays locked until the session ends. The 5 s limit
+  ends that session within the test budget, so the setting stays.
 - For #1879, the latency test uses a 2 s heartbeat. A decision cycle also
   takes more than 10 s at that latency, so it keeps the default 60 s
   workflow-task budget.
