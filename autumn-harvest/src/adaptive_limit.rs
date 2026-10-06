@@ -1,4 +1,64 @@
 //! Adaptive concurrency limit per activity type (issue #1836).
+//!
+//! The slot tuner grows the worker slots when tasks wait. That is the wrong
+//! direction when a dependency is the bottleneck. More calls then only add
+//! latency and errors.
+//!
+//! An adaptive limit caps the in-flight attempts of one activity type on one
+//! worker. The cap follows the handler latency and the retryable failures.
+//! It never reads a queue wait or a permit wait.
+//!
+//! ## Rules
+//!
+//! The limit collects samples in windows. A window holds about one cap of
+//! samples, so the cap moves about once per round trip.
+//!
+//! 1. **Baseline.** The baseline is the lowest window mean latency since the
+//!    last probe. It estimates the latency at no load.
+//! 2. **Gradient.** The gradient is `tolerance * baseline / mean latency`,
+//!    clamped to the range from 0.5 to 1. The cap moves 20 % of the way to
+//!    `cap * gradient + QUEUE_SIZE`. Thus the cap grows while latency stays
+//!    near the baseline, and it shrinks when latency inflates.
+//! 3. **Backoff.** A retryable failure in a window cuts the cap by
+//!    `backoff_ratio`. A non-retryable failure is an answer. A cancelled
+//!    attempt gives no sample.
+//! 4. **App limit.** A window that used less than half of the cap does not
+//!    move the cap. Low demand says nothing about the dependency.
+//! 5. **Probe.** Every `probe_interval` samples, the cap drops to
+//!    [`QUEUE_SIZE`] and the baseline is cleared. Answers from attempts that
+//!    started before the probe do not count. The next full window measures
+//!    a fresh baseline at a low concurrency. Then the cap returns to its
+//!    value from before the probe.
+//! 6. **Bounds.** The cap stays in `[min_limit, max_limit]`.
+//!
+//! A new type starts with a probe at [`QUEUE_SIZE`], so its first baseline
+//! is measured at a low concurrency.
+//!
+//! ## Why a probed minimum
+//!
+//! Netflix Gradient2 compares the latency with a smoothed long-term average.
+//! Under steady load that average catches up with the latency. The gradient
+//! then returns to 1, and the cap grows again. The cap ratchets up without
+//! bound. A minimum that a probe measures again does not drift, so the cap
+//! settles. Against a dependency whose latency grows in proportion to the
+//! concurrency above a knee, the fixed point is
+//! `tolerance * knee + QUEUE_SIZE`. The simulation tests prove it.
+//!
+//! ## Worker integration
+//!
+//! - The claim skips a type at its cap. Its tasks stay `PENDING` for another
+//!   worker or a later poll.
+//! - A claim can race past the cap, for example for a row with capability
+//!   requirements. The dispatch gate then defers the row with the fenced
+//!   retry-budget write. The deferral uses no attempt and appends no event.
+//! - The gate runs before the retry budget, so a deferral spends no budget
+//!   token. A circuit short-circuit and a half-open probe take no slot.
+//!
+//! ## Scope
+//!
+//! The state is in process and per worker, like the retry budget. N workers
+//! allow up to N caps. The limit never touches the event log, so replay is
+//! unaffected. Local activities and the SQLite backend do not use it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -104,7 +164,7 @@ impl AdaptiveLimitConfig {
 }
 
 /// A view of the limit state of one activity type.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LimitSnapshot {
     /// The cap on in-flight attempts.
     pub limit: u32,
@@ -611,7 +671,7 @@ mod tests {
         assert_eq!(reg.saturated(), vec![A.to_owned()]);
         drop(held);
         assert_eq!(reg.snapshot(A).expect("state").in_flight, 0);
-        assert!(reg.saturated().is_empty());
+        assert_eq!(reg.saturated(), Vec::<String>::new());
         assert!(matches!(reg.try_acquire(A), Acquire::Acquired(_)));
     }
 

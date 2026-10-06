@@ -143,15 +143,19 @@ impl Drop for Running {
     }
 }
 
+/// One published limit state: the cap, the in-flight count and the
+/// baseline in seconds.
+type LimitSample = (u32, u32, Option<f64>);
+
 /// The last limit state that the worker published, per activity type.
 #[derive(Default)]
 struct LimitMetrics {
-    last: Mutex<HashMap<String, (u32, u32, Option<f64>)>>,
+    last: Mutex<HashMap<String, LimitSample>>,
     peak_in_flight: Mutex<HashMap<String, u32>>,
 }
 
 impl LimitMetrics {
-    fn last(&self, activity: &str) -> Option<(u32, u32, Option<f64>)> {
+    fn last(&self, activity: &str) -> Option<LimitSample> {
         self.last
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -187,6 +191,7 @@ impl MetricsRecorder for LimitMetrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let peak = peaks.entry(activity.to_owned()).or_default();
         *peak = (*peak).max(in_flight);
+        drop(peaks);
     }
 }
 
