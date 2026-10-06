@@ -225,8 +225,10 @@ The guard fails safe: when it cannot read, it does not abort.
   its marker under the same id. So a later guard can finish a pool that did
   not clear, also after a restart, and a failed report stays recoverable.
   A pool that rejects that write keeps no id, and the guard cannot finish
-  it after a restart. Two replicas that abort the same ramp with no id pick
-  two report ids, so that abort can be reported twice.
+  it after a restart. Two replicas can abort the same ramp with no id. The
+  first id on a row wins, and the other replica adopts it for its clear,
+  report and mark, so the ledger reports the abort once. Only when no pool
+  takes an id do the two replicas report the abort twice.
 - A pool can hold an abort marker and a newer operator ramp at the same time.
   The guard reads the marker anyway. It clears only the pools whose `ramp_id`
   matches a marker. The newer ramp stays, and the next pass judges it on its

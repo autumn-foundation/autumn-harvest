@@ -1824,6 +1824,78 @@ async fn a_partial_abort_of_an_id_less_ramp_is_finished_after_a_restart() {
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
 }
 
+/// Two guards can race to give an id-less ramp its report id (issue #1814).
+/// The guard that loses adopts the id on the row. Its clear, report and
+/// mark then all use that id, so the marker is reported once.
+#[tokio::test]
+async fn a_guard_adopts_the_report_id_another_guard_stamped() {
+    use diesel_async::AsyncConnection as _;
+
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut other = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect other guard");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // An old writer sets the ramp with no id.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+    .execute(&mut conn)
+    .await
+    .expect("old writer ramp");
+    seed_healthy_base(&mut conn, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn, true, "FAILED", false).await;
+    }
+
+    // The other guard holds the row while this pass reads and judges.
+    diesel::sql_query("BEGIN")
+        .execute(&mut other)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut other)
+        .await
+        .expect("lock the row");
+    let config = guard_config().with_interval(Duration::from_secs(5));
+    let pass = tokio::spawn({
+        let pool = pool.clone();
+        async move { guard_once(std::slice::from_ref(&pool), &pool, &config, None).await }
+    });
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    // The other guard stamps its report id first.
+    let won = uuid::Uuid::new_v4();
+    diesel::sql_query("UPDATE harvest_build_policies SET ramp_id = $2 WHERE queue_name = $1")
+        .bind::<Text, _>(QUEUE)
+        .bind::<diesel::sql_types::Uuid, _>(won)
+        .execute(&mut other)
+        .await
+        .expect("stamp");
+    diesel::sql_query("COMMIT")
+        .execute(&mut other)
+        .await
+        .expect("commit");
+
+    let aborts = pass.await.expect("pass");
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert!(!ramp_is_active(&mut conn).await);
+    assert_eq!(
+        marker_reported(&mut conn, won).await,
+        Some(true),
+        "the marker of the adopted id is reported"
+    );
+}
+
 /// A guard can stop after its clear commits and before its report. A later
 /// pass reports that abort once, from the marker, after the report grace.
 #[tokio::test]

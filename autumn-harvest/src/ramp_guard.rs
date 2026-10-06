@@ -1240,6 +1240,10 @@ async fn record_abort_tombstones(
 /// can finish that pool after a restart. The write changes only
 /// `ramp_id`, so the step and the reset trigger leave the ramp as is. A
 /// failure only logs a warning: that pool then stays unmatched, as before.
+///
+/// Returns the id that the row holds after the write. Another guard can
+/// stamp the row first. The caller then adopts that id, so the clear, the
+/// report and the mark of both guards use one id.
 #[cfg(feature = "db")]
 async fn stamp_report_id(
     pool: &crate::worker::DbPool,
@@ -1248,45 +1252,76 @@ async fn stamp_report_id(
     step: chrono::DateTime<chrono::Utc>,
     report_id: uuid::Uuid,
     bound: Duration,
-) {
-    use diesel::sql_types::{Text, Timestamptz};
+) -> Option<uuid::Uuid> {
+    use diesel::OptionalExtension;
+    use diesel::sql_types::{Nullable, Text, Timestamptz};
     use diesel_async::{AsyncConnection, RunQueryDsl};
+
+    #[derive(diesel::QueryableByName)]
+    struct Stamped {
+        #[diesel(sql_type = Nullable<diesel::sql_types::Uuid>)]
+        ramp_id: Option<uuid::Uuid>,
+    }
 
     let timeout_ms = bound.as_millis().max(1);
     let stamp = async {
         let mut conn = pool.get().await.map_err(|e| e.to_string())?;
-        conn.transaction(async |conn| -> crate::error::HarvestResult<()> {
-            for setting in ["lock_timeout", "statement_timeout"] {
-                diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
-            diesel::sql_query(
-                "UPDATE harvest_build_policies SET ramp_id = $5 \
-                 WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
-                   AND updated_at = $4 AND ramp_id IS NULL",
-            )
-            .bind::<Text, _>(queue)
-            .bind::<Text, _>(base)
-            .bind::<Text, _>(target)
-            .bind::<Timestamptz, _>(step)
-            .bind::<diesel::sql_types::Uuid, _>(report_id)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-            Ok(())
-        })
+        conn.transaction(
+            async |conn| -> crate::error::HarvestResult<Option<uuid::Uuid>> {
+                for setting in ["lock_timeout", "statement_timeout"] {
+                    diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                }
+                let stamped: Option<Stamped> = diesel::sql_query(
+                    "UPDATE harvest_build_policies SET ramp_id = $5 \
+                     WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
+                       AND updated_at = $4 AND ramp_id IS NULL \
+                     RETURNING ramp_id",
+                )
+                .bind::<Text, _>(queue)
+                .bind::<Text, _>(base)
+                .bind::<Text, _>(target)
+                .bind::<Timestamptz, _>(step)
+                .bind::<diesel::sql_types::Uuid, _>(report_id)
+                .get_result(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+                if let Some(row) = stamped {
+                    return Ok(row.ramp_id);
+                }
+                // A new statement sees a stamp that another guard committed
+                // while this UPDATE waited.
+                let current: Option<Stamped> = diesel::sql_query(
+                    "SELECT ramp_id FROM harvest_build_policies \
+                     WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
+                       AND updated_at = $4",
+                )
+                .bind::<Text, _>(queue)
+                .bind::<Text, _>(base)
+                .bind::<Text, _>(target)
+                .bind::<Timestamptz, _>(step)
+                .get_result(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+                Ok(current.and_then(|row| row.ramp_id))
+            },
+        )
         .await
         .map_err(|e| e.to_string())
     };
     match tokio::time::timeout(bound.saturating_mul(2), stamp).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(id)) => id,
         Ok(Err(error)) => {
             tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard report id stamp failed");
+            None
         }
         Err(_) => {
             tracing::warn!(queue = %queue, pool = index, "ramp guard report id stamp timed out");
+            None
         }
     }
 }
@@ -2051,15 +2086,24 @@ impl RampGuard {
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<RampAbort> {
-        let report_id = ramp_id.unwrap_or_else(uuid::Uuid::new_v4);
+        let mut report_id = ramp_id.unwrap_or_else(uuid::Uuid::new_v4);
         if ramp_id.is_none() {
+            // The first id on a row wins. A guard that lost the race on the
+            // first pool stamps the other pools with the winner's id.
+            let mut adopted = None;
             for &(index, step) in steps {
                 if cancel.is_cancelled() {
                     break;
                 }
                 if let Some(pool) = pools.get(index) {
-                    stamp_report_id(pool, index, &key, step, report_id, bound).await;
+                    let stamp = adopted.unwrap_or(report_id);
+                    if let Some(id) = stamp_report_id(pool, index, &key, step, stamp, bound).await {
+                        adopted.get_or_insert(id);
+                    }
                 }
+            }
+            if let Some(id) = adopted {
+                report_id = id;
             }
         }
         let mut outcomes = Vec::with_capacity(steps.len());
