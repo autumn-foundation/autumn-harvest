@@ -25,9 +25,13 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Read a repository file with `\n` line endings.
+///
+/// A Windows checkout can convert the files to CRLF.
 fn read(relative: &str) -> String {
     fs::read_to_string(repo_root().join(relative))
         .unwrap_or_else(|e| panic!("failed to read {relative}: {e}"))
+        .replace("\r\n", "\n")
 }
 
 /// Every `harvest.*` value of a `pub const METRIC_*` in telemetry.rs.
