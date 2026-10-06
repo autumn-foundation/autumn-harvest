@@ -85,14 +85,14 @@ jobs:
       TARGET: ${{ matrix.target }}
       SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
       # One build cache for all targets. Its key names the nightly, because
       # rust-cache reads the version of the toolchain that rust-toolchain.toml
       # pins. Only the nightly fuzz_replay job saves it.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fuzz
           shared-key: fuzz-${{ env.FUZZ_TOOLCHAIN }}
@@ -159,7 +159,7 @@ jobs:
           echo "corpus size after: $(find "corpus/${TARGET}" -type f | wc -l)"
       - name: Save the corpus
         if: always() && hashFiles(format('fuzz/corpus/{0}/**', matrix.target)) != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
@@ -168,7 +168,7 @@ jobs:
           retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
       - name: Upload the crash input
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
