@@ -33241,14 +33241,20 @@ async fn bulk_discard_dead_letters_handler(
 /// The default window scales with the rows in one call. Each shard sees only
 /// its own rows. So with N shards, each shard gets a shorter window, and the
 /// shards together start tasks N times faster than one shard. A call that
-/// spans more than one shard therefore gives every shard the window of the
-/// whole row budget, rounded up to whole seconds. An explicit value is kept.
-fn fan_out_spread_secs(spread_secs: Option<u64>, budget: u32, shards: usize) -> Option<u64> {
+/// spans more than one shard therefore gives every shard the window of all
+/// `rows` the call selects, rounded up to whole seconds. An explicit value is
+/// kept.
+fn fan_out_spread_secs(spread_secs: Option<u64>, rows: usize, shards: usize) -> Option<u64> {
     if spread_secs.is_some() || shards <= 1 {
         return spread_secs;
     }
-    let window = dlq::redrive_spread_window(None, usize::try_from(budget).unwrap_or(usize::MAX));
+    let window = dlq::redrive_spread_window(None, rows);
     Some(window.as_secs() + u64::from(window.subsec_nanos() > 0))
+}
+
+/// The rows a fan-out selects: the matches on every shard, capped at `budget`.
+fn fan_out_rows(matched: usize, budget: u32) -> usize {
+    matched.min(usize::try_from(budget).unwrap_or(usize::MAX))
 }
 
 #[cfg(test)]
@@ -33261,12 +33267,21 @@ mod fan_out_spread_secs_tests {
     }
 
     #[test]
-    fn many_shards_share_the_window_of_the_whole_budget() {
+    fn many_shards_share_the_window_of_all_selected_rows() {
         // Two shards of 500 rows must not each get a 30 s window.
         assert_eq!(fan_out_spread_secs(None, 1000, 2), Some(60));
         // 100 rows: 6 s. 1 row: 60 ms, rounded up to 1 s.
         assert_eq!(fan_out_spread_secs(None, 100, 4), Some(6));
         assert_eq!(fan_out_spread_secs(None, 1, 4), Some(1));
+    }
+
+    #[test]
+    fn the_window_follows_the_matches_not_the_budget() {
+        use super::fan_out_rows;
+        // One match under the default budget of 100 waits at most 1 s, not 6 s.
+        assert_eq!(fan_out_spread_secs(None, fan_out_rows(1, 100), 2), Some(1));
+        // More matches than the budget scale to the budget.
+        assert_eq!(fan_out_rows(5000, 1000), 1000);
     }
 
     #[test]
@@ -33301,7 +33316,26 @@ async fn bulk_replay_from_shards(
         .iter_shards()
         .filter(|(shard_id, _)| selector.shard_id.is_none_or(|w| w == shard_id.as_i32()))
         .count();
-    let spread_secs = fan_out_spread_secs(selector.filter.spread_secs, remaining, shards);
+    let mut spread_secs = selector.filter.spread_secs;
+    if spread_secs.is_none() && shards > 1 {
+        // Size the shared window from the rows the call selects.
+        let mut matched = 0_usize;
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            if selector
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                continue;
+            }
+            let mut conn = shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let n = count_api_bulk_filter_matches(&mut conn, selector).await?;
+            matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
+        }
+        spread_secs = fan_out_spread_secs(None, fan_out_rows(matched, remaining), shards);
+    }
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if selector
@@ -33464,7 +33498,26 @@ async fn redrive_from_shards(
         .iter_shards()
         .filter(|(shard_id, _)| request.shard_id.is_none_or(|w| w == shard_id.as_i32()))
         .count();
-    let spread_secs = fan_out_spread_secs(request.filter.spread_secs, remaining, shards);
+    let mut spread_secs = request.filter.spread_secs;
+    if spread_secs.is_none() && shards > 1 {
+        // Size the shared window from the rows the call selects.
+        let mut matched = 0_usize;
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            if request
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                continue;
+            }
+            let mut conn = shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let n = dlq::count_redrive_filter_matches(&mut conn, &request.filter).await?;
+            matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
+        }
+        spread_secs = fan_out_spread_secs(None, fan_out_rows(matched, remaining), shards);
+    }
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if request
