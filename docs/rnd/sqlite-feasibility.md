@@ -57,8 +57,8 @@ module counts at the audited revision, recomputed by CI:
 | `diesel` query layer | 64 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
-| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 14 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 44 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 15 modules | Yes — integer epoch milliseconds. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 45 modules | Case by case — the SQL must be read, not inferred from the ORM. |
 | `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 32 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 14 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 10 modules | Yes — `sqlite_master` lookup. |
@@ -107,7 +107,7 @@ have grown past that round's 18 as new Postgres-only syntax lands; each module
 the open rule newly catches has so far already been (b) or (c). The counts move;
 the classifications do not.
 
-That 44 of the 63 coupled modules hand-write SQL is therefore the more
+That 45 of the 64 coupled modules hand-write SQL is therefore the more
 decision-relevant number than any dialect tally. It is the volume of query text
 a second backend must re-author by hand, and it is knowable exactly.
 
@@ -373,7 +373,7 @@ disputed:
 
 - **26 modules are class (c)** — portable only by dropping a capability or
   reimplementing wholesale — against 8 that are trivially trait-able.
-- **44 modules reach for raw SQL**, so their portability cannot be read off
+- **45 modules reach for raw SQL**, so their portability cannot be read off
   their Diesel usage at all.
 - The **capability losses are documented and unavoidable** on the single-writer
   side (*Known capability losses*, below), so the second backend is not the same

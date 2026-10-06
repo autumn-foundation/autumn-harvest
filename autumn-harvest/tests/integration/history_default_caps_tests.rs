@@ -134,6 +134,7 @@ fn build_worker(
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
             },
             registry,
         )
