@@ -96,11 +96,13 @@
 //!   a large backlog should `SCAN` for the old `{prefix}:dispatch:*`
 //!   pattern and `DEL` what it finds. Do that once no old worker is still
 //!   running.
-//! - **No TLS.** A `rediss://` URL is rejected at `connect` with a message
-//!   that says so. The `redis` client's TLS stack depends on an unmaintained
-//!   crate that the dependency ledger refuses. This is not one of issue
-//!   #1429's ten items; it needs its own follow-up issue. A plain
-//!   `redis://` URL sends the password in cleartext.
+//! - **TLS through rustls (issue #1834).** A `rediss://` URL connects over
+//!   TLS and verifies the server against the platform trust store.
+//!   `SSL_CERT_FILE` and `SSL_CERT_DIR` point that store at a private CA.
+//!   [`RedisDispatch::connect_with_tls`] takes a private CA and a client
+//!   certificate for mutual TLS (see [`RedisTlsOptions`]). There is no
+//!   option to skip verification. A plain `redis://` URL still sends the
+//!   password in cleartext.
 //! - **One channel per shard, not one channel that spans shards.** A single
 //!   [`RedisDispatch`] instance still addresses one key family and expects
 //!   every reference it carries to belong to one database. A multi-shard
@@ -133,6 +135,7 @@ mod envelope;
 mod error;
 mod naming;
 mod redis_queue;
+mod tls;
 
 pub use adapter::{ClaimedTask, TaskQueueAdapter};
 pub use dispatch::{RedisDispatch, RedisDispatchConfig};
@@ -143,3 +146,4 @@ pub use naming::{
     scheduled_payloads_key, scheduled_zset_key, stream_key,
 };
 pub use redis_queue::{RedisTaskQueue, RedisTaskQueueConfig};
+pub use tls::RedisTlsOptions;

@@ -1397,17 +1397,18 @@ jobs:
       # `postgres:11-alpine` (the unoverridden default -- `autumn-web`'s own
       # `TestDb`, used by e.g. the webhook suites), `postgres:16` (the tag
       # ~220 of this repo's own DB suites request via `.with_tag("16")`),
-      # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
+      # `postgres:16-alpine` (one outlier suite's override), `redis:5.0`
       # (Redis's default, un-overridden anywhere; needed by the issue #1312
       # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
-      # below), and `softwaremill/elasticmq:1.5.2` on the one shard that runs the
+      # below), `redis:7.4-alpine` (the TLS-only server of the issue #1834
+      # `tls_redis` suite; Redis 5 has no TLS), and `softwaremill/elasticmq:1.5.2` on the one shard that runs the
       # `connector_sqs_broker` suite (its ElasticMQ default, which "bytes
       # remaining on stream" failed on PR #1773 because it was not pre-pulled).
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
-          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0"
+          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 redis:7.4-alpine"
           # Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
           # The dry run prints this shard's cargo invocations without running
           # them, so no shard number is hardcoded here. It is captured first:
