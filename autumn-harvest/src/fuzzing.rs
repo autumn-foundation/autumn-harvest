@@ -22,7 +22,7 @@
 //! of an [`Op`] program. By default the program mirrors the history, so
 //! replay goes past the first event.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -310,6 +310,25 @@ pub enum Op {
     Mutex {
         /// Lock key.
         key: String,
+    },
+    /// `ctx.start_timer`, a cancellable timer. The handle drops at once.
+    ArmTimer {
+        /// Timer id.
+        id: String,
+        /// Duration in seconds.
+        secs: u64,
+    },
+    /// `ctx.cancel_timer`.
+    CancelTimer {
+        /// Timer id.
+        id: String,
+    },
+    /// `ctx.version(change_id, 0, version)`.
+    Version {
+        /// Change id.
+        change_id: String,
+        /// The recorded version, which is also the newest one.
+        version: u32,
     },
     /// `ctx.continue_as_new`, or `ctx.continue_as_new_as_type` with a type.
     ContinueAsNew {
@@ -658,10 +677,18 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
 /// that follows a parking one in the same run joins that batch too. A batch
 /// runs as one [`Op::Concurrent`], so the replayer matches all of it.
 pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
+    // A timer id that history cancels came from the cancellable timer API.
+    let cancellable: HashSet<&str> = history
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::TimerCancelled { timer_id } => Some(timer_id.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut program = Vec::new();
     let mut batch = Vec::new();
     for event in history {
-        match mirror_event(event) {
+        match mirror_event(event, &cancellable) {
             Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => batch.push(op),
             other => {
                 flush_batch(&mut program, &mut batch);
@@ -713,6 +740,9 @@ impl Op {
                 | Self::Patched { .. }
                 | Self::SideEffect { .. }
                 | Self::DetachedChild { .. }
+                | Self::ArmTimer { .. }
+                | Self::CancelTimer { .. }
+                | Self::Version { .. }
         )
     }
 
@@ -727,7 +757,7 @@ impl Op {
 }
 
 /// The op behind a lifecycle, activity, timer, signal or marker event.
-fn mirror_event(event: &WorkflowEvent) -> Option<Op> {
+fn mirror_event(event: &WorkflowEvent, cancellable: &HashSet<&str>) -> Option<Op> {
     match event {
         WorkflowEvent::ActivityScheduled {
             name, input, queue, ..
@@ -743,9 +773,19 @@ fn mirror_event(event: &WorkflowEvent) -> Option<Op> {
         WorkflowEvent::TimerStarted {
             timer_id,
             duration_secs,
+        } if cancellable.contains(timer_id.as_str()) => Some(Op::ArmTimer {
+            id: timer_id.as_str().to_string(),
+            secs: *duration_secs,
+        }),
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs,
         } => Some(Op::Timer {
             id: timer_id.as_str().to_string(),
             secs: *duration_secs,
+        }),
+        WorkflowEvent::TimerCancelled { timer_id } => Some(Op::CancelTimer {
+            id: timer_id.as_str().to_string(),
         }),
         WorkflowEvent::SignalReceived { signal_name, .. } => Some(Op::Signal {
             name: signal_name.clone(),
@@ -756,9 +796,7 @@ fn mirror_event(event: &WorkflowEvent) -> Option<Op> {
             SideEffectKind::Random => Some(Op::Random),
             SideEffectKind::Custom => name.clone().map(|name| Op::SideEffect { name }),
         },
-        WorkflowEvent::MarkerRecorded { name, .. } => name
-            .strip_prefix("patch:")
-            .map(|id| Op::Patched { id: id.to_string() }),
+        WorkflowEvent::MarkerRecorded { name, details } => marker_op(name, details),
         WorkflowEvent::WorkflowCompleted { output } => Some(Op::Complete {
             output: output.clone(),
         }),
@@ -775,6 +813,19 @@ fn mirror_event(event: &WorkflowEvent) -> Option<Op> {
         }),
         other => mirror_external(other),
     }
+}
+
+/// The op behind a `patch:` or `version:` marker. Other markers have none.
+fn marker_op(name: &str, details: &Value) -> Option<Op> {
+    if let Some(id) = name.strip_prefix("patch:") {
+        return Some(Op::Patched { id: id.to_string() });
+    }
+    let change_id = name.strip_prefix("version:")?;
+    let version = details.as_u64().and_then(|v| u32::try_from(v).ok());
+    Some(Op::Version {
+        change_id: change_id.to_string(),
+        version: version.unwrap_or(0),
+    })
 }
 
 /// The op behind a child, external or mutex event.
@@ -830,13 +881,14 @@ fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
         }
         WorkflowEvent::MutexGranted { key, .. } => Some(Op::Mutex { key: key.clone() }),
         // Every other variant, listed so that a new one fails to compile here.
-        // `mirror_event` handles the first nine.
+        // `mirror_event` handles the first ten.
         WorkflowEvent::ActivityScheduled { .. }
         | WorkflowEvent::LocalActivityScheduled { .. }
         | WorkflowEvent::TimerStarted { .. }
         | WorkflowEvent::SignalReceived { .. }
         | WorkflowEvent::SideEffectRecorded { .. }
         | WorkflowEvent::MarkerRecorded { .. }
+        | WorkflowEvent::TimerCancelled { .. }
         | WorkflowEvent::WorkflowCompleted { .. }
         | WorkflowEvent::WorkflowFailed { .. }
         | WorkflowEvent::WorkflowContinuedAsNew { .. }
@@ -871,7 +923,6 @@ fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
         | WorkflowEvent::ExternalCancelFailed { .. }
         | WorkflowEvent::WorkflowRedriven { .. }
         | WorkflowEvent::WorkflowRetryScheduled { .. }
-        | WorkflowEvent::TimerCancelled { .. }
         | WorkflowEvent::ExternalAwaitResolved { .. }
         | WorkflowEvent::ExternalAwaitFailed { .. } => None,
     }
@@ -935,6 +986,17 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
         }
         Op::Complete { output } => return Some(Ok(output)),
         Op::Fail { error } => return Some(Err(error)),
+        // An empty timer id is a documented caller panic.
+        Op::ArmTimer { id, .. } | Op::CancelTimer { id } if id.is_empty() => {}
+        Op::ArmTimer { id, secs } => {
+            let _ = ctx.start_timer(&id, secs);
+        }
+        Op::CancelTimer { id } => {
+            let _ = ctx.cancel_timer(&id);
+        }
+        Op::Version { change_id, version } => {
+            let _ = ctx.version(&change_id, 0, version);
+        }
         Op::ContinueAsNew {
             input,
             workflow_type,

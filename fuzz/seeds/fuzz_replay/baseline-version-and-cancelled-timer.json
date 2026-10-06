@@ -1,0 +1,44 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": {
+          "order": 14
+        },
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "MarkerRecorded",
+      "data": {
+        "name": "version:pricing",
+        "details": 2
+      }
+    },
+    {
+      "type": "TimerStarted",
+      "data": {
+        "timer_id": "idle",
+        "duration_secs": 300
+      }
+    },
+    {
+      "type": "TimerCancelled",
+      "data": {
+        "timer_id": "idle"
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": {
+          "done": true
+        }
+      }
+    }
+  ]
+}
