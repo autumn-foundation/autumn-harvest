@@ -572,6 +572,9 @@ pub struct AuditExportBuilderConfig {
     /// HMAC key for the audit hash chain (issue #1838). `None` turns the chain
     /// off. See [`crate::audit_chain`].
     pub chain_key: Option<CallbackSecret>,
+    /// Keys the exporter accepts on a stored chain checkpoint, but never signs
+    /// with. Set them for a key rotation.
+    pub chain_accept_keys: Vec<CallbackSecret>,
 }
 
 /// A webhook URL reduced to its origin, for diagnostics.
@@ -627,6 +630,7 @@ impl std::fmt::Debug for AuditExportBuilderConfig {
             .field("backoff", &self.backoff)
             .field("lease", &self.lease)
             .field("chain_key", &self.chain_key)
+            .field("chain_accept_keys", &self.chain_accept_keys)
             .finish()
     }
 }
@@ -644,6 +648,7 @@ impl Default for AuditExportBuilderConfig {
             backoff: ExportBackoff::default(),
             lease: DEFAULT_EXPORT_LEASE,
             chain_key: None,
+            chain_accept_keys: Vec::new(),
         }
     }
 }
@@ -981,24 +986,34 @@ fn direct_worker_runtime_config(
         batch_size: config.effective_batch_size(),
         backoff: config.backoff.clone(),
         lease: config.effective_lease(),
-        chain_key: runtime_chain_key(config.chain_key.as_ref()),
+        chain_key: runtime_chain_key(config),
     })
 }
 
 /// The validated chain key for the runtime config (issue #1838).
 ///
-/// `try_build` already rejects a short key, so this drops only a key that
-/// skipped the builder. It logs that, because the chain is then off.
+/// It carries the accepted keys of `config` too. `try_build` already rejects
+/// a short key, so this drops only a key that skipped the builder. It logs
+/// that, because the chain or that accepted key is then off.
 #[must_use]
 pub fn runtime_chain_key(
-    key: Option<&CallbackSecret>,
+    config: &AuditExportBuilderConfig,
 ) -> Option<crate::audit_chain::AuditChainKey> {
-    let key = key?;
-    crate::audit_chain::AuditChainKey::new(key.as_bytes().to_vec())
-        .inspect_err(|e| {
-            tracing::error!(error = %e, "the audit hash chain is off: the chain key is too short");
-        })
-        .ok()
+    let validate = |key: &CallbackSecret| {
+        crate::audit_chain::AuditChainKey::new(key.as_bytes().to_vec())
+            .inspect_err(|e| {
+                tracing::error!(error = %e, "an audit chain key is too short and is ignored");
+            })
+            .ok()
+    };
+    let active = validate(config.chain_key.as_ref()?)?;
+    Some(
+        config
+            .chain_accept_keys
+            .iter()
+            .filter_map(validate)
+            .fold(active, crate::audit_chain::AuditChainKey::with_accepted_key),
+    )
 }
 
 /// `true` after a live export config was removed and none replaced it.
@@ -2384,32 +2399,30 @@ pub async fn claim_shard_chained(
             // key set later starts the chain at the next sequence.
             let stamped = match chain_key {
                 Some(key) if last_assigned_seq > cursor.last_assigned_seq => {
-                    // A rebuilt cursor has no head while chained rows exist.
-                    // Seed it here, under the cursor lock and in this
-                    // transaction, so the chain never restarts from genesis.
-                    let seed = if cursor.chain_head.is_none() {
-                        crate::audit_chain::stored_chain_state(conn, cursor.last_assigned_seq)
-                            .await?
+                    // Extend only a checkpoint the key accepts. Otherwise a
+                    // writer could move the head and have it re-signed.
+                    if let Some(anchor) =
+                        crate::audit_chain::chain_anchor(conn, &cursor, key).await?
+                    {
+                        crate::audit_chain::stamp_chain(
+                            conn,
+                            shard_id,
+                            key.secret(),
+                            cursor.last_assigned_seq,
+                            last_assigned_seq,
+                            anchor.head.as_ref().map(<[u8; 32]>::as_slice),
+                        )
+                        .await?
+                        .map(|stamped| (key, stamped, anchor.start_seq))
                     } else {
+                        tracing::error!(
+                            shard_id,
+                            "the audit chain checkpoint is missing or does not verify; new \
+                             rows stay unchained until an operator calls \
+                             audit_chain::reanchor_shard_chain"
+                        );
                         None
-                    };
-                    let head = cursor
-                        .chain_head
-                        .clone()
-                        .or_else(|| seed.map(|seed| seed.head.to_vec()));
-                    let start_seq = cursor
-                        .chain_start_seq
-                        .or_else(|| seed.map(|seed| seed.start_seq));
-                    crate::audit_chain::stamp_chain(
-                        conn,
-                        shard_id,
-                        key.secret(),
-                        cursor.last_assigned_seq,
-                        last_assigned_seq,
-                        head.as_deref(),
-                    )
-                    .await?
-                    .map(|stamped| (key, stamped, start_seq))
+                    }
                 }
                 _ => None,
             };
@@ -2421,7 +2434,7 @@ pub async fn claim_shard_chained(
                     head: stamped.head,
                     head_occurred_at: stamped.head_occurred_at,
                 };
-                (checkpoint, checkpoint.mac(key.secret(), shard_id))
+                (checkpoint, key)
             });
 
             // ── Load the batch to deliver ─────────────────────────────────
@@ -2449,18 +2462,8 @@ pub async fn claim_shard_chained(
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
-                if let Some((checkpoint, mac)) = checkpoint {
-                    diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
-                        .set((
-                            cur::chain_start_seq.eq(checkpoint.start_seq),
-                            cur::chain_head_seq.eq(checkpoint.head_seq),
-                            cur::chain_head.eq(checkpoint.head.to_vec()),
-                            cur::chain_head_occurred_at.eq(checkpoint.head_occurred_at),
-                            cur::chain_mac.eq(mac.to_vec()),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
+                if let Some((checkpoint, key)) = checkpoint {
+                    crate::audit_chain::write_checkpoint(conn, shard_id, &checkpoint, key).await?;
                 }
             }
 
@@ -4378,10 +4381,39 @@ mod tests {
 
     #[test]
     fn a_short_chain_key_never_reaches_the_runtime_config() {
-        assert!(runtime_chain_key(Some(&CallbackSecret::new(vec![1_u8; 31]))).is_none());
-        assert!(runtime_chain_key(Some(&CallbackSecret::new(Vec::new()))).is_none());
-        assert!(runtime_chain_key(None).is_none());
-        assert!(runtime_chain_key(Some(&CallbackSecret::new(vec![1_u8; 32]))).is_some());
+        let with = |key: Option<Vec<u8>>| AuditExportBuilderConfig {
+            chain_key: key.map(CallbackSecret::new),
+            ..AuditExportBuilderConfig::default()
+        };
+        assert!(runtime_chain_key(&with(Some(vec![1_u8; 31]))).is_none());
+        assert!(runtime_chain_key(&with(Some(Vec::new()))).is_none());
+        assert!(runtime_chain_key(&with(None)).is_none());
+        assert!(runtime_chain_key(&with(Some(vec![1_u8; 32]))).is_some());
+    }
+
+    #[test]
+    fn the_runtime_chain_key_accepts_the_configured_accept_keys() {
+        let checkpoint = crate::audit_chain::ChainCheckpoint {
+            start_seq: 1,
+            head_seq: 1,
+            head: crate::audit_chain::GENESIS,
+            head_occurred_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        let old = CallbackSecret::new(vec![2_u8; 32]);
+        let short = CallbackSecret::new(vec![3_u8; 31]);
+        let config = AuditExportBuilderConfig {
+            chain_key: Some(CallbackSecret::new(vec![1_u8; 32])),
+            chain_accept_keys: vec![old.clone(), short.clone()],
+            ..AuditExportBuilderConfig::default()
+        };
+        let key = runtime_chain_key(&config).expect("an active key");
+        assert_eq!(key.secret().as_bytes(), &[1_u8; 32][..]);
+        assert!(key.accepts(&checkpoint, 0, &checkpoint.mac(&old, 0)));
+        assert!(!key.accepts(&checkpoint, 0, &checkpoint.mac(&short, 0)));
+        let mut unrelated = config;
+        unrelated.chain_accept_keys.clear();
+        let key = runtime_chain_key(&unrelated).expect("an active key");
+        assert!(!key.accepts(&checkpoint, 0, &checkpoint.mac(&old, 0)));
     }
 
     #[test]

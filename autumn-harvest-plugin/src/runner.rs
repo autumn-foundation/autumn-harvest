@@ -691,9 +691,7 @@ fn prepare_audit_export_config(
             batch_size: audit_config.effective_batch_size(),
             backoff: audit_config.backoff.clone(),
             lease: audit_config.effective_lease(),
-            chain_key: autumn_harvest::audit_export::runtime_chain_key(
-                audit_config.chain_key.as_ref(),
-            ),
+            chain_key: autumn_harvest::audit_export::runtime_chain_key(audit_config),
         })
     })
 }

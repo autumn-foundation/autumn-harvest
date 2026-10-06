@@ -28,7 +28,13 @@
 //! The cursor holds a [`ChainCheckpoint`]: the first chained `seq`, the
 //! newest chained `seq`, its link and its `occurred_at`. A MAC under the chain
 //! key covers all four. A writer without the key cannot move the checkpoint.
-//! So the verifier finds a stripped row and a deleted tail. A writer who
+//! So the verifier finds a stripped row and a deleted tail.
+//!
+//! The exporter extends only a checkpoint that its key accepts. Otherwise a
+//! writer could move the head and have the exporter sign it. A missing or
+//! invalid checkpoint stops the chain until [`reanchor_shard_chain`] runs.
+//!
+//! A writer who
 //! removes every chain value and the whole checkpoint leaves a table that
 //! looks unchained. Only the SIEM copy detects that.
 //!
@@ -66,8 +72,14 @@ pub const MIN_CHAIN_KEY_BYTES: usize = 32;
 ///
 /// The exporter stamps links only with this type. So a short or empty key
 /// cannot reach the stamp path, whichever way a caller builds the config.
+///
+/// The key can also hold accepted keys. The exporter accepts a stored
+/// checkpoint under any of them, but it signs only with the active key.
 #[derive(Clone)]
-pub struct AuditChainKey(CallbackSecret);
+pub struct AuditChainKey {
+    active: CallbackSecret,
+    accepted: Vec<CallbackSecret>,
+}
 
 /// The rejected key was shorter than [`MIN_CHAIN_KEY_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -78,7 +90,7 @@ pub struct ChainKeyTooShort {
 }
 
 impl AuditChainKey {
-    /// Wrap `key`.
+    /// Wrap `key` as the active key.
     ///
     /// # Errors
     /// Returns [`ChainKeyTooShort`] for a key shorter than
@@ -88,13 +100,36 @@ impl AuditChainKey {
         if key.len() < MIN_CHAIN_KEY_BYTES {
             return Err(ChainKeyTooShort { len: key.len() });
         }
-        Ok(Self(CallbackSecret::new(key)))
+        Ok(Self {
+            active: CallbackSecret::new(key),
+            accepted: Vec::new(),
+        })
     }
 
-    /// The key as the HMAC secret.
+    /// Also accept the keys of `other` on a stored checkpoint.
+    ///
+    /// Use it for a key rotation. The exporter never signs with an accepted
+    /// key. See `docs/audit-export.md`.
+    #[must_use]
+    pub fn with_accepted_key(mut self, other: Self) -> Self {
+        self.accepted.push(other.active);
+        self.accepted.extend(other.accepted);
+        self
+    }
+
+    /// The active key as the HMAC secret.
     #[must_use]
     pub const fn secret(&self) -> &CallbackSecret {
-        &self.0
+        &self.active
+    }
+
+    /// `true` when `mac` is the MAC of `checkpoint` on `shard` under the
+    /// active key or an accepted key.
+    #[must_use]
+    pub fn accepts(&self, checkpoint: &ChainCheckpoint, shard: i32, mac: &ChainHash) -> bool {
+        std::iter::once(&self.active)
+            .chain(&self.accepted)
+            .any(|key| checkpoint.mac(key, shard) == *mac)
     }
 }
 
@@ -501,12 +536,16 @@ pub(crate) struct Stamped {
 #[cfg(feature = "db")]
 const VERIFY_PAGE_ROWS: i64 = 1_000;
 
-/// The chain state the stored rows hold, for a cursor that lost its own.
+/// The chain state the stored rows hold.
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StoredChainState {
     /// The link of the newest chained row.
     pub(crate) head: ChainHash,
+    /// The `export_seq` of the newest chained row.
+    pub(crate) head_seq: i64,
+    /// The `occurred_at` of the newest chained row.
+    pub(crate) head_occurred_at: DateTime<Utc>,
     /// The first chained `export_seq`.
     pub(crate) start_seq: i64,
 }
@@ -517,13 +556,17 @@ struct StoredChainRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Bytea>)]
     head: Option<Vec<u8>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    head_seq: Option<i64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    head_occurred_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     start_seq: Option<i64>,
 }
 
 /// Read the newest link and the chain start from rows up to `through_seq`.
 ///
-/// Returns `None` when no row is chained. It scans the unchained rows, so the
-/// exporter calls it only for a cursor with no head, before a stamp.
+/// Returns `None` when no row is chained. It scans the unchained rows, so
+/// the exporter calls it only for a cursor with no checkpoint.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -535,23 +578,185 @@ pub(crate) async fn stored_chain_state(
     use diesel_async::RunQueryDsl;
 
     let row: StoredChainRow = diesel::sql_query(
-        "SELECT \
-             (SELECT chain_hash FROM harvest_audit_log \
-              WHERE chain_hash IS NOT NULL AND export_seq <= $1 \
-              ORDER BY export_seq DESC LIMIT 1) AS head, \
+        "SELECT h.chain_hash AS head, h.export_seq AS head_seq, \
+             h.occurred_at AS head_occurred_at, \
              (SELECT MIN(export_seq) FROM harvest_audit_log \
-              WHERE chain_hash IS NOT NULL AND export_seq <= $1) AS start_seq",
+              WHERE chain_hash IS NOT NULL AND export_seq <= $1) AS start_seq \
+         FROM (SELECT 1) AS one \
+         LEFT JOIN ( \
+             SELECT chain_hash, export_seq, occurred_at FROM harvest_audit_log \
+             WHERE chain_hash IS NOT NULL AND export_seq <= $1 \
+             ORDER BY export_seq DESC LIMIT 1 \
+         ) AS h ON true",
     )
     .bind::<diesel::sql_types::BigInt, _>(through_seq)
     .get_result(conn)
     .await
     .map_err(crate::error::database_error)?;
-    Ok(row
-        .head
-        .as_deref()
-        .and_then(from_bytes)
-        .zip(row.start_seq)
-        .map(|(head, start_seq)| StoredChainState { head, start_seq }))
+    Ok(row.head.as_deref().and_then(from_bytes).and_then(|head| {
+        Some(StoredChainState {
+            head,
+            head_seq: row.head_seq?,
+            head_occurred_at: row.head_occurred_at?,
+            start_seq: row.start_seq?,
+        })
+    }))
+}
+
+/// The point the exporter extends the chain from.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChainAnchor {
+    /// The link to extend, or `None` for a new chain.
+    pub(crate) head: Option<ChainHash>,
+    /// The first chained `export_seq`, or `None` for a new chain.
+    pub(crate) start_seq: Option<i64>,
+}
+
+/// The anchor for the next stamp on `cursor`, or `None` to refuse the stamp.
+///
+/// The exporter signs a new checkpoint over each stamp. So it must not trust
+/// a head that a database writer can set. It extends a checkpoint only when
+/// `key` accepts its MAC. It starts a new chain only when the cursor has no
+/// checkpoint and no row is chained. Any other state needs
+/// [`reanchor_shard_chain`].
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub(crate) async fn chain_anchor(
+    conn: &mut diesel_async::AsyncPgConnection,
+    cursor: &crate::models::AuditExportCursor,
+    key: &AuditChainKey,
+) -> crate::error::HarvestResult<Option<ChainAnchor>> {
+    if let Some((checkpoint, mac)) = stored_checkpoint(cursor) {
+        let valid = key.accepts(&checkpoint, cursor.shard_id, &mac)
+            && checkpoint.head_seq <= cursor.last_assigned_seq;
+        return Ok(valid.then_some(ChainAnchor {
+            head: Some(checkpoint.head),
+            start_seq: Some(checkpoint.start_seq),
+        }));
+    }
+    let partial = cursor.chain_head.is_some()
+        || cursor.chain_start_seq.is_some()
+        || cursor.chain_head_seq.is_some()
+        || cursor.chain_head_occurred_at.is_some()
+        || cursor.chain_mac.is_some();
+    if partial {
+        return Ok(None);
+    }
+    let stored = stored_chain_state(conn, cursor.last_assigned_seq).await?;
+    Ok(stored.is_none().then_some(ChainAnchor {
+        head: None,
+        start_seq: None,
+    }))
+}
+
+/// Write `checkpoint` and its MAC under the active key to the cursor.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub(crate) async fn write_checkpoint(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    checkpoint: &ChainCheckpoint,
+    key: &AuditChainKey,
+) -> crate::error::HarvestResult<()> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_audit_export_cursor::dsl as cur;
+
+    let mac = checkpoint.mac(key.secret(), shard_id);
+    diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
+        .set((
+            cur::chain_start_seq.eq(checkpoint.start_seq),
+            cur::chain_head_seq.eq(checkpoint.head_seq),
+            cur::chain_head.eq(checkpoint.head.to_vec()),
+            cur::chain_head_occurred_at.eq(checkpoint.head_occurred_at),
+            cur::chain_mac.eq(mac.to_vec()),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Sign a new checkpoint over the stored chain on `shard_id`.
+///
+/// The exporter does not extend a chain whose checkpoint is missing or does
+/// not verify. New rows then stay unchained. An operator calls this to
+/// recover, for example after a cursor rebuild.
+///
+/// It accepts the stored rows as they are. So compare the chain with the
+/// SIEM copy first. It chains the unchained rows after the newest link, up to
+/// `last_assigned_seq`. It then signs the checkpoint with the active key.
+///
+/// Returns the new checkpoint. Returns `None` when the cursor is missing or
+/// no row is chained. In the second case it clears the checkpoint, and the
+/// next export tick starts a new chain.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn reanchor_shard_chain(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    key: &AuditChainKey,
+) -> crate::error::HarvestResult<Option<ChainCheckpoint>> {
+    use diesel::prelude::*;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+
+    use crate::schema::harvest_audit_export_cursor::dsl as cur;
+
+    Box::pin(
+        conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
+            let cursor: Option<crate::models::AuditExportCursor> = cur::harvest_audit_export_cursor
+                .find(shard_id)
+                .select(crate::models::AuditExportCursor::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let Some(cursor) = cursor else {
+                return Ok(None);
+            };
+            let Some(seed) = stored_chain_state(conn, cursor.last_assigned_seq).await? else {
+                diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
+                    .set((
+                        cur::chain_start_seq.eq(None::<i64>),
+                        cur::chain_head_seq.eq(None::<i64>),
+                        cur::chain_head.eq(None::<Vec<u8>>),
+                        cur::chain_head_occurred_at.eq(None::<DateTime<Utc>>),
+                        cur::chain_mac.eq(None::<Vec<u8>>),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                return Ok(None);
+            };
+            let stamped = stamp_chain(
+                conn,
+                shard_id,
+                key.secret(),
+                seed.head_seq,
+                cursor.last_assigned_seq,
+                Some(seed.head.as_slice()),
+            )
+            .await?;
+            let checkpoint = ChainCheckpoint {
+                start_seq: seed.start_seq,
+                head_seq: stamped.map_or(seed.head_seq, |s| s.head_seq),
+                head: stamped.map_or(seed.head, |s| s.head),
+                head_occurred_at: stamped.map_or(seed.head_occurred_at, |s| s.head_occurred_at),
+            };
+            write_checkpoint(conn, shard_id, &checkpoint, key).await?;
+            Ok(Some(checkpoint))
+        }),
+    )
+    .await
 }
 
 /// Stamp the chain over the rows with `after_seq < export_seq <= through_seq`.
@@ -737,7 +942,7 @@ pub async fn verify_shard_chain_with(
 
 /// The checkpoint and its stored MAC, when every column is set.
 #[cfg(feature = "db")]
-fn stored_checkpoint(
+pub(crate) fn stored_checkpoint(
     cursor: &crate::models::AuditExportCursor,
 ) -> Option<(ChainCheckpoint, ChainHash)> {
     Some((
@@ -939,6 +1144,30 @@ mod tests {
         });
         assert_eq!(key.secret().as_bytes().len(), MIN_CHAIN_KEY_BYTES);
         assert_eq!(format!("{key:?}"), "AuditChainKey(<redacted>)");
+    }
+
+    #[test]
+    fn a_key_accepts_its_own_and_its_accepted_checkpoints_only() {
+        let full = |byte: u8| {
+            AuditChainKey::new(vec![byte; MIN_CHAIN_KEY_BYTES])
+                .unwrap_or_else(|e| panic!("a full-length key builds: {e}"))
+        };
+        let rows = chain(&[1]);
+        let Some(checkpoint) = checkpoint(&rows) else {
+            panic!("checkpoint");
+        };
+        let mac = |byte: u8| checkpoint.mac(full(byte).secret(), 2);
+        let rotated = full(1).with_accepted_key(full(2).with_accepted_key(full(3)));
+        assert_eq!(
+            rotated.secret().as_bytes(),
+            &[1_u8; MIN_CHAIN_KEY_BYTES][..]
+        );
+        for byte in [1, 2, 3] {
+            assert!(rotated.accepts(&checkpoint, 2, &mac(byte)));
+        }
+        assert!(!rotated.accepts(&checkpoint, 2, &mac(4)));
+        assert!(!rotated.accepts(&checkpoint, 3, &mac(1)));
+        assert!(!full(1).accepts(&checkpoint, 2, &mac(2)));
     }
 
     #[test]

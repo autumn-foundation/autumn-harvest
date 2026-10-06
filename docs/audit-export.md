@@ -265,6 +265,12 @@ chained `seq`, its link and its `occurred_at`. An HMAC under the chain key
 covers all four. A database writer without the key cannot move it. So the
 verifier finds stripped links and a deleted tail.
 
+The exporter extends the chain only from a checkpoint that its key accepts.
+If the checkpoint is missing or does not verify, and rows are chained, the
+exporter does not stamp. New rows then stay unchained, and it logs an error.
+So a writer cannot move the head and have the exporter sign it. To recover,
+see **Re-anchor** below.
+
 Keep the key out of the database. A writer without the key cannot forge a
 link or the checkpoint, so an edit shows. A process that holds the key can
 forge both. The chain protects against database-level tampering, not a
@@ -273,8 +279,9 @@ compromised Harvest process.
 **Set the key on every exporter.** Every process that runs audit export must
 run this release and hold the same key. An exporter without the key sequences
 rows without links, and the verifier reports them as `Unchained`. An exporter
-with another key makes links that report as `Tampered`. In a rolling upgrade,
-set the key after the whole fleet runs this release.
+with another key does not accept the checkpoint, so its rows are `Unchained`
+too. In a rolling upgrade, set the key after the whole fleet runs this
+release.
 
 **Verify it.** Call `audit_chain::verify_shard_chain(conn, shard, &key)`, or
 `verify_shard_chain_with` with a `ChainVerifyOptions`. The verifier reads the
@@ -288,7 +295,7 @@ short queries, so it holds no long snapshot. It returns a `ChainReport`:
 | `Unchained` | A row at or after the chain start has no hash. |
 | `Gap` | Sequence numbers are missing. Rows were deleted. |
 | `HeadMismatch` | The newest chained row is not the checkpoint head. The newest rows were deleted, or their links were removed. |
-| `CheckpointMissing` | Chained rows exist, but the cursor has no signed checkpoint. Someone rebuilt or edited the cursor. The next keyed export tick signs a new one. |
+| `CheckpointMissing` | Chained rows exist, but the cursor has no signed checkpoint. Someone rebuilt or edited the cursor. The exporter stops the chain until you re-anchor. |
 | `CheckpointInvalid` | The checkpoint MAC does not verify. Someone edited the cursor, or you passed the wrong key. |
 
 Rows sequenced before you set the key are an `unchained_prefix`, not a
@@ -304,8 +311,25 @@ the cutoff plus one hour. After the first newer row, a gap is a finding. A
 missing tail counts as retention only when the checkpoint head is that old
 too.
 
-**Key rotation.** Pass the old and the new key in `ChainVerifyOptions::keys`.
-A link or a checkpoint may verify under any key in that list.
+**Key rotation.** Rotate in two steps, so that each exporter accepts the
+checkpoint that any other exporter signed:
+
+1. On every exporter, add the new key with
+   `HarvestBuilder::audit_export_chain_accept_key`. Keep the old key active.
+2. On every exporter, make the new key active with `audit_export_chain_key`.
+   Keep the old key as an accept key until each shard has a new checkpoint.
+
+The exporter signs only with the active key. To verify, pass the old and the
+new key in `ChainVerifyOptions::keys`. A link or a checkpoint may verify under
+any key in that list.
+
+**Re-anchor.** After a cursor rebuild or a checkpoint finding, the exporter
+leaves new rows unchained. First compare the chain with the SIEM copy. Then
+call `audit_chain::reanchor_shard_chain(conn, shard, &key)`. It accepts the
+stored rows as they are. It chains the unchained rows after the newest link
+and signs a new checkpoint. Rows that lost their links before that link stay
+`Unchained`. If no row is chained, it clears the checkpoint, and the next
+export tick starts a new chain.
 
 **Verify from the SIEM.** A SIEM that holds the key can also verify the chain.
 Each chained record carries `chain_prev` and `chain_hash`. Build the canonical
@@ -324,6 +348,8 @@ canonical row equals `chain_hash`.
 - A writer who removes every link and the whole checkpoint leaves a table that
   looks unchained. A writer can also hide a deletion near the retention cutoff.
   Only the SIEM copy detects these cases.
+- A re-anchor accepts the stored rows. It hides any deletion at the tail that
+  happened before it. Compare with the SIEM copy before you re-anchor.
 - Each sequenced row is written twice: once for `export_seq`, once for the
   chain columns. This cost applies only when you set a chain key.
 

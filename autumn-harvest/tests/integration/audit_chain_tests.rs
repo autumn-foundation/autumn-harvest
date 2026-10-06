@@ -7,8 +7,8 @@
 
 use autumn_harvest::audit::{self, OP_WORKFLOW_CANCEL, STATUS_SUCCEEDED, TARGET_WORKFLOW};
 use autumn_harvest::audit_chain::{
-    ChainFinding, ChainVerifyOptions, MIN_CHAIN_KEY_BYTES, verify_shard_chain,
-    verify_shard_chain_with,
+    AuditChainKey, ChainFinding, ChainVerifyOptions, MIN_CHAIN_KEY_BYTES, reanchor_shard_chain,
+    verify_shard_chain, verify_shard_chain_with,
 };
 use autumn_harvest::audit_export::{
     ExportBackoff, RewindRequest, SinkAttempt, apply_outcome, claim_shard, claim_shard_chained,
@@ -99,15 +99,20 @@ async fn insert_rows(conn: &mut AsyncPgConnection, count: usize) {
     }
 }
 
+fn chain_key(key: &CallbackSecret) -> AuditChainKey {
+    AuditChainKey::new(key.as_bytes().to_vec()).expect("a full-length key")
+}
+
 /// Claim one batch with the chain key and acknowledge it.
 async fn export_tick(conn: &mut AsyncPgConnection, chain: Option<&CallbackSecret>) -> Vec<u8> {
+    export_tick_with(conn, chain.map(chain_key).as_ref()).await
+}
+
+/// Claim one batch with `chain` and acknowledge it.
+async fn export_tick_with(conn: &mut AsyncPgConnection, chain: Option<&AuditChainKey>) -> Vec<u8> {
     ensure_cursor_row(conn, SHARD).await.expect("cursor row");
     let now = chrono::Utc::now();
-    let chain = chain.map(|key| {
-        autumn_harvest::audit_chain::AuditChainKey::new(key.as_bytes().to_vec())
-            .expect("a full-length key")
-    });
-    let claim = claim_shard_chained(conn, SHARD, 500, LEASE, now, chain.as_ref())
+    let claim = claim_shard_chained(conn, SHARD, 500, LEASE, now, chain)
         .await
         .expect("claim")
         .expect("a batch to deliver");
@@ -304,14 +309,34 @@ async fn a_rebuilt_cursor_keeps_the_chain_head() {
     assert_eq!(report.findings, vec![ChainFinding::CheckpointMissing]);
 
     insert_rows(&mut conn, 1).await;
-    // The rebuilt cursor re-delivers rows 1 and 2, then row 3.
+    // The rebuilt cursor re-delivers rows 1 and 2, then row 3. The exporter
+    // does not trust the stored head, so row 3 stays unchained.
+    export_tick(&mut conn, Some(&key())).await;
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(
+        report.findings,
+        vec![
+            ChainFinding::CheckpointMissing,
+            ChainFinding::Unchained { seq: 3 },
+        ]
+    );
+
+    // The operator re-anchors. That chains row 3 and signs a checkpoint.
+    let checkpoint = reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
+        .await
+        .expect("reanchor")
+        .expect("a chained row");
+    assert_eq!((checkpoint.start_seq, checkpoint.head_seq), (1, 3));
+    insert_rows(&mut conn, 1).await;
     export_tick(&mut conn, Some(&key())).await;
 
     let report = verify_shard_chain(&mut conn, SHARD, &key())
         .await
         .expect("verify");
     assert!(report.is_intact(), "{report:?}");
-    assert_eq!(report.checked, 3);
+    assert_eq!(report.checked, 4);
 }
 
 #[tokio::test]
@@ -473,7 +498,8 @@ async fn a_rotated_key_verifies_with_both_keys() {
     insert_rows(&mut conn, 2).await;
     export_tick(&mut conn, Some(&key())).await;
     insert_rows(&mut conn, 2).await;
-    export_tick(&mut conn, Some(&new)).await;
+    let rotated = chain_key(&new).with_accepted_key(chain_key(&key()));
+    export_tick_with(&mut conn, Some(&rotated)).await;
 
     let ring = [key(), new.clone()];
     let options = ChainVerifyOptions {
@@ -544,4 +570,161 @@ async fn deleting_every_row_is_detected() {
             found_seq: None,
         }]
     );
+}
+
+/// Delete row 3 and roll the cursor back to row 2, as a writer without the
+/// key can. `checkpoint` is the SQL that sets the checkpoint columns.
+async fn roll_back_the_tail(conn: &mut AsyncPgConnection, checkpoint: &str) {
+    conn.batch_execute(&format!(
+        "DELETE FROM harvest_audit_log WHERE export_seq = 3; \
+         UPDATE harvest_audit_export_cursor c SET \
+             last_assigned_seq = 2, last_acked_seq = 2, {checkpoint} \
+         FROM harvest_audit_log a WHERE a.export_seq = 2"
+    ))
+    .await
+    .expect("roll back the tail");
+}
+
+#[tokio::test]
+async fn the_exporter_does_not_extend_a_forged_checkpoint() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+    roll_back_the_tail(
+        &mut conn,
+        "chain_head_seq = 2, chain_head = a.chain_hash, \
+         chain_head_occurred_at = a.occurred_at",
+    )
+    .await;
+
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(
+        report.findings,
+        vec![
+            ChainFinding::CheckpointInvalid,
+            ChainFinding::Unchained { seq: 3 },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_exporter_does_not_reseed_a_removed_checkpoint() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+    roll_back_the_tail(
+        &mut conn,
+        "chain_start_seq = NULL, chain_head_seq = NULL, chain_head = NULL, \
+         chain_head_occurred_at = NULL, chain_mac = NULL",
+    )
+    .await;
+
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(
+        report.findings,
+        vec![
+            ChainFinding::CheckpointMissing,
+            ChainFinding::Unchained { seq: 3 },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_exporter_does_not_extend_a_checkpoint_past_the_cursor() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+    roll_back_the_tail(&mut conn, "updated_at = c.updated_at").await;
+
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    let unchained = count(
+        &mut conn,
+        "SELECT count(*) AS n FROM harvest_audit_log \
+         WHERE export_seq = 3 AND chain_hash IS NULL",
+    )
+    .await;
+    assert_eq!(unchained, 1, "the replacement row 3 stays unchained");
+}
+
+#[tokio::test]
+async fn a_new_key_without_the_old_one_does_not_extend_the_chain() {
+    let (mut conn, _c) = fresh_db().await;
+    let new = CallbackSecret::new(vec![43_u8; MIN_CHAIN_KEY_BYTES]);
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&new)).await;
+
+    let ring = [key(), new];
+    let options = ChainVerifyOptions {
+        keys: &ring,
+        retention_cutoff: None,
+    };
+    let report = verify_shard_chain_with(&mut conn, SHARD, &options)
+        .await
+        .expect("verify");
+    assert_eq!(report.findings, vec![ChainFinding::Unchained { seq: 3 }]);
+}
+
+#[tokio::test]
+async fn reanchoring_after_a_forged_checkpoint_restores_the_chain() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+    roll_back_the_tail(
+        &mut conn,
+        "chain_head_seq = 2, chain_head = a.chain_hash, \
+         chain_head_occurred_at = a.occurred_at",
+    )
+    .await;
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
+        .await
+        .expect("reanchor")
+        .expect("a chained row");
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.checked, 3);
+}
+
+#[tokio::test]
+async fn reanchoring_with_no_chained_row_clears_the_checkpoint() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    conn.batch_execute("UPDATE harvest_audit_log SET chain_prev = NULL, chain_hash = NULL")
+        .await
+        .expect("strip");
+
+    assert!(
+        reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
+            .await
+            .expect("reanchor")
+            .is_none()
+    );
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.unchained_prefix, 2);
+    assert_eq!(report.anchor_seq, Some(3));
 }

@@ -37,6 +37,12 @@ that the exporter sequences.
 - The cursor stores a keyed checkpoint: the chain start, the newest link, its
   `seq` and its `occurred_at`, under one HMAC. A database writer cannot move
   it. So stripped links and a deleted tail show.
+- The exporter extends only a checkpoint that its key accepts. Otherwise a
+  writer could move the head and have the exporter sign it. A missing or
+  invalid checkpoint stops the chain until an operator calls
+  `audit_chain::reanchor_shard_chain`.
+- A key rotation uses accept keys. The exporter accepts a checkpoint under an
+  accept key, but signs only with the active key.
 - `audit_chain::verify_shard_chain` reports changed rows, broken links,
   unchained rows, missing sequence numbers, a missing newest row, and a
   missing or invalid checkpoint.
@@ -61,7 +67,9 @@ that the exporter sequences.
 - Each sequenced row is written twice: once for `export_seq`, once for the
   chain columns. Only a deployment with a chain key pays this cost.
 - Every exporter must hold the same key. Set it after a rolling upgrade
-  ends.
+  ends. Rotate in two steps with an accept key.
+- A re-anchor accepts the stored rows. An operator compares them with the
+  SIEM copy first.
 
 **Declined:**
 

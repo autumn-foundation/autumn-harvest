@@ -1036,9 +1036,9 @@ pub enum HarvestBuilderError {
     )]
     AuditSinkSecretMissing,
 
-    /// The audit-chain key is shorter than
+    /// An audit-chain key or accepted key is shorter than
     /// [`crate::audit_chain::MIN_CHAIN_KEY_BYTES`] (issue #1838).
-    #[error("audit_export_chain_key(...) is {len} bytes; the chain needs at least {min} bytes")]
+    #[error("an audit chain key is {len} bytes; the chain needs at least {min} bytes")]
     AuditChainKeyTooShort {
         /// The configured key length.
         len: usize,
@@ -2215,6 +2215,20 @@ impl HarvestBuilder {
         self
     }
 
+    /// Accept `key` on a stored audit chain checkpoint (issue #1838).
+    ///
+    /// The exporter extends only a checkpoint that a known key signed. Add the
+    /// old key here during a key rotation. The exporter never signs with it.
+    /// A short key fails [`try_build`](Self::try_build). See
+    /// `docs/audit-export.md`.
+    #[must_use]
+    pub fn audit_export_chain_accept_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.audit_export_config
+            .chain_accept_keys
+            .push(crate::completion_callback::CallbackSecret::new(key));
+        self
+    }
+
     /// Records per exported batch. Clamped to
     /// `[1, crate::audit_export::MAX_EXPORT_BATCH_SIZE]`; defaults to
     /// [`crate::audit_export::DEFAULT_EXPORT_BATCH_SIZE`].
@@ -2700,8 +2714,12 @@ impl HarvestBuilder {
         if self.audit_export_config.webhook_is_missing_a_secret() {
             return Err(HarvestBuilderError::AuditSinkSecretMissing);
         }
-        if let Some(key) = &self.audit_export_config.chain_key
-            && key.as_bytes().len() < crate::audit_chain::MIN_CHAIN_KEY_BYTES
+        if let Some(key) = self
+            .audit_export_config
+            .chain_key
+            .iter()
+            .chain(&self.audit_export_config.chain_accept_keys)
+            .find(|key| key.as_bytes().len() < crate::audit_chain::MIN_CHAIN_KEY_BYTES)
         {
             return Err(HarvestBuilderError::AuditChainKeyTooShort {
                 len: key.as_bytes().len(),
@@ -8310,6 +8328,21 @@ mod tests {
             matches!(
                 result,
                 Err(HarvestBuilderError::AuditChainKeyTooShort { len: 31, min: 32 })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_a_short_audit_chain_accept_key() {
+        let result = HarvestBuilder::new()
+            .audit_export_chain_key(vec![1_u8; crate::audit_chain::MIN_CHAIN_KEY_BYTES])
+            .audit_export_chain_accept_key(vec![2_u8; 8])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::AuditChainKeyTooShort { len: 8, min: 32 })
             ),
             "got {result:?}"
         );
