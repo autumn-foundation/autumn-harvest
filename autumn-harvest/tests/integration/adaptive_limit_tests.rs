@@ -256,6 +256,16 @@ fn late_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) ->
     })
 }
 
+/// Answers in 20 ms.
+fn fast_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
+    let (running, _) = Running::start(ctx.activity_type());
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(running);
+        Ok(input)
+    })
+}
+
 /// Concurrency above which [`knee_call`] slows down.
 const KNEE: u32 = 8;
 
@@ -349,6 +359,27 @@ fn build_worker(
     limit: Option<AdaptiveLimitConfig>,
     labels: HashMap<String, String>,
 ) -> (Arc<Worker>, Arc<HandlerRegistry>) {
+    build_worker_polling(
+        worker_id,
+        queue,
+        activities,
+        metrics,
+        limit,
+        labels,
+        Duration::from_millis(10),
+    )
+}
+
+/// [`build_worker`] with an explicit idle poll interval.
+fn build_worker_polling(
+    worker_id: &str,
+    queue: &str,
+    activities: Vec<ActivityInfo>,
+    metrics: Arc<LimitMetrics>,
+    limit: Option<AdaptiveLimitConfig>,
+    labels: HashMap<String, String>,
+    poll_interval: Duration,
+) -> (Arc<Worker>, Arc<HandlerRegistry>) {
     let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
     let mut registry = HandlerRegistry::with_state_and_telemetry(
         vec![wf_info()],
@@ -371,7 +402,7 @@ fn build_worker(
                 notification_database_url: None,
                 max_concurrent_workflows: 8,
                 max_concurrent_activities: 32,
-                poll_interval: Duration::from_millis(10),
+                poll_interval,
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::ZERO,
@@ -809,4 +840,62 @@ async fn answers_after_the_deadline_cut_the_cap() {
     .await;
     worker.shutdown();
     handle.await.expect("worker joins");
+}
+
+/// A freed adaptive slot must wake the idle poll loop. Otherwise a worker
+/// whose backlog holds only a saturated type waits one full poll interval
+/// after each batch, and the cap stays idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_freed_slot_wakes_the_poll_loop() {
+    const ACTIVITY: &str = "al_fast_capped";
+    const RUNS: u32 = 20;
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("al-wake");
+    let config = AdaptiveLimitConfig::disabled()
+        .with_activity(ACTIVITY, Some(AdaptiveLimitPolicy::new(2, 2)));
+    let (worker, _registry) = build_worker_polling(
+        &format!("{queue}-worker"),
+        &queue,
+        vec![act_info(ACTIVITY, fast_call)],
+        Arc::new(LimitMetrics::default()),
+        Some(config),
+        HashMap::new(),
+        Duration::from_secs(1),
+    );
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    let mut ids = Vec::new();
+    for _ in 0..RUNS {
+        ids.push(seed_workflow(&mut conn, &queue, ACTIVITY).await.as_uuid());
+    }
+    let runner = Arc::clone(&worker);
+    let started = std::time::Instant::now();
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+    let open_runs = || {
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq_any(ids.clone()))
+            .filter(harvest_workflow_executions::state.ne("COMPLETED"))
+            .count()
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while open_runs()
+            .get_result::<i64>(&mut conn)
+            .await
+            .expect("count open runs")
+            > 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every run completes within 60 s");
+    let elapsed = started.elapsed();
+    worker.shutdown();
+    handle.await.expect("worker joins");
+    // Ten batches of two 20 ms calls. Without a cap the run takes about
+    // 2 s here. Each missed wake adds one second of idle polling.
+    assert!(
+        elapsed < Duration::from_millis(3_500),
+        "{RUNS} runs at a cap of 2 took {elapsed:?}"
+    );
 }

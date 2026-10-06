@@ -28189,6 +28189,10 @@ pub struct Worker {
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
     /// backlog.
     gate_refused: Arc<GateRefused>,
+    /// A claim skipped a type at its adaptive limit since the last idle
+    /// wait (issue #1836). The next idle wait then also wakes on
+    /// `capacity_freed`, even when the slot freed before the wait began.
+    limit_refused: AtomicBool,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -30078,6 +30082,7 @@ impl Worker {
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             capacity_freed: Arc::new(tokio::sync::Notify::new()),
             gate_refused: Arc::new(GateRefused::default()),
+            limit_refused: AtomicBool::new(false),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             drain_cancel: CancellationToken::new(),
@@ -33476,8 +33481,19 @@ impl Worker {
     /// True when at least one pool has no free permit. The idle wait then
     /// also wakes on `capacity_freed`. A NOTIFY alone does not do it: the
     /// backlog that waits for the permit sent its NOTIFY long ago.
+    ///
+    /// Also true while an activity type is at its adaptive limit, or when a
+    /// claim skipped such a type since the last wait (issue #1836). That
+    /// backlog waits for a slot even when the pools have free permits. The
+    /// slot can free between the claim and this check. The flag keeps that
+    /// wake, because `Notify` stores it until the wait polls it. The attempt
+    /// frees its limit slot before its dispatch permit, so the wake finds
+    /// the slot free.
     fn capacity_bound(&self) -> bool {
+        let limit_refused = self.limit_refused.swap(false, Ordering::Relaxed);
         self.poll_admission_now() != PollAdmission::Any
+            || limit_refused
+            || self.registry.adaptive_limits.any_saturated()
     }
 
     /// Mark each kind the gate refuses (issue #1787). See `gate_refused`.
@@ -33505,7 +33521,11 @@ impl Worker {
         if !limits.any_saturated() {
             return std::borrow::Cow::Borrowed(&self.ineligible_activities);
         }
-        claim_exclusions(&self.ineligible_activities, limits.saturated())
+        let exclusions = claim_exclusions(&self.ineligible_activities, limits.saturated());
+        if matches!(exclusions, std::borrow::Cow::Owned(_)) {
+            self.limit_refused.store(true, Ordering::Relaxed);
+        }
+        exclusions
     }
 
     /// Execute a single poll iteration.
