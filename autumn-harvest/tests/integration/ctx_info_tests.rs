@@ -188,9 +188,15 @@ async fn worker_threads_parent_execution_id_into_child_ctx_info() {
     );
 
     // Sanity: no unexpected events; ctx.info() left no footprint.
+    // Decision boundaries (issue #1833) are attribution, not footprint.
     let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    let parent_events: Vec<_> = parent_history
+        .events
+        .into_iter()
+        .filter(|e| !e.is_decision_boundary())
+        .collect();
     assert!(matches!(
-        parent_history.events.as_slice(),
+        parent_events.as_slice(),
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ChildWorkflowStarted { .. },

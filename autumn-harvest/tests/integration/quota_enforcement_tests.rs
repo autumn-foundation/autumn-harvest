@@ -3662,7 +3662,12 @@ async fn continue_as_new_cross_type_oversized_quota_key_still_records_its_abando
     );
     assert!(
         matches!(
-            history.events.last(),
+            // A decision boundary (issue #1833) follows the terminal.
+            history
+                .events
+                .iter()
+                .rev()
+                .find(|e| !e.is_decision_boundary()),
             Some(WorkflowEvent::WorkflowFailed { .. })
         ),
         "the abandoned-dispatch pair must be appended BEFORE the terminal event, not after \
