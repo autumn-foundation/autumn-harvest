@@ -59,6 +59,11 @@ pub const MAX_OP_DEPTH: usize = 4;
 
 std::thread_local! {
     static OP_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The error that the replayed program returned, if it returned one. The
+    /// replayer polls the workflow on the thread of the current-thread
+    /// runtime that [`check_case`] builds, so the harness can read it back.
+    static RETURNED_FAILURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The nesting depth of [`Op::Concurrent`] and [`Op::Race`] in `ops`.
@@ -674,6 +679,7 @@ fn to_json(history: &[WorkflowEvent]) -> Value {
 }
 
 async fn run_once(case: &ReplayCase, history: &[WorkflowEvent]) -> (Verdict, String) {
+    RETURNED_FAILURE.with(|r| r.replace(None));
     let codecs = codecs(case.codec);
     let offloader = PayloadOffloader::new(
         Arc::new(MemStore::default()),
@@ -731,7 +737,7 @@ async fn run_once(case: &ReplayCase, history: &[WorkflowEvent]) -> (Verdict, Str
         .with_context_headers(HashMap::from([(PROGRAM_HEADER.to_string(), program_json)]))
         .replay_from_events(read)
         .await;
-    assert_no_contained_panic(&report, &program);
+    assert_no_contained_panic(&report);
     (
         Verdict::Replayed(format!("{:?}", report.status)),
         report.to_string(),
@@ -797,11 +803,14 @@ async fn assert_lossy_read(codecs: &PayloadCodecs, offloader: &PayloadOffloader,
 /// The executor contains a workflow panic as a `HandlerPanic` failure.
 /// [`program_workflow`] never panics, so such a failure is an engine panic.
 /// A `Fail` op that returns the same text is not one.
-fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
+fn assert_no_contained_panic(report: &ReplayReport) {
+    let returned = RETURNED_FAILURE.with(std::cell::RefCell::take);
     let Some(message) = report.failure_message() else {
         return;
     };
-    let from_program = program.iter().any(|op| op.fails_with(message));
+    // Only the failure that the program returned is a programmed one. Text
+    // in an op that never ran must not hide a real panic.
+    let from_program = returned.as_deref() == Some(message);
     let panicked = crate::failure::parse_workflow_typed_payload(message)
         .is_some_and(|failure| failure.error_type == ERROR_TYPE_HANDLER_PANIC);
     assert!(
@@ -1200,6 +1209,9 @@ struct RaceOpen<'h> {
     count: usize,
 }
 
+/// The error that a cancelled race loser fails with. `queue.rs` writes it.
+const RACE_LOSER_ERROR: &str = "lost race to a sibling branch";
+
 /// The signal name that no history holds. A race branch on it never wins.
 const UNSEEN_SIGNAL: &str = "__fuzz_unseen_signal";
 
@@ -1325,10 +1337,10 @@ fn mirror_race<'h>(
     Op::Race { branches }
 }
 
-/// Gives back to the main loop each claimed command that completes after the
+/// Gives back to the main loop each claimed command that settles after the
 /// race was decided. A losing signal writes no event, so the branch count
-/// can claim a sibling command too. A race loser does not complete after
-/// the decision, so such a command was a sibling.
+/// can claim a sibling command too. After the decision, a race loser only
+/// fails with [`RACE_LOSER_ERROR`], so any other outcome marks a sibling.
 fn release_late_siblings(
     after: &[WorkflowEvent],
     finished: &HashSet<Branch>,
@@ -1338,12 +1350,19 @@ fn release_late_siblings(
     let completed_later: HashSet<Branch> = after
         .iter()
         .filter_map(|event| match event {
-            WorkflowEvent::ActivityCompleted { activity_id, .. } => {
+            WorkflowEvent::ActivityFailed { error, .. }
+            | WorkflowEvent::ChildWorkflowFailed { error, .. }
+                if error == RACE_LOSER_ERROR =>
+            {
+                None
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
                 Some(Branch::Activity(*activity_id))
             }
-            WorkflowEvent::ChildWorkflowCompleted { child_id, .. } => {
-                Some(Branch::Child(*child_id))
-            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+            | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => Some(Branch::Child(*child_id)),
             _ => None,
         })
         .filter(|branch| !finished.contains(branch))
@@ -1696,15 +1715,6 @@ impl Op {
                 | Self::Version { .. }
         )
     }
-
-    /// True when this op, or an op nested in it, is `Fail` with `message`.
-    fn fails_with(&self, message: &str) -> bool {
-        match self {
-            Self::Fail { error } => error == message,
-            Self::Concurrent { ops } => ops.iter().any(|op| op.fails_with(message)),
-            _ => false,
-        }
-    }
 }
 
 /// The op behind a lifecycle, activity, timer, signal or marker event.
@@ -1936,6 +1946,9 @@ fn program_workflow(
             .unwrap_or_default();
         for op in program {
             if let Some(result) = run_op(ctx, op).await {
+                if let Err(error) = &result {
+                    RETURNED_FAILURE.with(|r| r.replace(Some(error.clone())));
+                }
                 return result;
             }
         }
