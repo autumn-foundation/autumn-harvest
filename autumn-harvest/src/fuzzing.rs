@@ -70,7 +70,9 @@ std::thread_local! {
 fn op_depth(ops: &[Op]) -> usize {
     ops.iter()
         .map(|op| match op {
-            Op::Concurrent { ops } | Op::Race { branches: ops } => 1 + op_depth(ops),
+            Op::Concurrent { ops } | Op::Sequence { ops } | Op::Race { branches: ops } => {
+                1 + op_depth(ops)
+            }
             _ => 0,
         })
         .max()
@@ -477,6 +479,12 @@ pub enum Op {
         #[arbitrary(with = nested_ops)]
         branches: Vec<Self>,
     },
+    /// Runs the ops one after another, as one branch of a `join!` does.
+    Sequence {
+        /// The ops of the branch, in order.
+        #[arbitrary(with = nested_ops)]
+        ops: Vec<Self>,
+    },
     /// Runs the ops concurrently, as `join!` does.
     Concurrent {
         /// The ops of one command batch.
@@ -861,7 +869,7 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     // The op takes the signal that wins, or the timer fire.
     let mut timeouts: HashMap<&str, usize> = HashMap::new();
     let mut program = Vec::new();
-    let mut batch = Vec::new();
+    let mut batch = Batch::default();
     let mut index = 0;
     while index < history.len() {
         let event = &history[index];
@@ -901,15 +909,124 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
             },
         };
         match op {
-            Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => batch.push(op),
+            Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => {
+                batch.push(op, pending_key(event));
+            }
+            None if batch.settle(event) => {}
             other => {
-                flush_batch(&mut program, &mut batch);
+                batch.flush(&mut program);
                 program.extend(other);
             }
         }
     }
-    flush_batch(&mut program, &mut batch);
+    batch.flush(&mut program);
     program
+}
+
+/// What a batch member waits for: the outcome of an activity, a child or a
+/// timer.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Pending {
+    Activity(ActivityExecId),
+    Child(ExecutionId),
+    Timer(String),
+}
+
+/// The outcome that the command `event` waits for, if any.
+fn pending_key(event: &WorkflowEvent) -> Option<Pending> {
+    match event {
+        WorkflowEvent::ActivityScheduled { activity_id, .. } => {
+            Some(Pending::Activity(*activity_id))
+        }
+        WorkflowEvent::ChildWorkflowStarted { child_id, .. } => Some(Pending::Child(*child_id)),
+        WorkflowEvent::TimerStarted { timer_id, .. } => {
+            Some(Pending::Timer(timer_id.as_str().to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// The outcome that `event` reports, if it is one.
+fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
+    match event {
+        WorkflowEvent::ActivityCompleted { activity_id, .. }
+        | WorkflowEvent::ActivityFailed { activity_id, .. }
+        | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+            Some(Pending::Activity(*activity_id))
+        }
+        WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+        | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => Some(Pending::Child(*child_id)),
+        WorkflowEvent::TimerFired { timer_id } => {
+            Some(Pending::Timer(timer_id.as_str().to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// The commands of one decision, as the branches of a `join!`.
+///
+/// A batch stays open past the outcome of one member while another member
+/// still waits. A command right after that outcome came from the same
+/// branch, as in `join!(slow, async { fast.await; next.await })`, so it
+/// joins that branch as a sequence. The batch closes at any other event, or
+/// once every member has settled.
+#[derive(Default)]
+struct Batch {
+    branches: Vec<Vec<Op>>,
+    /// What each branch waits for. `None` once it settled.
+    pending: Vec<Option<Pending>>,
+    /// The branch that settled last, while another one still waits.
+    resumed: Option<usize>,
+}
+
+impl Batch {
+    const fn is_empty(&self) -> bool {
+        self.branches.is_empty()
+    }
+
+    fn push(&mut self, op: Op, waits_for: Option<Pending>) {
+        if let Some(branch) = self.resumed.take() {
+            self.branches[branch].push(op);
+            self.pending[branch] = waits_for;
+        } else {
+            self.branches.push(vec![op]);
+            self.pending.push(waits_for);
+        }
+    }
+
+    /// Settles the member that `event` reports. True while the batch stays
+    /// open; false when `event` should close it.
+    fn settle(&mut self, event: &WorkflowEvent) -> bool {
+        let Some(key) = settled_key(event) else {
+            return false;
+        };
+        let Some(branch) = self.pending.iter().position(|p| p.as_ref() == Some(&key)) else {
+            return false;
+        };
+        self.pending[branch] = None;
+        self.resumed = Some(branch);
+        self.pending.iter().any(Option::is_some)
+    }
+
+    fn flush(&mut self, program: &mut Vec<Op>) {
+        let mut ops: Vec<Op> = std::mem::take(&mut self.branches)
+            .into_iter()
+            .map(|mut branch| {
+                if branch.len() == 1 {
+                    branch.remove(0)
+                } else {
+                    Op::Sequence { ops: branch }
+                }
+            })
+            .collect();
+        self.pending.clear();
+        self.resumed = None;
+        match ops.len() {
+            0 => {}
+            1 => program.append(&mut ops),
+            _ => program.push(Op::Concurrent { ops }),
+        }
+    }
 }
 
 /// Builds the fan-out op that a `fan_out:{n}` marker opens. The next `count`
@@ -1479,8 +1596,12 @@ fn paired_op<'h>(
     timeouts: &mut HashMap<&'h str, usize>,
 ) -> Paired {
     match &history[next - 1] {
-        WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("saga_compensated:") => {
-            Paired::Mapped(Some(mirror_saga(history, next, claimed)))
+        WorkflowEvent::MarkerRecorded { name, details }
+            if name.starts_with("saga_compensated:") =>
+        {
+            let count = details.as_u64().and_then(|n| usize::try_from(n).ok());
+            let count = count.unwrap_or(0).min(MAX_FAN_OUT_ITEMS);
+            Paired::Mapped(Some(mirror_saga(history, next, count, claimed)))
         }
         WorkflowEvent::MarkerRecorded { name, .. }
             if name.starts_with("saga_compensation_failed:") =>
@@ -1547,14 +1668,21 @@ fn paired_op<'h>(
 
 /// Builds the [`Op::SagaUnwind`] that a `saga_compensated:{seq}` marker
 /// opens. The compensations are the activities the saga runs one by one
-/// after the marker. Their schedules go to `claimed`.
-fn mirror_saga(history: &[WorkflowEvent], start: usize, claimed: &mut HashSet<usize>) -> Op {
+/// after the marker, at most the `count` that the marker records. Their
+/// schedules go to `claimed`.
+fn mirror_saga(
+    history: &[WorkflowEvent],
+    start: usize,
+    count: usize,
+    claimed: &mut HashSet<usize>,
+) -> Op {
     let mut compensations = Vec::new();
     let mut ids = HashSet::new();
     for (index, event) in history.iter().enumerate().skip(start) {
         match activity_outcome(event) {
             Some((id, Outcome::Progress))
-                if matches!(event, WorkflowEvent::ActivityScheduled { .. }) =>
+                if matches!(event, WorkflowEvent::ActivityScheduled { .. })
+                    && compensations.len() < count =>
             {
                 if let WorkflowEvent::ActivityScheduled {
                     name, input, queue, ..
@@ -1664,16 +1792,6 @@ fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
     armed
 }
 
-fn flush_batch(program: &mut Vec<Op>, batch: &mut Vec<Op>) {
-    match batch.len() {
-        0 => {}
-        1 => program.append(batch),
-        _ => program.push(Op::Concurrent {
-            ops: std::mem::take(batch),
-        }),
-    }
-}
-
 impl Op {
     /// True for an op that waits on a later event, such as an activity
     /// result. Only such ops can share a batch. A local activity cannot
@@ -1697,6 +1815,7 @@ impl Op {
                 | Self::ChildTimeout { .. }
                 | Self::Session { .. }
                 | Self::SagaUnwind { .. }
+                | Self::Sequence { .. }
         )
     }
 
@@ -2017,6 +2136,13 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
                 Some(workflow_type) => ctx.continue_as_new_as_type(&workflow_type, input).await,
                 None => ctx.continue_as_new(input).await,
             };
+        }
+        Op::Sequence { ops } => {
+            for op in ops {
+                if let Some(result) = Box::pin(run_op(ctx, op)).await {
+                    return Some(result);
+                }
+            }
         }
         Op::Concurrent { ops } => {
             let runs = ops.into_iter().map(|op| Box::pin(run_op(ctx, op)));

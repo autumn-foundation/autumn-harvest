@@ -214,7 +214,9 @@ fn generated_programs_round_trip_through_json() {
 fn op_depth(ops: &[Op]) -> usize {
     ops.iter()
         .map(|op| match op {
-            Op::Concurrent { ops } | Op::Race { branches: ops } => 1 + op_depth(ops),
+            Op::Concurrent { ops } | Op::Sequence { ops } | Op::Race { branches: ops } => {
+                1 + op_depth(ops)
+            }
             _ => 0,
         })
         .max()
