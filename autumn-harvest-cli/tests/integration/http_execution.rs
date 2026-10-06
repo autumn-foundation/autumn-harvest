@@ -412,3 +412,47 @@ fn request_timeout_outlasts_a_server_side_wait() {
         std::time::Duration::from_secs(30)
     );
 }
+
+// A non-2xx error body that stalls is bounded by the timeout too. Only a
+// successful stream may run past it.
+#[tokio::test]
+async fn events_tail_bounds_a_stalled_error_body() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let addr = listener.local_addr().expect("test server should have addr");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("server should accept");
+        let mut buf = [0_u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        // Promise 100 bytes, send 1, then stall.
+        socket
+            .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 100\r\n\r\nx")
+            .await
+            .expect("server should send headers");
+        std::future::pending::<()>().await;
+    });
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--base-url",
+        &format!("http://{addr}/api/harvest"),
+        "--http-timeout-secs",
+        "1",
+        "events",
+        "tail",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("CLI args should parse");
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), run_cli(cli))
+        .await
+        .expect("events tail must give up on its own, not hang");
+    server.abort();
+
+    assert!(
+        matches!(outcome, Err(CliError::Timeout { seconds: 1 })),
+        "expected CliError::Timeout, got {outcome:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}

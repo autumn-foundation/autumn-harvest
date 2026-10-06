@@ -7831,23 +7831,26 @@ fn transport_error(error: reqwest::Error, timeout: std::time::Duration) -> CliEr
 
 /// Send `request` and wait at most `timeout` for the response headers.
 ///
-/// A non-2xx response becomes [`CliError::Http`]. The body after the headers
-/// has no total limit, so a live stream can run for as long as it needs.
+/// A non-2xx response becomes [`CliError::Http`]. Its body must arrive in the
+/// same `timeout` as the headers. Only a 2xx stream has no total limit, so a
+/// live stream can run for as long as it needs.
 async fn send_for_stream(
     request: reqwest::RequestBuilder,
     timeout: std::time::Duration,
 ) -> Result<reqwest::Response, CliError> {
-    let response = tokio::time::timeout(timeout, request.send())
+    let deadline = tokio::time::Instant::now() + timeout;
+    let timed_out = |_| CliError::Timeout {
+        seconds: timeout.as_secs(),
+    };
+    let response = tokio::time::timeout_at(deadline, request.send())
         .await
-        .map_err(|_| CliError::Timeout {
-            seconds: timeout.as_secs(),
-        })?
+        .map_err(timed_out)?
         .map_err(|e| transport_error(e, timeout))?;
     let status = response.status();
     if !status.is_success() {
-        let body = response
-            .text()
+        let body = tokio::time::timeout_at(deadline, response.text())
             .await
+            .map_err(timed_out)?
             .map_err(|e| transport_error(e, timeout))?;
         return Err(CliError::Http { status, body });
     }
