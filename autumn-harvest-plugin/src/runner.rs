@@ -691,7 +691,9 @@ fn prepare_audit_export_config(
             batch_size: audit_config.effective_batch_size(),
             backoff: audit_config.backoff.clone(),
             lease: audit_config.effective_lease(),
-            chain_key: audit_config.chain_key.clone(),
+            chain_key: autumn_harvest::audit_export::runtime_chain_key(
+                audit_config.chain_key.as_ref(),
+            ),
         })
     })
 }
@@ -2351,10 +2353,7 @@ mod tests {
             .expect("builds");
         let config = super::prepare_audit_export_config(&built).expect("a sink is set");
         assert_eq!(
-            config
-                .chain_key
-                .as_ref()
-                .map(autumn_harvest::completion_callback::CallbackSecret::as_bytes),
+            config.chain_key.as_ref().map(|key| key.secret().as_bytes()),
             Some(&[2_u8; 32][..])
         );
     }

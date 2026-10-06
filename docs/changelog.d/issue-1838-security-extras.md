@@ -15,7 +15,9 @@ gaps, a missing head and a missing or invalid checkpoint. With a retention
 cutoff, gaps at the old end of the chain go to `retention_gaps`. Exported
 records carry `chain_prev` and `chain_hash`. Both fields are omitted when
 absent. A key shorter than 32 bytes fails `try_build` with
-`AuditChainKeyTooShort`.
+`AuditChainKeyTooShort`. The runtime config and `claim_shard_chained` take an
+`audit_chain::AuditChainKey`, which only `AuditChainKey::new` can build, so a
+short key cannot reach the stamp path by any route.
 
 **Signed WASM modules.** `HarvestBuilder::wasm_trusted_publisher_key` sets an
 Ed25519 trust policy. A publisher signs `(domain, activity, hash)` with
@@ -44,9 +46,10 @@ these functions, must change:
   `HandlerRegistry::wasm_module_registrations` and
   `BuiltHarvest::wasm_module_registrations`.
 
-New APIs: `audit_chain` (`ChainVerifier`, `ChainVerifyOptions`,
+New APIs: `audit_chain` (`AuditChainKey`, `ChainVerifier`, `ChainVerifyOptions`,
 `ChainCheckpoint`, `verify_shard_chain_with`), `audit_export::claim_shard_chained`,
-`AuditExportRuntimeConfig::claim`, `AuditExportRecord::from_row`,
+`AuditExportRuntimeConfig::claim`, `audit_export::runtime_chain_key`,
+`AuditExportRecord::from_row`,
 `wasm_signing`, `publish_signed_wasm_module`, `seed_signed_wasm_module`,
 `resolve_active_wasm_version`, `WasmModuleStore::{set_trust_policy,
 trust_policy}`, `BuiltHarvest::wasm_store`, and the builder errors

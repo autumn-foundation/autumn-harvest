@@ -427,7 +427,10 @@ async fn the_scanner_stamps_the_audit_chain_with_the_configured_key() {
             batch_size: 100,
             backoff: ExportBackoff::default(),
             lease: std::time::Duration::from_secs(60),
-            chain_key: Some(key.clone()),
+            chain_key: Some(
+                autumn_harvest::audit_chain::AuditChainKey::new(key.as_bytes().to_vec())
+                    .expect("a full-length key"),
+            ),
         },
     )));
     insert_audit_rows(&mut conn, 3).await;
@@ -463,7 +466,10 @@ async fn the_dedicated_export_task_stamps_the_audit_chain() {
             batch_size: 100,
             backoff: ExportBackoff::default(),
             lease: std::time::Duration::from_secs(60),
-            chain_key: Some(key.clone()),
+            chain_key: Some(
+                autumn_harvest::audit_chain::AuditChainKey::new(key.as_bytes().to_vec())
+                    .expect("a full-length key"),
+            ),
         },
     )));
     let (mut conn, url, _c) = make_conn_any().await;

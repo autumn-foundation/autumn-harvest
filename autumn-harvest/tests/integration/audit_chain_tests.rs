@@ -103,7 +103,11 @@ async fn insert_rows(conn: &mut AsyncPgConnection, count: usize) {
 async fn export_tick(conn: &mut AsyncPgConnection, chain: Option<&CallbackSecret>) -> Vec<u8> {
     ensure_cursor_row(conn, SHARD).await.expect("cursor row");
     let now = chrono::Utc::now();
-    let claim = claim_shard_chained(conn, SHARD, 500, LEASE, now, chain)
+    let chain = chain.map(|key| {
+        autumn_harvest::audit_chain::AuditChainKey::new(key.as_bytes().to_vec())
+            .expect("a full-length key")
+    });
+    let claim = claim_shard_chained(conn, SHARD, 500, LEASE, now, chain.as_ref())
         .await
         .expect("claim")
         .expect("a batch to deliver");

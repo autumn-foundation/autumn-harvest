@@ -59,8 +59,50 @@ use crate::completion_callback::CallbackSecret;
 /// Domain separator for the chain MAC.
 pub const CHAIN_DOMAIN: &[u8] = b"harvest-audit-chain-v1";
 
-/// Shortest chain key the builder accepts, in bytes.
+/// Shortest chain key the exporter accepts, in bytes.
 pub const MIN_CHAIN_KEY_BYTES: usize = 32;
+
+/// A chain key of at least [`MIN_CHAIN_KEY_BYTES`] bytes.
+///
+/// The exporter stamps links only with this type. So a short or empty key
+/// cannot reach the stamp path, whichever way a caller builds the config.
+#[derive(Clone)]
+pub struct AuditChainKey(CallbackSecret);
+
+/// The rejected key was shorter than [`MIN_CHAIN_KEY_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("an audit chain key is {len} bytes; it needs at least {MIN_CHAIN_KEY_BYTES} bytes")]
+pub struct ChainKeyTooShort {
+    /// The rejected key length.
+    pub len: usize,
+}
+
+impl AuditChainKey {
+    /// Wrap `key`.
+    ///
+    /// # Errors
+    /// Returns [`ChainKeyTooShort`] for a key shorter than
+    /// [`MIN_CHAIN_KEY_BYTES`].
+    pub fn new(key: impl Into<Vec<u8>>) -> Result<Self, ChainKeyTooShort> {
+        let key = key.into();
+        if key.len() < MIN_CHAIN_KEY_BYTES {
+            return Err(ChainKeyTooShort { len: key.len() });
+        }
+        Ok(Self(CallbackSecret::new(key)))
+    }
+
+    /// The key as the HMAC secret.
+    #[must_use]
+    pub const fn secret(&self) -> &CallbackSecret {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AuditChainKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuditChainKey(<redacted>)")
+    }
+}
 
 /// One chain link: an HMAC-SHA256 output.
 pub type ChainHash = [u8; 32];
@@ -878,6 +920,25 @@ mod tests {
         let mut other_shard = rec(1);
         other_shard.shard = 3;
         assert_ne!(base, link(&key, &GENESIS, &other_shard));
+    }
+
+    #[test]
+    fn a_short_chain_key_cannot_be_built() {
+        assert_eq!(
+            AuditChainKey::new(vec![1_u8; MIN_CHAIN_KEY_BYTES - 1]).err(),
+            Some(ChainKeyTooShort {
+                len: MIN_CHAIN_KEY_BYTES - 1
+            })
+        );
+        assert_eq!(
+            AuditChainKey::new(Vec::new()).err(),
+            Some(ChainKeyTooShort { len: 0 })
+        );
+        let key = AuditChainKey::new(vec![1_u8; MIN_CHAIN_KEY_BYTES]).unwrap_or_else(|e| {
+            panic!("a full-length key builds: {e}");
+        });
+        assert_eq!(key.secret().as_bytes().len(), MIN_CHAIN_KEY_BYTES);
+        assert_eq!(format!("{key:?}"), "AuditChainKey(<redacted>)");
     }
 
     #[test]

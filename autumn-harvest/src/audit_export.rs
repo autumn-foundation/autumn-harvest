@@ -859,8 +859,8 @@ pub struct AuditExportRuntimeConfig {
     pub backoff: ExportBackoff,
     /// How long a claim holds a shard's cursor.
     pub lease: std::time::Duration,
-    /// HMAC key for the audit hash chain (issue #1838). `None` stamps no chain.
-    pub chain_key: Option<CallbackSecret>,
+    /// Key for the audit hash chain (issue #1838). `None` stamps no chain.
+    pub chain_key: Option<crate::audit_chain::AuditChainKey>,
 }
 
 #[cfg(feature = "db")]
@@ -981,8 +981,24 @@ fn direct_worker_runtime_config(
         batch_size: config.effective_batch_size(),
         backoff: config.backoff.clone(),
         lease: config.effective_lease(),
-        chain_key: config.chain_key.clone(),
+        chain_key: runtime_chain_key(config.chain_key.as_ref()),
     })
+}
+
+/// The validated chain key for the runtime config (issue #1838).
+///
+/// `try_build` already rejects a short key, so this drops only a key that
+/// skipped the builder. It logs that, because the chain is then off.
+#[must_use]
+pub fn runtime_chain_key(
+    key: Option<&CallbackSecret>,
+) -> Option<crate::audit_chain::AuditChainKey> {
+    let key = key?;
+    crate::audit_chain::AuditChainKey::new(key.as_bytes().to_vec())
+        .inspect_err(|e| {
+            tracing::error!(error = %e, "the audit hash chain is off: the chain key is too short");
+        })
+        .ok()
 }
 
 /// `true` after a live export config was removed and none replaced it.
@@ -2263,7 +2279,7 @@ pub async fn claim_shard_chained(
     batch_size: i64,
     lease: std::time::Duration,
     now: DateTime<Utc>,
-    chain_key: Option<&CallbackSecret>,
+    chain_key: Option<&crate::audit_chain::AuditChainKey>,
 ) -> crate::error::HarvestResult<Option<ClaimedBatch>> {
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
@@ -2387,7 +2403,7 @@ pub async fn claim_shard_chained(
                     crate::audit_chain::stamp_chain(
                         conn,
                         shard_id,
-                        key,
+                        key.secret(),
                         cursor.last_assigned_seq,
                         last_assigned_seq,
                         head.as_deref(),
@@ -2405,7 +2421,7 @@ pub async fn claim_shard_chained(
                     head: stamped.head,
                     head_occurred_at: stamped.head_occurred_at,
                 };
-                (checkpoint, checkpoint.mac(key, shard_id))
+                (checkpoint, checkpoint.mac(key.secret(), shard_id))
             });
 
             // ── Load the batch to deliver ─────────────────────────────────
@@ -4351,10 +4367,21 @@ mod tests {
         };
         let runtime = direct_worker_runtime_config(&config).expect("a sink is set");
         assert_eq!(
-            runtime.chain_key.as_ref().map(CallbackSecret::as_bytes),
+            runtime
+                .chain_key
+                .as_ref()
+                .map(|key| key.secret().as_bytes()),
             Some(&[1_u8; 32][..])
         );
         assert!(direct_worker_runtime_config(&AuditExportBuilderConfig::default()).is_none());
+    }
+
+    #[test]
+    fn a_short_chain_key_never_reaches_the_runtime_config() {
+        assert!(runtime_chain_key(Some(&CallbackSecret::new(vec![1_u8; 31]))).is_none());
+        assert!(runtime_chain_key(Some(&CallbackSecret::new(Vec::new()))).is_none());
+        assert!(runtime_chain_key(None).is_none());
+        assert!(runtime_chain_key(Some(&CallbackSecret::new(vec![1_u8; 32]))).is_some());
     }
 
     #[test]
