@@ -38,8 +38,9 @@ defaults to `DEFAULT_ACTIVITY_START_TO_CLOSE` (10 minutes, issue #1808). A hung
 activity thus cannot hold a worker slot forever. The floor skips an activity
 that declares a `schedule_to_close` or a `heartbeat_timeout`, because each
 already bounds a running attempt. The `schedule_to_close` scanner skips a
-paused execution, so a hung attempt there waits for the resume. A timeout fails the activity call with no
-retry. Give a long activity its own `start_to_close`, or raise the floor. Call
+paused execution, so a hung attempt there waits for the resume. A timeout ends
+the attempt, and the retry policy decides what follows (see below). Give a long
+activity its own `start_to_close`, or raise the floor. Call
 `without_default_activity_start_to_close()` to remove it. At build time,
 `HarvestBuilder::try_build` logs one warning that names each regular activity
 type that the floor governs.
@@ -63,6 +64,26 @@ cap.
 cluster-wide in-flight count without provisioning a dedicated worker. Share
 the budget across activities by giving them the same `concurrency_key`.
 Inspect live counts with `harvest concurrency status`.
+
+**Adaptive concurrency limits.** A fixed `max_concurrent` needs a number you
+know in advance. When a dependency's capacity is unknown or changes, let the
+worker find the cap. The adaptive limit grows the cap while the handler
+latency stays near its no-load value. It shrinks the cap when the latency
+inflates or retryable failures rise. It is off by default:
+
+```rust
+let limits = AdaptiveLimitConfig::disabled()
+    .with_activity("charge_card", Some(AdaptiveLimitPolicy::new(1, 100)));
+
+WorkerConfig::default().with_adaptive_limit(limits)
+```
+
+The cap is per worker and per activity type. A type at its cap is not
+claimed, so its tasks wait in the queue instead of overloading the
+dependency. Run `cargo run --example adaptive_concurrency_limit` to see the
+cap follow a simulated dependency. See
+[the adaptive-limit runbook](../runbooks/activity-concurrency-limit.md) for
+the policy fields, the metrics and tuning.
 
 **Local activities.** Mark trivial in-process work with
 `#[activity(local = true)]` to skip the task-queue round-trip. Local
@@ -103,7 +124,22 @@ the timeout scanner appends `ActivityTimedOut { ScheduleToClose }` to history
 and fails the task. If the deadline would be exceeded by the next retry's
 back-off delay, the retry is skipped and the same event is appended instead of
 requeuing — so the workflow sees a clean `HarvestError::Timeout { ScheduleToClose }`
-rather than an exhausted-retry failure.
+rather than an exhausted-retry failure. A timed-out attempt is the one
+exception: it keeps its own timeout type (see the next paragraph).
+
+**Timeouts retry per the retry policy (issue #1809).** A `start_to_close` or
+`heartbeat_timeout` timeout ends one attempt. The task goes back to `PENDING`
+with the policy's backoff, as a handler failure does. Only the last attempt
+appends `ActivityTimedOut`, so the workflow sees the final outcome only. No
+retry starts after `schedule_to_close`. When the deadline stops the retry, the
+event keeps the attempt's own type (`StartToClose` or `Heartbeat`), not
+`ScheduleToClose`. A `schedule_to_start` or
+`schedule_to_close` timeout is terminal.
+[ADR 0005](../adr/0005-activity-timeout-retry-and-open-circuit.md) records the
+rule. To keep a timeout terminal, set `max_attempts = 1`. Set `start_to_close`
+together with `schedule_to_close`. A `schedule_to_close` alone removes the
+10-minute default, so a hung attempt is never retried. A timed-out attempt
+can still run when its retry starts, so keep the activity idempotent.
 
 **Honor a downstream's own `Retry-After` (`ActivityFailure::with_retry_after`).**
 `RetryPolicy` computes a generic backoff shape, but a well-behaved downstream

@@ -17,6 +17,10 @@
 //! dependency and is unit-tested without the `db` feature. The DB scanner
 //! ([`reclaim_orphaned_tasks`]) is gated behind `db`.
 //!
+//! The reclaimer loop uses `reclaim_orphaned_tasks_witnessed` (issue #1879).
+//! It holds the last strike until an [`OrphanWitness`] and the heartbeat age
+//! confirm the death of the worker.
+//!
 //! [`reclaim_orphaned_tasks`] also runs a second, independent backstop pass
 //! (issue #1459). A `workflow` decision-cycle task can stay `RUNNING` on a
 //! worker that is still alive. This happens when the in-process timeout's
@@ -73,6 +77,10 @@ pub struct ReclaimSummary {
     /// dead-worker orphan path, this one requires no worker liveness signal
     /// at all. See [`stuck_running_tasks_query`].
     pub stuck_requeued: usize,
+    /// Orphans at the quarantine threshold that this sweep left `RUNNING`
+    /// (issue #1879). The death of their workers is not yet confirmed.
+    /// [`Self::total`] does not count them, because no row changed.
+    pub held: usize,
 }
 
 impl ReclaimSummary {
@@ -80,6 +88,118 @@ impl ReclaimSummary {
     #[must_use]
     pub const fn total(&self) -> usize {
         self.requeued + self.quarantined + self.stuck_requeued
+    }
+}
+
+/// One claim of an orphaned task, as a reclaim sweep saw it (issue #1879).
+///
+/// Each new claim of a task has a different key. A workflow-task reset keeps
+/// `crash_strikes`, and the same worker can claim the row again. A deferral
+/// can also restore `attempt`. So the key also holds `attempt` and
+/// `started_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrphanClaim {
+    /// The orphaned task.
+    pub task_id: uuid::Uuid,
+    /// The worker that holds the claim.
+    pub worker_id: String,
+    /// The strike count of the claim, before this reclaim.
+    pub crash_strikes: i32,
+    /// The attempt of the claim.
+    pub attempt: i32,
+    /// The start time of the claim.
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The orphan claims that one reclaimer saw, and when it first saw each one
+/// (issue #1879).
+///
+/// The last strike needs the claim in two sweeps in a row. One sweep after
+/// a database pause sees every heartbeat as old. The next sweep sees the
+/// heartbeats of the live workers again.
+///
+/// A worker with no row has no heartbeat age. For such a claim, the
+/// reclaimer measures how long it saw the claim as an orphan without a break.
+#[derive(Debug, Default)]
+pub struct OrphanWitness {
+    first_seen: std::collections::HashMap<OrphanClaim, (u64, std::time::Instant)>,
+    sweep: u64,
+}
+
+impl OrphanWitness {
+    /// Record the orphan claims of one sweep, seen at `now`.
+    ///
+    /// The witness forgets each claim that is not in `claims`.
+    pub fn observe<I>(&mut self, claims: I, now: std::time::Instant)
+    where
+        I: IntoIterator<Item = OrphanClaim>,
+    {
+        self.sweep += 1;
+        let sweep = self.sweep;
+        let seen = std::mem::take(&mut self.first_seen);
+        self.first_seen = claims
+            .into_iter()
+            .map(|claim| {
+                let first = seen.get(&claim).copied().unwrap_or((sweep, now));
+                (claim, first)
+            })
+            .collect();
+    }
+
+    /// Forget `claim`. A fresh sighting of its worker breaks the watch, so
+    /// a later sighting starts a new hold.
+    pub fn forget(&mut self, claim: &OrphanClaim) {
+        self.first_seen.remove(claim);
+    }
+
+    /// Tell if the last two sweeps both saw `claim` as an orphan.
+    #[must_use]
+    pub fn seen_twice(&self, claim: &OrphanClaim) -> bool {
+        self.first_seen
+            .get(claim)
+            .is_some_and(|(first, _)| *first < self.sweep)
+    }
+
+    /// Tell if the sweeps saw `claim` as an orphan without a break for at
+    /// least `hold`, up to `now`.
+    #[must_use]
+    pub fn seen_for(
+        &self,
+        claim: &OrphanClaim,
+        now: std::time::Instant,
+        hold: std::time::Duration,
+    ) -> bool {
+        self.first_seen
+            .get(claim)
+            .is_some_and(|(_, first)| now.saturating_duration_since(*first) >= hold)
+    }
+}
+
+/// SQL that reports how a worker looks to the reclaimer (issue #1879).
+///
+/// `$1` is the worker id. `$2` is a silence in seconds. The row has `fresh`
+/// true when the last heartbeat is newer than `$2` seconds ago. No row comes
+/// back when the worker has no row.
+#[must_use]
+pub const fn worker_sighting_query() -> &'static str {
+    "SELECT last_heartbeat_at > clock_timestamp() - ($2::bigint * INTERVAL '1 second') \
+            AS fresh \
+     FROM harvest_workers \
+     WHERE worker_id = $1"
+}
+
+/// The silence, in seconds, that confirms the death of a worker before its
+/// task takes the last strike (issue #1879).
+///
+/// It is two stale windows. A worker that writes no heartbeat for that long
+/// is not only late. The value is clamped to [`MAX_WORKER_STALE_SECS`].
+#[must_use]
+pub const fn quarantine_confirm_secs(worker_stale_secs: i64) -> i64 {
+    let confirm = worker_stale_secs.saturating_mul(2);
+    if confirm > MAX_WORKER_STALE_SECS {
+        MAX_WORKER_STALE_SECS
+    } else {
+        confirm
     }
 }
 
@@ -234,8 +354,8 @@ mod scanner {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ReclaimAction, ReclaimSummary, orphaned_running_tasks_query, quarantine_decision,
-        stuck_running_tasks_query,
+        OrphanClaim, OrphanWitness, ReclaimAction, ReclaimSummary, orphaned_running_tasks_query,
+        quarantine_decision, stuck_running_tasks_query,
     };
     use crate::completion_trigger::DeferredTriggerStart;
     use crate::error::{HarvestError, HarvestResult};
@@ -248,6 +368,46 @@ mod scanner {
     /// Reason label emitted on the `harvest.task.quarantined` metric and stored
     /// in the dead-letter reason discriminator.
     pub const QUARANTINE_REASON: &str = "poison_pill";
+
+    /// How a worker looks to the reclaimer (issue #1879).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WorkerSighting {
+        /// The last heartbeat is inside the window.
+        Fresh,
+        /// The last heartbeat is older than the window.
+        Stale,
+        /// The worker has no row, so it has no heartbeat age.
+        Absent,
+    }
+
+    /// Read how `worker_id` looks against a window of `silence_secs`.
+    ///
+    /// The age comes from the database clock (issue #1879). The heartbeat
+    /// stamps use that clock, so a skewed host clock cannot change the age.
+    async fn worker_sighting(
+        conn: &mut AsyncPgConnection,
+        worker_id: &str,
+        silence_secs: i64,
+    ) -> HarvestResult<WorkerSighting> {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Bool)]
+            fresh: bool,
+        }
+
+        let row: Option<Row> = diesel::sql_query(super::worker_sighting_query())
+            .bind::<diesel::sql_types::Text, _>(worker_id)
+            .bind::<diesel::sql_types::BigInt, _>(silence_secs)
+            .get_result(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        Ok(match row {
+            Some(Row { fresh: true }) => WorkerSighting::Fresh,
+            Some(Row { fresh: false }) => WorkerSighting::Stale,
+            None => WorkerSighting::Absent,
+        })
+    }
 
     /// Re-check, under a row lock, whether the worker that holds `worker_id`
     /// is still dead. Guards against a worker that resurrected between the
@@ -262,18 +422,7 @@ mod scanner {
         worker_id: &str,
         worker_stale_secs: i64,
     ) -> HarvestResult<bool> {
-        use crate::schema::harvest_workers::dsl;
-
-        let cutoff = Utc::now() - chrono::Duration::seconds(worker_stale_secs);
-        let live: Option<String> = dsl::harvest_workers
-            .filter(dsl::worker_id.eq(worker_id))
-            .filter(dsl::last_heartbeat_at.gt(cutoff))
-            .select(dsl::worker_id)
-            .first(conn)
-            .await
-            .optional()
-            .map_err(crate::error::database_error)?;
-        Ok(live.is_none())
+        Ok(worker_sighting(conn, worker_id, worker_stale_secs).await? != WorkerSighting::Fresh)
     }
 
     /// Re-queue an orphaned task for another attempt, recording the new
@@ -642,22 +791,32 @@ mod scanner {
         ))
     }
 
+    /// State, worker, strikes, attempt and start time of a locked task row.
+    type LockedClaim = (
+        String,
+        Option<String>,
+        i32,
+        i32,
+        Option<chrono::DateTime<Utc>>,
+    );
+
     /// Quarantine an orphaned poison-pill task: move it to the dead-letter
     /// queue with a [`PoisonPill`](super::super::dlq::DeadLetterReason) reason,
     /// mark the queue row `FAILED`, and fail the owning workflow terminally.
     ///
-    /// Returns `true` if the task was quarantined, `false` if a concurrent
-    /// actor already handled the row.
+    /// Returns what happened to the row. See [`QuarantineOutcome`].
     #[allow(clippy::too_many_lines)]
     async fn quarantine_orphan(
         conn: &mut AsyncPgConnection,
         task: &TaskQueueItem,
         new_strikes: i32,
-        worker_stale_secs: i64,
+        // The silence, in seconds, that marks the worker as dead. The
+        // witnessed sweep passes a wider window here (issue #1879).
+        dead_secs: i64,
         metrics: &dyn MetricsRecorder,
         // Issue #1243: forwarded to the owning-workflow failure write.
         codecs: &crate::payload_codec::PayloadCodecs,
-    ) -> HarvestResult<bool> {
+    ) -> HarvestResult<QuarantineOutcome> {
         use crate::dlq::{DeadLetterReason, NewDeadLetterEntry, dead_letter};
         use crate::schema::harvest_task_queue::dsl;
 
@@ -688,6 +847,8 @@ mod scanner {
         let task_id = task.id;
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
+        let prior_attempt = task.attempt;
+        let prior_started_at = task.started_at;
 
         let entry = NewDeadLetterEntry {
             original_task_id: task.id,
@@ -726,6 +887,9 @@ mod scanner {
         // regardless, so `buffered_settled_in_background` hands the hint to
         // the existing non-blocking background publisher instead of
         // awaiting it inline.
+        // Issue #1879: set when the locked re-check finds the worker fresh.
+        let worker_alive = std::sync::atomic::AtomicBool::new(false);
+        let worker_alive = &worker_alive;
         let (acted, failed_workflow, deferred_starts, closed_children, pending_cancel_metrics) =
             crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
                 bool,
@@ -748,23 +912,35 @@ mod scanner {
                     // already ours, so it is guaranteed a fresh snapshot.
                     // `SKIP LOCKED` skips the row while another session
                     // holds it. The next pass retries it (issue #1876).
-                    let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                    // Issue #1879: `attempt` and `started_at` fence the claim
+                    // too. A reset keeps `crash_strikes`, and the same worker
+                    // can claim the row again between the scan and this lock.
+                    let current: Option<LockedClaim> = dsl::harvest_task_queue
                         .find(task_id)
                         .for_update()
                         .skip_locked()
-                        .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                        .select((
+                            dsl::state,
+                            dsl::worker_id,
+                            dsl::crash_strikes,
+                            dsl::attempt,
+                            dsl::started_at,
+                        ))
                         .first(conn)
                         .await
                         .optional()
                         .map_err(crate::error::database_error)?;
                     match current {
-                        Some((state, Some(wid), strikes))
+                        Some((state, Some(wid), strikes, attempt, started_at))
                             if state == "RUNNING"
                                 && wid == worker_id
-                                && strikes == prior_strikes => {}
+                                && strikes == prior_strikes
+                                && attempt == prior_attempt
+                                && started_at == prior_started_at => {}
                         _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
                     }
-                    if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                    if !worker_still_dead(conn, &worker_id, dead_secs).await? {
+                        worker_alive.store(true, std::sync::atomic::Ordering::Relaxed);
                         return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                     }
 
@@ -884,7 +1060,25 @@ mod scanner {
                 start.spawn();
             }
         }
-        Ok(acted)
+        Ok(if acted {
+            QuarantineOutcome::Quarantined
+        } else if worker_alive.load(std::sync::atomic::Ordering::Relaxed) {
+            QuarantineOutcome::WorkerFresh
+        } else {
+            QuarantineOutcome::Skipped
+        })
+    }
+
+    /// What [`quarantine_orphan`] did with one row.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum QuarantineOutcome {
+        /// The task went to the dead-letter queue.
+        Quarantined,
+        /// The locked re-check found the worker fresh (issue #1879). The
+        /// witness must forget the claim, because the watch has a break.
+        WorkerFresh,
+        /// Another actor changed the row, or the row was locked.
+        Skipped,
     }
 
     /// Whether `error` ends the work on one row but leaves the pass able to
@@ -905,10 +1099,11 @@ mod scanner {
     }
 
     /// Turn a row conflict into a skip (issue #1876).
-    fn skip_on_row_conflict(
-        outcome: HarvestResult<bool>,
+    fn skip_on_row_conflict<T>(
+        outcome: HarvestResult<T>,
         task: &TaskQueueItem,
-    ) -> HarvestResult<bool> {
+        skipped: T,
+    ) -> HarvestResult<T> {
         match outcome {
             Err(e) if is_row_conflict(&e) => {
                 tracing::warn!(
@@ -916,7 +1111,7 @@ mod scanner {
                     error = %e,
                     "orphan reclaim skipped a task after a row conflict; the next pass retries it"
                 );
-                Ok(false)
+                Ok(skipped)
             }
             other => other,
         }
@@ -945,6 +1140,10 @@ mod scanner {
     /// deadlock on one row skips that row too. The next pass retries a
     /// skipped row (issue #1876).
     ///
+    /// This sweep quarantines an orphan on first sight. A late heartbeat can
+    /// then quarantine a live worker's task (issue #1879). In a reclaim loop,
+    /// use [`reclaim_orphaned_tasks_witnessed`] instead.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] on query failure, except for a
@@ -959,10 +1158,121 @@ mod scanner {
         // `WorkflowFailed` carries a payload-bearing `details` field.
         codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<ReclaimSummary> {
+        reclaim_sweep(
+            conn,
+            threshold,
+            worker_stale_secs,
+            stuck_running_secs,
+            metrics,
+            codecs,
+            None,
+        )
+        .await
+    }
+
+    /// [`reclaim_orphaned_tasks`], with a last strike that waits until the
+    /// death of the worker is confirmed (issue #1879).
+    ///
+    /// The last strike needs two conditions. `witness` saw the same claim in
+    /// the previous sweep too. The worker also wrote no heartbeat for
+    /// [`quarantine_confirm_secs`], on the database clock. A worker with no
+    /// row needs that long of unbroken sightings instead. Until then the row
+    /// stays `RUNNING` and
+    /// gets no strike. A worker that heartbeats again keeps its task. A
+    /// requeue under the threshold does not wait.
+    ///
+    /// Use one `witness` for all sweeps of one reclaim loop. The sweep reads
+    /// `clock` once, after the orphan scan returns. A delay before the scan
+    /// then cannot count toward a hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] on query failure.
+    // One more parameter than `reclaim_orphaned_tasks`, which is at the limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reclaim_orphaned_tasks_witnessed(
+        conn: &mut AsyncPgConnection,
+        threshold: i32,
+        worker_stale_secs: i64,
+        stuck_running_secs: Option<i64>,
+        metrics: &dyn MetricsRecorder,
+        codecs: &crate::payload_codec::PayloadCodecs,
+        witness: &mut OrphanWitness,
+        clock: &(dyn Fn() -> std::time::Instant + Sync),
+    ) -> HarvestResult<ReclaimSummary> {
+        reclaim_sweep(
+            conn,
+            threshold,
+            worker_stale_secs,
+            stuck_running_secs,
+            metrics,
+            codecs,
+            Some((witness, clock)),
+        )
+        .await
+    }
+
+    /// The claim that `task` shows, or `None` for a row with no worker.
+    fn orphan_claim(task: &TaskQueueItem) -> Option<OrphanClaim> {
+        task.worker_id.clone().map(|worker_id| OrphanClaim {
+            task_id: task.id,
+            worker_id,
+            crash_strikes: task.crash_strikes,
+            attempt: task.attempt,
+            started_at: task.started_at,
+        })
+    }
+
+    /// Tell if the last strike of `task` must wait (issue #1879).
+    async fn hold_last_strike(
+        conn: &mut AsyncPgConnection,
+        task: &TaskQueueItem,
+        witness: &mut OrphanWitness,
+        now: std::time::Instant,
+        confirm_secs: i64,
+    ) -> HarvestResult<bool> {
+        let Some(claim) = orphan_claim(task) else {
+            return Ok(true);
+        };
+        if !witness.seen_twice(&claim) {
+            return Ok(true);
+        }
+        Ok(
+            match worker_sighting(conn, &claim.worker_id, confirm_secs).await? {
+                // A fresh heartbeat breaks the watch. Time seen before it
+                // must not count toward a later hold.
+                WorkerSighting::Fresh => {
+                    witness.forget(&claim);
+                    true
+                }
+                WorkerSighting::Stale => false,
+                // A live worker can lose its row for a short time, for
+                // example during a registration retry. So the reclaimer
+                // measures the silence itself.
+                WorkerSighting::Absent => {
+                    let hold = std::time::Duration::from_secs(confirm_secs.unsigned_abs());
+                    !witness.seen_for(&claim, now, hold)
+                }
+            },
+        )
+    }
+
+    /// The body of both reclaim sweeps. `watch` is the witness and its clock.
+    /// With no `watch`, the last strike does not wait.
+    async fn reclaim_sweep(
+        conn: &mut AsyncPgConnection,
+        threshold: i32,
+        worker_stale_secs: i64,
+        stuck_running_secs: Option<i64>,
+        metrics: &dyn MetricsRecorder,
+        codecs: &crate::payload_codec::PayloadCodecs,
+        mut watch: Option<(&mut OrphanWitness, &(dyn Fn() -> std::time::Instant + Sync))>,
+    ) -> HarvestResult<ReclaimSummary> {
         // Clamp once at the entry point. Neither the candidate scan nor
         // the per-row liveness re-check can then overflow the SQL
         // interval arithmetic on an out-of-range caller value.
         let worker_stale_secs = worker_stale_secs.clamp(0, super::MAX_WORKER_STALE_SECS);
+        let confirm_secs = super::quarantine_confirm_secs(worker_stale_secs);
         // Chaos: inject a transient DB/connection error before the orphan scan
         // (issue #940 AC1(b)). The reclaim is idempotent and the poll loop
         // retries it on the next tick, so a transient error must not strand an
@@ -973,28 +1283,55 @@ mod scanner {
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
+        // Issue #1879: read the clock after the scan returns. A delay before
+        // the scan is not time that the reclaimer saw the orphan.
+        let swept_at = watch.as_ref().map(|(_, clock)| clock());
+        if let (Some((witness, _)), Some(now)) = (watch.as_mut(), swept_at) {
+            witness.observe(orphans.iter().filter_map(orphan_claim), now);
+        }
 
         let mut summary = ReclaimSummary::default();
+        // The stuck-running pass below must not requeue a held row. That
+        // requeue counts no strike, so a poison pill would never quarantine.
+        let mut held = std::collections::HashSet::new();
         for task in orphans {
             let new_strikes = task.crash_strikes.saturating_add(1);
             match quarantine_decision(new_strikes, threshold) {
                 ReclaimAction::Quarantine => {
-                    let outcome = quarantine_orphan(
-                        conn,
-                        &task,
-                        new_strikes,
-                        worker_stale_secs,
-                        metrics,
-                        codecs,
-                    )
-                    .await;
-                    if skip_on_row_conflict(outcome, &task)? {
-                        summary.quarantined += 1;
+                    // Issue #1879: the strike is permanent and the quarantine
+                    // is terminal. Hold the row until the death of the worker
+                    // is confirmed. A late worker is not a dead one.
+                    let (wait, dead_secs) = match (watch.as_mut(), swept_at) {
+                        (Some((witness, _)), Some(now)) => (
+                            hold_last_strike(conn, &task, witness, now, confirm_secs).await?,
+                            confirm_secs,
+                        ),
+                        _ => (false, worker_stale_secs),
+                    };
+                    if wait {
+                        summary.held += 1;
+                        held.insert(task.id);
+                        continue;
+                    }
+                    let outcome =
+                        quarantine_orphan(conn, &task, new_strikes, dead_secs, metrics, codecs)
+                            .await;
+                    match skip_on_row_conflict(outcome, &task, QuarantineOutcome::Skipped)? {
+                        QuarantineOutcome::Quarantined => summary.quarantined += 1,
+                        // Issue #1879: a fresh worker breaks the watch.
+                        QuarantineOutcome::WorkerFresh => {
+                            if let (Some((witness, _)), Some(claim)) =
+                                (watch.as_mut(), orphan_claim(&task))
+                            {
+                                witness.forget(&claim);
+                            }
+                        }
+                        QuarantineOutcome::Skipped => {}
                     }
                 }
                 ReclaimAction::Requeue => {
                     let outcome = requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await;
-                    if skip_on_row_conflict(outcome, &task)? {
+                    if skip_on_row_conflict(outcome, &task, false)? {
                         summary.requeued += 1;
                         // Dispatch hint (issue #1312). The orphan is `PENDING`
                         // again and its inner transaction has committed, so the
@@ -1012,9 +1349,9 @@ mod scanner {
                 .load(conn)
                 .await
                 .map_err(crate::error::database_error)?;
-            for task in stuck {
+            for task in stuck.into_iter().filter(|task| !held.contains(&task.id)) {
                 let outcome = requeue_stuck_task(conn, &task, stuck_running_secs).await;
-                if skip_on_row_conflict(outcome, &task)? {
+                if skip_on_row_conflict(outcome, &task, false)? {
                     summary.stuck_requeued += 1;
                     crate::queue::record_pending_hints(conn, &[task.id]).await;
                 }
@@ -1107,6 +1444,8 @@ mod scanner {
         );
         // Keep the worker dispatch binding for hints (issue #1431).
         crate::dispatch::spawn_bound(async move {
+            // Issue #1879: one witness for the life of this loop.
+            let mut witness = OrphanWitness::default();
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
@@ -1133,27 +1472,37 @@ mod scanner {
                     Ok(mut conn) => {
                         match crate::replication::run_fenced_pass(
                             &fence,
-                            Box::pin(reclaim_orphaned_tasks(
+                            Box::pin(reclaim_orphaned_tasks_witnessed(
                                 &mut conn,
                                 threshold,
                                 worker_stale_secs,
                                 stuck_running_secs,
                                 &*telemetry.metrics,
                                 &payload_codecs,
+                                &mut witness,
+                                &std::time::Instant::now,
                             )),
                         )
                         .await
                         .and_then(|done| done)
                         {
-                            Ok(summary) if summary.total() > 0 => {
-                                tracing::warn!(
-                                    requeued = summary.requeued,
-                                    quarantined = summary.quarantined,
-                                    stuck_requeued = summary.stuck_requeued,
-                                    "reclaimed orphaned poison-pill tasks"
-                                );
+                            Ok(summary) => {
+                                if summary.total() > 0 {
+                                    tracing::warn!(
+                                        requeued = summary.requeued,
+                                        quarantined = summary.quarantined,
+                                        stuck_requeued = summary.stuck_requeued,
+                                        "reclaimed orphaned poison-pill tasks"
+                                    );
+                                }
+                                if summary.held > 0 {
+                                    tracing::info!(
+                                        held = summary.held,
+                                        "held orphans at the poison-pill threshold until \
+                                         their workers are confirmed dead"
+                                    );
+                                }
                             }
-                            Ok(_) => {}
                             Err(e) => {
                                 tracing::error!(error = %e, "poison-pill reclaim sweep failed");
                             }
@@ -1211,8 +1560,8 @@ mod scanner_tests {
 
 #[cfg(feature = "db")]
 pub use scanner::{
-    QUARANTINE_REASON, reclaim_orphaned_tasks, spawn_poison_pill_reclaimer,
-    spawn_poison_pill_reclaimer_for_shard,
+    QUARANTINE_REASON, reclaim_orphaned_tasks, reclaim_orphaned_tasks_witnessed,
+    spawn_poison_pill_reclaimer, spawn_poison_pill_reclaimer_for_shard,
 };
 
 #[cfg(test)]
@@ -1287,8 +1636,9 @@ mod tests {
             requeued: 2,
             quarantined: 1,
             stuck_requeued: 4,
+            held: 8,
         };
-        assert_eq!(summary.total(), 7);
+        assert_eq!(summary.total(), 7, "a held orphan changed no row");
     }
 
     #[test]
@@ -1308,5 +1658,123 @@ mod tests {
             !sql.contains("harvest_workers"),
             "this backstop applies regardless of worker liveness"
         );
+    }
+
+    fn claim(task: u128, worker: &str, strikes: i32) -> OrphanClaim {
+        OrphanClaim {
+            task_id: uuid::Uuid::from_u128(task),
+            worker_id: worker.to_owned(),
+            crash_strikes: strikes,
+            attempt: 1,
+            started_at: None,
+        }
+    }
+
+    /// Issue #1879: a claim that no sweep saw is not seen twice.
+    #[test]
+    fn witness_does_not_confirm_an_unseen_claim() {
+        let witness = OrphanWitness::default();
+        assert!(!witness.seen_twice(&claim(1, "w", 2)));
+    }
+
+    fn at(secs: u64) -> std::time::Instant {
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        *ORIGIN.get_or_init(std::time::Instant::now) + std::time::Duration::from_secs(secs)
+    }
+
+    /// Issue #1879: the first sight of a claim is not enough.
+    #[test]
+    fn witness_needs_two_sweeps_in_a_row() {
+        let mut witness = OrphanWitness::default();
+        witness.observe([claim(1, "w", 2)], at(1));
+        assert!(!witness.seen_twice(&claim(1, "w", 2)));
+        witness.observe([claim(1, "w", 2)], at(2));
+        assert!(witness.seen_twice(&claim(1, "w", 2)));
+    }
+
+    /// Issue #1879: a worker that heartbeats again leaves the orphan set.
+    /// A later stall then starts again from the first sight.
+    #[test]
+    fn witness_forgets_a_claim_that_leaves_the_orphan_set() {
+        let mut witness = OrphanWitness::default();
+        witness.observe([claim(1, "w", 2), claim(2, "w", 0)], at(3));
+        witness.observe([claim(2, "w", 0)], at(4));
+        witness.observe([claim(1, "w", 2), claim(2, "w", 0)], at(5));
+        assert!(!witness.seen_twice(&claim(1, "w", 2)));
+        assert!(witness.seen_twice(&claim(2, "w", 0)));
+    }
+
+    /// A new claim of the same task is a new key.
+    #[test]
+    fn witness_treats_a_new_claim_of_the_same_task_as_new() {
+        let mut witness = OrphanWitness::default();
+        witness.observe([claim(1, "w", 2)], at(6));
+        witness.observe([claim(1, "other", 2)], at(7));
+        assert!(!witness.seen_twice(&claim(1, "other", 2)));
+        witness.observe([claim(1, "other", 3)], at(8));
+        assert!(!witness.seen_twice(&claim(1, "other", 3)));
+    }
+
+    /// Issue #1879: the confirm window is two stale windows, clamped.
+    #[test]
+    fn quarantine_confirm_window_is_two_stale_windows() {
+        assert_eq!(quarantine_confirm_secs(10), 20);
+        assert_eq!(quarantine_confirm_secs(1), 2);
+        assert_eq!(quarantine_confirm_secs(0), 0);
+        assert_eq!(
+            quarantine_confirm_secs(MAX_WORKER_STALE_SECS),
+            MAX_WORKER_STALE_SECS
+        );
+    }
+
+    const CONFIRM: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Issue #1879: a claim with no worker row needs the full confirm window
+    /// of unbroken sightings. Two quick sweeps are not enough.
+    #[test]
+    fn witness_measures_how_long_a_claim_stays_an_orphan() {
+        let mut witness = OrphanWitness::default();
+        witness.observe([claim(1, "w", 2)], at(100));
+        witness.observe([claim(1, "w", 2)], at(101));
+        assert!(witness.seen_twice(&claim(1, "w", 2)));
+        assert!(!witness.seen_for(&claim(1, "w", 2), at(101), CONFIRM));
+        witness.observe([claim(1, "w", 2)], at(120));
+        assert!(witness.seen_for(&claim(1, "w", 2), at(120), CONFIRM));
+    }
+
+    /// A slow sweep does not reset the time. Only a break in the sightings
+    /// does.
+    #[test]
+    fn witness_time_restarts_only_after_a_break() {
+        let mut witness = OrphanWitness::default();
+        witness.observe([claim(1, "w", 2)], at(200));
+        witness.observe([claim(1, "w", 2)], at(215));
+        assert!(witness.seen_for(&claim(1, "w", 2), at(220), CONFIRM));
+        witness.observe([], at(221));
+        witness.observe([claim(1, "w", 2)], at(222));
+        assert!(!witness.seen_for(&claim(1, "w", 2), at(241), CONFIRM));
+        assert!(witness.seen_for(&claim(1, "w", 2), at(242), CONFIRM));
+    }
+
+    /// Issue #1879: a forgotten claim starts a new watch.
+    #[test]
+    fn witness_restarts_a_forgotten_claim() {
+        let mut witness = OrphanWitness::default();
+        witness.observe([claim(1, "w", 2)], at(300));
+        witness.observe([claim(1, "w", 2)], at(301));
+        witness.forget(&claim(1, "w", 2));
+        witness.observe([claim(1, "w", 2)], at(320));
+        assert!(!witness.seen_twice(&claim(1, "w", 2)));
+        assert!(!witness.seen_for(&claim(1, "w", 2), at(320), CONFIRM));
+    }
+
+    /// Issue #1879: the heartbeat age comes from the database clock. A host
+    /// clock that runs ahead must not shorten the confirm window.
+    #[test]
+    fn worker_sighting_query_uses_the_database_clock() {
+        let sql = worker_sighting_query();
+        assert!(sql.contains("clock_timestamp()"), "{sql}");
+        assert!(sql.contains("$2::bigint * INTERVAL '1 second'"), "{sql}");
+        assert!(sql.contains("harvest_workers"), "{sql}");
     }
 }

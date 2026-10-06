@@ -386,7 +386,7 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
 /// registration while the invalidation fails is therefore strictly worse than
 /// not registering at all, and "log and continue" leaves precisely that state.
 /// Rolling back keeps the worker unpublished until the pair succeeds, and the
-/// heartbeat's `Ok(0)` self-heal retries it within one interval.
+/// heartbeat's missing-row self-heal retries it within one interval.
 ///
 /// **Atomicity is also what makes a claimant's reads coherent.** A decision
 /// brackets its fleet read between two miss-state reads and requires them to
@@ -529,12 +529,37 @@ pub async fn heartbeat_worker(
     in_use_sessions: i32,
     registered_codec_key_ids: &[String],
 ) -> HarvestResult<usize> {
-    // Issue #1244: refreshed on every heartbeat, not just at registration.
-    // A worker's advertised capability -- and its registered key ids --
-    // must never outlive an upgrade, downgrade, or runtime key rotation of
-    // its own process.
+    heartbeat_worker_status(
+        conn,
+        worker_id,
+        in_flight_count,
+        labels,
+        in_use_sessions,
+        registered_codec_key_ids,
+    )
+    .await
+    .map(|status| usize::from(status.is_some()))
+}
+
+/// [`heartbeat_worker`], returning the status of the row it wrote.
+///
+/// Returns `None` when the worker row is missing. The status comes back in
+/// the same round trip as the write (issue #1879). A separate status read
+/// made each tick slower, and a slow tick makes a live worker look dead.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn heartbeat_worker_status(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    in_flight_count: i32,
+    labels: &serde_json::Value,
+    in_use_sessions: i32,
+    registered_codec_key_ids: &[String],
+) -> HarvestResult<Option<String>> {
     let labels = crate::payload_codec::advertise_codec_capability(labels, registered_codec_key_ids);
-    let affected = diesel::update(harvest_workers::table.find(worker_id))
+    diesel::update(harvest_workers::table.find(worker_id))
         .set((
             // The shard database's own clock, never this host's
             // `Utc::now()`. `codec_rotation::blocking_workers` computes
@@ -550,10 +575,11 @@ pub async fn heartbeat_worker(
             harvest_workers::labels.eq(&labels),
             harvest_workers::in_use_sessions.eq(in_use_sessions),
         ))
-        .execute(conn)
+        .returning(harvest_workers::status)
+        .get_result::<String>(conn)
         .await
-        .map_err(crate::error::database_error)?;
-    Ok(affected)
+        .optional()
+        .map_err(crate::error::database_error)
 }
 
 /// Transition a worker's lifecycle status.
@@ -1521,9 +1547,9 @@ async fn heal_missing_worker_row(
 /// Retry a startup registration that failed and rolled the atomic pair back,
 /// BEFORE [`do_heartbeat_tick`]'s heartbeat call observes a row (issue #804).
 ///
-/// The `Ok(0)` arm in [`do_heartbeat_tick`] heals the absent-row case. A
+/// The `Ok(None)` arm in [`do_heartbeat_tick`] heals the absent-row case. A
 /// reused `worker_id` leaves the PREVIOUS row alive, though, so the
-/// heartbeat succeeds, returns `Ok(1)`, and that arm is never reached.
+/// heartbeat succeeds, returns the row's status, and that arm is never reached.
 /// This worker is left advertising the old build's `build_id`/queues while
 /// its id stays in `capability_miss_workers` as affirmative fleet evidence
 /// against itself.
@@ -1642,7 +1668,7 @@ pub async fn do_heartbeat_tick(
     {
         return;
     }
-    match heartbeat_worker(
+    match heartbeat_worker_status(
         conn,
         &registration.worker_id,
         in_flight,
@@ -1652,7 +1678,7 @@ pub async fn do_heartbeat_tick(
     )
     .await
     {
-        Ok(0) => {
+        Ok(None) => {
             if worker_shutdown.is_cancelled() {
                 // Worker is already draining — do not create a new Active row on
                 // a shard that missed the fan-out.  An absent row correctly
@@ -1673,7 +1699,7 @@ pub async fn do_heartbeat_tick(
                 .await;
             }
         }
-        Ok(_) => {
+        Ok(Some(status)) => {
             if worker_shutdown.is_cancelled() {
                 // Already draining — transition this shard's row to Draining if
                 // the fan-out missed it (e.g. shard recovered after the drain was
@@ -1708,28 +1734,60 @@ pub async fn do_heartbeat_tick(
                 // this worker's status to Draining.  Cancel the worker's
                 // poll-loop token (not the heartbeat token) so the poll loop
                 // stops accepting new work while heartbeats continue until
-                // fully stopped (P1).
-                match read_worker_status(conn, &registration.worker_id).await {
-                    Ok(Some(ref s)) if s == WorkerStatus::Draining.as_str() => {
-                        tracing::info!(
-                            worker_id = %registration.worker_id,
-                            "remote drain detected; triggering graceful shutdown"
-                        );
-                        sync_drain_deadline(
-                            conn,
-                            &registration.worker_id,
-                            drain_deadline_max,
-                            remote_drain_deadline,
-                        )
-                        .await;
-                        worker_shutdown.cancel();
-                    }
-                    _ => {}
+                // fully stopped (P1). The status comes from the heartbeat
+                // write itself (issue #1879).
+                if status == WorkerStatus::Draining.as_str() {
+                    tracing::info!(
+                        worker_id = %registration.worker_id,
+                        "remote drain detected; triggering graceful shutdown"
+                    );
+                    sync_drain_deadline(
+                        conn,
+                        &registration.worker_id,
+                        drain_deadline_max,
+                        remote_drain_deadline,
+                    )
+                    .await;
+                    worker_shutdown.cancel();
                 }
             }
         }
         Err(error) => {
             tracing::warn!(worker_id = %registration.worker_id, error = %error, "worker heartbeat write failed");
+        }
+    }
+}
+
+/// The start times of the worker heartbeat ticks (issue #1879).
+///
+/// The schedule has a fixed rate. Tick latency does not add to the period.
+/// A fixed delay makes the period the interval plus the latency. A slow
+/// database then makes a live worker look dead.
+///
+/// After a tick that takes longer than one interval, the next tick starts
+/// at once. The schedule does not send a burst of ticks to catch up.
+#[derive(Debug)]
+pub(crate) struct HeartbeatSchedule {
+    ticks: tokio::time::Interval,
+}
+
+impl HeartbeatSchedule {
+    /// Make a schedule. The first tick comes one `interval` after this call.
+    ///
+    /// A zero `interval` becomes 1 ms, because a zero period panics.
+    pub(crate) fn new(interval: Duration) -> Self {
+        let period = interval.max(Duration::from_millis(1));
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self { ticks }
+    }
+
+    /// Wait until the next tick is due. Return `false` when `cancel` fires
+    /// first.
+    pub(crate) async fn wait(&mut self, cancel: &CancellationToken) -> bool {
+        tokio::select! {
+            () = cancel.cancelled() => false,
+            _ = self.ticks.tick() => true,
         }
     }
 }
@@ -1770,14 +1828,14 @@ pub fn spawn_worker_heartbeat(
     // actual live session count.
     session_slots_in_use: crate::sessions::SessionSlotRegistry,
     // Set by startup when the atomic register+invalidate pair failed and rolled
-    // back (issue #804, Codex round-49 P1). The `Ok(0)` arm below already heals
-    // that when the row is ABSENT, but a reused `worker_id` — a configured
-    // stable id such as a pod name, not the random default — leaves the PREVIOUS
-    // row alive, so `heartbeat_worker` updates it, returns `Ok(1)`, and the pair
-    // is never retried. This worker would then poll indefinitely while the
-    // registry advertises the old build's `build_id`/queues and its id remains
-    // in `capability_miss_workers`, letting a peer read the live fleet as
-    // `AllLiveWorkersMissed` and terminally fail a task this worker can run.
+    // back (issue #804). The missing-row arm of the tick heals an absent row.
+    // A reused `worker_id` is different. A configured stable id, such as a pod
+    // name, leaves the PREVIOUS row alive. The heartbeat then updates that
+    // row, and the pair is never retried. This worker would then poll
+    // indefinitely while the registry advertises the old build's
+    // `build_id`/queues and its id remains in `capability_miss_workers`,
+    // letting a peer read the live fleet as `AllLiveWorkersMissed` and
+    // terminally fail a task this worker can run.
     registration_pending: Arc<AtomicBool>,
     // Read fresh every tick, never cached with `labels_json` below (issue
     // #1244). Keys may be registered on this process at runtime, after this
@@ -1790,11 +1848,8 @@ pub fn spawn_worker_heartbeat(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(interval) => {}
-            }
+        let mut schedule = HeartbeatSchedule::new(interval);
+        while schedule.wait(&cancel).await {
             // Issue #1823: a process that lost write authority stops beating.
             // Another region owns this row, and may reuse this worker id.
             if crate::replication::FenceRegistry::is_fenced_out() {
@@ -2702,5 +2757,64 @@ mod tests {
         let _act_permits = act_sem.try_acquire_many(5).unwrap();
 
         assert_eq!(compute_in_flight(&wf_sem, 10, &act_sem, 20), 8);
+    }
+
+    /// Run one heartbeat tick per entry of `latencies`, with the loop shape of
+    /// [`spawn_worker_heartbeat`]. Each tick takes its latency in
+    /// milliseconds. Return the start of each tick, in milliseconds after the
+    /// loop started.
+    async fn tick_starts(interval: Duration, latencies: &[u64]) -> Vec<u128> {
+        let origin = tokio::time::Instant::now();
+        let cancel = CancellationToken::new();
+        let mut schedule = HeartbeatSchedule::new(interval);
+        let mut starts = Vec::with_capacity(latencies.len());
+        for latency in latencies {
+            assert!(schedule.wait(&cancel).await, "no cancel was sent");
+            starts.push(origin.elapsed().as_millis());
+            tokio::time::sleep(Duration::from_millis(*latency)).await;
+        }
+        starts
+    }
+
+    /// Issue #1879: tick latency must not add to the heartbeat period.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_period_does_not_grow_with_tick_latency() {
+        let starts = tick_starts(Duration::from_millis(500), &[300, 300, 300, 300]).await;
+        assert_eq!(starts, vec![500, 1000, 1500, 2000]);
+    }
+
+    /// Issue #1879: after a tick longer than one interval, the next tick
+    /// starts at once. Then the schedule keeps one interval between starts.
+    /// It sends no burst of ticks to catch up.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_after_a_slow_tick_starts_at_once_with_no_burst() {
+        let starts = tick_starts(Duration::from_millis(500), &[1200, 0, 0, 0]).await;
+        assert_eq!(starts, vec![500, 1700, 2200, 2700]);
+    }
+
+    /// The first tick comes one interval after the loop starts.
+    /// Registration has just written the row, so an immediate tick is waste.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_first_tick_waits_one_interval() {
+        let starts = tick_starts(Duration::from_secs(5), &[0]).await;
+        assert_eq!(starts, vec![5000]);
+    }
+
+    /// A zero interval becomes 1 ms and does not panic.
+    /// `spawn_worker_heartbeat` is public, so a caller can pass a value that
+    /// the builder rejects.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_schedule_floors_a_zero_interval_to_one_millisecond() {
+        let starts = tick_starts(Duration::ZERO, &[0, 0, 0]).await;
+        assert_eq!(starts, vec![1, 2, 3]);
+    }
+
+    /// A cancel ends the wait before the next tick.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_wait_returns_false_on_cancel() {
+        let cancel = CancellationToken::new();
+        let mut schedule = HeartbeatSchedule::new(Duration::from_millis(500));
+        cancel.cancel();
+        assert!(!schedule.wait(&cancel).await);
     }
 }

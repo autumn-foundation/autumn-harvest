@@ -293,7 +293,8 @@ restart therefore does not change any URL. These tests ignore
 shared database.
 
 Workers use a 500 ms heartbeat, so the lease TTL (the stale threshold) is 1 s.
-The latency test is the exception, see the known bugs below.
+The latency test also raises the workflow-task budget to 60 s, because a
+decision cycle takes more than 10 s at that latency.
 
 | Scenario | Test | Fault | Proof the fault landed |
 |---|---|---|---|
@@ -347,9 +348,11 @@ event, an `ActivityCompleted`.
   TCP keepalive ends the session. That transaction keeps its row locks.
   Orphan reclaim blocked on such a lock, so no orphan was reclaimed. The
   #1876 fix makes reclaim skip a locked row and reclaim the other rows.
-- #1879: the heartbeat period is the interval plus the tick latency. When a
-  tick takes longer than one interval, a live worker looks dead. False
-  reclaims then count crash strikes and quarantine healthy work.
+- #1879: the heartbeat period was the interval plus the tick latency. When a
+  tick took longer than one interval, a live worker looked dead. False
+  reclaims then counted crash strikes and quarantined healthy work. The fix
+  makes the heartbeat fixed-rate. The reclaimer also holds the last strike
+  until it confirms the death of the worker.
 
 Each test works around a bug only where the bug applies:
 
@@ -370,9 +373,6 @@ Each test works around a bug only where the bug applies:
   server. This setting is no longer a #1876 workaround. A row that the
   cut-off session locks stays locked until the session ends. The 5 s limit
   ends that session within the test budget, so the setting stays.
-- For #1879, the latency test uses a 2 s heartbeat. A decision cycle also
-  takes more than 10 s at that latency, so it keeps the default 60 s
-  workflow-task budget.
 
 When a fix for a bug merges, remove its workaround.
 
