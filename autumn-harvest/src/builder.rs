@@ -4461,6 +4461,9 @@ impl WorkerConfig {
     ///
     /// It also sets the drain's join window. A drain never aborts the
     /// handler. See [`WorkerConfig::shutdown_timeout`].
+    ///
+    /// A worker rejects a grace above
+    /// [`crate::worker::MAX_CANCELLATION_GRACE_PERIOD`] (24 h) at startup.
     #[must_use]
     pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
         self.cancellation_grace_period = grace_period;

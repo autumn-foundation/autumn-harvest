@@ -929,6 +929,12 @@ pub const METRIC_CIRCUIT_TRIPPED: &str = "harvest.activity.circuit.tripped";
 /// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_CIRCUIT_CLOSED: &str = "harvest.activity.circuit.closed";
 
+/// Counter: incremented each time an open circuit breaker defers a claimed
+/// task back to `PENDING` (issue #1809, `CircuitOpenMode::Defer`).
+///
+/// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_CIRCUIT_DEFERRED: &str = "harvest.activity.circuit.deferred";
+
 /// Counter: incremented each time an activity handler **panics** (unwinds)
 /// instead of returning a clean `Err`, and the engine contains the panic as a
 /// retryable typed `HandlerPanic` failure (issue #782).
@@ -1510,6 +1516,22 @@ pub const METRIC_SCANNER_PASS: &str = "harvest.scanner.pass";
 /// pool is too small or a connection is stuck. See
 /// `docs/operations/postgres-timeouts.md`.
 pub const METRIC_DB_POOL_ACQUIRE_TIMEOUT: &str = "harvest.db.pool_acquire_timeout";
+
+/// Counter: Postgres aborted a transaction and the engine ran it again
+/// (issue #1822).
+///
+/// Labelled `{site, reason}`. `site` is `persist`, `workflow_task`, `claim`
+/// or `scanner`. `reason` is `deadlock` (`40P01`) or `serialization_failure`
+/// (`40001`). A steady `deadlock` rate points to a lock-order defect. See the
+/// lock-order table in `docs/architecture.md`.
+pub const METRIC_DB_TRANSACTION_RETRY: &str = "harvest.db.transaction_retry";
+
+/// Counter: a transaction still hit a conflict abort after its last retry
+/// (issue #1822).
+///
+/// Labelled `{site, reason}` like [`METRIC_DB_TRANSACTION_RETRY`]. The error
+/// then reaches the caller, so any non-zero rate needs attention.
+pub const METRIC_DB_TRANSACTION_RETRY_EXHAUSTED: &str = "harvest.db.transaction_retry_exhausted";
 
 /// Counter: an activity heartbeat flush failed (issue #1788).
 ///
@@ -2895,6 +2917,24 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = site;
     }
 
+    /// Postgres aborted a transaction and the engine runs it again
+    /// (issue #1822).
+    ///
+    /// `site` is `persist`, `workflow_task`, `claim` or `scanner`. `reason`
+    /// is `deadlock` or `serialization_failure`. Additive with a no-op default.
+    fn record_db_transaction_retry(&self, site: &str, reason: &str) {
+        let _ = (site, reason);
+    }
+
+    /// A transaction still hit a conflict abort after its last retry
+    /// (issue #1822).
+    ///
+    /// Labels as [`Self::record_db_transaction_retry`]. Additive with a no-op
+    /// default.
+    fn record_db_transaction_retry_exhausted(&self, site: &str, reason: &str) {
+        let _ = (site, reason);
+    }
+
     /// An activity heartbeat flush failed (issue #1788).
     ///
     /// `reason` is `acquire_timeout`, `acquire_error` or `write_error`.
@@ -3588,6 +3628,14 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.activity.circuit.closed{activity.name}`.
     fn record_circuit_closed(&self, activity_name: &str) {
+        let _ = activity_name;
+    }
+
+    /// An open circuit breaker deferred a claimed task back to `PENDING`
+    /// (issue #1809).
+    ///
+    /// Maps to the counter `harvest.activity.circuit.deferred{activity.name}`.
+    fn record_circuit_deferred(&self, activity_name: &str) {
         let _ = activity_name;
     }
 

@@ -26,9 +26,9 @@ use autumn_harvest::failure::{
 };
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
-use autumn_harvest::policy::RetryPolicy;
+use autumn_harvest::policy::{CircuitBreakerPolicy, RetryPolicy};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -865,17 +865,29 @@ fn build_wasm_registry(
     wasm: Vec<WasmActivitySpec>,
     metrics: Arc<dyn MetricsRecorder>,
 ) -> Arc<HandlerRegistry> {
+    build_wasm_registry_with(workflows, wasm, metrics, |_| {})
+}
+
+/// [`build_wasm_registry`], with `tweak` applied to each activity.
+fn build_wasm_registry_with(
+    workflows: Vec<WorkflowInfo>,
+    wasm: Vec<WasmActivitySpec>,
+    metrics: Arc<dyn MetricsRecorder>,
+    tweak: impl Fn(&mut ActivityInfo),
+) -> Arc<HandlerRegistry> {
     let mut activities = Vec::new();
     let mut bindings = HashMap::new();
     let mut registrations = Vec::new();
     for spec in wasm {
-        activities.push(ActivityInfo::wasm(
+        let mut activity = ActivityInfo::wasm(
             spec.name,
             None,
             spec.retry.clone(),
             Some(Duration::from_secs(5)),
             spec.schedule_to_close,
-        ));
+        );
+        tweak(&mut activity);
+        activities.push(activity);
         bindings.insert(
             spec.name.to_string(),
             WasmBinding {
@@ -1184,6 +1196,251 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
     assert!(
         !types.iter().any(|t| t.to_lowercase().contains("wasm")),
         "no wasm-specific event variant may appear: {types:?}"
+    );
+
+    // The guest's start marker is written once its module resolves, not in
+    // the `ActivityStarted` transaction (issue #1809).
+    let markers: Vec<(Option<i32>, i32)> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select((
+            harvest_task_queue::handler_started_attempt,
+            harvest_task_queue::attempt,
+        ))
+        .load(&mut conn)
+        .await
+        .expect("load the activity task");
+    assert_eq!(markers.len(), 1, "one activity task: {markers:?}");
+    assert_eq!(
+        markers[0].0,
+        Some(markers[0].1),
+        "the guest that ran marks its attempt started"
+    );
+}
+
+/// Make the WASM start-marker write on `queue` behave as `action` (issue
+/// #1809), run the echo guest, and return its history. The trigger is gone
+/// when this returns.
+async fn run_echo_with_start_marker_trigger(
+    queue: &str,
+    worker_id: &str,
+    action: &str,
+) -> Vec<WorkflowEvent> {
+    run_echo_with_start_marker_trigger_and_bucket(queue, worker_id, action, None)
+        .await
+        .0
+}
+
+/// [`run_echo_with_start_marker_trigger`]. With `bucket`, the activity is
+/// rate-limited on that key and tracked by a circuit breaker, so it debits
+/// at dispatch. The bucket holds one token, has room for two, and never
+/// refills. Returns the history and the tokens left at the end.
+async fn run_echo_with_start_marker_trigger_and_bucket(
+    queue: &str,
+    worker_id: &str,
+    action: &str,
+    bucket: Option<&'static str>,
+) -> (Vec<WorkflowEvent>, Option<f64>) {
+    run_echo_with_start_marker_trigger_and_debit(queue, worker_id, action, bucket, true).await
+}
+
+/// [`run_echo_with_start_marker_trigger_and_bucket`]. Without `tracked`, no
+/// circuit breaker tracks the activity, so its claim debits the token.
+async fn run_echo_with_start_marker_trigger_and_debit(
+    queue: &str,
+    worker_id: &str,
+    action: &str,
+    bucket: Option<&'static str>,
+    tracked: bool,
+) -> (Vec<WorkflowEvent>, Option<f64>) {
+    use diesel_async::SimpleAsyncConnection as _;
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    conn.batch_execute(&format!(
+        "CREATE OR REPLACE FUNCTION t1809_start_marker() RETURNS trigger AS $$ \
+         BEGIN \
+           IF NEW.queue_name = '{queue}' \
+              AND NEW.handler_started_attempt IS DISTINCT FROM OLD.handler_started_attempt THEN \
+             {action}; \
+           END IF; \
+           RETURN NEW; \
+         END $$ LANGUAGE plpgsql; \
+         DROP TRIGGER IF EXISTS t1809_start_marker ON harvest_task_queue; \
+         CREATE TRIGGER t1809_start_marker BEFORE UPDATE ON harvest_task_queue \
+           FOR EACH ROW EXECUTE FUNCTION t1809_start_marker();"
+    ))
+    .await
+    .expect("install the trigger");
+    if let Some(key) = bucket {
+        conn.batch_execute(&format!(
+            "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
+             VALUES ('{key}', 0.0, 2.0, 1.0, NOW()) \
+             ON CONFLICT (key) DO UPDATE SET refill_rate = 0.0, burst = 2.0, tokens = 1.0"
+        ))
+        .await
+        .expect("seed the rate-limit bucket");
+    }
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_run_wasm",
+        serde_json::json!({"hello": "unrecorded"}),
+        queue,
+    )
+    .await;
+    let registry = build_wasm_registry_with(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: assemble(ECHO_WAT),
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            // One attempt, so no retry debits again.
+            retry: bucket.map(|_| RetryPolicy::fixed(1, Duration::from_millis(1))),
+            schedule_to_close: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+        |activity| {
+            if let Some(key) = bucket {
+                activity.rate_limit_rps = Some(1.0);
+                activity.rate_limit_burst = Some(2.0);
+                activity.rate_limit_key = Some(key);
+                activity.circuit_breaker = tracked.then(|| {
+                    CircuitBreakerPolicy::new(100, Duration::from_secs(60), Duration::from_secs(60))
+                });
+            }
+        },
+    );
+    let worker = build_worker(worker_id, queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // Wait until the attempt started, then give the guest time to finish.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let history = load_history(&url, exec_id).await;
+            if history
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the activity starts");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    worker.shutdown();
+    handle.await.expect("worker joins cleanly");
+    conn.batch_execute("DROP TRIGGER IF EXISTS t1809_start_marker ON harvest_task_queue")
+        .await
+        .expect("drop the trigger");
+    let tokens = match bucket {
+        Some(key) => Some(bucket_tokens(&mut conn, key).await),
+        None => None,
+    };
+    (load_history(&url, exec_id).await, tokens)
+}
+
+/// The tokens left in the rate-limit bucket `key`.
+async fn bucket_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+        .bind::<diesel::sql_types::Text, _>(key)
+        .get_result::<Tokens>(conn)
+        .await
+        .expect("read the rate-limit bucket")
+        .tokens
+}
+
+/// A WASM guest must not start after its claim is lost (issue #1809). The
+/// start marker is the last claim-fenced write before the guest runs. The
+/// trigger makes that write match no row, as a timeout committed in between
+/// would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_guest_does_not_start_after_a_lost_claim() {
+    let history =
+        run_echo_with_start_marker_trigger("q-wasm-lost-claim", "w-wasm-lost-claim", "RETURN NULL")
+            .await;
+    assert_eq!(
+        find_activity_completed(&history),
+        None,
+        "a guest whose claim was lost must not run: {history:?}"
+    );
+}
+
+/// A tracked WASM activity debits its token at dispatch, before its module
+/// resolves (issue #1809). When the claim is lost before the guest starts,
+/// the worker gives that token back. The enforcer cannot see this debit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_dispatch_debit_comes_back_when_the_guest_never_starts() {
+    let (history, tokens) = run_echo_with_start_marker_trigger_and_bucket(
+        "q-wasm-lost-debit",
+        "w-wasm-lost-debit",
+        "RETURN NULL",
+        Some("t1809-wasm-dispatch-bucket"),
+    )
+    .await;
+    assert_eq!(
+        find_activity_completed(&history),
+        None,
+        "the guest must not run: {history:?}"
+    );
+    let tokens = tokens.expect("a bucket");
+    assert!(
+        (tokens - 1.0).abs() < 0.01,
+        "the dispatch debit comes back, so the bucket holds its one token: {tokens}"
+    );
+}
+
+/// An untracked WASM activity debits its token at the claim. When the claim
+/// is lost before the guest starts, the worker refunds that debit itself.
+/// Only the dispatch that made a debit refunds it (issue #1809).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_claim_debit_comes_back_when_the_guest_never_starts() {
+    let (history, tokens) = run_echo_with_start_marker_trigger_and_debit(
+        "q-wasm-lost-claim-debit",
+        "w-wasm-lost-claim-debit",
+        "RETURN NULL",
+        Some("t1809-wasm-claim-bucket"),
+        false,
+    )
+    .await;
+    assert_eq!(
+        find_activity_completed(&history),
+        None,
+        "the guest must not run: {history:?}"
+    );
+    let tokens = tokens.expect("a bucket");
+    assert!(
+        (tokens - 1.0).abs() < 0.01,
+        "the claim debit comes back, so the bucket holds its one token: {tokens}"
+    );
+}
+
+/// A WASM guest must not start when its start marker cannot be written
+/// (issue #1809). A later timeout of an unrecorded start would feed no
+/// breaker. The attempt fails as a retry instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_guest_does_not_start_when_its_start_is_not_recorded() {
+    let history = run_echo_with_start_marker_trigger(
+        "q-wasm-unrecorded-start",
+        "w-wasm-unrecorded-start",
+        "RAISE EXCEPTION 'start marker refused'",
+    )
+    .await;
+    assert_eq!(
+        find_activity_completed(&history),
+        None,
+        "a guest whose start was not recorded must not run: {history:?}"
     );
 }
 

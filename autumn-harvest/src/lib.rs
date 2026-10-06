@@ -246,8 +246,8 @@ pub mod canary;
 /// `#[cfg(feature = "chaos")]` and never part of a production binary.
 #[doc(hidden)]
 pub mod chaos;
-/// Per-activity circuit breaker that fast-fails dispatch during downstream
-/// outages (issue #369).
+/// Per-activity circuit breaker that stops dispatch during downstream
+/// outages (issues #369, #1809).
 pub mod circuit_breaker;
 /// Payload-codec key rotation and the lazy re-encryption sweep (issue #948).
 ///
@@ -467,6 +467,13 @@ pub mod shard_fence;
 pub mod shard_rebalance;
 /// Shared, immutable JSON payload for the workflow start path (issue #1733).
 pub mod shared_json;
+/// Retry a transaction after a deadlock or serialization abort (issue #1822).
+///
+/// Engine internal with no stability guarantee. It is `pub` for the
+/// integration tests only.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub mod tx_retry;
 
 /// `cfg(shuttle)` async-primitive shim (tokio under normal builds).
 ///
