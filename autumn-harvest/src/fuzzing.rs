@@ -950,10 +950,11 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                     batch.late.insert(Pending::Activity(*activity_id));
                 }
             }
-            // A branch that resumed can end the run while a sibling still
-            // waits. It can continue as new, or fail as in `try_join!`.
+            // A branch can end the run while a sibling still waits. It can
+            // continue as new, or fail as in `try_join!`. It is the branch
+            // that resumed, or a new branch on the first poll.
             Some(op @ (Op::ContinueAsNew { .. } | Op::Fail { .. } | Op::Complete { .. }))
-                if batch.resumed_with_waiting() =>
+                if batch.waiting() =>
             {
                 batch.push(op, None);
             }

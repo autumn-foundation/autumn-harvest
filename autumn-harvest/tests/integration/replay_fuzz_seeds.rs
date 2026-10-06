@@ -333,8 +333,9 @@ fn shape(ops: &[Op]) -> String {
 /// does a local activity in a resumed branch, or a pause pair. A
 /// received signal settles its own branch. So does the outcome of an
 /// external operation, or the signal that wins a signal timeout or a race.
-/// The record of a race does not end the batch. A branch that resumed can
-/// continue as new, or fail the run, while a sibling still waits.
+/// The record of a race does not end the batch. A branch can continue as
+/// new, or fail the run, while a sibling still waits. That holds for a
+/// branch that resumed and for one on the first poll.
 #[test]
 fn a_join_branch_continues_where_its_wait_ended() {
     let expected = [
@@ -393,6 +394,10 @@ fn a_join_branch_continues_where_its_wait_ended() {
         (
             "baseline-join-branch-continues-into-failure.json",
             "join(slow, seq(fast, fail))",
+        ),
+        (
+            "baseline-join-branch-continues-into-failure-at-first-poll.json",
+            "join(slow, fail)",
         ),
     ];
     let cases = seed("baseline-join-branch-continues");
