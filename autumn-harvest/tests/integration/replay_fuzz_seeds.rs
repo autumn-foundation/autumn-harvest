@@ -297,8 +297,11 @@ fn shape(ops: &[Op]) -> String {
             ops.iter().map(one).collect::<Vec<_>>().join(", ")
         };
         match op["op"].as_str().unwrap_or_default() {
-            "activity" => name.to_string(),
+            "activity" | "external_activity" => name.to_string(),
             "signal" => format!("signal {name}"),
+            "signal_timeout" => format!("signal timeout {name}"),
+            "signal_external" => format!("signal external {name}"),
+            "mutex" => format!("mutex {}", op["key"].as_str().unwrap_or_default()),
             "side_effect" => format!("side effect {name}"),
             "concurrent" => format!("join({})", nested("ops")),
             "sequence" => format!("seq({})", nested("ops")),
@@ -312,7 +315,8 @@ fn shape(ops: &[Op]) -> String {
 
 /// A command right after the outcome of one `join!` branch continues that
 /// branch. A start or a heartbeat of a member does not end the batch. A
-/// received signal settles its own branch.
+/// received signal settles its own branch. So does the outcome of an
+/// external operation, or the signal that wins a signal timeout.
 #[test]
 fn a_join_branch_continues_where_its_wait_ended() {
     let expected = [
@@ -332,6 +336,22 @@ fn a_join_branch_continues_where_its_wait_ended() {
             "baseline-join-branch-continues-after-signal.json",
             "join(slow, seq(signal go, next)); complete",
         ),
+        (
+            "baseline-join-branch-continues-after-signal-timeout.json",
+            "join(slow, seq(signal timeout go, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-after-external-signal.json",
+            "join(slow, seq(signal external ping, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-after-external-cancel.json",
+            "join(slow, seq(cancel_external, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-after-external-await.json",
+            "join(slow, seq(await_external, next)); complete",
+        ),
     ];
     let cases = seed("baseline-join-branch-continues");
     assert_eq!(cases.len(), expected.len(), "one expectation per seed");
@@ -345,6 +365,38 @@ fn a_join_branch_continues_where_its_wait_ended() {
             check_case(case),
             Verdict::Replayed("ReplaySucceeded".to_string()),
             "seed {name}"
+        );
+    }
+}
+
+/// The mirror puts the continuation of a mutex grant or an external activity
+/// in its branch too. Replay of these two histories stops early today.
+/// `scan_activity_terminal` stops at a `MutexGranted` or an external-activity
+/// event, so it never finds the completion of the sibling activity. A fix in
+/// the replayer flips these verdicts.
+#[test]
+fn a_join_branch_after_a_mutex_or_external_activity_hits_the_engine_gap() {
+    let expected = [
+        (
+            "engine-gap-mutex-in-join.json",
+            "join(slow, seq(mutex k, next)); complete",
+        ),
+        (
+            "engine-gap-external-activity-in-join.json",
+            "join(slow, seq(approve, next)); complete",
+        ),
+    ];
+    let cases = seed("engine-gap-");
+    for (name, want) in expected {
+        let (_, case) = cases
+            .iter()
+            .find(|(seed, _)| seed == name)
+            .unwrap_or_else(|| panic!("seed {name} is missing"));
+        assert_eq!(shape(&mirror(&case.history)), want, "seed {name}");
+        let verdict = check_case(case);
+        assert!(
+            matches!(&verdict, Verdict::Replayed(r) if r.contains("workflow suspended early")),
+            "seed {name}: {verdict:?}"
         );
     }
 }

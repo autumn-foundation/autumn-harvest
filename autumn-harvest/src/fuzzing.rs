@@ -44,7 +44,10 @@ use crate::payload_store::{
 use crate::replay::{DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatcher};
 use crate::telemetry::NoOpMetrics;
 use crate::testing::{ReplayReport, WorkflowReplayer};
-use crate::types::{ActivityExecId, ExecutionId, ExternalTarget, ParentClosePolicy};
+use crate::types::{
+    ActivityExecId, ExecutionId, ExternalAwaitId, ExternalCancelId, ExternalSignalId,
+    ExternalTarget, ParentClosePolicy,
+};
 
 /// The deepest JSON nesting that the generator builds.
 const MAX_DEPTH: u32 = 6;
@@ -916,6 +919,10 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                 for i in claimed.difference(&claimed_before) {
                     keys.extend(pending_key(&history[*i]));
                 }
+                // A signal timeout also settles when its signal wins.
+                if let Op::SignalTimeout { name, .. } = &op {
+                    keys.insert(Pending::SignalWait(name.clone()));
+                }
                 let any = matches!(
                     op,
                     Op::Race { .. } | Op::ChildTimeout { .. } | Op::SignalTimeout { .. }
@@ -929,11 +936,11 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                     any,
                     fail_fast,
                 });
-                let signal = matches!(op, Op::Signal { .. });
+                // The event of a signal or a mutex grant is the outcome of
+                // its wait, so its branch goes on with the next command.
+                let arrived = matches!(op, Op::Signal { .. } | Op::Mutex { .. });
                 batch.push(op, waits);
-                if signal {
-                    // The signal already arrived, so its branch goes on with
-                    // the next command.
+                if arrived {
                     batch.resume_last();
                 }
             }
@@ -948,25 +955,37 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     program
 }
 
-/// What a batch member waits for: the outcome of an activity, a child or a
-/// timer.
+/// What a batch member waits for: the outcome of an activity, a child, a
+/// timer, an external operation, or the signal of a signal timeout.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Pending {
     Activity(ActivityExecId),
     Child(ExecutionId),
     Timer(String),
+    Signal(ExternalSignalId),
+    Cancel(ExternalCancelId),
+    Await(ExternalAwaitId),
+    SignalWait(String),
 }
 
 /// The outcome that the command `event` waits for, if any.
 fn pending_key(event: &WorkflowEvent) -> Option<Pending> {
     match event {
-        WorkflowEvent::ActivityScheduled { activity_id, .. } => {
+        WorkflowEvent::ActivityScheduled { activity_id, .. }
+        | WorkflowEvent::ActivityAwaitingExternal { activity_id, .. } => {
             Some(Pending::Activity(*activity_id))
         }
         WorkflowEvent::ChildWorkflowStarted { child_id, .. } => Some(Pending::Child(*child_id)),
         WorkflowEvent::TimerStarted { timer_id, .. } => {
             Some(Pending::Timer(timer_id.as_str().to_string()))
         }
+        WorkflowEvent::ExternalSignalRequested { signal_id, .. } => {
+            Some(Pending::Signal(*signal_id))
+        }
+        WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => {
+            Some(Pending::Cancel(*cancel_id))
+        }
+        WorkflowEvent::ExternalAwaitRequested { await_id, .. } => Some(Pending::Await(*await_id)),
         _ => None,
     }
 }
@@ -976,7 +995,9 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
     match event {
         WorkflowEvent::ActivityCompleted { activity_id, .. }
         | WorkflowEvent::ActivityFailed { activity_id, .. }
-        | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+        | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+        | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+        | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
             Some(Pending::Activity(*activity_id))
         }
         WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
@@ -984,16 +1005,32 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
         WorkflowEvent::TimerFired { timer_id } => {
             Some(Pending::Timer(timer_id.as_str().to_string()))
         }
+        WorkflowEvent::ExternalSignalDelivered { signal_id }
+        | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+            Some(Pending::Signal(*signal_id))
+        }
+        WorkflowEvent::ExternalCancelDelivered { cancel_id }
+        | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+            Some(Pending::Cancel(*cancel_id))
+        }
+        WorkflowEvent::ExternalAwaitResolved { await_id, .. }
+        | WorkflowEvent::ExternalAwaitFailed { await_id, .. } => Some(Pending::Await(*await_id)),
+        // A plain signal maps to an op. Only a signal that a signal timeout
+        // or a race took reaches this match.
+        WorkflowEvent::SignalReceived { signal_name, .. } => {
+            Some(Pending::SignalWait(signal_name.clone()))
+        }
         _ => None,
     }
 }
 
-/// The activity that `event` reports progress for, if it is a start or a
-/// heartbeat.
+/// The activity that `event` reports progress for, if it is a start, a
+/// heartbeat or a deadline extension.
 const fn progress_key(event: &WorkflowEvent) -> Option<Pending> {
     match event {
         WorkflowEvent::ActivityStarted { activity_id, .. }
-        | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
+        | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+        | WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
             Some(Pending::Activity(*activity_id))
         }
         _ => None,
@@ -1015,10 +1052,10 @@ struct Waits {
 /// A batch stays open past the outcome of one member while another member
 /// still waits. A command right after that outcome came from the same
 /// branch, as in `join!(slow, async { fast.await; next.await })`, so it
-/// joins that branch as a sequence. A received signal settles its own
-/// branch the same way. An activity start or heartbeat leaves the batch as
-/// it is. The batch closes at any other event, or once every member has
-/// settled.
+/// joins that branch as a sequence. A received signal or a mutex grant
+/// settles its own branch the same way. An activity start or heartbeat
+/// leaves the batch as it is. The batch closes at any other event, or once
+/// every member has settled.
 #[derive(Default)]
 struct Batch {
     branches: Vec<Vec<Op>>,
