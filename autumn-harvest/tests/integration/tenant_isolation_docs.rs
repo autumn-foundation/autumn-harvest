@@ -66,8 +66,11 @@ fn adr_cites_only_real_apis() {
         ("with_queues", &builder, "builder.rs"),
     ] {
         assert!(adr.contains(api), "{ADR} must cite `{api}`");
+        let declared = [format!("pub fn {api}("), format!("pub fn {api}<")]
+            .iter()
+            .any(|sig| source.contains(sig.as_str()));
         assert!(
-            source.contains(&format!("pub fn {api}(")),
+            declared,
             "{ADR} cites `{api}`, but {file} has no such public fn"
         );
     }

@@ -162,6 +162,7 @@ curl -s .../admin/config | jq -S '.shard_topology'
   "default_shard": 0,
   "readable_shards": [0, 1],
   "residency_map": { "eu": 0, "us": 1 },
+  "reserved_shards": [],
   "shard_forwards": {},
   "writable_shards": [0, 1]
 }
@@ -250,7 +251,7 @@ So pinning the **root** of a workflow tree confines the whole tree.
 - **Deferred starts cannot be pinned.** Debounce (#499) and batch (#518) admit a start without creating an execution, so there is nothing to place at request time; combining either with `shard_id` / `residency_key` is a `400` rather than a silently discarded pin. A throttled start (#607) *is* pinned — it defers the same concrete placement to its scanner.
 - **Rollout ordering.** Placement is enforced by the node handling the start. During a rolling deploy, a pinned request that lands on a pre-#697 node is accepted and hashed, silently ignoring the pin. Upgrade the whole fleet before you begin sending pinned starts, and treat the first pinned start as the cutover point.
 - **Residency keys are an operator-declared, low-cardinality set.** The map is held in memory on every node and validated at boot; it is sized for regions/jurisdictions (single digits to dozens), not per-tenant keys. For per-tenant placement, map the tenant to a region in your own application layer and pass the region as the key.
-- **Out of scope**: migrating a *running* workflow between shards, per-shard worker assignment, geo-replication / cross-region failover, and inferring residency from payload contents. Harvest never reads your payload to decide placement — the caller states it explicitly.
+- **Out of scope**: migrating a *running* workflow between shards, geo-replication / cross-region failover, and inferring residency from payload contents. Per-shard worker assignment is supported; see [Tenant cells](#tenant-cells-issue-1837). Harvest never reads your payload to decide placement — the caller states it explicitly.
 
 ### Business-key addressing finds a pinned run wherever it is (issue #1146)
 
@@ -406,6 +407,98 @@ If you need approximate cross-shard fair-share rather than a hard global cap, th
 When a worker crashes and its heartbeat times out, the `timeout.rs` scanner transitions the claimed task back to `PENDING` state. The concurrency cap check counts only `RUNNING` rows, so the slot is immediately available for another worker to claim. No operator intervention is required.
 
 This is handled entirely within the shard where the task lives — no cross-shard coordination is needed for crash recovery.
+
+---
+
+## Tenant cells (issue #1837)
+
+A cell is one shard and one worker pool for one tenant. A flood in a cell
+does not reach tenants outside it. The cell has its own database
+connections, scanners, NOTIFY channel and worker slots. Key-based quotas
+cannot isolate those resources. [ADR 0004](adr/0004-tenant-isolation-cells.md)
+records the decision and its limits.
+
+### Build a cell
+
+1. Reserve the cell shard on the router of **every** replica.
+   `with_reserved_shards` keeps unpinned starts off the shard.
+2. Map a cell residency key to the shard. Name the cell, not the tenant.
+3. Give each pool explicit shard assignments.
+
+```rust
+use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::types::ShardId;
+use autumn_harvest::WorkerConfig;
+
+let shared = ShardId::new(0);
+let cell_a = ShardId::new(1);
+let router = ShardRouter::new(vec![shared, cell_a], vec![shared, cell_a], shared)
+    .with_residency_map([("cell-a".to_string(), cell_a)])
+    .with_reserved_shards([cell_a]);
+
+// Shared processes serve every unreserved shard.
+let shared_pool = WorkerConfig::default().with_shard_assignments([shared]);
+// Cell processes serve the cell shard only.
+let cell_pool = WorkerConfig::default().with_shard_assignments([cell_a]);
+```
+
+Pass the router to `HarvestRunnerResources::with_shard_router`. The
+`HarvestPlugin` boot path is single shard, so it cannot host a cell.
+
+4. Start the tenant's work with the cell key. The application keeps the
+   tenant-to-cell map.
+
+```bash
+curl -X POST .../workflows/import_orders/start \
+  -d '{"workflow_id": "acme-42", "input": {}, "residency_key": "cell-a"}'
+```
+
+An in-process start resolves the shard first:
+
+```rust
+use autumn_harvest::shard::ShardPlacement;
+use autumn_harvest::types::ExecutionId;
+
+let placement = ShardPlacement::residency_key("cell-a");
+let shard = router.resolve_placement(&placement, "import_orders", "acme-42")?;
+let exec_id = ExecutionId::new_for_shard(shard);
+// Pass exec_id in StartWorkflowParams on that shard's connection.
+```
+
+### Rules
+
+- **Unpinned placement never picks a reserved shard.** That covers
+  `ShardPlacement::Auto`, idempotency-key routing, DAG pinning and
+  `ChildPlacement::Distributed`. A pin by `shard_id` or `residency_key`
+  still reaches it.
+- **Only keys that hashed to the reserved shard move.** They re-hash among
+  the other writable shards. Other keys keep their shard.
+- **Reserve a fresh shard.** A business key already on the shard hashes
+  elsewhere after the reservation. This is the same effect as a drain.
+- **An auto pool is refused.** The standalone runner does not start a
+  worker without explicit shard assignments when the router reserves
+  shards. An auto pool covers every pool shard, cells included.
+- **Children stay in the cell** by default. `Distributed` children leave it.
+- **Some start paths cannot reach a cell.** Signal-with-start,
+  update-with-start, debounce, batch and the typed stubs carry no pin.
+- **At least one writable shard stays unreserved.** The router panics at
+  boot otherwise.
+
+### Verify a cell
+
+- `GET /api/harvest/admin/config` reports `shard_topology.reserved_shards`.
+  Diff it across replicas. A replica that does not reserve the cell hashes
+  shared tenants into it.
+- `GET /api/harvest/admin/shards/health` shows a live worker on each cell
+  shard.
+- `harvest.queue.schedule_to_start{queue}` measures each tenant when each
+  tenant has its own queue.
+
+### Proof
+
+`tenant_cell_isolation_tests.rs` floods tenant A in a cell. Tenant B's worst
+schedule-to-start stays under 3 s. A control run on one shared shard pushes
+it above 3 s.
 
 ---
 

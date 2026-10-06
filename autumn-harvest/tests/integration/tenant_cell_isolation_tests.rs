@@ -101,7 +101,11 @@ async fn setup_shard_databases(
         .expect("connect to the admin database");
     let mut urls = BTreeMap::new();
     for shard in shards {
-        let db_name = format!("h1837_s{}_{}", shard.as_i32(), uuid::Uuid::new_v4().simple());
+        let db_name = format!(
+            "h1837_s{}_{}",
+            shard.as_i32(),
+            uuid::Uuid::new_v4().simple()
+        );
         diesel::sql_query(format!("CREATE DATABASE {db_name}"))
             .execute(&mut admin)
             .await
@@ -487,7 +491,15 @@ async fn probe_tenant_b(
     let mut probes = Vec::new();
     for i in 0..PROBES {
         let id = format!("b-{i}");
-        let exec_id = start(router, sharded, &ShardPlacement::Auto, "probe_wf", &id, QUEUE_B).await;
+        let exec_id = start(
+            router,
+            sharded,
+            &ShardPlacement::Auto,
+            "probe_wf",
+            &id,
+            QUEUE_B,
+        )
+        .await;
         assert_eq!(
             exec_id.shard(),
             SHARED,
@@ -509,7 +521,9 @@ async fn probe_tenant_b(
         2 * PROBES,
         samples.len()
     );
-    Duration::from_secs_f64(samples.into_iter().fold(0.0, f64::max))
+    let worst = Duration::from_secs_f64(samples.into_iter().fold(0.0, f64::max));
+    eprintln!("tenant B worst schedule-to-start: {worst:?} (bound {BOUND:?})");
+    worst
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -529,7 +543,12 @@ async fn a_flood_in_one_cell_does_not_raise_the_other_tenants_schedule_to_start(
 
     let shared_metrics = Arc::new(WaitRecorder::default());
     let cell_metrics = Arc::new(WaitRecorder::default());
-    let shared_pool = build_worker(&sharded, vec![SHARED], Arc::clone(&shared_metrics), "shared");
+    let shared_pool = build_worker(
+        &sharded,
+        vec![SHARED],
+        Arc::clone(&shared_metrics),
+        "shared",
+    );
     let cell_pool = build_worker(&sharded, vec![CELL_A], Arc::clone(&cell_metrics), "cell-a");
     let shared_run = spawn(&shared_pool, &sharded);
     let cell_run = spawn(&cell_pool, &sharded);

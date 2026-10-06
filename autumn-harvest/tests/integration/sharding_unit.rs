@@ -193,8 +193,8 @@ fn reserved_shards_are_sorted_and_deduplicated() {
 #[should_panic(expected = "reserved shard 9 is not in the readable set")]
 fn reserving_an_unknown_shard_panics_at_boot() {
     let all = vec![ShardId::new(0), ShardId::new(1)];
-    let _ = ShardRouter::new(all.clone(), all, ShardId::new(0))
-        .with_reserved_shards([ShardId::new(9)]);
+    let _ =
+        ShardRouter::new(all.clone(), all, ShardId::new(0)).with_reserved_shards([ShardId::new(9)]);
 }
 
 #[test]

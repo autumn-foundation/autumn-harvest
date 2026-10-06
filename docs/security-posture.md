@@ -538,6 +538,29 @@ for the mechanism. Security-relevant properties:
 
 ---
 
+## Multi-tenant deployment (issue #1837)
+
+[ADR 0004](./adr/0004-tenant-isolation-cells.md) records the decision.
+
+- **Cooperative multi-tenancy is supported.** Many tenants of one operator
+  can share a deployment. Quotas, throttles and concurrency caps bound a
+  tenant on a shared shard. A **cell** gives a tenant its own shard and its
+  own worker pool. See [Tenant cells](./sharding.md#tenant-cells-issue-1837).
+- **A cell is not a security boundary between tenants.** It bounds load,
+  not access. Any caller that may start a workflow may also pin it into any
+  cell. To confine a caller to its tenant, install an
+  [authorizer hook](#authorizer-hook-issue-1803) and check the shard and
+  the target.
+- **The tenant header is not an identity.** The caller declares
+  `x-harvest-tenant`. Harvest does not bind it to stored executions.
+- **Name cells, not tenants.** A cell residency key appears in requests,
+  CLI calls and audit rows. Use `cell-a`, not a customer name. Keep the
+  tenant-to-cell map in the application.
+- **Namespaces are not supported.** All tenants on one shard share its
+  tables. Harvest has no per-tenant row scoping.
+
+---
+
 ## Business-key targeting for signal/cancel (issue #751)
 
 `WorkflowContext::signal_external_workflow_by_id` and
@@ -916,6 +939,10 @@ record. Without it, records default to `"anonymous"`.
 Authentication middleware applies uniformly across all shards because it wraps
 the router layer, not individual handlers. No extra configuration is needed for
 multi-shard deployments.
+
+A deployment with tenant cells needs one more check. The authorizer hook
+must refuse a pin into a cell the caller does not own. See
+[Multi-tenant deployment](#multi-tenant-deployment-issue-1837).
 
 ### 6. Payloads that carry PII are encrypted
 

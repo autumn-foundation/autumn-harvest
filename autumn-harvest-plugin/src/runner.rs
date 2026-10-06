@@ -853,6 +853,20 @@ impl PreparedHarvestRuntime {
         // configured `WorkerConfig::with_sharded_pool` to a single shard.
         worker_runtime_config.sharded_pool = Some(storage_pool.sharded_pool().clone());
 
+        // An auto pool covers every pool shard, cell shards included. It
+        // would drain a tenant cell and void its isolation (issue #1837).
+        let unassigned_cells = reserved_shards_under_auto_assignment(
+            &shard_router,
+            &worker_runtime_config.shard_assignments,
+        );
+        if !unassigned_cells.is_empty() {
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "ShardRouter reserves shards {unassigned_cells:?} for tenant cells, but this \
+                 worker has no explicit shard assignments and would drain them; call \
+                 WorkerConfig::with_shard_assignments with the shards this pool serves"
+            )));
+        }
+
         // Resolve auto (empty) shard assignments now that `sharded_pool` is
         // final (issue #961, AC1). `Worker::new` runs the same idempotent pass,
         // but doing it here first means the warning below — and anything else
@@ -2290,6 +2304,26 @@ fn warn_uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId])
     }
 }
 
+/// Reserved shards that an auto-assigned worker would drain (issue #1837).
+///
+/// An empty `assignments` list means auto: the worker covers every pool
+/// shard. When the router reserves shards for tenant cells, such a worker
+/// also claims cell work. Startup refuses it. An explicit list is a
+/// deliberate choice, so it is accepted even when it names a cell shard.
+fn reserved_shards_under_auto_assignment(
+    router: &ShardRouter,
+    assignments: &[ShardId],
+) -> Vec<i32> {
+    if !assignments.is_empty() {
+        return Vec::new();
+    }
+    router
+        .reserved_shards()
+        .iter()
+        .map(|shard| shard.as_i32())
+        .collect()
+}
+
 fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
     let mut missing: Vec<ShardId> = router
         .readable_shards()
@@ -2333,8 +2367,8 @@ pub(crate) fn injected_runtime_state(
 mod tests {
     use super::{
         DeferredAuditExportInstall, HarvestRunnerResources, registered_workflow_type_names,
-        resolve_runtime_storage_pool, select_runtime_gate_shards, select_runtime_shard0_pool,
-        uncovered_writable_shards,
+        reserved_shards_under_auto_assignment, resolve_runtime_storage_pool,
+        select_runtime_gate_shards, select_runtime_shard0_pool, uncovered_writable_shards,
     };
     use autumn_harvest::shard::ShardRouter;
     use autumn_harvest::shard::ShardedDbPool;

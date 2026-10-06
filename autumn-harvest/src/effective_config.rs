@@ -617,6 +617,12 @@ pub struct ShardTopologyView {
     /// reporting identical `readable`/`writable`/`default` sets. Diff this field
     /// across replicas as the last step of a shard decommission.
     pub shard_forwards: BTreeMap<i32, i32>,
+    /// The shards reserved for pinned work, one per tenant cell (issue #1837).
+    ///
+    /// Empty unless the deployment reserves a shard. Unpinned starts never
+    /// land on these shards. Diff this field across replicas. A replica that
+    /// does not reserve a cell shard hashes shared tenants into that cell.
+    pub reserved_shards: Vec<i32>,
 }
 
 impl ShardTopologyView {
@@ -635,6 +641,7 @@ impl ShardTopologyView {
             default_shard,
             residency_map,
             shard_forwards,
+            reserved_shards,
         } = router.parts();
         Self {
             readable_shards: readable_shards.iter().map(|s| s.as_i32()).collect(),
@@ -648,6 +655,7 @@ impl ShardTopologyView {
                 .iter()
                 .map(|(from, to)| (from.as_i32(), to.as_i32()))
                 .collect(),
+            reserved_shards: reserved_shards.iter().map(|s| s.as_i32()).collect(),
         }
     }
 }
