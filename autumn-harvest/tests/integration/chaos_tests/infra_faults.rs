@@ -1030,8 +1030,9 @@ async fn toxiproxy_partition_longer_than_lease_ttl() {
     LATE_RETURNS.store(0, Ordering::SeqCst);
     let db = FaultDb::start().await;
     // Postgres keeps the open transaction of a partitioned worker. That
-    // transaction keeps its row locks, and orphan reclaim stalls behind them
-    // (bug #1876). This server timeout ends such a session.
+    // transaction keeps its row locks. Orphan reclaim skips a locked row
+    // (issue #1876), but it cannot reclaim the row until the session ends.
+    // This server timeout ends such a session within the test budget.
     db.limit_idle_in_transaction(5).await;
     let input = serde_json::json!({ "sleep_ms": 0, "hold_attempts": true });
     let execs = start_workload(
