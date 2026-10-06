@@ -219,3 +219,150 @@ fn request_is_complete(request: &[u8]) -> bool {
         .unwrap_or(0);
     request.len() >= header_end + content_length
 }
+
+// ── HTTP timeouts (issue #1832) ──────────────────────────────────────────────
+
+/// Accept TCP connections and never answer. Returns the base URL.
+async fn spawn_black_hole() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("black hole should bind");
+    let addr = listener.local_addr().expect("black hole should have addr");
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    (format!("http://{addr}/api/harvest"), task)
+}
+
+// Issue #1832 AC: a CLI call to a black-hole endpoint fails within the timeout.
+#[tokio::test]
+async fn execute_fails_within_the_timeout_on_a_black_hole_endpoint() {
+    let (base_url, black_hole) = spawn_black_hole().await;
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--base-url",
+        &base_url,
+        "--http-timeout-secs",
+        "1",
+        "health",
+    ])
+    .expect("CLI args should parse");
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), execute(&cli))
+        .await
+        .expect("execute must give up on its own, not hang");
+    let elapsed = started.elapsed();
+    black_hole.abort();
+
+    match outcome {
+        Err(CliError::Timeout { seconds }) => assert_eq!(seconds, 1),
+        other => panic!("expected CliError::Timeout, got {other:?}"),
+    }
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "a 1 s timeout took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn timeout_error_names_the_flag() {
+    let message = CliError::Timeout { seconds: 7 }.to_string();
+    assert!(message.contains("7 s"), "{message}");
+    assert!(message.contains("--http-timeout-secs"), "{message}");
+}
+
+#[test]
+fn http_timeout_defaults_to_thirty_seconds_and_rejects_zero() {
+    let cli = Cli::try_parse_from(["harvest", "health"]).expect("CLI args should parse");
+    assert_eq!(cli.http_timeout(), std::time::Duration::from_secs(30));
+    assert!(
+        Cli::try_parse_from(["harvest", "--http-timeout-secs", "0", "health"]).is_err(),
+        "a zero timeout would fail every request"
+    );
+}
+
+// The events tail bounds the wait for headers by the timeout.
+#[tokio::test]
+async fn events_tail_fails_within_the_timeout_on_a_black_hole_endpoint() {
+    let (base_url, black_hole) = spawn_black_hole().await;
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--base-url",
+        &base_url,
+        "--http-timeout-secs",
+        "1",
+        "events",
+        "tail",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("CLI args should parse");
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), run_cli(cli))
+        .await
+        .expect("events tail must give up on its own, not hang");
+    black_hole.abort();
+
+    assert!(
+        matches!(outcome, Err(CliError::Timeout { seconds: 1 })),
+        "expected CliError::Timeout, got {outcome:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+// A live stream outlasts the timeout. Only the header wait is bounded.
+#[tokio::test]
+async fn events_tail_stream_may_outlast_the_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let addr = listener.local_addr().expect("test server should have addr");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("server should accept");
+        let mut buf = [0_u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                  connection: close\r\n\r\n",
+            )
+            .await
+            .expect("server should send headers");
+        // Three keepalives, 0.6 s apart, then the end. That is 1.8 s in all.
+        for _ in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            socket
+                .write_all(b": keepalive\n\n")
+                .await
+                .expect("server should send keepalive");
+        }
+        socket
+            .write_all(b"event: stream-end\ndata: {}\n\n")
+            .await
+            .expect("server should end the stream");
+    });
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--base-url",
+        &format!("http://{addr}/api/harvest"),
+        "--http-timeout-secs",
+        "1",
+        "events",
+        "tail",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("CLI args should parse");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), run_cli(cli))
+        .await
+        .expect("the stream should end");
+    server.await.expect("server task should finish");
+    assert!(
+        outcome.is_ok(),
+        "a 1.8 s stream must survive a 1 s timeout: {outcome:?}"
+    );
+}

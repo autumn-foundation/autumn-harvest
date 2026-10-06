@@ -26,6 +26,8 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:3000/api/harvest";
+/// Default for `--http-timeout-secs` (issue #1832).
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 /// Characters percent-encoded when a caller-supplied value becomes one URL path
 /// segment.
 ///
@@ -85,6 +87,19 @@ pub struct Cli {
     /// Output format for successful API responses.
     #[arg(long, global = true, value_enum, default_value = "pretty-json")]
     output: OutputFormat,
+
+    /// Seconds an HTTP request to the management API may take (issue #1832).
+    ///
+    /// A request that gets no full response in this time fails. For
+    /// `events tail`, it bounds the wait for the response headers only.
+    #[arg(
+        long,
+        global = true,
+        env = "HARVEST_HTTP_TIMEOUT_SECS",
+        default_value_t = DEFAULT_HTTP_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    http_timeout_secs: u64,
 
     #[command(subcommand)]
     command: Commands,
@@ -658,6 +673,16 @@ pub enum CliError {
     /// HTTP transport failed.
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
+
+    /// The management API did not answer in time (issue #1832).
+    #[error(
+        "request timed out after {seconds} s; raise --http-timeout-secs \
+         (HARVEST_HTTP_TIMEOUT_SECS) for a slow link"
+    )]
+    Timeout {
+        /// The timeout that expired, in seconds.
+        seconds: u64,
+    },
 
     /// The Harvest API returned a non-success status.
     #[error("harvest API returned {status}: {body}")]
@@ -3194,6 +3219,11 @@ enum DeadLetterCommand {
         /// Preview matching rows without performing any writes.
         #[arg(long)]
         dry_run: bool,
+        /// Spread the replayed tasks over this many seconds (issue #1832).
+        /// 0 makes every task due at once. Default: 60 s for 1000 rows,
+        /// pro-rated for fewer.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=3600))]
+        spread_secs: Option<u64>,
     },
     /// Aggregate dead-lettered tasks by dimension for fast root-cause triage.
     ///
@@ -3316,6 +3346,11 @@ enum DeadLetterCommand {
         /// Preview matching rows without re-enqueuing.
         #[arg(long)]
         dry_run: bool,
+        /// Spread the redriven tasks over this many seconds (issue #1832).
+        /// 0 makes every task due at once. Default: 60 s for 1000 rows,
+        /// pro-rated for fewer.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=3600))]
+        spread_secs: Option<u64>,
     },
 }
 
@@ -3434,6 +3469,12 @@ enum EventsCommand {
 }
 
 impl Cli {
+    /// The `--http-timeout-secs` value (issue #1832).
+    #[must_use]
+    pub const fn http_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.http_timeout_secs)
+    }
+
     /// Build the management API request represented by these CLI arguments.
     ///
     /// # Errors
@@ -7825,6 +7866,7 @@ async fn run_worker_drain_wait(
             actor: cli.actor.clone(),
             request_id: cli.request_id.clone(),
             output: cli.output,
+            http_timeout_secs: cli.http_timeout_secs,
             command: Commands::Worker {
                 command: WorkerCommand::Get {
                     worker_id: worker_id.to_string(),
@@ -11979,6 +12021,7 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             failure_signature,
             limit,
             dry_run,
+            spread_secs: _,
         } => ApiRequest::post(
             "/dead-letters/replay",
             Some(build_bulk_dlq_body(
@@ -12082,6 +12125,7 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             max,
             reason,
             dry_run,
+            spread_secs: _,
         } => ApiRequest::post(
             "/dlq/redrive",
             Some(build_redrive_dlq_body(

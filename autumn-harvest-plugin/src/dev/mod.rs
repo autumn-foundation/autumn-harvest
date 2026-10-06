@@ -560,7 +560,7 @@ impl DevRuntime {
     async fn wait_until_ready(&self) -> Result<(), DevError> {
         const READY_TIMEOUT_SECS: u64 = 180;
         let url = format!("{}/health", self.api_url);
-        let client = reqwest::Client::new();
+        let client = health_probe_client();
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(READY_TIMEOUT_SECS);
         while std::time::Instant::now() < deadline {
@@ -1205,6 +1205,51 @@ mod server_panic_tests {
         let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
 
         assert_eq!(panic_payload_message(&*payload), "boom");
+    }
+}
+
+/// The client for the readiness probe in `wait_until_ready`.
+fn health_probe_client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
+#[cfg(test)]
+mod health_probe_client_tests {
+    //! Issue #1832. A probe with no timeout can hang on a server that accepts
+    //! but never answers. The readiness deadline then never fires.
+
+    use super::health_probe_client;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn a_probe_to_a_black_hole_fails_within_the_probe_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let black_hole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            health_probe_client()
+                .get(format!("http://{addr}/health"))
+                .send(),
+        )
+        .await
+        .expect("the probe must give up on its own, not hang");
+        black_hole.abort();
+
+        assert!(
+            outcome.as_ref().is_err_and(reqwest::Error::is_timeout),
+            "expected a timeout, got {outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
 
