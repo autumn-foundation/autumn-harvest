@@ -737,6 +737,52 @@ struct ObservedRamp {
 #[cfg(feature = "db")]
 type AbortMarker = (String, String, uuid::Uuid);
 
+/// Merge the id-less part of a partly stamped ramp into its stamped part
+/// (issue #1814).
+///
+/// A guard stamps the report id of an id-less ramp on every pool before it
+/// clears. It can stop, or fail on one pool, after it stamped only some.
+/// A later read then sees one generation with that id and one with none.
+/// The stamp does not change a step. So when the derived id over the steps
+/// of both parts equals the stamped id, both parts are one ramp. They merge
+/// under the stamped id, and no guard derives a second id from the smaller
+/// set of pools.
+#[cfg(feature = "db")]
+fn merge_partial_stamps(merged: &mut std::collections::BTreeMap<GenerationKey, ObservedRamp>) {
+    let id_less: Vec<RampKey> = merged
+        .keys()
+        .filter(|(_, ramp_id)| ramp_id.is_none())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in id_less {
+        let Some(unstamped) = merged.get(&(key.clone(), None)) else {
+            continue;
+        };
+        let stamped = merged.iter().find_map(|((other, ramp_id), ramp)| {
+            let id = (*ramp_id)?;
+            if *other != key {
+                return None;
+            }
+            let mut steps: Vec<_> = unstamped.steps.iter().chain(&ramp.steps).copied().collect();
+            steps.sort_unstable();
+            (id_less_report_id(&key, &steps) == id).then_some(id)
+        });
+        let Some(id) = stamped else {
+            continue;
+        };
+        let Some(part) = merged.remove(&(key.clone(), None)) else {
+            continue;
+        };
+        if let Some(whole) = merged.get_mut(&(key, Some(id))) {
+            whole.ramp_percent = whole.ramp_percent.max(part.ramp_percent);
+            whole.base = whole.base.plus(part.base);
+            whole.target = whole.target.plus(part.target);
+            whole.steps.extend(part.steps);
+            whole.steps.sort_unstable();
+        }
+    }
+}
+
 /// One abort marker as stored on a pool.
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1006,6 +1052,7 @@ async fn read_ramps(
         );
         pool_markers_by_index.push(pool_markers);
     }
+    merge_partial_stamps(&mut merged);
     for (((queue, base, _), ramp_id), ramp) in &mut merged {
         ramp.abort_marked = ramp_id
             .is_some_and(|ramp_id| markers.contains(&(queue.clone(), base.clone(), ramp_id)));

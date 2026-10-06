@@ -227,8 +227,11 @@ The guard fails safe: when it cannot read, it does not abort.
   of every pool that still holds the ramp. The clear writes its marker
   under the same id. So a later guard can finish a pool that did not
   clear, also after a restart, and a failed report stays recoverable. A
-  pool that rejects that write keeps no id, and the guard cannot finish it
-  after a restart. A later ramp with the same builds has new steps, so an
+  guard can stop after it stamped only some pools. The stamp keeps each
+  step, so a later read derives the id over the stamped and the unstamped
+  pools together. When it matches the stamp, the read treats them as one
+  ramp under that id, and no second id appears. A pool that rejects every
+  write keeps no id, and the guard cannot finish it after a restart. A later ramp with the same builds has new steps, so an
   old marker never matches it.
 - A pool can hold an abort marker and a newer operator ramp at the same time.
   The guard reads the marker anyway. It clears only the pools whose `ramp_id`

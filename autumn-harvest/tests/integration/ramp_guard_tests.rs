@@ -1981,6 +1981,109 @@ async fn guards_derive_one_report_id_for_an_id_less_ramp() {
     assert_eq!(stamped[0], stamped[1], "both guards derive one report id");
 }
 
+/// A guard can stamp the report id of an id-less ramp on some pools only
+/// (issue #1814). A later guard then reads one stamped generation and one
+/// id-less one. It sees that both are the same ramp and stamps the id that
+/// is already there, so the pools never hold two ids.
+#[tokio::test]
+async fn a_later_guard_converges_on_a_partial_stamp() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conns = [
+        AsyncPgConnection::establish(&url_1)
+            .await
+            .expect("connect 1"),
+        AsyncPgConnection::establish(&url_2)
+            .await
+            .expect("connect 2"),
+    ];
+    for conn in &mut conns {
+        set_build_policy(conn, QUEUE, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        // An old writer sets the ramp with no id.
+        diesel::sql_query(
+            "UPDATE harvest_build_policies \
+             SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+             WHERE queue_name = $1",
+        )
+        .bind::<Text, _>(QUEUE)
+        .bind::<Text, _>(BUILD_B)
+        .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+        .execute(conn)
+        .await
+        .expect("old writer ramp");
+        // Every clear fails, so the stamps stay visible.
+        diesel::sql_query(
+            "CREATE FUNCTION fail_ramp_clear() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+                 IF OLD.target_build_id IS NOT NULL AND NEW.target_build_id IS NULL THEN \
+                     RAISE EXCEPTION 'injected clear failure'; \
+                 END IF; \
+                 RETURN NEW; \
+             END $$",
+        )
+        .execute(conn)
+        .await
+        .expect("create function");
+        diesel::sql_query(
+            "CREATE TRIGGER fail_ramp_clear BEFORE UPDATE ON harvest_build_policies \
+             FOR EACH ROW EXECUTE FUNCTION fail_ramp_clear()",
+        )
+        .execute(conn)
+        .await
+        .expect("create trigger");
+        seed_healthy_base(conn, 5).await;
+        for _ in 0..6 {
+            seed(conn, true, "FAILED", false).await;
+        }
+    }
+    // The first guard's stamp fails on pool 2.
+    diesel::sql_query(
+        "CREATE FUNCTION fail_ramp_stamp() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             IF OLD.ramp_id IS NULL AND NEW.ramp_id IS NOT NULL THEN \
+                 RAISE EXCEPTION 'injected stamp failure'; \
+             END IF; \
+             RETURN NEW; \
+         END $$",
+    )
+    .execute(&mut conns[1])
+    .await
+    .expect("create stamp function");
+    diesel::sql_query(
+        "CREATE TRIGGER fail_ramp_stamp BEFORE UPDATE ON harvest_build_policies \
+         FOR EACH ROW EXECUTE FUNCTION fail_ramp_stamp()",
+    )
+    .execute(&mut conns[1])
+    .await
+    .expect("create stamp trigger");
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let _ = RampGuard::new(guard_config())
+        .pass(&pools, &pool_1, None, &never)
+        .await;
+    let stamped = policy_ramp_id(&mut conns[0]).await;
+    assert!(stamped.is_some(), "pool 1 holds the stamp");
+    assert_eq!(policy_ramp_id(&mut conns[1]).await, None, "pool 2 does not");
+
+    // A fresh guard reads one stamped and one id-less generation.
+    diesel::sql_query("DROP TRIGGER fail_ramp_stamp ON harvest_build_policies")
+        .execute(&mut conns[1])
+        .await
+        .expect("drop stamp trigger");
+    let _ = RampGuard::new(guard_config())
+        .pass(&pools, &pool_1, None, &never)
+        .await;
+    let second = policy_ramp_id(&mut conns[1]).await;
+    assert!(
+        second.is_none() || second == stamped,
+        "pool 2 holds no other id: {second:?} vs {stamped:?}"
+    );
+    assert_eq!(policy_ramp_id(&mut conns[0]).await, stamped);
+}
+
 /// A guard can stop after its clear commits and before its report. A later
 /// pass reports that abort once, from the marker, after the report grace.
 #[tokio::test]
