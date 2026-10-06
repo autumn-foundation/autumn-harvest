@@ -258,11 +258,14 @@ pub enum Op {
     Random,
     /// `ctx.random_f64`.
     RandomF64,
-    /// `ctx.execute_activity_fan_out_raw` over `(name, input, queue)` items.
+    /// `ctx.execute_activity_fan_out_raw` over `(name, input, queue)` items,
+    /// or the `_windowed` form when `window` is set.
     FanOut {
         /// The activities of the group.
         #[arbitrary(with = fan_out_items)]
         activities: Vec<(String, Value, String)>,
+        /// The most activities in flight at once.
+        window: Option<usize>,
     },
     /// `ctx.spawn_child_workflow_fan_out_raw` over `(name, input)` items.
     ChildFanOut {
@@ -796,10 +799,24 @@ fn mirror_fan_out(
         }
         consumed.insert(index);
     }
+    // A windowed or unfinished fan-out schedules fewer items than its
+    // marker counts. The count must still match, so the last item repeats.
+    // Replay never reaches the repeats, because history ends first.
+    let scheduled = activities.len();
     if children.is_empty() {
-        Op::FanOut { activities }
+        pad_to(&mut activities, count);
+        let window = (scheduled > 0 && scheduled < count).then_some(scheduled);
+        Op::FanOut { activities, window }
     } else {
+        pad_to(&mut children, count);
         Op::ChildFanOut { children }
+    }
+}
+
+/// Repeats the last item until `items` holds `count` items.
+fn pad_to<T: Clone>(items: &mut Vec<T>, count: usize) {
+    if let Some(last) = items.last().cloned() {
+        items.resize(count.max(items.len()), last);
     }
 }
 
@@ -894,6 +911,8 @@ impl Op {
                 | Self::SignalExternal { .. }
                 | Self::CancelExternal { .. }
                 | Self::Mutex { .. }
+                | Self::FanOut { .. }
+                | Self::ChildFanOut { .. }
         )
     }
 
@@ -1149,8 +1168,19 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
         Op::RandomF64 => {
             let _ = ctx.random_f64();
         }
-        Op::FanOut { activities } => {
+        Op::FanOut {
+            activities,
+            window: None,
+        } => {
             let _ = ctx.execute_activity_fan_out_raw(activities).await;
+        }
+        Op::FanOut {
+            activities,
+            window: Some(window),
+        } => {
+            let _ = ctx
+                .execute_activity_fan_out_raw_windowed(activities, window)
+                .await;
         }
         Op::ChildFanOut { children } => {
             let _ = ctx.spawn_child_workflow_fan_out_raw(children).await;
