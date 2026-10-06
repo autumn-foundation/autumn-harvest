@@ -15725,27 +15725,54 @@ const fn claim_may_be_lost(was_cancelled: bool, has_heartbeat_timeout: bool) -> 
 
 /// Whether an attempt timed out (issue #1836). See [`timeout_check`].
 ///
-/// For [`TimeoutCheck::ReadRow`], the function reads the task row. A lost
-/// claim with the scanner's timeout error for this activity is a timeout. A
-/// failed read counts as no timeout.
+/// For [`TimeoutCheck::ReadRow`], the function reads the task row. `None`
+/// means the read failed, so the answer is unknown and the attempt gives no
+/// sample.
 async fn attempt_timed_out(
     pool: &DbPool,
     claim: &queue::TaskClaim,
     activity_name: &str,
     check: TimeoutCheck,
-) -> bool {
+) -> Option<bool> {
     match check {
-        TimeoutCheck::NotTimedOut => return false,
-        TimeoutCheck::TimedOut => return true,
+        TimeoutCheck::NotTimedOut => return Some(false),
+        TimeoutCheck::TimedOut => return Some(true),
         TimeoutCheck::ReadRow => {}
     }
     let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
-        return false;
+        return None;
     };
-    matches!(
+    timed_out_from_row(
         queue::task_status_for_claim(&mut conn, claim).await,
-        Ok(Some((_, Some(error), false))) if is_attempt_timeout_error(&error, activity_name)
+        activity_name,
     )
+}
+
+/// Read a timeout from the task row of one attempt (issue #1836).
+///
+/// A lost claim with the scanner's timeout error for this activity is a
+/// timeout. A held claim, another error or a missing row is not. A failed
+/// read is unknown.
+fn timed_out_from_row(
+    read: HarvestResult<Option<(String, Option<String>, bool)>>,
+    activity_name: &str,
+) -> Option<bool> {
+    match read {
+        Err(_) => None,
+        Ok(Some((_, Some(error), false))) => Some(is_attempt_timeout_error(&error, activity_name)),
+        Ok(_) => Some(false),
+    }
+}
+
+/// Whether a claim's exclusion list marked `activity_name` as saturated
+/// (issue #1836).
+///
+/// The by-id claim keeps this answer. The limiter state can change between
+/// the claim and the decision about its reference.
+fn excluded_as_saturated(exclusions: &[String], activity_name: &str) -> bool {
+    exclusions
+        .iter()
+        .any(|name| name.strip_prefix(queue::SATURATED_ACTIVITY_MARKER) == Some(activity_name))
 }
 
 /// Whether a task-row error is a timeout of one activity attempt (issue
@@ -15908,6 +15935,49 @@ mod adaptive_limit_gate_tests {
             Some(SampleOutcome::Overloaded)
         );
         assert_eq!(limit_sample_outcome(None, None, false), None);
+    }
+
+    /// A row read that fails says nothing, so the attempt gives no sample.
+    #[test]
+    fn a_failed_row_read_is_an_unknown_timeout() {
+        use super::timed_out_from_row;
+        use crate::error::HarvestError;
+        let timeout = "timeout: Heartbeat for charge_card".to_owned();
+        assert_eq!(
+            timed_out_from_row(Err(HarvestError::Config("down".into())), "charge_card"),
+            None
+        );
+        assert_eq!(
+            timed_out_from_row(
+                Ok(Some(("FAILED".into(), Some(timeout.clone()), false))),
+                "charge_card"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            timed_out_from_row(Ok(Some(("RUNNING".into(), None, true))), "charge_card"),
+            Some(false)
+        );
+        assert_eq!(
+            timed_out_from_row(
+                Ok(Some(("PENDING".into(), Some(timeout), true))),
+                "charge_card"
+            ),
+            Some(false),
+            "a claim that is still held did not time out"
+        );
+        assert_eq!(timed_out_from_row(Ok(None), "charge_card"), Some(false));
+    }
+
+    /// The by-id claim's own exclusion list tells whether saturation caused
+    /// a miss. Current limiter state can change after the claim.
+    #[test]
+    fn a_marked_exclusion_records_the_saturation_cause() {
+        use super::excluded_as_saturated;
+        let exclusions = vec!["gpu_job".to_owned(), "\u{1}charge_card".to_owned()];
+        assert!(excluded_as_saturated(&exclusions, "charge_card"));
+        assert!(!excluded_as_saturated(&exclusions, "gpu_job"));
+        assert!(!excluded_as_saturated(&exclusions, "send_email"));
     }
 
     /// The timeout decision table (issue #1836).
@@ -18011,9 +18081,12 @@ async fn process_activity_task(
             past_attempt_deadline(attempt_deadline, task.started_at, dispatched_at.elapsed()),
             claim_may_be_lost(was_cancelled, task.heartbeat_timeout.is_some()),
         );
-        let timed_out = attempt_timed_out(pool, &activity_claim, activity_name, check).await;
         let error_type = failure_info.as_ref().map(|(et, _, _)| et.as_str());
-        match limit_sample_outcome(circuit_outcome, error_type, timed_out) {
+        // An unknown timeout answer gives no sample.
+        let outcome = attempt_timed_out(pool, &activity_claim, activity_name, check)
+            .await
+            .and_then(|timed_out| limit_sample_outcome(circuit_outcome, error_type, timed_out));
+        match outcome {
             Some(outcome) => permit.complete(attempt_latency, outcome),
             None => drop(permit),
         }
@@ -32701,10 +32774,19 @@ impl Worker {
                         return ReferenceDisposition::Handled;
                     }
                 };
+                // The claim's own exclusions tell whether saturation caused
+                // the miss. The slot may have freed since, so a type that is
+                // no longer saturated retries after the shortest delay.
                 let saturated_delay = probe
                     .as_ref()
                     .and_then(|p| p.activity_name.as_deref())
-                    .and_then(|name| self.registry.adaptive_limits.saturated_delay(name));
+                    .filter(|name| excluded_as_saturated(&exclusions, name))
+                    .map(|name| {
+                        self.registry
+                            .adaptive_limits
+                            .saturated_delay(name)
+                            .unwrap_or(crate::adaptive_limit::MIN_LIMIT_DEFER)
+                    });
                 let outcome = reference_outcome(
                     probe.as_ref(),
                     lease.redeliveries,
