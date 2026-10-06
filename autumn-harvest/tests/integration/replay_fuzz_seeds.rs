@@ -456,6 +456,16 @@ fn a_join_branch_that_hits_an_engine_gap_keeps_its_shape() {
             "join(fan out window 2 fail fast, seq(signal go, next)); complete",
             "expected: \"ActivityScheduled(task)\"",
         ),
+        (
+            "engine-gap-windowed-fan-out-beside-side-effect.json",
+            "join(fan out window 2 fail fast, side effect trace, other); complete",
+            "actual: \"SideEffectRecorded(custom:trace)\"",
+        ),
+        (
+            "engine-gap-saga-beside-side-effect.json",
+            "reserve; hold; join(saga unwind 2, side effect trace); complete",
+            "expected: \"ActivityScheduled(unhold)\"",
+        ),
     ];
     let cases = seed("engine-gap-");
     for (name, want, stop) in expected {

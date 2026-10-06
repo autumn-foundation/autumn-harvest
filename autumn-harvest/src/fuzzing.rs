@@ -1281,6 +1281,8 @@ fn mirror_fan_out(
             event if sibling_key(event).is_some_and(|key| siblings.contains(&key)) => {
                 continue;
             }
+            // An immediate command, such as a side effect, is a sibling's.
+            event if is_immediate_command(event) => continue,
             WorkflowEvent::ActivityScheduled {
                 activity_id,
                 name,
@@ -1438,6 +1440,12 @@ const fn is_schedule(event: &WorkflowEvent) -> bool {
     )
 }
 
+/// True for a command that resolves in its own decision, such as a side
+/// effect. A group scan passes over it as a sibling branch's work.
+fn is_immediate_command(event: &WorkflowEvent) -> bool {
+    mirror_event(event, false).is_some_and(|op| op.is_immediate())
+}
+
 /// True for a buffered signal, which can arrive between a group's items.
 const fn is_signal(event: &WorkflowEvent) -> bool {
     matches!(event, WorkflowEvent::SignalReceived { .. })
@@ -1475,6 +1483,7 @@ fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<us
             // A signal resumes some other branch, so a schedule right after
             // it is that branch's command.
             e if is_signal(e) => sibling_turn = true,
+            e if is_immediate_command(e) => {}
             e if activity_outcome(e).is_some() || child_outcome(e).is_some() => {
                 sibling_turn = !settled_key(e).is_some_and(|key| open.remove(&key));
                 if current > 0 {
@@ -2022,6 +2031,7 @@ fn mirror_saga(
             // A signal can arrive for a sibling branch while a compensation
             // runs.
             (WorkflowEvent::SignalReceived { .. }, _) => {}
+            (event, _) if is_immediate_command(event) => {}
             // Any other command is a sibling. Its own events are passed over.
             (event, _) if pending_key(event).is_some() => siblings.extend(pending_key(event)),
             (event, _) if sibling_key(event).is_some_and(|key| siblings.contains(&key)) => {}
