@@ -4,11 +4,12 @@ No scheduled `chaos.yml` run passed for 48 h, so the watchdog opened #1925.
 Two runs failed:
 
 - 2026-10-04: the integration suite did not compile. A test set
-  `resident_workflows` twice. `trunk-dev` already has the fix.
+  `resident_workflows` twice. `597108e` (#1887) already removed the
+  duplicate.
 - 2026-10-05: `terminate_backend_mid_commit_append` failed on purpose. It
   required `FAILED`, the outcome of bugs #1871 and #1870. #1788
-  (`3405cae`) fixed #1871: the worker writes a lost activity result again
-  on a new connection. The workflow now completes.
+  (`3405cae`) fixed #1871 for a session that the server ends: the worker
+  writes a lost activity result again on a new connection. The workflow now completes.
 
 The test now requires `COMPLETED`. Both append tests also require one
 activity attempt: one activity task at attempt 1 and one `ActivityStarted`.
