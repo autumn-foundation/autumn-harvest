@@ -938,9 +938,11 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                     batch.resume_last();
                 }
             }
-            // A branch that resumed can end the run, as when it continues
-            // as new while a sibling still waits.
-            Some(op @ Op::ContinueAsNew { .. }) if batch.resumed_with_waiting() => {
+            // A branch that resumed can end the run while a sibling still
+            // waits. It can continue as new, or fail as in `try_join!`.
+            Some(op @ (Op::ContinueAsNew { .. } | Op::Fail { .. } | Op::Complete { .. }))
+                if batch.resumed_with_waiting() =>
+            {
                 batch.push(op, None);
             }
             None if batch.settle(event) => {}
@@ -2401,18 +2403,40 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
                 }
             }
         }
-        Op::Concurrent { ops } => {
-            let runs = ops.into_iter().map(|op| Box::pin(run_op(ctx, op)));
-            // The first result in program order wins, as in a sequence.
-            return futures::future::join_all(runs)
-                .await
-                .into_iter()
-                .flatten()
-                .next();
-        }
+        Op::Concurrent { ops } => return run_concurrent(ctx, ops).await,
         other => run_external_op(ctx, other).await,
     }
     None
+}
+
+/// Runs `ops` as the branches of a `join!`, polled in program order. A
+/// branch that ends the run, by completing or failing, ends the whole op at
+/// once, as in `try_join!`. A sibling may still wait then. When two
+/// branches end in the same poll, the first in program order wins.
+async fn run_concurrent(ctx: &WorkflowContext, ops: Vec<Op>) -> Option<Result<Value, String>> {
+    let mut runs: Vec<Option<_>> = ops
+        .into_iter()
+        .map(|op| Some(Box::pin(run_op(ctx, op))))
+        .collect();
+    std::future::poll_fn(move |cx| {
+        let mut pending = false;
+        for slot in &mut runs {
+            let Some(run) = slot else { continue };
+            match run.as_mut().poll(cx) {
+                std::task::Poll::Ready(Some(result)) => {
+                    return std::task::Poll::Ready(Some(result));
+                }
+                std::task::Poll::Ready(None) => *slot = None,
+                std::task::Poll::Pending => pending = true,
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(None)
+        }
+    })
+    .await
 }
 
 /// Runs a fan-out or a race, an op that starts a group of commands.
