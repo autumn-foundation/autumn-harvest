@@ -1480,6 +1480,65 @@ async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
     assert_eq!(abort_marker_count(&mut conn_2).await, 0);
 }
 
+/// Before the guard prunes the markers of a reported abort, it leaves a
+/// tombstone in the report ledger of every pool. A direct ramp write with
+/// the aborted id is then refused on each pool, also on a pool that never
+/// held the ramp (issue #1814).
+#[tokio::test]
+async fn pruned_markers_leave_a_tombstone_on_every_pool() {
+    let urls = [setup().await, setup().await, setup().await];
+    let pools: Vec<DbPool> = urls.iter().map(|(url, _)| build_pool(url)).collect();
+    let mut conns = Vec::new();
+    for (url, _) in &urls {
+        conns.push(AsyncPgConnection::establish(url).await.expect("connect"));
+    }
+    let ramp_id = uuid::Uuid::new_v4();
+    // Pools 1 and 2 hold the ramp. Pool 3 never got it.
+    for conn in &mut conns[..2] {
+        set_ramp_with_id(conn, ramp_id).await;
+        let step = policy_step(conn).await;
+        assert!(
+            abort_ramp(conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+                .await
+                .expect("clear")
+                .is_some()
+        );
+        mark_abort_reported(conn, QUEUE, stored(ramp_id), CLEAR_BOUND)
+            .await
+            .expect("mark");
+    }
+    set_build_policy(&mut conns[2], QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // The audit pool is pool 1. Its ledger holds the report.
+    assert!(
+        record_abort_report(&mut conns[0], QUEUE, stored(ramp_id))
+            .await
+            .expect("ledger row")
+    );
+    let past = MIN_MARKER_RETENTION + Duration::from_secs(60);
+    for conn in &mut conns[..2] {
+        age_markers(conn, past).await;
+    }
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pools[0], &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    for conn in &mut conns[..2] {
+        assert_eq!(abort_marker_count(conn).await, 0, "the markers are pruned");
+    }
+
+    for (index, conn) in conns.iter_mut().enumerate() {
+        let refused = set_build_ramp_with_id(conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id).await;
+        assert!(
+            matches!(refused, Err(autumn_harvest::HarvestError::Config(_))),
+            "pool {} refuses the aborted ramp: {refused:?}",
+            index + 1
+        );
+        assert!(!ramp_is_active(conn).await);
+    }
+}
+
 /// A guard can stop after its clear commits and before its report. A later
 /// pass reports that abort once, from the marker, after the report grace.
 #[tokio::test]

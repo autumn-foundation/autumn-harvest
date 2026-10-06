@@ -1151,6 +1151,65 @@ struct FleetRead {
     half_marked: Vec<(String, uuid::Uuid, Vec<usize>)>,
 }
 
+/// Write a tombstone for each of `ramp_ids` into the report ledger of one
+/// pool, within `bound`. Returns `true` when the write committed.
+///
+/// The guard calls it on every pool before it prunes the markers of a
+/// reported abort. A ramp write then still refuses the aborted generation
+/// on that pool, as [`crate::build_routing::set_build_ramp_with_id`] reads
+/// the local ledger. Without the tombstone, only the audit pool would know
+/// the abort once the markers are gone. A tombstone row never starts a
+/// report. Only the audit pool's ledger elects a reporter, and the guard
+/// prunes only the markers of a reported abort.
+#[cfg(feature = "db")]
+async fn record_abort_tombstones(
+    pool: &crate::worker::DbPool,
+    index: usize,
+    queue: &str,
+    ramp_ids: &[uuid::Uuid],
+    bound: Duration,
+) -> bool {
+    use diesel::sql_types::{Array, Text};
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+
+    let timeout_ms = bound.as_millis().max(1);
+    let write = async {
+        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        conn.transaction(async |conn| -> crate::error::HarvestResult<()> {
+            for setting in ["lock_timeout", "statement_timeout"] {
+                diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            diesel::sql_query(
+                "INSERT INTO harvest_ramp_abort_reports (ramp_id, queue_name) \
+                 SELECT id, $1 FROM unnest($2::uuid[]) AS t(id) \
+                 ON CONFLICT (ramp_id) DO NOTHING",
+            )
+            .bind::<Text, _>(queue)
+            .bind::<Array<diesel::sql_types::Uuid>, _>(ramp_ids)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())
+    };
+    match tokio::time::timeout(bound.saturating_mul(2), write).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard tombstone write failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(queue = %queue, pool = index, "ramp guard tombstone write timed out");
+            false
+        }
+    }
+}
+
 /// Remove finished abort markers from one pool, within `bound`.
 ///
 /// The removal is best effort. A failure logs a warning, and the next pass
@@ -1855,9 +1914,41 @@ impl RampGuard {
                 aborts.push(abort);
             }
         }
+        // Every pool gets a tombstone of a finished abort before any pool
+        // loses its marker. A pool that misses the tombstone keeps the
+        // markers of that queue until a later pass writes it.
+        let mut finished: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<uuid::Uuid>,
+        > = std::collections::BTreeMap::new();
+        for (_, queue, ramp_ids) in &finished_markers {
+            finished
+                .entry(queue.clone())
+                .or_default()
+                .extend(ramp_ids.iter().copied());
+        }
+        let mut tombstoned = std::collections::BTreeSet::new();
+        for (queue, ramp_ids) in finished {
+            let ramp_ids: Vec<uuid::Uuid> = ramp_ids.into_iter().collect();
+            let mut all = true;
+            for (index, pool) in pools.iter().enumerate() {
+                if cancel.is_cancelled()
+                    || !record_abort_tombstones(pool, index, &queue, &ramp_ids, bound).await
+                {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                tombstoned.insert(queue);
+            }
+        }
         for (index, queue, ramp_ids) in finished_markers {
             if cancel.is_cancelled() {
                 break;
+            }
+            if !tombstoned.contains(&queue) {
+                continue;
             }
             if let Some(pool) = pools.get(index) {
                 prune_finished_markers(pool, index, &queue, &ramp_ids, bound).await;

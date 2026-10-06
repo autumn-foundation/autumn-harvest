@@ -289,8 +289,12 @@ The guard fails safe: when it cannot read, it does not abort.
   `MIN_MARKER_RETENTION` (10 minutes), so a zero grace still keeps them. A
   ramp fan-out that is still in flight can write the same `ramp_id` to a
   later pool. Within the retention, the markers still finish that late
-  ramp. A fan-out write that is later than the retention makes a ramp with
-  no marker, which the guard judges as usual.
+  ramp. Before it removes any marker, the guard writes a tombstone of the
+  abort into the report ledger table of every pool. The ramp write reads
+  the local ledger, so a fan-out write or a library retry with the aborted
+  `ramp_id` is refused on every pool, also after the retention. When a
+  pool misses its tombstone, the guard keeps the markers of that queue and
+  tries again on the next pass.
 - A guard that reported but could not mark any of its markers causes a
   second report after the grace. A failed audit write also makes the counter count
   the abort twice. An extra report is better than an abort with none.
