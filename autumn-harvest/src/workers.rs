@@ -1544,28 +1544,42 @@ struct StoredSnapshotSeq {
 /// Delete task-stats rows older than [`WORKER_TASK_STATS_RETENTION`] (issue
 /// #1815). Returns the number of rows deleted.
 ///
-/// A slow fleet can count a row as live for longer than the retention. The
-/// prune then keeps every row inside `fleet_stale_secs`, so it cannot delete a
-/// live peer's row.
+/// A slow cohort can count a row as live for longer than the retention. Each
+/// row therefore keeps its own cohort's `peer_stale_secs` when that is longer.
+/// A worker with a fast heartbeat then cannot delete a slow peer's live row. A
+/// key without the field falls back to `fallback_stale_secs`.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError`] on database failure.
+/// Returns [`HarvestError`] on database failure, or when a stored cohort key
+/// is not JSON.
 pub async fn prune_worker_task_stats(
     conn: &mut AsyncPgConnection,
-    fleet_stale_secs: i64,
+    fallback_stale_secs: i64,
 ) -> HarvestResult<usize> {
-    let retention = i64::try_from(WORKER_TASK_STATS_RETENTION.as_secs())
-        .unwrap_or(i64::MAX)
-        .max(fleet_stale_secs);
-    diesel::sql_query(
-        "DELETE FROM harvest_worker_task_stats \
-         WHERE updated_at < NOW() - ($1::bigint * INTERVAL '1 second')",
-    )
+    let retention = i64::try_from(WORKER_TASK_STATS_RETENTION.as_secs()).unwrap_or(i64::MAX);
+    diesel::sql_query(format!(
+        "DELETE FROM harvest_worker_task_stats s \
+         WHERE s.updated_at < NOW() - (GREATEST($1::bigint, {}) * INTERVAL '1 second')",
+        cohort_stale_secs_sql("$2")
+    ))
     .bind::<diesel::sql_types::BigInt, _>(retention)
+    .bind::<diesel::sql_types::BigInt, _>(
+        fallback_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS),
+    )
     .execute(conn)
     .await
     .map_err(crate::error::database_error)
+}
+
+/// The SQL for the `peer_stale_secs` of row `s`'s cohort, bounded to
+/// `0..=MAX_WORKER_STALE_SECS` (issue #1815). A key without the field uses
+/// the bind parameter `fallback`.
+fn cohort_stale_secs_sql(fallback: &str) -> String {
+    format!(
+        "LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, {fallback}), 0), {})",
+        crate::poison_pill::MAX_WORKER_STALE_SECS
+    )
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1641,10 +1655,7 @@ async fn load_task_stats(
         ""
     };
     let limit = if per_cohort_freshness {
-        format!(
-            "LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, $2), 0), {})",
-            crate::poison_pill::MAX_WORKER_STALE_SECS
-        )
+        cohort_stale_secs_sql("$2")
     } else {
         "$2::bigint".to_owned()
     };

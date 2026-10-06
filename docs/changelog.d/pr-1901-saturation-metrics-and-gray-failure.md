@@ -112,8 +112,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - No worker label is added. Each worker reports itself, and the scrape
   `instance` label tells them apart.
 - Every shard heartbeat deletes stats rows older than one hour, so orphan
-  rows from restarted workers do not pile up. A fleet whose peer freshness
-  window is longer keeps rows for that window, so a live peer stays.
+  rows from restarted workers do not pile up. A row whose own cohort has a
+  longer peer freshness window keeps it, so a fast worker's prune leaves a
+  slow peer's live row.
 
 **`GET /admin/status`.** The `workers` block gains `outliers`, the worst 20
 flagged workers with their stats and the peer medians. It also gains

@@ -161,6 +161,11 @@ fn window(tasks: u32, fail_every: Option<u32>) -> Arc<TaskOutcomeWindow> {
 
 /// The cohort key of a worker that polls `queue` alone, with no weights.
 fn cohort(queue: &str) -> String {
+    cohort_with_freshness(queue, 120)
+}
+
+/// [`cohort`] with the peer freshness limit of `peer_stale_secs`.
+fn cohort_with_freshness(queue: &str, peer_stale_secs: i64) -> String {
     workers::worker_cohort(&workers::CohortPolicy {
         queues: &[queue.to_owned()],
         queue_weights: &HashMap::new(),
@@ -177,7 +182,7 @@ fn cohort(queue: &str) -> String {
         dispatch_channel: false,
         retry_budgets: &autumn_harvest::retry_budget::RetryBudgetConfig::default(),
         outcome_window: std::time::Duration::from_secs(300),
-        peer_stale_secs: 120,
+        peer_stale_secs,
         execution: workers::ExecutionPolicy::default(),
         payload: workers::PayloadPolicy::default(),
     })
@@ -665,14 +670,23 @@ async fn frozen_stats_leave_the_live_set_and_old_rows_are_pruned() {
     let queue = unique_id("frozen-q");
     let frozen = unique_id("w-frozen");
     let ancient = unique_id("w-ancient");
+    let slow = unique_id("w-slow");
     let stats = WorkerTaskStats {
         tasks: 30,
         failures: 15,
         p99_latency_ms: Some(10),
     };
-    for (id, age_secs) in [(&frozen, 120_i64), (&ancient, 7_200)] {
+    // The slow worker's cohort heartbeats rarely, so its rows stay fresh for
+    // three hours.
+    let fast_key = cohort(&queue);
+    let slow_key = cohort_with_freshness(&queue, 3 * 3_600);
+    for (id, key, age_secs) in [
+        (&frozen, &fast_key, 120_i64),
+        (&ancient, &fast_key, 7_200),
+        (&slow, &slow_key, 7_200),
+    ] {
         register(&mut conn, id, &queue).await;
-        workers::upsert_worker_task_stats(&mut conn, id, &cohort(&queue), &stats)
+        workers::upsert_worker_task_stats(&mut conn, id, key, &stats)
             .await
             .expect("upsert");
         diesel::sql_query(
@@ -691,20 +705,16 @@ async fn frozen_stats_leave_the_live_set_and_old_rows_are_pruned() {
         .expect("load");
     assert_eq!(find(&rows, &frozen), None, "a frozen row is not live");
 
-    // A fleet with a slow heartbeat counts a row as live for longer than the
-    // default retention, so the prune keeps it.
-    workers::prune_worker_task_stats(&mut conn, 3 * 3_600)
-        .await
-        .expect("prune with a slow fleet");
-    assert_eq!(
-        count_stats_rows(&mut conn, &ancient).await,
-        1,
-        "inside the slow fleet's freshness window"
-    );
-
+    // A worker with a fast heartbeat prunes. Each row keeps its own cohort's
+    // freshness window, so the slow cohort's live row stays.
     workers::prune_worker_task_stats(&mut conn, 60)
         .await
         .expect("prune");
+    assert_eq!(
+        count_stats_rows(&mut conn, &slow).await,
+        1,
+        "inside its own cohort's freshness window"
+    );
     assert_eq!(
         count_stats_rows(&mut conn, &frozen).await,
         1,
