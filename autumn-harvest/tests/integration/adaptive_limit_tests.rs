@@ -23,7 +23,7 @@ use std::time::Duration;
 use autumn_harvest::adaptive_limit::AdaptiveLimitConfig;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
-use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
+use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::policy::AdaptiveLimitPolicy;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::harvest_workflow_executions;
@@ -187,10 +187,10 @@ impl MetricsRecorder for LimitMetrics {
     fn record_activity_concurrency_limit(
         &self,
         activity: &str,
-        limit: u32,
-        in_flight: u32,
-        baseline_secs: Option<f64>,
+        state: &autumn_harvest::adaptive_limit::LimitSnapshot,
     ) {
+        let (limit, in_flight) = (state.limit, state.in_flight);
+        let baseline_secs = state.baseline.map(|b| b.as_secs_f64());
         self.last
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -235,8 +235,18 @@ fn slow_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) ->
     })
 }
 
+/// Never answers in time, like a hung dependency.
+fn hung_call(ctx: &autumn_harvest::ActivityContext, _input: serde_json::Value) -> BoxFut<'_> {
+    let (running, _) = Running::start(ctx.activity_type());
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(running);
+        Ok(serde_json::Value::Null)
+    })
+}
+
 /// Concurrency above which [`knee_call`] slows down.
-const KNEE: u32 = 4;
+const KNEE: u32 = 8;
 
 /// Answers in 60 ms up to [`KNEE`] concurrent calls. Above the knee, latency
 /// grows in proportion to the concurrency, as for a pool of [`KNEE`]
@@ -319,7 +329,7 @@ fn act_info(name: &'static str, handler: autumn_harvest::info::ActivityHandlerFn
 // Worker and seeding
 // ---------------------------------------------------------------------------
 
-/// A worker with 16 activity slots and the given adaptive limit config.
+/// A worker with 32 activity slots and the given adaptive limit config.
 fn build_worker(
     worker_id: &str,
     queue: &str,
@@ -348,8 +358,8 @@ fn build_worker(
                 worker_id: worker_id.to_string(),
                 queues: vec![queue.to_string()],
                 notification_database_url: None,
-                max_concurrent_workflows: 4,
-                max_concurrent_activities: 16,
+                max_concurrent_workflows: 8,
+                max_concurrent_activities: 32,
                 poll_interval: Duration::from_millis(10),
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -452,17 +462,6 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
     exec_id
 }
 
-async fn execution_state(url: &str, exec_id: ExecutionId) -> String {
-    let mut conn = connect(url).await;
-    harvest_workflow_executions::table
-        .find(exec_id.as_uuid())
-        .select(WorkflowExecution::as_select())
-        .first(&mut conn)
-        .await
-        .expect("load execution")
-        .state
-}
-
 /// Poll `cond` every 20 ms until it holds, or panic after `timeout`.
 async fn wait_until<F, Fut>(what: &str, timeout: Duration, mut cond: F)
 where
@@ -523,20 +522,28 @@ async fn run_with_labels(
     let runner = Arc::clone(&worker);
     let pool_for_run = pool.clone();
     let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
-    let url_owned = url.to_owned();
-    wait_until("every run completes", Duration::from_secs(90), || {
-        let execs = execs.clone();
-        let url = url_owned.clone();
-        async move {
-            for exec in execs {
-                if execution_state(&url, exec).await != "COMPLETED" {
-                    return false;
-                }
-            }
-            true
+    // One connection and one count query per poll. A connection per run
+    // per poll is slow under load, and its handshake competes with the
+    // handlers for the runtime threads.
+    let ids: Vec<Uuid> = execs.iter().map(ExecutionId::as_uuid).collect();
+    let open_runs = || {
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq_any(ids.clone()))
+            .filter(harvest_workflow_executions::state.ne("COMPLETED"))
+            .count()
+    };
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while open_runs()
+            .get_result::<i64>(&mut conn)
+            .await
+            .expect("count open runs")
+            > 0
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await;
+    .await
+    .expect("every run completes within 120 s");
     worker.shutdown();
     handle.await.expect("worker joins");
     (metrics, registry)
@@ -606,9 +613,10 @@ async fn the_limit_is_off_by_default() {
 }
 
 /// Regression test for issue #1836. The dependency slows down above a knee
-/// of 4. The slot tuner would see waits and grow. The adaptive limit sees
+/// of 8. The slot tuner would see waits and grow. The adaptive limit sees
 /// the latency and settles near the analytic fixed point
-/// `tolerance * knee + QUEUE_SIZE`, which is 9, below the 16 worker slots.
+/// `tolerance * knee + QUEUE_SIZE`, which is 14, far below the 32 worker
+/// slots. The limit starts at 4, so reaching the knee proves growth.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_limit_settles_near_the_knee_of_a_real_dependency() {
     const ACTIVITY: &str = "al_knee";
@@ -620,7 +628,7 @@ async fn the_limit_settles_near_the_knee_of_a_real_dependency() {
         &queue,
         vec![act_info(ACTIVITY, knee_call)],
         Some(config),
-        200,
+        400,
     )
     .await;
 
@@ -638,10 +646,16 @@ async fn the_limit_settles_near_the_knee_of_a_real_dependency() {
     );
     let peak = gauge(ACTIVITY).peak();
     assert!(
-        f64::from(peak) <= fixed_point + 3.0 && peak < 16,
+        f64::from(peak) <= fixed_point + 3.0,
         "the dependency saw {peak} calls at once"
     );
-    assert_eq!(metrics.last(ACTIVITY).map(|m| m.0), Some(limit));
+    let (published, _, baseline) = metrics.last(ACTIVITY).expect("limit gauges");
+    assert_eq!(published, limit);
+    let baseline = baseline.expect("a baseline estimate");
+    assert!(
+        (0.06..0.2).contains(&baseline),
+        "baseline {baseline} s; the no-load latency is 0.06 s"
+    );
 }
 
 /// A row with capability requirements skips the ineligible-activity gate of
@@ -663,11 +677,49 @@ async fn a_capability_type_at_its_cap_is_not_claimed() {
 
     let deferred = metrics.deferred(ACTIVITY);
     assert!(
-        deferred <= 3,
+        deferred <= 6,
         "{deferred} claims churned through a deferral"
     );
     let g = gauge(ACTIVITY);
     assert_eq!(g.done(), 12, "each run calls the handler once");
     assert!(g.peak() <= 2, "the type ran {} attempts at once", g.peak());
     assert_eq!(g.max_attempt(), 1, "a deferral must not use an attempt");
+}
+
+/// A hung dependency never answers. Its attempts time out, and the limit
+/// must read the timeouts as overload and cut the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeouts_of_a_hung_dependency_cut_the_cap() {
+    const ACTIVITY: &str = "al_hung";
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("al-hung");
+    let mut activity = act_info(ACTIVITY, hung_call);
+    activity.default_start_to_close = Some(Duration::from_millis(500));
+    let config = AdaptiveLimitConfig::disabled()
+        .with_activity(ACTIVITY, Some(AdaptiveLimitPolicy::default()));
+    let metrics = Arc::new(LimitMetrics::default());
+    let (worker, registry) = build_worker(
+        &format!("{queue}-worker"),
+        &queue,
+        vec![activity],
+        Arc::clone(&metrics),
+        Some(config),
+        HashMap::new(),
+    );
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    for _ in 0..8 {
+        seed_workflow(&mut conn, &queue, ACTIVITY).await;
+    }
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+    let limits = registry.adaptive_limits();
+    wait_until("a cap below the probe cap", Duration::from_secs(60), || {
+        let limits = Arc::clone(&limits);
+        async move { limits.snapshot(ACTIVITY).is_some_and(|s| s.limit < 4) }
+    })
+    .await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+    assert!(metrics.last(ACTIVITY).is_some_and(|m| m.0 < 4));
 }

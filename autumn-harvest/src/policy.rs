@@ -474,8 +474,9 @@ pub struct AdaptiveLimitPolicy {
     /// Highest cap. At least `min_limit`.
     pub max_limit: u32,
     /// Latency inflation over the no-load baseline that the limit accepts.
-    /// At 1.25, the cap stops growing when latency is 25 % above the
-    /// baseline. At least 1.
+    /// At 1.25, the gradient stays at 1 until latency is 25 % above the
+    /// baseline. Above that, the cap grows more slowly and settles. At
+    /// least 1.
     pub tolerance: f64,
     /// Factor that an overloaded window applies to the cap. It is in the
     /// range from 0.5 to 1.

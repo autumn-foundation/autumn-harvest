@@ -190,7 +190,7 @@ An activity attempt owns its task row only through its claim. The claim is the p
 
 *Invariant.* A task-row write takes effect only while its claim is current. So only the current claim writes the terminal event and the terminal row state.
 
-*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral, the retry-budget deferral (which the adaptive-limit deferral of issue #1836 also uses) and the drain release of a task that never started (issue #1813). Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
+*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral, the retry-budget deferral and the drain release of a task that never started (issue #1813). The adaptive-limit deferral (issue #1836) uses the retry-budget write. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
 
 The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue #1917). On an activity row it runs only on a worker without the handler, before the activity starts.
 
@@ -283,44 +283,46 @@ The first delay is the time to the next refill token. Each later deferral gets t
 
 **12. Adaptive concurrency limit per activity type (issue #1836)**
 
-The slot tuner grows the worker slots when tasks wait. When a dependency is the bottleneck, more calls only add latency and errors. An adaptive limit caps the in-flight attempts of one activity type on one worker. The cap follows the handler latency and the retryable failures. It never reads a queue wait or a permit wait. `adaptive_limit.rs` holds the limit. `poll_once` and `process_activity_task` in `worker.rs` hold the gates.
+The slot tuner grows the worker slots when tasks wait. When a dependency is the bottleneck, more calls only add latency and errors. An adaptive limit caps the in-flight attempts of one activity type on one worker. The cap follows the handler latency and the retryable failures. It never reads a queue wait or a permit wait. `adaptive_limit.rs` holds the limit. `poll_once`, `consume_reference` and `process_activity_task` in `worker.rs` hold the gates.
 
-*Policy.* `AdaptiveLimitPolicy` sets five values:
+*Policy.* `AdaptiveLimitPolicy` sets six values:
 
 | Field | Default | Meaning |
 |---|---|---|
 | `min_limit` | `1` | Lowest cap. |
 | `max_limit` | `200` | Highest cap. |
-| `tolerance` | `1.25` | Latency inflation over the baseline that the cap accepts. |
-| `backoff_ratio` | `0.9` | Factor that a window with a retryable failure applies to the cap. |
+| `tolerance` | `1.25` | Latency inflation over the baseline at which the gradient starts to fall below 1. |
+| `backoff_ratio` | `0.9` | Factor that an overloaded window applies to the cap. |
+| `error_threshold` | `0.05` | Share of retryable failures above which a window is overloaded. |
 | `probe_interval` | `1000` | Samples between two baseline probes. |
 
 *Rules.* The limit collects samples in windows of about one cap. The cap moves once per window.
 
 1. The baseline is the lowest window mean latency since the last probe.
 2. The gradient is `tolerance × baseline / mean latency`, clamped to the range from 0.5 to 1. The cap moves 20 % of the way to `cap × gradient + 4`.
-3. A retryable failure in a window cuts the cap by `backoff_ratio`. A non-retryable failure is an answer. A cancelled attempt gives no sample.
-4. A window that used less than half of the cap does not move it.
-5. Every `probe_interval` samples, the cap drops to 4 and the baseline is cleared. Answers from attempts that started before the probe do not count. The next window measures a fresh baseline at a low concurrency. Then the cap returns to its value from before the probe.
+3. A window is overloaded when the retryable failures pass `error_threshold` of its completions. An overloaded window cuts the cap by `backoff_ratio`. A rare failure is noise and does not cut the cap.
+4. A success is an answer. A timeout is a retryable failure, because a hung dependency is overload. A non-retryable failure, a panic, a WASM module failure and any other cancelled attempt give no sample.
+5. A window that used less than half of the cap does not move it.
+6. After `probe_interval` samples, the next window that is not overloaded starts a probe. The cap drops to 4, or stays lower, and the baseline is cleared. Answers from attempts that started before the probe do not count. Their failures still count, but they cannot close the probe window. The probe window ends with its first answers and sets a fresh baseline at a low concurrency. Then the cap returns to its value from before the probe.
 
-Against a dependency whose latency grows in proportion to the concurrency above a knee, the cap settles at `tolerance × knee + 4`. A new type starts at 4.
+Against a dependency whose latency grows in proportion to the concurrency above a knee, the cap settles at `tolerance × knee + 4`. A new type starts at 4, clamped to `[min_limit, max_limit]`.
 
-*Why not plain Gradient2.* Gradient2 compares the latency with a smoothed long-term average. Under steady load the average catches up with the latency, and the cap grows again. The cap ratchets up without bound. A probed minimum does not drift. The test `the_limit_does_not_grow_without_bound` fails when the baseline follows the window mean.
+*Why not plain Gradient2.* Gradient2 compares the latency with a smoothed long-term average. Under steady load the average catches up with the latency, and the cap grows again. The cap ratchets up without bound. A probed minimum does not drift. The simulation tests fail when the baseline follows the window mean.
 
 *Gates.*
 
-- The claim skips a type at its cap. `Worker::claim_exclusions` adds the saturated types to the ineligible-activity list, `$6` of the claim query. The tasks stay `PENDING` for another worker or a later poll. No row churns.
-- A claim can race past the cap. A row with `required_capabilities` skips `$6`, for example. `process_activity_task` then takes a slot after the circuit breaker and before the retry budget. At the cap, it defers the row with `queue::defer_claimed_retry_for_budget`. The deferral uses no attempt, appends no event and refunds the claim-time rate-limit token. The delay is one to two baselines, from 50 ms to 5 s.
+- The claim skips a type at its cap. `Worker::claim_exclusions` adds each saturated type to `$6` of the claim query, with `queue::SATURATED_ACTIVITY_MARKER` in front. A separate gate reads the marked names. Unlike the ineligible-activity gate, it also applies to a row with `required_capabilities`. The tasks stay `PENDING` for another worker or a later poll. When no type is saturated, the check reads one atomic and takes no lock.
+- A claim can still race past the cap, for example when two pollers claim at once. `process_activity_task` then takes a slot after the circuit breaker and before the retry budget. At the cap, it defers the row with `queue::defer_claimed_retry_for_budget`. The deferral uses no attempt and appends no event. A deferral of a rate-limited activity without a circuit breaker also refunds the claim-time token. The delay is one to two baselines, from 50 ms to 5 s. The counter `harvest.activity.concurrency_deferred` counts these deferrals.
 - A circuit short-circuit and a half-open probe take no slot.
-- The slot is freed after the handler returns. Every earlier return frees it without a sample.
+- The worker frees the slot after the handler returns and the retry policy loads. Any return before that point frees it without a sample.
 
-*Configuration.* The limit is off by default. `WorkerConfig::with_adaptive_limit` takes an `AdaptiveLimitConfig`. `with_default` sets the policy for all types. `with_activity(name, policy)` overrides one type, and `None` turns the limit off for that type. An override for an unregistered name logs a warning. `GET /admin/config` reports `adaptive_limit_default` and `adaptive_limit_overrides`.
+*Configuration.* The limit is off by default. `WorkerConfig::with_adaptive_limit` takes an `AdaptiveLimitConfig`. `with_default` sets the policy for all types. `with_activity(name, policy)` overrides one type, and `None` turns the limit off for that type. An override for an unregistered name logs a warning. `GET /admin/config` reports `adaptive_limit_default` and `adaptive_limit_overrides` from the `WorkerConfig`. An embedder who builds the `HandlerRegistry` directly must also call `HandlerRegistry::with_adaptive_limit`, as for the retry budget.
 
 *Composition.* The limit, the retry budget and the circuit breaker are independent. The limit caps concurrency. The budget caps retry rate. The breaker stops calls to a failed dependency. The static `max_concurrent` cap is fleet-wide and still applies.
 
-*Scope.* The state is in process and per worker. N workers allow up to N caps. The limit never touches the event log, so replay is unaffected. Local activities and the SQLite backend do not use it. The limit suits request and response calls. A long activity gives few samples, so its cap moves slowly.
+*Scope.* The state is in process and per worker. N workers allow up to N caps. The limit never touches the event log, so replay is unaffected. Local activities and the SQLite backend do not use it. The limit suits request and response calls. A long activity gives few samples, so its cap moves slowly. Each probe drains the in-flight attempts down to 4, so at a high cap a probe costs some throughput. Raise `probe_interval` to probe less often.
 
-*Metrics.* Three gauges, each labeled by `activity`: `harvest.activity.concurrency_limit`, `harvest.activity.concurrency_in_flight` and `harvest.activity.latency_baseline_seconds`. The registry publishes them under its lock after every change. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
+*Metrics.* Three gauges, each labeled by `activity`: `harvest.activity.concurrency_limit`, `harvest.activity.concurrency_in_flight` and `harvest.activity.latency_baseline_seconds`. The registry publishes them under its lock after every change. A call that changes nothing publishes nothing. The counter `harvest.activity.concurrency_deferred{activity}` counts deferrals. Prometheus exports it as `harvest_activity_concurrency_deferred_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
 
 ### Sharding
 

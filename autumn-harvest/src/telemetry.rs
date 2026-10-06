@@ -1289,9 +1289,9 @@ pub const METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT: &str = "harvest.activity.concur
 /// Gauge: the no-load handler latency estimate of one activity type, in
 /// seconds (issue #1836).
 ///
-/// Labeled by `activity`. The adaptive limit compares each latency sample
-/// with it. A probe resets it. Until the first sample after a probe, the
-/// gauge keeps its last value.
+/// Labeled by `activity`. The adaptive limit compares the mean latency of
+/// each window with it. A probe clears it. The gauge keeps its last value
+/// until the probe window closes.
 pub const METRIC_ACTIVITY_LATENCY_BASELINE: &str = "harvest.activity.latency_baseline_seconds";
 
 /// Counter: claimed attempts that the adaptive limit deferred (issue #1836).
@@ -2972,22 +2972,19 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// Record the adaptive concurrency limit state of one activity type
-    /// (issue #1836).
+    /// (issue #1836). The registry calls it only when the state changes.
     ///
     /// Maps to three gauges, each labeled by `activity`:
     /// `harvest.activity.concurrency_limit`,
     /// `harvest.activity.concurrency_in_flight` and
-    /// `harvest.activity.latency_baseline_seconds`. A `baseline_secs` of
-    /// `None` means no estimate yet. The baseline gauge then keeps its last
-    /// value.
+    /// `harvest.activity.latency_baseline_seconds`. A `baseline` of `None`
+    /// means no estimate yet. The baseline gauge then keeps its last value.
     fn record_activity_concurrency_limit(
         &self,
         activity: &str,
-        limit: u32,
-        in_flight: u32,
-        baseline_secs: Option<f64>,
+        state: &crate::adaptive_limit::LimitSnapshot,
     ) {
-        let _ = (activity, limit, in_flight, baseline_secs);
+        let _ = (activity, state);
     }
 
     /// Record one claimed attempt that the adaptive limit deferred (issue

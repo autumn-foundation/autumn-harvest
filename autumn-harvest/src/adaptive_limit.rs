@@ -19,20 +19,26 @@
 //!    clamped to the range from 0.5 to 1. The cap moves 20 % of the way to
 //!    `cap * gradient + QUEUE_SIZE`. Thus the cap grows while latency stays
 //!    near the baseline, and it shrinks when latency inflates.
-//! 3. **Backoff.** A retryable failure in a window cuts the cap by
-//!    `backoff_ratio`. A non-retryable failure is an answer. A cancelled
-//!    attempt gives no sample.
+//! 3. **Backoff.** A window is overloaded when the retryable failures pass
+//!    `error_threshold` of its completions. An overloaded window cuts the
+//!    cap by `backoff_ratio`. A rare failure is noise and does not cut it.
 //! 4. **App limit.** A window that used less than half of the cap does not
 //!    move the cap. Low demand says nothing about the dependency.
-//! 5. **Probe.** Every `probe_interval` samples, the cap drops to
-//!    [`QUEUE_SIZE`] and the baseline is cleared. Answers from attempts that
-//!    started before the probe do not count. The next full window measures
-//!    a fresh baseline at a low concurrency. Then the cap returns to its
-//!    value from before the probe.
+//! 5. **Probe.** After `probe_interval` samples, the next window that is not
+//!    overloaded starts a probe. The cap drops to [`QUEUE_SIZE`], or stays
+//!    lower, and the baseline is cleared. Answers from attempts that started
+//!    before the probe do not count. Their failures still count, but they
+//!    cannot close the probe window. The probe window ends with its first
+//!    answers and sets a fresh baseline at a low concurrency. Then the cap
+//!    returns to its value from before the probe.
 //! 6. **Bounds.** The cap stays in `[min_limit, max_limit]`.
 //!
-//! A new type starts with a probe at [`QUEUE_SIZE`], so its first baseline
-//! is measured at a low concurrency.
+//! A new type starts with a probe at [`QUEUE_SIZE`], clamped to the bounds,
+//! so its first baseline is measured at a low concurrency.
+//!
+//! The worker decides what a sample is. A success is an answer. A timeout
+//! and a retryable failure are overload. A non-retryable failure, a panic
+//! and any other cancelled attempt give no sample.
 //!
 //! ## Why a probed minimum
 //!
@@ -46,10 +52,11 @@
 //!
 //! ## Worker integration
 //!
-//! - The claim skips a type at its cap. Its tasks stay `PENDING` for another
-//!   worker or a later poll.
-//! - A claim can race past the cap, for example for a row with capability
-//!   requirements. The dispatch gate then defers the row with the fenced
+//! - The claim skips a type at its cap, also on a row with capability
+//!   requirements. Its tasks stay `PENDING` for another worker or a later
+//!   poll.
+//! - A claim can still race past the cap, for example when two pollers
+//!   claim at once. The dispatch gate then defers the row with the fenced
 //!   retry-budget write. The deferral uses no attempt and appends no event.
 //! - The gate runs before the retry budget, so a deferral spends no budget
 //!   token. A circuit short-circuit and a half-open probe take no slot.
@@ -61,6 +68,7 @@
 //! unaffected. Local activities and the SQLite backend do not use it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -80,7 +88,7 @@ pub const MAX_LIMIT_DEFER: Duration = Duration::from_secs(5);
 /// Weight of the new target in each update.
 const SMOOTHING: f64 = 0.2;
 
-/// Lowest gradient. One sample cannot cut the cap by more than half.
+/// Lowest gradient. One window cannot set a target below half of the cap.
 const MIN_GRADIENT: f64 = 0.5;
 
 /// Fewest samples in one window. The first window after a probe sets the
@@ -89,10 +97,11 @@ const PROBE_SAMPLES: u32 = 4;
 
 /// How one attempt ended, as the limit sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SampleOutcome {
-    /// The dependency answered. A non-retryable failure is an answer too.
+    /// The dependency answered.
     Answered,
-    /// The attempt failed with a retryable failure.
+    /// The attempt failed with a retryable failure or timed out.
     Overloaded,
 }
 
@@ -176,6 +185,7 @@ pub struct LimitSnapshot {
 
 /// Outcome of [`AdaptiveLimitRegistry::try_acquire`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Acquire {
     /// The activity type has no limit. Run the attempt.
     Untracked,
@@ -391,6 +401,10 @@ impl Limiter {
             .clamp(MIN_LIMIT_DEFER, MAX_LIMIT_DEFER)
     }
 
+    fn is_saturated(&self) -> bool {
+        self.in_flight >= self.cap()
+    }
+
     fn snapshot(&self) -> LimitSnapshot {
         LimitSnapshot {
             limit: self.cap(),
@@ -441,6 +455,9 @@ impl Drop for LimitPermit {
 pub struct AdaptiveLimitRegistry {
     config: AdaptiveLimitConfig,
     limiters: Mutex<HashMap<String, Limiter>>,
+    /// Activity types at their cap. The claim path reads it without the
+    /// lock.
+    saturated_count: AtomicUsize,
     metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
@@ -464,12 +481,14 @@ impl AdaptiveLimitRegistry {
         Self {
             config,
             limiters: Mutex::new(HashMap::new()),
+            saturated_count: AtomicUsize::new(0),
             metrics: None,
         }
     }
 
     /// Publish the limit gauges through `metrics`. The registry sends the
-    /// state after every change, under its lock.
+    /// state after every change, under its lock. A call that changes nothing
+    /// sends nothing.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
         self.metrics = Some(metrics);
@@ -489,28 +508,46 @@ impl AdaptiveLimitRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Run `f` on the limiter of `activity_name`, and publish the result.
-    /// Returns `None` when the type has no limit.
+    /// Run `f` on the limiter of `activity_name`, and publish a changed
+    /// state. Returns `None` when the type has no limit.
     fn with_limiter<T>(&self, activity_name: &str, f: impl FnOnce(&mut Limiter) -> T) -> Option<T> {
         let policy = self.config.policy_for(activity_name)?;
         let mut limiters = self.lock();
         // Look up first, so the common path does not allocate a key.
-        if !limiters.contains_key(activity_name) {
+        let created = !limiters.contains_key(activity_name);
+        if created {
             limiters.insert(activity_name.to_owned(), Limiter::new(policy));
         }
         let limiter = limiters.get_mut(activity_name)?;
+        let before = limiter.snapshot();
+        let was_saturated = limiter.is_saturated();
         let out = f(limiter);
+        let after = limiter.snapshot();
+        // The count changes under the lock, so it never goes below 0.
+        match (was_saturated, limiter.is_saturated()) {
+            (false, true) => {
+                self.saturated_count.fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                self.saturated_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         // Publish under the lock, so the samples follow the change order.
-        if let Some(metrics) = &self.metrics {
-            metrics.record_activity_concurrency_limit(
-                activity_name,
-                limiter.cap(),
-                limiter.in_flight,
-                limiter.baseline.map(|b| b.as_secs_f64()),
-            );
+        if let Some(metrics) = &self.metrics
+            && (created || after != before)
+        {
+            metrics.record_activity_concurrency_limit(activity_name, &after);
         }
         drop(limiters);
         Some(out)
+    }
+
+    /// Whether any activity type is at its cap. It reads no lock, so the
+    /// claim path can call it on every poll.
+    #[must_use]
+    pub fn any_saturated(&self) -> bool {
+        self.saturated_count.load(Ordering::Relaxed) > 0
     }
 
     /// Take a slot for one attempt of `activity_name`.
@@ -550,6 +587,9 @@ impl AdaptiveLimitRegistry {
     /// does not claim tasks of these types.
     #[must_use]
     pub fn saturated(&self) -> Vec<String> {
+        if !self.any_saturated() {
+            return Vec::new();
+        }
         let mut names: Vec<String> = self
             .lock()
             .iter()
@@ -702,7 +742,9 @@ mod tests {
         };
         assert!((MIN_LIMIT_DEFER..=MAX_LIMIT_DEFER).contains(&retry_after));
         assert_eq!(reg.saturated(), vec![A.to_owned()]);
+        assert!(reg.any_saturated());
         drop(held);
+        assert!(!reg.any_saturated());
         assert_eq!(reg.snapshot(A).expect("state").in_flight, 0);
         assert_eq!(reg.saturated(), Vec::<String>::new());
         assert!(matches!(reg.try_acquire(A), Acquire::Acquired(_)));
@@ -738,8 +780,8 @@ mod tests {
         assert_eq!(limit(&reg, A), before);
     }
 
-    /// Latency far above the baseline cuts the limit, by at most half each
-    /// sample.
+    /// Latency far above the baseline cuts the limit. The gradient floor
+    /// keeps each window target at half of the cap or more.
     #[test]
     fn inflated_latency_shrinks_the_limit() {
         let reg = registry(AdaptiveLimitPolicy::default());
@@ -929,21 +971,40 @@ mod tests {
 
     /// Records every limit sample, in order.
     #[derive(Default)]
-    struct LimitLog(Mutex<Vec<(u32, u32, Option<f64>)>>);
+    struct LimitLog(Mutex<Vec<LimitSnapshot>>);
 
-    impl MetricsRecorder for LimitLog {
-        fn record_activity_concurrency_limit(
-            &self,
-            _activity: &str,
-            limit: u32,
-            in_flight: u32,
-            baseline_secs: Option<f64>,
-        ) {
+    impl LimitLog {
+        fn len(&self) -> usize {
             self.0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((limit, in_flight, baseline_secs));
+                .len()
         }
+    }
+
+    impl MetricsRecorder for LimitLog {
+        fn record_activity_concurrency_limit(&self, _activity: &str, state: &LimitSnapshot) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(*state);
+        }
+    }
+
+    /// A refused attempt changes nothing, so it publishes nothing.
+    #[test]
+    fn a_limited_attempt_publishes_nothing() {
+        let log = Arc::new(LimitLog::default());
+        let reg = Arc::new(
+            AdaptiveLimitRegistry::new(
+                AdaptiveLimitConfig::disabled().with_default(Some(AdaptiveLimitPolicy::new(1, 1))),
+            )
+            .with_metrics(log.clone()),
+        );
+        let _held = permit(&reg, A);
+        let before = log.len();
+        assert!(matches!(reg.try_acquire(A), Acquire::Limited { .. }));
+        assert_eq!(log.len(), before);
     }
 
     /// Every change publishes the state under the lock, so the last sample
@@ -983,10 +1044,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .last()
             .expect("the gauges were published");
-        let snap = reg.snapshot(A).expect("state");
-        assert_eq!(last.0, snap.limit);
-        assert_eq!(last.1, 0);
-        assert_eq!(last.2, snap.baseline.map(|b| b.as_secs_f64()));
+        assert_eq!(Some(last), reg.snapshot(A));
+        assert_eq!(last.in_flight, 0);
     }
 }
 

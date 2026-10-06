@@ -15626,20 +15626,53 @@ const fn adaptive_limit_gates(
     }
 }
 
-/// The adaptive limit sample for one breaker outcome (issue #1836).
+/// The adaptive limit sample for one attempt (issue #1836).
 ///
-/// `None` is a cancelled attempt. It says nothing about the dependency, so
-/// it gives no sample.
-const fn limit_sample_outcome(
+/// - A cancelled attempt whose deadline passed (`timed_out`) is overload. A
+///   hung dependency is the classic overload signal.
+/// - A retryable failure is overload, unless `error_type` names a fault of
+///   the worker, such as a panic.
+/// - A success is an answer.
+/// - A non-retryable failure gives no sample. It is often fast, and its
+///   latency would pull the baseline down.
+/// - Any other cancelled attempt (`outcome` is `None`) gives no sample.
+fn limit_sample_outcome(
     outcome: Option<crate::circuit_breaker::AttemptOutcome>,
+    error_type: Option<&str>,
+    timed_out: bool,
 ) -> Option<crate::adaptive_limit::SampleOutcome> {
     use crate::adaptive_limit::SampleOutcome;
     use crate::circuit_breaker::AttemptOutcome;
+    if timed_out {
+        return Some(SampleOutcome::Overloaded);
+    }
+    if error_type.is_some_and(is_worker_local_failure) {
+        return None;
+    }
     match outcome {
         Some(AttemptOutcome::RetryableFailure) => Some(SampleOutcome::Overloaded),
         Some(AttemptOutcome::Success) => Some(SampleOutcome::Answered),
         Some(AttemptOutcome::NonRetryableFailure) | None => None,
     }
+}
+
+/// Whether a failure type is a fault of the worker, not of the dependency
+/// (issue #1836).
+fn is_worker_local_failure(error_type: &str) -> bool {
+    if error_type == crate::failure::ERROR_TYPE_HANDLER_PANIC {
+        return true;
+    }
+    #[cfg(feature = "wasm-activities")]
+    if [
+        crate::failure::ERROR_TYPE_WASM_MODULE_UNAVAILABLE,
+        crate::failure::ERROR_TYPE_WASM_MODULE_INVALID,
+        crate::failure::ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
+    ]
+    .contains(&error_type)
+    {
+        return true;
+    }
+    false
 }
 
 /// The activity names that a claim must skip (issue #1836).
@@ -15708,18 +15741,64 @@ mod adaptive_limit_gate_tests {
     #[test]
     fn breaker_outcomes_map_to_limit_samples() {
         assert_eq!(
-            limit_sample_outcome(Some(AttemptOutcome::Success)),
+            limit_sample_outcome(Some(AttemptOutcome::Success), None, false),
             Some(SampleOutcome::Answered)
         );
         assert_eq!(
-            limit_sample_outcome(Some(AttemptOutcome::NonRetryableFailure)),
+            limit_sample_outcome(Some(AttemptOutcome::NonRetryableFailure), None, false),
             None
         );
         assert_eq!(
-            limit_sample_outcome(Some(AttemptOutcome::RetryableFailure)),
+            limit_sample_outcome(Some(AttemptOutcome::RetryableFailure), None, false),
             Some(SampleOutcome::Overloaded)
         );
-        assert_eq!(limit_sample_outcome(None), None);
+        assert_eq!(limit_sample_outcome(None, None, false), None);
+    }
+
+    /// An attempt cancelled because its deadline passed timed out. A hung
+    /// dependency is overload, so it must back the cap off.
+    #[test]
+    fn a_timed_out_attempt_is_overload() {
+        assert_eq!(
+            limit_sample_outcome(None, None, true),
+            Some(SampleOutcome::Overloaded)
+        );
+    }
+
+    /// A panic is a fault of the worker, not of the dependency, so it gives
+    /// no sample.
+    #[test]
+    fn a_panic_gives_no_sample() {
+        assert_eq!(
+            limit_sample_outcome(
+                Some(AttemptOutcome::RetryableFailure),
+                Some(crate::failure::ERROR_TYPE_HANDLER_PANIC),
+                false
+            ),
+            None
+        );
+    }
+
+    /// A WASM module failure is a fault of the worker, not of the
+    /// dependency, so it gives no sample.
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_module_failures_give_no_sample() {
+        for error_type in [
+            crate::failure::ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
+            crate::failure::ERROR_TYPE_WASM_MODULE_UNAVAILABLE,
+            crate::failure::ERROR_TYPE_WASM_MODULE_INVALID,
+        ] {
+            assert_eq!(
+                limit_sample_outcome(
+                    Some(AttemptOutcome::RetryableFailure),
+                    Some(error_type),
+                    false
+                ),
+                None,
+                "{error_type}"
+            );
+        }
     }
 
     #[test]
@@ -17585,6 +17664,9 @@ async fn process_activity_task(
     // resolved. On non-`db` builds `run_transactional` does not exist, so the
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
+    // A cancel after the attempt deadline is a timeout. The adaptive limit
+    // reads it as overload (issue #1836).
+    let timed_out = was_cancelled && ctx.deadline().is_some_and(|d| chrono::Utc::now() >= d);
 
     let attempt_latency = attempt_clock_start.elapsed();
     let duration_secs = attempt_latency.as_secs_f64();
@@ -17689,9 +17771,11 @@ async fn process_activity_task(
         })
     };
     // Adaptive limit (issue #1836): report the handler latency and outcome,
-    // and free the slot. A cancelled attempt frees it without a sample.
+    // and free the slot. See `limit_sample_outcome` for which attempts give
+    // no sample.
     if let Some(permit) = limit_permit.take() {
-        match limit_sample_outcome(circuit_outcome) {
+        let error_type = failure_info.as_ref().map(|(et, _, _)| et.as_str());
+        match limit_sample_outcome(circuit_outcome, error_type, timed_out) {
             Some(outcome) => permit.complete(attempt_latency, outcome),
             None => drop(permit),
         }
@@ -33298,10 +33382,12 @@ impl Worker {
     /// The activity names that a claim must skip: the names with unmet
     /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
-        claim_exclusions(
-            &self.ineligible_activities,
-            self.registry.adaptive_limits().saturated(),
-        )
+        let limits = &self.registry.adaptive_limits;
+        // The common case reads one atomic and takes no lock.
+        if !limits.any_saturated() {
+            return std::borrow::Cow::Borrowed(&self.ineligible_activities);
+        }
+        claim_exclusions(&self.ineligible_activities, limits.saturated())
     }
 
     /// Execute a single poll iteration.
