@@ -302,6 +302,10 @@ fn shape(ops: &[Op]) -> String {
             "signal_timeout" => format!("signal timeout {name}"),
             "signal_external" => format!("signal external {name}"),
             "mutex" => format!("mutex {}", op["key"].as_str().unwrap_or_default()),
+            "saga_unwind" => {
+                let n = op["compensations"].as_array().map_or(0, Vec::len);
+                format!("saga unwind {n}")
+            }
             "fan_out" => {
                 let window = op["window"]
                     .as_u64()
@@ -437,6 +441,16 @@ fn a_join_branch_that_hits_an_engine_gap_keeps_its_shape() {
             "join(fan out window 2 fail fast, slow); complete",
             "actual: \"ActivityScheduled(slow)\"",
         ),
+        (
+            "engine-gap-windowed-fan-out-with-child-sibling.json",
+            "join(fan out window 2 fail fast, child); complete",
+            "actual: \"ChildWorkflowStarted\"",
+        ),
+        (
+            "engine-gap-saga-with-child-sibling.json",
+            "reserve; hold; join(saga unwind 2, child); complete",
+            "expected: \"ActivityScheduled(unhold)\"",
+        ),
     ];
     let cases = seed("engine-gap-");
     for (name, want, stop) in expected {
@@ -493,5 +507,35 @@ fn a_collect_all_fan_out_is_told_from_a_fail_fast_one() {
             Verdict::Replayed("ReplaySucceeded".to_string()),
             "seed {name}"
         );
+    }
+}
+
+/// A timer that never fires is armed, not awaited, when the run ends. It is
+/// armed too when a later decision issues a command and nothing else was
+/// pending. With a sibling pending, the later decision can be the
+/// sibling's. The timer then stays an awaited branch of a `join!`.
+#[test]
+fn an_unresolved_timer_beside_a_sibling_stays_awaited() {
+    let expected = [
+        (
+            "baseline-timer-awaited-beside-sibling.json",
+            "join(timer, seq(work, side effect trace))",
+        ),
+        (
+            "baseline-timer-armed-before-later-decision.json",
+            "join(timer, seq(fetch, store))",
+        ),
+        (
+            "baseline-timer-armed-at-completion.json",
+            "arm_timer; side effect trace; complete",
+        ),
+    ];
+    let cases = seed("baseline-timer-");
+    for (name, want) in expected {
+        let (_, case) = cases
+            .iter()
+            .find(|(seed, _)| seed == name)
+            .unwrap_or_else(|| panic!("seed {name} is missing"));
+        assert_eq!(shape(&mirror(&case.history)), want, "seed {name}");
     }
 }

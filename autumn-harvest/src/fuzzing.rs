@@ -1074,6 +1074,17 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
     }
 }
 
+/// The command that `event` reports on, if it is an outcome, a cancel or
+/// progress. A scan uses it to pass over a sibling's events.
+fn sibling_key(event: &WorkflowEvent) -> Option<Pending> {
+    match event {
+        WorkflowEvent::TimerCancelled { timer_id } => {
+            Some(Pending::Timer(timer_id.as_str().to_string()))
+        }
+        other => settled_key(other).or_else(|| progress_key(other)),
+    }
+}
+
 /// The activity that `event` reports progress for, if it is a start, a
 /// heartbeat, a deadline extension or a local attempt that will retry.
 const fn progress_key(event: &WorkflowEvent) -> Option<Pending> {
@@ -1261,12 +1272,13 @@ fn mirror_fan_out(
             wave = 0;
         }
         match event {
-            // A sibling command in the same `join!`, past the first wave.
-            WorkflowEvent::ActivityScheduled { activity_id, .. } if first_wave && !open => {
-                siblings.insert(*activity_id);
+            // A sibling command in the same `join!`, past the first wave. It
+            // can be an activity, a child, a timer or an external operation.
+            event if first_wave && !open && pending_key(event).is_some() => {
+                siblings.extend(pending_key(event));
                 continue;
             }
-            event if activity_outcome(event).is_some_and(|(id, _)| siblings.contains(&id)) => {
+            event if sibling_key(event).is_some_and(|key| siblings.contains(&key)) => {
                 continue;
             }
             WorkflowEvent::ActivityScheduled {
@@ -2000,13 +2012,16 @@ fn mirror_saga(
                     running = Some(*activity_id);
                     claimed.insert(index);
                 } else {
-                    siblings.insert(*activity_id);
+                    siblings.insert(Pending::Activity(*activity_id));
                 }
             }
             (_, Some((id, Outcome::Done | Outcome::Failed))) if running == Some(id) => {
                 running = None;
             }
-            (_, Some((id, _))) if ids.contains(&id) || siblings.contains(&id) => {}
+            (_, Some((id, _))) if ids.contains(&id) => {}
+            // Any other command is a sibling. Its own events are passed over.
+            (event, _) if pending_key(event).is_some() => siblings.extend(pending_key(event)),
+            (event, _) if sibling_key(event).is_some_and(|key| siblings.contains(&key)) => {}
             _ => break,
         }
     }
@@ -2068,6 +2083,7 @@ const fn is_decision_boundary(event: &WorkflowEvent) -> bool {
 /// classic timer parks the workflow until it fires, so it allows neither.
 /// An id can be reused, so each start is judged alone.
 fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
+    let accompanied = accompanied_timer_starts(history);
     let mut next_is_cancel: HashMap<&str, bool> = HashMap::new();
     let mut armed = HashSet::new();
     let mut run_ends = false;
@@ -2095,7 +2111,10 @@ fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
                 // The start consumes the next event, so an earlier start of a
                 // reused id looks further back.
                 let next = next_is_cancel.remove(timer_id.as_str());
-                if next == Some(true) || (next.is_none() && (run_ends || later_decision)) {
+                // A later decision proves nothing when another command was
+                // pending too. A sibling in the same `join!` can drive it.
+                let lone_then_later = later_decision && !accompanied.contains(&index);
+                if next == Some(true) || (next.is_none() && (run_ends || lone_then_later)) {
                     armed.insert(index);
                 }
             }
@@ -2103,6 +2122,32 @@ fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
         }
     }
     armed
+}
+
+/// The indexes of the `TimerStarted` events with another command pending:
+/// one started earlier and not yet settled, or one started in the same
+/// decision. Such a timer can be the awaited branch of a `join!`.
+fn accompanied_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
+    let mut pending: HashSet<Pending> = HashSet::new();
+    let mut accompanied = HashSet::new();
+    for (index, event) in history.iter().enumerate() {
+        if let WorkflowEvent::TimerStarted { .. } = event {
+            let same_decision = history[index + 1..]
+                .iter()
+                .take_while(|e| !is_decision_boundary(e))
+                .any(|e| pending_key(e).is_some());
+            if !pending.is_empty() || same_decision {
+                accompanied.insert(index);
+            }
+        }
+        if let Some(key) = sibling_key(event)
+            && progress_key(event).is_none()
+        {
+            pending.remove(&key);
+        }
+        pending.extend(pending_key(event));
+    }
+    accompanied
 }
 
 impl Op {
