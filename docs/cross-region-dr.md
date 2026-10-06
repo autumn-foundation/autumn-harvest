@@ -374,9 +374,12 @@ These direct-database commands are exempt, by design:
 
 An admin write holds the same fence barrier as a scheduler pass. The
 management API holds one per pinned shard until the handler returns. A
-rebalance or a partition command holds one per shard, at the stated epoch,
-until that shard's work ends. The runner's startup trigger sync holds one
-too. A bump therefore cannot commit while any of them writes.
+rebalance or a partition command holds one for every shard with a row on
+each database it changes, at the stated epoch, until that database's work
+ends. It also holds `harvest_shard_generation` in `SHARE` mode, so no new
+shard row can appear mid-command. A colocated shard with no stated epoch is
+refused. The runner's startup trigger sync holds one too. A bump therefore
+cannot commit while any of them writes.
 
 Three limits, stated plainly:
 

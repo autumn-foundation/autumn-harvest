@@ -1827,23 +1827,7 @@ mod db {
         allowed: &[(ShardId, ShardGeneration)],
     ) -> HarvestResult<FencePassGuard> {
         use diesel_async::SimpleAsyncConnection as _;
-        conn.batch_execute("BEGIN").await.map_err(database_error)?;
-        // The guard runs no query while the pass works. A server timeout
-        // must not end its transaction and free the lock mid-pass, so this
-        // transaction turns them off. PostgreSQL 17 adds
-        // `transaction_timeout`; older servers do not know it.
-        conn.batch_execute(
-            "SET LOCAL idle_in_transaction_session_timeout = 0; \
-             SET LOCAL statement_timeout = 0; \
-             SET LOCAL application_name = 'harvest_dr_fence_pass'; \
-             DO $$ BEGIN \
-               IF current_setting('server_version_num')::int >= 170000 THEN \
-                 PERFORM set_config('transaction_timeout', '0', true); \
-               END IF; \
-             END $$",
-        )
-        .await
-        .map_err(database_error)?;
+        begin_guard_transaction(&mut conn).await?;
         diesel::sql_query(FENCE_PASS_LOCK_SHARED)
             .bind::<BigInt, _>(fence_pass_lock_key(shard.as_i32()))
             .execute(&mut conn)
@@ -1862,6 +1846,39 @@ mod db {
         conn.batch_execute("ROLLBACK TO SAVEPOINT harvest_fence_check")
             .await
             .map_err(database_error)?;
+        Ok(keep_guard_alive(conn, shard.as_i32()))
+    }
+
+    /// Open a transaction on `conn` that a long guard holds (issue #1823).
+    /// The guard runs no query while the pass works. A server timeout must
+    /// not end its transaction and free its locks mid-pass, so this turns
+    /// them off. PostgreSQL 17 adds `transaction_timeout`; older servers do
+    /// not know it.
+    async fn begin_guard_transaction(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+        use diesel_async::SimpleAsyncConnection as _;
+        conn.batch_execute("BEGIN").await.map_err(database_error)?;
+        // The guard runs no query while the pass works. A server timeout
+        // must not end its transaction and free the lock mid-pass, so this
+        // transaction turns them off. PostgreSQL 17 adds
+        // `transaction_timeout`; older servers do not know it.
+        conn.batch_execute(
+            "SET LOCAL idle_in_transaction_session_timeout = 0; \
+             SET LOCAL statement_timeout = 0; \
+             SET LOCAL application_name = 'harvest_dr_fence_pass'; \
+             DO $$ BEGIN \
+               IF current_setting('server_version_num')::int >= 170000 THEN \
+                 PERFORM set_config('transaction_timeout', '0', true); \
+               END IF; \
+             END $$",
+        )
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Hand `conn` to a keepalive task and return its guard. The task pings
+    /// the session, and marks the guard lost when the session ends.
+    fn keep_guard_alive(mut conn: AsyncPgConnection, shard_id: i32) -> FencePassGuard {
         let lost = tokio_util::sync::CancellationToken::new();
         let flag = lost.clone();
         let keepalive = tokio::spawn(async move {
@@ -1874,14 +1891,62 @@ mod db {
                 {
                     flag.cancel();
                     tracing::error!(
-                        shard_id = shard.as_i32(),
+                        shard_id,
                         "the DR fence guard lost its session; its pass stops writing"
                     );
                     return;
                 }
             }
         });
-        Ok(FencePassGuard { lost, keepalive })
+        FencePassGuard { lost, keepalive }
+    }
+
+    /// Freeze the set of generation rows on a database while a command runs
+    /// (issue #1823).
+    ///
+    /// A command that changes tables every logical shard shares must hold a
+    /// barrier for each shard there. A row provisioned during the command
+    /// would have none. So this guard takes `harvest_shard_generation` in
+    /// `SHARE` mode. That blocks a new row and every bump on this database
+    /// until the guard drops. Reads and the `FOR SHARE` fence checks still
+    /// run.
+    ///
+    /// Take the per-shard barriers in `guarded` first. A bump takes its pass
+    /// lock before the table, so this order cannot deadlock with one.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Config`] when the database holds a row
+    /// outside `guarded`. [`crate::error::HarvestError::Database`] when the
+    /// lock is not granted within the bump's lock timeout, or a query fails.
+    pub async fn freeze_generation_rows_on(
+        mut conn: AsyncPgConnection,
+        guarded: &[ShardId],
+    ) -> HarvestResult<FencePassGuard> {
+        use diesel_async::SimpleAsyncConnection as _;
+        begin_guard_transaction(&mut conn).await?;
+        conn.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '{BUMP_LOCK_TIMEOUT_MS}ms'; \
+             LOCK TABLE harvest_shard_generation IN SHARE MODE"
+        ))
+        .await
+        .map_err(database_error)?;
+        let rows = probe_dr_markers(&mut conn, super::DEFAULT_DR_SLOT_PREFIX)
+            .await?
+            .generation_shards;
+        let unguarded: Vec<i32> = rows
+            .iter()
+            .filter(|row| !guarded.contains(row))
+            .map(|row| row.as_i32())
+            .collect();
+        if !unguarded.is_empty() {
+            return Err(crate::error::HarvestError::Config(format!(
+                "shard row(s) {unguarded:?} appeared on this database while the command \
+                 took its barriers. Run the command again, with --expect-generation for \
+                 every shard."
+            )));
+        }
+        Ok(keep_guard_alive(conn, -1))
     }
 
     /// Assert that this process still holds write authority for `shard`.
@@ -3370,8 +3435,9 @@ pub use db::{
     FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority, assert_fence,
     assert_fence_group, begin_fenced_group, begin_fenced_pass, begin_fenced_pass_at,
     begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
-    ensure_generation_row, measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers,
-    query_replication_status, record_replication_heartbeat, resolve_held, run_fenced_pass,
+    ensure_generation_row, freeze_generation_rows_on, measure_rpo, pin_process_fence,
+    pin_worker_fence, probe_dr_markers, query_replication_status, record_replication_heartbeat,
+    resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]

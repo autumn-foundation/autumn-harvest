@@ -3514,6 +3514,41 @@ async fn dsn_aliases_of_one_database_are_colocated() {
     );
 }
 
+/// A direct-database command freezes the set of generation rows while it
+/// runs (issue #1823). A shard provisioned mid-command would otherwise have
+/// no barrier.
+#[tokio::test]
+async fn a_row_freeze_blocks_new_rows_and_refuses_unguarded_ones() {
+    use autumn_harvest::replication::freeze_generation_rows_on;
+
+    let (url, _db) = require_db!("rowfreeze");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let freeze = freeze_generation_rows_on(connect(&url).await, &[ShardId::new(0)])
+        .await
+        .expect("every row is guarded");
+    let provision = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        ensure_generation_row(&mut conn, ShardId::new(1)),
+    )
+    .await;
+    assert!(provision.is_err(), "a new row waits for the freeze");
+    drop(freeze);
+    drop(conn);
+
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .expect("the row lands once the freeze drops");
+    let refused = freeze_generation_rows_on(connect(&url).await, &[ShardId::new(0)]).await;
+    assert!(
+        matches!(refused, Err(autumn_harvest::error::HarvestError::Config(_))),
+        "an unguarded row is refused"
+    );
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

@@ -6140,8 +6140,8 @@ async fn direct_write_authority(
     })
 }
 
-/// Open the fence barriers for one partition command on one database (issue
-/// #1823), at the epochs the operator stated.
+/// Open the fence barriers for one direct-database command on one database
+/// (issue #1823), at the epochs the operator stated.
 ///
 /// The command changes tables that every logical shard on the database
 /// shares. So it holds a barrier for the named shard and for every other
@@ -6150,14 +6150,19 @@ async fn direct_write_authority(
 /// marker, so it needs no barrier. A colocated shard with no stated epoch is
 /// refused: the command cannot hold its barrier.
 ///
+/// A last guard then freezes the set of rows, so a shard provisioned during
+/// the command cannot appear without a barrier. See
+/// `autumn_harvest::replication::freeze_generation_rows_on`.
+///
 /// Each barrier takes its own connection. A bump cannot commit while the
 /// caller holds them, so the command's DDL and row moves keep their
 /// authority.
-async fn partition_fence(
+async fn database_fence(
     dsn: &str,
     shard_id: i32,
     expect_generation: &[ExpectGeneration],
 ) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, String> {
+    use autumn_harvest::types::ShardId;
     let rows = {
         let mut probe = dr_connect(dsn).await.map_err(|e| e.to_string())?;
         autumn_harvest::replication::probe_dr_markers(
@@ -6169,12 +6174,13 @@ async fn partition_fence(
         .generation_shards
     };
     let mut shards = vec![shard_id];
-    for row in rows {
+    for row in &rows {
         if !shards.contains(&row.as_i32()) {
             shards.push(row.as_i32());
         }
     }
-    let mut guards = Vec::with_capacity(shards.len());
+    let mut guards = Vec::with_capacity(shards.len() + 1);
+    let mut guarded = Vec::with_capacity(shards.len());
     for shard in shards {
         let Some(expected) =
             expected_generation_for(expect_generation, shard).map_err(|e| e.to_string())?
@@ -6192,11 +6198,20 @@ async fn partition_fence(
         guards.push(
             autumn_harvest::replication::begin_fenced_pass_on(
                 conn,
-                autumn_harvest::types::ShardId::new(shard),
+                ShardId::new(shard),
                 autumn_harvest::replication::ShardGeneration::new(expected),
             )
             .await
             .map_err(|e| e.to_string())?,
+        );
+        guarded.push(ShardId::new(shard));
+    }
+    if !rows.is_empty() {
+        let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;
+        guards.push(
+            autumn_harvest::replication::freeze_generation_rows_on(conn, &guarded)
+                .await
+                .map_err(|e| e.to_string())?,
         );
     }
     Ok(guards)
@@ -6206,8 +6221,13 @@ async fn partition_fence(
 /// write. A rebalance moves history between two shards, so both must hold
 /// authority. The returned guards hold each stated epoch until the caller
 /// drops them, so a bump cannot commit while the rebalance writes.
+///
+/// The rebalance scans tables that every logical shard on a database
+/// shares. So each database gets [`database_fence`], which guards every
+/// shard with a row there, not only the configured ones.
 async fn shard_pool_write_authority(
     pool: &autumn_harvest::shard::ShardedDbPool,
+    targets: &[autumn_harvest::backup_verify::ShardTarget],
     expect_generation: &[ExpectGeneration],
 ) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, CliError> {
     let mut guards = Vec::new();
@@ -6224,18 +6244,20 @@ async fn shard_pool_write_authority(
         )
         .await
         .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
-        // Hold a barrier at the stated epoch for the whole command, so a bump
-        // cannot commit while the rebalance writes (issue #1823).
-        if let Some(expected) = expected_generation_for(expect_generation, shard.as_i32())? {
-            let guard = autumn_harvest::replication::begin_fenced_pass_at(
-                shard_pool,
-                shard,
-                autumn_harvest::replication::ShardGeneration::new(expected),
-            )
-            .await
-            .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
-            guards.push(guard);
+    }
+    // Hold the barriers for the whole command, so a bump cannot commit while
+    // the rebalance writes (issue #1823). One set for each database.
+    let mut fenced: Vec<&str> = Vec::new();
+    for target in targets {
+        if fenced.contains(&target.dsn.as_str()) {
+            continue;
         }
+        fenced.push(&target.dsn);
+        guards.extend(
+            database_fence(&target.dsn, target.shard_id, expect_generation)
+                .await
+                .map_err(|e| CliError::InvalidInput(format!("shard {}: {e}", target.shard_id)))?,
+        );
     }
     Ok(guards)
 }
@@ -6553,7 +6575,7 @@ async fn run_partition_enable(
             continue;
         }
         // Held until this shard's mutation ends (issue #1823).
-        let fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
             Ok(guard) => guard,
             Err(error) => {
                 row.error = Some(error);
@@ -6621,7 +6643,7 @@ async fn run_partition_maintain(
             continue;
         }
         // Held until this shard's mutation ends (issue #1823).
-        let fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
             Ok(guard) => guard,
             Err(error) => {
                 row.error = Some(error);
@@ -6697,7 +6719,7 @@ async fn run_partition_disable(
             continue;
         }
         // Held until this shard's mutation ends (issue #1823).
-        let fence = match partition_fence(&target.dsn, target.shard_id, expect_generation).await {
+        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
             Ok(guard) => guard,
             Err(error) => {
                 row.error = Some(error);
@@ -10532,7 +10554,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let fence = if *dry_run {
                 Vec::new()
             } else {
-                shard_pool_write_authority(&pool, expect_generation).await?
+                shard_pool_write_authority(&pool, &targets, expect_generation).await?
             };
             let after = after_created_at
                 .zip(*after_execution_id)
@@ -10576,7 +10598,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            let fence = shard_pool_write_authority(&pool, expect_generation).await?;
+            let fence = shard_pool_write_authority(&pool, &targets, expect_generation).await?;
             // A lost fence session stops the command. See `run_fenced_pass`.
             let outcomes = autumn_harvest::replication::run_fenced_pass(
                 &fence,
@@ -10619,7 +10641,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            let fence = shard_pool_write_authority(&pool, expect_generation).await?;
+            let fence = shard_pool_write_authority(&pool, &targets, expect_generation).await?;
             let after = after_migrated_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
