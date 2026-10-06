@@ -48087,8 +48087,9 @@ fn fan_out_ramp_id(
 /// The check runs before any write, so no shard gets the ramp back. Each
 /// shard checks its abort markers for the generation id of its own base.
 /// The audit pool then checks its report ledger, which outlives the
-/// markers. A shard that cannot be read is left to the write, which runs
-/// the same check on that shard in its UPDATE.
+/// markers. The check fails closed with `503`. A shard that cannot be read
+/// could hold an aborted generation whose markers are pruned, and only the
+/// audit pool can then refuse it.
 #[allow(clippy::result_large_err)]
 async fn refuse_aborted_ramp(
     pool: &HarvestDbPool,
@@ -48101,19 +48102,32 @@ async fn refuse_aborted_ramp(
     };
 
     let refused = || conflict_from(aborted_generation_error(queue_name, target_build_id));
+    let unchecked = |shard: ShardId, error: &dyn std::fmt::Display| {
+        AutumnError::service_unavailable_msg(format!(
+            "shard {}: cannot check the ramp for an earlier abort: {error}; no shard was \
+             written, retry the request",
+            shard.as_i32()
+        ))
+        .into_response()
+    };
     let mut generations = Vec::new();
-    for (_, shard_pool) in pool.iter_shards() {
-        let Ok(mut conn) = acquire_conn(shard_pool).await else {
-            continue;
-        };
-        let Ok(Some(policy)) = get_build_policy(&mut conn, queue_name).await else {
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool)
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?;
+        // A shard with no base policy holds no ramp. Its write fails on the
+        // missing base.
+        let Some(policy) = get_build_policy(&mut conn, queue_name)
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?
+        else {
             continue;
         };
         let generation = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
-        if matches!(
-            ramp_generation_aborted(&mut conn, queue_name, &[generation]).await,
-            Ok(true)
-        ) {
+        if ramp_generation_aborted(&mut conn, queue_name, &[generation])
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?
+        {
             return Err(refused().into_response());
         }
         generations.push(generation);

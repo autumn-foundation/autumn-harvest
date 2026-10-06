@@ -569,3 +569,39 @@ async fn a_keyed_retry_after_marker_pruning_does_not_restore_an_aborted_ramp() {
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert!(!ramp_is_active(&pool).await, "the aborted ramp stays off");
 }
+
+/// The aborted-ramp check of a keyed ramp fails closed (issue #1814). A
+/// shard that it cannot read could hold an aborted generation with pruned
+/// markers. So the request writes no shard and answers `503`.
+#[tokio::test]
+async fn a_keyed_ramp_writes_nothing_when_a_shard_cannot_be_checked() {
+    use autumn_harvest::ShardId;
+    use autumn_harvest::shard::ShardedDbPool;
+
+    let (url, _container) = setup_test_database_url().await;
+    let live = build_test_pool(&url);
+    let mut conn = live.get().await.expect("get conn");
+    set_build_policy(&mut conn, "default", "base-v1", None)
+        .await
+        .expect("seed base policy");
+    drop(conn);
+    // No server listens on port 1, so shard 1 cannot be read.
+    let dead = build_test_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), live.clone());
+    pools.insert(ShardId::new(1), dead);
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(ShardedDbPool::from_map(
+        pools,
+        ShardId::new(0),
+    )));
+    let app = harvest_api_router(api_state);
+    let ramp =
+        json!({ "queue_name": "default", "target_build_id": "canary-v2", "ramp_percent": 10 });
+
+    let (status, body) =
+        post_json_with_key(&app, "/admin/build-routing/ramp", ramp, Some("k-dead")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert!(!ramp_is_active(&live).await, "no shard gets the ramp");
+}

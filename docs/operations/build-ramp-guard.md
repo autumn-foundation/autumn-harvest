@@ -264,7 +264,9 @@ The guard fails safe: when it cannot read, it does not abort.
   for the generation id of its own base. The audit pool then checks the
   report ledger, which outlives the markers. The pool write runs the same
   check in its `UPDATE`, so an abort that lands between the check and the
-  write is also refused. Send a new key to ramp again.
+  write is also refused. Send a new key to ramp again. The check fails
+  closed: when it cannot read a pool, the request gets `503` and changes
+  no pool. Retry it when the pool is back.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported, older than `report_grace`, and whose ramp no
