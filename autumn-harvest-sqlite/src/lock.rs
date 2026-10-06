@@ -137,15 +137,17 @@ fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
     if !uri.to_ascii_lowercase().contains("cache=shared") {
         return Ok(None);
     }
-    // `SQLite` names the database by the URI path. The query does not count.
+    // `SQLite` names the database by the URI path, with `%HH` escapes decoded.
+    // The query does not count.
     let without_scheme = uri
         .get(..5)
         .filter(|scheme| scheme.eq_ignore_ascii_case("file:"))
         .map_or(&*uri, |_| &uri[5..]);
-    let name = without_scheme
-        .split_once('?')
-        .map_or(without_scheme, |(name, _)| name)
-        .to_string();
+    let name = percent_decode(
+        without_scheme
+            .split_once('?')
+            .map_or(without_scheme, |(name, _)| name),
+    );
     let inserted = SHARED_MEMORY
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -156,6 +158,31 @@ fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
         });
     }
     Ok(Some(WriterLock::SharedMemory(name)))
+}
+
+/// Decode `%HH` escapes as `SQLite` does for a URI path. A malformed escape
+/// stays as it is.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|pair| std::str::from_utf8(pair).ok())
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The canonical form of the database path.

@@ -285,3 +285,15 @@ fn a_shared_cache_memory_database_takes_an_in_process_lock() {
     drop(first);
     SqliteRuntime::open(uri).expect("a dropped runtime releases its in-process lock");
 }
+
+/// `SQLite` decodes `%HH` escapes in a URI name, so both spellings below name
+/// one shared database. They must share one in-process lock.
+#[test]
+fn a_percent_encoded_shared_memory_alias_shares_the_lock() {
+    let _first = SqliteRuntime::open("file:memdb_1834?mode=memory&cache=shared").unwrap();
+
+    let err = SqliteRuntime::open("file:mem%64b_1834?cache=shared&mode=memory")
+        .err()
+        .expect("an encoded alias is the same database");
+    assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
+}
