@@ -71,6 +71,16 @@ a caller to some shards, deny `None` too.
 Every token-scope deny and every hook deny writes an `authz.deny` audit row
 with status `failed`. The audit export ships it to the SIEM.
 
+## Rate limiting
+
+The optional per-client rate limiter (issue #1827) can answer `429 Too Many
+Requests` on any route that is not `PublicSafe`. The response carries a
+`Retry-After` header in whole seconds and the body
+`{"error": "rate limited", "route_class", "retry_after_secs"}`. The `error`
+value tells it apart from a load-shed `429` (`"load shed"`). Wait
+`Retry-After` seconds, then send the request again. See
+[API rate limiting](./security-posture.md#api-rate-limiting).
+
 ## SSE Execution Event Stream
 
 ### Endpoint

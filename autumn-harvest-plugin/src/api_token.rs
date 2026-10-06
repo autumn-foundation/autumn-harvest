@@ -493,6 +493,11 @@ pub async fn enforce_token_scope(
         };
     }
 
+    // Issue #1827: give the connection back before the handler runs. The
+    // handler takes its own, so a held one would double each request's pool
+    // use. A rate-limited request would also hold one for nothing.
+    drop(conn);
+
     // AC6/D3: mark the verified principal so `require_admin` admits it.
     request.extensions_mut().insert(TokenPrincipal {
         id: token.id,
