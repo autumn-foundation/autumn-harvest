@@ -271,8 +271,9 @@ seconds, one job per target (issue #1835).
 - **Manual run.** Run the workflow from the Actions tab. The `seconds`
   input sets the time per target.
 - **Pull request.** A change under `fuzz/`, to the workflow, to
-  `rust-toolchain.toml`, or to the `autumn-harvest` files that carry the
-  derives runs each target for 60 seconds. A draft PR skips it.
+  `rust-toolchain.toml`, or to the source of `autumn-harvest` or its macros
+  runs each target for 60 seconds. `fuzz_replay` reaches most of the engine,
+  so a narrower filter would miss a replayer change. A draft PR skips it.
 
 The guard `fuzz_nightly_wiring.rs` keeps the target lists of
 `fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow equal. It also checks

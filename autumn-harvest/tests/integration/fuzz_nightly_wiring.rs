@@ -9,7 +9,9 @@
 
 use std::collections::BTreeSet;
 
-use super::ci_run_coverage::{parse_workflow, parse_workflow_text, ungated, workflow_crons};
+use super::ci_run_coverage::{
+    parse_workflow, parse_workflow_text, repo_root, ungated, workflow_crons,
+};
 
 const FUZZ_CARGO_TOML: &str = include_str!("../../../fuzz/Cargo.toml");
 const FUZZ_SMOKE_SH: &str = include_str!("../../../fuzz/smoke.sh");
@@ -292,6 +294,86 @@ fn corpus_check_rejects_a_broken_cycle() {
         !job(head, &format!("{restore}{soft_fuzz}{save}")),
         "a fuzz step that hides a crash"
     );
+}
+
+/// The `on.pull_request.paths` filter of a workflow.
+fn pr_paths(doc: &serde_yaml::Value) -> Vec<&str> {
+    doc.get("on")
+        .and_then(|on| on.get("pull_request"))
+        .and_then(|pr| pr.get("paths"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect()
+}
+
+/// True when a filter entry matches `file`: the same path, or a `dir/**`
+/// entry over it.
+fn covers(paths: &[&str], file: &str) -> bool {
+    paths.iter().any(|entry| {
+        entry.strip_suffix("/**").map_or(*entry == file, |dir| {
+            file.strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+    })
+}
+
+/// Every `.rs` file under `dir`, relative to the repository root.
+fn rust_files(dir: &str) -> Vec<String> {
+    let root = repo_root();
+    let mut out = Vec::new();
+    let mut todo = vec![root.join(dir)];
+    while let Some(path) = todo.pop() {
+        for entry in std::fs::read_dir(&path).expect("the source directory is readable") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                todo.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path.strip_prefix(&root).expect("under the repository root");
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out
+}
+
+/// The fuzz targets link the whole `autumn-harvest` crate. `fuzz_replay`
+/// drives the replayer, the codecs and the workflow context. So a change to
+/// any of its source files must run the PR campaign.
+#[test]
+fn a_change_to_the_crate_source_runs_the_pr_campaign() {
+    let doc = parse_workflow(NIGHTLY);
+    let paths = pr_paths(&doc);
+    let files = rust_files("autumn-harvest/src");
+    assert!(
+        files.iter().any(|f| f == "autumn-harvest/src/replay.rs"),
+        "the walk must find the replayer"
+    );
+    let missed: Vec<&String> = files.iter().filter(|f| !covers(&paths, f)).collect();
+    assert!(
+        missed.is_empty(),
+        "{NIGHTLY} `on.pull_request.paths` must cover {missed:?}"
+    );
+}
+
+/// Self-test: the path check reads both entry shapes, and the old filter
+/// misses the replayer.
+#[test]
+fn path_check_rejects_a_filter_without_the_replayer() {
+    let old = [
+        "autumn-harvest/src/event.rs",
+        "autumn-harvest/src/fuzzing.rs",
+    ];
+    assert!(covers(&old, "autumn-harvest/src/event.rs"));
+    assert!(!covers(&old, "autumn-harvest/src/replay.rs"));
+    let new = ["autumn-harvest/src/**"];
+    assert!(covers(&new, "autumn-harvest/src/replay.rs"));
+    assert!(covers(&new, "autumn-harvest/src/replay/matcher.rs"));
+    assert!(!covers(&new, "autumn-harvest/srcx/lib.rs"));
+    let text = "on:\n  pull_request:\n    paths:\n      - \"a/**\"\n      - b.rs\n";
+    let doc = parse_workflow_text(text).expect("synthetic workflow must parse");
+    assert_eq!(pr_paths(&doc), vec!["a/**", "b.rs"]);
 }
 
 /// Self-test: only the draft-skip `if` may gate the fuzz job.

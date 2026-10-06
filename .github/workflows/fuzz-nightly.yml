@@ -11,8 +11,9 @@
 #   reproducers, such as the #1253 and #1758 envelope look-alikes.
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. The crash input is a run artifact.
-# - `pull_request`: a change to the fuzz harness runs each target for 60
-#   seconds. That checks the wiring and the corpus cycle before the merge.
+# - `pull_request`: a change to the fuzz harness or to the crate source runs
+#   each target for 60 seconds. That checks the wiring, the corpus cycle and
+#   the replayer before the merge.
 #
 # `autumn-harvest/tests/integration/fuzz_nightly_wiring.rs` guards this
 # file. `docs/testing/property-and-fuzz.md` tells how to reproduce a crash.
@@ -34,12 +35,11 @@ on:
     paths:
       - "fuzz/**"
       - ".github/workflows/fuzz-nightly.yml"
+      # `fuzz_replay` drives the replayer, the payload codecs and stores and
+      # the workflow context. So any change to the crate source runs it.
       - "autumn-harvest/Cargo.toml"
-      - "autumn-harvest/src/error.rs"
-      - "autumn-harvest/src/event.rs"
-      - "autumn-harvest/src/fuzzing.rs"
-      - "autumn-harvest/src/policy.rs"
-      - "autumn-harvest/src/types.rs"
+      - "autumn-harvest/src/**"
+      - "autumn-harvest-macros/**"
       - "rust-toolchain.toml"
 
 concurrency:
