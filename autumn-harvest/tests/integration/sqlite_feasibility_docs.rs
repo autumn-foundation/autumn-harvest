@@ -217,6 +217,17 @@ const MECHANISMS: &[(&str, &[&str])] = &[
 /// `excluded_modules_all_exist` keeps the list from rotting past a rename).
 const AUDIT_EXCLUDED_MODULES: &[&str] = &["chaos"];
 
+/// Subdirectories of `autumn-harvest/src` that the flat scan skips, with the
+/// reason for each.
+///
+/// `dst` is the simulation harness of issue #1830. It is test
+/// infrastructure, like `chaos`, and a port to `SQLite` does not carry it. It
+/// also has no Postgres coupling.
+/// `skipped_subdirectories_have_no_postgres_coupling` checks that every file
+/// in it stays free of the `MECHANISMS` tokens, so the skip cannot hide
+/// coupling.
+const SKIPPED_SUBDIRS: &[&str] = &["dst"];
+
 /// Every auditable core `.rs` module directly under `autumn-harvest/src`, as
 /// `(module name, path)`.
 ///
@@ -246,7 +257,7 @@ fn core_module_files() -> Vec<(String, PathBuf)> {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
-            if name != "bin" {
+            if name != "bin" && !SKIPPED_SUBDIRS.contains(&name.as_str()) {
                 subdirs.push(name);
             }
             continue;
@@ -412,6 +423,36 @@ fn markdown_section<'a>(document: &'a str, heading_contains: &str) -> Option<&'a
     }
     // Unterminated section: runs to end of document.
     start.map(|begin| &document[begin..])
+}
+
+/// A skipped subdirectory must not carry Postgres coupling. Otherwise the
+/// skip would hide the coupling that the inventory exists to record.
+#[test]
+fn skipped_subdirectories_have_no_postgres_coupling() {
+    for dir in SKIPPED_SUBDIRS {
+        let path = repo_root().join("autumn-harvest/src").join(dir);
+        let entries = std::fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+        let mut files = 0;
+        for entry in entries {
+            let file = entry.expect("readable dir entry").path();
+            if file.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            files += 1;
+            let body = read_normalized(&file);
+            for (label, tokens) in MECHANISMS {
+                let hit = tokens.iter().find(|token| body.contains(**token));
+                assert!(
+                    hit.is_none(),
+                    "{} is in a skipped subdirectory but has {label} coupling ({hit:?}). \
+                     Remove it from SKIPPED_SUBDIRS and inventory it.",
+                    file.display()
+                );
+            }
+        }
+        assert!(files > 0, "skipped subdirectory {dir} has no .rs files");
+    }
 }
 
 #[test]

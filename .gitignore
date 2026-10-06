@@ -36,3 +36,8 @@ clients/typescript/*.tgz
 # TLC trace dumps from a manual run in formal/tla (issue #1819).
 formal/tla/*_TTrace_*
 formal/tla/states/
+
+# Patch leftovers (issue #1831). CI fails on a tracked one
+# (docs/audits/tracked-artifacts.py).
+*.orig
+*.rej
