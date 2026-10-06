@@ -600,6 +600,23 @@ impl AdaptiveLimitRegistry {
         names
     }
 
+    /// The delay before a task of `activity_name` should try again, when the
+    /// type is at its cap. `None` when the type has a free slot or no limit.
+    ///
+    /// The delay is one to two baselines, the time in which a slot is likely
+    /// to free. The dispatch channel releases such a reference for this delay
+    /// instead of its gate backoff.
+    #[must_use]
+    pub fn saturated_delay(&self, activity_name: &str) -> Option<Duration> {
+        if !self.any_saturated() {
+            return None;
+        }
+        self.lock()
+            .get(activity_name)
+            .filter(|limiter| limiter.is_saturated())
+            .map(Limiter::defer_delay)
+    }
+
     /// The limit state of `activity_name`, or `None` when it has no state.
     #[must_use]
     pub fn snapshot(&self, activity_name: &str) -> Option<LimitSnapshot> {
@@ -743,8 +760,14 @@ mod tests {
         assert!((MIN_LIMIT_DEFER..=MAX_LIMIT_DEFER).contains(&retry_after));
         assert_eq!(reg.saturated(), vec![A.to_owned()]);
         assert!(reg.any_saturated());
+        let delay = reg
+            .saturated_delay(A)
+            .expect("a saturated type has a delay");
+        assert!((MIN_LIMIT_DEFER..=MAX_LIMIT_DEFER).contains(&delay));
+        assert_eq!(reg.saturated_delay(B), None);
         drop(held);
         assert!(!reg.any_saturated());
+        assert_eq!(reg.saturated_delay(A), None);
         assert_eq!(reg.snapshot(A).expect("state").in_flight, 0);
         assert_eq!(reg.saturated(), Vec::<String>::new());
         assert!(matches!(reg.try_acquire(A), Acquire::Acquired(_)));

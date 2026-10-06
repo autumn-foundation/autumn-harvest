@@ -29924,6 +29924,7 @@ fn reference_outcome(
     redeliveries: u32,
     now: chrono::DateTime<chrono::Utc>,
     settings: &crate::dispatch::DispatchSettings,
+    saturated_delay: Option<Duration>,
 ) -> ReferenceOutcome {
     let Some(probe) = probe else {
         // Absent row. A publish can beat its own commit, so give the row a few
@@ -29960,6 +29961,13 @@ fn reference_outcome(
         // reference on at once, so the owner can see it before the pin ends.
         // A growing delay here would outlast the sticky window.
         return ReferenceOutcome::Release(settings.poll_interval.min(settings.release_backoff_cap));
+    }
+    if let Some(delay) = saturated_delay {
+        // The type is at its adaptive limit (issue #1836). A slot frees in
+        // about one handler latency. The gate backoff would hold that slot
+        // idle for up to the backoff cap. A freed slot cannot wake a released
+        // reference, so the reference returns when a slot is likely free.
+        return ReferenceOutcome::Release(delay.min(settings.release_backoff_cap));
     }
     // Due but gated: a queue pause, a concurrency cap, a rate limit, a session
     // pin, or any other claim gate. Back off so a held row does not cycle once
@@ -32693,11 +32701,16 @@ impl Worker {
                         return ReferenceDisposition::Handled;
                     }
                 };
+                let saturated_delay = probe
+                    .as_ref()
+                    .and_then(|p| p.activity_name.as_deref())
+                    .and_then(|name| self.registry.adaptive_limits.saturated_delay(name));
                 let outcome = reference_outcome(
                     probe.as_ref(),
                     lease.redeliveries,
                     chrono::Utc::now(),
                     &installed.settings,
+                    saturated_delay,
                 );
                 // Same reason as the claimed arm: disposal is a channel round
                 // trip the caller batches, so the connection goes back first.
@@ -47640,7 +47653,31 @@ mod tests {
             scheduled_at,
             has_worker: state == "RUNNING",
             pinned_elsewhere: false,
+            activity_name: None,
         }
+    }
+
+    /// A due reference to a type at its adaptive limit returns after the
+    /// limit delay, not the growing gate backoff (issue #1836).
+    #[test]
+    fn a_saturated_reference_is_released_for_the_limit_delay() {
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let due = probe("PENDING", now - chrono::Duration::seconds(1));
+        let delay = Duration::from_millis(80);
+        for redeliveries in [0, 5, 40] {
+            assert_eq!(
+                reference_outcome(Some(&due), redeliveries, now, &settings, Some(delay)),
+                ReferenceOutcome::Release(delay),
+                "redelivery {redeliveries}"
+            );
+        }
+        // A row that is not yet due keeps waiting for its due time.
+        let later = probe("PENDING", now + chrono::Duration::seconds(5));
+        assert_eq!(
+            reference_outcome(Some(&later), 0, now, &settings, Some(delay)),
+            ReferenceOutcome::Release(Duration::from_secs(5)),
+        );
     }
 
     #[test]
@@ -47654,7 +47691,7 @@ mod tests {
 
         for redeliveries in [0, 3, 40] {
             assert_eq!(
-                reference_outcome(Some(&pinned), redeliveries, now, &settings),
+                reference_outcome(Some(&pinned), redeliveries, now, &settings, None),
                 ReferenceOutcome::Release(settings.poll_interval),
                 "redelivery {redeliveries} must not back off"
             );
@@ -47668,15 +47705,15 @@ mod tests {
         let due = probe("PENDING", now - chrono::Duration::seconds(1));
 
         assert_eq!(
-            reference_outcome(Some(&due), 0, now, &settings),
+            reference_outcome(Some(&due), 0, now, &settings, None),
             ReferenceOutcome::Release(Duration::from_millis(20))
         );
         assert_eq!(
-            reference_outcome(Some(&due), 3, now, &settings),
+            reference_outcome(Some(&due), 3, now, &settings, None),
             ReferenceOutcome::Release(Duration::from_millis(160))
         );
         assert_eq!(
-            reference_outcome(Some(&due), 40, now, &settings),
+            reference_outcome(Some(&due), 40, now, &settings, None),
             ReferenceOutcome::Release(settings.release_backoff_cap)
         );
     }
@@ -47688,7 +47725,7 @@ mod tests {
         let later = probe("PENDING", now + chrono::Duration::milliseconds(500));
 
         assert_eq!(
-            reference_outcome(Some(&later), 0, now, &settings),
+            reference_outcome(Some(&later), 0, now, &settings, None),
             ReferenceOutcome::Release(Duration::from_millis(500))
         );
     }
@@ -47700,7 +47737,7 @@ mod tests {
         let far = probe("PENDING", now + chrono::Duration::days(7));
 
         assert_eq!(
-            reference_outcome(Some(&far), 0, now, &settings),
+            reference_outcome(Some(&far), 0, now, &settings, None),
             ReferenceOutcome::Release(settings.release_backoff_cap)
         );
     }
@@ -47711,7 +47748,7 @@ mod tests {
         let now = chrono::Utc::now();
         for state in ["RUNNING", "COMPLETED", "FAILED", "CANCELLED"] {
             assert_eq!(
-                reference_outcome(Some(&probe(state, now)), 0, now, &settings),
+                reference_outcome(Some(&probe(state, now)), 0, now, &settings, None),
                 ReferenceOutcome::Ack,
                 "a {state} row must be acked"
             );
@@ -47727,17 +47764,24 @@ mod tests {
             scheduled_at: now,
             has_worker: false,
             pinned_elsewhere: false,
+            activity_name: None,
         };
 
         for redeliveries in 0..DISPATCH_PARKED_ROW_RELEASES {
             assert_eq!(
-                reference_outcome(Some(&parked), redeliveries, now, &settings),
+                reference_outcome(Some(&parked), redeliveries, now, &settings, None),
                 ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
                 "a wake may be in flight against a parked row"
             );
         }
         assert_eq!(
-            reference_outcome(Some(&parked), DISPATCH_PARKED_ROW_RELEASES, now, &settings),
+            reference_outcome(
+                Some(&parked),
+                DISPATCH_PARKED_ROW_RELEASES,
+                now,
+                &settings,
+                None
+            ),
             ReferenceOutcome::Ack,
             "a row still parked after the grace releases has no wake in flight"
         );
@@ -47791,13 +47835,13 @@ mod tests {
 
         for redeliveries in 0..DISPATCH_ABSENT_ROW_RELEASES {
             assert_eq!(
-                reference_outcome(None, redeliveries, now, &settings),
+                reference_outcome(None, redeliveries, now, &settings, None),
                 ReferenceOutcome::Release(DISPATCH_ABSENT_ROW_DELAY),
                 "an uncommitted insert must get a short release"
             );
         }
         assert_eq!(
-            reference_outcome(None, DISPATCH_ABSENT_ROW_RELEASES, now, &settings),
+            reference_outcome(None, DISPATCH_ABSENT_ROW_RELEASES, now, &settings, None),
             ReferenceOutcome::Ack,
             "a row that is still absent after the grace releases is gone"
         );

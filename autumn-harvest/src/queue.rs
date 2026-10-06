@@ -2129,6 +2129,9 @@ pub struct DispatchProbe {
     /// Session rows never set it. A session pin is a hard pin that does not
     /// expire, so the reference must keep its normal backoff.
     pub pinned_elsewhere: bool,
+    /// The activity name of an activity row (issue #1836). A reference to a
+    /// type at its adaptive limit returns when a slot is likely free.
+    pub activity_name: Option<String>,
 }
 
 impl DispatchProbe {
@@ -2162,6 +2165,8 @@ pub async fn dispatch_probe(
         has_worker: bool,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         pinned_elsewhere: bool,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        activity_name: Option<String>,
     }
 
     let rows: Vec<Row> = diesel::sql_query(dispatch_probe_query())
@@ -2176,6 +2181,7 @@ pub async fn dispatch_probe(
         scheduled_at: row.scheduled_at,
         has_worker: row.has_worker,
         pinned_elsewhere: row.pinned_elsewhere,
+        activity_name: row.activity_name,
     }))
 }
 
@@ -2188,7 +2194,8 @@ pub const fn dispatch_probe_query() -> &'static str {
                 AND sticky_worker_id <> $2 \
                 AND sticky_until > NOW(), \
                 FALSE \
-            ) AS pinned_elsewhere \
+            ) AS pinned_elsewhere, \
+            activity_name \
      FROM harvest_task_queue \
      WHERE id = $1"
 }
@@ -12826,6 +12833,7 @@ mod tests {
             scheduled_at: Utc::now(),
             has_worker: false,
             pinned_elsewhere: false,
+            activity_name: None,
         };
         assert!(probe("PENDING").is_pending());
         assert!(!probe("RUNNING").is_pending());
