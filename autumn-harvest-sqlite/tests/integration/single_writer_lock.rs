@@ -297,3 +297,23 @@ fn a_percent_encoded_shared_memory_alias_shares_the_lock() {
         .expect("an encoded alias is the same database");
     assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
 }
+
+/// `SQLite` also decodes `%HH` in query keys and values. An encoded
+/// `cache=shared` still names a shared database and still needs the lock.
+#[test]
+fn an_encoded_cache_parameter_still_takes_the_lock() {
+    let _first = SqliteRuntime::open("file:memq_1834?mode=memory&cache=shared").unwrap();
+
+    for alias in [
+        "file:memq_1834?mode=memory&cache=sh%61red",
+        "file:memq_1834?mode=memory&c%61che=shared",
+    ] {
+        let err = SqliteRuntime::open(alias)
+            .err()
+            .unwrap_or_else(|| panic!("{alias} is the same shared database"));
+        assert!(
+            matches!(err, SqliteError::DatabaseLocked { .. }),
+            "{alias}: {err}"
+        );
+    }
+}

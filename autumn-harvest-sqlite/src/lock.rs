@@ -132,22 +132,31 @@ pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<Write
 
 /// Lock a shared-cache in-memory database in this process. A private one needs
 /// no lock.
+///
+/// The URI is read as `SQLite` reads it. The name is the part before `?`.
+/// Every query key and value has its `%HH` escapes decoded. Any `cache` value
+/// that matches `shared` without regard to case counts. When in doubt, the
+/// database takes the lock.
 fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
     let uri = requested.to_string_lossy();
-    if !uri.to_ascii_lowercase().contains("cache=shared") {
-        return Ok(None);
-    }
-    // `SQLite` names the database by the URI path, with `%HH` escapes decoded.
-    // The query does not count.
-    let without_scheme = uri
+    let Some(rest) = uri
         .get(..5)
         .filter(|scheme| scheme.eq_ignore_ascii_case("file:"))
-        .map_or(&*uri, |_| &uri[5..]);
-    let name = percent_decode(
-        without_scheme
-            .split_once('?')
-            .map_or(without_scheme, |(name, _)| name),
-    );
+        .map(|_| &uri[5..])
+    else {
+        // Not a URI, such as `:memory:` or an empty name: always private.
+        return Ok(None);
+    };
+    let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
+    let (raw_name, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let shared = query.split('&').any(|param| {
+        let (key, value) = param.split_once('=').unwrap_or((param, ""));
+        percent_decode(key) == "cache" && percent_decode(value).eq_ignore_ascii_case("shared")
+    });
+    if !shared {
+        return Ok(None);
+    }
+    let name = percent_decode(raw_name);
     let inserted = SHARED_MEMORY
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
