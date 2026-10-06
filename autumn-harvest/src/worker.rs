@@ -30247,6 +30247,9 @@ impl Worker {
         }
 
         let ineligible_activities = ineligible_activities(&registry, &config.labels)?;
+        // The limit registry fires this wake when a limit slot frees (issue
+        // #1836). That happens before the attempt writes its result.
+        let capacity_freed = registry.adaptive_limits.slot_freed_notify();
 
         let workflow_parts =
             build_dispatch_semaphore(config.max_concurrent_workflows, config.slot_tuner.as_ref());
@@ -30268,7 +30271,7 @@ impl Worker {
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
-            capacity_freed: Arc::new(tokio::sync::Notify::new()),
+            capacity_freed,
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),

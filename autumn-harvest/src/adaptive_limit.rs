@@ -458,6 +458,9 @@ pub struct AdaptiveLimitRegistry {
     /// Activity types at their cap. The claim path reads it without the
     /// lock.
     saturated_count: AtomicUsize,
+    /// Wakes the worker's idle wait when a type leaves its cap. The worker
+    /// uses it as its capacity wake.
+    slot_freed: Arc<tokio::sync::Notify>,
     metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
@@ -482,6 +485,7 @@ impl AdaptiveLimitRegistry {
             config,
             limiters: Mutex::new(HashMap::new()),
             saturated_count: AtomicUsize::new(0),
+            slot_freed: Arc::new(tokio::sync::Notify::new()),
             metrics: None,
         }
     }
@@ -530,6 +534,9 @@ impl AdaptiveLimitRegistry {
             }
             (true, false) => {
                 self.saturated_count.fetch_sub(1, Ordering::Relaxed);
+                // A slot frees before the attempt writes its result. Wake the
+                // idle poll loop now, not when the dispatch permit drops.
+                self.slot_freed.notify_one();
             }
             _ => {}
         }
@@ -541,6 +548,13 @@ impl AdaptiveLimitRegistry {
         }
         drop(limiters);
         Some(out)
+    }
+
+    /// The wake that fires when an activity type leaves its cap. The worker
+    /// shares it as its capacity wake.
+    #[must_use]
+    pub(crate) fn slot_freed_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.slot_freed)
     }
 
     /// Whether any activity type is at its cap. It reads no lock, so the
@@ -1012,6 +1026,25 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(*state);
         }
+    }
+
+    /// A slot that leaves saturation wakes the worker's idle wait at once,
+    /// before the attempt writes its result.
+    #[test]
+    fn a_freed_slot_notifies_the_worker() {
+        use futures::FutureExt as _;
+        let reg = registry(AdaptiveLimitPolicy::new(1, 1));
+        let freed = reg.slot_freed_notify();
+        let held = permit(&reg, A);
+        assert!(
+            freed.notified().now_or_never().is_none(),
+            "no slot freed yet"
+        );
+        drop(held);
+        assert!(
+            freed.notified().now_or_never().is_some(),
+            "the free must wake"
+        );
     }
 
     /// A refused attempt changes nothing, so it publishes nothing.
