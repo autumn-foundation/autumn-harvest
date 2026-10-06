@@ -1142,6 +1142,100 @@ fn allowlist_entries_are_unique() {
     }
 }
 
+// ── Tracking table: every allowlist entry has an owner or a reason (#1799) ──
+
+/// The tracking table for the allowlist (issue #1799).
+const TRACKING_DOC: &str = include_str!("../../../docs/testing/ci-db-suite-allowlist.md");
+
+/// The owner value of a suite that CI does not run by design.
+const WONT_WIRE: &str = "won't wire";
+
+/// Reasons that mark an entry as debt to wire. Every other reason marks a
+/// suite that CI does not run by design.
+const DEBT_REASONS: &[&str] = &[ALLOWLIST_DEBT_REASON, ALLOWLIST_TESTING_REASON];
+
+/// One table row: the suite key, the owner and the reason.
+struct TrackingRow {
+    key: String,
+    owner: String,
+    reason: String,
+}
+
+/// Reads the rows between the table markers of [`TRACKING_DOC`].
+fn parse_tracking_table(doc: &str) -> Vec<TrackingRow> {
+    let begin = doc
+        .find("<!-- allowlist-tracking:begin -->")
+        .expect("the tracking doc must have a begin marker");
+    let end = doc
+        .find("<!-- allowlist-tracking:end -->")
+        .expect("the tracking doc must have an end marker");
+    doc[begin..end]
+        .lines()
+        .filter(|l| l.starts_with("| `"))
+        .map(|l| {
+            let cols: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+            assert_eq!(cols.len(), 3, "a tracking row has 3 columns: {l:?}");
+            TrackingRow {
+                key: cols[0].trim_matches('`').to_string(),
+                owner: cols[1].to_string(),
+                reason: cols[2].to_string(),
+            }
+        })
+        .collect()
+}
+
+/// True when `owner` names a person (`@login`) or a tracking issue (`#123`).
+fn names_an_owner(owner: &str) -> bool {
+    owner
+        .split_whitespace()
+        .any(|w| w.starts_with('@') || w.starts_with('#'))
+}
+
+/// Issue #1799 asks for a table of the remaining suites. Each row has an
+/// owner, or [`WONT_WIRE`] and a reason. The table and `ALLOWLIST` must
+/// agree, so the table cannot go stale.
+#[test]
+fn tracking_table_lists_every_allowlist_entry_with_an_owner_or_reason() {
+    let rows = parse_tracking_table(TRACKING_DOC);
+    let table: BTreeSet<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+    let code: BTreeSet<&str> = ALLOWLIST.iter().map(|&(k, _)| k).collect();
+    assert_eq!(rows.len(), table.len(), "the tracking table has a duplicate row");
+    assert_eq!(
+        table, code,
+        "docs/testing/ci-db-suite-allowlist.md must list each ALLOWLIST key once, and no other key"
+    );
+    for row in &rows {
+        let &(_, reason) = ALLOWLIST.iter().find(|&&(k, _)| k == row.key).unwrap();
+        assert!(!row.reason.is_empty(), "{}: the reason is empty", row.key);
+        if DEBT_REASONS.contains(&reason) {
+            assert!(
+                names_an_owner(&row.owner),
+                "{}: debt needs an `@login` or `#issue` owner, got {:?}",
+                row.key,
+                row.owner
+            );
+        } else {
+            assert_eq!(
+                row.owner, WONT_WIRE,
+                "{}: CI does not run it by design, so its owner is {WONT_WIRE:?}",
+                row.key
+            );
+        }
+    }
+}
+
+#[test]
+fn tracking_table_parser_reads_owner_and_reason() {
+    let doc = "intro\n<!-- allowlist-tracking:begin -->\n| Suite | Owner | Reason |\n|---|---|---|\n| `core:a` | @someone (#12) | debt |\n| `plugin:b` | won't wire | manual |\n<!-- allowlist-tracking:end -->\n| `core:outside` | x | y |\n";
+    let rows = parse_tracking_table(doc);
+    assert_eq!(rows.len(), 2, "rows outside the markers do not count");
+    assert_eq!(rows[0].key, "core:a");
+    assert!(names_an_owner(&rows[0].owner));
+    assert_eq!(rows[1].owner, WONT_WIRE);
+    assert!(!names_an_owner(&rows[1].owner));
+    assert_eq!(rows[1].reason, "manual");
+}
+
 // ── Feature-gate coverage (DB or not) ───────────────────────────────────────
 
 /// Features a core suite needs to compile, from its `mod.rs` cfg and its own
