@@ -338,6 +338,7 @@ event, an `ActivityCompleted`.
 
 - #1871: the worker does not retry the activity result write after a DB
   error. The result is lost, and only `start_to_close` recovers the task.
+  #1788 fixed it: the worker writes the result again on a new connection.
 - #1870: a `StartToClose` timeout ignores the retry policy and fails the
   workflow.
 - #1876: Postgres keeps the open transaction of a partitioned worker until
@@ -349,13 +350,16 @@ event, an `ActivityCompleted`.
 
 Each test works around a bug only where the bug applies:
 
-- #1871 and #1870 turn a lost result write into `FAILED` after one
-  `StartToClose` timeout. The rolled-back append test requires that outcome,
-  so a fix for the bugs makes the test fail on purpose. The restart test
-  accepts it, but only for workflows with an activity that the old Postgres
-  instance claimed. Each accepted `FAILED` must have the exact history: one
-  activity terminal event, a `StartToClose` timeout, and one terminal event,
-  a `WorkflowFailed` for the timeout.
+- Both append tests require `COMPLETED`, with one attempt of the activity.
+  That pins the #1871 fix: the worker writes the result again, and the
+  handler does not run again. With the repeat turned off, a second attempt
+  runs, and the attempt check fails.
+- #1870 turns a result write that the worker cannot repeat into `FAILED`
+  after one `StartToClose` timeout. A crash restart can stop every repeat.
+  So the restart test accepts that outcome, but only for workflows with an
+  activity that the old Postgres instance claimed. Each accepted `FAILED`
+  must have the exact history: one activity terminal event, a `StartToClose`
+  timeout, and one terminal event, a `WorkflowFailed` for the timeout.
 - For #1876, the partition test sets `idle_in_transaction_session_timeout =
   5s` on the server to end the session.
 - For #1879, the latency test uses a 2 s heartbeat. A decision cycle also
