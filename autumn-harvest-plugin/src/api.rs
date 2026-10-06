@@ -32570,6 +32570,7 @@ impl BulkDlqApiBody {
                 failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
+                spread_secs: None,
             },
             dead_letter_id: self.dead_letter_id,
             task_type,
@@ -32663,10 +32664,43 @@ impl RedriveApiBody {
                 dead_letter_ids: self.dead_letter_ids,
                 max: self.max,
                 dry_run: self.dry_run,
+                spread_secs: None,
             },
             shard_id: self.shard_id,
             reason: self.reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod dlq_spread_body_tests {
+    use super::*;
+
+    #[test]
+    fn redrive_body_carries_spread_secs() {
+        let body: RedriveApiBody =
+            serde_json::from_str(r#"{"queue":"q","spread_secs":90}"#).expect("valid body");
+        assert_eq!(body.into_request().filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn bulk_replay_body_carries_spread_secs() {
+        let body: BulkDlqApiBody =
+            serde_json::from_str(r#"{"queue_name":"q","spread_secs":90}"#).expect("valid body");
+        let selector = body.into_selector().expect("valid selector");
+        assert_eq!(selector.filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn bulk_replay_form_carries_spread_secs() {
+        let parsed = parse_bulk_dlq_form(b"queue_name=q&spread_secs=90").expect("valid form");
+        assert_eq!(parsed.selector.filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn spread_secs_is_absent_by_default() {
+        let body: RedriveApiBody = serde_json::from_str(r#"{"queue":"q"}"#).expect("valid body");
+        assert_eq!(body.into_request().filter.spread_secs, None);
     }
 }
 

@@ -25,12 +25,13 @@
 //! - AC2 — dry-run mutates nothing.
 //! - filter dimensions (queue / error_contains / dead_letter_ids / time bounds).
 //! - AC8 — the `harvest.dlq.redriven{queue, outcome}` metric is emitted.
+//! - Issue #1832 — a bulk redrive spreads `scheduled_at` across a window.
 
 use std::sync::Mutex;
 
 use autumn_harvest::dlq::{
-    NewDeadLetterEntry, RedriveFilter, RedriveOutcome, dead_letter, redrive_dead_letter,
-    redrive_dead_letters,
+    BulkDlqFilter, NewDeadLetterEntry, RedriveFilter, RedriveOutcome, bulk_replay_dead_letters,
+    dead_letter, redrive_dead_letter, redrive_dead_letters,
 };
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::telemetry::MetricsRecorder;
@@ -545,4 +546,206 @@ async fn redrive_emits_metric_per_outcome() {
     let recorded = metrics.redriven.lock().unwrap();
     assert!(recorded.contains(&("metricq".to_string(), "redriven".to_string())));
     assert!(recorded.contains(&("metricq".to_string(), "failed".to_string())));
+}
+
+// ── Redrive spread (issue #1832) ─────────────────────────────────────────────
+
+/// Insert `n` activity dead letters with no owning execution on `queue`.
+async fn insert_orphan_activity_dlq_rows(conn: &mut AsyncPgConnection, queue: &str, n: i32) {
+    diesel::sql_query(
+        "INSERT INTO harvest_dead_letters \
+         (id, original_task_id, queue_name, task_type, activity_name, input, error, attempts, failed_at) \
+         SELECT gen_random_uuid(), gen_random_uuid(), $1, 'activity', 'act', '{}'::jsonb, \
+                'overloaded', 3, now() - make_interval(secs => g) \
+         FROM generate_series(1, $2) AS g",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Integer, _>(n)
+    .execute(conn)
+    .await
+    .expect("seed dlq rows");
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+struct SpreadStats {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    distinct_at: i64,
+    /// Seconds from the reference instant to the earliest `scheduled_at`.
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    first_secs: f64,
+    /// Seconds from the reference instant to the latest `scheduled_at`.
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    last_secs: f64,
+    /// Rows in the emptiest of ten equal buckets across `[0, window)`.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    min_bucket: i64,
+}
+
+/// Summarise the `scheduled_at` spread of `queue`'s PENDING tasks, relative
+/// to the database instant `t0`.
+async fn spread_stats(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    t0: chrono::DateTime<chrono::Utc>,
+    window_secs: f64,
+) -> SpreadStats {
+    diesel::sql_query(
+        "WITH t AS ( \
+           SELECT EXTRACT(EPOCH FROM scheduled_at - $2)::float8 AS secs, scheduled_at \
+           FROM harvest_task_queue WHERE queue_name = $1 AND state = 'PENDING' \
+         ), b AS ( \
+           SELECT g AS bucket, \
+                  (SELECT count(*) FROM t WHERE width_bucket(t.secs, 0, $3, 10) = g) AS n \
+           FROM generate_series(1, 10) AS g \
+         ) \
+         SELECT (SELECT count(*) FROM t) AS n, \
+                (SELECT count(DISTINCT scheduled_at) FROM t) AS distinct_at, \
+                (SELECT min(secs) FROM t) AS first_secs, \
+                (SELECT max(secs) FROM t) AS last_secs, \
+                (SELECT min(n) FROM b) AS min_bucket",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Timestamptz, _>(t0)
+    .bind::<diesel::sql_types::Double, _>(window_secs)
+    .get_result(conn)
+    .await
+    .expect("spread stats")
+}
+
+async fn db_clock(conn: &mut AsyncPgConnection) -> chrono::DateTime<chrono::Utc> {
+    #[derive(diesel::QueryableByName)]
+    struct Now {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        now: chrono::DateTime<chrono::Utc>,
+    }
+    diesel::sql_query("SELECT clock_timestamp() AS now")
+        .get_result::<Now>(conn)
+        .await
+        .expect("db clock")
+        .now
+}
+
+/// Assert that 1000 tasks spread across a 60 s window that starts at `t0`.
+fn assert_spread_across_window(stats: &SpreadStats, rows: i64) {
+    assert_eq!(stats.n, rows, "every row is re-enqueued");
+    assert_eq!(stats.distinct_at, rows, "no two tasks share an instant");
+    assert!(
+        stats.first_secs >= 0.0,
+        "nothing is due before the call: {stats:?}"
+    );
+    assert!(
+        stats.first_secs < 6.0,
+        "the first slot starts at once: {stats:?}"
+    );
+    assert!(
+        stats.last_secs >= 54.0,
+        "the last slot is near the end: {stats:?}"
+    );
+    // One second of slack covers the time the call itself takes.
+    assert!(
+        stats.last_secs < 61.0,
+        "nothing is past the window: {stats:?}"
+    );
+    assert!(
+        stats.min_bucket >= rows / 20,
+        "every 6 s bucket gets a share: {stats:?}"
+    );
+}
+
+// Issue #1832 AC: a bulk redrive of 1000 tasks spreads `scheduled_at`
+// across the window, not all at one instant.
+#[tokio::test]
+async fn bulk_redrive_of_1000_tasks_spreads_scheduled_at_across_the_window() {
+    let (mut conn, _c) = setup_db().await;
+    insert_orphan_activity_dlq_rows(&mut conn, "spreadq", 1000).await;
+
+    let t0 = db_clock(&mut conn).await;
+    let metrics = RecordingMetrics::default();
+    let filter = RedriveFilter {
+        queue: Some("spreadq".to_string()),
+        max: Some(1000),
+        spread_secs: Some(60),
+        ..Default::default()
+    };
+    let result = redrive_dead_letters(&mut conn, &filter, None, None, &metrics)
+        .await
+        .expect("bulk redrive");
+    assert_eq!(result.redriven, 1000, "{:?}", result.failures.iter().next());
+
+    let stats = spread_stats(&mut conn, "spreadq", t0, 60.0).await;
+    assert_spread_across_window(&stats, 1000);
+}
+
+// The default window is pro-rated: a full 1000-row batch spreads over 60 s.
+#[tokio::test]
+async fn bulk_redrive_default_spreads_a_full_batch_over_sixty_seconds() {
+    let (mut conn, _c) = setup_db().await;
+    insert_orphan_activity_dlq_rows(&mut conn, "defaultq", 1000).await;
+
+    let t0 = db_clock(&mut conn).await;
+    let metrics = RecordingMetrics::default();
+    let filter = RedriveFilter {
+        queue: Some("defaultq".to_string()),
+        max: Some(1000),
+        ..Default::default()
+    };
+    let result = redrive_dead_letters(&mut conn, &filter, None, None, &metrics)
+        .await
+        .expect("bulk redrive");
+    assert_eq!(result.redriven, 1000);
+
+    let stats = spread_stats(&mut conn, "defaultq", t0, 60.0).await;
+    assert_spread_across_window(&stats, 1000);
+}
+
+// The bulk replay path spreads the same way.
+#[tokio::test]
+async fn bulk_replay_of_1000_tasks_spreads_scheduled_at_across_the_window() {
+    let (mut conn, _c) = setup_db().await;
+    insert_orphan_activity_dlq_rows(&mut conn, "replayq", 1000).await;
+
+    let t0 = db_clock(&mut conn).await;
+    let filter = BulkDlqFilter {
+        queue_name: Some("replayq".to_string()),
+        limit: Some(1000),
+        spread_secs: Some(60),
+        ..Default::default()
+    };
+    let result = bulk_replay_dead_letters(&mut conn, &filter, None)
+        .await
+        .expect("bulk replay");
+    assert_eq!(result.acted_on, 1000, "{:?}", result.failures.iter().next());
+
+    let stats = spread_stats(&mut conn, "replayq", t0, 60.0).await;
+    assert_spread_across_window(&stats, 1000);
+}
+
+// `spread_secs: 0` keeps the old behaviour: every task is due at once.
+#[tokio::test]
+async fn bulk_redrive_with_zero_spread_is_due_at_once() {
+    let (mut conn, _c) = setup_db().await;
+    insert_orphan_activity_dlq_rows(&mut conn, "nowq", 20).await;
+
+    let metrics = RecordingMetrics::default();
+    let filter = RedriveFilter {
+        queue: Some("nowq".to_string()),
+        spread_secs: Some(0),
+        ..Default::default()
+    };
+    let result = redrive_dead_letters(&mut conn, &filter, None, None, &metrics)
+        .await
+        .expect("bulk redrive");
+    assert_eq!(result.redriven, 20);
+
+    let not_due = diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_task_queue \
+         WHERE queue_name = 'nowq' AND scheduled_at > now()",
+    )
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .expect("count not due")
+    .n;
+    assert_eq!(not_due, 0, "a zero window must not delay any task");
 }

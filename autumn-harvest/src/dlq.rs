@@ -25,6 +25,13 @@ pub const DEFAULT_BULK_LIMIT: u32 = 100;
 /// Maximum number of DLQ rows a single bulk operation can act on.
 pub const MAX_BULK_LIMIT: u32 = 1000;
 
+/// Default spread window for a full [`MAX_BULK_LIMIT`] redrive (issue #1832).
+///
+/// A smaller batch gets a pro-rated window. See [`redrive_spread_window`].
+pub const DEFAULT_REDRIVE_SPREAD: std::time::Duration = std::time::Duration::from_secs(60);
+/// Upper bound on an operator-set redrive spread, in seconds.
+pub const MAX_REDRIVE_SPREAD_SECS: u64 = 3600;
+
 /// Filter for bulk DLQ operations.
 ///
 /// At least one substantive criterion (any of `activity_name`, `workflow_name`,
@@ -69,6 +76,10 @@ pub struct BulkDlqFilter {
     /// When `true`, return matching rows and count without writing.
     #[serde(default)]
     pub dry_run: bool,
+    /// Replay only: the window, in seconds, over which replayed tasks
+    /// become due (issue #1832). See [`redrive_spread_window`].
+    #[serde(default)]
+    pub spread_secs: Option<u64>,
 }
 
 impl BulkDlqFilter {
@@ -183,6 +194,10 @@ pub struct RedriveFilter {
     /// When `true`, return matching rows and count without writing.
     #[serde(default)]
     pub dry_run: bool,
+    /// The window, in seconds, over which redriven tasks become due
+    /// (issue #1832). See [`redrive_spread_window`].
+    #[serde(default)]
+    pub spread_secs: Option<u64>,
 }
 
 impl RedriveFilter {
@@ -234,6 +249,33 @@ pub struct RedriveResult {
     pub dry_run: bool,
     /// Per-row rejections that did not roll back other rows.
     pub failures: Vec<BulkDlqFailure>,
+}
+
+/// The window over which a bulk redrive of `rows` rows spreads its tasks.
+#[must_use]
+pub fn redrive_spread_window(_spread_secs: Option<u64>, _rows: usize) -> std::time::Duration {
+    std::time::Duration::ZERO
+}
+
+/// The offset of row `index` of `count` inside `window`.
+#[must_use]
+pub fn redrive_spread_offset(
+    _index: usize,
+    _count: usize,
+    _window: std::time::Duration,
+    _seed: u64,
+) -> std::time::Duration {
+    std::time::Duration::ZERO
+}
+
+/// The `scheduled_at` for each row of a bulk redrive.
+#[must_use]
+pub fn redrive_schedule(
+    _now: DateTime<Utc>,
+    _window: std::time::Duration,
+    ids: &[Uuid],
+) -> Vec<Option<DateTime<Utc>>> {
+    vec![None; ids.len()]
 }
 
 /// Outcome of redriving a single dead-letter entry.
@@ -2498,6 +2540,111 @@ mod tests {
         assert_eq!(filter.effective_limit(), 1);
     }
 
+    // ── Redrive spread (issue #1832) ─────────────────────────────────────
+
+    use std::time::Duration as StdDuration;
+
+    #[test]
+    fn spread_window_honours_an_explicit_value() {
+        assert_eq!(
+            redrive_spread_window(Some(60), 1000),
+            StdDuration::from_secs(60)
+        );
+        assert_eq!(
+            redrive_spread_window(Some(60), 1),
+            StdDuration::from_secs(60)
+        );
+        assert_eq!(redrive_spread_window(Some(0), 1000), StdDuration::ZERO);
+    }
+
+    #[test]
+    fn spread_window_caps_an_explicit_value() {
+        assert_eq!(
+            redrive_spread_window(Some(u64::MAX), 10),
+            StdDuration::from_secs(MAX_REDRIVE_SPREAD_SECS)
+        );
+    }
+
+    #[test]
+    fn spread_window_default_is_pro_rated_by_batch_size() {
+        assert_eq!(redrive_spread_window(None, 1000), DEFAULT_REDRIVE_SPREAD);
+        assert_eq!(redrive_spread_window(None, 100), StdDuration::from_secs(6));
+        assert_eq!(redrive_spread_window(None, 1), StdDuration::from_millis(60));
+        assert_eq!(redrive_spread_window(None, 0), StdDuration::ZERO);
+        // More rows than the bulk cap never exceed the default window.
+        assert_eq!(redrive_spread_window(None, 5000), DEFAULT_REDRIVE_SPREAD);
+    }
+
+    #[test]
+    fn spread_offset_stays_inside_its_slot() {
+        let window = StdDuration::from_secs(60);
+        let count = 1000;
+        let slot = window / 1000;
+        for index in 0..count {
+            for seed in [0, 1, u64::MAX / 2, u64::MAX] {
+                let offset = redrive_spread_offset(index, count, window, seed);
+                let start = slot * u32::try_from(index).unwrap();
+                assert!(
+                    offset >= start && offset < start + slot,
+                    "row {index} seed {seed}: {offset:?} outside slot {start:?}+{slot:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spread_offset_jitters_by_seed() {
+        let window = StdDuration::from_secs(60);
+        let offsets: std::collections::HashSet<_> = (0..20_u64)
+            .map(|seed| redrive_spread_offset(3, 10, window, seed.wrapping_mul(0x9e37_79b9)))
+            .collect();
+        assert!(offsets.len() > 1, "seeds must move a row inside its slot");
+        assert_eq!(
+            redrive_spread_offset(3, 10, window, 42),
+            redrive_spread_offset(3, 10, window, 42),
+            "the offset is deterministic"
+        );
+    }
+
+    #[test]
+    fn spread_offset_is_zero_for_an_empty_window() {
+        assert_eq!(
+            redrive_spread_offset(5, 10, StdDuration::ZERO, 7),
+            StdDuration::ZERO
+        );
+    }
+
+    #[test]
+    fn schedule_with_no_window_is_immediate() {
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        assert_eq!(
+            redrive_schedule(Utc::now(), StdDuration::ZERO, &ids),
+            vec![None; 5]
+        );
+    }
+
+    #[test]
+    fn schedule_of_1000_rows_spreads_across_the_window() {
+        // Issue #1832 AC: 1000 redriven tasks spread across the window.
+        let now = Utc::now();
+        let window = StdDuration::from_secs(60);
+        let ids: Vec<Uuid> = (0..1000).map(|_| Uuid::new_v4()).collect();
+        let schedule = redrive_schedule(now, window, &ids);
+        assert_eq!(schedule.len(), 1000);
+
+        let mut buckets = [0_u32; 10];
+        let mut distinct = std::collections::HashSet::new();
+        for at in &schedule {
+            let at = at.expect("a non-zero window schedules every row");
+            let offset = (at - now).to_std().expect("never before now");
+            assert!(offset < window, "{offset:?} is past the window");
+            buckets[usize::try_from(offset.as_secs() / 6).unwrap()] += 1;
+            distinct.insert(at);
+        }
+        assert_eq!(distinct.len(), 1000, "no two rows share an instant");
+        assert_eq!(buckets, [100; 10], "each 6 s bucket gets 100 rows");
+    }
+
     #[test]
     fn bulk_filter_effective_limit_clamps_at_1000() {
         let filter = BulkDlqFilter {
@@ -2527,6 +2674,7 @@ mod tests {
             failure_signature: None,
             limit: Some(200),
             dry_run: true,
+            spread_secs: Some(30),
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: BulkDlqFilter = serde_json::from_str(&json).unwrap();
