@@ -185,8 +185,8 @@ fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
     Ok(Some(WriterLock::SharedMemory(name)))
 }
 
-/// Decode `%HH` escapes as `SQLite` does for a URI path. A malformed escape
-/// stays as it is.
+/// Decode `%HH` escapes as `SQLite` does for a URI component. A malformed
+/// escape stays as it is. A decoded NUL ends the component, as in `SQLite`.
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -197,6 +197,7 @@ fn percent_decode(text: &str) -> String {
             .and_then(|pair| std::str::from_utf8(pair).ok())
             .and_then(|pair| u8::from_str_radix(pair, 16).ok());
         match (bytes[i], hex) {
+            (b'%', Some(0)) => break,
             (b'%', Some(byte)) => {
                 out.push(byte);
                 i += 3;

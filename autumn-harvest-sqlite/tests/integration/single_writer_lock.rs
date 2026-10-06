@@ -347,3 +347,20 @@ fn an_explicit_default_vfs_shares_the_lock() {
         .expect("the default VFS named explicitly is the same database");
     assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
 }
+
+/// `SQLite` ends a decoded URI component at its first `%00`. The lock reads
+/// the URI the same way.
+#[test]
+fn a_decoded_nul_ends_a_uri_component() {
+    let _first = SqliteRuntime::open("file:memn_1834?mode=memory&cache=shared").unwrap();
+    let err = SqliteRuntime::open("file:memn_1834%00tail?mode=memory&cache=shared")
+        .err()
+        .expect("a name ends at its first NUL");
+    assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
+
+    let _unnamed = SqliteRuntime::open("file::memory:?cache=shared").unwrap();
+    let err = SqliteRuntime::open("file::memory:?cache=shared%00tail")
+        .err()
+        .expect("a value ends at its first NUL");
+    assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
+}
