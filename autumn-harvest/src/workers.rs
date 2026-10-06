@@ -813,6 +813,17 @@ impl std::fmt::Debug for OutlierProbe {
 }
 
 impl OutlierProbe {
+    /// Enter the window into this probe's cohort, before any task runs
+    /// (issue #1815).
+    ///
+    /// A codec reload before the first heartbeat then changes the cohort, and
+    /// the window drops the samples taken before it.
+    #[must_use]
+    pub fn seeded(self) -> Self {
+        self.window.enter_cohort(&self.cohort_key());
+        self
+    }
+
     /// The cohort key this tick writes and reads (issue #1815).
     ///
     /// It is [`OutlierProbe::cohort`] with the codecs' registered key ids
@@ -3999,6 +4010,30 @@ mod tests {
             ..probe
         };
         assert_eq!(without.cohort_key(), without.cohort);
+    }
+
+    /// Issue #1815: the heartbeat seeds the window with the cohort at start.
+    /// A codec reload before the first tick then restarts the window too.
+    #[test]
+    fn a_codec_key_change_before_the_first_tick_restarts_the_window() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        }
+        .seeded();
+        for _ in 0..30 {
+            probe
+                .window
+                .record(true, std::time::Duration::from_millis(40));
+        }
+        codecs
+            .register_key("k1", std::sync::Arc::new(IdentityCodec))
+            .expect("register a key");
+        let (first, _) = super::capture_task_stats(&probe.window, &probe.cohort_key());
+        assert_eq!(first, crate::worker_outlier::WorkerTaskStats::default());
     }
 
     /// Issue #1815: samples taken under the old codec keys do not reach the

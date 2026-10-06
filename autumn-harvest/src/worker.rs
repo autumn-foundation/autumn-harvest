@@ -32641,7 +32641,9 @@ impl Worker {
                 process_flags: crate::workers::ProcessOutlierFlags::for_recorder(
                     &self.registry.telemetry().metrics,
                 ),
-            },
+            }
+            // Issue #1815: enter the cohort before any task runs.
+            .seeded(),
         )
     }
 

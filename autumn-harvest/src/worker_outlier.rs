@@ -82,6 +82,15 @@ impl WorkerTaskStats {
     }
 }
 
+/// The samples of a [`TaskOutcomeWindow`], and the instant its cohort last
+/// changed.
+#[derive(Debug, Default)]
+struct Samples {
+    queue: VecDeque<Sample>,
+    // A task dispatched before this instant ran under the old cohort.
+    since: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Sample {
     at: Instant,
@@ -99,7 +108,7 @@ struct Sample {
 /// each insert finds its place by timestamp.
 #[derive(Debug)]
 pub struct TaskOutcomeWindow {
-    samples: Mutex<VecDeque<Sample>>,
+    samples: Mutex<Samples>,
     // The cohort of the last snapshot. A new cohort clears the samples.
     cohort: Mutex<Option<String>>,
     capacity: usize,
@@ -123,7 +132,7 @@ impl TaskOutcomeWindow {
     #[must_use]
     pub fn new(capacity: usize, max_age: Duration) -> Self {
         Self {
-            samples: Mutex::new(VecDeque::new()),
+            samples: Mutex::new(Samples::default()),
             cohort: Mutex::new(None),
             capacity: capacity.max(1),
             max_age,
@@ -137,9 +146,19 @@ impl TaskOutcomeWindow {
 
     /// Record one task outcome that ends at `at`.
     ///
-    /// A full window evicts its oldest sample, which can be this one.
+    /// A full window evicts its oldest sample, which can be this one. The
+    /// task was dispatched at `at - latency`. A task dispatched before the
+    /// last cohort change ran under the old cohort, so it is dropped.
     pub fn record_at(&self, at: Instant, failed: bool, latency: Duration) {
-        let mut samples = self.lock();
+        let mut guard = self.lock();
+        if let Some(since) = guard.since
+            && at
+                .checked_sub(latency)
+                .is_none_or(|dispatched| dispatched < since)
+        {
+            return;
+        }
+        let samples = &mut guard.queue;
         // A late sample lands near the back, so the insert moves few samples.
         let index = samples.partition_point(|s| s.at <= at);
         samples.insert(
@@ -153,6 +172,7 @@ impl TaskOutcomeWindow {
         if samples.len() > self.capacity {
             samples.pop_front();
         }
+        drop(guard);
     }
 
     /// Snapshot the window as it is now.
@@ -164,7 +184,8 @@ impl TaskOutcomeWindow {
     /// Snapshot the window as it is at `now`.
     #[must_use]
     pub fn snapshot_at(&self, now: Instant) -> WorkerTaskStats {
-        let mut samples = self.lock();
+        let mut guard = self.lock();
+        let samples = &mut guard.queue;
         // The samples are in time order, so the expired ones are at the front.
         while samples
             .front()
@@ -174,7 +195,7 @@ impl TaskOutcomeWindow {
         }
         let mut latencies: Vec<Duration> = samples.iter().map(|s| s.latency).collect();
         let failures = samples.iter().filter(|s| s.failed).count();
-        drop(samples);
+        drop(guard);
         latencies.sort_unstable();
         WorkerTaskStats {
             tasks: saturating_u32(latencies.len()),
@@ -191,23 +212,33 @@ impl TaskOutcomeWindow {
     /// then judged only after it records enough samples in the new cohort.
     #[must_use]
     pub fn snapshot_in_cohort(&self, cohort: &str) -> WorkerTaskStats {
+        self.enter_cohort(cohort);
+        self.snapshot()
+    }
+
+    /// Enter `cohort` without a snapshot (issue #1815).
+    ///
+    /// The first cohort keeps the samples recorded before it. A change clears
+    /// the samples. A task dispatched before the change and recorded after it
+    /// is dropped too. The worker enters its cohort before any task runs.
+    pub fn enter_cohort(&self, cohort: &str) {
         let mut current = self
             .cohort
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.as_deref() != Some(cohort) {
-            // The first cohort keeps the samples recorded before the first tick.
-            if current.is_some() {
-                self.lock().clear();
-            }
-            *current = Some(cohort.to_owned());
+        if current.as_deref() == Some(cohort) {
+            return;
         }
-        drop(current);
-        self.snapshot()
+        if current.is_some() {
+            let mut guard = self.lock();
+            guard.queue.clear();
+            guard.since = Some(Instant::now());
+        }
+        *current = Some(cohort.to_owned());
     }
 
     /// A poisoned lock still holds valid samples, so the window keeps them.
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Sample>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Samples> {
         self.samples
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -483,6 +514,21 @@ mod tests {
     /// Issue #1815: a worker exactly on the failure-ratio boundary is
     /// flagged. In floating point, 0.3 - 0.1 falls just short of 0.2.
     #[test]
+    fn a_late_outcome_from_the_old_cohort_is_dropped() {
+        let window = TaskOutcomeWindow::default();
+        window.enter_cohort("old");
+        let before_reload = Instant::now();
+        window.enter_cohort("new");
+        // A task dispatched before the reload ends after it.
+        let now = Instant::now();
+        let old_task = now.duration_since(before_reload) + Duration::from_millis(1);
+        window.record_at(now, true, old_task);
+        assert_eq!(window.snapshot().tasks, 0, "an old-cohort task is dropped");
+        window.record_at(now, false, Duration::ZERO);
+        assert_eq!(window.snapshot().tasks, 1, "a new-cohort task counts");
+    }
+
+    #[test]
     fn a_new_cohort_starts_from_an_empty_window() {
         let window = TaskOutcomeWindow::default();
         for _ in 0..30 {
@@ -493,7 +539,8 @@ mod tests {
         assert_eq!(window.snapshot_in_cohort("old").tasks, 30);
         // Samples from the old cohort do not carry into the new one.
         assert_eq!(window.snapshot_in_cohort("new"), WorkerTaskStats::default());
-        window.record(false, Duration::from_millis(40));
+        // A task dispatched after the change counts.
+        window.record(false, Duration::ZERO);
         let fresh = window.snapshot_in_cohort("new");
         assert_eq!((fresh.tasks, fresh.failures), (1, 0));
     }
