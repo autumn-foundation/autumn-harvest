@@ -12,6 +12,8 @@ Two runs failed:
 
 The test now requires `COMPLETED`. Both append tests also require one
 activity attempt: one activity task at attempt 1 and one `ActivityStarted`.
+In the rolled-back test, that check pins the #1871 fix. In the ack-lost
+test, the commit landed, so the repeat must change nothing.
 The change removes `Accept::KnownFailure`. The restart test still accepts
 the #1870 outcome for in-flight activities. A crash restart can make every
 repeat of the write fail, and the claim give-back too.

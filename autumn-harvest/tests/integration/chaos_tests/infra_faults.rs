@@ -601,9 +601,10 @@ async fn start_workload(
 /// The outcomes that [`converge`] accepts.
 ///
 /// The known failure is `FAILED` after one activity `StartToClose` timeout.
-/// A crash restart can make every repeat of a result write fail, and the claim
-/// give-back too. Bug #1870: the timeout then ignores the retry policy. When #1870 is fixed, the known
-/// failure becomes `COMPLETED`. Then remove the known-failure variant.
+/// A crash restart can make every repeat of a result write fail, and the
+/// claim give-back too. Bug #1870: the timeout then ignores the retry policy.
+/// When #1870 is fixed, the known failure becomes `COMPLETED`. Then remove the
+/// known-failure variant.
 #[derive(Clone, Copy, Debug)]
 enum Accept<'a> {
     /// Every workflow is `COMPLETED`.
@@ -898,7 +899,9 @@ async fn terminate_backend_in_commit(site: CommitSite, fate: CommitFate) {
     converge(&db.admin_url, &execs, activity_wf, Accept::Completed, &diag).await;
 
     // After a dropped connection, the worker writes the result again on a new
-    // connection (#1871). The handler must not run a second time.
+    // connection (#1871). The handler must not run a second time. Only the
+    // rolled-back test needs the repeat. In the ack-lost test, the commit
+    // landed, so the repeat must change nothing.
     if matches!(site, CommitSite::Append) {
         let mut conn = connect(&db.admin_url).await;
         for exec_id in &execs {

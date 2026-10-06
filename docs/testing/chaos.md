@@ -352,12 +352,14 @@ event, an `ActivityCompleted`.
 Each test works around a bug only where the bug applies:
 
 - Both append tests require `COMPLETED`, with one attempt of the activity.
-  That pins the #1871 fix: the worker writes the result again, and the
-  handler does not run again. With the repeat turned off, the worker gives
-  the claim back and a second attempt runs. Only the attempt check fails.
+  The rolled-back test pins the #1871 fix: the worker writes the result
+  again, and the handler does not run again. With the repeat turned off, the
+  worker gives the claim back and a second attempt runs. Only the attempt
+  check fails. In the ack-lost test, the commit landed, so the repeat must
+  change nothing.
 - #1870 fails the workflow after one `StartToClose` timeout. A result write
-  reaches that timeout only when its repeats and the claim give-back all
-  fail. A crash restart can cause that. So the restart test accepts that
+  reaches that timeout, for example, when its repeats and the claim give-back
+  all fail. A crash restart can cause that. So the restart test accepts that
   outcome, but only for workflows with an activity that the old Postgres
   instance claimed. Each accepted `FAILED` must have the exact history: one
   activity terminal event, a `StartToClose` timeout, and one terminal event,
