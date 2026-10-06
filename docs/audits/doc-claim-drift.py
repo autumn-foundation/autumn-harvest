@@ -56,18 +56,34 @@ REBALANCING = (
 
 
 def harvest_scope(text):
-    """Keep only the text about harvest in a multi-vendor page.
+    """Blank the text about competitors in a multi-vendor page.
 
-    Harvest's own table rows and each `##` section that names harvest stay.
-    Every other line is blanked, so a claim about a competitor never matches.
-    Blank lines keep the line numbers of the findings.
+    A table with one row per engine keeps the autumn-harvest row only. A
+    table with one column per engine keeps the label and autumn-harvest
+    cells only. A "**Choose X if**" paragraph is about a competitor, so it
+    goes. All other prose stays, so a stale claim in neutral text still
+    matches. Blank lines keep the line numbers of the findings.
     """
-    kept, in_section = [], False
+    kept, table_col, in_choose = [], None, False
     for line in text.split("\n"):
-        if line.startswith("## "):
-            in_section = "harvest" in line.lower()
-        keep = in_section or line.startswith("| **autumn-harvest** |")
-        kept.append(line if keep else "")
+        if not line.startswith("|"):
+            table_col = None
+            in_choose = (in_choose and line.strip() != "") or line.startswith("**Choose ")
+            kept.append("" if in_choose else line)
+            continue
+        cells = [c.strip() for c in CELL_SPLIT_RE.split(line)[1:-1]]
+        if table_col is None:
+            # The header row decides the table's shape.
+            table_col = next(
+                (k for k, c in enumerate(cells) if k and c.strip("*") == "autumn-harvest"), 0
+            )
+        if table_col:
+            keep = cells[: 1] + cells[table_col : table_col + 1]
+            kept.append("| " + " | ".join(keep) + " |")
+        elif cells and cells[0].strip("*") == "autumn-harvest":
+            kept.append(line)
+        else:
+            kept.append("")
     return "\n".join(kept)
 
 
@@ -416,18 +432,21 @@ def self_test():
     assert "shipped" in found[0] and "missing" in found[3], found
 
     page = (
-        "# Comparing autumn-harvest\n\n## Dimension-by-dimension\n\n"
+        "# Comparing autumn-harvest\n\n"
+        "Intro. **Planned:** cross-region DR ([#954](u)).\n\n"
+        "| Dimension | autumn-harvest | DBOS |\n|---|---|---|\n"
+        "| **HA** | Shipped | Planned via [#954](u) |\n\n"
+        "## Dimension-by-dimension\n\n"
+        "| Engine | Story |\n|---|---|\n"
         "| **autumn-harvest** | There is no built-in multi-region replication or failover. |\n"
         "| DBOS | DBOS has no cross-region replication or failover. |\n\n"
-        "## Where harvest is behind\n\n"
-        "- No multi-region DR or replication.\n\n"
+        "Neutral prose: harvest has no multi-region DR or replication.\n\n"
         "## Choose something else if\n\n"
-        "Pick X: harvest has no cross-region replication or failover.\n"
+        "**Choose DBOS if** you want\nno cross-region replication or failover.\n"
     )
-    found = stale_claim_findings(
-        {"p.md": page}.get, [("p.md", region, "shipped", harvest_scope)]
-    )
-    assert [m.split(":")[1] for m in found] == ["5", "10"], found
+    claims = [("p.md", planned, "shipped", harvest_scope), ("p.md", region, "shipped", harvest_scope)]
+    found = stale_claim_findings({"p.md": page}.get, claims)
+    assert [m.split(":")[1] for m in found] == ["3", "13", "16"], found
 
     # Every real pattern compiles.
     for _, pattern, *_ in STALE_CLAIMS:
