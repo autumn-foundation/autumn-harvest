@@ -3153,6 +3153,50 @@ async fn a_fence_stops_an_activity_heartbeat_flusher() {
     );
 }
 
+/// A replication heartbeat checks the fence in its own transaction (issue
+/// #1823). A process whose pin is superseded writes no beat, also when the
+/// bump lands after the sampler's own fence check.
+#[tokio::test]
+async fn a_superseded_pin_writes_no_replication_heartbeat() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("beatfence");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+
+    let beat = autumn_harvest::replication::record_replication_heartbeat(
+        &mut conn,
+        ShardId::new(0),
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    #[derive(diesel::QueryableByName)]
+    struct Beats {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        beats: i64,
+    }
+    let rows: Vec<Beats> =
+        diesel::sql_query("SELECT count(*) AS beats FROM harvest_replication_heartbeat")
+            .load(&mut conn)
+            .await
+            .expect("count the beats");
+
+    assert!(
+        matches!(
+            beat,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a superseded pin must not write a beat: {beat:?}"
+    );
+    assert_eq!(<[Beats]>::first(&rows).map(|row| row.beats), Some(0));
+}
+
 /// A pass on one shard does not block a bump of another shard on the same
 /// database (issue #1823). Generations are per shard, so the barrier is too.
 #[tokio::test]

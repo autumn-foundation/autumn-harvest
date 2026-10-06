@@ -256,7 +256,8 @@ shard is plain:
   DR marker. The pins are process-wide, so that worker would check its
   writes against another database. The reverse order is refused too: a
   process that runs an unfenced worker refuses a fenced one. Run each in
-  its own process, or set `DrFencing::Enabled` on both.
+  its own process, or set `DrFencing::Enabled` on both. A worker that fails
+  to start does not count: its mode is free again.
 - A worker's startup writes (its fleet row and its rate-limit buckets) and
   each heartbeat run under the fence barrier. A held or fenced shard gets
   none of them, and they retry later.

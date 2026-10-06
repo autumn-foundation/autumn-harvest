@@ -646,6 +646,35 @@ pub fn shard_writes_held(shard: Option<ShardId>) -> bool {
     FenceRegistry::is_held(shard.unwrap_or(ShardId::UNENCODED))
 }
 
+/// One worker's reservation of fenced or unfenced mode (issue #1823). See
+/// [`FenceRegistry::reserve_mode`].
+///
+/// A startup that fails drops the reservation, and the drop gives the mode
+/// back. Each reservation counts on its own. A failed startup therefore
+/// never frees a mode that another worker still holds. A worker that starts
+/// calls [`Self::keep`].
+#[derive(Debug)]
+#[must_use = "dropping a reservation gives the mode back"]
+pub struct ModeReservation {
+    fenced: bool,
+    kept: bool,
+}
+
+impl ModeReservation {
+    /// Keep the mode for the life of the process.
+    pub fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for ModeReservation {
+    fn drop(&mut self) {
+        if !self.kept {
+            FenceRegistry::release_mode(self.fenced);
+        }
+    }
+}
+
 /// The sentinel a held shard is pinned to (issue #1823). No row holds it,
 /// so the claim gate selects nothing and the persist assert fails closed.
 const HELD: ShardGeneration = ShardGeneration(i64::MIN);
@@ -674,12 +703,12 @@ struct Pinned {
     /// #1823). A claim scan there is not filtered by shard, so it checks
     /// them all.
     colocated: BTreeMap<i32, Vec<i32>>,
-    /// Whether a worker in this process started unfenced (issue #1823). A
-    /// later pin would apply to that worker's database too, so a fenced
+    /// How many workers in this process reserved unfenced mode (issue
+    /// #1823). A later pin would apply to their databases too, so a fenced
     /// worker then refuses to start.
-    unfenced_worker: bool,
-    /// Whether a worker in this process reserved fenced mode (issue #1823).
-    fenced_worker: bool,
+    unfenced_workers: usize,
+    /// How many workers in this process reserved fenced mode (issue #1823).
+    fenced_workers: usize,
     /// Whether this process found one of its pins superseded (issue #1823).
     /// Shutdown then skips its database bookkeeping. Another region owns
     /// those rows now.
@@ -1165,18 +1194,20 @@ impl FenceRegistry {
     /// The registry is process-wide, so one process cannot run fenced and
     /// unfenced workers side by side. The check and the reservation happen
     /// under one write lock, so two workers that start at once cannot both
-    /// pass the check. A reservation stays for the life of the process.
+    /// pass the check. A worker that starts keeps its reservation for the
+    /// life of the process. A startup that fails drops it, and the mode is
+    /// free again. See [`ModeReservation`].
     ///
     /// # Errors
     ///
     /// A message for the operator when the process already runs a worker in
     /// the other mode.
-    pub fn reserve_mode(fenced: bool) -> Result<(), String> {
+    pub fn reserve_mode(fenced: bool) -> Result<ModeReservation, String> {
         let mut guard = PINNED
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pinned = guard.get_or_insert_with(Pinned::default);
-        let refusal = if fenced && pinned.unfenced_worker {
+        let refusal = if fenced && pinned.unfenced_workers > 0 {
             Some(
                 "this process already runs a worker whose databases carry no DR marker. The \
                  fence registry is process-wide, so pinning DR shards now would check that \
@@ -1184,7 +1215,7 @@ impl FenceRegistry {
                  process, or set DrFencing::Enabled on both.",
             )
         } else if !fenced
-            && (pinned.fenced_worker || pinned.generations.values().any(|pin| *pin != HELD))
+            && (pinned.fenced_workers > 0 || pinned.generations.values().any(|pin| *pin != HELD))
         {
             Some(
                 "this process already pins DR shard generations, but this worker's databases \
@@ -1197,13 +1228,37 @@ impl FenceRegistry {
         };
         if refusal.is_none() {
             if fenced {
-                pinned.fenced_worker = true;
+                pinned.fenced_workers += 1;
             } else {
-                pinned.unfenced_worker = true;
+                pinned.unfenced_workers += 1;
             }
         }
         drop(guard);
-        refusal.map_or(Ok(()), |message| Err(message.to_string()))
+        refusal.map_or_else(
+            || {
+                Ok(ModeReservation {
+                    fenced,
+                    kept: false,
+                })
+            },
+            |message| Err(message.to_string()),
+        )
+    }
+
+    /// Give back one reservation of `fenced` mode. See [`ModeReservation`].
+    fn release_mode(fenced: bool) {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pinned) = guard.as_mut() {
+            let count = if fenced {
+                &mut pinned.fenced_workers
+            } else {
+                &mut pinned.unfenced_workers
+            };
+            *count = count.saturating_sub(1);
+        }
+        drop(guard);
     }
 
     /// Record that `shards` share one database (issue #1823).
@@ -2609,7 +2664,9 @@ mod db {
         // This process already fences another database. The registry is
         // process-wide, so one process cannot mix fenced and unfenced workers.
         // The check and the reservation are one atomic step.
-        FenceRegistry::reserve_mode(fence).map_err(crate::error::HarvestError::Config)?;
+        // A failed startup drops the reservation, so the mode is free again.
+        let reservation =
+            FenceRegistry::reserve_mode(fence).map_err(crate::error::HarvestError::Config)?;
         if !fence {
             if !held.is_empty() {
                 let default_shard = targets
@@ -2619,6 +2676,7 @@ mod db {
                 FenceRegistry::hold(&shards, default_shard)
                     .map_err(|conflict| crate::error::HarvestError::Config(conflict.to_string()))?;
             }
+            reservation.keep();
             return Ok((None, held));
         }
         // A shard outside this worker's assignment does not block it. The
@@ -2806,6 +2864,7 @@ mod db {
         for (shard, pool) in &fenced {
             record_pin_pool(*shard, pool);
         }
+        reservation.keep();
         Ok((Some(fenced), held))
     }
 
@@ -2938,6 +2997,9 @@ mod db {
     /// # Errors
     ///
     /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    /// Also returns the errors of [`assert_fence_group`], for example when
+    /// this process pins a superseded generation (issue #1823). It then
+    /// writes no beat.
     pub async fn record_replication_heartbeat(
         conn: &mut AsyncPgConnection,
         shard: ShardId,
@@ -2979,6 +3041,10 @@ mod db {
                     // check and gauges still ran; only the write is skipped.
                     return Ok(());
                 }
+                // Check the fence in this transaction (issue #1823). The
+                // check holds each pinned row `FOR SHARE`, so a bump cannot
+                // commit between the check and the beat.
+                assert_fence_group(conn, shard).await?;
 
                 // The lock alone only prevents SIMULTANEOUS writers. Workers
                 // sampling on staggered schedules each take it uncontended a
@@ -4313,15 +4379,58 @@ pub(crate) mod tests {
     fn a_process_reserves_one_fence_mode() {
         let _serial = registry_guard();
         FenceRegistry::clear();
-        assert!(FenceRegistry::reserve_mode(true).is_ok());
         assert!(
-            FenceRegistry::reserve_mode(true).is_ok(),
+            FenceRegistry::reserve_mode(true)
+                .map(ModeReservation::keep)
+                .is_ok()
+        );
+        assert!(
+            FenceRegistry::reserve_mode(true)
+                .map(ModeReservation::keep)
+                .is_ok(),
             "same mode is fine"
         );
         assert!(FenceRegistry::reserve_mode(false).is_err());
         FenceRegistry::clear();
-        assert!(FenceRegistry::reserve_mode(false).is_ok());
+        assert!(
+            FenceRegistry::reserve_mode(false)
+                .map(ModeReservation::keep)
+                .is_ok()
+        );
         assert!(FenceRegistry::reserve_mode(true).is_err());
+        FenceRegistry::clear();
+    }
+
+    /// A failed startup gives back its mode reservation (issue #1823). A
+    /// worker in the other mode can then start.
+    #[test]
+    fn a_failed_startup_gives_back_its_mode_reservation() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        let failed = FenceRegistry::reserve_mode(true).expect("reserve");
+        drop(failed);
+        assert!(
+            FenceRegistry::reserve_mode(false).is_ok(),
+            "a failed fenced startup must not block an unfenced worker"
+        );
+        FenceRegistry::clear();
+    }
+
+    /// A failed startup gives back only its own reservation (issue #1823). A
+    /// fenced worker that started still blocks an unfenced one.
+    #[test]
+    fn a_failed_startup_keeps_another_workers_mode() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::reserve_mode(true)
+            .map(ModeReservation::keep)
+            .expect("the first worker starts");
+        let failed = FenceRegistry::reserve_mode(true).expect("reserve");
+        drop(failed);
+        assert!(
+            FenceRegistry::reserve_mode(false).is_err(),
+            "a started fenced worker still blocks an unfenced worker"
+        );
         FenceRegistry::clear();
     }
 
