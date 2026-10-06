@@ -3842,6 +3842,12 @@ pub struct WorkerConfig {
     /// threshold the task is moved to the DLQ and its owning workflow is failed
     /// terminally, rather than being re-dispatched to crash another worker.
     ///
+    /// The last strike waits until the reclaimer confirms the death of the
+    /// worker (issue #1879). Two sweeps in a row must see the orphan, and the
+    /// worker must write no heartbeat for two stale windows. Until then the
+    /// task stays `RUNNING`. A late worker that heartbeats again keeps its
+    /// task.
+    ///
     /// Defaults to **3**. Set to `0` to disable quarantine entirely (reclaimed
     /// poison pills are re-queued indefinitely — the legacy retry-loop
     /// behaviour).
