@@ -181,6 +181,9 @@ pub struct WorkflowHistoryPolicy {
     /// via [`Self::with_history_bloat_warn_fraction`], the sole (guarded)
     /// entry point, since this field is private.
     history_bloat_warn_fraction: f64,
+    /// Whether each decision appends a `DecisionCommitted` boundary
+    /// (issue #1833). Defaults to `true`.
+    decision_boundaries: bool,
 }
 
 impl Default for WorkflowHistoryPolicy {
@@ -190,6 +193,7 @@ impl Default for WorkflowHistoryPolicy {
             event_hard_cap: None,
             continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
             history_bloat_warn_fraction: DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
+            decision_boundaries: true,
         }
     }
 }
@@ -265,8 +269,22 @@ impl WorkflowHistoryPolicy {
     /// to the documented default (rather than to `0.0`/disabled) is the safer
     /// failure mode for a garbage/corrupted config value: it keeps the signal
     /// behaving as if unconfigured instead of silently going dark forever.
+    /// Whether each decision appends a
+    /// [`DecisionCommitted`](crate::event::WorkflowEvent::DecisionCommitted)
+    /// boundary (issue #1833). Defaults to `true`.
     #[must_use]
-    pub const fn with_decision_boundaries(self, _enabled: bool) -> Self {
+    pub const fn decision_boundaries(self) -> bool {
+        self.decision_boundaries
+    }
+
+    /// Turn decision boundaries on or off (issue #1833).
+    ///
+    /// A worker older than this release cannot decode a boundary. It fails
+    /// the execution that holds one. Turn boundaries off while such workers
+    /// still run, and turn them on when the rollout is complete.
+    #[must_use]
+    pub const fn with_decision_boundaries(mut self, enabled: bool) -> Self {
+        self.decision_boundaries = enabled;
         self
     }
 

@@ -237,8 +237,7 @@ async fn completed_two_steps(
         serde_json::json!({"n": 1}),
     )
     .await;
-    wait_for_execution_state_with_timeout(url, exec_id, "COMPLETED", Duration::from_secs(30))
-        .await;
+    wait_for_execution_state_with_timeout(url, exec_id, "COMPLETED", Duration::from_secs(30)).await;
     running.stop().await;
     (exec_id, history(url, exec_id).await, worker_id)
 }
@@ -396,12 +395,13 @@ async fn measure_boundary_storage_overhead() {
         .expect("other rows");
     println!("issue #1833 storage: {rows:#?}");
     assert_eq!(boundary.rows, 3);
-    // One boundary holds a short build id and a worker id. Its JSON must stay
-    // well under the cost of an average event.
+    // The JSON text of one boundary here is about 100 bytes: the type tag,
+    // two keys, a 10-byte build id and a 38-byte worker id. The jsonb form
+    // adds a header and offsets. 160 bytes catches a field added by mistake.
     let per_boundary = boundary.data_bytes / boundary.rows;
     let per_other = other.data_bytes / other.rows;
     assert!(
-        per_boundary < 128,
+        per_boundary < 160,
         "a boundary costs {per_boundary} bytes of event_data"
     );
     assert!(

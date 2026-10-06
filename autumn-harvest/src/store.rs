@@ -197,7 +197,27 @@ pub async fn append_events_with_codecs(
     }
 
     let rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
+    let inserted = insert_event_rows(conn, exec_id, &rows).await?;
 
+    if let Some(last_event) = events.last() {
+        crate::notify::notify_workflow_events_appended(
+            conn,
+            exec_id.as_uuid(),
+            inserted,
+            last_event.type_name(),
+        )
+        .await?;
+    }
+
+    Ok(inserted)
+}
+
+/// Insert prepared event rows behind the DR write fence. Stages no NOTIFY.
+async fn insert_event_rows(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    rows: &[NewHarvestEvent<'_>],
+) -> HarvestResult<usize> {
     // Cross-region DR write-authority fence (issue #954).
     //
     // Below the empty-append early return — an empty append writes nothing, so
@@ -214,37 +234,64 @@ pub async fn append_events_with_codecs(
     // opens a savepoint and the outer lock already covers this. The wrapper is
     // skipped entirely when fencing is off, so the pre-#954 path is unchanged:
     // no fence read, no savepoint, one INSERT.
-    let inserted = if crate::replication::FenceRegistry::is_enabled() {
+    if crate::replication::FenceRegistry::is_enabled() {
         Box::pin(
             conn.transaction::<usize, crate::error::HarvestError, _>(async |conn| {
                 crate::replication::assert_fence(conn, exec_id.shard()).await?;
                 diesel::insert_into(harvest_events::table)
-                    .values(&rows)
+                    .values(rows)
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)
             }),
         )
-        .await?
+        .await
     } else {
         diesel::insert_into(harvest_events::table)
-            .values(&rows)
+            .values(rows)
             .execute(conn)
             .await
-            .map_err(crate::error::database_error)?
-    };
-
-    if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
-            conn,
-            exec_id.as_uuid(),
-            inserted,
-            last_event.type_name(),
-        )
-        .await?;
+            .map_err(crate::error::database_error)
     }
+}
 
-    Ok(inserted)
+/// Append a decision boundary when the decision grew the history (issue #1833).
+///
+/// `decision_start` is the next event id when the decision loaded its
+/// history. The boundary goes in only when the history grew since then, so a
+/// wake that writes nothing adds no row.
+///
+/// Call it inside the transaction that persists the decision outcome. The
+/// `FOR UPDATE` lock in [`next_event_id_for`] keeps the id valid.
+///
+/// The insert stages no NOTIFY. The events of the decision already staged
+/// one, and the boundary must not change its `last_event_type`.
+///
+/// Returns `true` when it appended the boundary.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if a query fails, or a
+/// codec error if encoding fails.
+pub(crate) async fn append_decision_boundary(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    decision_start: i32,
+    boundary: &WorkflowEvent,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<bool> {
+    let next_id = next_event_id_for(conn, exec_id).await?;
+    if next_id <= decision_start {
+        return Ok(false);
+    }
+    let rows = events_to_insert_rows_from_with_codecs(
+        exec_id,
+        std::slice::from_ref(boundary),
+        next_id,
+        codecs,
+    )?;
+    insert_event_rows(conn, exec_id, &rows).await?;
+    Ok(true)
 }
 
 /// Append events, offloading any over-threshold payload fields (issue #524).

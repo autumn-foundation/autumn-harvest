@@ -185,6 +185,13 @@ fn step_headline(step: &DebugStep) -> String {
     if let Some(name) = &step.signal_name {
         return format!("signal {name}");
     }
+    if let Some(decision) = &step.decision {
+        return format!(
+            "decision: build {}, worker {}",
+            build_label(&decision.build_id),
+            decision.worker_id
+        );
+    }
     step.open_awaitables
         .iter()
         .find(|a| a.opened_at == step.index)
@@ -293,7 +300,24 @@ pub fn render_step_detail(trace: &ReplayTrace, index: usize) -> String {
     if let Some(payload) = &step.resolved_payload {
         let _ = writeln!(out, "\n  resolved payload: {}", compact(payload));
     }
+    if let Some(decision) = &step.decision {
+        let _ = writeln!(
+            out,
+            "\n  decision:\n    build:  {}\n    worker: {}",
+            build_label(&decision.build_id),
+            decision.worker_id
+        );
+    }
     out
+}
+
+/// Shows an empty build id as `<none>` (issue #1833).
+fn build_label(build_id: &str) -> &str {
+    if build_id.is_empty() {
+        "<none>"
+    } else {
+        build_id
+    }
 }
 
 /// Render a titled list section, or nothing when the list is empty.

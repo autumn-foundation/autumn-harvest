@@ -2179,6 +2179,17 @@ impl HarvestBuilder {
         self
     }
 
+    /// Record a `DecisionCommitted` boundary after each decision (issue #1833).
+    ///
+    /// On by default. A worker older than this release fails an execution
+    /// whose history holds a boundary. Pass `false` until every worker runs
+    /// this release. See `docs/decision-boundaries.md`.
+    #[must_use]
+    pub const fn record_decision_boundaries(mut self, enabled: bool) -> Self {
+        self.history_policy = self.history_policy.with_decision_boundaries(enabled);
+        self
+    }
+
     /// Set a server-side hard ceiling on the number of durable events a RUNNING
     /// workflow execution may accumulate (issue #493).
     ///

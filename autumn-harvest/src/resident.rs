@@ -422,26 +422,22 @@ impl ResidentWorkflow {
     }
 
     /// Returns the event in `delta` that resolves the awaited command.
+    ///
+    /// Decision boundaries (issue #1833) are skipped. Replay never reads them.
     fn resolving_event<'a>(
         &self,
         delta: &'a [WorkflowEvent],
     ) -> Result<&'a WorkflowEvent, ResumeDeclined> {
-        let own = self.own_events.len();
-        let head = &delta[..own.min(delta.len())];
+        let mut events = delta.iter().filter(|event| !event.is_decision_boundary());
         let own_match = self
             .own_events
             .iter()
-            .zip(head)
-            .all(|(expected, event)| expected.matches(event));
+            .all(|expected| events.next().is_some_and(|event| expected.matches(event)));
         if !own_match {
             return Err(ResumeDeclined::OwnEventsMismatch);
         }
         // Replay skips progress events only up to the resolving event.
-        let mut rest = delta
-            .get(own..)
-            .unwrap_or_default()
-            .iter()
-            .skip_while(|event| self.awaiting.is_progress(event));
+        let mut rest = events.skip_while(|event| self.awaiting.is_progress(event));
         match (rest.next(), rest.next()) {
             (Some(event), None) => Ok(event),
             (Some(_), Some(_)) => Err(ResumeDeclined::ExtraEvents),

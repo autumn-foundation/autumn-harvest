@@ -18892,6 +18892,37 @@ async fn handle_suspended_workflow(
     .await
 }
 
+/// Appends the boundary of this decision when the policy allows it
+/// (issue #1833).
+///
+/// It runs in the transaction that persists the decision outcome. A decision
+/// that appended no event since `decision_start` gets no boundary.
+async fn record_decision_boundary(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    exec_id: ExecutionId,
+    decision_start: i32,
+    worker_id: &str,
+    build_id: &str,
+) -> HarvestResult<()> {
+    if !registry.history_policy().decision_boundaries() {
+        return Ok(());
+    }
+    let boundary = WorkflowEvent::DecisionCommitted {
+        build_id: crate::types::BuildId::new(build_id),
+        worker_id: crate::types::WorkerId::new(worker_id),
+    };
+    store::append_decision_boundary(
+        conn,
+        exec_id,
+        decision_start,
+        &boundary,
+        registry.payload_codecs(),
+    )
+    .await?;
+    Ok(())
+}
+
 #[doc(hidden)]
 pub async fn fail_execution_on_error<T>(
     conn: &mut AsyncPgConnection,
@@ -22694,6 +22725,8 @@ async fn process_workflow_task(
     // activity, timer, signal wait, …) breaks out of the loop.
     let mut history_events = prepared.history_events;
     let mut next_event_id = prepared.next_event_id;
+    // Issue #1833: the boundary covers every event this decision appends.
+    let decision_start_event_id = prepared.next_event_id;
     // Issue #1798: the resident workflow of a warm hit. The first iteration
     // tries to resume it. A decline replays cold, as on a miss.
     let mut warm_resident = prepared.resident.take();
@@ -24455,6 +24488,16 @@ async fn process_workflow_task(
             )
             .await?
             {
+                // Inline local activities can have appended events already.
+                record_decision_boundary(
+                    conn,
+                    registry,
+                    prepared.exec_id,
+                    decision_start_event_id,
+                    worker_id,
+                    build_id,
+                )
+                .await?;
                 return Ok(WorkflowPersistFlow::ParkedPaused);
             }
 
@@ -24517,6 +24560,15 @@ async fn process_workflow_task(
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
                 };
+            record_decision_boundary(
+                conn,
+                registry,
+                prepared.exec_id,
+                decision_start_event_id,
+                worker_id,
+                build_id,
+            )
+            .await?;
             // Chaos: kill/delay inside the persist transaction, after the
             // outcome is written but before the outer commit — the #367 window
             // (worker dies after claim, before the terminal is durable). A kill

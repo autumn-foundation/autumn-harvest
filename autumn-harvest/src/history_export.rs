@@ -537,6 +537,11 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
     Ok(exporter.out)
 }
 
+/// Makes operator text safe inside one Mermaid note line.
+fn mermaid_text(text: &str) -> String {
+    text.replace('\n', " ").replace('"', "'")
+}
+
 struct MermaidExporter {
     out: String,
     participants: std::collections::HashSet<String>,
@@ -922,6 +927,21 @@ impl MermaidExporter {
             WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
                 let label = name.as_deref().unwrap_or(kind.as_str());
                 writeln!(self.out, "    Note over WF: Side Effect: {label}")?;
+            }
+            WorkflowEvent::DecisionCommitted {
+                build_id,
+                worker_id,
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Decision committed (build {}, worker {})",
+                    if build_id.is_legacy() {
+                        "none".to_string()
+                    } else {
+                        mermaid_text(build_id.as_str())
+                    },
+                    mermaid_text(worker_id.as_str()),
+                )?;
             }
             WorkflowEvent::MutexGranted { key, .. } => {
                 writeln!(self.out, "    Note over WF: Mutex Acquired: {key}")?;

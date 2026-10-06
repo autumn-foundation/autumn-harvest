@@ -423,7 +423,7 @@ impl ReplayTrace {
                 resolved_payload: resolved_payload(event),
                 event_facts: normalized_event_facts(event),
                 signal_name: signal_name_of(event),
-                decision: None,
+                decision: decision_of(event),
                 divergence: None,
             });
         }
@@ -589,6 +589,20 @@ fn step_names_signal(step: &DebugStep, name: &str) -> bool {
 fn signal_name_of(event: &WorkflowEvent) -> Option<String> {
     match event {
         WorkflowEvent::SignalReceived { signal_name, .. } => Some(signal_name.clone()),
+        _ => None,
+    }
+}
+
+/// The build and worker, when `event` is a `DecisionCommitted`.
+fn decision_of(event: &WorkflowEvent) -> Option<DecisionAttribution> {
+    match event {
+        WorkflowEvent::DecisionCommitted {
+            build_id,
+            worker_id,
+        } => Some(DecisionAttribution {
+            build_id: build_id.to_string(),
+            worker_id: worker_id.to_string(),
+        }),
         _ => None,
     }
 }
@@ -2081,7 +2095,9 @@ const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
 ///   **field name**, not by "looks like a UUID";
 /// * `timestamp`;
 /// * the recorded `value` of a non-deterministic side-effect draw
-///   (`Now`/`Uuid`/`Random`, issue #384) — its `kind` and `name` still compare.
+///   (`Now`/`Uuid`/`Random`, issue #384) — its `kind` and `name` still compare;
+/// * every field of a `DecisionCommitted` (issue #1833). Its event type still
+///   compares.
 ///
 /// Field-name matching is load-bearing. A purely value-based test ("normalize
 /// anything that parses as a UUID") also eats
@@ -2108,6 +2124,9 @@ fn normalized_event_facts(event: &WorkflowEvent) -> Value {
         .get("kind")
         .and_then(Value::as_str)
         .is_some_and(|kind| kind != "Custom");
+    // A boundary names the build and worker of a decision (issue #1833).
+    // That is attribution, not behavior. A cross-build diff must not flag it.
+    let boundary = event.is_decision_boundary();
 
     for (key, slot) in data.iter_mut() {
         // The UUID parse is kept *in addition to* the name match, not instead
@@ -2116,6 +2135,7 @@ fn normalized_event_facts(event: &WorkflowEvent) -> Value {
         // serializes as an object that must compare verbatim.
         let is_per_run = key == "timestamp"
             || (nondeterministic_draw && key == "value")
+            || boundary
             || (ENGINE_MINTED_ID_FIELDS.contains(&key.as_str())
                 && slot
                     .as_str()

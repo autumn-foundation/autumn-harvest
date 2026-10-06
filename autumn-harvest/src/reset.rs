@@ -233,6 +233,8 @@ pub fn resolve_reset_point(
                         // * ChildWorkflowCascadeApplied — post-terminal operational
                         //   tail emitted when the parent close cascade fires; including
                         //   it would re-trigger the cascade on replay.
+                        // * DecisionCommitted — the boundary after the terminal of
+                        //   the last decision (issue #1833). It is never a reset point.
                         if matches!(
                             event,
                             WorkflowEvent::WorkflowCompleted { .. }
@@ -241,6 +243,7 @@ pub fn resolve_reset_point(
                                 | WorkflowEvent::WorkflowExecutionTimedOut { .. }
                                 | WorkflowEvent::WorkflowRetryScheduled { .. }
                                 | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+                                | WorkflowEvent::DecisionCommitted { .. }
                         ) {
                             return None;
                         }

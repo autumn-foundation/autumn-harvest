@@ -772,12 +772,14 @@ impl HistoryMatcher {
         // retried-then-redriven run's cursor gets stuck on the
         // bookkeeping event itself, before it ever reaches the marker or
         // dispatch behind it.
+        //
+        // A decision boundary (issue #1833) is transparent too. It carries
+        // no command, so replay must read a history the same way with or
+        // without boundaries.
         let mut transparent_events: HashSet<usize> = events
             .iter()
             .enumerate()
-            .filter(|(_, e)| {
-                Self::is_pause_lifecycle_event(e) || Self::is_post_terminal_bookkeeping(e)
-            })
+            .filter(|(_, e)| Self::is_command_free_bookkeeping(e))
             .map(|(i, _)| i)
             .collect();
         // DLQ redrive (issue #510): a `WorkflowRedriven` event reopens a run that
@@ -921,8 +923,10 @@ impl HistoryMatcher {
     /// and are never consumed by the workflow function — operator pause/resume
     /// (#383) and post-terminal bookkeeping appended *after* a terminal event
     /// (`WorkflowRetryScheduled` from a workflow-level retry (#523),
-    /// `ChildWorkflowCascadeApplied` from a parent-close cascade (#347)). If the
-    /// first event it lands on is a `WorkflowFailed`, that index opens the tail.
+    /// `ChildWorkflowCascadeApplied` from a parent-close cascade (#347)). It
+    /// also skips a decision boundary (#1833), which follows the terminal of
+    /// the last decision. If the first event it lands on is a `WorkflowFailed`,
+    /// that index opens the tail.
     ///
     /// A `WorkflowRedriven` (#510) is deliberately **not** skipped: a redriven
     /// run is reopened, not failing, and keeps the narrower redrive-anchored
@@ -936,7 +940,7 @@ impl HistoryMatcher {
         while idx > 0 {
             idx -= 1;
             let event = &events[idx];
-            if Self::is_pause_lifecycle_event(event) || Self::is_post_terminal_bookkeeping(event) {
+            if Self::is_command_free_bookkeeping(event) {
                 continue;
             }
             // `idx > 0` guard: a history whose FIRST event is the terminal
@@ -949,6 +953,15 @@ impl HistoryMatcher {
                 .then_some(idx);
         }
         None
+    }
+
+    /// Events that carry no workflow command and that replay never consumes:
+    /// pause and resume (#383), post-terminal bookkeeping, and decision
+    /// boundaries (#1833).
+    const fn is_command_free_bookkeeping(event: &WorkflowEvent) -> bool {
+        Self::is_pause_lifecycle_event(event)
+            || Self::is_post_terminal_bookkeeping(event)
+            || event.is_decision_boundary()
     }
 
     /// Events appended **after** a run's terminal event as durable bookkeeping.
@@ -14083,7 +14096,9 @@ mod tests {
     fn trailing_boundary_after_completion_is_not_unconsumed() {
         let events = vec![
             started_event(),
-            WorkflowEvent::WorkflowCompleted { output: Value::Null },
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
             decision_boundary(),
         ];
         let mut matcher = HistoryMatcher::new(events);
@@ -14098,7 +14113,10 @@ mod tests {
             WorkflowEvent::workflow_failed("boom"),
             decision_boundary(),
         ];
-        assert_eq!(HistoryMatcher::terminal_failure_tail_start(&events), Some(1));
+        assert_eq!(
+            HistoryMatcher::terminal_failure_tail_start(&events),
+            Some(1)
+        );
         let matcher = HistoryMatcher::new(events);
         assert!(matcher.has_terminal_failure_tail());
         assert!(matcher.is_consumed(1));

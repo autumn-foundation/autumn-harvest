@@ -5682,6 +5682,13 @@ fn event_human_label(event_type: &str, event_data: &Value, execution_state: &str
         "ActivityCompletedExternally" => "Activity completed externally".to_string(),
         "ActivityFailedExternally" => "Activity failed externally".to_string(),
         "ActivityExternalDeadlineExtended" => "External activity deadline extended".to_string(),
+        "DecisionCommitted" => {
+            let build = event_data_field(event_data, "build_id")
+                .filter(|build| !build.is_empty())
+                .unwrap_or("<none>");
+            let worker = event_data_field(event_data, "worker_id").unwrap_or("?");
+            format!("Decision committed: build {build}, worker {worker}")
+        }
         "TimerStarted" => "Timer started".to_string(),
         "TimerFired" => "Timer fired".to_string(),
         "TimerCancelled" => "Timer cancelled".to_string(),

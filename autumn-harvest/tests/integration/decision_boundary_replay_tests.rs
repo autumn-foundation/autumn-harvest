@@ -78,7 +78,10 @@ fn is_success(report: &ReplayReport) -> bool {
 async fn a_pre_1833_history_replays_unchanged() {
     let snapshot = fixture();
     assert!(
-        !snapshot.events.iter().any(WorkflowEvent::is_decision_boundary),
+        !snapshot
+            .events
+            .iter()
+            .any(WorkflowEvent::is_decision_boundary),
         "the fixture must predate decision boundaries"
     );
     let report = replayer()
@@ -114,7 +117,12 @@ async fn a_boundary_does_not_hide_a_real_divergence() {
     let mut snapshot = with_boundaries_after(fixture(), &[1, 4, 7, 10]);
     for event in &mut snapshot.events {
         if let WorkflowEvent::ActivityScheduled { name, .. } = event {
-            *name = if name == "reserve" { "charge" } else { "reserve" }.to_string();
+            *name = if name == "reserve" {
+                "charge"
+            } else {
+                "reserve"
+            }
+            .to_string();
         }
     }
     let report = replay(&snapshot).await;

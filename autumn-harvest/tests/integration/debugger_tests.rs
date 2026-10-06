@@ -2962,7 +2962,10 @@ async fn a_history_with_boundaries_replays_clean_step_by_step() {
         .expect("trace");
     assert!(trace.is_clean(), "{trace:#?}");
     assert_eq!(
-        trace.steps[8].decision.as_ref().map(|d| d.build_id.as_str()),
+        trace.steps[8]
+            .decision
+            .as_ref()
+            .map(|d| d.build_id.as_str()),
         Some("build-8")
     );
 }

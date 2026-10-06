@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::error::TimeoutType;
 use crate::types::{
-    ActivityExecId, BuildId, ExecutionId, ExternalActivityToken, ExternalAwaitId,
-    ExternalCancelId, ExternalSignalId, TimerId, UpdateId, WorkerId,
+    ActivityExecId, BuildId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
+    ExternalSignalId, TimerId, UpdateId, WorkerId,
 };
 
 fn default_error_type() -> String {
@@ -1065,7 +1065,7 @@ impl WorkflowEvent {
     /// Returns `true` for a [`Self::DecisionCommitted`] boundary (issue #1833).
     #[must_use]
     pub const fn is_decision_boundary(&self) -> bool {
-        false
+        matches!(self, Self::DecisionCommitted { .. })
     }
 
     /// Returns `true` for terminal lifecycle events that are appended by the
