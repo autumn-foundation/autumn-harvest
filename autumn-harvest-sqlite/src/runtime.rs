@@ -267,7 +267,8 @@ impl SqliteRuntime {
         Self::from_connection(conn, writer_lock)
     }
 
-    fn from_connection(conn: Connection, writer_lock: Option<WriterLock>) -> SqliteResult<Self> {
+    /// Apply the pragmas and the schema, and reclaim orphaned tasks.
+    fn prepare(conn: &Connection) -> SqliteResult<()> {
         // Durability & concurrency posture (issue #1068). This backend makes a
         // deliberate, conservative durability claim (a committed transaction
         // survives a crash/power-loss — the crash-then-reopen tests depend on it),
@@ -293,11 +294,23 @@ impl SqliteRuntime {
         // ORIGINAL columns, so this additive, idempotent step adds any column
         // introduced since the file was created (e.g. `harvest_tasks`'s freeze
         // columns) before any read/insert touches them. A no-op on a fresh file.
-        schema::migrate(&conn)?;
+        schema::migrate(conn)?;
         // Single-server crash recovery: any task left `RUNNING` was claimed by a
         // process that exited without finalizing — flip it back to `PENDING` so
         // its body re-runs (at-least-once).
-        queue::reclaim_orphaned_running(&conn)?;
+        queue::reclaim_orphaned_running(conn)?;
+        Ok(())
+    }
+
+    fn from_connection(conn: Connection, writer_lock: Option<WriterLock>) -> SqliteResult<Self> {
+        // A failed setup builds no runtime, so `Drop` never runs. Release the
+        // lock here, or an in-memory owner row would outlive the failed open.
+        if let Err(err) = Self::prepare(&conn) {
+            if let Some(lock) = &writer_lock {
+                lock.release(&conn);
+            }
+            return Err(err);
+        }
         Ok(Self {
             conn,
             workflows: HashMap::new(),

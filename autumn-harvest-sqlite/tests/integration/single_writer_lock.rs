@@ -375,3 +375,28 @@ fn a_localhost_authority_alias_shares_the_lock() {
         .expect("a localhost authority names the same database");
     assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
 }
+
+/// A failed open must release the in-memory owner row. Otherwise the database
+/// reads as locked until its last connection closes.
+#[test]
+fn a_failed_open_releases_the_in_memory_lock() {
+    let uri = "file:memf_1834?mode=memory&cache=shared";
+    // Keeps the shared database alive, and holds a table the schema rejects.
+    let keeper = rusqlite::Connection::open(uri).unwrap();
+    keeper
+        .execute_batch("CREATE TABLE harvest_executions (unrelated INTEGER);")
+        .unwrap();
+
+    let err = SqliteRuntime::open(uri)
+        .err()
+        .expect("an incompatible table fails the schema step");
+    assert!(
+        !matches!(err, SqliteError::DatabaseLocked { .. }),
+        "the first failure is the schema, not the lock: {err}"
+    );
+
+    keeper
+        .execute_batch("DROP TABLE harvest_executions;")
+        .unwrap();
+    SqliteRuntime::open(uri).expect("a failed open must not leave its lock behind");
+}
