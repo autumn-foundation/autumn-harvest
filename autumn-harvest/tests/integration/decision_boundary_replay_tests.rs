@@ -70,7 +70,7 @@ async fn replay(snapshot: &HistorySnapshot) -> ReplayReport {
     replayer().replay_from_snapshot(snapshot.clone()).await
 }
 
-fn is_success(report: &ReplayReport) -> bool {
+const fn is_success(report: &ReplayReport) -> bool {
     matches!(report.status, ReplayStatus::ReplaySucceeded)
 }
 

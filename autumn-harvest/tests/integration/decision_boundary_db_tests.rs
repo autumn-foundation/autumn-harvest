@@ -1,5 +1,5 @@
 #![cfg(feature = "db")]
-#![allow(clippy::unused_async)]
+#![allow(clippy::unused_async, clippy::used_underscore_binding)]
 //! Decision boundaries on a live worker (issue #1833).
 //!
 //! Each decision that appends events also appends one `DecisionCommitted`
@@ -69,6 +69,55 @@ async fn boundary_signal_wait(
         .map_err(|e| e.to_string())
 }
 
+/// Takes the mutex in `key` and holds it until `release`.
+#[workflow]
+async fn boundary_mutex_holder(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let key = input["key"].as_str().unwrap_or("k").to_string();
+    let guard = ctx.mutex(key).acquire().await.map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("release")
+        .await
+        .map_err(|e| e.to_string())?;
+    guard.release();
+    Ok(serde_json::json!("released"))
+}
+
+/// The database a waiter writes through, and whether it did so.
+static FOREIGN_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static FOREIGN_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const FOREIGN_WORKER: &str = "another-writer";
+
+/// Waits for the held mutex in `key`. Its first run appends one row as
+/// another writer, so the row lands after the decision start.
+///
+/// Activity workers and the timer service append to the history directly.
+/// The row stands in for such a write. It is a boundary because replay
+/// ignores boundaries, so the waiter still replays clean.
+#[workflow]
+async fn boundary_mutex_waiter(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if let Some(url) = FOREIGN_URL.get()
+        && !FOREIGN_SENT.swap(true, Ordering::SeqCst)
+    {
+        let mut conn = connect(url).await;
+        let foreign = WorkflowEvent::DecisionCommitted {
+            build_id: autumn_harvest::types::BuildId::new(BUILD_ID),
+            worker_id: autumn_harvest::types::WorkerId::new(FOREIGN_WORKER),
+        };
+        store::append_events(&mut conn, ctx.info().execution_id, &[foreign], 1)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let key = input["key"].as_str().unwrap_or("k").to_string();
+    let guard = ctx.mutex(key).acquire().await.map_err(|e| e.to_string())?;
+    guard.release();
+    Ok(serde_json::json!("acquired"))
+}
+
 #[activity(start_to_close = "30s")]
 async fn boundary_step(
     _ctx: &ActivityContext,
@@ -108,7 +157,12 @@ fn registry(policy: WorkflowHistoryPolicy, decisions: Arc<DecisionCount>) -> Arc
     });
     Arc::new(
         HandlerRegistry::with_state_and_telemetry(
-            vec![boundary_two_steps_info(), boundary_signal_wait_info()],
+            vec![
+                boundary_two_steps_info(),
+                boundary_signal_wait_info(),
+                boundary_mutex_holder_info(),
+                boundary_mutex_waiter_info(),
+            ],
             activities![boundary_step],
             autumn_harvest::context::empty_shared_state(),
             telemetry,
@@ -385,6 +439,51 @@ async fn a_wake_that_appends_nothing_records_no_boundary() {
             "WorkflowCompleted",
             "DecisionCommitted",
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_contended_acquire_records_no_boundary_after_a_foreign_write() {
+    // A contended acquire only enqueues. It writes no event, though the
+    // history-cap estimate counts one. A row another writer commits while
+    // the decision runs is not this decision's write. So no boundary of
+    // this worker follows it.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("mutex");
+    let key = format!("k1833-{}", Uuid::new_v4().simple());
+    let running = Running::start(&queue, &pool, WorkflowHistoryPolicy::default());
+    let mut conn = connect(&url).await;
+    let holder = seed(
+        &mut conn,
+        "boundary_mutex_holder",
+        &queue,
+        serde_json::json!({ "key": key }),
+    )
+    .await;
+    running.wait_parked_after(&mut conn, holder, 1).await;
+
+    FOREIGN_URL.set(url.clone()).expect("one test sets the URL");
+    let waiter = seed(
+        &mut conn,
+        "boundary_mutex_waiter",
+        &queue,
+        serde_json::json!({ "key": key }),
+    )
+    .await;
+    running.wait_parked_after(&mut conn, waiter, 2).await;
+    assert!(
+        std::sync::atomic::AtomicBool::load(&FOREIGN_SENT, Ordering::SeqCst),
+        "the foreign write ran"
+    );
+    running.stop().await;
+
+    let events = history(&url, waiter).await;
+    assert_eq!(
+        boundaries(&events),
+        vec![(BUILD_ID.to_string(), FOREIGN_WORKER.to_string())],
+        "an enqueue-only decision must write no boundary: {:?}",
+        type_names(&events)
     );
 }
 

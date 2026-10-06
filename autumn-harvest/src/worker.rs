@@ -18905,8 +18905,10 @@ fn decision_boundary_reserve(registry: &HandlerRegistry, appends: bool) -> u64 {
 /// (issue #1833).
 ///
 /// It runs in the transaction that persists the decision outcome. `appends`
-/// tells whether this decision writes events of its own. A decision that
-/// writes none gets no boundary, even when another writer appended meanwhile.
+/// tells whether this decision may write events of its own. The boundary
+/// follows only when a row exists at or past `decision_start`. A decision
+/// that writes none gets no boundary, even when another writer appended
+/// meanwhile.
 async fn record_decision_boundary(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -24534,6 +24536,19 @@ async fn process_workflow_task(
                 return Ok(WorkflowPersistFlow::ParkedPaused);
             }
 
+            // Issue #1833: the boundary follows only rows this decision
+            // writes. The execution row is locked now, and every history
+            // writer takes that lock. So a row past this id is this
+            // transaction's own. A row another writer committed after the
+            // decision start does not count. Inline steps wrote before
+            // the lock, so they keep the decision start.
+            let boundary_floor =
+                if inline_appends || !registry.history_policy().decision_boundaries() {
+                    decision_start_event_id
+                } else {
+                    store::next_event_id_for(conn, prepared.exec_id).await?
+                };
+
             // Issue #603: this cycle replayed cleanly (the ND gate above
             // did not fire), so if the execution was previously blocked on
             // replay non-determinism the offending build has been rolled
@@ -24597,7 +24612,7 @@ async fn process_workflow_task(
                 conn,
                 registry,
                 prepared.exec_id,
-                decision_start_event_id,
+                boundary_floor,
                 decision_appends,
                 worker_id,
                 build_id,
