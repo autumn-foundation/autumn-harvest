@@ -294,6 +294,8 @@ pub mod debounce;
 pub mod debugger;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
+/// Deterministic simulation of the activity claim protocol (issue #1830).
+pub mod dst;
 pub mod diagnostic;
 /// Task dispatch channel seam (issue #1312): Postgres stays the source of
 /// truth, a [`dispatch::TaskDispatch`] carries task references.
