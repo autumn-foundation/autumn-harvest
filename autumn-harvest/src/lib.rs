@@ -328,6 +328,14 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+/// Replay fuzz harness (issue #1835). Not a stable API.
+#[cfg(feature = "arbitrary")]
+#[doc(hidden)]
+#[allow(
+    clippy::expect_used,
+    reason = "fuzz harness code: a failed `expect` is a finding"
+)]
+pub mod fuzzing;
 /// Deterministic workflow guardrail rule catalog (issue #173).
 pub mod guardrail;
 #[cfg(feature = "db")]

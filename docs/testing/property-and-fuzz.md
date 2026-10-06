@@ -6,12 +6,13 @@ the property-testing workstream:
 - **Property tests** ([`proptest`]) — fast, deterministic-seeded, run on every
   push. They assert *invariants* of pure functions (totality, monotonicity,
   bounds, round-trips) over structured, strategy-generated inputs.
-- **Fuzz targets** ([`cargo-fuzz`] / libFuzzer) — coverage-guided, raw-bytes,
-  nightly-only, opt-in. They hammer parsers/deserializers with byte-level
-  adversarial input that property strategies never construct.
+- **Fuzz targets** ([`cargo-fuzz`] / libFuzzer) — coverage-guided, nightly
+  toolchain, run every night with a persisted corpus. They hammer
+  parsers/deserializers with byte-level adversarial input that property
+  strategies never construct, and drive the replayer with structured histories.
 
 Neither replaces the other: property tests are a CI regression net; fuzzing is a
-manual/soak tool for the handful of functions that eat untrusted bytes.
+soak tool for the functions that eat untrusted bytes or stored data.
 
 ---
 
@@ -147,10 +148,52 @@ touches these nightly-only, libFuzzer-only binaries.
 | `fuzz_det_check_source` | `det_check::check_source` | Highest-value target: a hand-rolled line/brace scanner over arbitrary Rust source, with a history of parity churn against the proc-macro lint. Runs over user code in CI/editors. Invariant: total, never panics. |
 | `fuzz_validate_target_url` | `completion_callback::validate_target_url` | SSRF security boundary (issue #605): drives the `url` parser + IPv4/IPv6 literal classification with the most permissive policy so the deepest branches are reached. Invariant: never panics. |
 | `fuzz_failure_signature` | `dlq::failure_signature` | Normalizes unbounded, adversarial error text (unicode, multi-byte boundaries) into a shard-stable key. `db`-gated (the `fuzz` crate enables the `db` feature). Invariants: never panics; output `<= SIGNATURE_MAX_LEN` chars. |
+| `fuzz_replay` | write path, read path and `WorkflowReplayer` | Structure-aware (issue #1835). See below. |
 
 Each target converts fuzzer bytes to the input the function wants
 (`String::from_utf8_lossy` for the source/URL/error targets; the raw slice for
 the deserializer) and keeps the body minimal.
+
+### The replay target (issue #1835)
+
+`fuzz_replay` feeds an arbitrary `Vec<WorkflowEvent>` to the replayer. The
+`arbitrary` feature of `autumn-harvest` derives `arbitrary::Arbitrary` for
+`WorkflowEvent`, so a new variant is fuzzed with no edit. A new
+`serde_json::Value` field needs a `crate::fuzzing::value` attribute. Clippy
+runs with `--all-features`, so a missing attribute fails the `lint` job.
+
+The JSON generator builds the reserved `_harvest_*` shapes on purpose: codec
+envelopes, offload references, erasure tombstones and undecodable markers.
+Plain random JSON almost never has those shapes. Issues #1253 and #1758 were
+replay corruption from such data.
+
+`autumn_harvest::fuzzing::check_case` runs each case twice through the
+write path (codec encode, then offload), the read path (inflate, then codec
+decode) and the replayer. The replayed workflow issues the commands that
+the history records, so replay goes past the first event. The oracles:
+
+1. Nothing panics.
+2. A history that the write path stores reads back unchanged. A read error
+   on such a row is a failure too.
+3. Both runs give the same report.
+
+The oracle compares after a JSON text round trip. Storage keeps text, and
+serde_json parses some floats back one digit off. That loss is not a
+pipeline defect.
+
+Input that starts with `{` is a JSON case, not `arbitrary` bytes. The seeds
+in `fuzz/seeds/fuzz_replay/` use this form, so they stay valid when the
+generator changes. The seed corpus holds the #1253 and #1758 reproducers.
+`tests/integration/replay_fuzz_seeds.rs` runs every seed, and the generator
+over fixed bytes, on stable Rust in CI:
+
+```bash
+cargo test -p autumn-harvest --no-default-features --features arbitrary \
+  --test integration replay_fuzz_seeds::
+```
+
+To add a reproducer, write the JSON case to `fuzz/seeds/fuzz_replay/` with
+the issue number in its name.
 
 ### Running them
 
@@ -160,6 +203,12 @@ cd fuzz && cargo +nightly fuzz build
 
 # Run one target (Ctrl-C to stop; grows a corpus under fuzz/corpus/<target>/):
 cargo +nightly fuzz run fuzz_det_check_source
+
+# Run with the committed seeds as a second, read-only corpus:
+cargo +nightly fuzz run fuzz_replay corpus/fuzz_replay seeds/fuzz_replay
+
+# Reproduce a crash input from a CI artifact:
+cargo +nightly fuzz run fuzz_replay path/to/crash-<hash>
 
 # Time-boxed run of one target:
 cargo +nightly fuzz run fuzz_det_check_source -- -max_total_time=300
@@ -172,11 +221,26 @@ MAX_TOTAL_TIME=60 ./fuzz/smoke.sh
 
 ### CI
 
-There is an **opt-in `fuzz-smoke` job** in `.github/workflows/ci.yml`, gated on
-`github.event_name == 'workflow_dispatch'` — it **never** runs on push or PR
-(Actions minutes are tight and fuzzing needs nightly). Trigger it manually from
-the Actions tab ("Run workflow") for a 30s-per-target smoke. Real campaigns run
-locally with a larger `-max_total_time`.
+`.github/workflows/fuzz-nightly.yml` runs every target each night for 600
+seconds, one job per target (issue #1835).
+
+- **Corpus.** The actions cache keeps each target's corpus. A cache key is
+  immutable, so each run saves under a new key. The next run restores the
+  newest one through `restore-keys`. The save runs also after a crash.
+  `cargo fuzz cmin` keeps the corpus small. GitHub evicts a cache that no
+  run reads for 7 days; the fuzzer then starts again from the seeds.
+- **Crash.** The crash input is uploaded as `fuzz-artifacts-<target>`. A
+  failed scheduled run opens the issue "Fuzz nightly: a scheduled run
+  failed", or comments on the open one. Fix the bug and commit the input to
+  `fuzz/seeds/<target>/`.
+- **Manual run.** Run the workflow from the Actions tab. The `seconds`
+  input sets the time per target.
+- **Pull request.** A change under `fuzz/`, to the workflow or to
+  `autumn-harvest/src/fuzzing.rs` runs each target for 60 seconds.
+
+The guard `fuzz_nightly_wiring.rs` keeps the target lists of
+`fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow equal. It also checks
+the cron, the corpus cycle and the alert job.
 
 ---
 
@@ -230,8 +294,6 @@ harness.
   (the bounded-caps validator is a natural totality target).
 - `dlq::DlqAggregateParams::from_query_pairs` / other query-string parsers
   (raw bytes → structured params).
-- `history_export` / read-path payload-codec envelope parsing over arbitrary
-  JSON (the `_harvest_*` envelope discriminators).
 
 ### Production follow-ups surfaced by this workstream
 

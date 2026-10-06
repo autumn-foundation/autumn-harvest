@@ -18,13 +18,18 @@ TARGETS=(
   fuzz_det_check_source
   fuzz_validate_target_url
   fuzz_failure_signature
+  fuzz_replay
 )
 
 MAX_TIME="${MAX_TOTAL_TIME:-15}"
 
 for t in "${TARGETS[@]}"; do
   echo "=== fuzzing ${t} for ${MAX_TIME}s ==="
-  cargo +nightly fuzz run "${t}" -- -max_total_time="${MAX_TIME}"
+  # New inputs go to the first directory. The seeds are read only.
+  mkdir -p "corpus/${t}"
+  dirs=("corpus/${t}")
+  if [ -d "seeds/${t}" ]; then dirs+=("seeds/${t}"); fi
+  cargo +nightly fuzz run "${t}" "${dirs[@]}" -- -max_total_time="${MAX_TIME}"
 done
 
 echo "smoke run complete: all targets ran clean"

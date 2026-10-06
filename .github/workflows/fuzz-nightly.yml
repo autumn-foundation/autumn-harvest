@@ -1,0 +1,137 @@
+# Nightly fuzzing with a persisted corpus (issue #1835).
+#
+# Each fuzz target runs in its own job, for 600 seconds by default.
+#
+# - `corpus`: the actions cache keeps each target's corpus. A key is
+#   immutable, so each run saves under a new key. The next run restores the
+#   newest key through `restore-keys`. The save runs also after a crash.
+#   GitHub evicts a cache that no run reads for 7 days. The fuzzer then
+#   starts again from the seeds.
+# - `seeds`: `fuzz/seeds/<target>/` is read too. It holds the committed
+#   reproducers, such as the #1253 and #1758 envelope look-alikes.
+# - `alert`: a failed scheduled run opens an issue, or comments on the open
+#   one. The crash input is a run artifact.
+# - `pull_request`: a change to the fuzz harness runs each target for 60
+#   seconds. That checks the wiring and the cache before the merge.
+#
+# `autumn-harvest/tests/integration/fuzz_nightly_wiring.rs` guards this
+# file. `docs/testing/property-and-fuzz.md` tells how to reproduce a crash.
+name: Fuzz nightly
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Fuzz time per target, in seconds
+        default: "600"
+  schedule:
+    # Nightly at 02:47 UTC, away from the proptest and chaos runs.
+    - cron: "47 2 * * *"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [trunk, trunk-dev]
+    paths:
+      - "fuzz/**"
+      - ".github/workflows/fuzz-nightly.yml"
+      - "autumn-harvest/src/fuzzing.rs"
+
+concurrency:
+  group: fuzz-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_workflow_event_deser
+          - fuzz_det_check_source
+          - fuzz_validate_target_url
+          - fuzz_failure_signature
+          - fuzz_replay
+    env:
+      TARGET: ${{ matrix.target }}
+      SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: ${{ matrix.target }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Restore the corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        id: fuzz
+        working-directory: fuzz
+        # New inputs go to the first directory. The seeds are read only.
+        run: |
+          set -euo pipefail
+          mkdir -p "corpus/${TARGET}"
+          echo "corpus size before: $(find "corpus/${TARGET}" -type f | wc -l)"
+          dirs=("corpus/${TARGET}")
+          if [ -d "seeds/${TARGET}" ]; then dirs+=("seeds/${TARGET}"); fi
+          cargo +nightly fuzz run "${TARGET}" "${dirs[@]}" -- \
+            -max_total_time="${SECONDS_PER_TARGET}" -timeout=30
+      - name: Minimize the corpus
+        if: always() && steps.fuzz.outcome != 'skipped'
+        # A failed minimization keeps the corpus as it is.
+        continue-on-error: true
+        working-directory: fuzz
+        run: |
+          cargo +nightly fuzz cmin "${TARGET}" "corpus/${TARGET}"
+          echo "corpus size after: $(find "corpus/${TARGET}" -type f | wc -l)"
+      - name: Save the corpus
+        if: always() && hashFiles(format('fuzz/corpus/{0}/**', matrix.target)) != ''
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload the crash input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+  alert:
+    name: Report a failed nightly
+    needs: fuzz
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the alert issue
+        run: |
+          title="Fuzz nightly: a scheduled run failed"
+          body="The nightly fuzz run failed: ${RUN_URL}. Download the fuzz-artifacts-<target> artifact and reproduce with \`cargo +nightly fuzz run <target> <input>\` (docs/testing/property-and-fuzz.md). Add the input to fuzz/seeds/<target>/ with the fix."
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
