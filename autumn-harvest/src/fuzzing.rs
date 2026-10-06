@@ -754,7 +754,11 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         .iter()
         .rposition(|event| matches!(event, WorkflowEvent::WorkflowRedriven { .. }));
     let mut race_timers: HashSet<&str> = HashSet::new();
-    let mut consumed: HashSet<usize> = HashSet::new();
+    // Commands that a fan-out or race claimed. They are passed over, so the
+    // group can share a batch with a sibling command.
+    let mut claimed: HashSet<usize> = HashSet::new();
+    // Other events that a race claimed, such as the signal that won.
+    let mut silenced: HashSet<usize> = HashSet::new();
     // Signal waits that a `__signal_timeout:` timer bounds, by signal name.
     // The op takes the signal that wins, or the timer fire.
     let mut timeouts: HashMap<&str, usize> = HashMap::new();
@@ -771,19 +775,23 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                     history,
                     index,
                     count.unwrap_or(0),
-                    &mut consumed,
+                    &mut claimed,
                 ))
             }
-            _ if consumed.remove(&(index - 1)) => None,
+            _ if claimed.remove(&(index - 1)) => continue,
+            _ if silenced.remove(&(index - 1)) => None,
             WorkflowEvent::MarkerRecorded { name, details } if race_seq(name).is_some() => {
                 let count = details.as_u64().and_then(|n| usize::try_from(n).ok());
                 let race = RaceOpen {
                     marker: name,
                     count: count.unwrap_or(0),
                 };
-                let (race, next) = mirror_race(history, index, &race, &mut race_timers);
-                index = next;
-                Some(race)
+                let mut taken = Taken {
+                    commands: &mut claimed,
+                    others: &mut silenced,
+                    race_timers: &mut race_timers,
+                };
+                Some(mirror_race(history, index, &race, &mut taken))
             }
             WorkflowEvent::TimerCancelled { timer_id }
                 if race_timers.contains(timer_id.as_str()) =>
@@ -834,12 +842,12 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
 
 /// Builds the fan-out op that a `fan_out:{n}` marker opens. The next `count`
 /// activity schedules, or child starts, are its items. Their indexes go to
-/// `consumed`, so the main loop does not mirror them again.
+/// `claimed`, so the main loop does not mirror them again.
 fn mirror_fan_out(
     history: &[WorkflowEvent],
     start: usize,
     count: usize,
-    consumed: &mut HashSet<usize>,
+    claimed: &mut HashSet<usize>,
 ) -> Op {
     let mut activities = Vec::new();
     let mut children = Vec::new();
@@ -921,7 +929,7 @@ fn mirror_fan_out(
         } else {
             refills -= 1;
         }
-        consumed.insert(index);
+        claimed.insert(index);
     }
     // A windowed or unfinished fan-out schedules fewer items than its
     // marker counts. The count must still match, so the last item repeats.
@@ -1063,98 +1071,177 @@ enum Branch {
     Child(ExecutionId),
 }
 
-/// Builds the [`Op::Race`] that a `race:{seq}` marker opens. Reads from
-/// `start` up to and past the matching `race_winner:{seq}` marker. Returns
-/// the op and the index after the race.
+/// The events that a race claims, and the race timers it starts.
+struct Taken<'a, 'h> {
+    /// Branch commands. The main loop passes over them.
+    commands: &'a mut HashSet<usize>,
+    /// Other events, such as the signal that won. They map to no op.
+    others: &'a mut HashSet<usize>,
+    /// Ids of the race timers. A race cancels its own losing timers.
+    race_timers: &'a mut HashSet<&'h str>,
+}
+
+/// One branch command of a race, in the order the race issued it.
+struct Claimed {
+    /// The slot a race timer names in its id.
+    fixed: Option<usize>,
+    /// The activity or child it started, if any.
+    branch: Option<Branch>,
+    op: Op,
+}
+
+/// Builds the [`Op::Race`] that a `race:{seq}` marker at `start - 1` opens.
 ///
-/// The race keeps the branch count of its marker. A race timer goes to the
-/// index in its `__race:{seq}:{index}` id. The winning signal, or else the
-/// first branch that finished, goes to the recorded winner index. The other
-/// branches fill the free slots in order. A losing signal writes no event,
-/// so each slot still free becomes a signal branch that never wins.
+/// The branch commands are the run of commands right after the marker, at
+/// most the branch count of the marker. A later command, such as a sibling
+/// in the same `join!`, stays with the main loop. The race also claims the
+/// signal that won and the `race_winner:{seq}` marker.
+///
+/// The race keeps the branch count of its marker. Branches keep the order in
+/// which the race issued them. A race timer takes the slot in its id. The
+/// race picks the lowest resolved branch, so the first finished command
+/// takes the recorded winner slot, and a resolved loser takes a later slot.
+/// A losing signal writes no event, so each slot left free becomes a signal
+/// branch that never wins.
 fn mirror_race<'h>(
     history: &'h [WorkflowEvent],
     start: usize,
     open: &RaceOpen<'_>,
-    race_timers: &mut HashSet<&'h str>,
-) -> (Op, usize) {
+    taken: &mut Taken<'_, 'h>,
+) -> Op {
     let seq = race_seq(open.marker).unwrap_or_default();
     let winner_marker = format!("race_winner:{seq}");
     let timer_prefix = format!("__race:{seq}:");
-    let mut timers = Vec::new();
-    let mut started = Vec::new();
+    let count = open.count.min(MAX_RACE_BRANCHES);
+    let mut commands = Vec::new();
     let mut finished = HashSet::new();
     let mut signal = None;
     let mut winner = None;
-    let mut index = start;
-    while index < history.len() {
-        let event = &history[index];
-        index += 1;
+    let mut in_run = true;
+    for (index, event) in history.iter().enumerate().skip(start) {
+        let claim = in_run && commands.len() < count;
         match event {
+            WorkflowEvent::TimerStarted { timer_id, .. } if claim => {
+                taken.race_timers.insert(timer_id.as_str());
+                let fixed = timer_id.as_str().strip_prefix(timer_prefix.as_str());
+                let fixed = fixed.and_then(|i| i.parse::<usize>().ok());
+                commands.extend(mirror_event(event, false).map(|op| Claimed {
+                    fixed,
+                    branch: None,
+                    op,
+                }));
+                taken.commands.insert(index);
+            }
+            WorkflowEvent::ActivityScheduled { activity_id, .. } if claim => {
+                commands.extend(mirror_event(event, false).map(|op| Claimed {
+                    fixed: None,
+                    branch: Some(Branch::Activity(*activity_id)),
+                    op,
+                }));
+                taken.commands.insert(index);
+            }
+            WorkflowEvent::ChildWorkflowStarted { child_id, .. } if claim => {
+                commands.extend(mirror_event(event, false).map(|op| Claimed {
+                    fixed: None,
+                    branch: Some(Branch::Child(*child_id)),
+                    op,
+                }));
+                taken.commands.insert(index);
+            }
             WorkflowEvent::MarkerRecorded { name, details } if *name == winner_marker => {
                 winner = details.as_u64().and_then(|w| usize::try_from(w).ok());
+                taken.others.insert(index);
                 break;
-            }
-            WorkflowEvent::TimerStarted { timer_id, .. } => {
-                race_timers.insert(timer_id.as_str());
-                let slot = timer_id.as_str().strip_prefix(timer_prefix.as_str());
-                let slot = slot.and_then(|i| i.parse::<usize>().ok());
-                if let Some(op) = mirror_event(event, false) {
-                    timers.push((slot, op));
-                }
-            }
-            WorkflowEvent::ActivityScheduled { activity_id, .. } => {
-                started.extend(
-                    mirror_event(event, false).map(|op| (Branch::Activity(*activity_id), op)),
-                );
-            }
-            WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
-                started.extend(mirror_event(event, false).map(|op| (Branch::Child(*child_id), op)));
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. }
             | WorkflowEvent::ActivityFailed { activity_id, .. }
             | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+                in_run = false;
                 finished.insert(Branch::Activity(*activity_id));
             }
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
             | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                in_run = false;
                 finished.insert(Branch::Child(*child_id));
             }
-            WorkflowEvent::SignalReceived { .. } => signal = mirror_event(event, false),
-            _ => {}
+            // A signal can win only when a slot has no command.
+            WorkflowEvent::SignalReceived { .. } if signal.is_none() && commands.len() < count => {
+                in_run = false;
+                signal = mirror_event(event, false);
+                taken.others.insert(index);
+            }
+            _ => in_run = false,
         }
     }
-    let seen = timers.len() + started.len() + usize::from(signal.is_some());
-    let mut slots: Vec<Option<Op>> = (0..open.count.min(MAX_RACE_BRANCHES).max(seen))
-        .map(|_| None)
-        .collect();
-    let mut rest = Vec::new();
-    for (slot, op) in timers {
-        match slot.and_then(|i| slots.get_mut(i)) {
-            Some(free @ None) => *free = Some(op),
-            _ => rest.push(op),
+    let branches = place_race_branches(commands, &finished, signal, winner, count);
+    Op::Race { branches }
+}
+
+/// Puts race branches into slots, as [`mirror_race`] describes.
+fn place_race_branches(
+    commands: Vec<Claimed>,
+    finished: &HashSet<Branch>,
+    mut signal: Option<Op>,
+    winner: Option<usize>,
+    count: usize,
+) -> Vec<Op> {
+    let size = count.max(commands.len() + usize::from(signal.is_some()));
+    let mut slots: Vec<Option<Op>> = (0..size).map(|_| None).collect();
+    let winner_command = commands
+        .iter()
+        .position(|c| c.branch.is_some_and(|b| finished.contains(&b)));
+    let winner = winner.filter(|w| *w < size);
+    if winner_command.is_none()
+        && let Some(w) = winner
+    {
+        slots[w] = signal.take();
+    }
+    // The winner slot waits for the winning command. Timers keep their slot.
+    let reserved = winner_command.and(winner);
+    let mut fixed = vec![false; commands.len()];
+    for (i, command) in commands.iter().enumerate() {
+        if let Some(s) = command
+            .fixed
+            .filter(|s| *s < size && slots[*s].is_none() && Some(*s) != reserved)
+        {
+            slots[s] = Some(command.op.clone());
+            fixed[i] = true;
         }
     }
-    if let Some(free @ None) = winner.and_then(|w| slots.get_mut(w)) {
-        let first_done = started
-            .iter()
-            .position(|(branch, _)| finished.contains(branch));
-        *free = signal
-            .take()
-            .or_else(|| first_done.map(|i| started.remove(i).1));
+    let mut floor = 0;
+    for (i, command) in commands.into_iter().enumerate() {
+        if fixed[i] {
+            floor = command.fixed.map_or(floor, |s| s + 1);
+            continue;
+        }
+        let target = if Some(i) == winner_command {
+            reserved.filter(|w| *w >= floor)
+        } else {
+            None
+        };
+        let target =
+            target.or_else(|| (floor..size).find(|s| slots[*s].is_none() && Some(*s) != reserved));
+        let target = target.or_else(|| (0..size).find(|s| slots[*s].is_none()));
+        if let Some(s) = target {
+            slots[s] = Some(command.op);
+            floor = s + 1;
+        }
     }
-    rest.extend(started.into_iter().map(|(_, op)| op));
-    rest.extend(signal);
-    let mut rest = rest.into_iter();
-    let branches = slots
+    if let Some(op) = signal {
+        let after = winner.map_or(0, |w| w + 1);
+        let free = (after..size).chain(0..after).find(|s| slots[*s].is_none());
+        if let Some(s) = free {
+            slots[s] = Some(op);
+        }
+    }
+    slots
         .into_iter()
         .map(|slot| {
-            slot.or_else(|| rest.next()).unwrap_or_else(|| Op::Signal {
+            slot.unwrap_or_else(|| Op::Signal {
                 name: UNSEEN_SIGNAL.to_string(),
             })
         })
-        .collect();
-    (Op::Race { branches }, index)
+        .collect()
 }
 
 /// The signal name in a `__signal_timeout:{seq}:{name}` timer id, which
@@ -1238,6 +1325,7 @@ impl Op {
                 | Self::FanOut { .. }
                 | Self::ChildFanOut { .. }
                 | Self::SignalTimeout { .. }
+                | Self::Race { .. }
         )
     }
 
