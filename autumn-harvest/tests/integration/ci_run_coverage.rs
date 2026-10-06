@@ -867,7 +867,31 @@ const ISSUE_1799_CORE: &[(&str, &[&str])] = &[
 ];
 
 /// Plugin suites that issue #1799 wired.
-const ISSUE_1799_PLUGIN: &[&str] = &["erase_payloads_integration"];
+const ISSUE_1799_PLUGIN: &[&str] = &[
+    "erase_payloads_integration",
+    "archival_integration",
+    "build_routing_ui_integration",
+    "dag_retry_integration",
+    "event_batch_integration",
+    "external_handoffs_integration",
+    "history_export_integration",
+    "outbox_integration",
+    "preflight_integration",
+    "replay_canary_integration",
+    "retirement_check_integration",
+    "scaling_api_tests",
+    "schedule_update_integration",
+    "shard_health_integration",
+    "signal_with_start_integration",
+    "stalled_workflow_tests",
+    "telemetry_propagation_tests",
+    "usage_integration",
+    "version_usage_integration",
+    "workflow_count_integration",
+    "workflow_filter_integration",
+    "workflow_history_pagination_integration",
+    "workflow_result_integration",
+];
 
 /// The suites that issue #1799 wired must keep a covering row. Removing one
 /// would put it back on the allowlist and raise the cap, which review sees.
