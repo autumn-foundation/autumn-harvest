@@ -43,7 +43,7 @@ use crate::payload_store::{
 };
 use crate::telemetry::NoOpMetrics;
 use crate::testing::{ReplayReport, WorkflowReplayer};
-use crate::types::ExecutionId;
+use crate::types::{ExecutionId, ExternalTarget, ParentClosePolicy};
 
 /// The deepest JSON nesting that the generator builds.
 const MAX_DEPTH: u32 = 6;
@@ -248,6 +248,68 @@ pub enum Op {
     Patched {
         /// Patch id.
         id: String,
+    },
+    /// `ctx.side_effect`, with a `null` value.
+    SideEffect {
+        /// Side-effect id.
+        name: String,
+    },
+    /// `ctx.spawn_child_workflow_raw`.
+    Child {
+        /// Child workflow name.
+        name: String,
+        /// Child input.
+        #[arbitrary(with = value)]
+        input: Value,
+    },
+    /// `ctx.spawn_child_workflow_detached_raw`.
+    DetachedChild {
+        /// Child workflow name.
+        name: String,
+        /// Child input.
+        #[arbitrary(with = value)]
+        input: Value,
+        /// What happens to the child when this workflow closes.
+        policy: ParentClosePolicy,
+    },
+    /// `ctx.execute_activity_external`.
+    ExternalActivity {
+        /// Activity name.
+        name: String,
+        /// Activity input.
+        #[arbitrary(with = value)]
+        input: Value,
+        /// Task queue.
+        queue: String,
+        /// Schedule-to-close timeout in seconds.
+        secs: u64,
+    },
+    /// `ctx.signal_external_workflow*_with_idempotency`.
+    SignalExternal {
+        /// The workflow to signal.
+        target: ExternalTarget,
+        /// Signal name.
+        name: String,
+        /// Signal payload.
+        #[arbitrary(with = value)]
+        payload: Value,
+        /// Idempotency key.
+        idempotency_key: Option<String>,
+    },
+    /// `ctx.request_cancel_external_workflow*`.
+    CancelExternal {
+        /// The workflow to cancel.
+        target: ExternalTarget,
+    },
+    /// `ctx.await_external_workflow_value`.
+    AwaitExternal {
+        /// The execution to await.
+        target: ExecutionId,
+    },
+    /// `ctx.mutex(key).acquire()`. The guard drops at once.
+    Mutex {
+        /// Lock key.
+        key: String,
     },
     /// Return `Ok(output)`.
     Complete {
@@ -569,90 +631,150 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
 /// so a new variant needs a decision here: an op, or `None`.
 #[must_use]
 pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
-    history
-        .iter()
-        .filter_map(|event| match event {
-            WorkflowEvent::ActivityScheduled {
-                name, input, queue, ..
-            } => Some(Op::Activity {
-                name: name.clone(),
-                input: input.clone(),
-                queue: queue.clone(),
-            }),
-            WorkflowEvent::LocalActivityScheduled { name, input, .. } => Some(Op::LocalActivity {
-                name: name.clone(),
-                input: input.clone(),
-            }),
-            WorkflowEvent::TimerStarted {
-                timer_id,
-                duration_secs,
-            } => Some(Op::Timer {
-                id: timer_id.as_str().to_string(),
-                secs: *duration_secs,
-            }),
-            WorkflowEvent::SignalReceived { signal_name, .. } => Some(Op::Signal {
-                name: signal_name.clone(),
-            }),
-            WorkflowEvent::SideEffectRecorded { kind, .. } => match kind {
-                SideEffectKind::Now => Some(Op::Now),
-                SideEffectKind::Uuid => Some(Op::NewUuid),
-                SideEffectKind::Random => Some(Op::Random),
-                SideEffectKind::Custom => None,
-            },
-            WorkflowEvent::MarkerRecorded { name, .. } => name
-                .strip_prefix("patch:")
-                .map(|id| Op::Patched { id: id.to_string() }),
-            WorkflowEvent::WorkflowCompleted { output } => Some(Op::Complete {
-                output: output.clone(),
-            }),
-            WorkflowEvent::WorkflowFailed { error, .. } => Some(Op::Fail {
-                error: error.clone(),
-            }),
-            // Every other variant, listed so that a new one fails to compile here.
-            WorkflowEvent::WorkflowStarted { .. }
-            | WorkflowEvent::WorkflowCancelled { .. }
-            | WorkflowEvent::ActivityStarted { .. }
-            | WorkflowEvent::ActivityCompleted { .. }
-            | WorkflowEvent::ActivityFailed { .. }
-            | WorkflowEvent::ActivityTimedOut { .. }
-            | WorkflowEvent::ActivityHeartbeat { .. }
-            | WorkflowEvent::TimerFired { .. }
-            | WorkflowEvent::ChildWorkflowStarted { .. }
-            | WorkflowEvent::ChildWorkflowCompleted { .. }
-            | WorkflowEvent::ChildWorkflowFailed { .. }
-            | WorkflowEvent::WorkflowContinuedAsNew { .. }
-            | WorkflowEvent::LocalActivityCompleted { .. }
-            | WorkflowEvent::LocalActivityFailed { .. }
-            | WorkflowEvent::ActivityAwaitingExternal { .. }
-            | WorkflowEvent::ActivityCompletedExternally { .. }
-            | WorkflowEvent::ActivityFailedExternally { .. }
-            | WorkflowEvent::ActivityExternalDeadlineExtended { .. }
-            | WorkflowEvent::UpdateAdmitted { .. }
-            | WorkflowEvent::UpdateCompleted { .. }
-            | WorkflowEvent::UpdateFailed { .. }
-            | WorkflowEvent::WorkflowResetFork { .. }
-            | WorkflowEvent::WorkflowResetTerminated { .. }
-            | WorkflowEvent::LocalActivityExhausted { .. }
-            | WorkflowEvent::ExternalSignalRequested { .. }
-            | WorkflowEvent::ExternalSignalDelivered { .. }
-            | WorkflowEvent::ExternalSignalFailed { .. }
-            | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
-            | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
-            | WorkflowEvent::WorkflowExecutionTimedOut { .. }
-            | WorkflowEvent::WorkflowExecutionPaused { .. }
-            | WorkflowEvent::WorkflowExecutionResumed { .. }
-            | WorkflowEvent::ExternalCancelRequested { .. }
-            | WorkflowEvent::ExternalCancelDelivered { .. }
-            | WorkflowEvent::ExternalCancelFailed { .. }
-            | WorkflowEvent::WorkflowRedriven { .. }
-            | WorkflowEvent::WorkflowRetryScheduled { .. }
-            | WorkflowEvent::TimerCancelled { .. }
-            | WorkflowEvent::ExternalAwaitRequested { .. }
-            | WorkflowEvent::ExternalAwaitResolved { .. }
-            | WorkflowEvent::ExternalAwaitFailed { .. }
-            | WorkflowEvent::MutexGranted { .. } => None,
-        })
-        .collect()
+    history.iter().filter_map(mirror_event).collect()
+}
+
+/// The op behind a lifecycle, activity, timer, signal or marker event.
+fn mirror_event(event: &WorkflowEvent) -> Option<Op> {
+    match event {
+        WorkflowEvent::ActivityScheduled {
+            name, input, queue, ..
+        } => Some(Op::Activity {
+            name: name.clone(),
+            input: input.clone(),
+            queue: queue.clone(),
+        }),
+        WorkflowEvent::LocalActivityScheduled { name, input, .. } => Some(Op::LocalActivity {
+            name: name.clone(),
+            input: input.clone(),
+        }),
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs,
+        } => Some(Op::Timer {
+            id: timer_id.as_str().to_string(),
+            secs: *duration_secs,
+        }),
+        WorkflowEvent::SignalReceived { signal_name, .. } => Some(Op::Signal {
+            name: signal_name.clone(),
+        }),
+        WorkflowEvent::SideEffectRecorded { kind, name, .. } => match kind {
+            SideEffectKind::Now => Some(Op::Now),
+            SideEffectKind::Uuid => Some(Op::NewUuid),
+            SideEffectKind::Random => Some(Op::Random),
+            SideEffectKind::Custom => name.clone().map(|name| Op::SideEffect { name }),
+        },
+        WorkflowEvent::MarkerRecorded { name, .. } => name
+            .strip_prefix("patch:")
+            .map(|id| Op::Patched { id: id.to_string() }),
+        WorkflowEvent::WorkflowCompleted { output } => Some(Op::Complete {
+            output: output.clone(),
+        }),
+        WorkflowEvent::WorkflowFailed { error, .. } => Some(Op::Fail {
+            error: error.clone(),
+        }),
+        other => mirror_external(other),
+    }
+}
+
+/// The op behind a child, external or mutex event.
+fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
+    match event {
+        WorkflowEvent::ChildWorkflowStarted {
+            workflow_name,
+            input,
+            ..
+        } => Some(Op::Child {
+            name: workflow_name.clone(),
+            input: input.clone(),
+        }),
+        WorkflowEvent::ChildWorkflowSpawnedDetached {
+            workflow_name,
+            input,
+            parent_close_policy,
+            ..
+        } => Some(Op::DetachedChild {
+            name: workflow_name.clone(),
+            input: input.clone(),
+            policy: *parent_close_policy,
+        }),
+        WorkflowEvent::ActivityAwaitingExternal {
+            name,
+            input,
+            queue,
+            schedule_to_close_secs,
+            ..
+        } => Some(Op::ExternalActivity {
+            name: name.clone(),
+            input: input.clone(),
+            queue: queue.clone(),
+            secs: *schedule_to_close_secs,
+        }),
+        WorkflowEvent::ExternalSignalRequested {
+            target,
+            signal_name,
+            payload,
+            idempotency_key,
+            ..
+        } => Some(Op::SignalExternal {
+            target: target.clone(),
+            name: signal_name.clone(),
+            payload: payload.clone(),
+            idempotency_key: idempotency_key.clone(),
+        }),
+        WorkflowEvent::ExternalCancelRequested { target, .. } => Some(Op::CancelExternal {
+            target: target.clone(),
+        }),
+        WorkflowEvent::ExternalAwaitRequested { target, .. } => {
+            Some(Op::AwaitExternal { target: *target })
+        }
+        WorkflowEvent::MutexGranted { key, .. } => Some(Op::Mutex { key: key.clone() }),
+        // Every other variant, listed so that a new one fails to compile here.
+        // `mirror_event` handles the first eight.
+        WorkflowEvent::ActivityScheduled { .. }
+        | WorkflowEvent::LocalActivityScheduled { .. }
+        | WorkflowEvent::TimerStarted { .. }
+        | WorkflowEvent::SignalReceived { .. }
+        | WorkflowEvent::SideEffectRecorded { .. }
+        | WorkflowEvent::MarkerRecorded { .. }
+        | WorkflowEvent::WorkflowCompleted { .. }
+        | WorkflowEvent::WorkflowFailed { .. }
+        | WorkflowEvent::WorkflowStarted { .. }
+        | WorkflowEvent::WorkflowCancelled { .. }
+        | WorkflowEvent::ActivityStarted { .. }
+        | WorkflowEvent::ActivityCompleted { .. }
+        | WorkflowEvent::ActivityFailed { .. }
+        | WorkflowEvent::ActivityTimedOut { .. }
+        | WorkflowEvent::ActivityHeartbeat { .. }
+        | WorkflowEvent::TimerFired { .. }
+        | WorkflowEvent::ChildWorkflowCompleted { .. }
+        | WorkflowEvent::ChildWorkflowFailed { .. }
+        | WorkflowEvent::WorkflowContinuedAsNew { .. }
+        | WorkflowEvent::LocalActivityCompleted { .. }
+        | WorkflowEvent::LocalActivityFailed { .. }
+        | WorkflowEvent::ActivityCompletedExternally { .. }
+        | WorkflowEvent::ActivityFailedExternally { .. }
+        | WorkflowEvent::ActivityExternalDeadlineExtended { .. }
+        | WorkflowEvent::UpdateAdmitted { .. }
+        | WorkflowEvent::UpdateCompleted { .. }
+        | WorkflowEvent::UpdateFailed { .. }
+        | WorkflowEvent::WorkflowResetFork { .. }
+        | WorkflowEvent::WorkflowResetTerminated { .. }
+        | WorkflowEvent::LocalActivityExhausted { .. }
+        | WorkflowEvent::ExternalSignalDelivered { .. }
+        | WorkflowEvent::ExternalSignalFailed { .. }
+        | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+        | WorkflowEvent::WorkflowExecutionTimedOut { .. }
+        | WorkflowEvent::WorkflowExecutionPaused { .. }
+        | WorkflowEvent::WorkflowExecutionResumed { .. }
+        | WorkflowEvent::ExternalCancelDelivered { .. }
+        | WorkflowEvent::ExternalCancelFailed { .. }
+        | WorkflowEvent::WorkflowRedriven { .. }
+        | WorkflowEvent::WorkflowRetryScheduled { .. }
+        | WorkflowEvent::TimerCancelled { .. }
+        | WorkflowEvent::ExternalAwaitResolved { .. }
+        | WorkflowEvent::ExternalAwaitFailed { .. } => None,
+    }
 }
 
 /// A workflow that runs the program in the [`PROGRAM_HEADER`] header.
@@ -669,41 +791,129 @@ fn program_workflow(
             .map(|json| serde_json::from_str(json).expect("the program header parses"))
             .unwrap_or_default();
         for op in program {
-            match op {
-                Op::Activity { name, input, queue } => {
-                    let _ = ctx.execute_activity_raw(&name, input, &queue).await;
-                }
-                Op::LocalActivity { name, input } => {
-                    let _ = ctx
-                        .execute_local_activity_raw(&name, input, None, None)
-                        .await;
-                }
-                Op::Timer { id, secs } => {
-                    let _ = ctx.timer(&id, secs).await;
-                }
-                Op::Signal { name } => {
-                    let _ = ctx.wait_for_signal(&name).await;
-                }
-                Op::Now => {
-                    let _ = ctx.system_now();
-                }
-                Op::NewUuid => {
-                    let _ = ctx.new_uuid();
-                }
-                Op::Random => {
-                    let _ = ctx.random_u64();
-                }
-                // An empty patch id is a documented caller panic.
-                Op::Patched { id } if id.is_empty() => {}
-                Op::Patched { id } => {
-                    let _ = ctx.patched(&id);
-                }
-                Op::Complete { output } => return Ok(output),
-                Op::Fail { error } => return Err(error),
+            if let Some(result) = run_op(ctx, op).await {
+                return result;
             }
         }
         Ok(Value::Null)
     })
+}
+
+/// Runs one op. Returns the workflow result for `Complete` and `Fail`.
+async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> {
+    match op {
+        Op::Activity { name, input, queue } => {
+            let _ = ctx.execute_activity_raw(&name, input, &queue).await;
+        }
+        Op::LocalActivity { name, input } => {
+            let _ = ctx
+                .execute_local_activity_raw(&name, input, None, None)
+                .await;
+        }
+        Op::Timer { id, secs } => {
+            let _ = ctx.timer(&id, secs).await;
+        }
+        Op::Signal { name } => {
+            let _ = ctx.wait_for_signal(&name).await;
+        }
+        Op::Now => {
+            let _ = ctx.system_now();
+        }
+        Op::NewUuid => {
+            let _ = ctx.new_uuid();
+        }
+        Op::Random => {
+            let _ = ctx.random_u64();
+        }
+        // An empty patch id is a documented caller panic.
+        Op::Patched { id } if id.is_empty() => {}
+        Op::Patched { id } => {
+            let _ = ctx.patched(&id);
+        }
+        Op::SideEffect { name } => {
+            let _ = ctx.side_effect::<_, Value>(&name, || Value::Null);
+        }
+        Op::Complete { output } => return Some(Ok(output)),
+        Op::Fail { error } => return Some(Err(error)),
+        other => run_external_op(ctx, other).await,
+    }
+    None
+}
+
+/// Runs a child, external or mutex op. `run_op` runs the others.
+async fn run_external_op(ctx: &WorkflowContext, op: Op) {
+    match op {
+        Op::Child { name, input } => {
+            let _ = ctx.spawn_child_workflow_raw(&name, input).await;
+        }
+        Op::DetachedChild {
+            name,
+            input,
+            policy,
+        } => {
+            let _ = ctx.spawn_child_workflow_detached_raw(&name, input, policy);
+        }
+        Op::ExternalActivity {
+            name,
+            input,
+            queue,
+            secs,
+        } => {
+            let _ = ctx
+                .execute_activity_external(&name, input, &queue, secs)
+                .await;
+        }
+        Op::SignalExternal {
+            target,
+            name,
+            payload,
+            idempotency_key,
+        } => {
+            let _ = match target {
+                ExternalTarget::ExecutionId(id) => {
+                    ctx.signal_external_workflow_with_idempotency(
+                        id,
+                        &name,
+                        payload,
+                        idempotency_key,
+                    )
+                    .await
+                }
+                ExternalTarget::WorkflowId {
+                    workflow_name,
+                    workflow_id,
+                } => {
+                    ctx.signal_external_workflow_by_id_with_idempotency(
+                        &workflow_name,
+                        &workflow_id,
+                        &name,
+                        payload,
+                        idempotency_key,
+                    )
+                    .await
+                }
+            };
+        }
+        Op::CancelExternal { target } => {
+            let _ = match target {
+                ExternalTarget::ExecutionId(id) => ctx.request_cancel_external_workflow(id).await,
+                ExternalTarget::WorkflowId {
+                    workflow_name,
+                    workflow_id,
+                } => {
+                    ctx.request_cancel_external_workflow_by_id(&workflow_name, &workflow_id)
+                        .await
+                }
+            };
+        }
+        Op::AwaitExternal { target } => {
+            let _ = ctx.await_external_workflow_value(target).await;
+        }
+        Op::Mutex { key } => {
+            let _ = ctx.mutex(key).acquire().await;
+        }
+        _ => {}
+    }
 }
 
 fn codecs(codec: Codec) -> PayloadCodecs {
