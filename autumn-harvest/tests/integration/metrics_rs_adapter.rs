@@ -316,3 +316,17 @@ fn record_db_transaction_retry_exhausted_bridges_counter_with_site_and_reason_la
         "issue #1822"
     );
 }
+
+#[test]
+fn record_api_rate_limited_bridges_counter_with_class_and_kind() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_api_rate_limited("mutating", "token");
+    });
+    let key = find_key(&keys, "harvest.api.rate_limited", InstrumentKind::Counter);
+    let labels = labels_of(key);
+    assert_eq!(
+        labels,
+        vec![("route_class", "mutating"), ("client_kind", "token")],
+        "issue #1827"
+    );
+}

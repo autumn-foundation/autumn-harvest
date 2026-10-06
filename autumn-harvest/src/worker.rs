@@ -1717,21 +1717,17 @@ struct ScheduledActivityCommand {
     /// Worker session this activity belongs to (issue #606). `None` for an
     /// ordinary activity dispatch.
     ///
-    /// TODO(#606 step 9): consumed by `persist_scheduled_activities` to
-    /// write the `harvest_task_queue.session_id` column and hard-pin
-    /// `sticky_worker_id`/`sticky_until` from `session_worker_id`. Not yet
-    /// wired -- `#[allow(dead_code)]` is temporary until that step lands.
-    #[allow(dead_code)]
+    /// `build_activity_enqueue_plan` writes it to `harvest_task_queue.session_id`
+    /// when `session_worker_id` is also set.
     session_id: Option<crate::types::SessionId>,
-    /// The session's host worker id (issue #606); when `Some`, the enqueued
-    /// task row is hard-pinned to this worker. `None` for a non-session
-    /// activity. See the `session_id` TODO above.
-    #[allow(dead_code)]
+    /// The session's host worker id (issue #606). When it is `Some`,
+    /// `build_activity_enqueue_plan` hard-pins the task row to this worker
+    /// through `sticky_worker_id` and `sticky_until`. `None` for a non-session
+    /// activity.
     session_worker_id: Option<String>,
     /// Per-call `schedule_to_start` override (issue #606), used only by the
     /// internal session-acquire dispatch. `None` for every ordinary
-    /// activity. See the `session_id` TODO above.
-    #[allow(dead_code)]
+    /// activity.
     schedule_to_start_override: Option<std::time::Duration>,
 }
 
