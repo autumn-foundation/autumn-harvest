@@ -1077,6 +1077,90 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
     assert_eq!(last_pollers, Some(0), "pollers read 0 after the drain");
 }
 
+const PANIC_WORKFLOW: &str = "saturation_panic_wf";
+
+fn panics<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { panic!("handler boom") })
+}
+
+/// With panic retries off, the first handler panic fails the run terminally.
+/// That workflow task is a failure in the outlier window, as a re-pended panic
+/// is (issue #1815).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_handler_panic_counts_as_a_failure() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool: DbPool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("panic-q");
+    let worker_id = unique_id("panic-w");
+    let built = HarvestBuilder::new()
+        .workflows(vec![WorkflowInfo {
+            name: PANIC_WORKFLOW,
+            handler: panics,
+            ..workflow_info()
+        }])
+        .worker(
+            WorkerConfig::default()
+                .with_queues([queue.as_str()])
+                .with_workflow_panic_max_attempts(0),
+        )
+        .build();
+    let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id.clone_from(&worker_id);
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.worker_heartbeat_interval = Duration::from_millis(100);
+    runtime_config.shutdown_timeout = Duration::from_secs(5);
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("panic-wf");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: PANIC_WORKFLOW,
+            ..start_params(exec_id, &workflow_id, &queue)
+        },
+        None,
+    )
+    .await
+    .expect("start workflow");
+    let runner = Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&run_pool).await });
+    wait_for_execution_state_with_timeout(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let row = loop {
+        let row: Option<StatsRow> = diesel::sql_query(
+            "SELECT window_tasks, window_failures FROM harvest_worker_task_stats \
+             WHERE worker_id = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&worker_id)
+        .get_result(&mut conn)
+        .await
+        .ok();
+        if let Some(row) = row
+            && row.window_tasks >= 1
+        {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "no task-stats row with a task");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        (row.window_tasks, row.window_failures),
+        (1, 1),
+        "the panicked workflow task is one failure"
+    );
+    worker.shutdown();
+    handle.await.expect("worker joins");
+}
+
 /// One timeout-scanner pass records the `scan` op.
 #[tokio::test]
 async fn timeout_scanner_pass_records_the_scan_op() {

@@ -24442,6 +24442,9 @@ async fn process_workflow_task(
                 // pending commands.
                 clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
                 pending_cmds = Vec::new();
+                // Issue #1815: the panicked task is a failure, as a re-pended
+                // panic is. An error from the persist below replaces this.
+                cycle_failure.failed_terminally();
                 tracing::error!(
                     execution_id = %prepared.exec_id,
                     workflow = %prepared.execution.workflow_name,
@@ -25355,6 +25358,10 @@ enum TaskDispatchOutcome {
     /// that a peer owns the claim (issue #1815). The stale attempt wrote
     /// nothing, so the dispatch site does not count it.
     ClaimLostAfterFailure,
+    /// A handler panic used up its retry budget, so the cycle failed the run
+    /// terminally (issue #1815). The failure is already persisted, so the
+    /// dispatch site only counts it.
+    FailedTerminally,
 }
 
 /// How a workflow cycle that returned `Ok` ended its task (issue #1815).
@@ -25368,6 +25375,7 @@ struct CycleFailure(std::sync::atomic::AtomicU8);
 impl CycleFailure {
     const REQUEUED: u8 = 1;
     const CLAIM_LOST: u8 = 2;
+    const FAILED_TERMINALLY: u8 = 3;
 
     /// The cycle failed the task and re-pended it under its claim.
     fn requeued(&self) {
@@ -25381,12 +25389,21 @@ impl CycleFailure {
             .store(Self::CLAIM_LOST, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// A handler panic used up its budget, so the cycle fails the run.
+    fn failed_terminally(&self) {
+        self.0.store(
+            Self::FAILED_TERMINALLY,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// The dispatch outcome of the cycle.
     fn outcome(&self) -> TaskDispatchOutcome {
         // Fully qualified, because diesel's `RunQueryDsl::load` is in scope.
         match std::sync::atomic::AtomicU8::load(&self.0, std::sync::atomic::Ordering::Relaxed) {
             Self::REQUEUED => TaskDispatchOutcome::RequeuedAfterFailure,
             Self::CLAIM_LOST => TaskDispatchOutcome::ClaimLostAfterFailure,
+            Self::FAILED_TERMINALLY => TaskDispatchOutcome::FailedTerminally,
             _ => TaskDispatchOutcome::Completed,
         }
     }
@@ -28055,13 +28072,18 @@ pub enum ClaimRecovery {
 /// Whether one workflow-task outcome is a failure, for the task window
 /// (issue #1815).
 ///
-/// A completion is a success. An error or a body timeout is a failure. A
-/// release is neither, because the task did not run to a decision here. A
-/// failure whose claim a peer took is neither too, because a peer owns it.
+/// A completion is a success. An error, a body timeout, a re-pended failure
+/// and a terminal handler panic are failures. A release is neither, because
+/// the task did not run to a decision here. A failure whose claim a peer took
+/// is neither too, because a peer owns it.
 const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> Option<bool> {
     match outcome {
         Ok(TaskDispatchOutcome::Completed) => Some(false),
-        Ok(TaskDispatchOutcome::BodyTimedOut | TaskDispatchOutcome::RequeuedAfterFailure)
+        Ok(
+            TaskDispatchOutcome::BodyTimedOut
+            | TaskDispatchOutcome::RequeuedAfterFailure
+            | TaskDispatchOutcome::FailedTerminally,
+        )
         | Err(_) => Some(true),
         Ok(TaskDispatchOutcome::Released { .. } | TaskDispatchOutcome::ClaimLostAfterFailure) => {
             None
@@ -34587,11 +34609,14 @@ impl Worker {
                                 .remove(&exec_id);
                         }
                     }
-                    Ok(TaskDispatchOutcome::RequeuedAfterFailure) => {
+                    Ok(
+                        TaskDispatchOutcome::RequeuedAfterFailure
+                        | TaskDispatchOutcome::FailedTerminally,
+                    ) => {
                         // Issue #1815: a deadlock or a contained panic failed
-                        // the task, and the cycle already re-pended it. It is
-                        // not a timeout, so the timeout strike clears, as for
-                        // a clean error.
+                        // the task, and the cycle already re-pended it or
+                        // failed the run. It is not a timeout, so the timeout
+                        // strike clears, as for a clean error.
                         if let Some(exec_id) = exec_id_for_timeout {
                             timeout_strikes
                                 .lock()
@@ -34866,8 +34891,13 @@ impl Worker {
                 if workflow_failed == Some(false) {
                     task_outcomes.record(false, dispatched_at.elapsed());
                 }
-                // Issue #1815: a re-pended failure already ran its recovery.
-                if matches!(outcome, Ok(TaskDispatchOutcome::RequeuedAfterFailure)) {
+                // Issue #1815: a re-pended or terminal failure already wrote
+                // its outcome.
+                if matches!(
+                    outcome,
+                    Ok(TaskDispatchOutcome::RequeuedAfterFailure
+                        | TaskDispatchOutcome::FailedTerminally)
+                ) {
                     record_failed_task(
                         &task_outcomes,
                         ClaimRecovery::Applied,
@@ -43682,6 +43712,8 @@ mod tests {
         assert_eq!(cycle.outcome(), TaskDispatchOutcome::RequeuedAfterFailure);
         cycle.claim_lost();
         assert_eq!(cycle.outcome(), TaskDispatchOutcome::ClaimLostAfterFailure);
+        cycle.failed_terminally();
+        assert_eq!(cycle.outcome(), TaskDispatchOutcome::FailedTerminally);
 
         let window = crate::worker_outlier::TaskOutcomeWindow::new(16, Duration::from_secs(300));
         let latency = Duration::from_millis(40);
@@ -43704,6 +43736,11 @@ mod tests {
             workflow_task_failed(&Ok(TaskDispatchOutcome::RequeuedAfterFailure)),
             Some(true),
             "a deadlock or a contained panic that re-pends the task is a failure"
+        );
+        assert_eq!(
+            workflow_task_failed(&Ok(TaskDispatchOutcome::FailedTerminally)),
+            Some(true),
+            "a panic that fails the run terminally is a failure"
         );
         assert_eq!(
             workflow_task_failed(&Ok(TaskDispatchOutcome::ClaimLostAfterFailure)),
