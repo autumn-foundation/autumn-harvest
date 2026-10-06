@@ -15719,6 +15719,43 @@ fn is_worker_local_failure(error_type: &str) -> bool {
     false
 }
 
+/// The registered activities whose requirements these worker labels do not
+/// meet.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] for an invalid requirement, or for a
+/// name that starts with [`queue::SATURATED_ACTIVITY_MARKER`].
+fn ineligible_activities(
+    registry: &HandlerRegistry,
+    labels: &std::collections::HashMap<String, String>,
+) -> HarvestResult<Vec<String>> {
+    let mut ineligible_activities = Vec::new();
+    for activity in registry.activities.values() {
+        // The claim reads a `$6` entry that starts with the marker as a
+        // saturated type (issue #1836). A registered name must not start
+        // with it.
+        if activity.name.starts_with(queue::SATURATED_ACTIVITY_MARKER) {
+            return Err(HarvestError::Config(format!(
+                "activity name {:?} starts with a reserved control character",
+                activity.name
+            )));
+        }
+        if let Some(requires) = activity.requires {
+            let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
+                HarvestError::Config(format!(
+                    "Invalid requirements for activity {}: {}",
+                    activity.name, err
+                ))
+            })?;
+            if !crate::eligibility::matches_requirements(&reqs, labels) {
+                ineligible_activities.push(activity.name.to_string());
+            }
+        }
+    }
+    Ok(ineligible_activities)
+}
+
 /// The activity names that a claim must skip (issue #1836).
 ///
 /// These are the names with unmet requirements, plus the types at their
@@ -29997,20 +30034,7 @@ impl Worker {
             let _ = global_dispatch.set(captured);
         }
 
-        let mut ineligible_activities = Vec::new();
-        for activity in registry.activities.values() {
-            if let Some(requires) = activity.requires {
-                let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
-                    HarvestError::Config(format!(
-                        "Invalid requirements for activity {}: {}",
-                        activity.name, err
-                    ))
-                })?;
-                if !crate::eligibility::matches_requirements(&reqs, &config.labels) {
-                    ineligible_activities.push(activity.name.to_string());
-                }
-            }
-        }
+        let ineligible_activities = ineligible_activities(&registry, &config.labels)?;
 
         let workflow_parts =
             build_dispatch_semaphore(config.max_concurrent_workflows, config.slot_tuner.as_ref());
@@ -41243,6 +41267,39 @@ mod tests {
                 .to_string()
                 .contains("exceeds chrono::Duration bounds")
         );
+    }
+
+    /// A registered name that starts with the saturation marker would read
+    /// as a marked `$6` entry, so the worker rejects it (issue #1836).
+    #[test]
+    fn worker_rejects_an_activity_name_with_the_saturation_marker() {
+        let act = ActivityInfo {
+            name: "\u{1}charge_card",
+            module: "app::activities",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            requires: Some("gpu = true"),
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
+        match Worker::new(default_runtime_config(), registry) {
+            Err(err) => assert!(matches!(err, HarvestError::Config(_)), "{err}"),
+            Ok(_) => panic!("the marker prefix must be rejected"),
+        }
     }
 
     #[test]

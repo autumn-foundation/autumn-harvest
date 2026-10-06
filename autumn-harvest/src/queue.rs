@@ -930,8 +930,8 @@ macro_rules! expired_runs_cte_sql {
 /// (issue #1836).
 ///
 /// `$6` holds the names with unmet requirements. The worker also adds each
-/// activity type at its adaptive limit, with this marker in front. No
-/// registered activity name starts with a control character.
+/// activity type at its adaptive limit, with this marker in front.
+/// `Worker::new` rejects a registered name that starts with the marker.
 pub const SATURATED_ACTIVITY_MARKER: char = '\u{1}';
 
 /// The claim predicate that skips an activity type at its adaptive limit
