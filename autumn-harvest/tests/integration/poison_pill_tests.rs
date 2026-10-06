@@ -16,7 +16,9 @@
 use std::sync::Mutex;
 
 use autumn_harvest::dlq::DeadLetterReason;
-use autumn_harvest::poison_pill::{QUARANTINE_REASON, reclaim_orphaned_tasks};
+use autumn_harvest::poison_pill::{
+    OrphanWitness, QUARANTINE_REASON, reclaim_orphaned_tasks, reclaim_orphaned_tasks_witnessed,
+};
 use autumn_harvest::telemetry::MetricsRecorder;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
@@ -805,4 +807,146 @@ struct FailRow {
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
+}
+
+// ── Issue #1879: a late worker is not a dead worker ─────────────────────────
+
+/// The stale window of the issue #1879 tests, in seconds.
+const STALE_SECS: i64 = 10;
+
+/// One stale window as a `Duration`.
+const STALE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Register a worker whose last heartbeat is `age_secs` old.
+async fn insert_worker_with_heartbeat_age(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    age_secs: i64,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, last_heartbeat_at, max_concurrency, host) \
+         VALUES ($1, NOW() - ($2::bigint * INTERVAL '1 second'), 10, 'localhost')",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::BigInt, _>(age_secs)
+    .execute(conn)
+    .await
+    .expect("insert late worker");
+}
+
+/// Run one witnessed sweep at `now`.
+async fn witnessed_sweep(
+    conn: &mut AsyncPgConnection,
+    witness: &mut OrphanWitness,
+    now: std::time::Instant,
+    metrics: &RecordingMetrics,
+) -> autumn_harvest::poison_pill::ReclaimSummary {
+    reclaim_orphaned_tasks_witnessed(
+        conn,
+        3,
+        STALE_SECS,
+        None,
+        metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        witness,
+        now,
+    )
+    .await
+    .expect("witnessed reclaim")
+}
+
+/// Issue #1879: the last strike quarantines only after this reclaimer saw
+/// the orphan for one full stale window. Until then the row stays `RUNNING`.
+#[tokio::test]
+async fn quarantine_waits_one_stale_window_of_witness() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-witness").await;
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "late-worker", 2).await;
+    insert_worker_with_heartbeat_age(&mut conn, "late-worker", 15).await;
+    let metrics = RecordingMetrics::default();
+    let mut witness = OrphanWitness::default();
+    let t0 = std::time::Instant::now();
+
+    let first = witnessed_sweep(&mut conn, &mut witness, t0, &metrics).await;
+    assert_eq!(first.quarantined, 0, "the first sight must not quarantine");
+    assert_eq!(first.held, 1, "the sweep must report the held orphan");
+    let (state, strikes, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "RUNNING", "a held orphan stays RUNNING");
+    assert_eq!(strikes, 2, "a held orphan gets no strike");
+    assert_eq!(worker.as_deref(), Some("late-worker"));
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
+    assert!(metrics.quarantined.lock().unwrap().is_empty());
+
+    let second = witnessed_sweep(&mut conn, &mut witness, t0 + STALE, &metrics).await;
+    assert_eq!(
+        second.quarantined, 1,
+        "one stale window of witness confirms the death"
+    );
+    assert_eq!(second.held, 0);
+    let (state, strikes, _) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "FAILED");
+    assert_eq!(strikes, 3);
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");
+}
+
+/// Issue #1879: a slow worker whose heartbeat comes back during the hold is
+/// alive. Its task is not quarantined and gets no strike.
+#[tokio::test]
+async fn late_worker_that_heartbeats_again_keeps_its_task() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-late").await;
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "slow-worker", 2).await;
+    insert_worker_with_heartbeat_age(&mut conn, "slow-worker", 15).await;
+    let metrics = RecordingMetrics::default();
+    let mut witness = OrphanWitness::default();
+    let t0 = std::time::Instant::now();
+
+    let first = witnessed_sweep(&mut conn, &mut witness, t0, &metrics).await;
+    assert_eq!(first.total(), 0, "the first sight changes no row");
+
+    let rows = autumn_harvest::workers::heartbeat_worker(
+        &mut conn,
+        "slow-worker",
+        1,
+        &serde_json::json!({}),
+        0,
+        &[],
+    )
+    .await
+    .expect("heartbeat");
+    assert_eq!(rows, 1, "setup: the heartbeat must refresh the row");
+
+    let second = witnessed_sweep(&mut conn, &mut witness, t0 + STALE, &metrics).await;
+    assert_eq!(second.total(), 0, "a live worker keeps its task");
+    assert_eq!(second.held, 0);
+    assert!(
+        witness.is_empty(),
+        "the witness forgets a claim that is live again"
+    );
+    let (state, strikes, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "RUNNING");
+    assert_eq!(strikes, 2, "a reclaim that did not happen counts no strike");
+    assert_eq!(worker.as_deref(), Some("slow-worker"));
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
+}
+
+/// A requeue under the threshold stays immediate. Only the terminal step
+/// waits, so crash recovery is not slower.
+#[tokio::test]
+async fn witnessed_requeue_under_threshold_is_immediate() {
+    let (mut conn, _container) = setup_db().await;
+    let task_id = insert_running_task(&mut conn, None, "crashed-worker", 0).await;
+    insert_worker_with_heartbeat_age(&mut conn, "crashed-worker", 15).await;
+    let metrics = RecordingMetrics::default();
+    let mut witness = OrphanWitness::default();
+
+    let summary =
+        witnessed_sweep(&mut conn, &mut witness, std::time::Instant::now(), &metrics).await;
+    assert_eq!(summary.requeued, 1);
+    assert_eq!(summary.held, 0);
+    let (state, strikes, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "PENDING");
+    assert_eq!(strikes, 1);
+    assert_eq!(worker, None);
 }

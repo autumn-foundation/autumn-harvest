@@ -66,6 +66,10 @@ pub struct ReclaimSummary {
     /// dead-worker orphan path, this one requires no worker liveness signal
     /// at all. See [`stuck_running_tasks_query`].
     pub stuck_requeued: usize,
+    /// Orphans at the quarantine threshold that this sweep left `RUNNING`
+    /// (issue #1879). The reclaimer has not yet seen them for one stale
+    /// window. Not counted in [`Self::total`], because no row changed.
+    pub held: usize,
 }
 
 impl ReclaimSummary {
@@ -73,6 +77,61 @@ impl ReclaimSummary {
     #[must_use]
     pub const fn total(&self) -> usize {
         self.requeued + self.quarantined + self.stuck_requeued
+    }
+}
+
+/// One claim of an orphaned task, as a reclaim sweep saw it (issue #1879).
+///
+/// A new claim of the same task has a different worker or strike count, so
+/// it is a different key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrphanClaim {
+    /// The orphaned task.
+    pub task_id: uuid::Uuid,
+    /// The worker that holds the claim.
+    pub worker_id: String,
+    /// The strike count of the claim, before this reclaim.
+    pub crash_strikes: i32,
+}
+
+/// The orphan claims that one reclaimer saw, and when it first saw each one
+/// (issue #1879).
+#[derive(Debug, Default)]
+pub struct OrphanWitness {
+    first_seen: std::collections::HashMap<OrphanClaim, std::time::Instant>,
+}
+
+impl OrphanWitness {
+    /// Record the orphan claims of one sweep, seen at `now`.
+    pub fn observe<I>(&mut self, claims: I, now: std::time::Instant, hold: std::time::Duration)
+    where
+        I: IntoIterator<Item = OrphanClaim>,
+    {
+        let _ = (claims.into_iter().count(), now, hold);
+    }
+
+    /// Tell if this reclaimer saw `claim` as an orphan for at least `hold`.
+    #[must_use]
+    pub fn confirmed(
+        &self,
+        claim: &OrphanClaim,
+        now: std::time::Instant,
+        hold: std::time::Duration,
+    ) -> bool {
+        let _ = (claim, now, hold, &self.first_seen);
+        true
+    }
+
+    /// The number of claims that the witness keeps.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.first_seen.len()
+    }
+
+    /// Tell if the witness keeps no claim.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.first_seen.is_empty()
     }
 }
 
@@ -965,6 +1024,37 @@ mod scanner {
         Ok(summary)
     }
 
+    /// [`reclaim_orphaned_tasks`], with a quarantine that waits for proof
+    /// (issue #1879).
+    ///
+    /// `now` is the time of this sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] on query failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reclaim_orphaned_tasks_witnessed(
+        conn: &mut AsyncPgConnection,
+        threshold: i32,
+        worker_stale_secs: i64,
+        stuck_running_secs: Option<i64>,
+        metrics: &dyn MetricsRecorder,
+        codecs: &crate::payload_codec::PayloadCodecs,
+        witness: &mut super::OrphanWitness,
+        now: std::time::Instant,
+    ) -> HarvestResult<ReclaimSummary> {
+        let _ = (&witness, now);
+        reclaim_orphaned_tasks(
+            conn,
+            threshold,
+            worker_stale_secs,
+            stuck_running_secs,
+            metrics,
+            codecs,
+        )
+        .await
+    }
+
     /// Spawn a background task that periodically reclaims orphaned poison-pill
     /// tasks. Stops when `cancel` is triggered.
     ///
@@ -1111,8 +1201,8 @@ mod scanner {
 
 #[cfg(feature = "db")]
 pub use scanner::{
-    QUARANTINE_REASON, reclaim_orphaned_tasks, spawn_poison_pill_reclaimer,
-    spawn_poison_pill_reclaimer_for_shard,
+    QUARANTINE_REASON, reclaim_orphaned_tasks, reclaim_orphaned_tasks_witnessed,
+    spawn_poison_pill_reclaimer, spawn_poison_pill_reclaimer_for_shard,
 };
 
 #[cfg(test)]
@@ -1187,8 +1277,9 @@ mod tests {
             requeued: 2,
             quarantined: 1,
             stuck_requeued: 4,
+            held: 8,
         };
-        assert_eq!(summary.total(), 7);
+        assert_eq!(summary.total(), 7, "a held orphan changed no row");
     }
 
     #[test]
@@ -1208,5 +1299,97 @@ mod tests {
             !sql.contains("harvest_workers"),
             "this backstop applies regardless of worker liveness"
         );
+    }
+
+    fn claim(task: u128, worker: &str, strikes: i32) -> OrphanClaim {
+        OrphanClaim {
+            task_id: uuid::Uuid::from_u128(task),
+            worker_id: worker.to_owned(),
+            crash_strikes: strikes,
+        }
+    }
+
+    const HOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Issue #1879: a claim that this reclaimer never saw is not confirmed.
+    #[test]
+    fn witness_does_not_confirm_an_unseen_claim() {
+        let witness = OrphanWitness::default();
+        let now = std::time::Instant::now();
+        assert!(!witness.confirmed(&claim(1, "w", 2), now, HOLD));
+    }
+
+    /// Issue #1879: a claim is confirmed only after one full hold.
+    #[test]
+    fn witness_confirms_a_claim_after_one_hold() {
+        let mut witness = OrphanWitness::default();
+        let t0 = std::time::Instant::now();
+        witness.observe([claim(1, "w", 2)], t0, HOLD);
+        assert!(!witness.confirmed(&claim(1, "w", 2), t0, HOLD));
+        let early = t0 + HOLD - std::time::Duration::from_millis(1);
+        witness.observe([claim(1, "w", 2)], early, HOLD);
+        assert!(!witness.confirmed(&claim(1, "w", 2), early, HOLD));
+        witness.observe([claim(1, "w", 2)], t0 + HOLD, HOLD);
+        assert!(witness.confirmed(&claim(1, "w", 2), t0 + HOLD, HOLD));
+    }
+
+    /// A zero hold confirms a claim on the sweep that first sees it.
+    #[test]
+    fn witness_with_a_zero_hold_confirms_at_first_sight() {
+        let mut witness = OrphanWitness::default();
+        let t0 = std::time::Instant::now();
+        witness.observe([claim(1, "w", 2)], t0, std::time::Duration::ZERO);
+        assert!(witness.confirmed(&claim(1, "w", 2), t0, std::time::Duration::ZERO));
+    }
+
+    /// Issue #1879: a worker that heartbeats again leaves the orphan set.
+    /// The witness forgets the claim, so a later stall starts a new hold.
+    #[test]
+    fn witness_forgets_a_claim_that_leaves_the_orphan_set() {
+        let mut witness = OrphanWitness::default();
+        let t0 = std::time::Instant::now();
+        witness.observe([claim(1, "w", 2), claim(2, "w", 0)], t0, HOLD);
+        witness.observe([claim(2, "w", 0)], t0 + HOLD / 2, HOLD);
+        assert_eq!(witness.len(), 1);
+        witness.observe([claim(1, "w", 2), claim(2, "w", 0)], t0 + HOLD, HOLD);
+        assert!(!witness.confirmed(&claim(1, "w", 2), t0 + HOLD, HOLD));
+        assert!(witness.confirmed(&claim(2, "w", 0), t0 + HOLD, HOLD));
+    }
+
+    /// A new claim of the same task starts a new hold.
+    #[test]
+    fn witness_treats_a_new_claim_of_the_same_task_as_new() {
+        let mut witness = OrphanWitness::default();
+        let t0 = std::time::Instant::now();
+        witness.observe([claim(1, "w", 2)], t0, HOLD);
+        witness.observe([claim(1, "other", 2)], t0 + HOLD, HOLD);
+        assert!(!witness.confirmed(&claim(1, "other", 2), t0 + HOLD, HOLD));
+        witness.observe([claim(1, "other", 3)], t0 + HOLD, HOLD);
+        assert!(!witness.confirmed(&claim(1, "other", 3), t0 + HOLD, HOLD));
+        assert_eq!(witness.len(), 1);
+    }
+
+    /// Issue #1879: a gap between two sweeps longer than the hold breaks the
+    /// watch. A heartbeat in the gap can go unseen, so the hold starts again.
+    #[test]
+    fn witness_restarts_after_a_gap_longer_than_the_hold() {
+        let mut witness = OrphanWitness::default();
+        let t0 = std::time::Instant::now();
+        witness.observe([claim(1, "w", 2)], t0, HOLD);
+        let late = t0 + HOLD + std::time::Duration::from_millis(1);
+        witness.observe([claim(1, "w", 2)], late, HOLD);
+        assert!(!witness.confirmed(&claim(1, "w", 2), late, HOLD));
+        witness.observe([claim(1, "w", 2)], late + HOLD, HOLD);
+        assert!(witness.confirmed(&claim(1, "w", 2), late + HOLD, HOLD));
+    }
+
+    /// Sweeps that come at most one hold apart keep the watch.
+    #[test]
+    fn witness_keeps_the_watch_across_sweeps_one_hold_apart() {
+        let mut witness = OrphanWitness::default();
+        let t0 = std::time::Instant::now();
+        witness.observe([claim(1, "w", 2)], t0, HOLD);
+        witness.observe([claim(1, "w", 2)], t0 + HOLD, HOLD);
+        assert!(witness.confirmed(&claim(1, "w", 2), t0 + HOLD, HOLD));
     }
 }

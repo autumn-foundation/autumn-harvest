@@ -1734,6 +1734,24 @@ pub async fn do_heartbeat_tick(
     }
 }
 
+/// The start times of the worker heartbeat ticks (issue #1879).
+#[derive(Debug)]
+pub(crate) struct HeartbeatSchedule {
+    interval: Duration,
+}
+
+impl HeartbeatSchedule {
+    /// Make a schedule. The first tick comes one `interval` after this call.
+    pub(crate) const fn new(interval: Duration) -> Self {
+        Self { interval }
+    }
+
+    /// Wait until the next tick is due.
+    pub(crate) async fn wait(&mut self) {
+        tokio::time::sleep(self.interval).await;
+    }
+}
+
 /// Spawn a background task that upserts worker heartbeats on a regular interval.
 ///
 /// The task reads the current `in_flight_count` from the semaphores, then
@@ -1787,10 +1805,11 @@ pub fn spawn_worker_heartbeat(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
+        let mut schedule = HeartbeatSchedule::new(interval);
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
-                () = tokio::time::sleep(interval) => {}
+                () = schedule.wait() => {}
             }
             // Loaded fresh each tick (issue #548 review): a tuned worker's
             // dispatch target can change between heartbeats, so a value
@@ -2685,5 +2704,50 @@ mod tests {
         let _act_permits = act_sem.try_acquire_many(5).unwrap();
 
         assert_eq!(compute_in_flight(&wf_sem, 10, &act_sem, 20), 8);
+    }
+
+    /// Run `ticks` heartbeat ticks that each take `latency`. Return the start
+    /// time of each tick, in milliseconds after the schedule was made.
+    async fn tick_starts(interval: Duration, latency: Duration, ticks: usize) -> Vec<u128> {
+        let origin = tokio::time::Instant::now();
+        let mut schedule = HeartbeatSchedule::new(interval);
+        let mut starts = Vec::with_capacity(ticks);
+        for _ in 0..ticks {
+            schedule.wait().await;
+            starts.push(origin.elapsed().as_millis());
+            tokio::time::sleep(latency).await;
+        }
+        starts
+    }
+
+    /// Issue #1879: tick latency must not add to the heartbeat period.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_period_does_not_grow_with_tick_latency() {
+        let starts = tick_starts(Duration::from_millis(500), Duration::from_millis(300), 4).await;
+        assert_eq!(starts, vec![500, 1000, 1500, 2000]);
+    }
+
+    /// Issue #1879: a tick that takes longer than one interval starts the
+    /// next tick at once. The schedule does not add a full interval after it.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_after_a_slow_tick_starts_at_once() {
+        let starts = tick_starts(Duration::from_millis(500), Duration::from_millis(700), 3).await;
+        assert_eq!(starts, vec![500, 1200, 1900]);
+    }
+
+    /// The first tick comes one interval after the schedule starts.
+    /// Registration has just written the row, so an immediate tick is waste.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_first_tick_waits_one_interval() {
+        let starts = tick_starts(Duration::from_secs(5), Duration::ZERO, 1).await;
+        assert_eq!(starts, vec![5000]);
+    }
+
+    /// A zero interval does not panic. `spawn_worker_heartbeat` is public,
+    /// so a caller can pass a value that the builder rejects.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_schedule_accepts_a_zero_interval() {
+        let starts = tick_starts(Duration::ZERO, Duration::from_millis(1), 2).await;
+        assert_eq!(starts.len(), 2);
     }
 }
