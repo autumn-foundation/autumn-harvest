@@ -576,12 +576,13 @@ pub use completion_trigger::{
 };
 pub use context::{
     ActivityContext, ActivityExecutionInfo, ActivityIdentity, AutoHeartbeatGuard,
-    DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
-    DEFAULT_SESSION_ACQUISITION_TIMEOUT, DEFAULT_WORKFLOW_LOG_MAX_LINES,
-    DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, MutexGuard, MutexHandle, RaceBuilder, RaceWinner,
-    Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand, WorkflowContext,
-    WorkflowExecutionInfo, WorkflowHistoryPolicy, WorkflowLogLevel, WorkflowLogPolicy,
-    WorkflowLogger, is_reserved_session_activity_name,
+    DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
+    DEFAULT_HISTORY_BYTE_HARD_CAP, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
+    DEFAULT_HISTORY_EVENT_HARD_CAP, DEFAULT_SESSION_ACQUISITION_TIMEOUT,
+    DEFAULT_WORKFLOW_LOG_MAX_LINES, DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, MutexGuard,
+    MutexHandle, RaceBuilder, RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome,
+    WorkflowCommand, WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
+    WorkflowLogLevel, WorkflowLogPolicy, WorkflowLogger, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
