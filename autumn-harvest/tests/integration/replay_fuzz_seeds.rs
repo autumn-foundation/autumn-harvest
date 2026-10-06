@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use autumn_harvest::fuzzing::{MAX_OP_DEPTH, Op, ReplayCase, Verdict, check_case};
+use autumn_harvest::fuzzing::{MAX_OP_DEPTH, Op, ReplayCase, Verdict, check_case, mirror};
 
 fn seed_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fuzz/seeds/fuzz_replay")
@@ -285,4 +285,66 @@ fn generator_reaches_every_event_variant() {
     }
     let missing: Vec<_> = declared.difference(&seen).collect();
     assert!(missing.is_empty(), "the generator never built {missing:?}");
+}
+
+/// A compact view of a mirrored program: activity names, signal names and
+/// the `join!` structure.
+fn shape(ops: &[Op]) -> String {
+    fn one(op: &serde_json::Value) -> String {
+        let name = op["name"].as_str().unwrap_or_default();
+        let nested = |key: &str| {
+            let ops = op[key].as_array().map(Vec::as_slice).unwrap_or_default();
+            ops.iter().map(one).collect::<Vec<_>>().join(", ")
+        };
+        match op["op"].as_str().unwrap_or_default() {
+            "activity" => name.to_string(),
+            "signal" => format!("signal {name}"),
+            "side_effect" => format!("side effect {name}"),
+            "concurrent" => format!("join({})", nested("ops")),
+            "sequence" => format!("seq({})", nested("ops")),
+            other => other.to_string(),
+        }
+    }
+    let value = serde_json::to_value(ops).expect("a program serializes");
+    let ops = value.as_array().expect("a program is a list");
+    ops.iter().map(one).collect::<Vec<_>>().join("; ")
+}
+
+/// A command right after the outcome of one `join!` branch continues that
+/// branch. A start or a heartbeat of a member does not end the batch. A
+/// received signal settles its own branch.
+#[test]
+fn a_join_branch_continues_where_its_wait_ended() {
+    let expected = [
+        (
+            "baseline-join-branch-continues.json",
+            "join(slow, seq(fast, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-past-side-effect.json",
+            "join(slow, seq(fast, side effect trace, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-past-heartbeat.json",
+            "join(slow, seq(fast, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-after-signal.json",
+            "join(slow, seq(signal go, next)); complete",
+        ),
+    ];
+    let cases = seed("baseline-join-branch-continues");
+    assert_eq!(cases.len(), expected.len(), "one expectation per seed");
+    for (name, want) in expected {
+        let (_, case) = cases
+            .iter()
+            .find(|(seed, _)| seed == name)
+            .unwrap_or_else(|| panic!("seed {name} is missing"));
+        assert_eq!(shape(&mirror(&case.history)), want, "seed {name}");
+        assert_eq!(
+            check_case(case),
+            Verdict::Replayed("ReplaySucceeded".to_string()),
+            "seed {name}"
+        );
+    }
 }

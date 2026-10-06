@@ -929,7 +929,13 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                     any,
                     fail_fast,
                 });
+                let signal = matches!(op, Op::Signal { .. });
                 batch.push(op, waits);
+                if signal {
+                    // The signal already arrived, so its branch goes on with
+                    // the next command.
+                    batch.resume_last();
+                }
             }
             None if batch.settle(event) => {}
             other => {
@@ -982,6 +988,18 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
     }
 }
 
+/// The activity that `event` reports progress for, if it is a start or a
+/// heartbeat.
+const fn progress_key(event: &WorkflowEvent) -> Option<Pending> {
+    match event {
+        WorkflowEvent::ActivityStarted { activity_id, .. }
+        | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
+            Some(Pending::Activity(*activity_id))
+        }
+        _ => None,
+    }
+}
+
 /// The outcomes that one batch branch waits for. With `any`, the first
 /// outcome settles the branch, as for a race. With `fail_fast`, the first
 /// failure settles it too, as for a fail-fast fan-out. Otherwise it waits
@@ -997,8 +1015,10 @@ struct Waits {
 /// A batch stays open past the outcome of one member while another member
 /// still waits. A command right after that outcome came from the same
 /// branch, as in `join!(slow, async { fast.await; next.await })`, so it
-/// joins that branch as a sequence. The batch closes at any other event, or
-/// once every member has settled.
+/// joins that branch as a sequence. A received signal settles its own
+/// branch the same way. An activity start or heartbeat leaves the batch as
+/// it is. The batch closes at any other event, or once every member has
+/// settled.
 #[derive(Default)]
 struct Batch {
     branches: Vec<Vec<Op>>,
@@ -1028,9 +1048,24 @@ impl Batch {
         }
     }
 
+    /// Lets the branch that the last push touched go on with the next
+    /// command.
+    const fn resume_last(&mut self) {
+        if self.resumed.is_none() {
+            self.resumed = self.branches.len().checked_sub(1);
+        }
+    }
+
     /// Settles the member that `event` reports. True while the batch stays
     /// open; false when `event` should close it.
     fn settle(&mut self, event: &WorkflowEvent) -> bool {
+        if let Some(key) = progress_key(event) {
+            // Progress of a member that still waits does not settle it.
+            return self
+                .pending
+                .iter()
+                .any(|p| p.as_ref().is_some_and(|w| w.keys.contains(&key)));
+        }
         let Some(key) = settled_key(event) else {
             return false;
         };
