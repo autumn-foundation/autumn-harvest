@@ -1963,6 +1963,10 @@ standalone note rather than part of the claim-path attribution table above:
   `shard_rebalance::history_fingerprint`, the replay-determinism check a
   shard migration runs on both sides of a copy (`docs/sharding.md`), fixed
   by reusing one buffer across events (alloc bytes -16.45%).
+* [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
+  — SipHash over `AccKey` in `timeline::derive_timeline`, the read model behind
+  `GET /workflows/{id}/timeline` (issue #739), replaced by one 128-bit hash
+  write per key (instructions -8.3%).
 * [`docs/performance-lineage.md`](performance-lineage.md) — the `visited`/
   `next`/`node.children` vecs in `lineage::LineageWalk`/
   `LineageTreeReport::finish`, the in-memory half of
