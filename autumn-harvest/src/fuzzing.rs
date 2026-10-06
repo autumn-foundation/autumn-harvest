@@ -1103,6 +1103,10 @@ struct Batch {
     pending: Vec<Option<Waits>>,
     /// The branch that settled last, while another one still waits.
     resumed: Option<usize>,
+    /// Outcomes still due from a member that settled early, such as the
+    /// other items of a fail-fast group or the losers of a race. They
+    /// arrive late and do not end the batch.
+    late: HashSet<Pending>,
 }
 
 impl Batch {
@@ -1148,14 +1152,18 @@ impl Batch {
     fn settle(&mut self, event: &WorkflowEvent) -> bool {
         if let Some(key) = progress_key(event) {
             // Progress of a member that still waits does not settle it.
-            return self
+            let waits_for_it = self
                 .pending
                 .iter()
                 .any(|p| p.as_ref().is_some_and(|w| w.keys.contains(&key)));
+            return waits_for_it || (self.late.contains(&key) && self.waiting());
         }
         let Some(key) = settled_key(event) else {
             return false;
         };
+        if self.late.remove(&key) {
+            return self.waiting();
+        }
         let Some(branch) = self
             .pending
             .iter()
@@ -1174,7 +1182,9 @@ impl Batch {
             w.any || w.keys.is_empty() || (w.fail_fast && failed)
         });
         if settled {
-            self.pending[branch] = None;
+            if let Some(waits) = self.pending[branch].take() {
+                self.late.extend(waits.keys);
+            }
             self.resumed = Some(branch);
         }
         self.pending.iter().any(Option::is_some)
@@ -1193,6 +1203,7 @@ impl Batch {
             .collect();
         self.pending.clear();
         self.resumed = None;
+        self.late.clear();
         match ops.len() {
             0 => {}
             1 => program.append(&mut ops),
