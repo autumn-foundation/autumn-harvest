@@ -753,6 +753,15 @@ impl PreparedHarvestRuntime {
         worker_enabled: bool,
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
+        // An auto pool covers every pool shard, cell shards included. It
+        // would drain a tenant cell and void its isolation (issue #1837).
+        // This pure check runs first, before any step publishes global state.
+        refuse_auto_pool_over_cells(
+            &shard_router,
+            &built.worker_config().shard_assignments,
+            worker_enabled,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
         install_completion_callback_config(&built);
@@ -853,15 +862,6 @@ impl PreparedHarvestRuntime {
         // resources/WorkerConfig precedence above, so this never narrows a
         // configured `WorkerConfig::with_sharded_pool` to a single shard.
         worker_runtime_config.sharded_pool = Some(storage_pool.sharded_pool().clone());
-
-        // An auto pool covers every pool shard, cell shards included. It
-        // would drain a tenant cell and void its isolation (issue #1837).
-        refuse_auto_pool_over_cells(
-            &shard_router,
-            &worker_runtime_config.shard_assignments,
-            worker_enabled,
-        )
-        .map_err(AutumnError::service_unavailable_msg)?;
 
         // Resolve auto (empty) shard assignments now that `sharded_pool` is
         // final (issue #961, AC1). `Worker::new` runs the same idempotent pass,
@@ -2673,6 +2673,41 @@ mod tests {
         assert_eq!(
             refuse_auto_pool_over_cells(&cell_router(), &[], false),
             Ok(())
+        );
+    }
+
+    /// A refused cell startup must publish no global state. The callback
+    /// config is the first thing `build` publishes, so the check runs before
+    /// it.
+    #[test]
+    fn a_refused_cell_startup_publishes_no_callback_config() {
+        const MARKER: u32 = 1837;
+        let built = autumn_harvest::HarvestBuilder::new()
+            .completion_callback_retry_policy(autumn_harvest::RetryPolicy {
+                max_attempts: MARKER,
+                ..autumn_harvest::RetryPolicy::default()
+            })
+            .build();
+        let pool = tagged_pool(1);
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(ShardId::new(0), pool.clone());
+        pools.insert(ShardId::new(1), tagged_pool(2));
+        pools.insert(ShardId::new(2), tagged_pool(3));
+        let resources = HarvestRunnerResources::new(pool)
+            .with_sharded_pool(ShardedDbPool::from_map(pools, ShardId::new(0)))
+            .with_shard_router(cell_router());
+
+        let refused = super::PreparedHarvestRuntime::build(built, resources, true);
+        assert!(refused.is_err(), "an auto pool over a cell must be refused");
+        let published = autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG
+            .read()
+            .expect("lock")
+            .clone()
+            .map(|config| config.retry_policy.max_attempts);
+        assert_ne!(
+            published,
+            Some(MARKER),
+            "the refused startup published its callback config"
         );
     }
 
