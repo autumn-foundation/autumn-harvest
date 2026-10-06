@@ -239,6 +239,9 @@ shard is plain:
   restarted worker pins it.
 - A shard this process already pinned keeps that pin. The runner pins
   before its worker starts, so a brief outage does not hold or stop it.
+  The worker must use the pool that took the pin. A worker on another pool
+  refuses to start: that pool can reach another database, such as a
+  logical standby.
 - A fenced worker with an assigned shard it cannot reach refuses to start.
   It cannot pin that shard.
 - A fenced worker holds an unassigned shard it cannot reach, and it serves

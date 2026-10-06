@@ -2527,22 +2527,33 @@ async fn a_worker_holds_a_shard_it_cannot_probe_and_claims_nothing_there() {
 /// A shard this process already pinned keeps that pin when a later worker
 /// cannot probe it (issue #1823). The runner pins before its worker starts.
 /// A brief outage at that moment must not hold, refuse or stop the worker.
+/// The worker must probe through the pool that took the pin. Another pool
+/// can reach another database, such as a logical standby.
 #[tokio::test]
 async fn an_unprobeable_shard_reuses_the_process_pin() {
     let _serial = registry_guard().await;
-    let unreachable = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
-    FenceRegistry::publish(
-        &[(ShardId::new(0), ShardGeneration::new(3))],
-        ShardId::new(0),
-    )
-    .expect("the runner pins first");
+    let (url, db) = require_db!("pinreuse");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    drop(conn);
+    let pool = dr_pool(&url);
+    let runner_targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    pin_process_fence(DrFencing::Auto, DR_PREFIX, runner_targets, &pool)
+        .await
+        .expect("the runner pins first");
+    // The outage: the pinned database goes away.
+    let admin = admin_url().await.expect("admin url");
+    let mut admin_conn = connect(&admin).await;
+    diesel::sql_query(format!("DROP DATABASE \"{db}\" WITH (FORCE)"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("drop the pinned database");
 
-    let targets = Some((
-        vec![(ShardId::new(0), unreachable.clone())],
-        ShardId::new(0),
-    ));
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
     let Ok((fenced, held)) =
-        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &unreachable, &[]).await
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &[]).await
     else {
         panic!("a pinned shard needs no probe to start");
     };
@@ -2555,17 +2566,25 @@ async fn an_unprobeable_shard_reuses_the_process_pin() {
     assert!(held.is_empty(), "a pinned shard is never held");
     assert_eq!(
         FenceRegistry::expected(ShardId::new(0)),
-        Some(ShardGeneration::new(3)),
+        Some(pinned),
         "the process pin is kept"
     );
 
     // A worker with no shard identity resolves through the default shard.
-    let Ok((fenced, held)) =
-        pin_worker_fence(DrFencing::Auto, DR_PREFIX, None, &unreachable, &[]).await
+    let Ok((fenced, held)) = pin_worker_fence(DrFencing::Auto, DR_PREFIX, None, &pool, &[]).await
     else {
         panic!("the default shard pin covers a worker with no shard identity");
     };
     assert!(fenced.is_some() && held.is_empty());
+
+    // Another pool proves nothing about the pinned database.
+    let other = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    let targets = Some((vec![(ShardId::new(0), other.clone())], ShardId::new(0)));
+    let refused = pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &other, &[]).await;
+    assert!(
+        refused.is_err(),
+        "an unprobed pool that did not take the pin must not reuse it"
+    );
 }
 
 /// A worker writes nothing to a held shard (issue #1823). The shard may be

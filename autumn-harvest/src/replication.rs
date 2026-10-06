@@ -917,6 +917,11 @@ impl FenceRegistry {
             return Err(conflict.into());
         }
         pinned.default_shard = Some(default_shard);
+        // Stored before the sentinel, under the write lock. A reader that
+        // sees `true` waits on the lock, so it finds the sentinel.
+        if !shards.is_empty() || !pinned.generations.is_empty() {
+            ENABLED.store(true, Ordering::Release);
+        }
         for shard in shards {
             let key = shard.as_i32();
             // A shard this process already pinned keeps its real pin.
@@ -924,9 +929,6 @@ impl FenceRegistry {
             if generation == HELD {
                 *pinned.holders.entry(key).or_insert(0) += 1;
             }
-        }
-        if !pinned.generations.is_empty() {
-            ENABLED.store(true, Ordering::Release);
         }
         drop(guard);
         Ok(())
@@ -1885,6 +1887,49 @@ mod db {
         pin_fence(mode, slot_prefix, targets, fallback_pool, Some(assigned)).await
     }
 
+    /// The pool type a pin records.
+    type PinPool = deadpool::managed::WeakPool<
+        diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>,
+    >;
+
+    /// The pools this process took each pin through (issue #1823).
+    ///
+    /// A worker that cannot probe a pinned shard reuses the pin only
+    /// through one of these pools. Another pool can reach another
+    /// database. The handles are weak, so a pin does not keep a pool open.
+    static PIN_POOLS: std::sync::Mutex<Vec<(i32, PinPool)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Record that this process pinned `shard` through `pool`.
+    fn record_pin_pool(shard: ShardId, pool: &crate::worker::DbPool) {
+        let mut pools = PIN_POOLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pools.retain(|(_, weak)| weak.upgrade().is_some());
+        if !pools.iter().any(|(key, weak)| {
+            *key == shard.as_i32() && weak.upgrade().is_some_and(|known| same_pool(&known, pool))
+        }) {
+            pools.push((shard.as_i32(), pool.weak()));
+        }
+        drop(pools);
+    }
+
+    /// Whether this process pinned `shard` through `pool`.
+    fn pinned_through(shard: ShardId, pool: &crate::worker::DbPool) -> bool {
+        let pools = PIN_POOLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = pools.iter().any(|(key, weak)| {
+            *key == shard.as_i32() && weak.upgrade().is_some_and(|known| same_pool(&known, pool))
+        });
+        drop(pools);
+        found
+    }
+
+    /// Whether two handles share one pool. Clones share one manager.
+    fn same_pool(a: &crate::worker::DbPool, b: &crate::worker::DbPool) -> bool {
+        std::ptr::eq(a.manager(), b.manager())
+    }
+
     /// Re-probe the shards [`pin_worker_fence`] held (issue #1823).
     ///
     /// A shard that still cannot be probed stays held. A shard with no DR
@@ -1958,8 +2003,11 @@ mod db {
         let mut held: Vec<(ShardId, crate::worker::DbPool)> = Vec::new();
         // Shards this process pinned before, keyed by their position. A
         // worker reuses such a pin when its probe fails, so a brief outage
-        // does not hold a shard the process already fences.
+        // does not hold a shard the process already fences. It must probe
+        // through the pool that took the pin.
         let mut reused: Vec<(usize, ShardId, ShardGeneration)> = Vec::new();
+        // Pinned shards whose probe failed on another pool.
+        let mut unproven: Vec<ShardId> = Vec::new();
         for (index, (shard, pool)) in probe_targets.iter().enumerate() {
             if worker.is_some() {
                 let once = async {
@@ -1970,6 +2018,10 @@ mod db {
                 let pinned = FenceRegistry::binding(*shard).filter(|(_, pin)| *pin != super::HELD);
                 match (once, pinned) {
                     (Ok(markers), _) => probed.push(Some(markers)),
+                    (Err(_), Some((resolved, _))) if !pinned_through(resolved, pool) => {
+                        probed.push(None);
+                        unproven.push(resolved);
+                    }
                     (Err(error), Some((resolved, generation))) => {
                         tracing::warn!(
                             shard_id = resolved.as_i32(),
@@ -1994,6 +2046,20 @@ mod db {
             } else {
                 probed.push(Some(probe_pool(pool, slot_prefix).await?));
             }
+        }
+        // This process fences the shard, but nothing proves this pool
+        // reaches the pinned database. It can be a logical standby.
+        if !unproven.is_empty() {
+            return Err(crate::error::HarvestError::Config(format!(
+                "this process pins shard(s) {:?}, but this worker cannot probe them, and its \
+                 pool is not the pool that took the pin. Nothing proves that the pool reaches \
+                 the pinned database. Refusing to start. Start the worker when the shard is \
+                 reachable.",
+                unproven
+                    .iter()
+                    .map(|shard| shard.as_i32())
+                    .collect::<Vec<_>>()
+            )));
         }
         let dr_configured = !reused.is_empty() || probed.iter().flatten().any(DrMarkers::is_dr);
         let fence = mode
@@ -2143,10 +2209,13 @@ mod db {
                 "pinned shard write-authority generation for cross-region DR fencing"
             );
         }
-        let fenced = targets
+        let fenced: Vec<_> = targets
             .into_iter()
             .filter(|(shard, _)| !held_shards.contains(shard))
             .collect();
+        for (shard, pool) in &fenced {
+            record_pin_pool(*shard, pool);
+        }
         Ok((Some(fenced), held))
     }
 
