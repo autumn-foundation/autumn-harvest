@@ -244,7 +244,7 @@ pub struct HeartbeatFlushOptions {
 ///
 /// A failed flush keeps its payload. The next tick sends it again, unless a
 /// newer payload replaces it. A lost claim cancels `cancel` and stops the
-/// flusher.
+/// flusher. So does a DR fence on this process.
 ///
 /// Each payload carries the time its sender stamped. The flush writes the
 /// database clock minus the age of that time. A payload that waits in the
@@ -257,6 +257,11 @@ pub fn spawn_heartbeat_flusher_with(
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
 ) -> HeartbeatSlot {
+    // A fence stops this flusher too (issue #1823). The flusher outlives a
+    // drain, so the worker token does not reach it.
+    if crate::replication::FenceRegistry::is_enabled() {
+        crate::replication::FenceRegistry::register_worker_shutdown(&cancel);
+    }
     let latest = LatestHeartbeat::default();
     tokio::spawn(stamped_heartbeat_loop(
         claim,

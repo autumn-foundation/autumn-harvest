@@ -1131,7 +1131,8 @@ impl FenceRegistry {
     /// Register a worker's shutdown token (issue #1823). When this process
     /// is fenced out, every registered worker stops, not only the one whose
     /// sampler saw the bump. A token registered after that is cancelled at
-    /// once.
+    /// once. An activity heartbeat flusher registers its stop token too,
+    /// because it outlives a drain.
     pub fn register_worker_shutdown(token: &tokio_util::sync::CancellationToken) {
         let mut tokens = WORKER_SHUTDOWNS
             .lock()

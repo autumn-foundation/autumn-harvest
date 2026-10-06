@@ -3120,6 +3120,37 @@ async fn a_bump_waits_out_a_write_a_lost_pass_already_sent() {
     );
 }
 
+/// A fence stops an activity heartbeat flusher (issue #1823). The flusher
+/// outlives a drain, so the worker token does not reach it. Without this,
+/// it keeps writing `last_heartbeat_at` after another region owns the row.
+#[tokio::test]
+async fn a_fence_stops_an_activity_heartbeat_flusher() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("hbfence");
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::INITIAL)],
+        ShardId::new(0),
+    )
+    .expect("pin");
+    let stop = tokio_util::sync::CancellationToken::new();
+    let _slot = autumn_harvest::heartbeat::spawn_heartbeat_flusher_with(
+        autumn_harvest::queue::TaskClaim::new(uuid::Uuid::new_v4(), "w-1", 1),
+        dr_pool(&url),
+        stop.clone(),
+        autumn_harvest::heartbeat::HeartbeatFlushOptions {
+            acquire_timeout: std::time::Duration::from_secs(1),
+            metrics: std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+        },
+    );
+
+    FenceRegistry::mark_fenced_out();
+
+    assert!(
+        stop.is_cancelled(),
+        "a fence must stop the heartbeat flusher"
+    );
+}
+
 /// A pass on one shard does not block a bump of another shard on the same
 /// database (issue #1823). Generations are per shard, so the barrier is too.
 #[tokio::test]

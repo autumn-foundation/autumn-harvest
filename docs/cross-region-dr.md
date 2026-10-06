@@ -261,8 +261,9 @@ shard is plain:
   each heartbeat run under the fence barrier. A held or fenced shard gets
   none of them, and they retry later.
 - A worker that finds its pin superseded stops, and so does every other
-  worker in its process: the pins are process-wide. Its heartbeat stops at
-  once, and its shutdown skips its database writes: fleet status,
+  worker in its process: the pins are process-wide. Its heartbeat and every
+  activity heartbeat flusher stop at once. Its shutdown skips its database
+  writes: fleet status,
   sticky-pin release, claim release and the lease keeper. Another region
   owns those rows. Its orphan reclaim recovers the claims.
 - A fenced worker with an assigned shard it cannot reach refuses to start.
