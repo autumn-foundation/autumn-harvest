@@ -629,6 +629,19 @@ jobs:
       - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
         run: python3 docs/audits/audit-catalog-coverage.py
 
+      # Issue #1831: a tracked binary or a patch leftover fails the build.
+      # The script lists the binaries that the repository needs.
+      - name: Tracked artifacts (docs/audits/tracked-artifacts.py)
+        run: |
+          python3 docs/audits/tracked-artifacts.py --self-test
+          python3 docs/audits/tracked-artifacts.py
+
+      # Issue #1831: a doc claim that shipped code made false fails the build.
+      - name: Doc claim drift (docs/audits/doc-claim-drift.py)
+        run: |
+          python3 docs/audits/doc-claim-drift.py --self-test
+          python3 docs/audits/doc-claim-drift.py
+
       # Issue #1614: the standalone getting-started chapter shows the files of
       # examples/standalone-quickstart byte for byte, and keeps the markers
       # that the `standalone-chapter` job runs.
@@ -714,6 +727,16 @@ jobs:
         run: |
           python3 -m pip install --quiet --disable-pip-version-check "PyYAML==6.0.2"
           python3 docs/audits/workflow-yaml-parse.py
+
+      # Issue #1828. The rolling-deploy contract page and the
+      # `mixed-version-smoke` job must both exist and name each other.
+      - name: Mixed-version contract guard (docs/audits/mixed-version-contract.py)
+        run: |
+          python3 docs/audits/mixed-version-contract.py --self-test
+          python3 docs/audits/mixed-version-contract.py
+      # The smoke crate is not a workspace member, so `cargo fmt --all` skips it.
+      - name: Format check of the mixed-version smoke crate
+        run: rustfmt --edition 2024 --check scripts/mixed-version-smoke/src/*.rs
 
       # The contract is what the OpenAPI document is generated from, so a
       # status or a mandatory field missing there is missing from every
@@ -1397,17 +1420,19 @@ jobs:
       # `postgres:11-alpine` (the unoverridden default -- `autumn-web`'s own
       # `TestDb`, used by e.g. the webhook suites), `postgres:16` (the tag
       # ~220 of this repo's own DB suites request via `.with_tag("16")`),
-      # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
+      # `postgres:16-alpine` (one outlier suite's override), `redis:5.0`
       # (Redis's default, un-overridden anywhere; needed by the issue #1312
       # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
-      # below), and `softwaremill/elasticmq:1.5.2` on the one shard that runs the
+      # below), `redis:7.4-alpine` (the TLS-only server of the issue #1834
+      # `tls_redis` suite; Redis 5 has no TLS), and
+      # `softwaremill/elasticmq:1.5.2` on the one shard that runs the
       # `connector_sqs_broker` suite (its ElasticMQ default, which "bytes
       # remaining on stream" failed on PR #1773 because it was not pre-pulled).
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
-          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0"
+          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 redis:7.4-alpine"
           # Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
           # The dry run prints this shard's cargo invocations without running
           # them, so no shard number is hardcoded here. It is captured first:
@@ -1660,6 +1685,51 @@ jobs:
           set -o pipefail
           cargo test -p autumn-harvest-plugin --features metrics,webhooks --doc EmbeddingDocSnippets 2>&1 | tee embedding-doctests.log
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' embedding-doctests.log
+
+  mixed-version-smoke:
+    name: "Mixed-version smoke: this tree and the previous release (issue #1828)"
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mvsmoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Full history: the script finds the previous release by its tag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Two trees build here, so free the disk as the `test` job does.
+      - name: Free runner disk before two builds
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      # See docs/upgrading/README.md, "How CI proves the contract".
+      - name: Run the previous release and this tree on one database
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/mvsmoke
+          # No debug info: it halves the size of two debug builds.
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: ./scripts/run-mixed-version-smoke.sh
 
   openapi-client-smoke:
     name: Generated TypeScript client drives a running plugin

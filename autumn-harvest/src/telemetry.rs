@@ -1294,6 +1294,18 @@ pub const METRIC_LOAD_SHED_ACTIVE: &str = "harvest.load_shed.active";
 ///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the shed queue.
 pub const METRIC_LOAD_SHED_REJECTED: &str = "harvest.load_shed.rejected";
 
+/// Counter: one per request the API rate limiter refused with `429` (issue
+/// #1827).
+///
+/// Labels:
+///   - `"route_class"` (= [`METRIC_LABEL_ROUTE_CLASS`]) — `"mutating"` or
+///     `"read"`.
+///   - `"client_kind"` (= [`METRIC_LABEL_CLIENT_KIND`]) — `"token"`, `"ip"`,
+///     `"unknown"` or `"overflow"`.
+///
+/// The token id and the client address are never labels.
+pub const METRIC_API_RATE_LIMITED: &str = "harvest.api.rate_limited";
+
 /// Gauge: current available tokens in a rate limit bucket.
 pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
 
@@ -1943,6 +1955,10 @@ pub const METRIC_LABEL_GAP: &str = "gap";
 pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 /// Metric label: admission gate scope kind (issue #377).
 pub const METRIC_LABEL_SCOPE: &str = "scope";
+/// Metric label: the route class an API rate-limit bucket counts (issue #1827).
+pub const METRIC_LABEL_ROUTE_CLASS: &str = "route_class";
+/// Metric label: what identifies an API rate-limit client (issue #1827).
+pub const METRIC_LABEL_CLIENT_KIND: &str = "client_kind";
 /// Metric label: the in-process start producer (issue #618).
 pub const METRIC_LABEL_PRODUCER: &str = "producer";
 /// Metric label: the build ID of the worker.
@@ -2517,6 +2533,14 @@ pub trait MetricsRecorder: Send + Sync {
     /// nothing is silently slipping an active gate.
     fn record_admission_bypassed(&self, producer: &str) {
         let _ = producer;
+    }
+
+    /// The API rate limiter refused one request with `429` (issue #1827).
+    ///
+    /// `route_class` is `"mutating"` or `"read"`. `client_kind` is
+    /// `"token"`, `"ip"`, `"unknown"` or `"overflow"`.
+    fn record_api_rate_limited(&self, route_class: &str, client_kind: &str) {
+        let _ = (route_class, client_kind);
     }
 
     /// The load-shed state of `queue` after one sample (issue #1794).

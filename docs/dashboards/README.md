@@ -200,7 +200,9 @@ value (`harvest_worker_slots_in_use` / `_available`, `harvest_db_pool_in_use`
 / `_idle`, `harvest_worker_pollers`), sum correctly across the fleet; the
 per-replica slot panels legend the `instance` label instead.
 `harvest_worker_outlier` is per worker: each worker reports only itself, so
-its panel keeps the `instance` label and never sums it.
+its panel keeps the `instance` label and never sums it. The API rate limiter
+keeps its buckets per replica, so `harvest_api_rate_limited_total` sums
+across the fleet (issue #1827).
 
 ## Lint Validation
 
