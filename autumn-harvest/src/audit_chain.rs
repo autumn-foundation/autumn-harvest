@@ -459,6 +459,59 @@ pub(crate) struct Stamped {
 #[cfg(feature = "db")]
 const VERIFY_PAGE_ROWS: i64 = 1_000;
 
+/// The chain state the stored rows hold, for a cursor that lost its own.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoredChainState {
+    /// The link of the newest chained row.
+    pub(crate) head: ChainHash,
+    /// The first chained `export_seq`.
+    pub(crate) start_seq: i64,
+}
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct StoredChainRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Bytea>)]
+    head: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    start_seq: Option<i64>,
+}
+
+/// Read the newest link and the chain start from rows up to `through_seq`.
+///
+/// Returns `None` when no row is chained. It scans the unchained rows, so the
+/// exporter calls it only for a cursor with no head, before a stamp.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub(crate) async fn stored_chain_state(
+    conn: &mut diesel_async::AsyncPgConnection,
+    through_seq: i64,
+) -> crate::error::HarvestResult<Option<StoredChainState>> {
+    use diesel_async::RunQueryDsl;
+
+    let row: StoredChainRow = diesel::sql_query(
+        "SELECT \
+             (SELECT chain_hash FROM harvest_audit_log \
+              WHERE chain_hash IS NOT NULL AND export_seq <= $1 \
+              ORDER BY export_seq DESC LIMIT 1) AS head, \
+             (SELECT MIN(export_seq) FROM harvest_audit_log \
+              WHERE chain_hash IS NOT NULL AND export_seq <= $1) AS start_seq",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(through_seq)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(row
+        .head
+        .as_deref()
+        .and_then(from_bytes)
+        .zip(row.start_seq)
+        .map(|(head, start_seq)| StoredChainState { head, start_seq }))
+}
+
 /// Stamp the chain over the rows with `after_seq < export_seq <= through_seq`.
 ///
 /// `head` is the cursor's `chain_head`, or `None` for the first link. Returns

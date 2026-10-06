@@ -1120,14 +1120,6 @@ pub struct ClaimedBatch {
     pub lease_until: DateTime<Utc>,
 }
 
-/// Whether an upsert inserted its row.
-#[cfg(feature = "db")]
-#[derive(diesel::QueryableByName)]
-struct Inserted {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    inserted: bool,
-}
-
 /// Create this shard's cursor row if it does not exist, and heartbeat it if it
 /// does. **Never reactivates a retired cursor** — see issue #1273.
 ///
@@ -1187,47 +1179,18 @@ pub async fn ensure_cursor_row(
     // Resuming a retired shard is [`reactivate_cursor`]: an explicit, audited
     // operator action, not a side effect of the exporter noticing new work.
     //
-    // `RETURNING` yields a row only when the upsert inserts or heartbeats.
-    // `xmax = 0` marks an insert (issue #1838).
-    let inserted = diesel::sql_query(
+    // A rebuilt row has no chain state. The next keyed claim seeds it from the
+    // stored rows, inside its own transaction (issue #1838).
+    diesel::sql_query(
         "INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq) \
          SELECT $1, COALESCE(MAX(export_seq), 0) FROM harvest_audit_log \
          ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW() \
-         WHERE harvest_audit_export_cursor.retired_at IS NULL \
-         RETURNING (xmax = 0) AS inserted",
+         WHERE harvest_audit_export_cursor.retired_at IS NULL",
     )
     .bind::<diesel::sql_types::Integer, _>(shard_id)
-    .load::<Inserted>(conn)
+    .execute(conn)
     .await
-    .map_err(crate::error::database_error)?
-    .iter()
-    .any(|row| row.inserted);
-
-    // A fresh row also seeds the chain head and start from the stored rows
-    // (issue #1838), for the same reason as `last_assigned_seq` above. A
-    // rebuilt cursor then continues the chain, not a new one from the genesis
-    // link. The seed cannot compute the checkpoint MAC. So the verifier
-    // reports the checkpoint as missing until the next keyed stamp signs it.
-    // It runs only on insert, because its lookups scan unchained rows.
-    if inserted {
-        diesel::sql_query(
-            "WITH head AS ( \
-                 SELECT chain_hash, export_seq, occurred_at FROM harvest_audit_log \
-                 WHERE chain_hash IS NOT NULL ORDER BY export_seq DESC LIMIT 1 \
-             ) \
-             UPDATE harvest_audit_export_cursor SET \
-                 chain_head = head.chain_hash, \
-                 chain_head_seq = head.export_seq, \
-                 chain_head_occurred_at = head.occurred_at, \
-                 chain_start_seq = (SELECT MIN(export_seq) FROM harvest_audit_log \
-                                    WHERE chain_hash IS NOT NULL) \
-             FROM head WHERE shard_id = $1",
-        )
-        .bind::<diesel::sql_types::Integer, _>(shard_id)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    }
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -2405,24 +2368,39 @@ pub async fn claim_shard_chained(
             // key set later starts the chain at the next sequence.
             let stamped = match chain_key {
                 Some(key) if last_assigned_seq > cursor.last_assigned_seq => {
+                    // A rebuilt cursor has no head while chained rows exist.
+                    // Seed it here, under the cursor lock and in this
+                    // transaction, so the chain never restarts from genesis.
+                    let seed = if cursor.chain_head.is_none() {
+                        crate::audit_chain::stored_chain_state(conn, cursor.last_assigned_seq)
+                            .await?
+                    } else {
+                        None
+                    };
+                    let head = cursor
+                        .chain_head
+                        .clone()
+                        .or_else(|| seed.map(|seed| seed.head.to_vec()));
+                    let start_seq = cursor
+                        .chain_start_seq
+                        .or_else(|| seed.map(|seed| seed.start_seq));
                     crate::audit_chain::stamp_chain(
                         conn,
                         shard_id,
                         key,
                         cursor.last_assigned_seq,
                         last_assigned_seq,
-                        cursor.chain_head.as_deref(),
+                        head.as_deref(),
                     )
                     .await?
-                    .map(|stamped| (key, stamped))
+                    .map(|stamped| (key, stamped, start_seq))
                 }
                 _ => None,
             };
-            // The keyed checkpoint moves with the head (issue #1838). A
-            // rebuilt cursor keeps its seeded start.
-            let checkpoint = stamped.map(|(key, stamped)| {
+            // The keyed checkpoint moves with the head (issue #1838).
+            let checkpoint = stamped.map(|(key, stamped, start_seq)| {
                 let checkpoint = crate::audit_chain::ChainCheckpoint {
-                    start_seq: cursor.chain_start_seq.unwrap_or(stamped.first_seq),
+                    start_seq: start_seq.unwrap_or(stamped.first_seq),
                     head_seq: stamped.head_seq,
                     head: stamped.head,
                     head_occurred_at: stamped.head_occurred_at,
