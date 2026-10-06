@@ -985,9 +985,14 @@ impl Batch {
     }
 
     fn push(&mut self, op: Op, waits_for: Option<Pending>) {
-        if let Some(branch) = self.resumed.take() {
+        if let Some(branch) = self.resumed {
             self.branches[branch].push(op);
-            self.pending[branch] = waits_for;
+            // An immediate op does not park, so the branch goes on with the
+            // next command. A parking one ends the resume.
+            if waits_for.is_some() {
+                self.pending[branch] = waits_for;
+                self.resumed = None;
+            }
         } else {
             self.branches.push(vec![op]);
             self.pending.push(waits_for);
@@ -1669,7 +1674,7 @@ fn paired_op<'h>(
 /// Builds the [`Op::SagaUnwind`] that a `saga_compensated:{seq}` marker
 /// opens. The compensations are the activities the saga runs one by one
 /// after the marker, at most the `count` that the marker records. Their
-/// schedules go to `claimed`.
+/// schedules go to `claimed`; a sibling schedule stays with the main loop.
 fn mirror_saga(
     history: &[WorkflowEvent],
     start: usize,
@@ -1678,22 +1683,34 @@ fn mirror_saga(
 ) -> Op {
     let mut compensations = Vec::new();
     let mut ids = HashSet::new();
+    // A saga runs its compensations one by one. A schedule while one still
+    // runs is a sibling command, such as another branch of a `join!`.
+    let mut running = None;
+    let mut siblings = HashSet::new();
     for (index, event) in history.iter().enumerate().skip(start) {
-        match activity_outcome(event) {
-            Some((id, Outcome::Progress))
-                if matches!(event, WorkflowEvent::ActivityScheduled { .. })
-                    && compensations.len() < count =>
-            {
-                if let WorkflowEvent::ActivityScheduled {
-                    name, input, queue, ..
-                } = event
-                {
+        match (event, activity_outcome(event)) {
+            (
+                WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name,
+                    input,
+                    queue,
+                },
+                _,
+            ) => {
+                if running.is_none() && compensations.len() < count {
                     compensations.push((name.clone(), input.clone(), queue.clone()));
+                    ids.insert(*activity_id);
+                    running = Some(*activity_id);
+                    claimed.insert(index);
+                } else {
+                    siblings.insert(*activity_id);
                 }
-                ids.insert(id);
-                claimed.insert(index);
             }
-            Some((id, _)) if ids.contains(&id) => {}
+            (_, Some((id, Outcome::Done | Outcome::Failed))) if running == Some(id) => {
+                running = None;
+            }
+            (_, Some((id, _))) if ids.contains(&id) || siblings.contains(&id) => {}
             _ => break,
         }
     }
