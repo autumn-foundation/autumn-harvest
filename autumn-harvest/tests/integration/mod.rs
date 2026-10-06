@@ -137,6 +137,7 @@ mod external_outbox_scan_tests;
 mod fanout_tests;
 mod force_fail_tests;
 mod formal_models_coverage;
+mod fuzz_nightly_wiring;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
@@ -227,6 +228,8 @@ mod redrive_tests;
 mod replay_canary_tests;
 #[cfg(feature = "testing")]
 mod replay_drift_tests;
+#[cfg(feature = "fuzzing")]
+mod replay_fuzz_seeds;
 mod replay_tests;
 #[cfg(feature = "testing")]
 mod replay_verifier_tests;
@@ -292,6 +295,9 @@ mod sticky_default_tests;
 mod sticky_routing_tests;
 mod supply_chain_ci;
 mod telemetry_span_tests;
+#[cfg(feature = "db")]
+mod tenant_cell_isolation_tests;
+mod tenant_isolation_docs;
 #[cfg(feature = "db")]
 mod terminal_task_gc_tests;
 #[cfg(feature = "db")]

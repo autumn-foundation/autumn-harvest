@@ -1,0 +1,94 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": null,
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000803",
+        "name": "slow",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "MarkerRecorded",
+      "data": {
+        "name": "fan_out:1",
+        "details": 2
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000804",
+        "name": "task",
+        "input": 0,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000805",
+        "name": "task",
+        "input": 1,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityFailed",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000804",
+        "error": "boom",
+        "attempt": 1,
+        "error_type": "Error",
+        "non_retryable": true
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000806",
+        "name": "cleanup",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000806",
+        "output": 6
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000805",
+        "output": 5
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000803",
+        "output": 3
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": null
+      }
+    }
+  ]
+}
