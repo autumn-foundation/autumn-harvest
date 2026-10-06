@@ -1390,12 +1390,17 @@ impl HandlerRegistry {
                     "wasm": wasm,
                 });
                 // A local activity has no task row, so its own defaults apply
-                // on this worker.
+                // on this worker. The local batch rejects a schedule-to-close
+                // at run time, so the key holds that field too.
                 let mut policy = policy;
                 if info.is_local {
                     policy["retry_policy"] = serde_json::json!(info.default_retry_policy);
                     policy["start_to_close"] = serde_json::json!(
                         info.default_start_to_close
+                            .map(crate::workers::duration_key)
+                    );
+                    policy["schedule_to_close"] = serde_json::json!(
+                        info.default_schedule_to_close
                             .map(crate::workers::duration_key)
                     );
                 }
@@ -40145,6 +40150,15 @@ mod tests {
             policy(vec![act("charge", None, false)]),
             policy(vec![with_timeout(false)]),
             "a remote activity's start-to-close is on its row"
+        );
+        // The local batch rejects a schedule-to-close at run time, so a worker
+        // with one fails tasks that its peers run.
+        let mut with_deadline = act("charge", None, true);
+        with_deadline.default_schedule_to_close = Some(Duration::from_secs(1));
+        assert_ne!(
+            policy(vec![act("charge", None, true)]),
+            policy(vec![with_deadline]),
+            "a local activity's schedule-to-close"
         );
         let registry_default = HandlerRegistry::new(vec![], vec![act("charge", None, true)])
             .with_activity_defaults(None, Some(Duration::from_secs(1)))

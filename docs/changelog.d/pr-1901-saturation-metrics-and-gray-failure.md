@@ -87,7 +87,7 @@ heartbeat check only. A worker that was alive but sick passed that check.
   `max_current_details_bytes`, the history policy, the offload threshold and store id, the
   activity interceptor chain, and each activity's effective result and input
   caps, local flag, rate limit, concurrency limit and WASM binding, a local
-  activity's own retry and start-to-close defaults, the registry's
+  activity's own retry, start-to-close and schedule-to-close defaults, the registry's
   local-activity defaults and retry-after ceiling, the hot-code-swap
   module-host policy, each workflow's effective input cap, DAG
   classification and quota, the declarative query and update handlers, and the workflow
