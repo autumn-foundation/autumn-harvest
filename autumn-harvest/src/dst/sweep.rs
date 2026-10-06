@@ -3,6 +3,7 @@
 use std::fmt;
 use std::ops::Range;
 
+use super::invariant::Invariant;
 use super::sim::{SimConfig, SimReport, SimStats, run};
 use super::store::Fencing;
 
@@ -14,6 +15,8 @@ pub const SEEDS_VAR: &str = "HARVEST_DST_SEEDS";
 pub const SEED_BASE_VAR: &str = "HARVEST_DST_SEED_BASE";
 /// The owner-write guard: `claim-epoch` (the default) or `state-only`.
 pub const FENCING_VAR: &str = "HARVEST_DST_FENCING";
+/// A comma list of invariant names to check. The default is all of them.
+pub const CHECKS_VAR: &str = "HARVEST_DST_CHECKS";
 
 /// Two runs of one seed gave different traces.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,32 +149,66 @@ impl SeedPlan {
     }
 }
 
-/// The fencing that [`FENCING_VAR`] names, or [`Fencing::ClaimEpoch`].
+/// The config for `seed` with the values of [`FENCING_VAR`] and
+/// [`CHECKS_VAR`]. A missing value keeps the default of [`SimConfig::new`].
 ///
 /// # Errors
 ///
-/// Returns a message when the value is not a known name.
-pub fn fencing_from_env() -> Result<Fencing, String> {
-    std::env::var(FENCING_VAR).map_or(Ok(Fencing::ClaimEpoch), |name| Fencing::parse(&name))
+/// Returns a message when a value is not a known name.
+pub fn config_from_vars(
+    seed: u64,
+    fencing: Option<&str>,
+    checks: Option<&str>,
+) -> Result<SimConfig, String> {
+    let mut config = SimConfig::new(seed);
+    if let Some(name) = fencing {
+        config.fencing = Fencing::parse(name.trim())?;
+    }
+    if let Some(list) = checks {
+        config.checks = list
+            .split(',')
+            .map(|name| Invariant::parse(name.trim()))
+            .collect::<Result<_, _>>()?;
+    }
+    Ok(config)
 }
 
-/// The shell command that replays `seed` locally.
+/// [`config_from_vars`] with the values from the environment.
+///
+/// # Errors
+///
+/// Returns a message when a value is not a known name.
+pub fn config_from_env(seed: u64) -> Result<SimConfig, String> {
+    let fencing = std::env::var(FENCING_VAR).ok();
+    let checks = std::env::var(CHECKS_VAR).ok();
+    config_from_vars(seed, fencing.as_deref(), checks.as_deref())
+}
+
+/// The shell command that replays `config` locally.
+///
+/// It names every value that [`config_from_env`] reads, so the replay
+/// builds the same config.
 #[must_use]
-pub fn repro_command(seed: u64, fencing: Fencing) -> String {
+pub fn repro_command(config: &SimConfig) -> String {
+    let checks = if config.checks == Invariant::ALL {
+        String::new()
+    } else {
+        let names: Vec<&str> = config.checks.iter().map(|i| i.name()).collect();
+        format!("{CHECKS_VAR}={} ", names.join(","))
+    };
     format!(
-        "{SEED_VAR}={seed} {FENCING_VAR}={} cargo test -p autumn-harvest \
+        "{SEED_VAR}={} {FENCING_VAR}={} {checks}cargo test -p autumn-harvest \
          --no-default-features --test dst replay_one_seed -- --nocapture",
-        fencing.as_str()
+        config.seed,
+        config.fencing.as_str()
     )
 }
 
 /// A seed that failed a sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepFailure {
-    /// The seed.
-    pub seed: u64,
-    /// The fencing of the run.
-    pub fencing: Fencing,
+    /// The config of the failed run.
+    pub config: SimConfig,
     /// The failed invariant or the determinism error.
     pub reason: String,
     /// The last trace lines of the run.
@@ -183,9 +220,9 @@ impl fmt::Display for SweepFailure {
         write!(
             f,
             "seed {} failed: {}\nreproduce: {}\nlast steps:\n{}",
-            self.seed,
+            self.config.seed,
             self.reason,
-            repro_command(self.seed, self.fencing),
+            repro_command(&self.config),
             self.trace_tail
         )
     }
@@ -211,24 +248,26 @@ pub const TAIL_LINES: usize = 40;
 pub fn sweep(
     plan: &SeedPlan,
     config: impl Fn(u64) -> SimConfig,
-) -> Result<SweepSummary, SweepFailure> {
+) -> Result<SweepSummary, Box<SweepFailure>> {
     let mut summary = SweepSummary::default();
     for seed in plan.seeds() {
         let config = config(seed);
-        let fencing = config.fencing;
-        let report = run_twice(&config).map_err(|error| SweepFailure {
-            seed,
-            fencing,
-            reason: error.to_string(),
-            trace_tail: String::new(),
-        })?;
+        let report = match run_twice(&config) {
+            Ok(report) => report,
+            Err(error) => {
+                return Err(Box::new(SweepFailure {
+                    config,
+                    reason: error.to_string(),
+                    trace_tail: String::new(),
+                }));
+            }
+        };
         if let Some(violation) = &report.violation {
-            return Err(SweepFailure {
-                seed,
-                fencing,
+            return Err(Box::new(SweepFailure {
+                config,
                 reason: violation.to_string(),
                 trace_tail: report.trace_tail(TAIL_LINES),
-            });
+            }));
         }
         summary.seeds += 1;
         summary.stats.merge(&report.stats);
@@ -242,10 +281,42 @@ mod tests {
 
     #[test]
     fn repro_command_names_the_seed_the_fencing_and_the_test() {
-        let command = repro_command(42, Fencing::StateOnly);
+        let config = SimConfig::new(42).with_fencing(Fencing::StateOnly);
+        let command = repro_command(&config);
         assert!(command.starts_with("HARVEST_DST_SEED=42 HARVEST_DST_FENCING=state-only "));
         assert!(command.contains("--test dst replay_one_seed"), "{command}");
+        assert!(
+            !command.contains(CHECKS_VAR),
+            "all checks is the default: {command}"
+        );
         assert!(!command.contains('\\'), "one line: {command}");
+    }
+
+    #[test]
+    fn repro_command_names_a_subset_of_checks() {
+        let checks = [
+            Invariant::TerminalByCurrentClaim,
+            Invariant::AtMostOneTerminal,
+        ];
+        let config = SimConfig::new(3).checking(&checks);
+        let command = repro_command(&config);
+        assert!(
+            command.contains("HARVEST_DST_CHECKS=TerminalByCurrentClaim,AtMostOneTerminal "),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn config_from_vars_round_trips_the_repro_command() {
+        let config = SimConfig::new(9)
+            .with_fencing(Fencing::StateOnly)
+            .checking(&[Invariant::HeartbeatByCurrentClaim]);
+        let parsed = config_from_vars(9, Some("state-only"), Some("HeartbeatByCurrentClaim"))
+            .expect("valid");
+        assert_eq!(parsed, config);
+        assert_eq!(config_from_vars(9, None, None), Ok(SimConfig::new(9)));
+        assert!(config_from_vars(9, None, Some("NoSuchInvariant")).is_err());
+        assert!(config_from_vars(9, Some("none"), None).is_err());
     }
 
     #[test]

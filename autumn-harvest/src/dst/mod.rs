@@ -27,6 +27,7 @@ pub use store::{
     Claim, ClaimStore, Fencing, Op, OracleStore, Orphan, Outcome, Row, TaskState, WriteOutcome,
 };
 pub use sweep::{
-    FENCING_VAR, Nondeterminism, SEED_BASE_VAR, SEED_VAR, SEEDS_VAR, SeedPlan, SweepFailure,
-    SweepSummary, TAIL_LINES, fencing_from_env, first_divergence, repro_command, run_twice, sweep,
+    CHECKS_VAR, FENCING_VAR, Nondeterminism, SEED_BASE_VAR, SEED_VAR, SEEDS_VAR, SeedPlan,
+    SweepFailure, SweepSummary, TAIL_LINES, config_from_env, config_from_vars, first_divergence,
+    repro_command, run_twice, sweep,
 };

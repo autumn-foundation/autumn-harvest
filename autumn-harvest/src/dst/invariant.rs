@@ -47,6 +47,26 @@ impl Invariant {
     }
 }
 
+impl Invariant {
+    /// Parse a name from [`Invariant::name`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message that names the accepted values.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|invariant| invariant.name() == name)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ALL.iter().map(|i| i.name()).collect();
+                format!(
+                    "unknown invariant {name:?}: use one of {}",
+                    names.join(", ")
+                )
+            })
+    }
+}
+
 impl fmt::Display for Invariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
@@ -76,7 +96,7 @@ impl fmt::Display for Violation {
 
 /// The kind of an owner write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriteKind {
+pub enum WriteKind {
     /// The start fence.
     Start,
     /// A task heartbeat.
@@ -87,14 +107,14 @@ pub(crate) enum WriteKind {
 
 /// A claim that a worker still acts on, with its ghost sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Live<'a> {
+pub struct Live<'a> {
     pub claim: &'a Claim,
     pub seq: u64,
 }
 
 /// The ghost state: which claim each row holds, and the terminal writes.
 #[derive(Debug, Clone)]
-pub(crate) struct Ghost {
+pub struct Ghost {
     holders: Vec<Option<u64>>,
     terminals: Vec<Vec<u64>>,
 }
@@ -184,7 +204,7 @@ mod tests {
         let mut ghost = Ghost::new(1);
         ghost.claimed(0, 1);
         for kind in [WriteKind::Start, WriteKind::Heartbeat, WriteKind::Complete] {
-            assert!(ghost.wrote(kind, 0, 1, WriteOutcome::Applied).is_empty());
+            assert_eq!(ghost.wrote(kind, 0, 1, WriteOutcome::Applied), Vec::new());
         }
     }
 
@@ -193,7 +213,7 @@ mod tests {
         let mut ghost = Ghost::new(1);
         ghost.claimed(0, 2);
         let found = ghost.wrote(WriteKind::Complete, 0, 1, WriteOutcome::LeaseLost);
-        assert!(found.is_empty());
+        assert_eq!(found, Vec::new());
     }
 
     #[test]
@@ -231,14 +251,19 @@ mod tests {
     fn a_second_terminal_write_breaks_at_most_one_terminal() {
         let mut ghost = Ghost::new(1);
         ghost.claimed(0, 1);
-        assert!(
-            ghost
-                .wrote(WriteKind::Complete, 0, 1, WriteOutcome::Applied)
-                .is_empty()
-        );
+        let first = ghost.wrote(WriteKind::Complete, 0, 1, WriteOutcome::Applied);
+        assert_eq!(first, Vec::new());
         ghost.claimed(0, 2);
         let found = ghost.wrote(WriteKind::Complete, 0, 2, WriteOutcome::Applied);
         assert_eq!(names(&found), [Invariant::AtMostOneTerminal]);
+    }
+
+    #[test]
+    fn names_round_trip() {
+        for invariant in Invariant::ALL {
+            assert_eq!(Invariant::parse(invariant.name()), Ok(invariant));
+        }
+        assert!(Invariant::parse("Nothing").is_err());
     }
 
     #[test]

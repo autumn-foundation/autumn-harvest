@@ -407,8 +407,8 @@ mod tests {
         assert_eq!(requeued, Outcome::Requeued(true));
     }
 
-    fn write(store: &mut OracleStore, op: Op) -> WriteOutcome {
-        match store.apply(&op) {
+    fn write(store: &mut OracleStore, op: &Op) -> WriteOutcome {
+        match store.apply(op) {
             Outcome::Write(outcome) => outcome,
             other => panic!("expected a write outcome, got {other:?}"),
         }
@@ -517,14 +517,14 @@ mod tests {
             },
         ];
         for op in ops {
-            assert_eq!(write(&mut store, op), WriteOutcome::LeaseLost);
+            assert_eq!(write(&mut store, &op), WriteOutcome::LeaseLost);
         }
         assert_eq!(store.rows()[0].state, TaskState::Running);
         let done = Op::Complete {
             claim: fresh,
             tag: 2,
         };
-        assert_eq!(write(&mut store, done), WriteOutcome::Applied);
+        assert_eq!(write(&mut store, &done), WriteOutcome::Applied);
         assert_eq!(store.rows()[0].state, TaskState::Completed);
         assert_eq!(store.rows()[0].output, Some(2));
     }
@@ -536,13 +536,13 @@ mod tests {
             claim: stale,
             tag: 1,
         };
-        assert_eq!(write(&mut store, done), WriteOutcome::Applied);
+        assert_eq!(write(&mut store, &done), WriteOutcome::Applied);
         assert_eq!(store.rows()[0].output, Some(1), "the stale result wins");
         let late = Op::Complete {
             claim: fresh,
             tag: 2,
         };
-        assert_eq!(write(&mut store, late), WriteOutcome::LeaseLost);
+        assert_eq!(write(&mut store, &late), WriteOutcome::LeaseLost);
     }
 
     #[test]
@@ -553,13 +553,13 @@ mod tests {
             claim: held.clone(),
             tag: 4,
         };
-        assert_eq!(write(&mut store, hb), WriteOutcome::Applied);
+        assert_eq!(write(&mut store, &hb), WriteOutcome::Applied);
         assert_eq!(store.rows()[0].heartbeat, Some(4));
         let done = Op::Complete {
             claim: held,
             tag: 5,
         };
-        assert_eq!(write(&mut store, done), WriteOutcome::Applied);
+        assert_eq!(write(&mut store, &done), WriteOutcome::Applied);
         assert_eq!(store.rows()[0].heartbeat, None);
     }
 
@@ -571,7 +571,7 @@ mod tests {
             claim: held,
             tag: 4,
         };
-        assert_eq!(write(&mut store, hb), WriteOutcome::Applied);
+        assert_eq!(write(&mut store, &hb), WriteOutcome::Applied);
         reclaim(&mut store, 0);
         assert_eq!(store.rows()[0].heartbeat, Some(4));
         assert_eq!(store.rows()[0].worker, None);

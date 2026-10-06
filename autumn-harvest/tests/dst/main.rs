@@ -56,6 +56,10 @@ fn pre_fix_guard_reproduces_issue_1789() {
     let report = first_pre_fix_failure();
     let violation = report.violation.clone().expect("a violation");
     assert_eq!(violation.invariant, Invariant::TerminalByCurrentClaim);
+    assert_eq!(
+        report.config.seed, 6,
+        "docs/testing/simulation.md names seed 6; update it with the seed"
+    );
 
     // The stale write took effect while another claim held the row.
     let step = report
@@ -89,12 +93,26 @@ fn claim_epoch_guard_rejects_the_stale_write_on_the_same_seed() {
 fn a_sweep_failure_prints_a_local_replay_command() {
     let failure = dst::sweep(&PRE_FIX_SEEDS, pre_fix).expect_err("the pre-fix sweep fails");
     let text = failure.to_string();
+    let seed = failure.config.seed;
+    assert!(text.contains(&format!("HARVEST_DST_SEED={seed}")), "{text}");
+    assert!(text.contains("HARVEST_DST_FENCING=state-only"), "{text}");
     assert!(
-        text.contains(&format!("HARVEST_DST_SEED={}", failure.seed)),
+        text.contains("HARVEST_DST_CHECKS=TerminalByCurrentClaim"),
         "{text}"
     );
-    assert!(text.contains("HARVEST_DST_FENCING=state-only"), "{text}");
-    assert!(text.contains("TerminalByCurrentClaim"), "{text}");
+
+    // The variables in the command rebuild the config, so the replay stops
+    // at the same violation.
+    let replay = dst::config_from_vars(seed, Some("state-only"), Some("TerminalByCurrentClaim"))
+        .expect("valid variables");
+    assert_eq!(replay, failure.config);
+    let report = dst::run(&replay);
+    let violation = report.violation.expect("the replay fails too");
+    assert!(
+        failure.reason.starts_with(&violation.to_string()),
+        "{}",
+        failure.reason
+    );
 }
 
 #[test]
@@ -102,7 +120,41 @@ fn every_seed_runs_twice_with_identical_traces() {
     for seed in 0..32 {
         let config = SimConfig::new(seed);
         let report = dst::run_twice(&config).unwrap_or_else(|error| panic!("{error}"));
-        assert!(!report.trace.is_empty());
+        assert_ne!(report.trace.len(), 0);
+    }
+}
+
+/// FNV-1a over the trace text.
+fn trace_hash(report: &SimReport) -> u64 {
+    report
+        .trace
+        .join("\n")
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
+/// The traces of the first seeds are fixed.
+///
+/// A run-twice check runs in one process, so it cannot see a difference
+/// between platforms. CI runs this test on Linux, macOS and Windows. A
+/// change to the scheduler or its weights changes these values on purpose.
+/// Update them in the same change.
+#[test]
+fn golden_traces_are_equal_on_every_platform() {
+    let golden = [
+        (0, 231, 0x4d60_3824_99b5_a6f6),
+        (1, 109, 0xddfd_d365_e1ca_b6cf),
+        (2, 178, 0x2eba_e3e7_de3a_e3a7),
+    ];
+    for (seed, lines, hash) in golden {
+        let report = dst::run(&SimConfig::new(seed));
+        assert_eq!(
+            (report.trace.len(), trace_hash(&report)),
+            (lines, hash),
+            "seed {seed}: the trace changed"
+        );
     }
 }
 
@@ -145,18 +197,22 @@ fn seed_plan_reads_one_seed_or_a_range() {
 /// The sweep that CI and the nightly job run.
 ///
 /// `HARVEST_DST_SEEDS` and `HARVEST_DST_SEED_BASE` pick the seeds.
-/// `HARVEST_DST_SEED` runs one seed.
+/// `HARVEST_DST_SEED` runs one seed. `HARVEST_DST_FENCING` and
+/// `HARVEST_DST_CHECKS` change the config.
 #[test]
 fn seed_sweep() {
     let plan = SeedPlan::from_env(DEFAULT_SEEDS).unwrap_or_else(|error| panic!("{error}"));
-    let fencing = dst::fencing_from_env().unwrap_or_else(|error| panic!("{error}"));
-    let summary = dst::sweep(&plan, |seed| SimConfig::new(seed).with_fencing(fencing))
-        .unwrap_or_else(|failure| panic!("{failure}"));
+    let template = dst::config_from_env(0).unwrap_or_else(|error| panic!("{error}"));
+    let summary = dst::sweep(&plan, |seed| SimConfig {
+        seed,
+        ..template.clone()
+    })
+    .unwrap_or_else(|failure| panic!("{failure}"));
     println!(
         "dst: {} seeds from {} passed, fencing {}: {:?}",
         summary.seeds,
         plan.first,
-        fencing.as_str(),
+        template.fencing.as_str(),
         summary.stats
     );
 }
@@ -170,8 +226,8 @@ fn replay_one_seed() {
         return;
     };
     let seed: u64 = seed.parse().expect("HARVEST_DST_SEED is a decimal u64");
-    let fencing = dst::fencing_from_env().unwrap_or_else(|error| panic!("{error}"));
-    let report = dst::run(&SimConfig::new(seed).with_fencing(fencing));
+    let config = dst::config_from_env(seed).unwrap_or_else(|error| panic!("{error}"));
+    let report = dst::run(&config);
     for line in &report.trace {
         println!("{line}");
     }

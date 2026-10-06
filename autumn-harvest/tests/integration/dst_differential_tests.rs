@@ -2,8 +2,8 @@
 //!
 //! Each test runs seeded simulations on the in-memory oracle. It then
 //! replays each run's operation log on a real database through the
-//! production statements and requires the same outcome and the same rows
-//! after every step. A green run shows that the oracle models the SQL, so a
+//! production statements. Every step must give the same outcome and the
+//! same rows. A green run shows that the oracle models the SQL, so a
 //! seed sweep on the oracle says something about the engine.
 //!
 //! `HARVEST_DST_SEEDS` and `HARVEST_DST_SEED_BASE` pick the seeds, as for
@@ -119,12 +119,11 @@ fn payload(tag: u64) -> serde_json::Value {
     serde_json::json!({ "tag": tag })
 }
 
-fn tag_of(value: Option<&serde_json::Value>) -> Option<u64> {
-    value.map(|v| {
-        v.get("tag")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or_else(|| panic!("payload without a tag: {v}"))
-    })
+fn tag_of(value: &serde_json::Value) -> u64 {
+    value
+        .get("tag")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("payload without a tag: {value}"))
 }
 
 impl<'c> PgStore<'c> {
@@ -413,8 +412,8 @@ impl<'c> PgStore<'c> {
                 worker: row.worker_id.as_deref().map(|id| self.sim_worker(id)),
                 attempt: row.attempt,
                 crash_strikes: row.crash_strikes,
-                heartbeat: tag_of(row.heartbeat_details.as_ref()),
-                output: tag_of(row.output.as_ref()),
+                heartbeat: row.heartbeat_details.as_ref().map(tag_of),
+                output: row.output.as_ref().map(tag_of),
             });
         }
         rows.into_iter()
@@ -532,7 +531,7 @@ async fn replay_on_postgres(conn: &mut AsyncPgConnection, report: &SimReport) {
                 "seed {seed}, step {}: {:?}\nreproduce the oracle run: {}\nlast steps:\n{}",
                 record.step,
                 record.op,
-                dst::repro_command(seed, report.config.fencing),
+                dst::repro_command(&report.config),
                 report.trace_tail(dst::TAIL_LINES)
             )
         };

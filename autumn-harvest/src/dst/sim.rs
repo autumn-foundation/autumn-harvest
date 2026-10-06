@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 
 use super::invariant::{Ghost, Invariant, Live, Violation, WriteKind};
 use super::rng::SplitMix64;
-use super::store::{Claim, ClaimStore, Fencing, Op, OracleStore, Outcome, Row, WriteOutcome};
+use super::store::{
+    Claim, ClaimStore, Fencing, Op, OracleStore, Orphan, Outcome, Row, TaskState, WriteOutcome,
+};
 
 /// The parameters of one simulated run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +227,7 @@ struct Sim<'a, S> {
     next_seq: u64,
     workers: Vec<Worker>,
     last_scan_ms: Option<u64>,
-    orphans: Vec<super::store::Orphan>,
+    orphans: Vec<Orphan>,
     ghost: Ghost,
     claimers: BTreeSet<usize>,
     report: SimReport,
@@ -272,7 +274,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
         }
         while self.step < self.config.max_steps && self.report.violation.is_none() {
             if self.all_done() {
-                self.log("all tasks completed".to_string());
+                self.log("all tasks completed");
                 break;
             }
             self.now_ms += self.rng.below(self.config.max_tick_ms + 1);
@@ -288,7 +290,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
         self.store
             .rows()
             .iter()
-            .all(|row| row.state == super::store::TaskState::Completed)
+            .all(|row| row.state == TaskState::Completed)
     }
 
     /// Every enabled action with its weight, in a fixed order.
@@ -347,7 +349,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
 
     fn act(&mut self, action: Action) {
         match action {
-            Action::Idle => self.log("idle".to_string()),
+            Action::Idle => self.log("idle"),
             Action::Beat(w) => self.beat(w),
             Action::Claim(w, i) => self.claim(w, i),
             Action::Start(w, i) => self.owner_write(w, i, WriteKind::Start),
@@ -361,7 +363,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
         }
     }
 
-    fn log(&mut self, line: String) {
+    fn log(&mut self, line: &str) {
         let text = format!("{:04} t={:06} {line}", self.step, self.now_ms);
         self.report.trace.push(text);
     }
@@ -369,7 +371,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
     /// Apply `op`, record it, and log `actor` with the outcome.
     fn apply(&mut self, actor: &str, op: Op) -> Outcome {
         let outcome = self.store.apply(&op);
-        self.log(format!("{actor} {} -> {outcome}", describe(&op)));
+        self.log(&format!("{actor} {} -> {outcome}", describe(&op)));
         self.report.steps.push(StepRecord {
             step: self.step,
             op,
@@ -384,7 +386,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
             .into_iter()
             .find(|(invariant, _)| self.config.checks.contains(invariant));
         if let Some((invariant, detail)) = checked {
-            self.log(format!("VIOLATION {invariant}: {detail}"));
+            self.log(&format!("VIOLATION {invariant}: {detail}"));
             self.report.violation = Some(Violation {
                 invariant,
                 step: self.step,
@@ -419,7 +421,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
         self.ghost.claimed(claim.task, seq);
         self.claimers.insert(w);
         self.report.stats.claims += 1;
-        self.log(format!("{id}/s{i} holds claim #{seq}"));
+        self.log(&format!("{id}/s{i} holds claim #{seq}"));
         self.workers[w].slots[i] = Some(Slot {
             claim,
             seq,
@@ -463,7 +465,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
         self.fail(found);
     }
 
-    fn count(&mut self, kind: WriteKind, outcome: WriteOutcome) {
+    const fn count(&mut self, kind: WriteKind, outcome: WriteOutcome) {
         let stats = &mut self.report.stats;
         match (kind, outcome) {
             (WriteKind::Start, WriteOutcome::Applied) => stats.starts += 1,
@@ -511,7 +513,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
             worker.stalled_until_ms
         );
         self.report.stats.stalls += 1;
-        self.log(line);
+        self.log(&line);
     }
 
     /// Kill the worker. Its claims die with it. It restarts later.
@@ -526,7 +528,7 @@ impl<'a, S: ClaimStore> Sim<'a, S> {
             self.now_ms + down
         );
         self.report.stats.crashes += 1;
-        self.log(line);
+        self.log(&line);
     }
 
     fn restart(&mut self, w: usize) {

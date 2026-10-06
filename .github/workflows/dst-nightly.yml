@@ -1,0 +1,118 @@
+# Deterministic simulation, nightly (issue #1830).
+#
+# - `sweep`: the oracle seed sweep of the `dst` target, in release mode.
+#   Four shards run 250000 seeds each. The seed base comes from the run
+#   number, so each night tests new seeds.
+# - `differential`: replays oracle runs on Postgres. Four shards run 500
+#   seeds each.
+# - `alert`: a failed scheduled run opens an issue, or comments on the open
+#   one. GitHub tells only the last editor of a cron about a failure.
+#
+# A failure prints its seed and a local replay command. See
+# docs/testing/simulation.md.
+name: DST nightly
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed_base:
+        description: >-
+          Optional first seed. Leave empty to derive it from the run number.
+        required: false
+        default: ""
+      seeds:
+        description: Seeds per sweep shard.
+        required: false
+        default: "250000"
+  schedule:
+    # Nightly at 02:43 UTC, away from the chaos and proptest runs.
+    - cron: "43 2 * * *"
+
+concurrency:
+  group: dst-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sweep:
+    name: Oracle sweep (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SEEDS: ${{ github.event.inputs.seeds || '250000' }}
+      SEED_BASE: ${{ github.event.inputs.seed_base || '' }}
+      SHARD: ${{ matrix.shard }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick the seeds
+        run: |
+          base="${SEED_BASE:-$((RUN_NUMBER * 1000000))}"
+          echo "HARVEST_DST_SEED_BASE=$((base + SHARD * SEEDS))" >> "$GITHUB_ENV"
+          echo "HARVEST_DST_SEEDS=$SEEDS" >> "$GITHUB_ENV"
+      - name: Run the sweep
+        run: cargo test --release -p autumn-harvest --no-default-features --test dst seed_sweep -- --nocapture
+
+  differential:
+    name: Postgres differential (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SEEDS: "500"
+      SEED_BASE: ${{ github.event.inputs.seed_base || '' }}
+      SHARD: ${{ matrix.shard }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick the seeds
+        run: |
+          base="${SEED_BASE:-$((RUN_NUMBER * 1000000))}"
+          echo "HARVEST_DST_SEED_BASE=$((base + SHARD * SEEDS))" >> "$GITHUB_ENV"
+          echo "HARVEST_DST_SEEDS=$SEEDS" >> "$GITHUB_ENV"
+      - name: Replay oracle runs on Postgres
+        # The test owns a Postgres container (testcontainers), so the
+        # runner needs only Docker.
+        run: 'cargo test -p autumn-harvest --test integration dst_differential_tests:: -- --nocapture --test-threads=1'
+
+  alert:
+    name: Report a failed nightly
+    needs: [sweep, differential]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the alert issue
+        run: |
+          title="DST nightly: a scheduled run failed"
+          body="The deterministic simulation run failed: ${RUN_URL}. The job log prints the seed and a replay command (docs/testing/simulation.md)."
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

@@ -5,6 +5,8 @@ tools for harvest, and the resulting adoption decisions. The companions
 [`loom.md`](loom.md) and [`shuttle.md`](shuttle.md) document the two tools in
 use. [`formal-methods.md`](formal-methods.md) covers the TLA+ models of the
 Postgres-coordinated protocols and the Kani proofs (issue #1819).
+[`simulation.md`](simulation.md) covers the seeded simulation of the activity
+claim protocol (issue #1830).
 
 The single most important framing fact, repeated throughout: **the large
 majority of harvest's concurrency is coordinated through Postgres** — `SELECT
@@ -97,6 +99,17 @@ behavior needs simulating.
 Turmoil to model; its capability doesn't intersect harvest's architecture. If a
 future feature introduces genuine worker-to-worker networking (it does not exist
 today), revisit.
+
+## Deterministic simulation — adopted (issue #1830)
+
+None of the three tools above can model Postgres. The simulator in
+`autumn_harvest::dst` does not try to. It replaces the store with an
+in-memory oracle and drives workers and the orphan reclaimer from a seed on
+one thread. A differential test replays each run on Postgres and requires
+equal outcomes and rows. A seed thus fixes the order of the
+Postgres-coordinated operations, which real tokio and a real database do
+not. [ADR 0004](../adr/0004-deterministic-simulation-testing.md) records the
+choice, and [`simulation.md`](simulation.md) describes the harness.
 
 ## Recommendation matrix
 
