@@ -3524,7 +3524,7 @@ mod db {
         }
 
         activate_target(&mut source, &mut target, exec_id).await?;
-        collapse_forward_chain(pool, exec_id, source_shard, target_shard).await;
+        collapse_forward_chain(pool, exec_id, source_shard, target_shard, false).await;
 
         Ok(MigrationOutcome::Migrated {
             execution_id: exec_id,
@@ -4019,11 +4019,14 @@ mod db {
                             return Ok(None);
                         }
                         audited = true;
+                        let fenced = matches!(driver, MigrationDriver::Scanner)
+                            && crate::replication::FenceRegistry::is_enabled();
                         collapse_forward_chain(
                             pool,
                             exec_id,
                             record.source_shard,
                             record.target_shard,
+                            fenced,
                         )
                         .await;
                         Ok(Some(migrated))
@@ -5048,11 +5051,16 @@ mod db {
     /// chain in [`resolve_execution_shard`]; this only shortens it. A failure
     /// here costs one extra hop on later lookups and nothing else, so it must
     /// never fail a migration that has already committed.
+    ///
+    /// With `fenced`, the update runs in a transaction that first checks the
+    /// DR fence of the origin shard (issue #1839). A node without write
+    /// authority there then skips the collapse.
     async fn collapse_forward_chain(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
         source_shard: ShardId,
         target_shard: ShardId,
+        fenced: bool,
     ) {
         let origin = exec_id.shard();
         if origin == source_shard || origin == target_shard {
@@ -5061,13 +5069,21 @@ mod db {
         let Ok(mut conn) = checkout(pool, origin).await else {
             return;
         };
-        let _ = diesel::sql_query(
-            "UPDATE harvest_workflow_executions SET migrated_to_shard = $2 \
-              WHERE id = $1 AND migrated_to_shard IS NOT NULL",
-        )
-        .bind::<SqlUuid, _>(exec_id.as_uuid())
-        .bind::<Integer, _>(target_shard.as_i32())
-        .execute(&mut *conn)
+        let _ = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+            if fenced {
+                crate::replication::assert_fence(conn, origin).await?;
+            }
+            diesel::sql_query(
+                "UPDATE harvest_workflow_executions SET migrated_to_shard = $2 \
+                  WHERE id = $1 AND migrated_to_shard IS NOT NULL",
+            )
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .bind::<Integer, _>(target_shard.as_i32())
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
+            Ok(())
+        }))
         .await;
     }
 
