@@ -920,7 +920,15 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                     op,
                     Op::Race { .. } | Op::ChildTimeout { .. } | Op::SignalTimeout { .. }
                 );
-                let waits = (!keys.is_empty()).then_some(Waits { keys, any });
+                let fail_fast = matches!(
+                    op,
+                    Op::FanOut { collect: false, .. } | Op::ChildFanOut { collect: false, .. }
+                );
+                let waits = (!keys.is_empty()).then_some(Waits {
+                    keys,
+                    any,
+                    fail_fast,
+                });
                 batch.push(op, waits);
             }
             None if batch.settle(event) => {}
@@ -975,10 +983,13 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
 }
 
 /// The outcomes that one batch branch waits for. With `any`, the first
-/// outcome settles the branch, as for a race. Otherwise it waits for all.
+/// outcome settles the branch, as for a race. With `fail_fast`, the first
+/// failure settles it too, as for a fail-fast fan-out. Otherwise it waits
+/// for all.
 struct Waits {
     keys: HashSet<Pending>,
     any: bool,
+    fail_fast: bool,
 }
 
 /// The commands of one decision, as the branches of a `join!`.
@@ -1030,9 +1041,15 @@ impl Batch {
         else {
             return false;
         };
+        let failed = matches!(
+            event,
+            WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+        );
         let settled = self.pending[branch].as_mut().is_some_and(|w| {
             w.keys.remove(&key);
-            w.any || w.keys.is_empty()
+            w.any || w.keys.is_empty() || (w.fail_fast && failed)
         });
         if settled {
             self.pending[branch] = None;
@@ -1072,17 +1089,33 @@ fn mirror_fan_out(
     claimed: &mut HashSet<usize>,
 ) -> Op {
     let mut group = FanOutGroup::default();
-    // The first wave is the run of schedules right after the marker. After
-    // it, each completed item lets one more schedule refill its slot.
+    // The first wave is the run of schedules right after the marker. A
+    // windowed group starts its next wave only once every item settled, so
+    // a schedule while an item still runs is not a refill.
     let mut first_wave = true;
-    let mut refills = 0usize;
+    let mut outstanding = 0usize;
+    // Schedules claimed in the current refill wave, which runs back to back.
+    let mut wave = 0usize;
     let first_cap = first_wave_cap(history, start, count);
     let mut siblings = HashSet::new();
     for (index, event) in history.iter().enumerate().skip(start) {
         if group.activities.len() + group.children.len() >= count {
             break;
         }
-        let open = (first_wave && group.first_wave_len < first_cap) || refills > 0;
+        let open = if first_wave {
+            group.first_wave_len < first_cap
+        } else {
+            (outstanding == 0 || wave > 0) && wave < group.first_wave_len
+        };
+        let claims_schedule = open
+            && matches!(
+                event,
+                WorkflowEvent::ActivityScheduled { .. }
+                    | WorkflowEvent::ChildWorkflowStarted { .. }
+            );
+        if !claims_schedule && !first_wave {
+            wave = 0;
+        }
         match event {
             // A sibling command in the same `join!`, past the first wave.
             WorkflowEvent::ActivityScheduled { activity_id, .. } if first_wave && !open => {
@@ -1115,14 +1148,14 @@ fn mirror_fan_out(
                 if group.activity_ids.contains(activity_id) =>
             {
                 first_wave = false;
-                refills += 1;
+                outstanding = outstanding.saturating_sub(1);
                 continue;
             }
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
                 if group.child_ids.contains(child_id) =>
             {
                 first_wave = false;
-                refills += 1;
+                outstanding = outstanding.saturating_sub(1);
                 continue;
             }
             WorkflowEvent::ActivityStarted { activity_id, .. }
@@ -1146,7 +1179,7 @@ fn mirror_fan_out(
             {
                 group.collect = true;
                 first_wave = false;
-                refills += 1;
+                outstanding = outstanding.saturating_sub(1);
                 continue;
             }
             // A signal is buffered, so it can arrive between the group's items.
@@ -1158,8 +1191,9 @@ fn mirror_fan_out(
         if first_wave {
             group.first_wave_len += 1;
         } else {
-            refills -= 1;
+            wave += 1;
         }
+        outstanding += 1;
         claimed.insert(index);
     }
     group.into_op(&history[start..], count)
@@ -1219,13 +1253,28 @@ fn first_wave_cap(history: &[WorkflowEvent], start: usize, count: usize) -> usiz
     let rest = &history[start.min(history.len())..];
     let first = rest.iter().take_while(|e| is_schedule(e) || is_signal(e));
     let run = first.filter(|e| is_schedule(e)).count();
+    // A wave starts only once every scheduled item settled. A schedule while
+    // an item still runs is the caller's own command, such as a follow-up
+    // after a fail-fast error.
+    let mut open: HashSet<Pending> = rest
+        .iter()
+        .take_while(|e| is_schedule(e) || is_signal(e))
+        .filter_map(pending_key)
+        .collect();
     let mut waves = Vec::new();
     let mut current = 0;
     for event in rest.iter().skip_while(|e| is_schedule(e) || is_signal(e)) {
         match event {
-            e if is_schedule(e) => current += 1,
+            e if is_schedule(e) && current == 0 && !open.is_empty() => break,
+            e if is_schedule(e) => {
+                current += 1;
+                open.extend(pending_key(e));
+            }
             e if is_signal(e) => {}
             e if activity_outcome(e).is_some() || child_outcome(e).is_some() => {
+                if let Some(key) = settled_key(e) {
+                    open.remove(&key);
+                }
                 if current > 0 {
                     waves.push(current);
                     current = 0;
@@ -1238,6 +1287,9 @@ fn first_wave_cap(history: &[WorkflowEvent], start: usize, count: usize) -> usiz
         waves.push(current);
     }
     match waves.as_slice() {
+        // The first run holds every item, so no refill wave follows. A later
+        // schedule is the caller's own.
+        _ if run >= count => count,
         [next, _, ..] if *next < run => *next,
         [next] if count.saturating_sub(*next) < run && count.saturating_sub(*next) >= *next => {
             count - next
@@ -1424,6 +1476,7 @@ fn mirror_race<'h>(
     let mut commands = Vec::new();
     let mut finished = HashSet::new();
     let mut signal = None;
+    let mut late_signal = None;
     let mut winner = None;
     let mut in_run = true;
     for (index, event) in history.iter().enumerate().skip(start) {
@@ -1467,6 +1520,15 @@ fn mirror_race<'h>(
                 winner = details.as_u64().and_then(|w| usize::try_from(w).ok());
                 taken.others.insert(index);
                 release_late_siblings(&history[index + 1..], &finished, &mut commands, taken);
+                // A released sibling frees a slot. Only then was the early
+                // signal a branch of this race.
+                if signal.is_none()
+                    && commands.len() < count
+                    && let Some((at, op)) = late_signal.take()
+                {
+                    signal = Some(op);
+                    taken.others.insert(at);
+                }
                 break;
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. }
@@ -1487,15 +1549,12 @@ fn mirror_race<'h>(
                 taken.others.insert(index);
             }
             // The slots are full, but no claimed command finished yet. A
-            // sibling took the signal's slot, so the signal gets it back.
-            WorkflowEvent::SignalReceived { .. } if signal.is_none() && finished.is_empty() => {
+            // sibling may hold the signal's slot. The winner marker decides.
+            WorkflowEvent::SignalReceived { .. }
+                if signal.is_none() && late_signal.is_none() && finished.is_empty() =>
+            {
                 in_run = false;
-                if let Some(pos) = commands.iter().rposition(|c| c.branch.is_some()) {
-                    let sibling = commands.remove(pos);
-                    taken.commands.remove(&sibling.index);
-                    signal = mirror_event(event, false);
-                    taken.others.insert(index);
-                }
+                late_signal = mirror_event(event, false).map(|op| (index, op));
             }
             _ => in_run = false,
         }
