@@ -258,6 +258,16 @@ pub enum Op {
     Random,
     /// `ctx.random_f64`.
     RandomF64,
+    /// `ctx.random_range(value..=value)` over `i64`.
+    RandomInt {
+        /// The value, which is also both bounds.
+        value: i64,
+    },
+    /// `ctx.random_range(value..=value)` over `f64`.
+    RandomFloat {
+        /// The value, which is also both bounds.
+        value: f64,
+    },
     /// `ctx.execute_activity_fan_out_raw` over `(name, input, queue)` items,
     /// or the `_windowed` form when `window` is set.
     FanOut {
@@ -973,6 +983,8 @@ impl Op {
                 | Self::NewUuid
                 | Self::Random
                 | Self::RandomF64
+                | Self::RandomInt { .. }
+                | Self::RandomFloat { .. }
                 | Self::Patched { .. }
                 | Self::SideEffect { .. }
                 | Self::DetachedChild { .. }
@@ -1029,8 +1041,7 @@ fn mirror_event(event: &WorkflowEvent, armed_timer: bool) -> Option<Op> {
         WorkflowEvent::SideEffectRecorded { kind, name, value } => match kind {
             SideEffectKind::Now => Some(Op::Now),
             SideEffectKind::Uuid => Some(Op::NewUuid),
-            SideEffectKind::Random if value.is_u64() => Some(Op::Random),
-            SideEffectKind::Random => Some(Op::RandomF64),
+            SideEffectKind::Random => Some(random_op(value)),
             SideEffectKind::Custom => name.clone().map(|name| Op::SideEffect { name }),
         },
         WorkflowEvent::MarkerRecorded { name, details } => marker_op(name, details),
@@ -1052,10 +1063,35 @@ fn mirror_event(event: &WorkflowEvent, armed_timer: bool) -> Option<Op> {
     }
 }
 
-/// The op behind a `patch:` or `version:` marker. Other markers have none.
+/// The op that captured a random value. `random_u64` writes any `u64`, and
+/// `random_f64` writes a float in `[0, 1)`. Any other number came from
+/// `random_range`, so a range of that one value replays it.
+fn random_op(value: &Value) -> Op {
+    if value.is_u64() {
+        return Op::Random;
+    }
+    if let Some(value) = value.as_i64() {
+        return Op::RandomInt { value };
+    }
+    match value.as_f64() {
+        Some(value) if (0.0..1.0).contains(&value) => Op::RandomF64,
+        Some(value) => Op::RandomFloat { value },
+        None => Op::RandomF64,
+    }
+}
+
+/// The op behind a `patch:`, `version:` or legacy `side_effect:` marker.
+/// Other markers have none. A history from before #384 records a named
+/// side effect as a `side_effect:{name}` marker, and the replayer still
+/// matches it.
 fn marker_op(name: &str, details: &Value) -> Option<Op> {
     if let Some(id) = name.strip_prefix("patch:") {
         return Some(Op::Patched { id: id.to_string() });
+    }
+    if let Some(name) = name.strip_prefix("side_effect:") {
+        return Some(Op::SideEffect {
+            name: name.to_string(),
+        });
     }
     let change_id = name.strip_prefix("version:")?;
     let version = details.as_u64().and_then(|v| u32::try_from(v).ok());
@@ -1204,18 +1240,14 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
         Op::Signal { name } => {
             let _ = ctx.wait_for_signal(&name).await;
         }
-        Op::Now => {
-            let _ = ctx.system_now();
-        }
-        Op::NewUuid => {
-            let _ = ctx.new_uuid();
-        }
-        Op::Random => {
-            let _ = ctx.random_u64();
-        }
-        Op::RandomF64 => {
-            let _ = ctx.random_f64();
-        }
+        op @ (Op::Now
+        | Op::NewUuid
+        | Op::Random
+        | Op::RandomF64
+        | Op::RandomInt { .. }
+        | Op::RandomFloat { .. }
+        | Op::Patched { .. }
+        | Op::SideEffect { .. }) => run_capture_op(ctx, op),
         Op::FanOut {
             activities,
             window: None,
@@ -1232,14 +1264,6 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
         }
         Op::ChildFanOut { children } => {
             let _ = ctx.spawn_child_workflow_fan_out_raw(children).await;
-        }
-        // An empty patch id is a documented caller panic.
-        Op::Patched { id } if id.is_empty() => {}
-        Op::Patched { id } => {
-            let _ = ctx.patched(&id);
-        }
-        Op::SideEffect { name } => {
-            let _ = ctx.side_effect::<_, Value>(&name, || Value::Null);
         }
         Op::Complete { output } => return Some(Ok(output)),
         Op::Fail { error } => return Some(Err(error)),
@@ -1290,7 +1314,43 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
     None
 }
 
-/// Runs a child, external or mutex op. `run_op` runs the others.
+/// Runs an op that captures a value in the same decision and never parks.
+fn run_capture_op(ctx: &WorkflowContext, op: Op) {
+    match op {
+        Op::Now => {
+            let _ = ctx.system_now();
+        }
+        Op::NewUuid => {
+            let _ = ctx.new_uuid();
+        }
+        Op::Random => {
+            let _ = ctx.random_u64();
+        }
+        Op::RandomF64 => {
+            let _ = ctx.random_f64();
+        }
+        Op::RandomInt { value } => {
+            let _ = ctx.random_range(value..=value);
+        }
+        // `gen_range` panics on a NaN bound, a documented caller error.
+        Op::RandomFloat { value } if !value.is_finite() => {}
+        Op::RandomFloat { value } => {
+            let _ = ctx.random_range(value..=value);
+        }
+        // An empty patch id is a documented caller panic.
+        Op::Patched { id } if id.is_empty() => {}
+        Op::Patched { id } => {
+            let _ = ctx.patched(&id);
+        }
+        Op::SideEffect { name } => {
+            let _ = ctx.side_effect::<_, Value>(&name, || Value::Null);
+        }
+        _ => {}
+    }
+}
+
+/// Runs a child, external or mutex op. `run_op` and `run_capture_op` run
+/// the others.
 async fn run_external_op(ctx: &WorkflowContext, op: Op) {
     match op {
         Op::Child { name, input } => {
