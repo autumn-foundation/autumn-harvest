@@ -81,7 +81,7 @@ Set a field directly to change it.
 | `tolerance` | `1.25` | Latency rise over the baseline that the limit accepts before it slows growth. | Raise it to trade latency for throughput. Lower it to keep latency close to the no-load value. |
 | `backoff_ratio` | `0.9` | Factor for the cap after a window with too many retryable failures. | Lower it, for example to `0.7`, to back off harder on errors. |
 | `error_threshold` | `0.05` | Share of retryable failures in a window that counts as overload. | Raise it for a dependency with a steady background error rate. At `0`, one failure cuts the cap. |
-| `probe_interval` | `1000` | Samples between two measurements of the no-load baseline. | Raise it at a high cap. Each probe drops the cap to 4 for one window. |
+| `probe_interval` | `1000` | Samples between two measurements of the no-load baseline. | Raise it at a high cap. Each probe drops the cap to 4, or to `min_limit` if that is higher, for one window. |
 
 The config clamps out-of-range values. For example, `min_limit` becomes at
 least 1, `tolerance` at least 1 and `probe_interval` at least 10.
@@ -104,8 +104,12 @@ about once per round trip.
    cuts the cap by `backoff_ratio`.
 5. **Low demand.** A window that used less than half of the cap leaves it
    unchanged. Little traffic says nothing about the dependency.
-6. **Probe.** Every `probe_interval` samples, the cap drops to 4 for one
-   window to measure the baseline again. Then it returns to its value.
+6. **Probe.** After `probe_interval` samples, the next window that is not
+   overloaded starts a probe. The cap drops to 4 for one window, so the
+   limit can measure the baseline again. The probe cap stays in
+   `[min_limit, max_limit]`, and a cap below 4 is not raised. Then the cap
+   returns to its value from before the probe. If the probe window is
+   overloaded, that value is first cut by `backoff_ratio`.
 
 A new type starts at 4. Against a dependency that slows down in proportion
 to the load above a knee, the cap settles near `tolerance × knee + 4`. The
@@ -148,8 +152,10 @@ row "Circuit breakers, retry budget and adaptive limit".
 | `harvest_activity_latency_baseline_seconds` | Gauge | The no-load latency estimate. |
 | `harvest_activity_concurrency_deferred_total` | Counter | Claims that raced past the cap and were deferred. |
 
-The gauges are per worker. Use `sum by (activity)` for the fleet total and
-`min by (activity)` to find the most limited worker.
+Each worker learns its own cap, so compare values per worker. The queries
+below keep the `instance` label that Prometheus adds to each scraped worker.
+Use `sum by (activity)` for a fleet total and `min by (activity)` to find the
+most limited worker.
 
 Useful queries:
 
@@ -161,12 +167,13 @@ harvest_activity_concurrency_in_flight
 # Types that are at their cap. A backlog then waits on the dependency.
 harvest_activity_concurrency_in_flight >= harvest_activity_concurrency_limit
 
-# Latency inflation over the baseline. Near `tolerance`, the cap has settled.
+# Latency inflation over the baseline, per worker. Near `tolerance`, the
+# cap has settled. Only successful attempts count, as in the limiter.
 (
-  sum by (activity) (rate(harvest_activity_duration_sum[5m]))
-  / sum by (activity) (rate(harvest_activity_duration_count[5m]))
+  sum by (activity, instance) (rate(harvest_activity_duration_sum{status="completed"}[5m]))
+  / sum by (activity, instance) (rate(harvest_activity_duration_count{status="completed"}[5m]))
 )
-/ max by (activity) (harvest_activity_latency_baseline_seconds)
+/ max by (activity, instance) (harvest_activity_latency_baseline_seconds)
 ```
 
 ## Troubleshooting
