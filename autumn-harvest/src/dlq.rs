@@ -495,8 +495,8 @@ async fn redrive_callback_dead_letter(
 
 /// Move a database-clock spread slot onto the host clock (issue #1832).
 ///
-/// [`spread_schedule`] reads the database clock. The callback scanner and
-/// the workflow timeout scanner compare their deadlines with the host clock.
+/// [`spread_schedule`] reads the database clock. The callback scanner
+/// compares `next_attempt_at` with the host clock.
 async fn slot_on_host_clock(
     conn: &mut AsyncPgConnection,
     not_before: Option<DateTime<Utc>>,
@@ -506,6 +506,34 @@ async fn slot_on_host_clock(
     };
     let db_now = crate::queue::db_now(conn).await?;
     Ok(Some(to_host_clock(at, db_now, Utc::now())))
+}
+
+/// Where a redriven run's timeout window starts (issue #1832).
+///
+/// `slot` is on the database clock. Two checks read `deadline_at` on
+/// different clocks. The claim gate uses the database clock, and the timeout
+/// scanner uses the host clock. The later of the two slot readings is due on
+/// both clocks, so a window that starts there never expires before the task
+/// becomes due. Clock skew can only add time to the window.
+#[must_use]
+fn deadline_window_start(
+    slot: DateTime<Utc>,
+    db_now: DateTime<Utc>,
+    host_now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    slot.max(to_host_clock(slot, db_now, host_now))
+}
+
+/// [`deadline_window_start`] for an optional slot, with the clocks read now.
+async fn deadline_slot(
+    conn: &mut AsyncPgConnection,
+    not_before: Option<DateTime<Utc>>,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let Some(slot) = not_before else {
+        return Ok(None);
+    };
+    let db_now = crate::queue::db_now(conn).await?;
+    Ok(Some(deadline_window_start(slot, db_now, Utc::now())))
 }
 
 /// Move a database-clock instant onto the host clock (issue #1832).
@@ -1409,8 +1437,8 @@ pub async fn redrive_dead_letter_at(
                     // sealed FAILED at quarantine time so it can resume.
                     "FAILED" => {
                         let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
-                        // The timeout scanner reads `deadline_at` on the host clock.
-                        let slot = slot_on_host_clock(conn, not_before).await?;
+                        // The window must start after the slot on both clocks.
+                        let slot = deadline_slot(conn, not_before).await?;
                         crate::execution::reactivate_failed_execution_at(
                             conn,
                             exec_id,
@@ -2814,6 +2842,23 @@ mod tests {
         assert_eq!(
             redrive_spread_offset(5, 10, StdDuration::ZERO, 7),
             StdDuration::ZERO
+        );
+    }
+
+    #[test]
+    fn deadline_window_starts_after_the_slot_on_both_clocks() {
+        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let slot = db_now + chrono::Duration::seconds(45);
+        // Host 30 s behind the database: the database-clock slot is later.
+        let behind = db_now - chrono::Duration::seconds(30);
+        assert_eq!(deadline_window_start(slot, db_now, behind), slot);
+        // Host 30 s ahead: the host-clock slot is later.
+        let ahead = db_now + chrono::Duration::seconds(30);
+        assert_eq!(
+            deadline_window_start(slot, db_now, ahead),
+            ahead + chrono::Duration::seconds(45)
         );
     }
 

@@ -5694,8 +5694,9 @@ pub async fn reactivate_failed_execution(
 /// slot cannot use up the execution timeout before the task runs. `None`
 /// starts both windows now.
 ///
-/// `not_before` is on the host clock, because the timeout scanner compares
-/// `deadline_at` with the host clock.
+/// A redrive passes the later of the slot's database-clock and host-clock
+/// readings. The claim gate and the timeout scanner read `deadline_at` on
+/// those two clocks.
 ///
 /// # Errors
 ///
