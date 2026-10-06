@@ -19732,9 +19732,11 @@ fn decision_boundary_reserve(registry: &HandlerRegistry, appends: bool) -> u64 {
 /// Whether the solo `AcquireMutex` in `commands` would be granted now
 /// (issue #1833).
 ///
-/// The read takes no lock, so the answer can change before persistence.
-/// A failed read answers `true`. Both errors count the grant's boundary
-/// against the history cap, which is the safe direction.
+/// It counts the waiters already queued, because a new acquire joins the
+/// queue behind them. The read takes no lock, so the answer can change
+/// before persistence. A failed read answers `true`, which counts the
+/// grant's boundary against the history cap. The boundary write itself
+/// never brings a running history to its cap.
 async fn mutex_acquire_would_grant(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -19746,7 +19748,7 @@ async fn mutex_acquire_would_grant(
     }) else {
         return false;
     };
-    crate::mutex::is_grantable_head(conn, key, exec_id)
+    crate::mutex::would_grant_acquire(conn, key, exec_id)
         .await
         .unwrap_or(true)
 }

@@ -232,6 +232,29 @@ pub const fn is_grantable_head_stmt() -> &'static str {
             ) AS grantable"
 }
 
+/// Read-only "would an acquire by `$2` be granted right now?" check, for a
+/// waiter that may not have joined the queue yet (issue #1833).
+///
+/// The key must be free, or its lease expired. With a waiter row for `$2`,
+/// no earlier waiter may exist, as in [`is_grantable_head_stmt`]. With no
+/// row, the acquire would join the end of the queue, so any waiter blocks
+/// it. `$1` = `lock_key`, `$2` = `waiter_exec_id`.
+#[must_use]
+pub const fn would_grant_acquire_stmt() -> &'static str {
+    "SELECT NOT EXISTS ( \
+              SELECT 1 FROM harvest_mutex_waiters w \
+              WHERE w.lock_key = $1 \
+                AND w.waiter_exec_id <> $2 \
+                AND w.id < COALESCE( \
+                      (SELECT id FROM harvest_mutex_waiters WHERE lock_key = $1 AND waiter_exec_id = $2), \
+                      w.id + 1) \
+            ) \
+        AND NOT EXISTS ( \
+              SELECT 1 FROM harvest_mutex_locks l \
+              WHERE l.lock_key = $1 AND l.lease_expires_at >= now() \
+            ) AS grantable"
+}
+
 /// The current head-of-line waiter for a key (smallest `id`). `$1` = `lock_key`.
 #[must_use]
 pub const fn head_of_line_stmt() -> &'static str {
@@ -406,6 +429,7 @@ mod db_ops {
         held_keys_for_holder_stmt, holder_holds_any_stmt, is_grantable_head_stmt,
         reclaim_expired_lock_and_wake_target_stmt, release_lock_by_holder_key_stmt,
         release_lock_stmt, renew_leases_for_holder_stmt, waiter_keys_for_holder_stmt,
+        would_grant_acquire_stmt,
     };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ExecutionId;
@@ -588,6 +612,26 @@ mod db_ops {
         exec_id: ExecutionId,
     ) -> HarvestResult<bool> {
         let row: Grantable = diesel::sql_query(is_grantable_head_stmt())
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .get_result(conn)
+            .await
+            .map_err(database_error)?;
+        Ok(row.grantable)
+    }
+
+    /// Would an acquire of `key` by `exec_id` be granted right now? Unlike
+    /// [`is_grantable_head`], it also answers before the waiter joins the
+    /// queue (issue #1833). Takes no lock, so the answer can change.
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if the database query fails.
+    pub async fn would_grant_acquire(
+        conn: &mut AsyncPgConnection,
+        key: &str,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<bool> {
+        let row: Grantable = diesel::sql_query(would_grant_acquire_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .get_result(conn)
@@ -849,7 +893,7 @@ pub use db_ops::{
     delete_waiters_for_holder, holder_holds_any_mutex, is_grantable_head,
     reclaim_expired_leases_and_wake, release_all_locks_for_holder, release_lock,
     renew_leases_for_holder, sweep_terminal_holder_and_wake, table_present, try_grant_or_enqueue,
-    waiter_wait_metrics,
+    waiter_wait_metrics, would_grant_acquire,
 };
 
 #[cfg(test)]
@@ -958,6 +1002,17 @@ mod pure_tests {
         let sql = is_grantable_head_stmt();
         assert!(sql.contains("AS grantable"));
         assert!(sql.contains("NOT EXISTS"));
+        assert!(sql.contains("l.lease_expires_at >= now()"));
+    }
+
+    #[test]
+    fn would_grant_acquire_stmt_counts_every_waiter_before_the_enqueue() {
+        let sql = would_grant_acquire_stmt();
+        assert!(sql.contains("AS grantable"));
+        // Without a waiter row for `$2`, every other waiter blocks it.
+        assert!(sql.contains("w.waiter_exec_id <> $2"));
+        assert!(sql.contains("COALESCE"));
+        assert!(sql.contains("w.id + 1"));
         assert!(sql.contains("l.lease_expires_at >= now()"));
     }
 

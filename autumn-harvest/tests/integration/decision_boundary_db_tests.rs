@@ -770,6 +770,49 @@ async fn the_terminal_wake_counts_its_boundary() {
 }
 
 #[tokio::test]
+async fn a_free_mutex_with_queued_waiters_reserves_no_boundary() {
+    // The key has no holder but one queued waiter. A new acquire joins the
+    // queue behind it and writes nothing. So the probe must not predict a
+    // grant. Under cap 4 the acquire loads 2 events and counts 3, so the
+    // run parks. A predicted grant counted 4, and the cap failed the run.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("queuedcap");
+    let key = format!("k1833-{}", Uuid::new_v4().simple());
+    let mut conn = connect(&url).await;
+    diesel::sql_query(
+        "INSERT INTO harvest_mutex_waiters (lock_key, waiter_exec_id) VALUES ($1, $2)",
+    )
+    .bind::<Text, _>(&key)
+    .bind::<SqlUuid, _>(Uuid::new_v4())
+    .execute(&mut conn)
+    .await
+    .expect("queue another waiter");
+
+    let policy = boundaries_on().with_event_hard_cap(4);
+    let running = Running::start(&queue, &pool, policy);
+    let exec_id = seed(
+        &mut conn,
+        "boundary_mutex_plain",
+        &queue,
+        serde_json::json!({ "key": key }),
+    )
+    .await;
+    running.wait_parked_after(&mut conn, exec_id, 1).await;
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", serde_json::json!(1))
+        .await
+        .expect("send go");
+    running.wait_parked_after(&mut conn, exec_id, 2).await;
+    running.stop().await;
+
+    assert_eq!(
+        type_names(&history(&url, exec_id).await),
+        ["WorkflowStarted", "SignalReceived"],
+        "the queued acquire writes nothing and the run stays live"
+    );
+}
+
+#[tokio::test]
 async fn the_default_records_no_boundary() {
     // Boundaries are opt-in in this release. A process of the previous
     // release cannot decode one, and the rolling-deploy contract forbids
