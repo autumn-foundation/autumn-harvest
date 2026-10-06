@@ -587,8 +587,10 @@ impl Model {
     /// strike. At the threshold the task goes to the dead-letter queue and
     /// its run fails. Below it the task is pending again.
     fn reclaim(&mut self) -> Res {
-        // The requeue stamps `clock_timestamp()` with no backdate. A requeued
-        // orphan therefore sorts behind a fresh start of the next 5 seconds.
+        // The requeue stamps `clock_timestamp()` with no backdate. The orphan
+        // keeps its `attempt`, so it is a continuation with no handicap. It
+        // sorts ahead of a fresh start made up to 25 seconds before the
+        // reclaim (issue #1923).
         let due = self.now;
         let (mut requeued, mut quarantined) = (0, 0);
         for run in 0..self.runs.len() {
@@ -1347,10 +1349,10 @@ async fn database() -> (
     (url, Some(container), None)
 }
 
-/// The stateful lifecycle property. The database and the model must agree
-/// after every operation of every generated sequence.
-#[test]
-fn lifecycle_matches_the_reference_model() {
+/// Run `body` on a runtime and a connection to [`database`].
+fn on_own_database<T>(
+    body: impl FnOnce(&tokio::runtime::Runtime, &mut AsyncPgConnection) -> T,
+) -> T {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1359,34 +1361,166 @@ fn lifecycle_matches_the_reference_model() {
     // a failing case can unwind past it.
     let _enter = rt.enter();
     let (url, _container, _db) = rt.block_on(database());
-    let conn = RefCell::new(
-        rt.block_on(AsyncPgConnection::establish(&url))
-            .expect("connect"),
-    );
-    // A database-backed shrink step costs about 150 ms. Cap the shrink so a
-    // late failure still prints its sequence before the job times out.
-    let mut runner = TestRunner::new(proptest::test_runner::Config {
-        max_shrink_time: 20 * 60 * 1000,
-        ..prop_config::config()
+    let mut conn = rt
+        .block_on(AsyncPgConnection::establish(&url))
+        .expect("connect");
+    body(&rt, &mut conn)
+}
+
+/// The stateful lifecycle property. The database and the model must agree
+/// after every operation of every generated sequence.
+#[test]
+fn lifecycle_matches_the_reference_model() {
+    let seen = on_own_database(|rt, conn| {
+        let conn = RefCell::new(conn);
+        // A database-backed shrink step costs about 150 ms. Cap the shrink so
+        // a late failure still prints its sequence before the job times out.
+        let mut runner = TestRunner::new(proptest::test_runner::Config {
+            max_shrink_time: 20 * 60 * 1000,
+            ..prop_config::config()
+        });
+        let seen = RefCell::new(BTreeSet::new());
+        let result = runner.run(&ops(), |ops| {
+            rt.block_on(run_case(
+                &mut conn.borrow_mut(),
+                &ops,
+                &mut seen.borrow_mut(),
+            ))
+        });
+        if let Err(e) = result {
+            panic!("{e}");
+        }
+        seen.into_inner()
     });
-    let ops = ops();
-    let seen = RefCell::new(BTreeSet::new());
-    let result = runner.run(&ops, |ops| {
-        rt.block_on(run_case(
-            &mut conn.borrow_mut(),
-            &ops,
-            &mut seen.borrow_mut(),
-        ))
-    });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
-    let seen = seen.into_inner();
     let missing: Vec<_> = REQUIRED.iter().filter(|l| !seen.contains(*l)).collect();
     assert!(
         missing.is_empty(),
         "the generated sequences never reached {missing:?}; the pass is too weak"
     );
+}
+
+// ── Pinned counterexamples ──────────────────────────────────────────────────
+
+/// A shrunk counterexample that replays against the database.
+struct Pinned {
+    name: &'static str,
+    /// The coverage labels the replay must reach. Without them, a pin can
+    /// stop reaching its branch after a change and still pass.
+    reaches: &'static [&'static str],
+    ops: &'static [Op],
+}
+
+/// Shrunk counterexamples from the deep nightly pass. The `test-db-linux`
+/// job replays each one against the database. So a model drift shows on a
+/// pull request, and not only in the nightly.
+const PINNED: &[Pinned] = &[
+    // Issue #1923: a worker re-claims its own requeued orphan. The orphan
+    // is a continuation, so it sorts ahead of the fresh start of slot 1.
+    Pinned {
+        name: "#1923 re-claim of an own orphan",
+        reaches: &["claim requeued orphan", "complete stale claim"],
+        ops: &[
+            Op::Start {
+                slot: 0,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::Start {
+                slot: 1,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::KillWorker { worker: 0 },
+            Op::Claim { worker: 0 },
+            Op::Reclaim,
+            Op::ReviveWorker { worker: 0 },
+            Op::Claim { worker: 0 },
+            Op::Heartbeat {
+                worker: 0,
+                claim: 1,
+            },
+            Op::Complete {
+                worker: 0,
+                claim: 1,
+            },
+            Op::Complete {
+                worker: 0,
+                claim: 0,
+            },
+        ],
+    },
+    // Issue #1923: an orphan is requeued, claimed again and quarantined.
+    Pinned {
+        name: "#1923 orphan to the dead-letter queue",
+        reaches: &["claim requeued orphan", "reclaim quarantine"],
+        ops: &[
+            Op::Start {
+                slot: 0,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::Start {
+                slot: 1,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::KillWorker { worker: 0 },
+            Op::Claim { worker: 0 },
+            Op::Reclaim,
+            Op::Claim { worker: 0 },
+            Op::Reclaim,
+            Op::ReviveWorker { worker: 0 },
+        ],
+    },
+    // Issue #1923: another worker claims the requeued orphan. The old
+    // claim is then stale.
+    Pinned {
+        name: "#1923 claim lost to a reclaim",
+        reaches: &[
+            "claim requeued orphan",
+            "heartbeat lease lost",
+            "complete stale claim",
+        ],
+        ops: &[
+            Op::Start {
+                slot: 2,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::Start {
+                slot: 0,
+                policy: Policy::AllowDuplicate,
+            },
+            Op::Claim { worker: 0 },
+            Op::KillWorker { worker: 0 },
+            Op::Reclaim,
+            Op::ReviveWorker { worker: 0 },
+            Op::Claim { worker: 1 },
+            Op::Heartbeat {
+                worker: 0,
+                claim: 0,
+            },
+            Op::Complete {
+                worker: 0,
+                claim: 0,
+            },
+        ],
+    },
+];
+
+/// Each pinned counterexample replays clean against the database and reaches
+/// its labels. The test replays all of them and reports every failure.
+#[test]
+fn pinned_counterexamples_replay() {
+    let failures = on_own_database(|rt, conn| {
+        PINNED
+            .iter()
+            .filter_map(|pin| {
+                let mut seen = BTreeSet::new();
+                if let Err(e) = rt.block_on(run_case(conn, pin.ops, &mut seen)) {
+                    return Some(format!("{}: {e}", pin.name));
+                }
+                let missed: Vec<_> = pin.reaches.iter().filter(|l| !seen.contains(*l)).collect();
+                (!missed.is_empty()).then(|| format!("{}: never reached {missed:?}", pin.name))
+            })
+            .collect::<Vec<_>>()
+    });
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 // ── Model self-tests (no database) ──────────────────────────────────────────

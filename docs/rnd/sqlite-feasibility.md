@@ -203,6 +203,7 @@ Classification rule:
 | `replication` | advisory-lock, diesel, interval-sql, raw-pg-sql, raw-sql | (c) | Cross-region DR fencing and RPO measurement (issue #954). The **most** Postgres-bound module in the inventory: it reads `pg_stat_replication`, `pg_replication_slots`, `pg_current_wal_lsn()` and the `pg_lsn` type, none of which SQLite has in any form — there is no replication to observe, so there is nothing to translate. The fencing epoch itself is ordinary CRUD and would survive; the measurement half does not. Advisory lock subsumed by the single write lock; `make_interval(secs => …)` as epoch ms. |
 | `reset` | diesel, row-lock | (b) | Fork takes a row lock before appending; subsumed. |
 | `retention` | diesel, skip-locked, row-lock, raw-pg-sql, raw-sql | (c) | Batched delete scanner with claim. |
+| `scanner_lease` | diesel, interval-sql, raw-sql | (b) | Per-shard scanner lease (#1795). The upsert with `ON CONFLICT ... DO UPDATE ... WHERE` and `RETURNING` works on SQLite 3.35+, and `make_interval` becomes integer epoch ms. A single process has no peer to elect, so the lease can also simply be off. |
 | `schedule_decision` | diesel | (a) | Append-only decision log. |
 | `scheduler` | diesel, row-lock, advisory-lock, interval-sql, raw-pg-sql, raw-sql | (b) | Cron/interval arithmetic as epoch ms. |
 | `schema` | diesel | (c) | Diesel `table!` definitions; reimplemented wholesale. |
