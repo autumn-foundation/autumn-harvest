@@ -31,16 +31,17 @@ ROOT = Path(__file__).resolve().parents[2]
 SKIP_DIRS = ("plans", "changelog.d", "rnd", "assays", "perf-artifacts", "adr")
 SKIP_FILES = ("docs/shipped-work.md",)
 
-# A total count only, in either order: "enum (41 variants", "has 41
-# variants" or "there are 41 WorkflowEvent variants". An additive count is
-# not a total: "gains 2 variants", "adds 2 WorkflowEvent variants" and "has 2
-# variants added". The pattern can cross a line wrap.
+# A total count of the enum only: "WorkflowEvent enum (41 variants",
+# "WorkflowEvent has 41 variants" or "there are 41 WorkflowEvent variants."
+# A count with another subject or a qualifier is not a total: "gains 2
+# variants", "the session feature has 2 WorkflowEvent variants", "there are 2
+# WorkflowEvent variants for sessions". The pattern can cross a line wrap.
 NOT_ADDITIVE = r"(?!\s+(?:added|introduced|removed)\b)"
 VARIANT_COUNT_RE = re.compile(
     r"WorkflowEvent`?\s+(?:enum\s+\(|(?:enum\s+)?(?:now\s+)?has\s+)(\d[\d,]*)\s+variants\b"
     + NOT_ADDITIVE
-    + r"|(?i:\b(?:there\s+are|has|have))\s+(\d[\d,]*)\s+`?WorkflowEvent`?\s+variants\b"
-    + NOT_ADDITIVE
+    + r"|(?i:\bthere\s+are)\s+(\d[\d,]*)\s+`?WorkflowEvent`?\s+variants"
+    + r"(?=\s*(?:in\s+total\b|[.,;:)]|$))"
 )
 VERSION_HEADING_RE = re.compile(r"^##\s+\[?v?(\d+\.\d+\.\d+[^\]\s]*)\]?", re.MULTILINE)
 FENCE_RE = re.compile(r"^(```|~~~).*?^\1", re.MULTILINE | re.DOTALL)
@@ -57,13 +58,17 @@ REBALANCING = (
 
 COMPETITOR_RE = re.compile(r"\b(?:Temporal|DBOS|Inngest|Hatchet|Restate)\b")
 HARVEST_RE = re.compile(r"(?i)harvest")
-# A sentence ends at end punctuation before a space, at a blank line, or
-# before a heading, a table row or a list item.
-SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])[ \t]+|\n(?:[ \t]*\n|(?=[ \t]*(?:#|\||- |\* )))")
+# A clause ends at end punctuation before a space, at a blank line, before a
+# heading, a table row or a list item, at a semicolon, or at a comma before
+# "while", "whereas", "but" or "and".
+SENTENCE_BREAK_RE = re.compile(
+    r"(?<=[.!?;])[ \t]+|\n(?:[ \t]*\n|(?=[ \t]*(?:#|\||- |\* )))"
+    r"|,\s+(?=(?:while|whereas|but|and)\b)"
+)
 
 
 def blank_competitor_sentences(text):
-    """Blank each sentence that names a competitor and not harvest."""
+    """Blank each clause that names a competitor and not harvest."""
     out, start = [], 0
     for m in [*SENTENCE_BREAK_RE.finditer(text), None]:
         end = m.start() if m else len(text)
@@ -82,8 +87,10 @@ def harvest_scope(text):
 
     A table with one row per engine keeps the autumn-harvest row only. A
     table with one column per engine keeps the label and autumn-harvest
-    cells only. In prose, a sentence that names a competitor and not
-    harvest goes. All other text stays, so a stale claim still matches.
+    cells only. In prose, a clause that names a competitor and not harvest
+    goes. A clause ends at a sentence end, at a semicolon, or at a comma
+    before "while", "whereas", "but" or "and". All other text stays, so a
+    stale claim still matches.
     Blank lines keep the line numbers of the findings.
     """
     kept, table_col = [], None
@@ -397,12 +404,14 @@ def self_test():
         "d.md": "`WorkflowEvent` gains 2 variants in issue #140.",
         "e.md": "`WorkflowEvent` has 1,050 variants.",
         "f.md": "There are 51 `WorkflowEvent` variants.",
-        "g.md": "The engine has\n51 WorkflowEvent variants.",
+        "g.md": "In all, there are\n51 WorkflowEvent variants in total.",
         "h.md": "There are 5 WorkflowEvent variants.",
         "i.md": "Issue #140 adds 3 WorkflowEvent variants.",
         "j.md": "This shipped with 2 `WorkflowEvent` variants added for updates.",
         "k.md": "Issue #140 has 3 WorkflowEvent variants added.",
         "l.md": "`WorkflowEvent` now has 3 variants introduced by #140.",
+        "m.md": "The session feature has 2 `WorkflowEvent` variants for acquire/release.",
+        "n.md": "There are 2 WorkflowEvent variants for sessions.",
     }
     found = variant_count_findings(docs, 5)
     assert [m.split(":")[0] for m in found] == ["b.md", "e.md", "f.md", "g.md"], found
@@ -466,11 +475,13 @@ def self_test():
         "**Choose DBOS if** you want\nno cross-region replication or failover.\n\n"
         "DBOS has no cross-region replication or failover. Restate is\nsimilar.\n"
         "Temporal is ahead. Here there is no built-in multi-region\n"
-        "replication or failover.\n"
+        "replication or failover.\n\n"
+        "Harvest has operator-driven DR, while DBOS has no cross-region replication or failover.\n"
+        "DBOS is fine; harvest has no cross-region replication or failover.\n"
     )
     claims = [("p.md", planned, "shipped", harvest_scope), ("p.md", region, "shipped", harvest_scope)]
     found = stale_claim_findings({"p.md": page}.get, claims)
-    assert [m.split(":")[1] for m in found] == ["3", "13", "16", "25"], found
+    assert [m.split(":")[1] for m in found] == ["3", "13", "16", "25", "29"], found
 
     # Every real pattern compiles.
     for _, pattern, *_ in STALE_CLAIMS:
