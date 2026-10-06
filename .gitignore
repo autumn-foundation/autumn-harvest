@@ -4,6 +4,9 @@ Cargo.lock
 .claude/
 __pycache__/
 
+# Crash dumps that rustc writes on an internal compiler error.
+rustc-ice-*.txt
+
 # Nested cargo target dirs (e.g. per-agent --target-dir runs inside member crates)
 **/target/
 
