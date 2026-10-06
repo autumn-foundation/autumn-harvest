@@ -78,5 +78,7 @@ No new `WorkflowEvent` variant, no migration, no schema change.
   - The timeouts of a hung dependency cut the cap, for an attempt deadline
     and for a heartbeat timeout. The heartbeat case failed before the worker
     read the timeout error from the task row.
+  - Answers that arrive 20 ms after a 300 ms deadline cut the cap. Before
+    the deadline check covered uncancelled attempts, they grew it.
 - `metrics_rs_adapter`: the adapter bridges the three gauges and the
   counter with the `activity` label, and skips an unknown baseline.

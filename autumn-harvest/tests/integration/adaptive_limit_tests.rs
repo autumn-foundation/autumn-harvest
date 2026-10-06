@@ -245,6 +245,17 @@ fn hung_call(ctx: &autumn_harvest::ActivityContext, _input: serde_json::Value) -
     })
 }
 
+/// Answers 20 ms after a 300 ms attempt deadline, before the timeout scan
+/// and the cancel observer can act.
+fn late_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
+    let (running, _) = Running::start(ctx.activity_type());
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(320)).await;
+        drop(running);
+        Ok(input)
+    })
+}
+
 /// Concurrency above which [`knee_call`] slows down.
 const KNEE: u32 = 8;
 
@@ -754,6 +765,44 @@ async fn heartbeat_timeouts_of_a_hung_dependency_cut_the_cap() {
     let handle = tokio::spawn(async move { runner.run(&pool).await });
     let limits = registry.adaptive_limits();
     wait_until("a cap below the probe cap", Duration::from_secs(40), || {
+        let limits = Arc::clone(&limits);
+        async move { limits.snapshot(ACTIVITY).is_some_and(|s| s.limit < 4) }
+    })
+    .await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+}
+
+/// An answer after the attempt deadline is a timeout, even when the handler
+/// returns before the worker sees the lost claim. Late answers must cut the
+/// cap, not grow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_after_the_deadline_cut_the_cap() {
+    const ACTIVITY: &str = "al_late";
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("al-late");
+    let mut activity = act_info(ACTIVITY, late_call);
+    activity.default_start_to_close = Some(Duration::from_millis(300));
+    let config = AdaptiveLimitConfig::disabled()
+        .with_activity(ACTIVITY, Some(AdaptiveLimitPolicy::default()));
+    let metrics = Arc::new(LimitMetrics::default());
+    let (worker, registry) = build_worker(
+        &format!("{queue}-worker"),
+        &queue,
+        vec![activity],
+        Arc::clone(&metrics),
+        Some(config),
+        HashMap::new(),
+    );
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    for _ in 0..8 {
+        seed_workflow(&mut conn, &queue, ACTIVITY).await;
+    }
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+    let limits = registry.adaptive_limits();
+    wait_until("a cap below the probe cap", Duration::from_secs(30), || {
         let limits = Arc::clone(&limits);
         async move { limits.snapshot(ACTIVITY).is_some_and(|s| s.limit < 4) }
     })

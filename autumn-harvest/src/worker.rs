@@ -15628,8 +15628,8 @@ const fn adaptive_limit_gates(
 
 /// The adaptive limit sample for one attempt (issue #1836).
 ///
-/// - A cancelled attempt whose deadline passed (`timed_out`) is overload. A
-///   hung dependency is the classic overload signal.
+/// - An attempt that timed out (`timed_out`) is overload. A hung dependency
+///   is the classic overload signal.
 /// - A retryable failure is overload, unless `error_type` names a fault of
 ///   the worker, such as a panic.
 /// - A success is an answer.
@@ -15656,20 +15656,25 @@ fn limit_sample_outcome(
     }
 }
 
-/// Whether a cancelled attempt timed out (issue #1836).
+/// Whether an attempt timed out (issue #1836).
 ///
-/// A cancel after the attempt deadline is a timeout. A heartbeat timeout
-/// fires before that deadline, so the function also reads the task row. The
-/// timeout scanner writes its timeout error there. A failed read counts as
-/// no timeout, so the attempt gives no sample.
-async fn cancelled_attempt_timed_out(
+/// An attempt that ends after its deadline timed out, even when the handler
+/// returned before the cancel observer saw the lost claim. A heartbeat
+/// timeout fires before that deadline. So for a cancelled attempt, the
+/// function also reads the task row, where the timeout scanner writes its
+/// timeout error. A failed read counts as no timeout.
+async fn attempt_timed_out(
     pool: &DbPool,
     claim: &queue::TaskClaim,
     activity_name: &str,
     deadline: Option<chrono::DateTime<chrono::Utc>>,
+    was_cancelled: bool,
 ) -> bool {
     if deadline.is_some_and(|d| chrono::Utc::now() >= d) {
         return true;
+    }
+    if !was_cancelled {
+        return false;
     }
     let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
         return false;
@@ -17882,9 +17887,14 @@ async fn process_activity_task(
     // and free the slot. See `limit_sample_outcome` for which attempts give
     // no sample.
     if let Some(permit) = limit_permit.take() {
-        let timed_out = was_cancelled
-            && cancelled_attempt_timed_out(pool, &activity_claim, activity_name, attempt_deadline)
-                .await;
+        let timed_out = attempt_timed_out(
+            pool,
+            &activity_claim,
+            activity_name,
+            attempt_deadline,
+            was_cancelled,
+        )
+        .await;
         let error_type = failure_info.as_ref().map(|(et, _, _)| et.as_str());
         match limit_sample_outcome(circuit_outcome, error_type, timed_out) {
             Some(outcome) => permit.complete(attempt_latency, outcome),
