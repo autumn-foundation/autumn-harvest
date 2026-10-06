@@ -143,6 +143,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          retry_budget_tests
 linux        autumn-harvest         integration                      -                          retry_chain_routing_tests
 linux        autumn-harvest         integration                      -                          retry_clock_skew_tests
+linux        autumn-harvest         integration                      -                          scanner_lease_tests
 linux        autumn-harvest         integration                      -                          scanner_tick_db_tests
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
 linux        autumn-harvest         integration                      -                          scheduler_ha_tests
