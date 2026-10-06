@@ -41,7 +41,7 @@ use crate::payload_codec::{
 use crate::payload_store::{
     OFFLOAD_ENVELOPE_KEY, PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
 };
-use crate::replay::HistoryMatcher;
+use crate::replay::{DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatcher};
 use crate::telemetry::NoOpMetrics;
 use crate::testing::{ReplayReport, WorkflowReplayer};
 use crate::types::{ActivityExecId, ExecutionId, ExternalTarget, ParentClosePolicy};
@@ -407,6 +407,24 @@ pub enum Op {
         /// Timeout in seconds.
         secs: u64,
     },
+    /// A saga unwind that runs these compensation activities, in this order.
+    SagaUnwind {
+        /// `(name, input, queue)` of each compensation, in the order run.
+        #[arbitrary(with = fan_out_items)]
+        compensations: Vec<(String, Value, String)>,
+    },
+    /// `ctx.dag_skip_marker`.
+    DagSkip {
+        /// Index of the skipped task.
+        task: usize,
+        /// Activity name of the skipped task.
+        activity: String,
+        /// Indexes of its upstream tasks.
+        upstreams: Vec<usize>,
+    },
+    /// `ctx.should_continue_as_new`, which reads the clock when the run has
+    /// an execution deadline.
+    DeadlineProbe,
     /// `ctx.create_session` on `queue`.
     Session {
         /// Queue of the session-acquire activity.
@@ -701,7 +719,12 @@ async fn run_once(case: &ReplayCase, history: &[WorkflowEvent]) -> (Verdict, Str
 
     let program = case.program.clone().unwrap_or_else(|| mirror(&read));
     let program_json = serde_json::to_string(&program).expect("a program serializes");
-    let report = WorkflowReplayer::new()
+    let mut replayer = WorkflowReplayer::new();
+    // A deadline probe reads the clock only when the run has a deadline.
+    if read.iter().any(is_deadline_probe) {
+        replayer = replayer.with_execution_timeout(chrono::Duration::hours(1));
+    }
+    let report = replayer
         .register_fn(WORKFLOW, program_workflow)
         .with_execution_id(ExecutionId::from_uuid(uuid::Uuid::nil()))
         .with_context_headers(HashMap::from([(PROGRAM_HEADER.to_string(), program_json)]))
@@ -961,6 +984,8 @@ fn mirror_fan_out(
                 refills += 1;
                 continue;
             }
+            // A signal is buffered, so it can arrive between the group's items.
+            WorkflowEvent::SignalReceived { .. } => continue,
             // Any other event is not part of the group, so a later schedule
             // is the caller's own.
             _ => break,
@@ -1010,7 +1035,9 @@ fn next_wave_is_full(rest: &[WorkflowEvent], group: &HashSet<ActivityExecId>, ne
     };
     let wave = rest
         .iter()
-        .skip_while(|event| of_group(event))
+        .skip_while(|event| {
+            of_group(event) || matches!(event, WorkflowEvent::SignalReceived { .. })
+        })
         .take_while(|event| matches!(event, WorkflowEvent::ActivityScheduled { .. }))
         .count();
     need > 0 && wave >= need
@@ -1075,6 +1102,7 @@ fn settles_after_failure<K: Copy + Eq + std::hash::Hash>(
                 settled.insert(id);
                 failed = true;
             }
+            None if matches!(event, WorkflowEvent::SignalReceived { .. }) => {}
             _ => break,
         }
     }
@@ -1124,6 +1152,8 @@ struct Taken<'a, 'h> {
 
 /// One branch command of a race, in the order the race issued it.
 struct Claimed {
+    /// The history index of the command.
+    index: usize,
     /// The slot a race timer names in its id.
     fixed: Option<usize>,
     /// The activity or child it started, if any.
@@ -1167,6 +1197,7 @@ fn mirror_race<'h>(
                 let fixed = timer_id.as_str().strip_prefix(timer_prefix.as_str());
                 let fixed = fixed.and_then(|i| i.parse::<usize>().ok());
                 commands.extend(mirror_event(event, false).map(|op| Claimed {
+                    index,
                     fixed,
                     branch: None,
                     op,
@@ -1175,6 +1206,7 @@ fn mirror_race<'h>(
             }
             WorkflowEvent::ActivityScheduled { activity_id, .. } if claim => {
                 commands.extend(mirror_event(event, false).map(|op| Claimed {
+                    index,
                     fixed: None,
                     branch: Some(Branch::Activity(*activity_id)),
                     op,
@@ -1183,6 +1215,7 @@ fn mirror_race<'h>(
             }
             WorkflowEvent::ChildWorkflowStarted { child_id, .. } if claim => {
                 commands.extend(mirror_event(event, false).map(|op| Claimed {
+                    index,
                     fixed: None,
                     branch: Some(Branch::Child(*child_id)),
                     op,
@@ -1192,6 +1225,7 @@ fn mirror_race<'h>(
             WorkflowEvent::MarkerRecorded { name, details } if *name == winner_marker => {
                 winner = details.as_u64().and_then(|w| usize::try_from(w).ok());
                 taken.others.insert(index);
+                release_late_siblings(&history[index + 1..], &finished, &mut commands, taken);
                 break;
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. }
@@ -1216,6 +1250,38 @@ fn mirror_race<'h>(
     }
     let branches = place_race_branches(commands, &finished, signal, winner, count);
     Op::Race { branches }
+}
+
+/// Gives back to the main loop each claimed command that completes after the
+/// race was decided. A losing signal writes no event, so the branch count
+/// can claim a sibling command too. A race loser does not complete after
+/// the decision, so such a command was a sibling.
+fn release_late_siblings(
+    after: &[WorkflowEvent],
+    finished: &HashSet<Branch>,
+    commands: &mut Vec<Claimed>,
+    taken: &mut Taken<'_, '_>,
+) {
+    let completed_later: HashSet<Branch> = after
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityCompleted { activity_id, .. } => {
+                Some(Branch::Activity(*activity_id))
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. } => {
+                Some(Branch::Child(*child_id))
+            }
+            _ => None,
+        })
+        .filter(|branch| !finished.contains(branch))
+        .collect();
+    commands.retain(|command| {
+        let sibling = command.branch.is_some_and(|b| completed_later.contains(&b));
+        if sibling {
+            taken.commands.remove(&command.index);
+        }
+        !sibling
+    });
 }
 
 /// Puts race branches into slots, as [`mirror_race`] describes.
@@ -1293,6 +1359,18 @@ enum Paired {
     Other,
 }
 
+/// True for the clock capture that `should_continue_as_new` records.
+fn is_deadline_probe(event: &WorkflowEvent) -> bool {
+    matches!(
+        event,
+        WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Now,
+            name: Some(name),
+            ..
+        } if name == DEADLINE_PROBE_SIDE_EFFECT_NAME
+    )
+}
+
 /// The op of an event that a paired API wrote with its neighbour: a worker
 /// session, a child or signal wait bounded by a timer. `next` is the index
 /// after the event.
@@ -1303,6 +1381,14 @@ fn paired_op<'h>(
     timeouts: &mut HashMap<&'h str, usize>,
 ) -> Paired {
     match &history[next - 1] {
+        WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("saga_compensated:") => {
+            Paired::Mapped(Some(mirror_saga(history, next, claimed)))
+        }
+        WorkflowEvent::MarkerRecorded { name, .. }
+            if name.starts_with("saga_compensation_failed:") =>
+        {
+            Paired::Mapped(None)
+        }
         WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("session:") => {
             let queue = match history.get(next) {
                 Some(WorkflowEvent::ActivityScheduled { name, queue, .. })
@@ -1359,6 +1445,33 @@ fn paired_op<'h>(
         }
         _ => Paired::Other,
     }
+}
+
+/// Builds the [`Op::SagaUnwind`] that a `saga_compensated:{seq}` marker
+/// opens. The compensations are the activities the saga runs one by one
+/// after the marker. Their schedules go to `claimed`.
+fn mirror_saga(history: &[WorkflowEvent], start: usize, claimed: &mut HashSet<usize>) -> Op {
+    let mut compensations = Vec::new();
+    let mut ids = HashSet::new();
+    for (index, event) in history.iter().enumerate().skip(start) {
+        match activity_outcome(event) {
+            Some((id, Outcome::Progress))
+                if matches!(event, WorkflowEvent::ActivityScheduled { .. }) =>
+            {
+                if let WorkflowEvent::ActivityScheduled {
+                    name, input, queue, ..
+                } = event
+                {
+                    compensations.push((name.clone(), input.clone(), queue.clone()));
+                }
+                ids.insert(id);
+                claimed.insert(index);
+            }
+            Some((id, _)) if ids.contains(&id) => {}
+            _ => break,
+        }
+    }
+    Op::SagaUnwind { compensations }
 }
 
 /// The timeout of a `spawn_child_workflow_timeout` call, when `next` is the
@@ -1460,6 +1573,7 @@ impl Op {
                 | Self::Race { .. }
                 | Self::ChildTimeout { .. }
                 | Self::Session { .. }
+                | Self::SagaUnwind { .. }
         )
     }
 
@@ -1474,6 +1588,8 @@ impl Op {
                 | Self::RandomF64
                 | Self::RandomInt { .. }
                 | Self::RandomFloat { .. }
+                | Self::DagSkip { .. }
+                | Self::DeadlineProbe
                 | Self::Patched { .. }
                 | Self::SideEffect { .. }
                 | Self::DetachedChild { .. }
@@ -1528,6 +1644,9 @@ fn mirror_event(event: &WorkflowEvent, armed_timer: bool) -> Option<Op> {
             name: signal_name.clone(),
         }),
         WorkflowEvent::SideEffectRecorded { kind, name, value } => match kind {
+            SideEffectKind::Now if name.as_deref() == Some(DEADLINE_PROBE_SIDE_EFFECT_NAME) => {
+                Some(Op::DeadlineProbe)
+            }
             SideEffectKind::Now => Some(Op::Now),
             SideEffectKind::Uuid => Some(Op::NewUuid),
             SideEffectKind::Random => Some(random_op(value)),
@@ -1576,6 +1695,20 @@ fn random_op(value: &Value) -> Op {
 fn marker_op(name: &str, details: &Value) -> Option<Op> {
     if let Some(id) = name.strip_prefix("patch:") {
         return Some(Op::Patched { id: id.to_string() });
+    }
+    if let Some(task) = name.strip_prefix("dag_skip:") {
+        return Some(Op::DagSkip {
+            task: task.parse().unwrap_or_default(),
+            activity: details["task"].as_str().unwrap_or_default().to_string(),
+            upstreams: details["upstreams"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .filter_map(|i| usize::try_from(i.as_u64()?).ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
     }
     if let Some(name) = name.strip_prefix("side_effect:") {
         return Some(Op::SideEffect {
@@ -1730,6 +1863,8 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
             let _ = ctx.wait_for_signal(&name).await;
         }
         op @ (Op::Now
+        | Op::DagSkip { .. }
+        | Op::DeadlineProbe
         | Op::NewUuid
         | Op::Random
         | Op::RandomF64
@@ -1875,6 +2010,16 @@ fn run_capture_op(ctx: &WorkflowContext, op: Op) {
         Op::SideEffect { name } => {
             let _ = ctx.side_effect::<_, Value>(&name, || Value::Null);
         }
+        Op::DagSkip {
+            task,
+            activity,
+            upstreams,
+        } => {
+            let _ = ctx.dag_skip_marker(task, &activity, &upstreams);
+        }
+        Op::DeadlineProbe => {
+            let _ = ctx.should_continue_as_new();
+        }
         _ => {}
     }
 }
@@ -1888,6 +2033,18 @@ async fn run_external_op(ctx: &WorkflowContext, op: Op) {
             let _ = ctx
                 .spawn_child_workflow_timeout(&name, input, timeout)
                 .await;
+        }
+        Op::SagaUnwind { compensations } => {
+            let mut saga = crate::saga::Saga::new(ctx);
+            // A saga runs its compensations last first.
+            for (name, input, queue) in compensations.into_iter().rev() {
+                saga.push_compensation(move || async move {
+                    ctx.execute_activity_raw(&name, input, &queue)
+                        .await
+                        .map(|_| ())
+                });
+            }
+            let _ = saga.compensate_all().await;
         }
         Op::Session { queue } => {
             let _ = ctx
