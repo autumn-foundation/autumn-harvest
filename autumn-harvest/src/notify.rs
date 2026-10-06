@@ -932,6 +932,81 @@ struct StageRow {
     started_at: DateTime<Utc>,
 }
 
+/// Notes that [`coalesced`] holds for one write connection (issue #1833).
+struct HeldNotes {
+    /// The address of the connection the notes belong to.
+    conn: usize,
+    /// The notes staged on that connection so far.
+    notes: Vec<Note>,
+}
+
+tokio::task_local! {
+    /// The notes of the [`coalesced`] scope that runs on this task.
+    static HELD: std::cell::RefCell<HeldNotes>;
+}
+
+/// The key that tells one connection from another in a [`coalesced`] scope.
+fn conn_key(conn: &AsyncPgConnection) -> usize {
+    std::ptr::from_ref(conn).addr()
+}
+
+/// Run `body` on `conn`, then stage its notes once, merged (issue #1833).
+///
+/// Call it inside a transaction. Each note that `body` stages on `conn` is
+/// held. The notes go out in one stage call before `body`'s transaction
+/// commits. So the fallback path also merges the notes of one execution
+/// into one wake, as the post-commit sender does. A decision boundary
+/// needs that: its count must reach the wake of the outcome event.
+///
+/// A note staged on another connection is not held. It can belong to
+/// another database or another transaction.
+///
+/// # Errors
+///
+/// Returns the error of `body`, or the error of the stage call.
+#[doc(hidden)]
+pub async fn coalesced<T>(
+    conn: &mut AsyncPgConnection,
+    body: impl AsyncFnOnce(&mut AsyncPgConnection) -> HarvestResult<T>,
+) -> HarvestResult<T> {
+    let held = HeldNotes {
+        conn: conn_key(conn),
+        notes: Vec::new(),
+    };
+    HELD.scope(std::cell::RefCell::new(held), async move {
+        let out = body(conn).await?;
+        let notes = HELD.with(|held| std::mem::take(&mut held.borrow_mut().notes));
+        if !notes.is_empty() {
+            stage_now(conn, notes).await?;
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Stage `notes` for the write on `conn`, or hold them in a [`coalesced`]
+/// scope for `conn`.
+///
+/// # Errors
+///
+/// Same as [`stage_now`].
+async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+    let key = conn_key(conn);
+    let mut notes = Some(notes);
+    let _ = HELD.try_with(|held| {
+        let mut held = held.borrow_mut();
+        if held.conn == key
+            && let Some(notes) = notes.take()
+        {
+            held.notes.extend(notes);
+        }
+    });
+    match notes {
+        Some(notes) => stage_now(conn, notes).await,
+        None => Ok(()),
+    }
+}
+
 /// Stage `notes` for the write on `conn`.
 ///
 /// # Errors
@@ -939,7 +1014,7 @@ struct StageRow {
 /// Returns an error only when the write transaction has already failed.
 /// Postgres answers `COMMIT` on a failed transaction with a silent rollback.
 /// The error therefore tells the caller that its write did not commit.
-async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+async fn stage_now(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
     let has_sink = any_sink();
     if AtomicBool::load(&ANY_DEFERRED, Ordering::Relaxed)
         && let Ok(runtime) = tokio::runtime::Handle::try_current()

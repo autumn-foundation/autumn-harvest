@@ -26273,130 +26273,134 @@ async fn process_workflow_task(
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
 
+    // Issue #1833: one merged wake per execution, also on the fallback path.
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
-            if check_paused_and_park(
-                conn,
-                exec_uuid,
-                task.id,
-                worker_id,
-                task.crash_strikes,
-                task.attempt,
-                sticky_timeout,
-            )
-            .await?
-            {
-                // Inline local activities can have appended events already.
+            crate::notify::coalesced(conn, async |conn| {
+                if check_paused_and_park(
+                    conn,
+                    exec_uuid,
+                    task.id,
+                    worker_id,
+                    task.crash_strikes,
+                    task.attempt,
+                    sticky_timeout,
+                )
+                .await?
+                {
+                    // Inline local activities can have appended events already.
+                    record_decision_boundary(
+                        conn,
+                        registry,
+                        prepared.exec_id,
+                        decision_start_event_id,
+                        inline_appends,
+                        true,
+                        worker_id,
+                        build_id,
+                    )
+                    .await?;
+                    return Ok(WorkflowPersistFlow::ParkedPaused);
+                }
+
+                // Issue #1833: the boundary follows only rows this decision
+                // writes. The execution row is locked now, and every history
+                // writer takes that lock. So a row past this id is this
+                // transaction's own. A row another writer committed after the
+                // decision start does not count. Inline steps wrote before
+                // the lock, so they keep the decision start.
+                let boundary_floor =
+                    if inline_appends || !registry.history_policy().decision_boundaries() {
+                        decision_start_event_id
+                    } else {
+                        store::next_event_id_for(conn, prepared.exec_id).await?
+                    };
+
+                // Issue #603: this cycle replayed cleanly (the ND gate above
+                // did not fire), so if the execution was previously blocked on
+                // replay non-determinism the offending build has been rolled
+                // back or fixed — clear the block marker atomically with the
+                // recovered cycle's persisted outcome. Guarded on
+                // `was_nd_blocked` (captured *before* the in-memory mutation
+                // above) rather than re-reading `execution_ref.nd_blocked_at`,
+                // which is already `None` here by the time this runs — so
+                // never-blocked executions still pay nothing, and a
+                // previously-blocked one still gets its DB row cleared.
+                if was_nd_blocked {
+                    clear_nd_block(conn, persistence.exec_id).await?;
+                }
+
+                let mut pending_cancel_metrics = Vec::new();
+                // Issue #1161: `false` unless the ContinuedAsNew outcome below
+                // (reached via either branch) redirects to a terminal failure —
+                // see `persist_workflow_outcome`'s parameter doc.
+                let mut continue_as_new_redirected_to_failure = false;
+                let (retry_scheduled, deferred_checks, race_deferred_triggers) =
+                    if is_terminal_with_commands {
+                        persist_terminal_outcome_commands(
+                            conn,
+                            registry,
+                            execution_ref,
+                            persistence,
+                            outcome,
+                            &pending_cmds,
+                            &recorded_dispatches,
+                            &execute_span,
+                            &mut pending_cancel_metrics,
+                            &mut continue_as_new_redirected_to_failure,
+                            resolved_router.as_ref(),
+                        )
+                        .await?
+                    } else {
+                        let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
+                            conn,
+                            registry,
+                            execution_ref,
+                            persistence,
+                            outcome,
+                            &execute_span,
+                            false,
+                            // Issue #678: carries any external-op terminal
+                            // resolved inline this cycle into the Suspended arm
+                            // so a mixed timer + external op self-wakes.
+                            resolved_inline_external,
+                            &mut pending_cancel_metrics,
+                            &mut continue_as_new_redirected_to_failure,
+                            resolved_router.as_ref(),
+                            // This path never computes an abandoned-dispatch
+                            // decision ahead of time (`is_terminal_with_commands`
+                            // is false here), so the arm resolves its own verdict.
+                            None,
+                        )
+                        .await?;
+                        (retry_scheduled, deferred_checks, Vec::new())
+                    };
                 record_decision_boundary(
                     conn,
                     registry,
                     prepared.exec_id,
-                    decision_start_event_id,
-                    inline_appends,
-                    true,
+                    boundary_floor,
+                    decision_appends,
+                    stays_running,
                     worker_id,
                     build_id,
                 )
                 .await?;
-                return Ok(WorkflowPersistFlow::ParkedPaused);
-            }
-
-            // Issue #1833: the boundary follows only rows this decision
-            // writes. The execution row is locked now, and every history
-            // writer takes that lock. So a row past this id is this
-            // transaction's own. A row another writer committed after the
-            // decision start does not count. Inline steps wrote before
-            // the lock, so they keep the decision start.
-            let boundary_floor =
-                if inline_appends || !registry.history_policy().decision_boundaries() {
-                    decision_start_event_id
-                } else {
-                    store::next_event_id_for(conn, prepared.exec_id).await?
-                };
-
-            // Issue #603: this cycle replayed cleanly (the ND gate above
-            // did not fire), so if the execution was previously blocked on
-            // replay non-determinism the offending build has been rolled
-            // back or fixed — clear the block marker atomically with the
-            // recovered cycle's persisted outcome. Guarded on
-            // `was_nd_blocked` (captured *before* the in-memory mutation
-            // above) rather than re-reading `execution_ref.nd_blocked_at`,
-            // which is already `None` here by the time this runs — so
-            // never-blocked executions still pay nothing, and a
-            // previously-blocked one still gets its DB row cleared.
-            if was_nd_blocked {
-                clear_nd_block(conn, persistence.exec_id).await?;
-            }
-
-            let mut pending_cancel_metrics = Vec::new();
-            // Issue #1161: `false` unless the ContinuedAsNew outcome below
-            // (reached via either branch) redirects to a terminal failure —
-            // see `persist_workflow_outcome`'s parameter doc.
-            let mut continue_as_new_redirected_to_failure = false;
-            let (retry_scheduled, deferred_checks, race_deferred_triggers) =
-                if is_terminal_with_commands {
-                    persist_terminal_outcome_commands(
-                        conn,
-                        registry,
-                        execution_ref,
-                        persistence,
-                        outcome,
-                        &pending_cmds,
-                        &recorded_dispatches,
-                        &execute_span,
-                        &mut pending_cancel_metrics,
-                        &mut continue_as_new_redirected_to_failure,
-                        resolved_router.as_ref(),
-                    )
-                    .await?
-                } else {
-                    let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
-                        conn,
-                        registry,
-                        execution_ref,
-                        persistence,
-                        outcome,
-                        &execute_span,
-                        false,
-                        // Issue #678: carries any external-op terminal
-                        // resolved inline this cycle into the Suspended arm
-                        // so a mixed timer + external op self-wakes.
-                        resolved_inline_external,
-                        &mut pending_cancel_metrics,
-                        &mut continue_as_new_redirected_to_failure,
-                        resolved_router.as_ref(),
-                        // This path never computes an abandoned-dispatch
-                        // decision ahead of time (`is_terminal_with_commands`
-                        // is false here), so the arm resolves its own verdict.
-                        None,
-                    )
-                    .await?;
-                    (retry_scheduled, deferred_checks, Vec::new())
-                };
-            record_decision_boundary(
-                conn,
-                registry,
-                prepared.exec_id,
-                boundary_floor,
-                decision_appends,
-                stays_running,
-                worker_id,
-                build_id,
-            )
-            .await?;
-            // Chaos: kill/delay inside the persist transaction, after the
-            // outcome is written but before the outer commit — the #367 window
-            // (worker dies after claim, before the terminal is durable). A kill
-            // (owned conn in the reproducer's spawned task) rolls the persist
-            // back, leaving the task RUNNING with a dead worker (AC4).
-            crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
-            Ok(WorkflowPersistFlow::Persisted {
-                retry_scheduled,
-                deferred_checks,
-                race_deferred_triggers,
-                pending_cancel_metrics,
-                continue_as_new_redirected_to_failure,
+                // Chaos: kill/delay inside the persist transaction, after the
+                // outcome is written but before the outer commit — the #367 window
+                // (worker dies after claim, before the terminal is durable). A kill
+                // (owned conn in the reproducer's spawned task) rolls the persist
+                // back, leaving the task RUNNING with a dead worker (AC4).
+                crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
+                Ok(WorkflowPersistFlow::Persisted {
+                    retry_scheduled,
+                    deferred_checks,
+                    race_deferred_triggers,
+                    pending_cancel_metrics,
+                    continue_as_new_redirected_to_failure,
+                })
             })
+            .await
         },
     ))
     .await;

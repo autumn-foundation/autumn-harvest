@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use autumn_harvest::context::WorkflowHistoryPolicy;
+use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::prelude::*;
@@ -910,6 +911,45 @@ async fn a_race_loser_that_already_closed_reserves_no_boundary() {
         ["MarkerRecorded", "DecisionCommitted"],
         "the race decision keeps its boundary"
     );
+}
+
+#[tokio::test]
+async fn one_decision_sends_one_wake_on_every_notify_path() {
+    // The post-commit sender merges the notes of one transaction. The
+    // fallback sends each stage call by itself. Inside `coalesced`, both
+    // send one wake per execution. Run alone, no pool is registered, so
+    // this test takes the fallback.
+    use autumn_harvest::notify::{
+        WorkflowEventListener, WorkflowEventWaitOutcome, coalesced, notify_workflow_events_appended,
+    };
+
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+    let mut conn = connect(&url).await;
+    let exec = Uuid::new_v4();
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        coalesced(conn, async |conn| {
+            notify_workflow_events_appended(conn, exec, 2, "WorkflowCompleted").await?;
+            notify_workflow_events_appended(conn, exec, 1, "DecisionCommitted").await
+        })
+        .await
+    }))
+    .await
+    .expect("commit");
+
+    let mut wakes = Vec::new();
+    while let WorkflowEventWaitOutcome::Notification(wake) = listener
+        .wait_for_notification_timeout(Duration::from_secs(2))
+        .await
+        .expect("payload parses")
+    {
+        if wake.workflow_exec_id == exec {
+            wakes.push((wake.event_count, wake.last_event_type));
+        }
+    }
+    assert_eq!(wakes, [(3, "DecisionCommitted".to_string())]);
 }
 
 #[tokio::test]
