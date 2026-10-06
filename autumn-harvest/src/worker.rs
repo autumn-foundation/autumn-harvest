@@ -15628,10 +15628,11 @@ const fn adaptive_limit_gates(
 
 /// The adaptive limit sample for one attempt (issue #1836).
 ///
+/// - A fault of the worker, such as a panic, gives no sample. This holds
+///   even past the deadline. `error_type` names the fault.
 /// - An attempt that timed out (`timed_out`) is overload. A hung dependency
 ///   is the classic overload signal.
-/// - A retryable failure is overload, unless `error_type` names a fault of
-///   the worker, such as a panic.
+/// - A retryable failure is overload.
 /// - A success is an answer.
 /// - A non-retryable failure gives no sample. It is often fast, and its
 ///   latency would pull the baseline down.
@@ -15643,11 +15644,12 @@ fn limit_sample_outcome(
 ) -> Option<crate::adaptive_limit::SampleOutcome> {
     use crate::adaptive_limit::SampleOutcome;
     use crate::circuit_breaker::AttemptOutcome;
-    if timed_out {
-        return Some(SampleOutcome::Overloaded);
-    }
+    // A worker fault gives no sample, even past the deadline.
     if error_type.is_some_and(is_worker_local_failure) {
         return None;
+    }
+    if timed_out {
+        return Some(SampleOutcome::Overloaded);
     }
     match outcome {
         Some(AttemptOutcome::RetryableFailure) => Some(SampleOutcome::Overloaded),
@@ -16073,6 +16075,20 @@ mod adaptive_limit_gate_tests {
                 Some(AttemptOutcome::RetryableFailure),
                 Some(crate::failure::ERROR_TYPE_HANDLER_PANIC),
                 false
+            ),
+            None
+        );
+    }
+
+    /// A worker fault that ends past the deadline is still a worker fault.
+    /// Its late end says nothing about the dependency, so it gives no sample.
+    #[test]
+    fn a_late_worker_local_failure_gives_no_sample() {
+        assert_eq!(
+            limit_sample_outcome(
+                Some(AttemptOutcome::RetryableFailure),
+                Some(crate::failure::ERROR_TYPE_HANDLER_PANIC),
+                true
             ),
             None
         );

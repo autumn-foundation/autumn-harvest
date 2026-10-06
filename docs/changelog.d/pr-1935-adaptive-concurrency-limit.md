@@ -22,7 +22,7 @@ failures. It never reads a queue wait or a permit wait.
   completions cuts the cap by `backoff_ratio`. A start-to-close,
   schedule-to-close or heartbeat timeout counts as a retryable failure. A
   non-retryable failure, a panic and a WASM module or runtime fault give no
-  sample.
+  sample, even past the deadline.
 - `WorkerConfig::with_adaptive_limit` and
   `HandlerRegistry::with_adaptive_limit` take an `AdaptiveLimitConfig`. The
   limit is off by default. An override for an unregistered name logs a
