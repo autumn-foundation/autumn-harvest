@@ -138,7 +138,9 @@ let mut rt = SqliteRuntime::open_in_memory()?;
 
 - Use **`open(path)`** for anything that must survive a process restart. Opening
   applies the schema idempotently and reclaims any task stranded `RUNNING` by a
-  previous crash (see [§9](#9-durability-and-crash-recovery)).
+  previous crash (see [§9](#9-durability-and-crash-recovery)). It first takes the
+  single-writer lock, so a second open of a held file fails with
+  `SqliteError::DatabaseLocked` (see [§10](#10-the-single-writer--single-server-contract)).
 - Use **`open_in_memory()`** for tests, demos, and throwaway runs. Each call is a
   brand-new database and is **not** reopen-safe — dropping the runtime discards
   all state.
@@ -370,8 +372,28 @@ The runtime opens the database with `journal_mode = WAL`, `synchronous = FULL`
 (fsync on every commit — the crash tests depend on it), and a `busy_timeout` so
 an occasional external *reader* (a monitoring/inspector connection) can coexist.
 
-**Do not** point two writer processes at the same file, and **do not** use this
-backend as a shared multi-server queue. The only residual crash window is *mid
+### The contract is enforced (issue #1834)
+
+`SqliteRuntime::open` takes an exclusive OS lock on a sidecar file,
+`<database>.lock`. A second runtime on the same file fails fast with
+`SqliteError::DatabaseLocked`. This applies to another process, and to a
+second runtime in the same process.
+
+- The second open fails **before** it changes the file. It runs no pragma, no
+  schema step and no orphan reclaim. It cannot steal a `RUNNING` task.
+- The kernel releases the lock when the holder exits, also on a crash. A
+  restart never meets a stale lock.
+- The lock path comes from the canonical database path. A symlink or a
+  relative path to the same file maps to the same lock.
+- A read-only inspector connection still works. It never touches the lock.
+- An in-memory database takes no lock.
+
+The lock file stays on disk after the runtime drops. **Do not delete it** while
+a runtime runs: a second process could then lock a new file.
+
+**Do not** use this backend as a shared multi-server queue. The lock is an
+advisory lock on the local file system. A network file system may not honour
+it. The only residual crash window is *mid
 activity body* — a crash while a body is executing leaves the task `RUNNING` and
 is recovered (re-running the body, at-least-once) by the orphan reclaim on the
 next `open`. A single-process design has no heartbeat-timeout reclaimer for a
@@ -384,7 +406,7 @@ next `open`. A single-process design has no heartbeat-timeout reclaimer for a
 Out-of-subset workflow primitives are rejected **loudly, by name** — never
 silently dropped. A workflow reaching one of these surfaces
 `SqliteError::Unsupported` (or a setup-time panic at registration) naming the
-specific command/feature:
+specific command/feature. The run then ends `FAILED` (see below):
 
 - **Child workflows** (`spawn_child_workflow`, `spawn_child_workflow_detached`).
 - **External signals / cancels** (`signal_external_workflow`,
@@ -396,13 +418,30 @@ specific command/feature:
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 
-A rejected execution stays `RUNNING` and keeps erroring on every later drive.
-It does not block unrelated executions, though. `poll_once` still drives the
-rest of the fleet in the same pass (issue #1530), and `run_until_idle` still
-converges the rest of the fleet to quiescence in one call — it no longer
-stops after one internal pass the first time the broken execution errors
-(issue #1555). Both keep reporting the broken execution's error to the
-caller; neither drops it.
+A rejected execution ends `FAILED` (issue #1834). The drive that meets the
+feature rolls back the whole cycle. It then seals the run in a new
+transaction, with a typed `WorkflowFailed` event:
+
+| Field | Value |
+|---|---|
+| `error_type` | `"UnsupportedFeature"` (`UNSUPPORTED_FEATURE_ERROR_TYPE`) |
+| `details` | `{"feature": "<command or field>"}` |
+| `non_retryable` | `true` |
+| `error` | The `SqliteError::Unsupported` message |
+
+That drive still returns `SqliteError::Unsupported`, so the caller sees the
+reason. A later drive returns `RunState::Failed` and does not run the handler
+again. `outcome()` returns `ExecutionOutcome::Failed`.
+
+Only an unsupported feature seals a run. An unregistered workflow or activity,
+a replay divergence, a contained panic under its budget, and a failed task
+leave the run `RUNNING`, because a fix in the same runtime can resume it.
+
+A failing execution does not block unrelated executions. `poll_once` still
+drives the rest of the fleet in the same pass (issue #1530), and
+`run_until_idle` still converges the rest of the fleet to quiescence in one
+call (issue #1555). Both report the first execution error to the caller. A
+sealed execution is terminal, so later passes skip it.
 
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
 push wake-ups, multi-server crash recovery, schedules, the management API,

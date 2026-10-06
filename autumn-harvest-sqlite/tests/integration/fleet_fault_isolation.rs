@@ -269,9 +269,10 @@ async fn poll_once_still_attempts_every_broken_execution_in_one_pass() {
         COUNTING_BROKEN_ATTEMPTS.load(Ordering::SeqCst) - attempts_before >= 2,
         "both broken executions must be driven in the same pass, not just the first"
     );
+    // Issue #1834: the pass seals each broken execution `FAILED`.
     assert!(matches!(
         rt.outcome(second).unwrap(),
-        ExecutionOutcome::Running
+        ExecutionOutcome::Failed(_)
     ));
 }
 

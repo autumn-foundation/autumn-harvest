@@ -22,7 +22,8 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
-use crate::{queue, schema, store, worker};
+use crate::lock::WriterLock;
+use crate::{lock, queue, schema, store, worker};
 
 /// The activity body a workflow's `execute_activity_raw(name, ...)` resolves to.
 ///
@@ -165,6 +166,10 @@ pub struct StartOutcome {
     pub created: bool,
 }
 
+/// The `error_type` of the `WorkflowFailed` event that seals an execution
+/// which reached an unsupported feature (issue #1834).
+pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
+
 /// Maximum driver iterations before declaring a runaway (safety bound only — the
 /// supported scenarios converge in a handful of cycles).
 const MAX_ITERATIONS: usize = 10_000;
@@ -206,6 +211,9 @@ pub struct SqliteRuntime {
     /// drivers bypass it entirely (they take a caller-fixed timestamp — the
     /// deterministic-simulation seam).
     now_fn: NowFn,
+    /// The single-writer lock (issue #1834). `None` for an in-memory database.
+    /// It is released when the runtime drops.
+    _writer_lock: Option<WriterLock>,
 }
 
 /// A wall-clock source for the public drivers — see [`SqliteRuntime::set_clock`].
@@ -221,13 +229,20 @@ impl SqliteRuntime {
     /// schema idempotently and reclaiming any orphaned `RUNNING` task from a
     /// previous process (crash recovery; makes activities at-least-once).
     ///
+    /// The open first takes the single-writer lock, `<path>.lock` (issue
+    /// #1834). It fails fast when another runtime holds that lock. It fails
+    /// before any pragma, schema step or reclaim, so it changes nothing.
+    ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::Sqlite`] if the file cannot be opened, the schema
-    /// cannot be applied, or the orphan reclaim fails.
+    /// Returns [`SqliteError::DatabaseLocked`] if another process or runtime
+    /// has the file open. Returns [`SqliteError::Io`] if the lock file cannot
+    /// be opened. Returns [`SqliteError::Sqlite`] if the file cannot be
+    /// opened, the schema cannot be applied, or the orphan reclaim fails.
     pub fn open(path: impl AsRef<Path>) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
-        Self::from_connection(conn)
+        let writer_lock = lock::acquire(&conn)?;
+        Self::from_connection(conn, writer_lock)
     }
 
     /// Open a private, in-memory database (each call is a fresh, empty database —
@@ -240,10 +255,10 @@ impl SqliteRuntime {
     /// created or the schema cannot be applied.
     pub fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn)
+        Self::from_connection(conn, None)
     }
 
-    fn from_connection(conn: Connection) -> SqliteResult<Self> {
+    fn from_connection(conn: Connection, writer_lock: Option<WriterLock>) -> SqliteResult<Self> {
         // Durability & concurrency posture (issue #1068). This backend makes a
         // deliberate, conservative durability claim (a committed transaction
         // survives a crash/power-loss — the crash-then-reopen tests depend on it),
@@ -280,6 +295,7 @@ impl SqliteRuntime {
             activities: HashMap::new(),
             workflow_panic_strikes: HashMap::new(),
             now_fn: std::sync::Arc::new(Utc::now),
+            _writer_lock: writer_lock,
         })
     }
 
@@ -912,7 +928,8 @@ impl SqliteRuntime {
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
     /// [`SqliteError::Stuck`] if the run makes no progress and cannot be
     /// classified. Returns [`SqliteError::Unsupported`] for an unsupported
-    /// command and [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
+    /// command, after it seals the run `FAILED` (issue #1834). Returns
+    /// [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// Returns [`SqliteError::UnregisteredActivity`] for an unregistered activity.
     /// Returns [`SqliteError::NonDeterministic`] on replay divergence and
     /// [`SqliteError::WorkflowPanicked`] for a contained panic. Returns
@@ -1139,6 +1156,48 @@ impl SqliteRuntime {
         Err(first_error.unwrap_or(SqliteError::Runaway))
     }
 
+    /// Run one decision cycle, and seal the run `FAILED` when the cycle meets an
+    /// unsupported feature (issue #1834).
+    ///
+    /// The cycle's own transaction has already rolled back at that point. The
+    /// seal is a new transaction, so no half-written cycle survives. The error
+    /// still returns to the caller, so the drive that seals the run reports why.
+    /// Every other error leaves the run `RUNNING`, because a fix in the same
+    /// runtime can still resume it.
+    async fn drive_one_cycle(
+        &mut self,
+        exec: ExecutionId,
+        now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
+        let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
+        if let Err(SqliteError::Unsupported(feature)) = &result {
+            self.seal_unsupported(exec, feature)?;
+        }
+        result
+    }
+
+    /// Seal `exec` `FAILED` with the typed unsupported-feature reason.
+    ///
+    /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`],
+    /// the feature in `details.feature`, and `non_retryable = true`. A retry
+    /// would meet the same feature again.
+    fn seal_unsupported(&mut self, exec: ExecutionId, feature: &str) -> SqliteResult<()> {
+        let message = SqliteError::Unsupported(feature.to_string()).to_string();
+        let event = WorkflowEvent::WorkflowFailed {
+            error: message.clone(),
+            error_type: Some(UNSUPPORTED_FEATURE_ERROR_TYPE.to_string()),
+            details: Some(serde_json::json!({ "feature": feature })),
+            non_retryable: Some(true),
+        };
+        let tx = self.conn.transaction()?;
+        store::append_event(&tx, exec, &event)?;
+        store::set_failed(&tx, exec, &message)?;
+        tx.commit()?;
+        self.workflow_panic_strikes.remove(&exec);
+        Ok(())
+    }
+
     /// Run exactly one decision cycle at logical time `now` (epoch milliseconds):
     /// replay/execute the workflow once, persist the resulting side effects, and
     /// run one worker pass.
@@ -1150,7 +1209,7 @@ impl SqliteRuntime {
     /// `_as_of` drivers pass one that returns the caller-fixed epoch, so simulation
     /// stays deterministic (`failure_now() == now`).
     #[allow(clippy::too_many_lines)] // one arm per `WorkflowOutcome` variant
-    async fn drive_one_cycle(
+    async fn drive_one_cycle_inner(
         &mut self,
         exec: ExecutionId,
         now: i64,

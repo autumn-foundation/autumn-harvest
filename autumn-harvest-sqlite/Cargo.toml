@@ -26,6 +26,9 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# The single-writer lock (issue #1834): an exclusive OS file lock that dies
+# with its process. std `File::try_lock` needs Rust 1.89, above the MSRV.
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 # `testing` gives the cross-backend replay harness (`WorkflowReplayer`).
