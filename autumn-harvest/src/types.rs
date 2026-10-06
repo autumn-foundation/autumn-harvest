@@ -1297,6 +1297,7 @@ impl std::str::FromStr for ParentClosePolicy {
 /// identity advertises an empty `BuildId`. It claims unpinned tasks only,
 /// never one with a `required_build_id` (issue #1805).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct BuildId(String);
 
 impl BuildId {

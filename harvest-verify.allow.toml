@@ -51,3 +51,27 @@ is ever dropped and restarted. The very same call already carries a reviewed \
 exactly that reason; this entry is the semantic layer recording that decision, \
 not a second opinion on it. Remove it if the example stops racing futures, or \
 when the model can verify a fixed-order select instead of reporting every one."""
+
+[[allow]]
+workflow = "integration::decision_boundary_db_tests::boundary_mutex_waiter"
+justification = """\
+A test fixture for issue #1833, nondeterministic on purpose. Its first run \
+appends one history row through a side connection, then takes a contended \
+mutex. That puts a write by another writer inside the decision window, the \
+race that `a_contended_acquire_records_no_boundary_after_a_foreign_write` \
+proves the boundary write ignores. No engine hook can place a write there. \
+The static flag makes the write fire once, and the row is a boundary, which \
+replay skips. So later replays issue the same commands. Remove this entry if \
+the engine gains a test hook between replay and persist."""
+
+[[allow]]
+workflow = "integration::decision_boundary_db_tests::boundary_pause_inline"
+justification = """\
+A test fixture for issue #1833, nondeterministic on purpose. After its local \
+activity completes inline, its first run pauses itself through a side \
+connection. The pause then lands after the inline writes and before the \
+decision persists, the window that \
+`a_pause_before_persist_keeps_the_boundary_of_inline_writes` covers. No \
+engine hook can place a pause there. The static flag makes the pause fire \
+once, and a paused run does not replay again in the test. Remove this entry \
+if the engine gains a test hook between replay and persist."""
