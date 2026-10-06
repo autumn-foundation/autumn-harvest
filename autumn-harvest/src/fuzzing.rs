@@ -350,6 +350,7 @@ pub struct ReplayCase {
     pub codec: Codec,
     /// Payloads over this many bytes are offloaded.
     #[serde(default = "default_threshold")]
+    #[arbitrary(with = threshold)]
     pub offload_threshold: u32,
     /// The events to store and replay.
     #[arbitrary(with = history)]
@@ -379,6 +380,16 @@ fn history(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<WorkflowEvent>> {
         }
     }
     Ok(events)
+}
+
+/// Generates an offload threshold. Three draws in four are at most 256
+/// bytes, so generated payloads cross it and the offload round trip runs.
+fn threshold(u: &mut Unstructured<'_>) -> arbitrary::Result<u32> {
+    if u.ratio(3, 4)? {
+        u.int_in_range(0..=256)
+    } else {
+        Ok(default_threshold())
+    }
 }
 
 const fn default_threshold() -> u32 {
