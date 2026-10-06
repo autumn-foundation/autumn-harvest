@@ -723,3 +723,41 @@ async fn timeouts_of_a_hung_dependency_cut_the_cap() {
     handle.await.expect("worker joins");
     assert!(metrics.last(ACTIVITY).is_some_and(|m| m.0 < 4));
 }
+
+/// A heartbeat timeout fires long before the attempt deadline. The limit
+/// must still read it as overload and cut the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heartbeat_timeouts_of_a_hung_dependency_cut_the_cap() {
+    const ACTIVITY: &str = "al_hung_heartbeat";
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("al-hung-hb");
+    let mut activity = act_info(ACTIVITY, hung_call);
+    activity.default_start_to_close = Some(Duration::from_secs(120));
+    activity.default_heartbeat_timeout = Some(Duration::from_millis(500));
+    let config = AdaptiveLimitConfig::disabled()
+        .with_activity(ACTIVITY, Some(AdaptiveLimitPolicy::default()));
+    let metrics = Arc::new(LimitMetrics::default());
+    let (worker, registry) = build_worker(
+        &format!("{queue}-worker"),
+        &queue,
+        vec![activity],
+        Arc::clone(&metrics),
+        Some(config),
+        HashMap::new(),
+    );
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+    for _ in 0..8 {
+        seed_workflow(&mut conn, &queue, ACTIVITY).await;
+    }
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+    let limits = registry.adaptive_limits();
+    wait_until("a cap below the probe cap", Duration::from_secs(40), || {
+        let limits = Arc::clone(&limits);
+        async move { limits.snapshot(ACTIVITY).is_some_and(|s| s.limit < 4) }
+    })
+    .await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+}

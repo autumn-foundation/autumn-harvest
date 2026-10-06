@@ -19,8 +19,8 @@ failures. It never reads a queue wait or a permit wait.
   about one cap of samples. The baseline is a probed minimum, as in Netflix
   Gradient.
 - A window whose retryable failures pass `error_threshold` of its
-  completions cuts the cap by `backoff_ratio`. A timeout counts as a
-  retryable failure. A non-retryable failure, a panic and a WASM module
+  completions cuts the cap by `backoff_ratio`. A start-to-close,
+  schedule-to-close or heartbeat timeout counts as a retryable failure. A non-retryable failure, a panic and a WASM module
   failure give no sample.
 - `WorkerConfig::with_adaptive_limit` and
   `HandlerRegistry::with_adaptive_limit` take an `AdaptiveLimitConfig`. The
@@ -75,6 +75,8 @@ No new `WorkflowEvent` variant, no migration, no schema change.
     latency.
   - A type with capability requirements at its cap is not claimed. Before
     the claim gate covered such rows, 35 claims churned through a deferral.
-  - The timeouts of a hung dependency cut the cap.
+  - The timeouts of a hung dependency cut the cap, for an attempt deadline
+    and for a heartbeat timeout. The heartbeat case failed before the worker
+    read the timeout error from the task row.
 - `metrics_rs_adapter`: the adapter bridges the three gauges and the
   counter with the `activity` label, and skips an unknown baseline.

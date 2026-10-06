@@ -15656,6 +15656,50 @@ fn limit_sample_outcome(
     }
 }
 
+/// Whether a cancelled attempt timed out (issue #1836).
+///
+/// A cancel after the attempt deadline is a timeout. A heartbeat timeout
+/// fires before that deadline, so the function also reads the task row. The
+/// timeout scanner writes its timeout error there. A failed read counts as
+/// no timeout, so the attempt gives no sample.
+async fn cancelled_attempt_timed_out(
+    pool: &DbPool,
+    claim: &queue::TaskClaim,
+    activity_name: &str,
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    if deadline.is_some_and(|d| chrono::Utc::now() >= d) {
+        return true;
+    }
+    let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
+        return false;
+    };
+    matches!(
+        queue::task_status_for_claim(&mut conn, claim).await,
+        Ok(Some((_, Some(error), false))) if is_attempt_timeout_error(&error, activity_name)
+    )
+}
+
+/// Whether a task-row error is a timeout of one activity attempt (issue
+/// #1836). The timeout scanner writes `HarvestError::Timeout` as text.
+fn is_attempt_timeout_error(error: &str, activity_name: &str) -> bool {
+    use crate::error::TimeoutType;
+    [
+        TimeoutType::Heartbeat,
+        TimeoutType::StartToClose,
+        TimeoutType::ScheduleToClose,
+    ]
+    .into_iter()
+    .any(|timeout_type| {
+        error
+            == HarvestError::Timeout {
+                timeout_type,
+                task_name: activity_name.to_owned(),
+            }
+            .to_string()
+    })
+}
+
 /// Whether a failure type is a fault of the worker, not of the dependency
 /// (issue #1836).
 fn is_worker_local_failure(error_type: &str) -> bool {
@@ -15753,6 +15797,34 @@ mod adaptive_limit_gate_tests {
             Some(SampleOutcome::Overloaded)
         );
         assert_eq!(limit_sample_outcome(None, None, false), None);
+    }
+
+    /// The scanner's timeout errors for this activity are timeouts. Other
+    /// errors, such as a cancel, and other activities are not.
+    #[test]
+    fn only_an_attempt_timeout_of_this_activity_matches() {
+        use super::is_attempt_timeout_error;
+        assert!(is_attempt_timeout_error(
+            "timeout: Heartbeat for charge_card",
+            "charge_card"
+        ));
+        assert!(is_attempt_timeout_error(
+            "timeout: StartToClose for charge_card",
+            "charge_card"
+        ));
+        assert!(is_attempt_timeout_error(
+            "timeout: ScheduleToClose for charge_card",
+            "charge_card"
+        ));
+        assert!(!is_attempt_timeout_error(
+            "timeout: ScheduleToStart for charge_card",
+            "charge_card"
+        ));
+        assert!(!is_attempt_timeout_error(
+            "timeout: Heartbeat for send_email",
+            "charge_card"
+        ));
+        assert!(!is_attempt_timeout_error("cancelled", "charge_card"));
     }
 
     /// An attempt cancelled because its deadline passed timed out. A hung
@@ -17664,9 +17736,8 @@ async fn process_activity_task(
     // resolved. On non-`db` builds `run_transactional` does not exist, so the
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
-    // A cancel after the attempt deadline is a timeout. The adaptive limit
-    // reads it as overload (issue #1836).
-    let timed_out = was_cancelled && ctx.deadline().is_some_and(|d| chrono::Utc::now() >= d);
+    // The adaptive limit reads a timeout as overload (issue #1836).
+    let attempt_deadline = ctx.deadline();
 
     let attempt_latency = attempt_clock_start.elapsed();
     let duration_secs = attempt_latency.as_secs_f64();
@@ -17774,6 +17845,9 @@ async fn process_activity_task(
     // and free the slot. See `limit_sample_outcome` for which attempts give
     // no sample.
     if let Some(permit) = limit_permit.take() {
+        let timed_out = was_cancelled
+            && cancelled_attempt_timed_out(pool, &activity_claim, activity_name, attempt_deadline)
+                .await;
         let error_type = failure_info.as_ref().map(|(et, _, _)| et.as_str());
         match limit_sample_outcome(circuit_outcome, error_type, timed_out) {
             Some(outcome) => permit.complete(attempt_latency, outcome),
