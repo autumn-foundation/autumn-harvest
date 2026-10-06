@@ -8,14 +8,18 @@ runtime in the same process. The open fails before any pragma, schema step or
 orphan reclaim, so it cannot steal a `RUNNING` task. The kernel releases the
 lock when its process exits, so a crash leaves no stale lock. The lock path
 comes from the canonical database path, so a symlink maps to the same lock. A
-read-only inspector connection still works. An in-memory database takes no
+hard link or a bind mount gives a second lock. On Unix the lock file takes the
+database file's read and write bits. A read-only inspector connection still
+works. A non-UTF-8 path still takes the lock. An in-memory database takes no
 lock. A new `SqliteError::Io` reports a lock file that cannot be opened.
 
 **SQLite: an unsupported feature ends the run `FAILED`.** Before, the run stayed
 `RUNNING` and failed again on every drive. Now the drive rolls back the cycle
 and seals the run in a new transaction. The `WorkflowFailed` event carries
 `error_type = "UnsupportedFeature"` (`UNSUPPORTED_FEATURE_ERROR_TYPE`),
-`details = {"feature": …}` and `non_retryable = true`. The sealing drive still
+`details = {"feature": <stable token>, "message": <full text>}` and
+`non_retryable = true`. If the seal itself fails, the drive logs it and still
+returns the original error. The sealing drive still
 returns `SqliteError::Unsupported`. A later drive returns `RunState::Failed` and
 does not run the handler again. Other errors (unregistered workflow or
 activity, replay divergence, contained panic under budget, failed task) still
@@ -31,17 +35,24 @@ against the platform store, which honours `SSL_CERT_FILE` and `SSL_CERT_DIR`.
 `RedisTlsOptions` with a private CA and a client certificate for mutual TLS.
 They check the PEM before any network I/O, and they reject a plain `redis://`
 URL. A one-shot probe reports a handshake failure by name instead of a
-timeout. There is no option to skip verification. The
-`RedisAdapterError::TlsUnavailable` variant is removed. Redis Cluster stays a follow-up.
+timeout. Every connect refuses the `#insecure` URL fragment, and `deny.toml`
+bans the `redis` features that turn verification off. The first TLS connect
+installs `ring` as the process `rustls` provider when the application set
+none. Redis Cluster stays a follow-up.
+
+**Breaking change.** `RedisAdapterError::TlsUnavailable` is removed.
+`SqliteError` gains `DatabaseLocked` and `Io`, so an exhaustive `match` no
+longer compiles. The public `redis` types in `from_connection` and
+`RedisAdapterError::Redis` move to 0.32. An unsupported SQLite run now ends
+`FAILED`, not `RUNNING`. A second `open` of one file in one process now fails.
 
 No new `WorkflowEvent` variant and no migration.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/single_writer_lock.rs` runs
-the test binary again as a child process: the second process fails, a killed
-holder leaves no stale lock, a symlink shares the lock, and an inspector still
-reads. `unsupported_terminal.rs` covers a child workflow, `continue_as_new`, a
+**Tests.** `single_writer_lock.rs` runs the test binary again as a child
+process. It proves four things: a second process fails, a killed holder leaves
+no stale lock, a symlink shares the lock, and an inspector still reads. `unsupported_terminal.rs` covers a child workflow, `continue_as_new`, a
 worker session, a terminal-cycle upsert, the fleet drivers and a reopen.
-`autumn-harvest-redis/tests/tls_redis.rs` starts a TLS-only `redis:7.4-alpine`
-with certificates minted by `rcgen`: a private CA, an untrusted CA, mutual TLS,
-the standalone queue, and `SSL_CERT_FILE` in a child process. The suite is in
+`tls_redis.rs` starts a TLS-only `redis:7.4-alpine` with certificates minted
+by `rcgen`. It covers a private CA, an untrusted CA, mutual TLS, the standalone
+queue, and `SSL_CERT_FILE` in a child process. The suite is in
 `.github/ci/integration-suites.txt`, and CI pre-pulls the image.

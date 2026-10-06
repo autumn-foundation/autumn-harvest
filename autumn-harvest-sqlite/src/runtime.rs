@@ -240,8 +240,8 @@ impl SqliteRuntime {
     /// be opened. Returns [`SqliteError::Sqlite`] if the file cannot be
     /// opened, the schema cannot be applied, or the orphan reclaim fails.
     pub fn open(path: impl AsRef<Path>) -> SqliteResult<Self> {
-        let conn = Connection::open(path)?;
-        let writer_lock = lock::acquire(&conn)?;
+        let conn = Connection::open(path.as_ref())?;
+        let writer_lock = lock::acquire(&conn, path.as_ref())?;
         Self::from_connection(conn, writer_lock)
     }
 
@@ -1171,23 +1171,33 @@ impl SqliteRuntime {
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
         let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
-        if let Err(SqliteError::Unsupported(feature)) = &result {
-            self.seal_unsupported(exec, feature)?;
+        if let Err(SqliteError::Unsupported(message)) = &result
+            && let Err(seal_error) = self.seal_unsupported(exec, message)
+        {
+            // Keep the reason the caller needs. The run stays `RUNNING`, so
+            // the next drive meets the feature again and retries the seal.
+            tracing::warn!(%exec, error = %seal_error, "could not seal an unsupported run FAILED");
         }
         result
     }
 
     /// Seal `exec` `FAILED` with the typed unsupported-feature reason.
     ///
-    /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`],
-    /// the feature in `details.feature`, and `non_retryable = true`. A retry
-    /// would meet the same feature again.
-    fn seal_unsupported(&mut self, exec: ExecutionId, feature: &str) -> SqliteResult<()> {
-        let message = SqliteError::Unsupported(feature.to_string()).to_string();
+    /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`]
+    /// and `non_retryable = true`. A retry would meet the same feature again.
+    /// `details.feature` is a stable token, such as `StartChildWorkflow` or
+    /// `ScheduleActivity.session_id`. `details.message` holds the full text.
+    fn seal_unsupported(&mut self, exec: ExecutionId, unsupported: &str) -> SqliteResult<()> {
+        let feature = unsupported
+            .split(" — ")
+            .next()
+            .unwrap_or(unsupported)
+            .trim();
+        let message = SqliteError::Unsupported(unsupported.to_string()).to_string();
         let event = WorkflowEvent::WorkflowFailed {
             error: message.clone(),
             error_type: Some(UNSUPPORTED_FEATURE_ERROR_TYPE.to_string()),
-            details: Some(serde_json::json!({ "feature": feature })),
+            details: Some(serde_json::json!({ "feature": feature, "message": unsupported })),
             non_retryable: Some(true),
         };
         let tx = self.conn.transaction()?;

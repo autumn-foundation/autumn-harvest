@@ -1195,9 +1195,9 @@ publish nothing, so the failure is loud instead.
 
 A `redis://` URL is plaintext and sends the password in cleartext. Use
 `rediss://` for TLS (issue #1834). The client verifies the server against the
-platform trust store; `SSL_CERT_FILE` or `SSL_CERT_DIR` points it at a private
-CA. v1 targets a single Redis instance and a single-shard runtime; Redis
-Cluster is not supported.
+platform trust store. `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces that store
+with a private CA bundle. v1 targets a single Redis instance and a
+single-shard runtime. Redis Cluster is not supported.
 
 See [`docs/operations/redis-dispatch.md`](docs/operations/redis-dispatch.md)
 for the key layout, the crash matrix, the failure modes and the v1 limits.

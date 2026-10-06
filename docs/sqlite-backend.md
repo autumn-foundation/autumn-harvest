@@ -384,12 +384,16 @@ second runtime in the same process.
 - The kernel releases the lock when the holder exits, also on a crash. A
   restart never meets a stale lock.
 - The lock path comes from the canonical database path. A symlink or a
-  relative path to the same file maps to the same lock.
+  relative path to the same file maps to the same lock. A hard link or a bind
+  mount gives a second path, and so a second lock. Open the database through
+  one path.
 - A read-only inspector connection still works. It never touches the lock.
 - An in-memory database takes no lock.
 
 The lock file stays on disk after the runtime drops. **Do not delete it** while
-a runtime runs: a second process could then lock a new file.
+a runtime runs: a second process could then lock a new file. On Unix the lock
+file takes the database file's read and write bits. Any user who can open the
+lock file can hold it, so this keeps that set to the users who reach the data.
 
 **Do not** use this backend as a shared multi-server queue. The lock is an
 advisory lock on the local file system. A network file system may not honour
@@ -425,7 +429,7 @@ transaction, with a typed `WorkflowFailed` event:
 | Field | Value |
 |---|---|
 | `error_type` | `"UnsupportedFeature"` (`UNSUPPORTED_FEATURE_ERROR_TYPE`) |
-| `details` | `{"feature": "<command or field>"}` |
+| `details` | `{"feature": "<stable token>", "message": "<full text>"}`. The token is a command or field name, such as `StartChildWorkflow` or `ScheduleActivity.session_id`. |
 | `non_retryable` | `true` |
 | `error` | The `SqliteError::Unsupported` message |
 
@@ -433,15 +437,16 @@ That drive still returns `SqliteError::Unsupported`, so the caller sees the
 reason. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
-Only an unsupported feature seals a run. An unregistered workflow or activity,
-a replay divergence, a contained panic under its budget, and a failed task
-leave the run `RUNNING`, because a fix in the same runtime can resume it.
+Only an unsupported feature seals a run. Other errors leave the run `RUNNING`:
+an unregistered workflow or activity, a replay divergence, a contained panic
+under its budget, or a failed task. A fix in the same runtime can then resume
+the run.
 
 A failing execution does not block unrelated executions. `poll_once` still
-drives the rest of the fleet in the same pass (issue #1530), and
-`run_until_idle` still converges the rest of the fleet to quiescence in one
-call (issue #1555). Both report the first execution error to the caller. A
-sealed execution is terminal, so later passes skip it.
+drives the rest of the fleet in the same pass (issue #1530). `run_until_idle`
+still converges the rest of the fleet in one call (issue #1555). Both report
+the first execution error to the caller. A sealed execution is terminal, so
+later passes skip it.
 
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
 push wake-ups, multi-server crash recovery, schedules, the management API,

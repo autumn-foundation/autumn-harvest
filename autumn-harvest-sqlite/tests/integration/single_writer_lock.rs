@@ -227,3 +227,41 @@ fn in_memory_runtimes_take_no_lock() {
     let _c = SqliteRuntime::open(":memory:").unwrap();
     let _d = SqliteRuntime::open(":memory:").unwrap();
 }
+
+/// `SQLite` reports no path for a non-UTF-8 file name. The lock must still
+/// apply, so `open` falls back to the path the caller gave.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_utf8_path_still_takes_the_lock() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"harvest-\xff.sqlite3"));
+    let _holder = SqliteRuntime::open(&path).unwrap();
+
+    let err = SqliteRuntime::open(&path)
+        .err()
+        .expect("a non-UTF-8 path is still one file");
+    assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
+}
+
+/// The lock file grants no access that the database file does not grant.
+#[cfg(unix)]
+#[test]
+fn the_lock_file_takes_the_database_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, path) = temp_db();
+    drop(rusqlite::Connection::open(&path).unwrap());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let _holder = SqliteRuntime::open(&path).unwrap();
+    let mut lock = path.into_os_string();
+    lock.push(".lock");
+    let mode = std::fs::metadata(&lock).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "lock mode {mode:o} must not open to others"
+    );
+}

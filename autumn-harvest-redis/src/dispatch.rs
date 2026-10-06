@@ -365,8 +365,6 @@ impl RedisDispatch {
     /// retries. A black-holed address therefore fails in about
     /// [`CONNECT_TIMEOUT`], not after the whole retry budget.
     ///
-    /// # Errors
-    ///
     /// A `rediss://` URL connects over TLS (issue #1834). It trusts the
     /// platform store, which honours `SSL_CERT_FILE` and `SSL_CERT_DIR`. Use
     /// [`connect_with_tls`](Self::connect_with_tls) for a private CA or for
@@ -408,7 +406,7 @@ impl RedisDispatch {
     ) -> RedisAdapterResult<Self> {
         config.validate()?;
         let client = crate::tls::client(url, tls)?;
-        if crate::tls::is_tls_url(url) {
+        if crate::tls::is_tls(&client) {
             crate::tls::probe(&client, CONNECT_TIMEOUT).await?;
         }
         let conn = open_manager(&client).await?;

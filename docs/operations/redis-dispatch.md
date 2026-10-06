@@ -131,17 +131,26 @@ to turn verification off.
 |---|---|
 | A public CA | Nothing. The client reads the platform trust store. |
 | A private CA, from the plugin | Set `SSL_CERT_FILE` (a PEM bundle) or `SSL_CERT_DIR` in the process environment. Either one replaces the platform store. |
-| A private CA, from code | Pass `RedisTlsOptions { ca_cert_pem, .. }` to `RedisDispatch::connect_with_tls`. The bundle replaces the platform store. |
+| A private CA, from code | Pass `RedisTlsOptions { ca_cert_pem: Some(pem), ..Default::default() }` to `RedisDispatch::connect_with_tls`. The bundle replaces the platform store. |
 | Mutual TLS, from code | Also set `client_cert_pem` and `client_key_pem` (PEM). Set both or neither. |
 
 `connect_with_tls` checks the PEM before any network I/O. It rejects a plain
 `redis://` URL, because certificates on a plaintext connection protect
-nothing. `RedisTaskQueue::connect_with_tls` takes the same options. A failed
+nothing. Every connect refuses the `#insecure` URL fragment. `RedisTaskQueue::connect_with_tls` takes the same options. A failed
 handshake fails startup with its reason, for example
 `invalid peer certificate: UnknownIssuer`.
 
 The plugin config has no certificate keys yet. Mutual TLS therefore needs a
 code-level `connect_with_tls`.
+
+Two process-wide effects apply:
+
+- The client reads the platform store on every TLS connect, also when a
+  private CA is set. An unreadable `SSL_CERT_FILE` therefore fails every TLS
+  connect. That failure is closed, not open.
+- The first TLS connect installs `ring` as the process `rustls` provider, if
+  the application set none. An application that needs another provider, such
+  as a FIPS one, installs it before that connect.
 
 ## Key layout
 

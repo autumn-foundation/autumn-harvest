@@ -26,11 +26,20 @@ use autumn_harvest_sqlite::{
 };
 use serde_json::json;
 
-static CHILD_WF_RUNS: AtomicU32 = AtomicU32::new(0);
+/// Counts runs of `spawns_child_counted` only. Other tests run in parallel in
+/// this binary, so they use `spawns_child` and never touch this counter.
+static COUNTED_RUNS: AtomicU32 = AtomicU32::new(0);
+
+#[workflow]
+async fn spawns_child_counted(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+    COUNTED_RUNS.fetch_add(1, Ordering::SeqCst);
+    ctx.spawn_child_workflow_raw("child", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
 
 #[workflow]
 async fn spawns_child(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
-    CHILD_WF_RUNS.fetch_add(1, Ordering::SeqCst);
     // A side effect in the same cycle. The rejected cycle must not keep it.
     let _id = ctx.new_uuid();
     ctx.spawn_child_workflow_raw("child", json!({}))
@@ -102,7 +111,7 @@ fn assert_sealed_unsupported(rt: &SqliteRuntime, exec: ExecutionId, feature: &st
                 .and_then(|d| d.get("feature"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            assert!(named.contains(feature), "details.feature: {details:?}");
+            assert_eq!(named, feature, "details.feature is a stable token");
             assert_eq!(*non_retryable, Some(true));
         }
         other => panic!("the last event must be a typed WorkflowFailed, got {other:?}"),
@@ -131,10 +140,10 @@ async fn a_child_workflow_ends_failed_with_a_typed_reason() {
 #[tokio::test]
 async fn a_sealed_execution_is_not_driven_again() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&spawns_child_info());
-    let exec = rt.start_workflow("spawns_child", json!(0)).unwrap();
+    rt.register_workflow(&spawns_child_counted_info());
+    let exec = rt.start_workflow("spawns_child_counted", json!(0)).unwrap();
     let _ = rt.run_until_blocked(exec).await.unwrap_err();
-    let runs = CHILD_WF_RUNS.load(Ordering::SeqCst);
+    let runs = COUNTED_RUNS.load(Ordering::SeqCst);
 
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
@@ -142,7 +151,7 @@ async fn a_sealed_execution_is_not_driven_again() {
         "a later drive reports the terminal state: {state:?}"
     );
     assert_eq!(
-        CHILD_WF_RUNS.load(Ordering::SeqCst),
+        COUNTED_RUNS.load(Ordering::SeqCst),
         runs,
         "a FAILED run must not re-run its handler"
     );
@@ -167,7 +176,7 @@ async fn a_worker_session_ends_failed_with_a_typed_reason() {
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "ScheduleActivity.");
+    assert_sealed_unsupported(&rt, exec, "ScheduleActivity.schedule_to_start_override");
 }
 
 #[tokio::test]

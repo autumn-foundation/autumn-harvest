@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use redis::{Client, ClientTlsConfig, TlsCertificates};
+use redis::{Client, ClientTlsConfig, ConnectionAddr, IntoConnectionInfo, TlsCertificates};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -13,7 +13,16 @@ use crate::error::{RedisAdapterError, RedisAdapterResult};
 ///
 /// The default trusts the platform store, and sends no client certificate.
 /// The platform store honours `SSL_CERT_FILE` and `SSL_CERT_DIR`.
-#[derive(Clone, Default, PartialEq, Eq)]
+///
+/// The `redis` client loads the platform store on every TLS connect, also when
+/// [`ca_cert_pem`](Self::ca_cert_pem) is set. An unreadable `SSL_CERT_FILE`
+/// therefore fails every TLS connect. That failure is closed, not open.
+///
+/// The first TLS connect installs `ring` as the process `rustls` provider, if
+/// no provider is set. Install another provider before that connect to use it.
+// No `PartialEq`: equality on key bytes is not constant-time, and no caller
+// needs it.
+#[derive(Clone, Default)]
 pub struct RedisTlsOptions {
     /// A PEM bundle of CA certificates. It replaces the platform store.
     pub ca_cert_pem: Option<Vec<u8>>,
@@ -42,37 +51,57 @@ impl fmt::Debug for RedisTlsOptions {
     }
 }
 
-/// Whether a URL asks for TLS.
-pub fn is_tls_url(url: &str) -> bool {
-    url.trim_start()
-        .split_once("://")
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
+/// Whether `client` connects over TLS.
+///
+/// The `redis` client's own parse decides, so `rediss://` and `valkeys://`
+/// both count, whatever their case or leading whitespace.
+pub fn is_tls(client: &Client) -> bool {
+    matches!(
+        client.get_connection_info().addr,
+        ConnectionAddr::TcpTls { .. }
+    )
 }
 
-/// Build a client for `url`, with TLS when the URL is `rediss://`.
+/// Build a client for `url`, with TLS when the URL asks for it.
 ///
-/// `tls` is `Some` only for the `connect_with_tls` constructors. It needs a
-/// `rediss://` URL: certificates on a plain URL would give a false sense of
-/// security. The PEM is checked here, before any network I/O, so a bad file
-/// fails with a clear message rather than a handshake error.
+/// `tls` is `Some` only for the `connect_with_tls` constructors. It needs a TLS
+/// URL: certificates on a plain URL would give a false sense of security. The
+/// PEM is checked here, before any network I/O, so a bad file fails with a
+/// clear message rather than a handshake error.
+///
+/// The `#insecure` URL fragment is refused. Today it fails at connect, but a
+/// downstream build that enables the `redis` feature `tls-rustls-insecure`
+/// would turn certificate checks off. This crate never offers that.
 ///
 /// # Errors
 ///
 /// Returns [`RedisAdapterError::InvalidConfig`] for TLS options on a plain
-/// URL, for unusable PEM, or for a client certificate without its key.
-/// Returns [`RedisAdapterError::Redis`] when the URL cannot be parsed.
+/// URL, for the `#insecure` fragment, for unusable PEM, or for a client
+/// certificate without its key. Returns [`RedisAdapterError::Redis`] when the
+/// URL cannot be parsed.
 pub fn client(url: &str, tls: Option<&RedisTlsOptions>) -> RedisAdapterResult<Client> {
-    if !is_tls_url(url) {
+    let info = url.into_connection_info()?;
+    let wants_tls = match &info.addr {
+        ConnectionAddr::TcpTls { insecure: true, .. } => {
+            return Err(RedisAdapterError::InvalidConfig(
+                "the #insecure url fragment turns certificate checks off and is refused"
+                    .to_string(),
+            ));
+        }
+        ConnectionAddr::TcpTls { .. } => true,
+        _ => false,
+    };
+    if !wants_tls {
         if tls.is_some() {
             return Err(RedisAdapterError::InvalidConfig(
                 "TLS options need a rediss:// url".to_string(),
             ));
         }
-        return Ok(Client::open(url)?);
+        return Ok(Client::open(info)?);
     }
     ensure_crypto_provider();
     let Some(tls) = tls else {
-        return Ok(Client::open(url)?);
+        return Ok(Client::open(info)?);
     };
     let client_tls = match (&tls.client_cert_pem, &tls.client_key_pem) {
         (Some(cert), Some(key)) => {
@@ -99,7 +128,7 @@ pub fn client(url: &str, tls: Option<&RedisTlsOptions>) -> RedisAdapterResult<Cl
         client_tls,
         root_cert: tls.ca_cert_pem.clone(),
     };
-    Ok(Client::build_with_tls(url, certificates)?)
+    Ok(Client::build_with_tls(info, certificates)?)
 }
 
 /// Fail unless `pem` holds at least one certificate and every block parses.
@@ -127,6 +156,10 @@ fn check_certificates(pem: &[u8], field: &str) -> RedisAdapterResult<()> {
 /// panics when no process provider is set and the build enables two
 /// providers. This crate enables `ring`, so `ring` is always available. A
 /// provider that the application installed first is kept.
+///
+/// The install is process-wide, and `redis` takes no custom `ClientConfig`.
+/// An application that needs another provider, such as a FIPS one, installs
+/// it before the first TLS connect.
 fn ensure_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         // A concurrent install may win the race. Either provider is valid.
@@ -172,11 +205,29 @@ mod tests {
     }
 
     #[test]
-    fn a_tls_url_is_recognised_by_its_scheme() {
-        assert!(is_tls_url("rediss://host:6379"));
-        assert!(is_tls_url("REDISS://host:6379"));
-        assert!(!is_tls_url("redis://host:6379"));
-        assert!(!is_tls_url("host:6379"));
+    fn the_redis_parser_decides_which_urls_use_tls() {
+        for url in ["rediss://host:6379", "valkeys://host:6379"] {
+            assert!(is_tls(&client(url, None).unwrap()), "{url}");
+        }
+        for url in ["redis://host:6379", "valkey://host:6379"] {
+            assert!(!is_tls(&client(url, None).unwrap()), "{url}");
+        }
+    }
+
+    #[test]
+    fn the_insecure_fragment_is_refused() {
+        let message = invalid_config(client("rediss://localhost:6380/#insecure", None));
+        assert!(message.contains("#insecure"), "{message}");
+    }
+
+    #[test]
+    fn tls_options_on_a_plain_url_are_refused() {
+        let tls = RedisTlsOptions {
+            ca_cert_pem: Some(ca_pem()),
+            ..RedisTlsOptions::default()
+        };
+        let message = invalid_config(client("redis://localhost:6379", Some(&tls)));
+        assert!(message.contains("rediss://"), "{message}");
     }
 
     #[test]

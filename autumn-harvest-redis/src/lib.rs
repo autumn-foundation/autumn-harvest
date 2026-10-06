@@ -98,7 +98,8 @@
 //!   running.
 //! - **TLS through rustls (issue #1834).** A `rediss://` URL connects over
 //!   TLS and verifies the server against the platform trust store.
-//!   `SSL_CERT_FILE` and `SSL_CERT_DIR` point that store at a private CA.
+//!   `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces that store with a private CA
+//!   bundle.
 //!   [`RedisDispatch::connect_with_tls`] takes a private CA and a client
 //!   certificate for mutual TLS (see [`RedisTlsOptions`]). There is no
 //!   option to skip verification. A plain `redis://` URL still sends the

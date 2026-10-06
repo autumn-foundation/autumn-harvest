@@ -1401,7 +1401,8 @@ jobs:
       # (Redis's default, un-overridden anywhere; needed by the issue #1312
       # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
       # below), `redis:7.4-alpine` (the TLS-only server of the issue #1834
-      # `tls_redis` suite; Redis 5 has no TLS), and `softwaremill/elasticmq:1.5.2` on the one shard that runs the
+      # `tls_redis` suite; Redis 5 has no TLS), and
+      # `softwaremill/elasticmq:1.5.2` on the one shard that runs the
       # `connector_sqs_broker` suite (its ElasticMQ default, which "bytes
       # remaining on stream" failed on PR #1773 because it was not pre-pulled).
       - name: Pre-pull Docker test images (retry transient pull failures)

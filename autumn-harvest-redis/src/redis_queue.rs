@@ -127,7 +127,10 @@ impl RedisTaskQueue {
     /// # Errors
     ///
     /// Returns [`RedisAdapterError::Redis`] if the URL cannot be parsed, the
-    /// connection cannot be established, or the TLS handshake fails.
+    /// connection cannot be established, or the TLS handshake fails. Returns
+    /// [`RedisAdapterError::ConnectTimeout`] when a TLS handshake does not
+    /// finish in 5 seconds. Returns [`RedisAdapterError::InvalidConfig`] for
+    /// the `#insecure` URL fragment.
     pub async fn connect(url: &str, config: RedisTaskQueueConfig) -> RedisAdapterResult<Self> {
         Self::connect_inner(url, config, None).await
     }
@@ -153,7 +156,7 @@ impl RedisTaskQueue {
         tls: Option<&crate::RedisTlsOptions>,
     ) -> RedisAdapterResult<Self> {
         let client = crate::tls::client(url, tls)?;
-        if crate::tls::is_tls_url(url) {
+        if crate::tls::is_tls(&client) {
             crate::tls::probe(&client, TLS_PROBE_TIMEOUT).await?;
         }
         let conn = ConnectionManager::new(client).await?;
