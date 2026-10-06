@@ -338,6 +338,12 @@ pub enum Op {
         /// Workflow type of the next run.
         workflow_type: Option<String>,
     },
+    /// `ctx.race()` over the branch ops, which waits for the first one.
+    /// Only activity, child, timer and signal ops are branches.
+    Race {
+        /// The branches.
+        branches: Vec<Self>,
+    },
     /// Runs the ops concurrently, as `join!` does.
     Concurrent {
         /// The ops of one command batch.
@@ -676,12 +682,42 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
 /// from one batch, such as a `join!` of two activities. An immediate command
 /// that follows a parking one in the same run joins that batch too. A batch
 /// runs as one [`Op::Concurrent`], so the replayer matches all of it.
+///
+/// A `race:{seq}` marker opens a race, and `race_winner:{seq}` closes it.
+/// The commands between them become one [`Op::Race`]. The race cancels its
+/// losing timers itself, so their `TimerCancelled` events map to no op.
+///
+/// A `WorkflowFailed` that a later `WorkflowRedriven` supersedes maps to no
+/// op. The replayer skips such a failure too.
 pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     let armed = armed_timer_starts(history);
+    let last_redrive = history
+        .iter()
+        .rposition(|event| matches!(event, WorkflowEvent::WorkflowRedriven { .. }));
+    let mut race_timers: HashSet<&str> = HashSet::new();
     let mut program = Vec::new();
     let mut batch = Vec::new();
-    for (index, event) in history.iter().enumerate() {
-        match mirror_event(event, armed.contains(&index)) {
+    let mut index = 0;
+    while index < history.len() {
+        let event = &history[index];
+        index += 1;
+        let op = match event {
+            WorkflowEvent::MarkerRecorded { name, .. } if race_seq(name).is_some() => {
+                let (race, next) = mirror_race(history, index, name, &mut race_timers);
+                index = next;
+                Some(race)
+            }
+            WorkflowEvent::TimerCancelled { timer_id }
+                if race_timers.contains(timer_id.as_str()) =>
+            {
+                None
+            }
+            WorkflowEvent::WorkflowFailed { .. } if last_redrive.is_some_and(|r| r >= index) => {
+                None
+            }
+            _ => mirror_event(event, armed.contains(&(index - 1))),
+        };
+        match op {
             Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => batch.push(op),
             other => {
                 flush_batch(&mut program, &mut batch);
@@ -691,6 +727,43 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     }
     flush_batch(&mut program, &mut batch);
     program
+}
+
+/// The `{seq}` of a `race:{seq}` marker. A `race_winner:` marker has none.
+fn race_seq(name: &str) -> Option<&str> {
+    name.strip_prefix("race:")
+}
+
+/// Builds the [`Op::Race`] that a `race:{seq}` marker opens. Reads from
+/// `start` up to and past the matching `race_winner:{seq}` marker. Returns
+/// the op and the index after the race.
+fn mirror_race<'h>(
+    history: &'h [WorkflowEvent],
+    start: usize,
+    open: &str,
+    race_timers: &mut HashSet<&'h str>,
+) -> (Op, usize) {
+    let winner = format!("race_winner:{}", race_seq(open).unwrap_or_default());
+    let mut branches = Vec::new();
+    let mut index = start;
+    while index < history.len() {
+        let event = &history[index];
+        index += 1;
+        if matches!(event, WorkflowEvent::MarkerRecorded { name, .. } if *name == winner) {
+            break;
+        }
+        if let WorkflowEvent::TimerStarted { timer_id, .. } = event {
+            race_timers.insert(timer_id.as_str());
+        }
+        let op = mirror_event(event, false);
+        if let Some(
+            op @ (Op::Activity { .. } | Op::Child { .. } | Op::Timer { .. } | Op::Signal { .. }),
+        ) = op
+        {
+            branches.push(op);
+        }
+    }
+    (Op::Race { branches }, index)
 }
 
 /// The indexes of the `TimerStarted` events that the cancellable timer API
@@ -1026,6 +1099,19 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
                 Some(workflow_type) => ctx.continue_as_new_as_type(&workflow_type, input).await,
                 None => ctx.continue_as_new(input).await,
             };
+        }
+        Op::Race { branches } => {
+            let mut race = ctx.race();
+            for branch in branches {
+                race = match branch {
+                    Op::Activity { name, input, queue } => race.activity_raw(&name, input, &queue),
+                    Op::Child { name, input } => race.child_workflow_raw(&name, input),
+                    Op::Timer { secs, .. } => race.timer(std::time::Duration::from_secs(secs)),
+                    Op::Signal { name } => race.signal(&name),
+                    _ => race,
+                };
+            }
+            let _ = race.run().await;
         }
         Op::Concurrent { ops } => {
             let runs = ops.into_iter().map(|op| Box::pin(run_op(ctx, op)));
