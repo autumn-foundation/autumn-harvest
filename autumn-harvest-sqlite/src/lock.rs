@@ -31,6 +31,19 @@ use rusqlite::Connection;
 
 use crate::error::{SqliteError, SqliteResult};
 
+/// How many times [`acquire`] tries the lock before it reports
+/// [`SqliteError::DatabaseLocked`].
+///
+/// A dropped runtime can leave its lock held for a moment. A child process
+/// that another thread forks holds a copy of the lock until it calls `exec`.
+/// On Windows, the release after a process ends can also lag. A short retry
+/// rides out those windows. A live holder still fails the open in about
+/// 100 ms.
+const LOCK_ATTEMPTS: u32 = 5;
+
+/// The pause between two lock attempts.
+const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// An acquired single-writer lock. Dropping it closes the file and so
 /// releases the lock.
 #[derive(Debug)]
@@ -74,12 +87,23 @@ pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<Write
         path: path.clone(),
         source,
     })?;
-    // Fully qualified: std has an inherent `File::try_lock` from Rust 1.89
-    // with a different error type, and the MSRV is 1.88.
-    match fs4::FileExt::try_lock(&file) {
-        Ok(()) => Ok(Some(WriterLock { _file: file })),
-        Err(fs4::TryLockError::WouldBlock) => Err(SqliteError::DatabaseLocked { path }),
-        Err(fs4::TryLockError::Error(source)) => Err(SqliteError::Io { path, source }),
+    let mut attempt = 1;
+    loop {
+        // Fully qualified: std has an inherent `File::try_lock` from Rust 1.89
+        // with a different error type, and the MSRV is 1.88.
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => return Ok(Some(WriterLock { _file: file })),
+            Err(fs4::TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(LOCK_RETRY_DELAY);
+            }
+            Err(fs4::TryLockError::WouldBlock) => {
+                return Err(SqliteError::DatabaseLocked { path });
+            }
+            Err(fs4::TryLockError::Error(source)) => {
+                return Err(SqliteError::Io { path, source });
+            }
+        }
     }
 }
 

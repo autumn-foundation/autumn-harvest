@@ -381,6 +381,9 @@ second runtime in the same process.
 
 - The second open fails **before** it changes the file. It runs no pragma, no
   schema step and no orphan reclaim. It cannot steal a `RUNNING` task.
+- The open retries the lock for about 100 ms before it fails. A just-dropped
+  runtime can hold its lock for a moment, for example while another thread
+  forks a child process.
 - The kernel releases the lock when the holder exits, also on a crash. A
   restart never meets a stale lock.
 - The lock path comes from the canonical database path. A symlink or a

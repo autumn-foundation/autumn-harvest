@@ -126,8 +126,19 @@ async fn start_tls_redis(pki: &Pki, require_client_cert: bool) -> Option<TlsRedi
             return None;
         }
     };
-    let port = container.get_host_port_ipv4(TLS_PORT).await.ok()?;
-    // `localhost` matches the certificate's DNS name.
+    let port = match container.get_host_port_ipv4(TLS_PORT).await {
+        Ok(port) => port,
+        Err(err) => {
+            assert!(
+                !fixture_is_required(),
+                "{REQUIRE_VAR}=1 demands the TLS port of the container: {err}"
+            );
+            eprintln!("skipping: no mapped TLS port: {err}");
+            return None;
+        }
+    };
+    // `localhost` matches the certificate's DNS name. The suite therefore needs
+    // a local Docker daemon, as on the CI runners.
     let url = format!("rediss://localhost:{port}");
     Some(TlsRedis {
         _container: container,
