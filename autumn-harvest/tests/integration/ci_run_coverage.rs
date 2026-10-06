@@ -828,17 +828,53 @@ fn claim_bench_support_is_classified_as_a_harness_not_a_suite() {
     );
 }
 
-/// Issue #1799 names five resilience suites that never ran in CI. Each must
-/// have a covering row and must not stay on the allowlist.
+/// Core suites that issue #1799 wired, with the features each row needs.
+///
+/// The first five are the resilience suites the issue names. The rest are
+/// the second batch. Each must have a covering row and no allowlist entry.
+const ISSUE_1799_CORE: &[(&str, &[&str])] = &[
+    ("scheduler_ha_tests", &[]),
+    ("poison_pill_tests", &[]),
+    ("signal_tests", &[]),
+    ("replayer_integration_tests", &["testing"]),
+    ("audit_tests", &[]),
+    ("build_routing_tests", &[]),
+    ("cache_delta_load_tests", &[]),
+    ("child_policy_tests", &[]),
+    ("cross_workflow_cancel_tests", &[]),
+    ("debounce_tests", &[]),
+    ("delayed_start_tests", &[]),
+    ("legal_hold_tests", &[]),
+    ("payload_offload_db_tests", &[]),
+    ("queue_fairness_tests", &[]),
+    ("replay_canary_tests", &["testing"]),
+    ("retry_now_tests", &[]),
+    ("schedule_decisions", &[]),
+    ("schedule_to_close_tests", &[]),
+    ("schedule_update_tests", &[]),
+    ("scheduled_time_tests", &["testing"]),
+    ("scheduler_bounded_runs_tests", &[]),
+    ("scheduler_carryover_tests", &["testing"]),
+    ("scheduler_catchup_tests", &[]),
+    ("signal_with_start_tests", &[]),
+    ("sla_breach_tests", &[]),
+    ("sticky_routing_tests", &[]),
+    ("telemetry_span_tests", &[]),
+    ("throttle_tests", &[]),
+    ("transactional_activity_tests", &[]),
+    ("typed_stubs_tests", &[]),
+    ("updt_with_start_tests", &[]),
+];
+
+/// Plugin suites that issue #1799 wired.
+const ISSUE_1799_PLUGIN: &[&str] = &["erase_payloads_integration"];
+
+/// The suites that issue #1799 wired must keep a covering row. Removing one
+/// would put it back on the allowlist and raise the cap, which review sees.
 #[test]
 fn issue_1799_suites_have_covering_rows() {
     let rows = parse_manifest();
-    for (module, required) in [
-        ("scheduler_ha_tests", &[][..]),
-        ("poison_pill_tests", &[]),
-        ("signal_tests", &[]),
-        ("replayer_integration_tests", &["testing"]),
-    ] {
+    for &(module, required) in ISSUE_1799_CORE {
         assert!(
             core_covers(&rows, module, &feats(required)),
             "core:{module} needs a covering `linux` manifest row"
@@ -848,17 +884,18 @@ fn issue_1799_suites_have_covering_rows() {
             "core:{module} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
         );
     }
-    let stem = "erase_payloads_integration";
-    let required =
-        plugin_required_features(&read_source(&plugin_tests_dir().join(format!("{stem}.rs"))));
-    assert!(
-        plugin_covered(&rows, stem, &required),
-        "plugin:{stem} needs a covering `linux` manifest row"
-    );
-    assert!(
-        !allowlisted(&format!("plugin:{stem}")),
-        "plugin:{stem} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
-    );
+    for &stem in ISSUE_1799_PLUGIN {
+        let required =
+            plugin_required_features(&read_source(&plugin_tests_dir().join(format!("{stem}.rs"))));
+        assert!(
+            plugin_covered(&rows, stem, &required),
+            "plugin:{stem} needs a covering `linux` manifest row"
+        );
+        assert!(
+            !allowlisted(&format!("plugin:{stem}")),
+            "plugin:{stem} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
+        );
+    }
 }
 
 #[test]
