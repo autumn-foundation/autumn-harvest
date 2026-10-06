@@ -3181,7 +3181,8 @@ enum DeadLetterCommand {
         #[arg(long)]
         error_class: Option<String>,
         /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
-        /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
+        /// `poison_pill`, `workflow_task_timeout`, `history_cap_exceeded`,
+        /// `history_bytes_cap_exceeded`, `retry_exhaustion`). Exact-equality.
         #[arg(long)]
         dlq_reason: Option<String>,
         /// Filter by derived failure signature (exact match on the normalized
@@ -3267,7 +3268,8 @@ enum DeadLetterCommand {
         #[arg(long)]
         error_class: Option<String>,
         /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
-        /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
+        /// `poison_pill`, `workflow_task_timeout`, `history_cap_exceeded`,
+        /// `history_bytes_cap_exceeded`, `retry_exhaustion`). Exact-equality.
         #[arg(long)]
         dlq_reason: Option<String>,
         /// Filter by derived failure signature (exact match on the normalized

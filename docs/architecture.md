@@ -212,6 +212,8 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 
 *Model.* `formal/tla/ActivityClaim.tla` models this protocol (issue #1819). TLC checks the invariant over every interleaving of a bounded model (3 workers, 5 claims). With the fence off, it reproduces the #1789 bug. See [`formal-methods.md`](testing/formal-methods.md).
 
+*Simulation.* `autumn_harvest::dst` drives the same protocol from a seed, with 3 workers, stalls and crashes (issue #1830). A differential test replays each run on Postgres through the production statements. With the fence off, a sweep reproduces the #1789 bug. See [`simulation.md`](testing/simulation.md).
+
 **10. Suspension readiness (issue #1797)**
 
 A decision cycle suspends when the workflow is blocked on Harvest futures. No clock decides a suspension. A clock bounds only waits on foreign futures. `executor::run_workflow_handler_cycle` applies this rule.
@@ -1743,6 +1745,9 @@ randomized- and model-checking-based testing layers:
 * [`docs/testing/formal-methods.md`](testing/formal-methods.md) — TLA+
   models of the core protocols and Kani proofs of the pure kernels
   (issue #1819).
+* [`docs/testing/simulation.md`](testing/simulation.md) — seeded,
+  deterministic simulation of the activity claim protocol, with a Postgres
+  differential test (issue #1830).
 
 ---
 
