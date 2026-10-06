@@ -74,6 +74,7 @@ impl std::fmt::Display for PayloadKind {
 /// assert_eq!(timeout.to_string(), "StartToClose");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum TimeoutType {
     /// Worker claimed the task but didn't finish in time.
     StartToClose,

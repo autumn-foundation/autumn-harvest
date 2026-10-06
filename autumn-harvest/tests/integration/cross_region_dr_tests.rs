@@ -92,7 +92,7 @@ impl autumn_harvest::telemetry::MetricsRecorder for NoOpMetrics {}
 
 /// Holds [`REGISTRY_SERIAL`]. On drop it clears the registry and the DR
 /// config, so a test that panics leaves no pin behind (issue #1823).
-struct RegistryGuard {
+pub struct RegistryGuard {
     _serial: tokio::sync::MutexGuard<'static, ()>,
 }
 
@@ -103,7 +103,9 @@ impl Drop for RegistryGuard {
     }
 }
 
-async fn registry_guard() -> RegistryGuard {
+/// Serializes every test in this crate that pins the process-global
+/// `FenceRegistry`. `shard_rebalance_db_tests` takes it too (issue #1839).
+pub async fn registry_guard() -> RegistryGuard {
     RegistryGuard {
         _serial: REGISTRY_SERIAL.lock().await,
     }
