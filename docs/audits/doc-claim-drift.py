@@ -32,12 +32,15 @@ SKIP_DIRS = ("plans", "changelog.d", "rnd", "assays", "perf-artifacts", "adr")
 SKIP_FILES = ("docs/shipped-work.md",)
 
 # A total count only, in either order: "enum (41 variants", "has 41
-# variants" or "there are 41 WorkflowEvent variants". "Gains 2 variants" and
-# "adds 2 WorkflowEvent variants" are not totals. The pattern can cross a line
-# wrap.
+# variants" or "there are 41 WorkflowEvent variants". An additive count is
+# not a total: "gains 2 variants", "adds 2 WorkflowEvent variants" and "has 2
+# variants added". The pattern can cross a line wrap.
+NOT_ADDITIVE = r"(?!\s+(?:added|introduced|removed)\b)"
 VARIANT_COUNT_RE = re.compile(
     r"WorkflowEvent`?\s+(?:enum\s+\(|(?:enum\s+)?(?:now\s+)?has\s+)(\d[\d,]*)\s+variants\b"
-    r"|(?i:\b(?:there\s+are|has|have|with|all))\s+(\d[\d,]*)\s+`?WorkflowEvent`?\s+variants\b"
+    + NOT_ADDITIVE
+    + r"|(?i:\b(?:there\s+are|has|have))\s+(\d[\d,]*)\s+`?WorkflowEvent`?\s+variants\b"
+    + NOT_ADDITIVE
 )
 VERSION_HEADING_RE = re.compile(r"^##\s+\[?v?(\d+\.\d+\.\d+[^\]\s]*)\]?", re.MULTILINE)
 FENCE_RE = re.compile(r"^(```|~~~).*?^\1", re.MULTILINE | re.DOTALL)
@@ -360,6 +363,9 @@ def self_test():
         "g.md": "The engine has\n51 WorkflowEvent variants.",
         "h.md": "There are 5 WorkflowEvent variants.",
         "i.md": "Issue #140 adds 3 WorkflowEvent variants.",
+        "j.md": "This shipped with 2 `WorkflowEvent` variants added for updates.",
+        "k.md": "Issue #140 has 3 WorkflowEvent variants added.",
+        "l.md": "`WorkflowEvent` now has 3 variants introduced by #140.",
     }
     found = variant_count_findings(docs, 5)
     assert [m.split(":")[0] for m in found] == ["b.md", "e.md", "f.md", "g.md"], found
