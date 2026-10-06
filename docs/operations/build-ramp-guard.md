@@ -240,6 +240,14 @@ The guard fails safe: when it cannot read, it does not abort.
   it. This covers an API replica from before the migration during a rolling
   upgrade. Such a ramp has no id, so no old marker can clear it. The guard
   judges it as usual.
+- Enable the guard only after every API replica runs this release. A
+  replica from before the migration writes ramps with no id. Its fan-out
+  can reach a pool after the guard aborted the same ramp on another pool.
+  The guard cannot tie that late ramp to the abort: it would have to match
+  on the builds alone, and that would also clear a new operator ramp with
+  no verdict. So the late ramp is judged on its own counts, as before the
+  guard existed. Check `GET /admin/build-routing` after the upgrade, and
+  clear such a ramp with `DELETE /admin/build-routing/ramp/{queue_name}`.
 - A ramp fan-out and a policy fan-out each pass one caller id to every
   pool. Each pool stores an id derived from that caller id, the queue, its
   base build and its target (`build_routing::ramp_generation_id`). The hash
