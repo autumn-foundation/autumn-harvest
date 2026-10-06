@@ -1029,6 +1029,9 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   channel on some shards only. So each route set gives its own task mix.
 /// - `retry_budgets`: the retry-budget policy of each registered activity. A
 ///   tighter budget defers more retries, so the worker runs fewer of them.
+/// - `adaptive_limits`: the adaptive-limit policy of each registered activity.
+///   A type at its limit is left out of the claim, so the limit shapes the
+///   task mix.
 /// - `outcome_window_ms` and `peer_stale_secs`: both follow the heartbeat
 ///   interval. Workers with two windows compare two time ranges, and workers
 ///   with two freshness limits can disagree on the live peer set.
@@ -1055,6 +1058,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         circuit_breakers,
         dispatch_channel,
         retry_budgets,
+        adaptive_limits,
         outcome_window,
         peer_stale_secs,
         execution,
@@ -1096,6 +1100,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "circuit_breakers": breaker_policies(circuit_breakers),
         "dispatch_channel": sorted_shards(dispatch_channel),
         "retry_budgets": budgets,
+        "adaptive_limits": limit_policies(adaptive_limits, registered_activities),
         "outcome_window": duration_key(*outcome_window),
         "peer_stale_secs": peer_stale_secs,
         "execution": execution.key(),
@@ -1118,6 +1123,18 @@ fn budget_policies(
             });
             serde_json::json!([name, policy])
         })
+        .collect()
+}
+
+/// The adaptive-limit policy of each registered activity, sorted by name, for
+/// a cohort key (issue #1815). An activity without a limit has `null`.
+fn limit_policies(
+    config: &crate::adaptive_limit::AdaptiveLimitConfig,
+    activities: &[String],
+) -> Vec<serde_json::Value> {
+    sorted_names(activities)
+        .into_iter()
+        .map(|name| serde_json::json!([name, config.policy_for(name)]))
         .collect()
 }
 
@@ -1209,6 +1226,10 @@ pub struct CohortPolicy<'a> {
     /// The worker's retry budgets. The key holds the policy of each
     /// registered activity.
     pub retry_budgets: &'a crate::retry_budget::RetryBudgetConfig,
+    /// The worker's adaptive concurrency limits. The key holds the policy of
+    /// each registered activity. The live limit is the worker's own health,
+    /// so it stays out.
+    pub adaptive_limits: &'a crate::adaptive_limit::AdaptiveLimitConfig,
     /// How long the worker keeps task outcomes: see
     /// [`crate::worker_outlier::window_max_age`].
     pub outcome_window: std::time::Duration,
@@ -3353,6 +3374,7 @@ mod tests {
             circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
             dispatch_channel: &[],
             retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+            adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
             outcome_window: std::time::Duration::from_secs(300),
             peer_stale_secs: 120,
             execution: super::ExecutionPolicy::default(),
@@ -3384,6 +3406,7 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
@@ -3420,6 +3443,7 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
@@ -3462,6 +3486,7 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
@@ -3498,6 +3523,7 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
@@ -3627,6 +3653,7 @@ mod tests {
                 circuit_breakers: breakers,
                 dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
@@ -3681,6 +3708,7 @@ mod tests {
                 circuit_breakers: &breakers,
                 dispatch_channel,
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
@@ -3691,6 +3719,54 @@ mod tests {
         // A multi-shard worker can use a channel on some shards only.
         assert_ne!(cohort(&[1]), cohort(&[2]));
         assert_eq!(cohort(&[2, 1]), cohort(&[1, 2, 2]));
+    }
+
+    /// Issue #1815: a type at its adaptive limit is left out of the claim.
+    /// Workers with different limit policies for a registered activity run
+    /// different task mixes, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_adaptive_limits() {
+        use crate::adaptive_limit::AdaptiveLimitConfig;
+        use crate::policy::AdaptiveLimitPolicy;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let activities = vec!["charge".to_owned()];
+        let cohort = |limits: &AdaptiveLimitConfig| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &activities,
+                circuit_breakers: &breakers,
+                dispatch_channel: &[],
+                retry_budgets: &budgets,
+                adaptive_limits: limits,
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let off = AdaptiveLimitConfig::disabled();
+        let limited = AdaptiveLimitConfig::disabled()
+            .with_activity("charge", Some(AdaptiveLimitPolicy::new(1, 10)));
+        let wider = AdaptiveLimitConfig::disabled()
+            .with_activity("charge", Some(AdaptiveLimitPolicy::new(1, 20)));
+        let unrelated = AdaptiveLimitConfig::disabled()
+            .with_activity("refund", Some(AdaptiveLimitPolicy::new(1, 10)));
+        assert_ne!(cohort(&off), cohort(&limited), "a limit");
+        assert_ne!(cohort(&limited), cohort(&wider), "a different limit");
+        assert_eq!(cohort(&off), cohort(&unrelated), "an unregistered activity");
     }
 
     /// Issue #1815: a retry budget defers retries, and a deferred retry does
@@ -3721,6 +3797,7 @@ mod tests {
                 circuit_breakers: &breakers,
                 dispatch_channel: &[],
                 retry_budgets: budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
@@ -3771,6 +3848,7 @@ mod tests {
                 circuit_breakers: &breakers,
                 dispatch_channel: &[],
                 retry_budgets: &budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window,
                 peer_stale_secs,
                 execution: super::ExecutionPolicy::default(),
@@ -3818,6 +3896,7 @@ mod tests {
                 circuit_breakers: &breakers,
                 dispatch_channel: &[],
                 retry_budgets: &budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window,
                 peer_stale_secs: 120,
                 execution,
@@ -3897,6 +3976,7 @@ mod tests {
                 circuit_breakers: &breakers,
                 dispatch_channel: &[],
                 retry_budgets: &budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution,
@@ -4061,6 +4141,7 @@ mod tests {
                 circuit_breakers: &breakers,
                 dispatch_channel: &[],
                 retry_budgets: &budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),
@@ -4272,6 +4353,7 @@ mod tests {
                 circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
                 dispatch_channel: &[],
                 retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
                 outcome_window: std::time::Duration::from_secs(300),
                 peer_stale_secs: 120,
                 execution: super::ExecutionPolicy::default(),

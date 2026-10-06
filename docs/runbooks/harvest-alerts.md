@@ -3416,7 +3416,8 @@ activity with a breaker skips the claim-time rate-limit gate. The open state
 of a breaker is left out, because it is the worker's own health. So does the
 dispatch route on each shard, because a dispatch channel ignores
 `queue_weights` and the Postgres claim applies them. So do the retry-budget policies, because a
-tighter budget defers more retries. So do the outcome window and the peer
+tighter budget defers more retries. So do the adaptive-limit policies, because a
+saturated activity type is left out of the claim. So do the outcome window and the peer
 freshness limit, which both follow `worker_heartbeat_interval`. Workers with
 two intervals would compare two time ranges. So do the workflow cache
 settings (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`), the

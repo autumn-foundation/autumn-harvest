@@ -76,7 +76,7 @@ heartbeat check only. A worker that was alive but sick passed that check.
   same `queue_weights`, on the same build with the same labels and the same
   slots per task kind (or the same slot-tuner band and tuner policy),
   session capacity, priority aging, activity eligibility, shards, registered
-  handlers, circuit-breaker policies, retry-budget policies, dispatch route
+  handlers, circuit-breaker policies, retry-budget policies, adaptive-limit policies, dispatch route
   per shard (a dispatch channel or the Postgres claim), outcome window and peer
   freshness limit (both follow the heartbeat interval), and execution policy
   (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`,

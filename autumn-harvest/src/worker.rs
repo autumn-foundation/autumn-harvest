@@ -33682,6 +33682,7 @@ impl Worker {
                     circuit_breakers: &self.registry.circuit_breakers(),
                     dispatch_channel: &self.dispatch_channel_shards(),
                     retry_budgets: self.registry.retry_budgets().config(),
+                    adaptive_limits: self.registry.adaptive_limits().config(),
                     outcome_window: crate::worker_outlier::window_max_age(
                         self.config.worker_heartbeat_interval,
                     ),
