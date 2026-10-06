@@ -1071,3 +1071,34 @@ fn release_signs_and_attests_the_client_tarball() {
         "SHA256SUMS must list the client: {sums}"
     );
 }
+
+/// `actions/attest` accepts a CycloneDX SBOM only with `bomFormat`,
+/// `specVersion` and `serialNumber`. A dry run writes no attestation, so each
+/// sign job checks the same rule first. The first dry run found this:
+/// `SOURCE_DATE_EPOCH` makes `cargo cyclonedx` omit `serialNumber`.
+#[test]
+fn release_sboms_pass_the_attest_format_check() {
+    let doc = parse_workflow(RELEASE_WORKFLOW);
+    for name in ["sign", "sign-client"] {
+        let check = job_steps(&doc, RELEASE_WORKFLOW, name)
+            .iter()
+            .find(|s| text(s, "name") == Some("Check the SBOM"))
+            .unwrap_or_else(|| panic!("{name} must have a `Check the SBOM` step"));
+        let run = text(check, "run").unwrap_or_default();
+        for field in [".bomFormat", ".specVersion", ".serialNumber"] {
+            assert!(
+                run.contains(field),
+                "{name}: the SBOM check must test `{field}`: {run}"
+            );
+        }
+    }
+    let binaries = job_steps(&doc, RELEASE_WORKFLOW, "binaries")
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !binaries.contains("SOURCE_DATE_EPOCH"),
+        "SOURCE_DATE_EPOCH drops the SBOM `serialNumber`"
+    );
+}
