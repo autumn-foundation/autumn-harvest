@@ -111,16 +111,41 @@ def line_of(text, offset):
     return text.count("\n", 0, offset) + 1
 
 
-CODE_SPAN_RE = re.compile(r"(`+)(?!`).*?(?<!`)\1(?!`)")
+TICK_RUN_RE = re.compile(r"`+")
 
 
-def strip_html_comments(line, in_comment):
+def mask_code_spans(line, open_run):
+    """Blank code-span text so its delimiters cannot open a comment.
+
+    A code span can continue onto the next line of a paragraph. open_run is
+    the backtick run of a span still open from the last line, or 0. Return
+    the masked line and the run still open at its end.
+    """
+    out, i = list(line), 0
+    while i < len(line):
+        if open_run:
+            close = re.compile(rf"(?<!`)`{{{open_run}}}(?!`)").search(line, i)
+            end = close.end() if close else len(line)
+            out[i:end] = " " * (end - i)
+            if not close:
+                break
+            i, open_run = end, 0
+        else:
+            tick = TICK_RUN_RE.search(line, i)
+            if not tick:
+                break
+            i, open_run = tick.start(), len(tick.group())
+            out[i : tick.end()] = " " * open_run
+            i = tick.end()
+    return "".join(out), open_run
+
+
+def strip_html_comments(line, masked, in_comment):
     """Return the visible part of a line, and whether a comment stays open.
 
-    A delimiter inside a code span, such as `<!--`, is text, not a comment.
+    The delimiters are found in masked, a copy with code spans blanked, so a
+    `<!--` in a code span is text. The visible text comes from line.
     """
-    # Search a copy with code spans masked, and slice the real line.
-    masked = CODE_SPAN_RE.sub(lambda m: " " * len(m.group()), line)
     out, i = [], 0
     while i < len(line):
         if in_comment:
@@ -146,23 +171,28 @@ def markdown_lines(text):
     fence can show a three-backtick block inside it. HTML comment text is not
     rendered, so it is blanked. A line keeps its number.
     """
-    fence, in_comment = None, False
-    for n, raw in enumerate(text.splitlines(), 1):
-        marker = FENCE_RE.fullmatch(raw)
-        if fence is None:
-            line, in_comment = strip_html_comments(raw, in_comment)
-            marker = FENCE_RE.fullmatch(line)
-            if marker and not (marker.group(1)[0] == "`" and "`" in marker.group(2)):
-                fence = marker.group(1)
-                continue
-            yield n, line
-        elif (
-            marker
-            and marker.group(1)[0] == fence[0]
-            and len(marker.group(1)) >= len(fence)
-            and not marker.group(2).strip()
-        ):
-            fence = None
+    fence, in_comment, open_run = None, False, 0
+    for n, line in enumerate(text.splitlines(), 1):
+        marker = FENCE_RE.fullmatch(line)
+        if fence is not None:
+            if (
+                marker
+                and marker.group(1)[0] == fence[0]
+                and len(marker.group(1)) >= len(fence)
+                and not marker.group(2).strip()
+            ):
+                fence = None
+            continue
+        if not line.strip():
+            # A code span cannot cross a blank line.
+            open_run = 0
+        is_opener = marker and not (marker.group(1)[0] == "`" and "`" in marker.group(2))
+        if is_opener and not in_comment and not open_run:
+            fence = marker.group(1)
+            continue
+        masked, open_run = mask_code_spans(line, open_run)
+        visible, in_comment = strip_html_comments(line, masked, in_comment)
+        yield n, visible
 
 
 def table_cells(line):
@@ -344,6 +374,11 @@ def self_test():
     assert list(markdown_lines(hidden))[-1] == (7, "a  c")
     spans = "Use `<!--` to start one.\n| M | P |\n|---|---|\n| `event.rs` | 9 variants |\n"
     assert len(event_row_count_findings("x.md", spans)) == 1
+    wrapped = "Use `<!--\n` to start one.\n\n| M | P |\n|---|---|\n| `event.rs` | 9 variants |\n"
+    assert len(event_row_count_findings("x.md", wrapped)) == 1
+    # An unclosed tick is reset at the blank line, so a later comment still hides.
+    lone = "A lone ` tick.\n\n<!--\n| M | P |\n|---|---|\n| `event.rs` | 9 variants |\n-->\n"
+    assert event_row_count_findings("x.md", lone) == []
     formatted = (
         "| M | P |\n|---|---|\n| `event.rs` | Variants: **49** |\n"
         "| `event.rs` | `50` variants |\n| `event.rs` | `last_error` field |\n"
