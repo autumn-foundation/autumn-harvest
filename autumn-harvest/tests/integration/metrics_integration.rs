@@ -2929,12 +2929,12 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
         .await
         .expect("failed to insert workflow execution row");
 
-    // Same shape as the single-suspension test: WorkflowStarted + 2 inert
-    // markers (3 events loaded), so cycle 1's fresh `ctx.timer(...)` (the
-    // handler's first live call) contributes exactly one new event, crossing
-    // cap=16, fraction=0.25 -> threshold=4. The count is 3 loaded + 1 timer +
-    // 1 reserved decision boundary (issue #1833) = 5 >= 4. Cycle 2 loads
-    // 6 rows and counts 8, so the cap must stay well above 8.
+    // Same shape as the single-suspension test. WorkflowStarted and 2 inert
+    // markers load 3 events. Cycle 1's fresh `ctx.timer(...)` is the first
+    // live call and adds exactly one new event. Cap 16 at fraction 0.25 gives
+    // threshold 4. The count is 3 loaded + 1 timer + 1 reserved decision
+    // boundary (issue #1833), so 5 >= 4 crosses it. Cycle 2 loads 6 rows and
+    // counts 8, so the cap must stay well above 8.
     store::append_events(
         &mut conn,
         exec_id,

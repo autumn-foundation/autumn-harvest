@@ -3023,3 +3023,63 @@ fn a_real_difference_after_a_one_sided_boundary_is_still_found() {
     assert_eq!(divergence.left.expect("left step").index, 2);
     assert_eq!(divergence.right.expect("right step").index, 3);
 }
+
+#[test]
+fn a_one_sided_boundary_does_not_shift_later_positions() {
+    // Snapshots record history positions: where an awaitable opened and where
+    // a side effect or marker landed. A boundary on one side must not move
+    // them, or a pre-upgrade recording diffs against its post-upgrade twin.
+    let tail = |id: ActivityExecId| {
+        vec![
+            scheduled(id, "step_b"),
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some("pick".to_string()),
+                value: json!(7),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "fan_out:1".to_string(),
+                details: json!(3),
+            },
+        ]
+    };
+    let mut before = vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    before.extend(tail(ActivityExecId::new()));
+    let mut after = vec![
+        started(),
+        scheduled(ActivityExecId::new(), "step_a"),
+        decision_committed("build-2", "worker-us-1"),
+    ];
+    after.extend(tail(ActivityExecId::new()));
+    after.push(decision_committed("build-2", "worker-us-1"));
+
+    let diff = diff_traces(&handler_free_trace(&before), &handler_free_trace(&after));
+    assert!(diff.is_clean(), "{diff:?}");
+}
+
+#[test]
+fn a_moved_side_effect_still_diverges_across_a_one_sided_boundary() {
+    // The control: positions still compare. They count only non-boundary
+    // events, so a side effect that really moves is still found.
+    let effect = || WorkflowEvent::SideEffectRecorded {
+        kind: SideEffectKind::Custom,
+        name: Some("pick".to_string()),
+        value: json!(7),
+    };
+    let before = vec![
+        started(),
+        effect(),
+        scheduled(ActivityExecId::new(), "step_a"),
+    ];
+    let after = vec![
+        started(),
+        decision_committed("build-2", "worker-us-1"),
+        scheduled(ActivityExecId::new(), "step_a"),
+        effect(),
+    ];
+    let diff = diff_traces(&handler_free_trace(&before), &handler_free_trace(&after));
+    assert!(
+        diff.divergence.is_some(),
+        "a reordered side effect must still diverge: {diff:?}"
+    );
+}

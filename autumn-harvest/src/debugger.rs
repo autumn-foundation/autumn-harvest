@@ -822,12 +822,8 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     // side can lack them, for example a recording from before the upgrade.
     // So the walk compares the other steps only. Each step keeps its own
     // `index` into its history.
-    let left_steps: Vec<&DebugStep> = left.steps.iter().filter(|s| s.decision.is_none()).collect();
-    let right_steps: Vec<&DebugStep> = right
-        .steps
-        .iter()
-        .filter(|s| s.decision.is_none())
-        .collect();
+    let left_steps = boundary_free_steps(left);
+    let right_steps = boundary_free_steps(right);
     let shared = left_steps.len().min(right_steps.len());
     // The first compared index where *neither* side replayed successfully. Both
     // sides failing the same way compares equal at every field, so the walk
@@ -839,8 +835,9 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     // (AC3's fixture-vs-fixture mode) is fully conclusive — the history facts
     // it compares are determined entirely by the two histories. Only a replay
     // that was attempted and did not finish makes agreement meaningless.
-    let inconclusive_step = (0..shared)
-        .find(|&i| left_steps[i].outcome.replay_failed() && right_steps[i].outcome.replay_failed());
+    let inconclusive_step = (0..shared).find(|&i| {
+        left_steps[i].raw.outcome.replay_failed() && right_steps[i].raw.outcome.replay_failed()
+    });
     let finish = |divergence| TraceDiff {
         divergence,
         left_steps: left.steps.len(),
@@ -873,15 +870,16 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     }
 
     for i in 0..shared {
-        let l = left_steps[i];
-        let r = right_steps[i];
+        let l = &left_steps[i];
+        let r = &right_steps[i];
 
-        if let Some(kind) = step_diff_kind(l, r) {
+        // Compare the renumbered copies. Report the steps as recorded.
+        if let Some(kind) = step_diff_kind(&l.compared, &r.compared) {
             return finish(Some(TraceDivergence {
                 step_index: i,
                 kind,
-                left: Some(l.clone()),
-                right: Some(r.clone()),
+                left: Some(l.raw.clone()),
+                right: Some(r.raw.clone()),
             }));
         }
     }
@@ -894,10 +892,56 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
                 right: right_steps.len(),
                 capped: truncated,
             },
-            left: left_steps.get(shared).map(|step| (*step).clone()),
-            right: right_steps.get(shared).map(|step| (*step).clone()),
+            left: left_steps.get(shared).map(|step| step.raw.clone()),
+            right: right_steps.get(shared).map(|step| step.raw.clone()),
         }),
     )
+}
+
+/// One non-boundary step, as recorded and as compared.
+struct ComparedStep<'a> {
+    /// The step as recorded. A divergence reports this one.
+    raw: &'a DebugStep,
+    /// A copy whose history positions count non-boundary events only.
+    compared: DebugStep,
+}
+
+/// The non-boundary steps of `trace`, with history positions renumbered.
+///
+/// Snapshots carry history positions: where an awaitable opened, and where a
+/// side effect, marker or divergence landed. Each boundary before a position
+/// moves it by one (issue #1833). So the copy maps each position to its
+/// ordinal among the non-boundary events. A history without boundaries maps
+/// every position to itself.
+fn boundary_free_steps(trace: &ReplayTrace) -> Vec<ComparedStep<'_>> {
+    let boundaries: Vec<usize> = trace
+        .steps
+        .iter()
+        .filter(|step| step.decision.is_some())
+        .map(|step| step.index)
+        .collect();
+    let ordinal = |position: usize| position - boundaries.partition_point(|&b| b < position);
+    trace
+        .steps
+        .iter()
+        .filter(|step| step.decision.is_none())
+        .map(|raw| {
+            let mut compared = raw.clone();
+            for awaitable in &mut compared.open_awaitables {
+                awaitable.opened_at = ordinal(awaitable.opened_at);
+            }
+            for effect in &mut compared.side_effects {
+                effect.event_index = ordinal(effect.event_index);
+            }
+            for marker in &mut compared.markers {
+                marker.event_index = ordinal(marker.event_index);
+            }
+            if let Some(divergence) = &mut compared.divergence {
+                divergence.event_index = ordinal(divergence.event_index);
+            }
+            ComparedStep { raw, compared }
+        })
+        .collect()
 }
 
 /// How a single pair of steps differs, if at all.
