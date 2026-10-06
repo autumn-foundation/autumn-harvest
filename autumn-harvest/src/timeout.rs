@@ -1613,6 +1613,15 @@ const fn expected_task_states_for_timeout(reason: &TimeoutReason) -> &'static [&
     }
 }
 
+/// True when a run can take a new activity attempt (issue #1870).
+///
+/// Only `RUNNING` and `PAUSED` runs are open. A timeout in any other run stays
+/// terminal, so no handler runs again for a sealed run or a shard move. A new
+/// state is closed until it is added here.
+fn run_accepts_retry(execution_state: &str) -> bool {
+    matches!(execution_state, "RUNNING" | "PAUSED")
+}
+
 /// Pure decision rule for the PAUSED re-check the timeout enforcers perform
 /// under the execution row lock (issue #609 post-review hardening, second
 /// bot-review round). `true` means "skip enforcement for this task without
@@ -2211,6 +2220,7 @@ async fn enforce_activity_timeout(
             // is the exception, because a pause stops that clock. Resume then
             // shifts the deadline, as on the worker retry path.
             if reason.retries_per_policy()
+                && run_accepts_retry(&execution.state)
                 && let Some(delay) = crate::worker::timeout_retry_delay(task, &error)
                 && let Some(claim) = queue::TaskClaim::of(task)
             {
@@ -6806,6 +6816,21 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 
 #[cfg(test)]
 mod tests {
+    // ── retry of a timed-out attempt needs an open run (issue #1870) ─────
+
+    #[test]
+    fn only_an_open_run_takes_a_timeout_retry() {
+        assert!(run_accepts_retry("RUNNING"));
+        assert!(run_accepts_retry("PAUSED"));
+        for state in crate::erase::TERMINAL_STATES
+            .iter()
+            .copied()
+            .chain(["MIGRATING"])
+        {
+            assert!(!run_accepts_retry(state), "{state}");
+        }
+    }
+
     // ── Timeout retry rule (issue #1809, ADR 0005) ───────────────────────
 
     /// A confirmed timeout releases a probe slot either way. Only a probe whose
