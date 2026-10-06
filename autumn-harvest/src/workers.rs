@@ -1241,6 +1241,10 @@ pub struct PayloadPolicy {
     /// carries the handlers of its workflow, and a worker without a handler
     /// fails a request that a peer runs.
     pub declarative_handlers: Vec<serde_json::Value>,
+    /// The workflow log policy as `[max_lines, max_message_bytes]`. `Null`
+    /// when workflow logs are off. A worker with logs on persists each line
+    /// inside the task.
+    pub workflow_log_policy: serde_json::Value,
 }
 
 impl PayloadPolicy {
@@ -1262,6 +1266,7 @@ impl PayloadPolicy {
             "module_host": self.module_host,
             "workflows": self.workflows,
             "declarative_handlers": self.declarative_handlers,
+            "workflow_log_policy": self.workflow_log_policy,
         })
     }
 }
@@ -3891,6 +3896,10 @@ mod tests {
             },
             PayloadPolicy {
                 declarative_handlers: vec![serde_json::json!(["update", "order", "approve"])],
+                ..base.clone()
+            },
+            PayloadPolicy {
+                workflow_log_policy: serde_json::json!([1000, 4096]),
                 ..base
             },
         ]

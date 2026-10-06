@@ -1215,6 +1215,17 @@ impl HandlerRegistry {
 
     /// The settings of this registry that decide whether a task's payloads
     /// pass, for the worker's cohort key (issue #1815).
+    ///
+    /// Some registry settings stay out, because they do not change how this
+    /// worker runs a task:
+    ///
+    /// - The workflow attempt, chain and execution ceilings shape a child or a
+    ///   successor run when it starts, as a start-time policy does.
+    /// - The signal handler metadata serves discovery only.
+    /// - A WASM activity runs the module that the database marks active, so
+    ///   every worker runs the same bytes. The binding's sandbox policy is in.
+    /// - The telemetry sinks and the shared application state do not decide
+    ///   an outcome.
     #[must_use]
     pub fn payload_policy(&self) -> crate::workers::PayloadPolicy {
         crate::workers::PayloadPolicy {
@@ -1258,6 +1269,11 @@ impl HandlerRegistry {
             module_host: serde_json::Value::Null,
             workflows: self.workflow_policies(),
             declarative_handlers: self.declarative_handler_policies(),
+            workflow_log_policy: self
+                .workflow_log_policy
+                .map_or(serde_json::Value::Null, |logs| {
+                    serde_json::json!([logs.max_lines(), logs.max_message_bytes()])
+                }),
         }
     }
 
@@ -38515,6 +38531,33 @@ mod tests {
         );
         // worker_id should be a valid UUID
         assert!(uuid::Uuid::parse_str(&runtime_cfg.worker_id).is_ok());
+    }
+
+    /// Issue #1815: a worker with workflow logs on persists each log line in
+    /// the task. A worker with them off skips that write. So the log policy is
+    /// part of the cohort.
+    #[test]
+    fn payload_policy_holds_the_workflow_log_policy() {
+        use crate::context::WorkflowLogPolicy;
+        let policy = |logs: Option<WorkflowLogPolicy>| {
+            HandlerRegistry::new(vec![], vec![])
+                .with_workflow_log_policy(logs)
+                .payload_policy()
+        };
+        let off = policy(None);
+        let on = policy(Some(WorkflowLogPolicy::new()));
+        assert_ne!(off, on, "logs on");
+        assert_ne!(
+            on,
+            policy(Some(WorkflowLogPolicy::new().with_max_lines(10))),
+            "a smaller line cap"
+        );
+        assert_ne!(
+            on,
+            policy(Some(WorkflowLogPolicy::new().with_max_message_bytes(16))),
+            "a smaller line size"
+        );
+        assert_eq!(on, policy(Some(WorkflowLogPolicy::new())));
     }
 
     /// Issue #1815: the task context carries the declarative query and update
