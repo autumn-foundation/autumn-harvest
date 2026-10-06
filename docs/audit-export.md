@@ -161,6 +161,11 @@ Compare with a constant-time comparison.
 Optional fields serialize as an explicit `null` rather than being omitted, so
 a SIEM's schema inference sees a stable object shape across every batch.
 
+One field is the exception: `chain_hash` (issue #1838). It appears only on
+rows the audit hash chain covers, and it is the last field. A deployment
+without a chain key ships the same bytes as before. See
+[The audit hash chain](#the-audit-hash-chain).
+
 ### Verifying completeness: `(shard, seq)`
 
 `seq` is a **dense, strictly monotonic, per-shard** sequence. Per shard it
@@ -211,6 +216,7 @@ collector:
 | `shard` | `attributes["harvest.audit.source_shard"]` — the shard whose **database this record was read from**. Together with `seq` it is the dedup and gap-detection key, *not* an operation attribute |
 | `seq` | `attributes["harvest.audit.seq"]` |
 | `id` | `attributes["harvest.audit.id"]` |
+| `chain_hash` | `attributes["harvest.audit.chain_hash"]`, when present |
 | `actor`, `target_type`, `target_id`, `route_or_command`, `request_id`, `idempotency_key`, `source` | `attributes["harvest.audit.<field>"]` |
 
 **`shard` and `shard_id` are different things and both are exported.** They
@@ -223,6 +229,65 @@ an operation that names no shard.
 
 Vendor-specific integrations (Splunk HEC, Datadog intake) are embedder glue on
 top of this surface, not engine features.
+
+### The audit hash chain
+
+The chain is optional (issue #1838). It makes the rows in the database
+tamper-evident. Turn it on with a key of 32 bytes or more:
+
+```rust,ignore
+HarvestBuilder::new()
+    .audit_export_webhook("https://siem.example.com/harvest/audit")
+    .audit_export_secret(webhook_secret)
+    .audit_export_chain_key(chain_key)
+```
+
+The exporter stamps the chain when it assigns `seq`. Each row then holds two
+32-byte values:
+
+- `chain_prev`: the `chain_hash` of the row with the previous `seq`. The first
+  chained row uses 32 zero bytes.
+- `chain_hash`: `HMAC-SHA256(key, "harvest-audit-chain-v1" || chain_prev ||
+  canonical row)`.
+
+The canonical row is these fields, in this order: `shard`, `seq`, `id`,
+`shard_id`, `occurred_at`, `actor`, `operation`, `target_type`, `target_id`,
+`route_or_command`, `request_id`, `idempotency_key`, `status`,
+`error_summary`, `source`. Each field is a big-endian `u32` byte length, then
+its UTF-8 text. An absent field is the length `0xFFFFFFFF` with no text.
+Numbers are decimal. `id` is the hyphenated lowercase UUID. `occurred_at` is
+RFC 3339 in UTC with microseconds, for example
+`2026-08-31T04:11:02.117000Z`.
+
+Keep the key out of the database. A writer without the key cannot forge a
+link, so an edit shows. A process that holds the key can forge links. The
+chain protects against database-level tampering, not a compromised Harvest
+process.
+
+**Verify it.** Call `audit_chain::verify_shard_chain(conn, shard, &key)`. It
+reads one snapshot and returns a `ChainReport`. Each finding names a `seq`:
+
+| Finding | Meaning |
+|---|---|
+| `Tampered` | The row does not match its own `chain_hash`. Its content changed. |
+| `LinkMismatch` | `chain_prev` does not match the row before it. |
+| `Unchained` | A row after the chain start has no hash. |
+| `Gap` | Sequence numbers are missing. Rows were deleted. |
+| `HeadMismatch` | The newest row does not match the cursor's `chain_head`. The newest rows were deleted. |
+
+Rows sequenced before you set the key are an `unchained_prefix`, not a
+finding. Retention near its cutoff can leave a `Gap`, because a late commit can
+hold an older `occurred_at` than its predecessor. Compare a gap with the SIEM
+copy before you treat it as tampering.
+
+A SIEM that holds the key can verify the chain from the export: recompute each
+link from the record and the `chain_hash` of the record with the previous
+`seq`.
+
+**Limits.** The chain covers a row from the moment the exporter sequences it.
+A row is unchained between its insert and the next export tick. The SIEM copy
+covers that window. Rows sequenced before you set the key stay unchained. If
+you remove the key, later rows are unchained, and the verifier flags them.
 
 ---
 
@@ -854,21 +919,16 @@ past the retention window returns whatever survives, and
 
 - **Exactly-once delivery.** At-least-once is the contract; receivers dedupe on
   `(shard, seq)`, matching #605.
-- **Hash-chained / Merkle tamper-proofing of the at-rest rows.** A worthy but
-  separate cryptographic-audit-log effort. What ships here is gap-detectable
-  off-box export, which removes most of the incentive to tamper at rest:
-  rewriting a row in the database does not rewrite the copy the SIEM already
-  holds, and deleting an **exported** row leaves a sequence hole the receiver
-  can see.
-
-  Be precise about the limit: a row deleted **before the exporter has sequenced
-  it** — inside the window between the audited action and the next scanner
-  tick, or anywhere in the backlog during a sink outage — never receives a
-  sequence, so the surviving rows are stamped densely and there is no hole to
-  detect. Tamper evidence begins at the moment a record is sequenced, not at
-  the moment it is written. Shorten that window by keeping the export healthy;
-  close it properly only with at-rest hash chaining, which is out of scope
-  here.
+- **Tamper evidence before a row is sequenced.** The optional
+  [audit hash chain](#the-audit-hash-chain) (issue #1838) makes sequenced rows
+  tamper-evident at rest. A row deleted **before the exporter sequences it**
+  never receives a sequence or a link. That covers the window between the
+  audited action and the next scanner tick, and the backlog during a sink
+  outage. The surviving rows are stamped densely, so there is no hole to
+  detect. Tamper evidence begins when a record is sequenced, not when it is
+  written. Keep the export healthy to keep that window short.
+  [ADR 0004](adr/0004-security-extras.md) explains why the chain is not
+  stamped at insert time.
 - **Exporting workflow event history.** That is `HistoryArchiver` (#345). This
   is the audit trail only.
 

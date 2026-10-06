@@ -183,6 +183,46 @@ pub struct AuditExportRecord {
     pub status: String,
     pub error_summary: Option<String>,
     pub source: String,
+    /// Lowercase hex of the row's audit-chain link (issue #1838).
+    ///
+    /// Present only on rows the chain covers. The field is omitted, not
+    /// `null`, when absent. So a deployment without a chain key ships the
+    /// same bytes as before. See [`crate::audit_chain`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_hash: Option<String>,
+}
+
+#[cfg(feature = "db")]
+impl AuditExportRecord {
+    /// Build the record the exporter ships for `row`, read from `shard`.
+    ///
+    /// Returns `None` for a row with no `export_seq`. A fabricated sequence
+    /// would corrupt the receiver's gap accounting.
+    #[must_use]
+    pub fn from_row(shard: i32, row: crate::models::AuditExportRow) -> Option<Self> {
+        Some(Self {
+            shard,
+            seq: row.export_seq?,
+            id: row.id,
+            shard_id: row.shard_id,
+            occurred_at: row.occurred_at,
+            actor: row.actor,
+            operation: row.operation,
+            target_type: row.target_type,
+            target_id: row.target_id,
+            route_or_command: row.route_or_command,
+            request_id: row.request_id,
+            idempotency_key: row.idempotency_key,
+            status: row.status,
+            error_summary: row.error_summary,
+            source: row.source,
+            chain_hash: row
+                .chain_hash
+                .as_deref()
+                .and_then(crate::audit_chain::from_bytes)
+                .map(|hash| crate::audit_chain::to_hex(&hash)),
+        })
+    }
 }
 
 /// Serialize a batch as JSON lines — one compact JSON object per line,
@@ -518,6 +558,9 @@ pub struct AuditExportBuilderConfig {
     /// sink call itself. Must exceed the sink's own per-request timeout — see
     /// [`DEFAULT_EXPORT_LEASE`].
     pub lease: std::time::Duration,
+    /// HMAC key for the audit hash chain (issue #1838). `None` turns the chain
+    /// off. See [`crate::audit_chain`].
+    pub chain_key: Option<CallbackSecret>,
 }
 
 /// A webhook URL reduced to its origin, for diagnostics.
@@ -572,6 +615,7 @@ impl std::fmt::Debug for AuditExportBuilderConfig {
             .field("batch_size", &self.batch_size)
             .field("backoff", &self.backoff)
             .field("lease", &self.lease)
+            .field("chain_key", &self.chain_key)
             .finish()
     }
 }
@@ -588,6 +632,7 @@ impl Default for AuditExportBuilderConfig {
             batch_size: DEFAULT_EXPORT_BATCH_SIZE,
             backoff: ExportBackoff::default(),
             lease: DEFAULT_EXPORT_LEASE,
+            chain_key: None,
         }
     }
 }
@@ -803,6 +848,33 @@ pub struct AuditExportRuntimeConfig {
     pub backoff: ExportBackoff,
     /// How long a claim holds a shard's cursor.
     pub lease: std::time::Duration,
+    /// HMAC key for the audit hash chain (issue #1838). `None` stamps no chain.
+    pub chain_key: Option<CallbackSecret>,
+}
+
+#[cfg(feature = "db")]
+impl AuditExportRuntimeConfig {
+    /// Claim a batch on `shard_id` with this config's batch size, lease and
+    /// chain key. See [`claim_shard_chained`].
+    ///
+    /// # Errors
+    /// Returns `HarvestError` on a database failure.
+    pub async fn claim(
+        &self,
+        conn: &mut diesel_async::AsyncPgConnection,
+        shard_id: i32,
+        now: DateTime<Utc>,
+    ) -> crate::error::HarvestResult<Option<ClaimedBatch>> {
+        claim_shard_chained(
+            conn,
+            shard_id,
+            self.batch_size,
+            self.lease,
+            now,
+            self.chain_key.as_ref(),
+        )
+        .await
+    }
 }
 
 // Write this static through [`set_global_audit_export_config`]. A direct write
@@ -892,6 +964,7 @@ pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExport
         batch_size: config.effective_batch_size(),
         backoff: config.backoff.clone(),
         lease: config.effective_lease(),
+        chain_key: config.chain_key.clone(),
     })));
 }
 
@@ -1088,9 +1161,16 @@ pub async fn ensure_cursor_row(
     //
     // Resuming a retired shard is [`reactivate_cursor`]: an explicit, audited
     // operator action, not a side effect of the exporter noticing new work.
+    //
+    // The INSERT arm seeds `chain_head` from the newest sequenced row for the
+    // same reason (issue #1838). A rebuilt cursor then continues the chain,
+    // and does not restart it from the genesis link.
     diesel::sql_query(
-        "INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq) \
-         SELECT $1, COALESCE(MAX(export_seq), 0) FROM harvest_audit_log \
+        "INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq, chain_head) \
+         SELECT $1, COALESCE(MAX(export_seq), 0), \
+                (SELECT chain_hash FROM harvest_audit_log \
+                 WHERE export_seq IS NOT NULL ORDER BY export_seq DESC LIMIT 1) \
+         FROM harvest_audit_log \
          ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW() \
          WHERE harvest_audit_export_cursor.retired_at IS NULL",
     )
@@ -2143,13 +2223,34 @@ struct HighWater {
 /// # Errors
 /// Returns `HarvestError` on a database failure.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_lines)] // claim + assign + load is one atomic unit
 pub async fn claim_shard(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
     batch_size: i64,
     lease: std::time::Duration,
     now: DateTime<Utc>,
+) -> crate::error::HarvestResult<Option<ClaimedBatch>> {
+    claim_shard_chained(conn, shard_id, batch_size, lease, now, None).await
+}
+
+/// [`claim_shard`], and stamp the audit hash chain with `chain_key`
+/// (issue #1838).
+///
+/// The chain covers exactly the rows this claim sequences. It is stamped in
+/// the same transaction, under the same cursor row lock, so two exporters
+/// can never fork the chain. `None` stamps no chain, as [`claim_shard`].
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)] // claim + assign + load is one atomic unit
+pub async fn claim_shard_chained(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    batch_size: i64,
+    lease: std::time::Duration,
+    now: DateTime<Utc>,
+    chain_key: Option<&CallbackSecret>,
 ) -> crate::error::HarvestResult<Option<ClaimedBatch>> {
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
@@ -2248,6 +2349,27 @@ pub async fn claim_shard(
 
             let last_assigned_seq = assigned.high_water.max(cursor.last_assigned_seq);
 
+            // ── Stamp the hash chain over the rows just sequenced ─────────
+            //
+            // Rows sequenced on an earlier tick keep whatever they had. So a
+            // key set later starts the chain at the next sequence.
+            let stamped_head = match chain_key {
+                Some(key) if last_assigned_seq > cursor.last_assigned_seq => {
+                    crate::audit_chain::stamp_chain(
+                        conn,
+                        shard_id,
+                        key,
+                        cursor.last_assigned_seq,
+                        last_assigned_seq,
+                        cursor.chain_head.as_deref(),
+                    )
+                    .await?
+                }
+                _ => None,
+            };
+            let chain_head =
+                stamped_head.map_or_else(|| cursor.chain_head.clone(), |head| Some(head.to_vec()));
+
             // ── Load the batch to deliver ─────────────────────────────────
             //
             // Everything above the cursor, not merely what was just assigned:
@@ -2268,6 +2390,7 @@ pub async fn claim_shard(
                 diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
                     .set((
                         cur::last_assigned_seq.eq(last_assigned_seq),
+                        cur::chain_head.eq(&chain_head),
                         cur::updated_at.eq(now),
                     ))
                     .execute(conn)
@@ -2290,31 +2413,11 @@ pub async fn claim_shard(
                 .await
                 .map_err(crate::error::database_error)?;
 
+            // `export_seq` is non-NULL by the filter above. A row without one
+            // is skipped, not exported with a fabricated sequence.
             let records = rows
                 .into_iter()
-                .filter_map(|row| {
-                    // `export_seq` is non-NULL by the filter above; a row
-                    // without one is skipped rather than exported with a
-                    // fabricated sequence, which would corrupt the receiver's
-                    // gap accounting.
-                    row.export_seq.map(|seq| AuditExportRecord {
-                        shard: shard_id,
-                        seq,
-                        id: row.id,
-                        shard_id: row.shard_id,
-                        occurred_at: row.occurred_at,
-                        actor: row.actor,
-                        operation: row.operation,
-                        target_type: row.target_type,
-                        target_id: row.target_id,
-                        route_or_command: row.route_or_command,
-                        request_id: row.request_id,
-                        idempotency_key: row.idempotency_key,
-                        status: row.status,
-                        error_summary: row.error_summary,
-                        source: row.source,
-                    })
-                })
+                .filter_map(|row| AuditExportRecord::from_row(shard_id, row))
                 .collect::<Vec<_>>();
 
             if records.is_empty() {
@@ -3105,8 +3208,7 @@ async fn export_once_on_conn(
     ensure_cursor_row(conn, shard_id).await?;
 
     let now = Utc::now();
-    let Some(claim) = claim_shard(conn, shard_id, config.batch_size, config.lease, now).await?
-    else {
+    let Some(claim) = config.claim(conn, shard_id, now).await? else {
         // Nothing claimed, but the lag gauge must still be emitted: an
         // operator's "is the export keeping up?" signal has to stay live
         // exactly when deliveries are NOT happening.
@@ -3634,7 +3736,7 @@ async fn export_once_via_pool(
         result = async {
             ensure_cursor_row(&mut conn, shard_id).await?;
             let now = Utc::now();
-            claim_shard(&mut conn, shard_id, config.batch_size, config.lease, now).await
+            config.claim(&mut conn, shard_id, now).await
         } => result?,
         () = cancel.cancelled() => {
             tracing::warn!(
@@ -4114,6 +4216,7 @@ mod tests {
             status: "SUCCEEDED".to_string(),
             error_summary: None,
             source: "api".to_string(),
+            chain_hash: None,
         }
     }
 
@@ -4179,6 +4282,23 @@ mod tests {
         // Tamper-evidence identity fields (AC4) are always present.
         assert_eq!(parsed["shard"], serde_json::json!(3));
         assert_eq!(parsed["seq"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn a_record_without_a_chain_hash_omits_the_field() {
+        let body = serialize_batch(&[rec(1)]).expect("serializes");
+        let line = String::from_utf8(body).expect("utf8");
+        assert!(!line.contains("chain_hash"), "{line}");
+    }
+
+    #[test]
+    fn a_chained_record_carries_its_chain_hash_last() {
+        let mut record = rec(1);
+        record.chain_hash = Some("ab".repeat(32));
+        let body = serialize_batch(&[record]).expect("serializes");
+        let line = String::from_utf8(body).expect("utf8");
+        let expected = format!(",\"chain_hash\":\"{}\"}}\n", "ab".repeat(32));
+        assert!(line.ends_with(&expected), "{line}");
     }
 
     // ── Signing (the #605 X-Harvest-Signature scheme, reused verbatim) ───────
@@ -4598,6 +4718,7 @@ mod tests {
             batch_size: 100,
             backoff: ExportBackoff::default(),
             lease,
+            chain_key: None,
         };
 
         let budget = audit_export_liveness_interval(interval, Some(&config));
@@ -4698,6 +4819,7 @@ mod tests {
             backoff: ExportBackoff::default(),
             // A generous lease: bounding by THIS would let the 300ms sink win.
             lease: std::time::Duration::from_secs(60),
+            chain_key: None,
         };
         let batch = AuditBatch {
             shard: 0,
@@ -4842,6 +4964,7 @@ mod tests {
                 batch_size,
                 backoff: ExportBackoff::default(),
                 lease: std::time::Duration::from_secs(30),
+                chain_key: None,
             })
         }
 
@@ -4942,6 +5065,7 @@ mod tests {
             batch_size: 10,
             backoff: ExportBackoff::default(),
             lease: Duration::from_secs(30),
+            chain_key: None,
         })
     }
 

@@ -21,6 +21,8 @@ mod admission_gate_tests;
 mod alert_pack_docs;
 #[cfg(feature = "db")]
 mod append_only_guard_tests;
+#[cfg(feature = "db")]
+mod audit_chain_tests;
 mod audit_export_docs;
 #[cfg(feature = "db")]
 mod audit_export_tests;
@@ -178,6 +180,7 @@ mod mutex_tests;
 mod nd_block_tests;
 #[cfg(feature = "db")]
 mod notify_post_commit_tests;
+mod otel_semconv_docs;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;

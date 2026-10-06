@@ -1104,6 +1104,10 @@ pub struct AuditExportRow {
     pub shard_id: Option<i32>,
     pub source: String,
     pub export_seq: Option<i64>,
+    /// Audit-chain link of the previous row (issue #1838).
+    pub chain_prev: Option<Vec<u8>>,
+    /// Audit-chain link of this row (issue #1838).
+    pub chain_hash: Option<Vec<u8>>,
 }
 
 /// The per-shard audit-export delivery cursor (issue #953).
@@ -1128,6 +1132,8 @@ pub struct AuditExportCursor {
     /// themselves; a retired cursor is inert — retention ignores it and a
     /// redrive refuses it.
     pub retired_at: Option<DateTime<Utc>>,
+    /// Newest audit-chain link on this shard (issue #1838).
+    pub chain_head: Option<Vec<u8>>,
 }
 
 // ── ApiToken ──────────────────────────────────────────────────────────────────
@@ -1762,6 +1768,8 @@ pub struct NewHarvestWasmModule<'a> {
     pub activity_name: &'a str,
     pub wasm_bytes: &'a [u8],
     pub active: bool,
+    /// Hex Ed25519 publisher signature (issue #1838). `None` = unsigned.
+    pub signature: Option<&'a str>,
 }
 
 // ── Durable mutex locks (issue #691) ────────────────────────────────────────

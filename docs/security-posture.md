@@ -650,6 +650,35 @@ and `workflow.erase_payloads`. A legal hold exempts a single execution's history
 from the retention janitor and from PII erasure until released — see
 [`docs/archival.md`](archival.md) for the retention/erasure lifecycle.
 
+### Tamper-evident audit rows (issue #1838)
+
+Audit export ships each row off-box. The optional audit hash chain also makes
+the rows in the database tamper-evident. Set
+`HarvestBuilder::audit_export_chain_key` with a key kept outside the database.
+`audit_chain::verify_shard_chain` then reports changed, missing and unlinked
+rows. See [The audit hash chain](audit-export.md#the-audit-hash-chain) and
+[ADR 0004](adr/0004-security-extras.md).
+
+---
+
+## Signed WASM modules (issue #1838)
+
+No HTTP route publishes a WASM module. A future route under `/modules` or
+`/admin/modules` needs the `admin` scope. As defence in depth, a worker can
+also require a publisher signature on every module:
+
+- Sign offline with `wasm_signing::sign_wasm_module` and a key that workers
+  never hold.
+- Give workers the public key with
+  `HarvestBuilder::wasm_trusted_publisher_key`.
+- Publish with `wasm_store::publish_signed_wasm_module`, or attach the
+  signature to a registration with `WasmActivityRegistration::with_signature`.
+
+The worker checks the signature before each run. A module written by direct
+SQL, or published without a signature, fails with the non-retryable
+`WasmModuleInvalid` error. Remove a key from the trusted set to revoke every
+module it signed. See [ADR 0004](adr/0004-security-extras.md).
+
 ---
 
 ## Payload encryption at rest (issue #1825)

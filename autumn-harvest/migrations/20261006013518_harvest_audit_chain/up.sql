@@ -1,0 +1,34 @@
+-- Keyed hash chain over exported audit rows (issue #1838).
+--
+-- The audit exporter stamps both row columns when it assigns `export_seq`,
+-- but only when a chain key is set. A NULL pair means the chain does not
+-- cover the row. `chain_prev` is the link of the previous `export_seq`, or 32
+-- zero bytes for the first chained row. `chain_hash` is
+-- HMAC-SHA256(key, domain || chain_prev || canonical row).
+--
+-- `chain_head` on the cursor is the newest link. The next stamp continues
+-- from it, and the verifier compares it with the newest row.
+--
+-- Audit metadata only: no `WorkflowEvent` variant, no change to
+-- `harvest_events`, no replay impact.
+--
+-- Nullable columns with no default need no table rewrite. ADD COLUMN takes an
+-- ACCESS EXCLUSIVE lock for a moment. A held lock fails the migration after
+-- 5 s, so audited requests do not queue behind it.
+SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE harvest_audit_log
+    ADD COLUMN IF NOT EXISTS chain_prev BYTEA,
+    ADD COLUMN IF NOT EXISTS chain_hash BYTEA;
+
+ALTER TABLE harvest_audit_export_cursor
+    ADD COLUMN IF NOT EXISTS chain_head BYTEA;
+
+COMMENT ON COLUMN harvest_audit_log.chain_hash IS
+    'Audit-chain link of this row (issue #1838). NULL when the chain does not '
+    'cover the row.';
+COMMENT ON COLUMN harvest_audit_log.chain_prev IS
+    'Audit-chain link of the previous export_seq (issue #1838). 32 zero bytes '
+    'for the first chained row.';
+COMMENT ON COLUMN harvest_audit_export_cursor.chain_head IS
+    'Newest audit-chain link on this shard (issue #1838).';

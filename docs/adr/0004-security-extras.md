@@ -1,0 +1,141 @@
+# ADR 0004 — Security extras: audit chain, signed WASM modules, OTel semconv
+
+**Status**: Accepted
+**Date**: 2026-10-06
+**Issue**: [#1838](https://github.com/autumn-foundation/autumn-harvest/issues/1838)
+(parent [#1786](https://github.com/autumn-foundation/autumn-harvest/issues/1786))
+
+---
+
+## Context
+
+The September 2026 gap analysis found three P3 gaps:
+
+1. The audit log goes to a SIEM, but the database copy is not tamper-evident.
+2. WASM modules have a content hash, but no publisher signature.
+3. Metrics do not follow the OTel semantic conventions, and Harvest has no
+   native OTLP export.
+
+The issue asks for each item to be implemented with tests, or declined here.
+This ADR records the decision for each item. It also records the parts of
+each item that are declined.
+
+---
+
+## 1. Tamper-evident audit log
+
+**Decision: implemented.** An optional keyed hash chain covers the audit rows
+that the exporter sequences.
+
+- The exporter already gives each row a dense per-shard `export_seq` under the
+  cursor row lock. The chain is stamped at that same point. The audit insert
+  path gets no new lock and no new work.
+- Each link is `HMAC-SHA256(key, domain || chain_prev || canonical row)`. The
+  key lives outside the database, so a database writer cannot forge a link.
+- Each row stores `chain_prev` and `chain_hash`. The cursor stores
+  `chain_head`. A row stays verifiable after retention deletes its
+  predecessor.
+- `audit_chain::verify_shard_chain` reports four problems apart: a changed
+  row, a broken link, a missing sequence number, and a missing newest row.
+- Exported records carry `chain_hash`. A SIEM that holds the key can verify
+  the chain on its side. A deployment without a key ships the same bytes as
+  before.
+- Turn it on with `HarvestBuilder::audit_export_chain_key`. The key must be at
+  least 32 bytes.
+
+**Limits.**
+
+- The chain needs audit export. A row is unchained from its insert until the
+  next export tick. The SIEM copy covers that window.
+- A process that holds the key can forge links. The chain protects against
+  database-level tampering, not a compromised Harvest process.
+- Retention near its cutoff can leave a sequence gap. Compare a gap with the
+  SIEM copy before you treat it as tampering.
+
+**Declined:**
+
+- *A chain at insert time.* It needs one lock per shard on every audited
+  request. The export-time chain gives the same evidence at no insert cost.
+- *A database trigger that computes the chain.* It needs `pgcrypto` and the
+  same per-shard lock. It also puts the key in the database.
+- *Signed export batches.* Batches already carry an HMAC signature (issue
+  #605). The chain adds what batch signatures lack: evidence inside the
+  database.
+- *An append-only trigger on `harvest_audit_log`.* Retention and export
+  writes need exceptions. The chain detects the same edits. It can follow
+  later, as issue #1817 did for `harvest_events`.
+
+## 2. Signed WASM modules
+
+**Decision: implemented.** An optional Ed25519 trust policy covers WASM
+activity modules.
+
+- A publisher signs `domain || name || hash` offline with
+  `wasm_signing::sign_wasm_module`. The name is in the message, so a
+  signature cannot move to another activity.
+- Workers hold only public keys, set with
+  `HarvestBuilder::wasm_trusted_publisher_key`. A stolen worker config or
+  database credential cannot sign a module.
+- `wasm_store::publish_signed_wasm_module` checks the signature before it
+  writes. The worker checks it again before each run, cache hit or not. So a
+  module written by direct SQL, or by the unsigned publish call, does not run.
+- With a trusted key set, `try_build` refuses a registered module that has no
+  valid signature.
+- Without a trusted key, behavior is unchanged.
+
+**Context correction.** No HTTP route publishes a WASM module today. Publish
+is a library call. A future route under `/modules` or `/admin/modules` needs
+the `admin` token scope (`ADMIN_SCOPE_PREFIXES`). So a stolen `mutate` token
+cannot publish code. The signature is defence in depth.
+
+**Declined:**
+
+- *Sigstore or cosign.* Keyless signing needs a network trust root and an
+  OIDC identity at publish time. That is a large new dependency for an opt-in
+  R&D feature. Ed25519 keys cover the threat with one crate that the lockfile
+  already holds.
+- *HMAC, as hot-swap modules use.* A symmetric key on every worker can also
+  sign. A worker compromise would then defeat the control.
+- *A hash allow-list.* Every new module version would need a config change
+  on every worker.
+
+## 3. OTel semantic conventions
+
+**Decision: implemented** as a Collector mapping. Native OTLP export is
+declined.
+
+- `telemetry::SEMCONV_METRIC_MAPPINGS` maps `harvest.*` metrics to the OTel
+  messaging conventions where the meaning matches:
+  `harvest.queue.dispatched` to `messaging.client.consumed.messages`, and
+  `harvest.activity.duration` to `messaging.process.duration`.
+- [`docs/operations/otel-collector.md`](../operations/otel-collector.md)
+  publishes the Collector recipe. It scrapes the Prometheus endpoint and
+  copies each mapped series under its semconv name. A test renders the recipe
+  from the table, so the two cannot drift.
+- Harvest keeps its own metric names. Dashboards, alerts and SLO rules do not
+  change.
+
+**Declined:**
+
+- *Native OTLP export.* The workspace has no `opentelemetry` crate. The
+  `metrics-rs` adapter already feeds any `metrics` exporter, and the Collector
+  speaks OTLP to every backend. A native exporter would add a large dependency
+  tree for no new capability.
+- *Renaming metrics in the emitter.* It breaks every existing dashboard and
+  alert. Emitting both names doubles the series count.
+- *RPC conventions.* Harvest emits no RPC or HTTP server metric. Autumn-web
+  owns the HTTP metrics.
+- *Other messaging mappings.* Connector metrics do not know the broker, so
+  `messaging.system` would be wrong. Queue depth and schedule-to-start have no
+  semconv equivalent. They keep their Harvest names.
+
+---
+
+## Consequences
+
+- Two migrations add nullable columns: the audit chain columns and the WASM
+  module `signature`. Neither needs a table rewrite.
+- No `WorkflowEvent` variant and no change to `harvest_events`. Replay is not
+  affected.
+- All three features are opt-in. A deployment that sets nothing sees no
+  change in behavior or wire bytes.

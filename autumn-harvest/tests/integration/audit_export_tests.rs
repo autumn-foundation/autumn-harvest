@@ -264,6 +264,7 @@ fn install_with_lease(
         batch_size,
         backoff: ExportBackoff::default(),
         lease,
+        chain_key: None,
     }));
     sink
 }
@@ -370,6 +371,7 @@ impl Drop for DisableMarkGuard {
                 batch_size: 10,
                 backoff: ExportBackoff::default(),
                 lease: std::time::Duration::from_secs(60),
+                chain_key: None,
             },
         )));
         uninstall();
@@ -391,6 +393,7 @@ async fn disabling_a_live_export_marks_the_default_shard_unobserved() {
             batch_size: 10,
             backoff: ExportBackoff::default(),
             lease: std::time::Duration::from_secs(60),
+            chain_key: None,
         },
     )));
     autumn_harvest::audit_export::set_global_audit_export_config(None);
@@ -407,6 +410,45 @@ async fn disabling_a_live_export_marks_the_default_shard_unobserved() {
         metrics.lag.lock().expect("lag").is_empty(),
         "the lag gauge stays untouched"
     );
+}
+
+// ── Issue #1838: the scanner stamps the chain with the configured key ────────
+
+#[tokio::test]
+async fn the_scanner_stamps_the_audit_chain_with_the_configured_key() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _url, _c) = make_conn_any().await;
+    let key = CallbackSecret::new(vec![3_u8; autumn_harvest::audit_chain::MIN_CHAIN_KEY_BYTES]);
+    let sink = Arc::new(RecordingSink::new(200));
+    autumn_harvest::audit_export::set_global_audit_export_config(Some(Arc::new(
+        AuditExportRuntimeConfig {
+            sink: sink.clone(),
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(60),
+            chain_key: Some(key.clone()),
+        },
+    )));
+    insert_audit_rows(&mut conn, 3).await;
+
+    let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics).await;
+    uninstall();
+    assert_eq!(processed.expect("scanner runs"), 3);
+
+    let bodies: Vec<String> = sink
+        .captured()
+        .into_iter()
+        .map(|batch| String::from_utf8(batch.body).expect("utf8"))
+        .collect();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0].matches("\"chain_hash\":\"").count(), 3);
+
+    let report = autumn_harvest::audit_chain::verify_shard_chain(&mut conn, 0, &key)
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.checked, 3);
 }
 
 // ── AC4: dense, strictly monotonic per-shard sequences ───────────────────────
@@ -4826,6 +4868,7 @@ async fn an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_o
             batch_size: 100,
             backoff: ExportBackoff::default(),
             lease: std::time::Duration::from_secs(300),
+            chain_key: None,
         }));
     }
     let (mut conn, container) = make_conn().await;
@@ -4923,6 +4966,7 @@ async fn graceful_shutdown_does_not_wait_for_an_in_flight_delivery() {
             batch_size: 100,
             backoff: ExportBackoff::default(),
             lease: std::time::Duration::from_secs(300),
+            chain_key: None,
         }));
     }
     let (mut conn, container) = make_conn().await;
@@ -4998,6 +5042,7 @@ async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
             batch_size: 100,
             backoff: ExportBackoff::default(),
             lease,
+            chain_key: None,
         }));
     }
     let (mut conn, container) = make_conn().await;

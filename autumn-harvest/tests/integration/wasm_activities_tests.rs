@@ -35,11 +35,12 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::wasm_activities::{
     WasmCapabilities, WasmLimits, WasmModuleStore, invoke_wasm_activity,
 };
+use autumn_harvest::wasm_signing::{WasmTrustPolicy, sign_wasm_module};
 use autumn_harvest::wasm_store::{
     MAX_WASM_MODULE_BYTES, WasmActivityRegistration, WasmBinding, WasmDispatch,
-    fetch_wasm_module_bytes, list_wasm_modules, publish_wasm_module, resolve_active_wasm_hash,
-    resolve_active_wasm_module, resolve_wasm_dispatch, seed_registered_wasm_modules,
-    seed_wasm_module,
+    fetch_wasm_module_bytes, list_wasm_modules, publish_signed_wasm_module, publish_wasm_module,
+    resolve_active_wasm_hash, resolve_active_wasm_module, resolve_wasm_dispatch,
+    seed_registered_wasm_modules, seed_wasm_module,
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
@@ -351,8 +352,8 @@ async fn seed_registered_modules_are_resolvable() {
     scrub(&mut conn).await;
 
     let regs = vec![
-        ("echo".to_string(), echo_bytes()),
-        ("beta".to_string(), echo_bytes_v2()),
+        ("echo".to_string(), echo_bytes(), None),
+        ("beta".to_string(), echo_bytes_v2(), None),
     ];
     seed_registered_wasm_modules(&mut conn, &regs)
         .await
@@ -407,7 +408,7 @@ async fn seed_registered_batch_helper_does_not_clobber_an_active_version() {
 
     // Old worker restarts; its builder-registered v1 flows through the batch
     // startup helper.
-    let regs = vec![("echo".to_string(), v1.clone())];
+    let regs = vec![("echo".to_string(), v1.clone(), None)];
     seed_registered_wasm_modules(&mut conn, &regs)
         .await
         .expect("batch seed v1");
@@ -698,10 +699,10 @@ async fn duplicate_registration_seeds_the_later_bytes() {
         .build();
 
     // Exactly one registration entry survives, carrying the later bytes.
-    let regs: Vec<&(String, Vec<u8>)> = built
+    let regs: Vec<&(String, Vec<u8>, Option<String>)> = built
         .wasm_module_registrations()
         .iter()
-        .filter(|(n, _)| n == "echo")
+        .filter(|(n, _, _)| n == "echo")
         .collect();
     assert_eq!(regs.len(), 1, "duplicate name must not keep both blobs");
     assert_eq!(regs[0].1, echo_bytes_v2(), "must retain the later bytes");
@@ -882,7 +883,7 @@ fn build_wasm_registry(
                 limits: spec.limits,
             },
         );
-        registrations.push((spec.name.to_string(), spec.bytes));
+        registrations.push((spec.name.to_string(), spec.bytes, None));
     }
     let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
     let store = Arc::new(WasmModuleStore::new());
@@ -1723,7 +1724,7 @@ fn build_mixed_registry(
                 limits: spec.limits,
             },
         );
-        registrations.push((spec.name.to_string(), spec.bytes));
+        registrations.push((spec.name.to_string(), spec.bytes, None));
     }
     let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
     let store = Arc::new(WasmModuleStore::new());
@@ -2096,4 +2097,211 @@ fn dispatch_overhead_wasm_echo_vs_native() {
          p99={d99:?} (wasm p99={w99:?}, native p99={n99:?}). The dominant cost is per-invocation \
          instantiation; the mitigation on file is instance pooling."
     );
+}
+
+// ── publisher signatures (issue #1838) ──────────────────────────────────────
+
+fn publisher() -> autumn_harvest::wasm_signing::SigningKey {
+    autumn_harvest::wasm_signing::SigningKey::from_bytes(&[5; 32])
+}
+
+fn trust_policy() -> WasmTrustPolicy {
+    WasmTrustPolicy::from_public_keys(&[publisher().verifying_key().to_bytes()]).expect("valid key")
+}
+
+fn trusting_store() -> Arc<WasmModuleStore> {
+    let store = Arc::new(WasmModuleStore::new());
+    store.set_trust_policy(Some(trust_policy()));
+    store
+}
+
+async fn dispatch_echo(conn: &mut AsyncPgConnection, store: &Arc<WasmModuleStore>) -> WasmDispatch {
+    let binding = WasmBinding {
+        capabilities: WasmCapabilities::default(),
+        limits: WasmLimits::default(),
+    };
+    resolve_wasm_dispatch(
+        conn,
+        store,
+        &binding,
+        "echo",
+        Some(Duration::from_secs(5)),
+        None,
+        std::time::Instant::now(),
+    )
+    .await
+}
+
+fn assert_refused(dispatch: WasmDispatch) {
+    match dispatch {
+        WasmDispatch::Fail(payload) => assert!(
+            payload.contains(ERROR_TYPE_WASM_MODULE_INVALID) && payload.contains("signature"),
+            "expected a non-retryable signature refusal, got: {payload}"
+        ),
+        WasmDispatch::Invoke(_) => panic!("an untrusted module must not run"),
+    }
+}
+
+async fn stored_signature(conn: &mut AsyncPgConnection, name: &str) -> Option<String> {
+    use autumn_harvest::schema::harvest_wasm_modules::dsl as m;
+    m::harvest_wasm_modules
+        .filter(m::activity_name.eq(name))
+        .filter(m::active.eq(true))
+        .select(m::signature)
+        .first::<Option<String>>(conn)
+        .await
+        .expect("active row")
+}
+
+#[tokio::test]
+async fn a_signed_publish_stores_the_signature_and_runs() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let signature = sign_wasm_module(&publisher(), "echo", &echo_bytes());
+    let policy = trust_policy();
+    publish_signed_wasm_module(
+        &mut conn,
+        "echo",
+        &echo_bytes(),
+        Some(&signature),
+        Some(&policy),
+    )
+    .await
+    .expect("signed publish");
+    assert_eq!(stored_signature(&mut conn, "echo").await, Some(signature));
+
+    let store = trusting_store();
+    match dispatch_echo(&mut conn, &store).await {
+        WasmDispatch::Invoke(prepared) => {
+            let input = serde_json::json!({"signed": true});
+            assert_eq!(prepared.invoke(&input).expect("runs"), input);
+        }
+        WasmDispatch::Fail(payload) => panic!("a signed module must run, got: {payload}"),
+    }
+}
+
+#[tokio::test]
+async fn a_signed_publish_refuses_a_bad_signature_before_any_write() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let wrong = sign_wasm_module(&publisher(), "other", &echo_bytes());
+    let policy = trust_policy();
+    for signature in [None, Some(wrong.as_str())] {
+        let result =
+            publish_signed_wasm_module(&mut conn, "echo", &echo_bytes(), signature, Some(&policy))
+                .await;
+        assert!(result.is_err(), "{signature:?} must be refused");
+    }
+    assert_eq!(list_wasm_modules(&mut conn).await.expect("list").len(), 0);
+}
+
+#[tokio::test]
+async fn dispatch_refuses_an_unsigned_module_under_a_trust_policy() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    // A plain publish, or a direct SQL write, stores no signature.
+    publish_wasm_module(&mut conn, "echo", &echo_bytes())
+        .await
+        .expect("publish");
+    assert_refused(dispatch_echo(&mut conn, &trusting_store()).await);
+}
+
+#[tokio::test]
+async fn dispatch_refuses_a_signature_made_for_another_activity() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    publish_wasm_module(&mut conn, "echo", &echo_bytes())
+        .await
+        .expect("publish");
+    let moved = sign_wasm_module(&publisher(), "other", &echo_bytes());
+    diesel::sql_query(
+        "UPDATE harvest_wasm_modules SET signature = $1 WHERE activity_name = 'echo'",
+    )
+    .bind::<diesel::sql_types::Text, _>(&moved)
+    .execute(&mut conn)
+    .await
+    .expect("plant a signature");
+    assert_refused(dispatch_echo(&mut conn, &trusting_store()).await);
+}
+
+#[tokio::test]
+async fn dispatch_refuses_a_cached_module_once_its_signature_is_gone() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let signature = sign_wasm_module(&publisher(), "echo", &echo_bytes());
+    publish_signed_wasm_module(&mut conn, "echo", &echo_bytes(), Some(&signature), None)
+        .await
+        .expect("publish");
+    let store = trusting_store();
+    match dispatch_echo(&mut conn, &store).await {
+        WasmDispatch::Invoke(prepared) => {
+            prepared.invoke(&serde_json::json!(1)).expect("runs");
+        }
+        WasmDispatch::Fail(payload) => panic!("expected invoke, got: {payload}"),
+    }
+    // The compiled module is now cached. The check must still run.
+    diesel::sql_query("UPDATE harvest_wasm_modules SET signature = NULL")
+        .execute(&mut conn)
+        .await
+        .expect("strip");
+    assert_refused(dispatch_echo(&mut conn, &store).await);
+}
+
+#[tokio::test]
+async fn a_seeded_registration_keeps_its_signature() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let signature = sign_wasm_module(&publisher(), "echo", &echo_bytes());
+    let regs = vec![("echo".to_string(), echo_bytes(), Some(signature.clone()))];
+    seed_registered_wasm_modules(&mut conn, &regs)
+        .await
+        .expect("seed");
+    assert_eq!(stored_signature(&mut conn, "echo").await, Some(signature));
+    assert!(matches!(
+        dispatch_echo(&mut conn, &trusting_store()).await,
+        WasmDispatch::Invoke(_)
+    ));
+}
+
+#[tokio::test]
+async fn an_unsigned_republish_keeps_the_stored_signature() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let signature = sign_wasm_module(&publisher(), "echo", &echo_bytes());
+    publish_signed_wasm_module(&mut conn, "echo", &echo_bytes(), Some(&signature), None)
+        .await
+        .expect("signed publish");
+    publish_wasm_module(&mut conn, "echo", &echo_bytes())
+        .await
+        .expect("identical republish");
+    assert_eq!(stored_signature(&mut conn, "echo").await, Some(signature));
+}
+
+#[tokio::test]
+async fn without_a_trust_policy_an_unsigned_module_still_runs() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    publish_wasm_module(&mut conn, "echo", &echo_bytes())
+        .await
+        .expect("publish");
+    assert!(matches!(
+        dispatch_echo(&mut conn, &Arc::new(WasmModuleStore::new())).await,
+        WasmDispatch::Invoke(_)
+    ));
 }

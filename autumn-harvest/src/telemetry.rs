@@ -1931,6 +1931,65 @@ pub const METRIC_LABEL_ROLE: &str = "role";
 ///
 /// Bounded: `claim` or `heartbeat_flush`.
 pub const METRIC_LABEL_SITE: &str = "site";
+
+/// The `messaging.system` value for Harvest's own task queues (issue #1838).
+pub const SEMCONV_MESSAGING_SYSTEM: &str = "harvest";
+
+/// The kind of instrument a [`SemconvMapping`] copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemconvInstrument {
+    /// A monotonic counter. Prometheus exposes it with a `_total` suffix.
+    Counter,
+    /// A histogram in seconds.
+    Histogram,
+}
+
+/// One `harvest.*` metric that has an OpenTelemetry messaging semantic
+/// convention equivalent (issue #1838).
+///
+/// Harvest keeps its own names. The OpenTelemetry Collector recipe in
+/// `docs/operations/otel-collector.md` copies each mapped series under the
+/// semconv name. A test renders that recipe from this table, so the two
+/// cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemconvMapping {
+    /// The Harvest metric name.
+    pub source: &'static str,
+    /// The instrument kind of the source.
+    pub instrument: SemconvInstrument,
+    /// The semantic convention metric name.
+    pub target: &'static str,
+    /// The `messaging.operation.name` value.
+    pub operation_name: &'static str,
+    /// The `messaging.operation.type` value.
+    pub operation_type: &'static str,
+    /// The Harvest label that becomes `messaging.destination.name`.
+    pub destination_label: &'static str,
+}
+
+/// Every `harvest.*` metric with a messaging semconv equivalent (issue #1838).
+///
+/// See ADR 0004 for the metrics that stay unmapped, and why.
+pub const SEMCONV_METRIC_MAPPINGS: &[SemconvMapping] = &[
+    // A worker claims a task from a queue: one consumed message.
+    SemconvMapping {
+        source: METRIC_QUEUE_DISPATCHED,
+        instrument: SemconvInstrument::Counter,
+        target: "messaging.client.consumed.messages",
+        operation_name: "claim",
+        operation_type: "receive",
+        destination_label: METRIC_LABEL_QUEUE,
+    },
+    // An activity attempt runs a claimed task: the processing duration.
+    SemconvMapping {
+        source: METRIC_ACTIVITY_DURATION,
+        instrument: SemconvInstrument::Histogram,
+        target: "messaging.process.duration",
+        operation_name: "process",
+        operation_type: "process",
+        destination_label: METRIC_LABEL_QUEUE,
+    },
+];
 /// `shard` label value for a control loop that is **not** per-shard (issue #797).
 ///
 /// The `retention` and `schedule` loops run once per process rather than once

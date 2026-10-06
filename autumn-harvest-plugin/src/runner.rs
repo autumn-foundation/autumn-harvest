@@ -691,6 +691,7 @@ fn prepare_audit_export_config(
             batch_size: audit_config.effective_batch_size(),
             backoff: audit_config.backoff.clone(),
             lease: audit_config.effective_lease(),
+            chain_key: audit_config.chain_key.clone(),
         })
     })
 }
@@ -2369,6 +2370,7 @@ mod tests {
                 batch_size,
                 backoff: autumn_harvest::audit_export::ExportBackoff::default(),
                 lease: std::time::Duration::from_secs(30),
+                chain_key: None,
             })
         }
 
