@@ -7,7 +7,7 @@
 //! - A SHA pin on every `uses:`. `docs/audits/action-sha-pin.py` checks each
 //!   line in the `lint` job. This file checks that the job runs it.
 //! - A Dependabot file for `cargo` and `github-actions`.
-//! - A release that builds auditable binaries, a CycloneDX SBOM, a Sigstore
+//! - A release that builds auditable binaries, a `CycloneDX` SBOM, a Sigstore
 //!   signature and GitHub artifact attestations.
 //!
 //! The scan behaviour tests run `.github/ci/advisory-scan.sh` with a stub
@@ -819,7 +819,7 @@ fn release_runs_on_tags_and_as_a_dry_run() {
 
 /// The build runs third-party `build.rs` code, so it must not hold a token
 /// that can sign or attest. It builds with `cargo auditable` and writes a
-/// CycloneDX SBOM for the same package and target.
+/// `CycloneDX` SBOM for the same package and target.
 #[test]
 fn release_builds_auditable_binaries_and_an_sbom() {
     let doc = parse_workflow(RELEASE_WORKFLOW);
@@ -1072,7 +1072,7 @@ fn release_signs_and_attests_the_client_tarball() {
     );
 }
 
-/// `actions/attest` accepts a CycloneDX SBOM only with `bomFormat`,
+/// `actions/attest` accepts a `CycloneDX` SBOM only with `bomFormat`,
 /// `specVersion` and `serialNumber`. A dry run writes no attestation, so each
 /// sign job checks the same rule first. The first dry run found this:
 /// `SOURCE_DATE_EPOCH` makes `cargo cyclonedx` omit `serialNumber`.
