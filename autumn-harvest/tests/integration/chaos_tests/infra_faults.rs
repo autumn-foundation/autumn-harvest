@@ -65,9 +65,10 @@ const FAST: Tuning = Tuning {
 /// The tuning of the latency test.
 ///
 /// The test uses [`HEARTBEAT`]. At this latency a heartbeat tick can take
-/// longer than one interval, so it is a regression test for #1879. A
-/// decision cycle also takes more than 10 s at this latency. So the test
-/// keeps the default 60 s cap, which gives a 60 s budget.
+/// longer than one interval. A false requeue can then occur, but the held
+/// last strike stops a false quarantine (#1879). The test is a smoke test for
+/// that fix. A decision cycle also takes more than 10 s at this latency. So
+/// the test keeps the default 60 s cap, which gives a 60 s budget.
 const SLOW_NETWORK: Tuning = Tuning {
     heartbeat: HEARTBEAT,
     local_activity_cap: Duration::from_secs(60),

@@ -350,7 +350,7 @@ event, an `ActivityCompleted`.
   tick took longer than one interval, a live worker looked dead. False
   reclaims then counted crash strikes and quarantined healthy work. The fix
   makes the heartbeat fixed-rate. The reclaimer also holds the last strike
-  until it saw the orphan for one more stale window.
+  until it confirms the death of the worker.
 
 Each test works around a bug only where the bug applies:
 
