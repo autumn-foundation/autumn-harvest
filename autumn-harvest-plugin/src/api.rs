@@ -5704,11 +5704,28 @@ async fn admit_mutation(
     }
     // Held until the handler returns, so a bump cannot commit while the
     // handler writes. See `FencePassGuard`.
-    let _fence = match enforce_dr_fence(api_state).await {
+    let fence = match enforce_dr_fence(api_state).await {
         Ok(guards) => guards,
         Err(refusal) => return refusal.into_response(),
     };
-    next.run(request).await
+    run_dr_fenced(&fence, next.run(request)).await
+}
+
+/// Run a handler under its DR fence guards (issue #1823).
+///
+/// A lost guard session frees the pass lock, so a bump can commit. The
+/// handler then stops and the caller gets a `503`. The pool discards a
+/// connection that the handler left in a transaction, so the server rolls
+/// the transaction back.
+pub(crate) async fn run_dr_fenced(
+    fence: &[autumn_harvest::replication::FencePassGuard],
+    handler: impl std::future::Future<Output = axum::response::Response>,
+) -> axum::response::Response {
+    autumn_harvest::replication::run_fenced_pass(fence, handler)
+        .await
+        .unwrap_or_else(|lost| {
+            AutumnError::service_unavailable_msg(lost.to_string()).into_response()
+        })
 }
 
 /// Refuse an admin write when this process lost write authority (issue #1823).

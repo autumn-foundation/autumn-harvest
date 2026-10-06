@@ -1150,7 +1150,7 @@ impl HarvestRunner {
             } else {
                 shard_id
             };
-            let _fence = autumn_harvest::replication::begin_fenced_pass(shard_pool, fence_key)
+            let fence = autumn_harvest::replication::begin_fenced_pass(shard_pool, fence_key)
                 .await
                 .map_err(|error| {
                     AutumnError::service_unavailable_msg(format!(
@@ -1162,11 +1162,16 @@ impl HarvestRunner {
                     "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
                 ))
             })?;
-            autumn_harvest::completion_trigger::sync_completion_triggers(
-                &mut conn,
-                &completion_triggers,
+            // A lost fence session stops the sync. See `run_fenced_pass`.
+            autumn_harvest::replication::run_fenced_pass(
+                fence.as_ref(),
+                autumn_harvest::completion_trigger::sync_completion_triggers(
+                    &mut conn,
+                    &completion_triggers,
+                ),
             )
             .await
+            .and_then(|done| done)
             .map_err(|e| {
                 AutumnError::service_unavailable_msg(format!(
                     "Failed to sync completion triggers on startup for shard {shard_id}: {e:?}"

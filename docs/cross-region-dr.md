@@ -359,8 +359,9 @@ Three limits, stated plainly:
   write, scheduler pass and partition pass pays that cost. The barrier pings
   that connection each second. If the session ends, the server frees the
   lock. The pass then stops: a scheduler pass before it fires, a partition
-  pass or a rebalance at once, with an error. A write already in flight can
-  still race a bump for up to one second.
+  pass or a rebalance at once, with an error. An admin write or a webhook
+  answers `503`. A write already in flight can still race a bump for up to
+  one second.
 - The check reads every pinned shard on each admin write. If one shard
   cannot be read, every admin write on the node answers `503`. That fails
   closed. A node that has lost authority on one shard has lost it on the

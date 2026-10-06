@@ -448,7 +448,7 @@ async fn handle_webhook(
     // here (issue #1823). The refusal is a `503`. A `5xx` releases the replay
     // key, so the provider retries later against a node with authority.
     // The guards are held until this handler returns.
-    let _fence = match crate::api::enforce_dr_fence(&api_state).await {
+    let fence = match crate::api::enforce_dr_fence(&api_state).await {
         Ok(guards) => guards,
         Err(refusal) => return refusal.into_response(),
     };
@@ -526,17 +526,21 @@ async fn handle_webhook(
             // header-name constant the handler reads so the two can't drift.
             let mut start_headers = headers.clone();
             start_headers.remove(HEADER_IDEMPOTENCY_KEY);
-            Box::pin(crate::api::start_workflow(
-                Extension(api_state.clone()),
-                axum::extract::Path(workflow.to_string()),
-                None,
-                start_headers,
-                Ok(Json(StartWorkflowRequest::from_webhook(
-                    workflow_id.as_str().to_string(),
-                    payload,
-                    queue.map(str::to_string),
-                ))),
-            ))
+            // A lost fence session stops the dispatch with a `503`.
+            crate::api::run_dr_fenced(
+                &fence,
+                Box::pin(crate::api::start_workflow(
+                    Extension(api_state.clone()),
+                    axum::extract::Path(workflow.to_string()),
+                    None,
+                    start_headers,
+                    Ok(Json(StartWorkflowRequest::from_webhook(
+                        workflow_id.as_str().to_string(),
+                        payload,
+                        queue.map(str::to_string),
+                    ))),
+                )),
+            )
             .await
         }
         WebhookTarget::SignalsWithStart {
@@ -572,19 +576,23 @@ async fn handle_webhook(
                 .delivery_id
                 .as_deref()
                 .map(|delivery_id| format!("{path}:{signal_name}:{delivery_id}"));
-            Box::pin(crate::api::signal_with_start_workflow(
-                Extension(api_state.clone()),
-                axum::extract::Path(workflow.to_string()),
-                None,
-                headers.clone(),
-                Json(SignalWithStartRequest::from_webhook(
-                    workflow_id.as_str().to_string(),
-                    payload,
-                    signal_name.to_string(),
-                    namespaced_idempotency_key,
-                    queue.map(str::to_string),
+            // A lost fence session stops the dispatch with a `503`.
+            crate::api::run_dr_fenced(
+                &fence,
+                Box::pin(crate::api::signal_with_start_workflow(
+                    Extension(api_state.clone()),
+                    axum::extract::Path(workflow.to_string()),
+                    None,
+                    headers.clone(),
+                    Json(SignalWithStartRequest::from_webhook(
+                        workflow_id.as_str().to_string(),
+                        payload,
+                        signal_name.to_string(),
+                        namespaced_idempotency_key,
+                        queue.map(str::to_string),
+                    )),
                 )),
-            ))
+            )
             .await
         }
     };

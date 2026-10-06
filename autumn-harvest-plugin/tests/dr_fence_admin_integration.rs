@@ -214,6 +214,72 @@ async fn an_admin_maintenance_write_against_a_fenced_shard_is_rejected() {
     assert_eq!(read_status, StatusCode::OK, "read routes still answer");
 }
 
+/// A lost fence session stops an admin write in flight (issue #1823). The
+/// server then frees the pass lock, so the handler must not write after it.
+#[tokio::test]
+async fn an_admin_write_stops_when_its_fence_session_is_lost() {
+    let _serial = REGISTRY_SERIAL.lock().await;
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .expect("provision generation 0");
+    }
+    FenceRegistry::clear();
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::INITIAL)],
+        ShardId::new(0),
+    )
+    .expect("no conflicting pin in this test");
+
+    // The handler waits for a pool connection, as a slow write would.
+    let mut busy = Vec::new();
+    for _ in 0..4 {
+        busy.push(pool.get().await.expect("conn"));
+    }
+    let request_app = app.clone();
+    let request = tokio::spawn(async move {
+        send(
+            &request_app,
+            "POST",
+            "/admin/queues/lost-guard/pause",
+            json!({"reason": "drill"}),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    {
+        let mut admin = AsyncPgConnection::establish(&url).await.expect("connect");
+        diesel::sql_query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND application_name = 'harvest_dr_fence_pass'",
+        )
+        .execute(&mut admin)
+        .await
+        .expect("terminate the guard backend");
+    }
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), request).await;
+    // A handler that kept running would write now.
+    drop(busy);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let written = paused_queue_count(&pool, "lost-guard").await;
+    FenceRegistry::clear();
+
+    let Ok(Ok((status, body))) = stopped else {
+        panic!("an admin write must stop when its fence session is lost");
+    };
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.to_string().contains("fence"),
+        "the refusal names the fence: {body}"
+    );
+    assert_eq!(written, 0, "a stopped admin write must write nothing");
+}
+
 /// A process that pinned nothing is not fenced. The check costs nothing there.
 #[tokio::test]
 async fn an_unpinned_process_admits_admin_writes() {
