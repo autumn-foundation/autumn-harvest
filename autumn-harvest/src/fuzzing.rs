@@ -287,11 +287,14 @@ pub enum Op {
         /// True for the collect-all form, which goes on past a failed item.
         collect: bool,
     },
-    /// `ctx.spawn_child_workflow_fan_out_raw` over `(name, input)` items.
+    /// `ctx.spawn_child_workflow_fan_out_raw` over `(name, input)` items, or
+    /// the `_collect_raw` form when `collect` is set.
     ChildFanOut {
         /// The children of the group.
         #[arbitrary(with = child_fan_out_items)]
         children: Vec<(String, Value)>,
+        /// True for the collect-all form, which waits past a failed child.
+        collect: bool,
     },
     /// `ctx.patched`.
     Patched {
@@ -929,7 +932,7 @@ fn mirror_fan_out(
         let collect = if window.is_some() {
             collect
         } else {
-            settles_after_failure(&history[start..], &activity_ids)
+            settles_after_failure(&history[start..], &activity_ids, activity_outcome)
         };
         Op::FanOut {
             activities,
@@ -938,7 +941,8 @@ fn mirror_fan_out(
         }
     } else {
         pad_to(&mut children, count);
-        Op::ChildFanOut { children }
+        let collect = settles_after_failure(&history[start..], &child_ids, child_outcome);
+        Op::ChildFanOut { children, collect }
     }
 }
 
@@ -963,26 +967,63 @@ fn next_wave_is_full(rest: &[WorkflowEvent], group: &HashSet<ActivityExecId>, ne
     need > 0 && wave >= need
 }
 
+/// What an event says about one item of a fan-out group.
+enum Outcome {
+    /// The item started or made progress.
+    Progress,
+    /// The item completed.
+    Done,
+    /// The item failed or timed out.
+    Failed,
+}
+
+/// The activity and outcome that an event reports, if it is about one.
+const fn activity_outcome(event: &WorkflowEvent) -> Option<(ActivityExecId, Outcome)> {
+    match event {
+        WorkflowEvent::ActivityScheduled { activity_id, .. }
+        | WorkflowEvent::ActivityStarted { activity_id, .. }
+        | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
+            Some((*activity_id, Outcome::Progress))
+        }
+        WorkflowEvent::ActivityCompleted { activity_id, .. } => Some((*activity_id, Outcome::Done)),
+        WorkflowEvent::ActivityFailed { activity_id, .. }
+        | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+            Some((*activity_id, Outcome::Failed))
+        }
+        _ => None,
+    }
+}
+
+/// The child and outcome that an event reports, if it is about one.
+const fn child_outcome(event: &WorkflowEvent) -> Option<(ExecutionId, Outcome)> {
+    match event {
+        WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
+            Some((*child_id, Outcome::Progress))
+        }
+        WorkflowEvent::ChildWorkflowCompleted { child_id, .. } => Some((*child_id, Outcome::Done)),
+        WorkflowEvent::ChildWorkflowFailed { child_id, .. } => Some((*child_id, Outcome::Failed)),
+        _ => None,
+    }
+}
+
 /// True when an item of an unbounded group failed and every item settled
 /// before the next command. Only the collect-all form waits for every item.
 /// A fail-fast caller goes on at the first failure, while items still run.
-fn settles_after_failure(rest: &[WorkflowEvent], group: &HashSet<ActivityExecId>) -> bool {
+fn settles_after_failure<K: Copy + Eq + std::hash::Hash>(
+    rest: &[WorkflowEvent],
+    group: &HashSet<K>,
+    outcome: fn(&WorkflowEvent) -> Option<(K, Outcome)>,
+) -> bool {
     let mut settled = HashSet::new();
     let mut failed = false;
     for event in rest {
-        match event {
-            WorkflowEvent::ActivityScheduled { activity_id, .. }
-            | WorkflowEvent::ActivityStarted { activity_id, .. }
-            | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
-                if group.contains(activity_id) => {}
-            WorkflowEvent::ActivityCompleted { activity_id, .. } if group.contains(activity_id) => {
-                settled.insert(*activity_id);
+        match outcome(event) {
+            Some((id, Outcome::Progress)) if group.contains(&id) => {}
+            Some((id, Outcome::Done)) if group.contains(&id) => {
+                settled.insert(id);
             }
-            WorkflowEvent::ActivityFailed { activity_id, .. }
-            | WorkflowEvent::ActivityTimedOut { activity_id, .. }
-                if group.contains(activity_id) =>
-            {
-                settled.insert(*activity_id);
+            Some((id, Outcome::Failed)) if group.contains(&id) => {
+                settled.insert(id);
                 failed = true;
             }
             _ => break,
@@ -1552,8 +1593,17 @@ async fn run_group_op(ctx: &WorkflowContext, op: Op) {
                 .execute_activity_fan_out_collect_raw_windowed(activities, window)
                 .await;
         }
-        Op::ChildFanOut { children } => {
+        Op::ChildFanOut {
+            children,
+            collect: false,
+        } => {
             let _ = ctx.spawn_child_workflow_fan_out_raw(children).await;
+        }
+        Op::ChildFanOut {
+            children,
+            collect: true,
+        } => {
+            let _ = ctx.spawn_child_workflow_fan_out_collect_raw(children).await;
         }
         Op::Race { branches } => {
             let mut race = ctx.race();
