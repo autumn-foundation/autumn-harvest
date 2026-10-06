@@ -2986,3 +2986,40 @@ fn recordings_from_two_builds_differing_only_in_boundaries_do_not_diverge() {
     let right = handler_free_trace(&run("build-2", "worker-us-1"));
     assert!(diff_traces(&left, &right).divergence.is_none());
 }
+
+#[test]
+fn a_boundary_on_one_side_only_does_not_diverge() {
+    // A recording from before the upgrade has no boundaries. The same run
+    // after the upgrade has them. That alone is no change in behavior.
+    let before = vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let after = vec![
+        started(),
+        scheduled(ActivityExecId::new(), "step_a"),
+        decision_committed("build-2", "worker-us-1"),
+    ];
+    let diff = diff_traces(&handler_free_trace(&before), &handler_free_trace(&after));
+    assert!(diff.is_clean(), "{diff:?}");
+}
+
+#[test]
+fn a_real_difference_after_a_one_sided_boundary_is_still_found() {
+    let before = vec![
+        started(),
+        scheduled(ActivityExecId::new(), "step_a"),
+        scheduled(ActivityExecId::new(), "step_b"),
+    ];
+    let after = vec![
+        started(),
+        scheduled(ActivityExecId::new(), "step_a"),
+        decision_committed("build-2", "worker-us-1"),
+        scheduled(ActivityExecId::new(), "step_c"),
+    ];
+    let diff = diff_traces(&handler_free_trace(&before), &handler_free_trace(&after));
+    let divergence = diff.divergence.expect("step_b against step_c must diverge");
+    assert_eq!(
+        divergence.step_index, 2,
+        "the compared position skips the boundary"
+    );
+    assert_eq!(divergence.left.expect("left step").index, 2);
+    assert_eq!(divergence.right.expect("right step").index, 3);
+}

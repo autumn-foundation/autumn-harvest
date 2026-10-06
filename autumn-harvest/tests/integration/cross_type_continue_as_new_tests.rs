@@ -821,13 +821,13 @@ async fn a_cap_redirected_transition_still_records_its_abandoned_dispatch() {
     );
     assert!(
         matches!(
-            // A decision boundary (issue #1833) follows the terminal.
-            history
-                .events
-                .iter()
-                .rev()
-                .find(|e| !e.is_decision_boundary()),
-            Some(WorkflowEvent::WorkflowFailed { .. })
+            // The decision boundary (issue #1833) closes the terminal decision.
+            history.events.as_slice(),
+            [
+                ..,
+                WorkflowEvent::WorkflowFailed { .. },
+                WorkflowEvent::DecisionCommitted { .. },
+            ]
         ),
         "the abandoned-dispatch pair must be appended BEFORE the terminal event, not after \
          (issue #1409's event-id ordering guarantee); got {:?}",
@@ -1824,13 +1824,13 @@ async fn a_child_workflow_rejected_continue_as_new_still_records_its_abandoned_d
     );
     assert!(
         matches!(
-            // A decision boundary (issue #1833) follows the terminal.
-            history
-                .events
-                .iter()
-                .rev()
-                .find(|e| !e.is_decision_boundary()),
-            Some(WorkflowEvent::WorkflowFailed { .. })
+            // The decision boundary (issue #1833) closes the terminal decision.
+            history.events.as_slice(),
+            [
+                ..,
+                WorkflowEvent::WorkflowFailed { .. },
+                WorkflowEvent::DecisionCommitted { .. },
+            ]
         ),
         "the abandoned-dispatch pair must be appended BEFORE the terminal event, not after \
          (issue #1409's event-id ordering guarantee); got {:?}",

@@ -519,6 +519,13 @@ mod tests {
     type HandlerFuture<'a> =
         Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
 
+    fn decision_boundary() -> WorkflowEvent {
+        WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("b"),
+            worker_id: crate::types::WorkerId::new("w"),
+        }
+    }
+
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
@@ -677,6 +684,8 @@ mod tests {
                 };
             };
             history.extend(own_events(&commands));
+            // A live worker closes each decision with a boundary (issue #1833).
+            history.push(decision_boundary());
             history.push(resolution(&commands));
         }
         panic!("the run did not finish in 32 decisions");
@@ -701,6 +710,7 @@ mod tests {
             };
             let start_len = history.len();
             history.extend(own_events(commands));
+            history.push(decision_boundary());
             history.push(resolution(commands));
             let delta = &history[start_len..];
             let warm_step = match resident.take() {
@@ -1334,11 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn a_decision_boundary_in_the_delta_is_skipped() {
         let (resident, own, id) = suspended_activity().await;
-        let boundary = WorkflowEvent::DecisionCommitted {
-            build_id: crate::types::BuildId::new("b"),
-            worker_id: crate::types::WorkerId::new("w"),
-        };
-        let delta = [own, vec![boundary, completed(id)]].concat();
+        let delta = [own, vec![decision_boundary(), completed(id)]].concat();
         let (outcome, _) = resident
             .resume(&delta)
             .await

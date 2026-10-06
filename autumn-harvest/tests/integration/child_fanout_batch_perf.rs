@@ -445,15 +445,17 @@ async fn awaited_local_child_fan_out_persists_with_one_insert_per_table() {
     // enqueue tasks for new children" section, not the parent's own
     // history append. That append re-reads `MAX(event_id) FOR UPDATE` per
     // event, to serialize against concurrent sibling completions. The
-    // bound below is exact given that shape. It proves the children's own
-    // batch adds exactly one call on top of the parent-side loop.
+    // decision then appends its one boundary (issue #1833). The children
+    // park and append nothing, so they write no boundary. The bound below
+    // is exact given that shape. It proves the children's own batch adds
+    // exactly one call on top of the parent-side loop.
     let fan_out_n_i64 = i64::try_from(FAN_OUT_N).expect("FAN_OUT_N fits in i64");
     assert_eq!(
         event_inserts,
-        fan_out_n_i64 + 2,
+        fan_out_n_i64 + 3,
         "harvest_events INSERT calls must be exactly the parent's own per-event appends \
-         ({FAN_OUT_N} ChildWorkflowStarted + 1 marker) plus exactly ONE batched call for \
-         all {FAN_OUT_N} children's own WorkflowStarted rows"
+         ({FAN_OUT_N} ChildWorkflowStarted + 1 marker + 1 decision boundary) plus exactly \
+         ONE batched call for all {FAN_OUT_N} children's own WorkflowStarted rows"
     );
 
     // Functional correctness alongside the call-count evidence: every

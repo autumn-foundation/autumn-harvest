@@ -2932,7 +2932,9 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
     // Same shape as the single-suspension test: WorkflowStarted + 2 inert
     // markers (3 events loaded), so cycle 1's fresh `ctx.timer(...)` (the
     // handler's first live call) contributes exactly one new event, crossing
-    // cap=8, fraction=0.5 -> threshold=4 (3 loaded + 1 this cycle = 4 >= 4).
+    // cap=16, fraction=0.25 -> threshold=4. The count is 3 loaded + 1 timer +
+    // 1 reserved decision boundary (issue #1833) = 5 >= 4. Cycle 2 loads
+    // 6 rows and counts 8, so the cap must stay well above 8.
     store::append_events(
         &mut conn,
         exec_id,
@@ -2973,8 +2975,8 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
             .build(),
     );
     let policy = WorkflowHistoryPolicy::default()
-        .with_event_hard_cap(8)
-        .with_history_bloat_warn_fraction(0.5);
+        .with_event_hard_cap(16)
+        .with_history_bloat_warn_fraction(0.25);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
             quota: None,
@@ -3776,7 +3778,10 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
             .build(),
     );
-    let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(4);
+    // The child stops after its first local activity: 4 events plus the
+    // boundary it reserves (issue #1833). The parent holds 4 rows with its
+    // boundary, so it stays under the cap until the child failure arrives.
+    let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(5);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![
             WorkflowInfo {

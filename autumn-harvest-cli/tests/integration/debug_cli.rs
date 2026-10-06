@@ -266,9 +266,10 @@ fn overview_marks_a_decision_without_a_build() {
 #[test]
 fn step_detail_shows_the_decision_build_and_worker() {
     let out = render_step_detail(&trace_of(&events_with_boundary("build-7")), 2);
-    assert!(out.contains("decision"), "{out}");
-    assert!(out.contains("build:  build-7"), "{out}");
-    assert!(out.contains("worker: worker-eu-1"), "{out}");
+    assert!(
+        out.contains("\n  decision:\n    build:  build-7\n    worker: worker-eu-1"),
+        "{out}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

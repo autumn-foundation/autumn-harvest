@@ -970,15 +970,17 @@ pub(crate) async fn next_event_id_for(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<i32> {
-    use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
 
+    // The row is read only to lock it and to prove it exists. Selecting the
+    // id alone skips the JSONB columns. Each decision runs this for its
+    // boundary (issue #1833).
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .for_update()
-        .select(WorkflowExecution::as_select())
-        .first(conn)
+        .select(harvest_workflow_executions::id)
+        .first::<uuid::Uuid>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?

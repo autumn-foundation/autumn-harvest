@@ -727,7 +727,9 @@ pub enum DiffKind {
 /// The first point at which two traces diverge, with both sides' snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TraceDivergence {
-    /// The step index at which the two traces first differ.
+    /// The position at which the two traces first differ. The walk skips
+    /// decision boundaries (issue #1833), so this counts the compared steps.
+    /// Each step's own `index` locates it in its history.
     pub step_index: usize,
     /// How they differ.
     pub kind: DiffKind,
@@ -816,7 +818,17 @@ impl TraceDiff {
 #[must_use]
 pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     let truncated = left.truncated || right.truncated;
-    let shared = left.steps.len().min(right.steps.len());
+    // Decision boundaries (issue #1833) are attribution, not behavior. One
+    // side can lack them, for example a recording from before the upgrade.
+    // So the walk compares the other steps only. Each step keeps its own
+    // `index` into its history.
+    let left_steps: Vec<&DebugStep> = left.steps.iter().filter(|s| s.decision.is_none()).collect();
+    let right_steps: Vec<&DebugStep> = right
+        .steps
+        .iter()
+        .filter(|s| s.decision.is_none())
+        .collect();
+    let shared = left_steps.len().min(right_steps.len());
     // The first compared index where *neither* side replayed successfully. Both
     // sides failing the same way compares equal at every field, so the walk
     // below reports no divergence — but "they agree" would be a claim about two
@@ -828,7 +840,7 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     // it compares are determined entirely by the two histories. Only a replay
     // that was attempted and did not finish makes agreement meaningless.
     let inconclusive_step = (0..shared)
-        .find(|&i| left.steps[i].outcome.replay_failed() && right.steps[i].outcome.replay_failed());
+        .find(|&i| left_steps[i].outcome.replay_failed() && right_steps[i].outcome.replay_failed());
     let finish = |divergence| TraceDiff {
         divergence,
         left_steps: left.steps.len(),
@@ -861,8 +873,8 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     }
 
     for i in 0..shared {
-        let l = &left.steps[i];
-        let r = &right.steps[i];
+        let l = left_steps[i];
+        let r = right_steps[i];
 
         if let Some(kind) = step_diff_kind(l, r) {
             return finish(Some(TraceDivergence {
@@ -875,15 +887,15 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     }
 
     finish(
-        (left.steps.len() != right.steps.len()).then(|| TraceDivergence {
+        (left_steps.len() != right_steps.len()).then(|| TraceDivergence {
             step_index: shared,
             kind: DiffKind::TraceLength {
-                left: left.steps.len(),
-                right: right.steps.len(),
+                left: left_steps.len(),
+                right: right_steps.len(),
                 capped: truncated,
             },
-            left: left.steps.get(shared).cloned(),
-            right: right.steps.get(shared).cloned(),
+            left: left_steps.get(shared).map(|step| (*step).clone()),
+            right: right_steps.get(shared).map(|step| (*step).clone()),
         }),
     )
 }

@@ -6,7 +6,8 @@ A history now shows which build and which worker made each decision.
   added at the end of the enum. No migration.
 - **Write path:** the Postgres worker appends one boundary in the transaction
   that persists the decision outcome, after the outcome events. A decision
-  that appends no event writes no boundary. The row stages no `NOTIFY`, so
+  that writes no event of its own writes no boundary, even when another
+  writer appends meanwhile. The row stages no `NOTIFY`, so
   `last_event_type` does not change. `store::append_decision_boundary` shares
   the DR write fence with `append_events_with_codecs`.
 - **Replay:** `HistoryMatcher::new` marks every boundary consumed, like pause
@@ -16,16 +17,24 @@ A history now shows which build and which worker made each decision.
   written before this release replays without change.
 - **Display:** the history export keeps both fields in redacted mode.
   `harvest debug` shows `decision: build …, worker …`, and `DebugStep` has a
-  new `decision` field. `harvest debug diff` ignores boundary attribution.
+  new `decision` field. `diff_traces` skips boundary steps when it aligns
+  two traces, so a recording without boundaries compares clean with one
+  that has them. `TraceDivergence::step_index` counts the compared steps.
   Vantage and the Mermaid diagram label each boundary.
-- **Rollout:** a worker older than this release fails an execution whose
-  history holds a boundary. `HarvestBuilder::record_decision_boundaries(false)`
-  and `WorkflowHistoryPolicy::with_decision_boundaries(false)` turn boundaries
-  off until every worker runs this release. They are on by default.
-- **Storage:** about 131 bytes of `event_data` and 438 bytes on disk with
-  indexes per boundary. A boundary counts toward the event hard cap, the
-  continue-as-new threshold and the history byte quota. See
-  `docs/decision-boundaries.md`.
+- **BREAKING DEFAULT:** boundaries are on by default. A process older than
+  this release cannot decode one: an old worker fails the execution, an old
+  timeout leader cannot enforce its activity timeouts, and an old API node or
+  CLI cannot show, export or cancel it.
+  `HarvestBuilder::record_decision_boundaries(false)` and
+  `WorkflowHistoryPolicy::with_decision_boundaries(false)` turn boundaries off
+  until every process that reads history runs this release. See
+  `docs/upgrading/0.8.0.md` §1.1.
+- **Storage and limits:** each boundary adds about 131 bytes of
+  `event_data`. With indexes, it adds about 438 bytes on disk. A boundary
+  counts toward the event hard cap, the continue-as-new threshold, the
+  timeout-scanner ceiling, the history-bloat warning and the history byte
+  quota. The hard-cap preflight of a run that stays running reserves the
+  boundary it is about to write. See `docs/decision-boundaries.md`.
 - **Scope:** the SQLite backend writes no boundaries.
 - **Tests:** `event::tests::decision_committed_*`,
   `replay::tests::decision_boundaries_*` and `trailing_boundary_*`,
