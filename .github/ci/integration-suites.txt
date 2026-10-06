@@ -54,6 +54,7 @@ allos        autumn-harvest         integration                      testing    
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
 allos        autumn-harvest         property                         db                         -
+allos        autumn-harvest-plugin  api_rate_limit                   -                          -
 allos        autumn-harvest-plugin  connector_dependency_graph       -                          -
 allos        autumn-harvest-plugin  connector_example_budget         -                          -
 allos        autumn-harvest-plugin  contract_regression              -                          -
@@ -110,6 +111,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
 linux        autumn-harvest         integration                      -                          history_crash_tests
+linux        autumn-harvest         integration                      -                          history_default_caps_tests
 linux        autumn-harvest         integration                      -                          host_clock_skew_tests
 linux        autumn-harvest         integration                      -                          integration_e2e
 linux        autumn-harvest         integration                      -                          lifecycle_model_props
@@ -197,6 +199,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
+linux        autumn-harvest-plugin  api_rate_limit_integration       -                          -
 linux        autumn-harvest-plugin  api_scheduler_integration        -                          -
 linux        autumn-harvest-plugin  authz_integration                -                          -
 linux        autumn-harvest-plugin  awaitables_integration           -                          -
@@ -267,6 +270,7 @@ linux        autumn-harvest-plugin  workflow_reset_integration       -          
 linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -
 linux        autumn-harvest-redis   dispatch_redis                   -                          -
 linux        autumn-harvest-redis   integration_redis                -                          -
+linux        autumn-harvest-redis   tls_redis                        -                          -
 linux        autumn-harvest-redis   worker_dispatch_e2e              -                          -
 linux        standalone-runner      acceptance                       -                          -
 linuxpart    autumn-harvest         integration                      -                          append_only_guard_tests

@@ -269,6 +269,14 @@ pub enum DeadLetterReason {
         cap: u64,
         workflow_type: String,
     },
+    /// Stored workflow history reached the byte hard cap (issue #1804).
+    /// `bytes` is the sum of `pg_column_size(event_data)` for the run.
+    /// `cap` is the configured byte cap.
+    HistoryBytesCapExceeded {
+        bytes: u64,
+        cap: u64,
+        workflow_type: String,
+    },
     /// A task crashed the worker process `crash_strikes` times in a row
     /// (issue #367). The orphan-reclaim scanner quarantined it instead of
     /// re-dispatching it to crash another worker. `last_worker_id` is the
@@ -322,6 +330,7 @@ impl DeadLetterReason {
     pub const fn reason_class(&self) -> &'static str {
         match self {
             Self::HistoryCapExceeded { .. } => "history_cap_exceeded",
+            Self::HistoryBytesCapExceeded { .. } => "history_bytes_cap_exceeded",
             Self::PoisonPill { .. } => "poison_pill",
             Self::WorkflowTaskTimeout { .. } => "workflow_task_timeout",
             Self::CallbackDeliveryExhausted { .. } => "callback_delivery_exhausted",
@@ -334,6 +343,7 @@ impl DeadLetterReason {
     pub const fn type_tag(&self) -> &'static str {
         match self {
             Self::HistoryCapExceeded { .. } => "HistoryCapExceeded",
+            Self::HistoryBytesCapExceeded { .. } => "HistoryBytesCapExceeded",
             Self::PoisonPill { .. } => "PoisonPill",
             Self::WorkflowTaskTimeout { .. } => "WorkflowTaskTimeout",
             Self::CallbackDeliveryExhausted { .. } => "CallbackDeliveryExhausted",
@@ -2333,6 +2343,24 @@ mod tests {
 
         assert_eq!(back, reason);
         assert!(json.contains("HistoryCapExceeded"));
+    }
+
+    #[test]
+    fn dead_letter_reason_history_bytes_cap_is_typed_json() {
+        // Issue #1804: the byte cap has its own typed reason.
+        let reason = DeadLetterReason::HistoryBytesCapExceeded {
+            bytes: 52_428_801,
+            cap: 52_428_800,
+            workflow_type: "billing_poll".into(),
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        assert_eq!(dlq_reason(&json), "history_bytes_cap_exceeded");
+        assert_eq!(error_class(&json), "HistoryBytesCapExceeded");
     }
 
     #[test]

@@ -250,7 +250,7 @@ So pinning the **root** of a workflow tree confines the whole tree.
 - **Deferred starts cannot be pinned.** Debounce (#499) and batch (#518) admit a start without creating an execution, so there is nothing to place at request time; combining either with `shard_id` / `residency_key` is a `400` rather than a silently discarded pin. A throttled start (#607) *is* pinned — it defers the same concrete placement to its scanner.
 - **Rollout ordering.** Placement is enforced by the node handling the start. During a rolling deploy, a pinned request that lands on a pre-#697 node is accepted and hashed, silently ignoring the pin. Upgrade the whole fleet before you begin sending pinned starts, and treat the first pinned start as the cutover point.
 - **Residency keys are an operator-declared, low-cardinality set.** The map is held in memory on every node and validated at boot; it is sized for regions/jurisdictions (single digits to dozens), not per-tenant keys. For per-tenant placement, map the tenant to a region in your own application layer and pass the region as the key.
-- **Out of scope**: migrating a *running* workflow between shards, per-shard worker assignment, geo-replication / cross-region failover, and inferring residency from payload contents. Harvest never reads your payload to decide placement — the caller states it explicitly.
+- **Out of scope**: migrating a *running* workflow between shards, per-shard worker assignment, and inferring residency from payload contents. A quiescent workflow can move; see [Shard rebalancing](#shard-rebalancing--migrating-quiescent-workflows-issue-964). [`cross-region-dr.md`](cross-region-dr.md) covers cross-region replication and failover (issue #954). Harvest never reads your payload to decide placement — the caller states it explicitly.
 
 ### Business-key addressing finds a pinned run wherever it is (issue #1146)
 
@@ -941,7 +941,7 @@ Renders a table by default; pass `--json` for piping.
 
 ### Adding a shard to a deployment that uses per-key concurrency
 
-Follow the standard add-a-shard procedure in [`docs/architecture.md`](architecture.md#sharding). The new shard starts with no task queue rows, so the cap is independent from day one. If you need to migrate in-flight workflows to the new shard, that is out of scope (cross-shard rebalancing is not supported).
+Follow the standard add-a-shard procedure in [`docs/architecture.md`](architecture.md#sharding). The new shard starts with no task queue rows, so the cap is independent from day one. A running workflow cannot move to the new shard. A quiescent one can; see [Shard rebalancing](#shard-rebalancing--migrating-quiescent-workflows-issue-964).
 
 ---
 

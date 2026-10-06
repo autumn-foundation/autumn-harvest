@@ -58,8 +58,8 @@ module counts at the audited revision, recomputed by CI:
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 15 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 45 modules | Case by case — the SQL must be read, not inferred from the ORM. |
-| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 31 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 46 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 32 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 14 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 10 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
@@ -107,7 +107,7 @@ have grown past that round's 18 as new Postgres-only syntax lands; each module
 the open rule newly catches has so far already been (b) or (c). The counts move;
 the classifications do not.
 
-That 45 of the 65 coupled modules hand-write SQL is therefore the more
+That 46 of the 65 coupled modules hand-write SQL is therefore the more
 decision-relevant number than any dialect tally. It is the volume of query text
 a second backend must re-author by hand, and it is knowable exactly.
 
@@ -213,7 +213,7 @@ Classification rule:
 | `shard_rebalance` | diesel, raw-pg-sql, raw-sql | (c) | Migrating quiescent executions between shards (issue #964). Coupled the same way `cross_shard_child` is: the module exists **because** there is more than one database, so under a single-file backend the whole capability has nothing to do and would be dropped wholesale rather than translated. Its syntax is Postgres-bound throughout — the copy round-trips whole rows through `to_jsonb` / `jsonb_populate_record` / `jsonb_to_recordset` (SQLite's JSON1 has no record-shaped equivalent, and the point of using them is schema-drift safety, which a hand-written column list would lose), and the cutover is one statement built from data-modifying CTEs whose `sealed` output feeds two further `UPDATE`s — SQLite's CTEs cannot contain DML at all, so the atomic seal-and-cancel would have to become several statements inside the single write lock. |
 | `shared_json` | diesel, raw-sql | (b) | `Arc<serde_json::Value>` newtype that the start path shares across four structs (issue #1733). The only coupling is a `ToSql`/`FromSql` pair for the Postgres `Jsonb` type. The `raw-sql` flag is a false positive: a unit-test helper is named `assert_sql::<T>()`, which matches the `sql::<` pattern; the module issues no SQL of its own. A SQLite backend writes the same impl pair over `Text`. |
 | `start_idempotency` | diesel, to_regclass, interval-sql, raw-sql | (b) | `ON CONFLICT` upsert has a direct SQLite form. |
-| `store` | diesel, skip-locked, row-lock | (c) | **Consumer of the claim invariant — issues no `SKIP LOCKED` SQL of its own.** Event append itself is (a); its TOCTOU assumption is not. |
+| `store` | diesel, raw-pg-sql, raw-sql, row-lock, skip-locked | (c) | **Consumer of the claim invariant — issues no `SKIP LOCKED` SQL of its own.** Event append itself is (a); its TOCTOU assumption is not. The history byte cap (issue #1804) sums `pg_column_size(event_data)` with a `::bigint` cast. SQLite has no `pg_column_size`; `length(event_data)` is the nearest stand-in. |
 | `testing` | diesel | (a) | Test-only helpers. |
 | `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid, raw-sql | (c) | Token-bucket scanner claim; the accrual formula itself (issue #945) lives behind `queue::effective_available_tokens_expr`. The pre-fire pass that sorts a claimed batch by advisory-lock id (issue #1230 Finding 2) now lives in `quota_lock_order`, which carries its `unnest($1::text[])` cast; the scanner's own SQL is the claim, the deferred-start insert and plain CRUD. |
 | `timeout` | diesel, skip-locked, row-lock, advisory-lock, raw-pg-sql, raw-sql | (c) | The scanner family; lock ordering vs the claim path is load-bearing. |
@@ -374,7 +374,7 @@ disputed:
 
 - **26 modules are class (c)** — portable only by dropping a capability or
   reimplementing wholesale — against 8 that are trivially trait-able.
-- **45 modules reach for raw SQL**, so their portability cannot be read off
+- **46 modules reach for raw SQL**, so their portability cannot be read off
   their Diesel usage at all.
 - The **capability losses are documented and unavoidable** on the single-writer
   side (*Known capability losses*, below), so the second backend is not the same
