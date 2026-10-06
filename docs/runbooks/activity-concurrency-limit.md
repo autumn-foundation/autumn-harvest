@@ -81,7 +81,7 @@ Set a field directly to change it.
 | `tolerance` | `1.25` | Latency rise over the baseline that the limit accepts before it slows growth. | Raise it to trade latency for throughput. Lower it to keep latency close to the no-load value. |
 | `backoff_ratio` | `0.9` | Factor for the cap after a window with too many retryable failures. | Lower it, for example to `0.7`, to back off harder on errors. |
 | `error_threshold` | `0.05` | Share of retryable failures in a window that counts as overload. | Raise it for a dependency with a steady background error rate. At `0`, one failure cuts the cap. |
-| `probe_interval` | `1000` | Samples between two measurements of the no-load baseline. | Raise it at a high cap. Each probe drops the cap to 4, or to `min_limit` if that is higher, for one window. |
+| `probe_interval` | `1000` | Samples between two measurements of the no-load baseline. | Raise it at a high cap. A probe drops the cap to 4, within `[min_limit, max_limit]`, and never raises it. It lasts until a window gets a successful answer, so in an outage it can last many windows. |
 
 The config clamps out-of-range values. For example, `min_limit` becomes at
 least 1, `tolerance` at least 1 and `probe_interval` at least 10.
@@ -118,7 +118,7 @@ about once per round trip.
    answers again, the cap returns to that reduced value and grows from
    there.
 
-A new type starts at 4. Against a dependency that slows down in proportion
+A new type starts with a probe at 4, within `[min_limit, max_limit]`. Against a dependency that slows down in proportion
 to the load above a knee, the cap settles near `tolerance × knee + 4`. The
 example shows this: a knee of 20 gives a cap of 29, and a knee of 8 gives 14.
 
