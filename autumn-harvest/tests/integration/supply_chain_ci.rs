@@ -1102,3 +1102,57 @@ fn release_sboms_pass_the_attest_format_check() {
         "SOURCE_DATE_EPOCH drops the SBOM `serialNumber`"
     );
 }
+
+/// Every check that can reject a tag runs in `validate`, and both sign jobs
+/// wait for it. Otherwise a rejected tag leaves Rekor entries and
+/// attestations for a release that never ships.
+#[test]
+fn release_runs_every_tag_gate_before_signing() {
+    let doc = parse_workflow(RELEASE_WORKFLOW);
+    let validate = job_steps(&doc, RELEASE_WORKFLOW, "validate");
+    let runs = validate
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in ["diff -u CHANGELOG.md", "clients/typescript/package.json"] {
+        assert!(
+            runs.contains(needle),
+            "validate must run the `{needle}` gate:\n{runs}"
+        );
+    }
+    let checkout = validate
+        .iter()
+        .find(|s| uses(s, "actions/checkout"))
+        .expect("validate checkout");
+    assert_eq!(
+        checkout
+            .get("with")
+            .and_then(|w| w.get("fetch-depth"))
+            .and_then(Value::as_u64),
+        Some(0),
+        "git-cliff needs the full history"
+    );
+    for name in ["sign", "sign-client"] {
+        let needs: Vec<&str> = job(&doc, RELEASE_WORKFLOW, name)
+            .get("needs")
+            .and_then(Value::as_sequence)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            needs.contains(&"validate"),
+            "{name} must need validate: {needs:?}"
+        );
+    }
+    let release_runs = job_steps(&doc, RELEASE_WORKFLOW, "release")
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !release_runs.contains("diff -u CHANGELOG.md"),
+        "the CHANGELOG gate must not wait until after signing"
+    );
+}

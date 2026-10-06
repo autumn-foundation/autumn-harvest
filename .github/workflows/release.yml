@@ -47,13 +47,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Every check that can reject a tag runs here. Both sign jobs wait for this
+  # job, so a rejected tag leaves no Rekor entry and no attestation.
   validate:
     name: Validate release
-    # CI runs these checks on every pull request. Run them again for a tag.
+    # CI runs the build checks on every pull request. Run them again for a tag.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # git-cliff reads the full history.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install git-cliff
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        with:
+          tool: git-cliff
+      - name: Verify CHANGELOG.md is current
+        run: |
+          git-cliff --config cliff.toml --output /tmp/CHANGELOG.md
+          perl -0pi -e 's/\n+\z/\n/' /tmp/CHANGELOG.md
+          if ! diff -u CHANGELOG.md /tmp/CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is out of date for ${GITHUB_REF_NAME}. Run git-cliff --config cliff.toml --output CHANGELOG.md and commit it before tagging the release."
+            exit 1
+          fi
+      # Issue #1616. The client package version must equal the tag.
+      - name: Check the TypeScript client version
+        run: |
+          version="$(jq -r .version clients/typescript/package.json)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::clients/typescript/package.json is ${version}, the tag is ${GITHUB_REF_NAME}"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: stable
@@ -357,18 +383,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # `validate` has checked CHANGELOG.md already.
       - name: Install git-cliff
         uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: git-cliff
-      - name: Verify CHANGELOG.md is current
-        run: |
-          git-cliff --config cliff.toml --output /tmp/CHANGELOG.md
-          perl -0pi -e 's/\n+\z/\n/' /tmp/CHANGELOG.md
-          if ! diff -u CHANGELOG.md /tmp/CHANGELOG.md; then
-            echo "::error::CHANGELOG.md is out of date for ${{ github.ref_name }}. Run git-cliff --config cliff.toml --output CHANGELOG.md and commit it before tagging the release."
-            exit 1
-          fi
       - name: Generate release notes
         id: release-notes
         run: |
