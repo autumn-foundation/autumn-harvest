@@ -9,7 +9,8 @@ Two runs failed:
 - 2026-10-05: `terminate_backend_mid_commit_append` failed on purpose. It
   required `FAILED`, the outcome of bugs #1871 and #1870. #1788
   (`3405cae`) fixed #1871 for a session that the server ends: the worker
-  writes a lost activity result again on a new connection. The workflow now completes.
+  writes a lost activity result again on a new connection. The workflow
+  now completes.
 
 The test now requires `COMPLETED`. Both append tests also require one
 activity attempt: one activity task at attempt 1 and one `ActivityStarted`.
