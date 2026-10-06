@@ -5,6 +5,7 @@
 
 #![cfg(feature = "metrics-rs")]
 
+use autumn_harvest::adaptive_limit::LimitSnapshot;
 use autumn_harvest::error::PayloadKind;
 use autumn_harvest::metrics_rs_adapter::MetricsRsRecorder;
 use autumn_harvest::telemetry::{
@@ -12,6 +13,7 @@ use autumn_harvest::telemetry::{
 };
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[test]
 fn metrics_rs_recorder_implements_metrics_recorder_trait() {
@@ -263,6 +265,67 @@ fn record_retry_budget_available_bridges_gauge_with_activity_label() {
     );
     let labels = labels_of(key);
     assert_eq!(labels, vec![("activity", "charge_card")], "issue #1793");
+}
+
+/// The adaptive limit state is three gauges, each labeled by `activity`
+/// (issue #1836).
+#[test]
+fn record_activity_concurrency_limit_bridges_three_gauges() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_activity_concurrency_limit(
+            "charge_card",
+            &LimitSnapshot {
+                limit: 12,
+                in_flight: 7,
+                baseline: Some(Duration::from_millis(250)),
+            },
+        );
+    });
+    for name in [
+        "harvest.activity.concurrency_limit",
+        "harvest.activity.concurrency_in_flight",
+        "harvest.activity.latency_baseline_seconds",
+    ] {
+        let key = find_key(&keys, name, InstrumentKind::Gauge);
+        assert_eq!(labels_of(key), vec![("activity", "charge_card")], "{name}");
+    }
+}
+
+/// With no baseline estimate, the baseline gauge is not touched.
+#[test]
+fn record_activity_concurrency_limit_skips_an_unknown_baseline() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_activity_concurrency_limit(
+            "charge_card",
+            &LimitSnapshot {
+                limit: 4,
+                in_flight: 0,
+                baseline: None,
+            },
+        );
+    });
+    assert!(
+        !keys.iter().any(|(kind, key)| *kind == InstrumentKind::Gauge
+            && key.name() == "harvest.activity.latency_baseline_seconds"),
+        "an unknown baseline must not set the gauge"
+    );
+}
+
+#[test]
+fn record_activity_concurrency_deferred_bridges_counter_with_activity_label() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_activity_concurrency_deferred("charge_card");
+    });
+    let key = find_key(
+        &keys,
+        "harvest.activity.concurrency_deferred",
+        InstrumentKind::Counter,
+    );
+    assert_eq!(
+        labels_of(key),
+        vec![("activity", "charge_card")],
+        "issue #1836"
+    );
 }
 
 #[test]

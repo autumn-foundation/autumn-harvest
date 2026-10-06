@@ -325,6 +325,10 @@ metric is emitted in the source code.
 | `harvest.activity.retries` | Counter | `worker.rs` — `handle_activity_result`, once per retry actually scheduled (after the `schedule_to_close` deadline check); use for retry-storm detection (issue #528) |
 | `harvest.retry.budget.available` | Gauge | `retry_budget.rs` — `RetryBudgetRegistry`, after every bucket access, under the bucket lock, so samples follow the mutation order. Tokens left in one activity type's retry budget on this worker (issue #1793) |
 | `harvest.retry.budget.exhausted` | Counter | `worker.rs` — `process_activity_task`, once per retry that the retry budget deferred. Prometheus: `harvest_retry_budget_exhausted_total`. A deferred retry is not lost; it runs later (issue #1793) |
+| `harvest.activity.concurrency_limit` | Gauge | `adaptive_limit.rs` — `AdaptiveLimitRegistry`, after every change, under its lock. The adaptive cap on in-flight attempts of one activity type on this worker. Only a type with an adaptive limit has it (issue #1836) |
+| `harvest.activity.concurrency_in_flight` | Gauge | `adaptive_limit.rs` — `AdaptiveLimitRegistry`, with the cap. Attempts that hold a slot. At the cap, the worker claims no more tasks of the type (issue #1836) |
+| `harvest.activity.latency_baseline_seconds` | Gauge | `adaptive_limit.rs` — `AdaptiveLimitRegistry`, with the cap. The no-load handler latency estimate that the limit compares each window mean with. A probe clears it, and the gauge keeps its last value until the probe window closes (issue #1836) |
+| `harvest.activity.concurrency_deferred` | Counter | `worker.rs` — `process_activity_task`, once per claimed attempt that the adaptive limit deferred. The claim skips a type at its cap, so a steady rate means claims race past the cap. Prometheus: `harvest_activity_concurrency_deferred_total` (issue #1836) |
 | `harvest.activity.pause_actions` | Counter | `activity_pause.rs` — the `pause_activity` / `resume_activity` write path, once per operator action on a whole activity type (issue #807). **Gated on the action having genuinely changed state** (`ActivityPauseOutcome::newly_paused` / `ActivityResumeOutcome::newly_resumed`) so an idempotent retry after a lost response does not read as a second hold — the same gating `harvest.workflow.paused` uses (issue #383). Deliberately a counter, not a gauge: it records *actions*, so a flat line says nothing about whether a hold is currently in effect — `GET /api/harvest/activities` is the read model for the state. Contrast its sibling `harvest.queue.paused` (issue #619), a gauge, because there the alertable thing is the *duration* of the hold |
 | `harvest.timer.started` | Counter | `worker.rs` — `persist_timer_command`, when a durable timer is written |
 | `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default). Aggregated **across all shards** of the worker's `ShardedDbPool` (summed per queue) so multi-shard backlog is fleet-wide, not default-shard-only (issue #522) |
@@ -408,6 +412,10 @@ metric is emitted in the source code.
 | `harvest.activity.retries` | `activity`, `queue` |
 | `harvest.retry.budget.available` | `activity` |
 | `harvest.retry.budget.exhausted` | `activity` |
+| `harvest.activity.concurrency_limit` | `activity` |
+| `harvest.activity.concurrency_in_flight` | `activity` |
+| `harvest.activity.latency_baseline_seconds` | `activity` |
+| `harvest.activity.concurrency_deferred` | `activity` |
 | `harvest.activity.pause_actions` | `activity` (bounded **by bucketing**: the pause routes accept an unregistered name on purpose, so the raw value is caller-controlled free text — the emitter resolves it against the registered activity catalogue and substitutes `__unregistered__` when absent, exactly as the #684 update-name label does), `action` (`pause\|resume`, bounded by `ActivityPauseAction`) |
 | `harvest.timer.started` | _(none)_ |
 | `harvest.queue.depth` | `queue` |

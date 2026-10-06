@@ -2344,7 +2344,7 @@
     {
       "id": 39,
       "type": "row",
-      "title": "Circuit breakers and retry budget",
+      "title": "Circuit breakers, retry budget and adaptive limit",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -2548,6 +2548,202 @@
             }
           ],
           "description": "Retries that the retry budget deferred in the last hour, per activity type. A deferred retry is not lost. It runs later (issue #1793)."
+        },
+        {
+          "id": 185257,
+          "type": "timeseries",
+          "title": "Adaptive concurrency limit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "min by (activity) (harvest_activity_concurrency_limit)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Lowest adaptive cap on in-flight attempts per activity type across workers. It falls when latency inflates or retryable failures occur (issue #1836)."
+        },
+        {
+          "id": 185258,
+          "type": "timeseries",
+          "title": "Adaptive limit slots in flight",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity) (harvest_activity_concurrency_in_flight)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "In-flight attempts that hold an adaptive limit slot, per activity type, summed across workers. At the cap, a worker claims no more tasks of that type (issue #1836)."
+        },
+        {
+          "id": 185259,
+          "type": "timeseries",
+          "title": "Adaptive limit latency baseline",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 66
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (activity) (harvest_activity_latency_baseline_seconds)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "No-load handler latency estimate of the adaptive limit, per activity type, highest across workers. Above tolerance times this value, the cap grows more slowly and then settles (issue #1836)."
+        },
+        {
+          "id": 185260,
+          "type": "timeseries",
+          "title": "Claims deferred by the adaptive limit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 66
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity) (increase(harvest_activity_concurrency_deferred_total[1h]))",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Claimed attempts that the adaptive limit deferred in the last hour, per activity type. The claim skips a type at its cap, so a steady rate means claims race past the cap (issue #1836)."
         }
       ]
     },
