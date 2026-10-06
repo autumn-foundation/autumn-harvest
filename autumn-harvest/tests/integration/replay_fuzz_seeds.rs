@@ -302,6 +302,17 @@ fn shape(ops: &[Op]) -> String {
             "signal_timeout" => format!("signal timeout {name}"),
             "signal_external" => format!("signal external {name}"),
             "mutex" => format!("mutex {}", op["key"].as_str().unwrap_or_default()),
+            "fan_out" => {
+                let window = op["window"]
+                    .as_u64()
+                    .map_or_else(String::new, |w| format!(" window {w}"));
+                let mode = if op["collect"].as_bool() == Some(true) {
+                    "collect"
+                } else {
+                    "fail fast"
+                };
+                format!("fan out{window} {mode}")
+            }
             "side_effect" => format!("side effect {name}"),
             "concurrent" => format!("join({})", nested("ops")),
             "sequence" => format!("seq({})", nested("ops")),
@@ -411,6 +422,49 @@ fn a_join_branch_after_a_mutex_or_external_activity_hits_the_engine_gap() {
         assert!(
             matches!(&verdict, Verdict::Replayed(r) if r.contains("workflow suspended early")),
             "seed {name}: {verdict:?}"
+        );
+    }
+}
+
+/// A fan-out is collect-all when every item settles after a failure and
+/// before the next command. That holds for a failure in the last wave of a
+/// windowed group too, and past a sibling command in the same `join!`. A
+/// fail-fast caller goes on while items still run.
+#[test]
+fn a_collect_all_fan_out_is_told_from_a_fail_fast_one() {
+    let expected = [
+        (
+            "baseline-unbounded-collect-all.json",
+            "fan out collect; report; complete",
+        ),
+        (
+            "baseline-windowed-collect-all.json",
+            "fan out window 2 collect; complete",
+        ),
+        (
+            "baseline-windowed-collect-all-last-wave-fails.json",
+            "fan out window 2 collect; report; complete",
+        ),
+        (
+            "baseline-collect-all-fan-out-in-join.json",
+            "join(fan out collect, audit); report; complete",
+        ),
+        (
+            "baseline-windowed-fail-fast-then-activity.json",
+            "fan out window 2 fail fast; notify; complete",
+        ),
+    ];
+    let cases = seed("baseline-");
+    for (name, want) in expected {
+        let (_, case) = cases
+            .iter()
+            .find(|(seed, _)| seed == name)
+            .unwrap_or_else(|| panic!("seed {name} is missing"));
+        assert_eq!(shape(&mirror(&case.history)), want, "seed {name}");
+        assert_eq!(
+            check_case(case),
+            Verdict::Replayed("ReplaySucceeded".to_string()),
+            "seed {name}"
         );
     }
 }

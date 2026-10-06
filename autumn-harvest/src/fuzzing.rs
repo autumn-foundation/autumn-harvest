@@ -1344,8 +1344,13 @@ impl FanOutGroup {
         }
         let first = self.first_wave_len;
         let window = (first > 0 && first < count).then_some(first);
+        // A failure in the last wave has no refill wave after it. The group
+        // is collect-all when every item still settles before the next
+        // command.
         let collect = if window.is_some() {
             self.collect
+                || (self.activities.len() >= count
+                    && settles_after_failure(rest, &self.activity_ids, activity_outcome))
         } else {
             settles_after_failure(rest, &self.activity_ids, activity_outcome)
         };
@@ -1480,9 +1485,13 @@ const fn child_outcome(event: &WorkflowEvent) -> Option<(ExecutionId, Outcome)> 
     }
 }
 
-/// True when an item of an unbounded group failed and every item settled
-/// before the next command. Only the collect-all form waits for every item.
-/// A fail-fast caller goes on at the first failure, while items still run.
+/// True when an item of a group failed and every item settled before the
+/// next command. Only the collect-all form waits for every item. A
+/// fail-fast caller goes on at the first failure, while items still run.
+///
+/// A sibling command in the same `join!` is not the next command. It is a
+/// schedule before the first outcome of the group, or a schedule right
+/// after the outcome of another sibling. Its own events are passed over.
 fn settles_after_failure<K: Copy + Eq + std::hash::Hash>(
     rest: &[WorkflowEvent],
     group: &HashSet<K>,
@@ -1490,18 +1499,31 @@ fn settles_after_failure<K: Copy + Eq + std::hash::Hash>(
 ) -> bool {
     let mut settled = HashSet::new();
     let mut failed = false;
+    let mut siblings: HashSet<Pending> = HashSet::new();
+    // True before the first outcome of the group, and right after the
+    // outcome of a sibling.
+    let mut sibling_turn = true;
     for event in rest {
         match outcome(event) {
             Some((id, Outcome::Progress)) if group.contains(&id) => {}
             Some((id, Outcome::Done)) if group.contains(&id) => {
                 settled.insert(id);
+                sibling_turn = false;
             }
             Some((id, Outcome::Failed)) if group.contains(&id) => {
                 settled.insert(id);
                 failed = true;
+                sibling_turn = false;
             }
             None if matches!(event, WorkflowEvent::SignalReceived { .. }) => {}
-            _ => break,
+            _ => match (pending_key(event), settled_key(event), progress_key(event)) {
+                (Some(key), _, _) if sibling_turn => {
+                    siblings.insert(key);
+                }
+                (_, Some(key), _) if siblings.contains(&key) => sibling_turn = true,
+                (_, _, Some(key)) if siblings.contains(&key) => {}
+                _ => break,
+            },
         }
     }
     failed && settled.len() == group.len()
