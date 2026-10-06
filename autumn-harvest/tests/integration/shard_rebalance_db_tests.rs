@@ -43,7 +43,8 @@
 //! [`a_record_settled_by_an_operator_is_not_reported_by_the_scanner`],
 //! [`a_down_target_is_retried_one_grace_period_later`],
 //! [`a_replica_without_the_target_pool_does_not_claim_the_record`],
-//! [`a_failed_audit_insert_leaves_the_record_for_the_next_pass`].
+//! [`a_failed_audit_insert_leaves_the_record_for_the_next_pass`],
+//! [`a_fenced_scanner_writes_nothing_on_a_shard_it_lost`].
 //!
 //! Runs against `HARVEST_TEST_DATABASE_URL` when set (each test gets two
 //! throwaway databases), otherwise against per-test Postgres containers.
@@ -8788,4 +8789,146 @@ async fn a_failed_audit_insert_leaves_the_record_for_the_next_pass() {
     assert_eq!(phase_of(&mut source, exec_id).await, MigrationPhase::Done);
     assert_eq!(auto_resume_audits(&mut source, exec_id).await, 1);
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+}
+
+/// A scanner on a node whose DR generation is stale writes nothing (issue
+/// #1839).
+///
+/// A stale source fence refuses the claim, so the record keeps its
+/// `updated_at` and `attempts`. A stale target fence refuses the activation.
+/// The record then stays `COMMITTED` with one attempt and no audit row, and
+/// the target copy stays `MIGRATING`.
+///
+/// The fence registry is process-global, and a pinned shard with no
+/// generation row fails closed. So this test pins shards 40 and 41, which no
+/// other test uses, and holds the registry lock of `cross_region_dr_tests`.
+#[tokio::test]
+async fn a_fenced_scanner_writes_nothing_on_a_shard_it_lost() {
+    use autumn_harvest::replication::{
+        FenceRegistry, ShardGeneration, bump_generation, ensure_generation_row,
+    };
+
+    #[derive(diesel::QueryableByName)]
+    struct Stamp {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        updated_at: chrono::DateTime<Utc>,
+    }
+
+    const FROM: ShardId = ShardId::new(40);
+    const TO: ShardId = ShardId::new(41);
+
+    let _fence_serial = crate::cross_region_dr_tests::registry_guard().await;
+    let (from_url, c1) = setup_isolated_db().await;
+    let (to_url, c2) = setup_isolated_db().await;
+    let _containers: Vec<_> = c1.into_iter().chain(c2).collect();
+    let pool = ShardedDbPool::from_map(
+        [(FROM, build_pool(&from_url)), (TO, build_pool(&to_url))]
+            .into_iter()
+            .collect(),
+        FROM,
+    );
+    let (mut source, mut target) = (connect(&from_url).await, connect(&to_url).await);
+    ensure_generation_row(&mut source, FROM)
+        .await
+        .expect("source row");
+    ensure_generation_row(&mut target, TO)
+        .await
+        .expect("target row");
+
+    let exec_id = insert_execution_with_id(
+        &mut source,
+        "entity_flow",
+        "entity-fenced",
+        ExecutionId::new_for_shard(FROM),
+        FROM,
+    )
+    .await;
+    append_history(
+        &mut source,
+        exec_id,
+        &[
+            started(json!({"seed": 1})),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+                duration_secs: 604_800,
+            },
+        ],
+    )
+    .await;
+    park_on_timer(&mut source, exec_id).await;
+    begin_migration(&mut source, exec_id, FROM, TO)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TO)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TO)
+            .await
+            .expect("cutover")
+    );
+    age_migration(&mut source, exec_id, 7200).await;
+
+    let stamp = async |conn: &mut AsyncPgConnection| -> chrono::DateTime<Utc> {
+        diesel::sql_query("SELECT updated_at FROM harvest_shard_migrations WHERE execution_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .get_result::<Stamp>(conn)
+            .await
+            .expect("stamp")
+            .updated_at
+    };
+    let grace = std::time::Duration::from_secs(60);
+
+    // A stale source: the claim is refused and nothing moves.
+    FenceRegistry::clear();
+    FenceRegistry::register(FROM, ShardGeneration::new(0)).expect("pin the source");
+    FenceRegistry::register(TO, ShardGeneration::new(0)).expect("pin the target");
+    bump_generation(&mut source, FROM, "promote", "test")
+        .await
+        .expect("fence the source");
+    let before = stamp(&mut source).await;
+    let refused = resume_stalled_cutovers(&pool, FROM, grace, 10).await;
+    assert!(
+        matches!(refused, Err(HarvestError::ShardFenced { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        stamp(&mut source).await,
+        before,
+        "no claim on a fenced source"
+    );
+    assert_eq!(attempts_of(&mut source, exec_id).await, 0);
+    assert_eq!(
+        phase_of(&mut source, exec_id).await,
+        MigrationPhase::Committed
+    );
+
+    // A current source but a stale target: the activation is refused.
+    FenceRegistry::clear();
+    FenceRegistry::register(FROM, ShardGeneration::new(1)).expect("pin the source");
+    FenceRegistry::register(TO, ShardGeneration::new(0)).expect("pin the target");
+    bump_generation(&mut target, TO, "promote", "test")
+        .await
+        .expect("fence the target");
+    let outcomes = resume_stalled_cutovers(&pool, FROM, grace, 10).await;
+    FenceRegistry::clear();
+    let outcomes = outcomes.expect("the pass itself runs");
+    assert!(
+        matches!(outcomes.as_slice(), [MigrationOutcome::Aborted { .. }]),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        phase_of(&mut source, exec_id).await,
+        MigrationPhase::Committed
+    );
+    assert_eq!(attempts_of(&mut source, exec_id).await, 1);
+    assert_eq!(auto_resume_audits(&mut source, exec_id).await, 0);
+    assert_eq!(
+        state_of(&mut target, exec_id).await.as_deref(),
+        Some("MIGRATING"),
+        "a fenced target is never activated"
+    );
 }

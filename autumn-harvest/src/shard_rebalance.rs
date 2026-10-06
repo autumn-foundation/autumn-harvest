@@ -1149,6 +1149,28 @@ mod db {
         Ok(())
     }
 
+    /// [`record_attempt`] behind the DR fence of `fence`, when given (issue
+    /// #1839).
+    ///
+    /// The scanner passes the source shard. A node without write authority
+    /// there then records nothing, so it cannot move `updated_at` and delay
+    /// the node that has authority.
+    async fn record_attempt_fenced(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        error: &str,
+        fence: Option<ShardId>,
+    ) -> HarvestResult<()> {
+        let Some(shard) = fence else {
+            return record_attempt(conn, exec_id, error).await;
+        };
+        Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+            crate::replication::assert_fence(conn, shard).await?;
+            record_attempt(conn, exec_id, error).await
+        }))
+        .await
+    }
+
     async fn set_phase(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -3903,6 +3925,10 @@ mod db {
         outcomes: &mut Vec<MigrationOutcome>,
     ) -> HarvestResult<()> {
         let exec_id = record.execution_id;
+        // Every scanner write on the source checks the DR fence (issue #1839).
+        let source_fence = (matches!(driver, MigrationDriver::Scanner)
+            && crate::replication::FenceRegistry::is_enabled())
+        .then_some(record.source_shard);
         // A `?` here would exit the whole sweep on one record naming an
         // unavailable or unconfigured shard (issue #1317). That starves
         // every later record behind it, including a settled one whose own
@@ -3928,7 +3954,8 @@ mod db {
                 // fails, there is nothing to record to. The record is
                 // left for the next sweep as-is.
                 if let Ok(mut source) = checkout(pool, record.source_shard).await {
-                    let _ = record_attempt(&mut source, exec_id, &reason).await;
+                    let _ =
+                        record_attempt_fenced(&mut source, exec_id, &reason, source_fence).await;
                 }
                 outcomes.push(MigrationOutcome::Aborted {
                     execution_id: exec_id,
@@ -4071,7 +4098,7 @@ mod db {
                 Ok(None) => {}
                 Err(error) => {
                     let reason = error.to_string();
-                    record_attempt(&mut source, exec_id, &reason).await?;
+                    record_attempt_fenced(&mut source, exec_id, &reason, source_fence).await?;
                     outcomes.push(MigrationOutcome::Aborted {
                         execution_id: exec_id,
                         reason,
