@@ -183,8 +183,9 @@ replay corruption from such data.
 write path (codec encode, then offload), the read path (inflate, then codec
 decode) and the replayer. The replayed workflow issues the commands that
 the history records, so replay goes past the first event. `fuzzing::mirror`
-models join batches, races, fan-outs, cancellable timers, version and patch
-markers, and redrives. A history that the mirror does not model still runs.
+models join batches, races, fan-outs (fail-fast and collect-all),
+cancellable timers, signal timeouts, version and patch markers, and
+redrives. A history that the mirror does not model still runs.
 It ends at an early mismatch, which costs coverage but no oracle. The
 oracles:
 

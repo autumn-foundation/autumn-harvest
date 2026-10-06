@@ -43,7 +43,7 @@ use crate::payload_store::{
 };
 use crate::telemetry::NoOpMetrics;
 use crate::testing::{ReplayReport, WorkflowReplayer};
-use crate::types::{ExecutionId, ExternalTarget, ParentClosePolicy};
+use crate::types::{ActivityExecId, ExecutionId, ExternalTarget, ParentClosePolicy};
 
 /// The deepest JSON nesting that the generator builds.
 const MAX_DEPTH: u32 = 6;
@@ -276,6 +276,8 @@ pub enum Op {
         activities: Vec<(String, Value, String)>,
         /// The most activities in flight at once.
         window: Option<usize>,
+        /// True for the collect-all form, which goes on past a failed item.
+        collect: bool,
     },
     /// `ctx.spawn_child_workflow_fan_out_raw` over `(name, input)` items.
     ChildFanOut {
@@ -349,6 +351,13 @@ pub enum Op {
     Mutex {
         /// Lock key.
         key: String,
+    },
+    /// `ctx.wait_for_signal_timeout`, a signal wait bounded by a timer.
+    SignalTimeout {
+        /// Signal name.
+        name: String,
+        /// Timeout in seconds.
+        secs: u64,
     },
     /// `ctx.start_timer`, a cancellable timer. The handle drops at once.
     ArmTimer {
@@ -735,6 +744,9 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         .rposition(|event| matches!(event, WorkflowEvent::WorkflowRedriven { .. }));
     let mut race_timers: HashSet<&str> = HashSet::new();
     let mut consumed: HashSet<usize> = HashSet::new();
+    // Signal waits that a `__signal_timeout:` timer bounds, by signal name.
+    // The op takes the signal that wins, or the timer fire.
+    let mut timeouts: HashMap<&str, usize> = HashMap::new();
     let mut program = Vec::new();
     let mut batch = Vec::new();
     let mut index = 0;
@@ -752,8 +764,13 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                 ))
             }
             _ if consumed.remove(&(index - 1)) => None,
-            WorkflowEvent::MarkerRecorded { name, .. } if race_seq(name).is_some() => {
-                let (race, next) = mirror_race(history, index, name, &mut race_timers);
+            WorkflowEvent::MarkerRecorded { name, details } if race_seq(name).is_some() => {
+                let count = details.as_u64().and_then(|n| usize::try_from(n).ok());
+                let race = RaceOpen {
+                    marker: name,
+                    count: count.unwrap_or(0),
+                };
+                let (race, next) = mirror_race(history, index, &race, &mut race_timers);
                 index = next;
                 Some(race)
             }
@@ -763,6 +780,31 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                 None
             }
             WorkflowEvent::WorkflowFailed { .. } if last_redrive.is_some_and(|r| r >= index) => {
+                None
+            }
+            WorkflowEvent::TimerStarted {
+                timer_id,
+                duration_secs,
+            } if signal_timeout_name(timer_id.as_str()).is_some() => {
+                let name = signal_timeout_name(timer_id.as_str()).unwrap_or_default();
+                *timeouts.entry(name).or_default() += 1;
+                Some(Op::SignalTimeout {
+                    name: name.to_string(),
+                    secs: *duration_secs,
+                })
+            }
+            WorkflowEvent::SignalReceived { signal_name, .. }
+                if take_one(&mut timeouts, signal_name.as_str()) =>
+            {
+                None
+            }
+            WorkflowEvent::TimerFired { timer_id } | WorkflowEvent::TimerCancelled { timer_id }
+                if signal_timeout_name(timer_id.as_str()).is_some() =>
+            {
+                take_one(
+                    &mut timeouts,
+                    signal_timeout_name(timer_id.as_str()).unwrap_or_default(),
+                );
                 None
             }
             _ => mirror_event(event, armed.contains(&(index - 1))),
@@ -797,6 +839,7 @@ fn mirror_fan_out(
     let mut first_wave = true;
     let mut first_wave_len = 0;
     let mut refills = 0usize;
+    let mut collect = false;
     for (index, event) in history.iter().enumerate().skip(start) {
         if activities.len() + children.len() >= count {
             break;
@@ -841,8 +884,25 @@ fn mirror_fan_out(
                 first_wave = false;
                 continue;
             }
-            // A failed item ends a fail-fast group. Any other event is not
-            // part of the group, so a later schedule is the caller's own.
+            // A failed item ends a fail-fast group. A collect-all group goes
+            // on, and its next wave is a full run of schedules.
+            WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                if activity_ids.contains(activity_id)
+                    && (collect
+                        || next_wave_is_full(
+                            &history[index + 1..],
+                            &activity_ids,
+                            first_wave_len.min(count - activities.len()),
+                        )) =>
+            {
+                collect = true;
+                first_wave = false;
+                refills += 1;
+                continue;
+            }
+            // Any other event is not part of the group, so a later schedule
+            // is the caller's own.
             _ => break,
         }
         if first_wave {
@@ -858,11 +918,36 @@ fn mirror_fan_out(
     if children.is_empty() {
         pad_to(&mut activities, count);
         let window = (first_wave_len > 0 && first_wave_len < count).then_some(first_wave_len);
-        Op::FanOut { activities, window }
+        Op::FanOut {
+            activities,
+            window,
+            collect: collect && window.is_some(),
+        }
     } else {
         pad_to(&mut children, count);
         Op::ChildFanOut { children }
     }
+}
+
+/// True when `rest` holds a run of at least `need` schedules once the group's
+/// own progress and terminal events are passed over. A collect-all group
+/// schedules such a wave after a failed item. A fail-fast caller that catches
+/// the error schedules its own work instead, which is seldom a full wave.
+fn next_wave_is_full(rest: &[WorkflowEvent], group: &HashSet<ActivityExecId>, need: usize) -> bool {
+    let of_group = |event: &WorkflowEvent| match event {
+        WorkflowEvent::ActivityStarted { activity_id, .. }
+        | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+        | WorkflowEvent::ActivityCompleted { activity_id, .. }
+        | WorkflowEvent::ActivityFailed { activity_id, .. }
+        | WorkflowEvent::ActivityTimedOut { activity_id, .. } => group.contains(activity_id),
+        _ => false,
+    };
+    let wave = rest
+        .iter()
+        .skip_while(|event| of_group(event))
+        .take_while(|event| matches!(event, WorkflowEvent::ActivityScheduled { .. }))
+        .count();
+    need > 0 && wave >= need
 }
 
 /// Repeats the last item until `items` holds `count` items.
@@ -877,36 +962,135 @@ fn race_seq(name: &str) -> Option<&str> {
     name.strip_prefix("race:")
 }
 
+/// The `race:{seq}` marker that opens a race, and the branch count it holds.
+struct RaceOpen<'h> {
+    marker: &'h str,
+    count: usize,
+}
+
+/// The signal name that no history holds. A race branch on it never wins.
+const UNSEEN_SIGNAL: &str = "__fuzz_unseen_signal";
+
+/// The most branches a mirrored race gets, whatever its marker claims.
+const MAX_RACE_BRANCHES: usize = 64;
+
+/// The activity or child that a race branch started.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Branch {
+    Activity(ActivityExecId),
+    Child(ExecutionId),
+}
+
 /// Builds the [`Op::Race`] that a `race:{seq}` marker opens. Reads from
 /// `start` up to and past the matching `race_winner:{seq}` marker. Returns
 /// the op and the index after the race.
+///
+/// The race keeps the branch count of its marker. A race timer goes to the
+/// index in its `__race:{seq}:{index}` id. The winning signal, or else the
+/// first branch that finished, goes to the recorded winner index. The other
+/// branches fill the free slots in order. A losing signal writes no event,
+/// so each slot still free becomes a signal branch that never wins.
 fn mirror_race<'h>(
     history: &'h [WorkflowEvent],
     start: usize,
-    open: &str,
+    open: &RaceOpen<'_>,
     race_timers: &mut HashSet<&'h str>,
 ) -> (Op, usize) {
-    let winner = format!("race_winner:{}", race_seq(open).unwrap_or_default());
-    let mut branches = Vec::new();
+    let seq = race_seq(open.marker).unwrap_or_default();
+    let winner_marker = format!("race_winner:{seq}");
+    let timer_prefix = format!("__race:{seq}:");
+    let mut timers = Vec::new();
+    let mut started = Vec::new();
+    let mut finished = HashSet::new();
+    let mut signal = None;
+    let mut winner = None;
     let mut index = start;
     while index < history.len() {
         let event = &history[index];
         index += 1;
-        if matches!(event, WorkflowEvent::MarkerRecorded { name, .. } if *name == winner) {
-            break;
-        }
-        if let WorkflowEvent::TimerStarted { timer_id, .. } = event {
-            race_timers.insert(timer_id.as_str());
-        }
-        let op = mirror_event(event, false);
-        if let Some(
-            op @ (Op::Activity { .. } | Op::Child { .. } | Op::Timer { .. } | Op::Signal { .. }),
-        ) = op
-        {
-            branches.push(op);
+        match event {
+            WorkflowEvent::MarkerRecorded { name, details } if *name == winner_marker => {
+                winner = details.as_u64().and_then(|w| usize::try_from(w).ok());
+                break;
+            }
+            WorkflowEvent::TimerStarted { timer_id, .. } => {
+                race_timers.insert(timer_id.as_str());
+                let slot = timer_id.as_str().strip_prefix(timer_prefix.as_str());
+                let slot = slot.and_then(|i| i.parse::<usize>().ok());
+                if let Some(op) = mirror_event(event, false) {
+                    timers.push((slot, op));
+                }
+            }
+            WorkflowEvent::ActivityScheduled { activity_id, .. } => {
+                started.extend(
+                    mirror_event(event, false).map(|op| (Branch::Activity(*activity_id), op)),
+                );
+            }
+            WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
+                started.extend(mirror_event(event, false).map(|op| (Branch::Child(*child_id), op)));
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+                finished.insert(Branch::Activity(*activity_id));
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+            | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                finished.insert(Branch::Child(*child_id));
+            }
+            WorkflowEvent::SignalReceived { .. } => signal = mirror_event(event, false),
+            _ => {}
         }
     }
+    let seen = timers.len() + started.len() + usize::from(signal.is_some());
+    let mut slots: Vec<Option<Op>> = (0..open.count.min(MAX_RACE_BRANCHES).max(seen))
+        .map(|_| None)
+        .collect();
+    let mut rest = Vec::new();
+    for (slot, op) in timers {
+        match slot.and_then(|i| slots.get_mut(i)) {
+            Some(free @ None) => *free = Some(op),
+            _ => rest.push(op),
+        }
+    }
+    if let Some(free @ None) = winner.and_then(|w| slots.get_mut(w)) {
+        let first_done = started
+            .iter()
+            .position(|(branch, _)| finished.contains(branch));
+        *free = signal
+            .take()
+            .or_else(|| first_done.map(|i| started.remove(i).1));
+    }
+    rest.extend(started.into_iter().map(|(_, op)| op));
+    rest.extend(signal);
+    let mut rest = rest.into_iter();
+    let branches = slots
+        .into_iter()
+        .map(|slot| {
+            slot.or_else(|| rest.next()).unwrap_or_else(|| Op::Signal {
+                name: UNSEEN_SIGNAL.to_string(),
+            })
+        })
+        .collect();
     (Op::Race { branches }, index)
+}
+
+/// The signal name in a `__signal_timeout:{seq}:{name}` timer id, which
+/// `wait_for_signal_timeout` and a timer-and-signal race write.
+fn signal_timeout_name(timer_id: &str) -> Option<&str> {
+    let rest = timer_id.strip_prefix("__signal_timeout:")?;
+    rest.split_once(':').map(|(_, name)| name)
+}
+
+/// Takes one from the count for `name`. False when the count is zero.
+fn take_one(counts: &mut HashMap<&str, usize>, name: &str) -> bool {
+    match counts.get_mut(name) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The indexes of the `TimerStarted` events that the cancellable timer API
@@ -971,6 +1155,7 @@ impl Op {
                 | Self::Mutex { .. }
                 | Self::FanOut { .. }
                 | Self::ChildFanOut { .. }
+                | Self::SignalTimeout { .. }
         )
     }
 
@@ -1248,22 +1433,12 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
         | Op::RandomFloat { .. }
         | Op::Patched { .. }
         | Op::SideEffect { .. }) => run_capture_op(ctx, op),
-        Op::FanOut {
-            activities,
-            window: None,
-        } => {
-            let _ = ctx.execute_activity_fan_out_raw(activities).await;
+        op @ (Op::FanOut { .. } | Op::ChildFanOut { .. } | Op::Race { .. }) => {
+            run_group_op(ctx, op).await;
         }
-        Op::FanOut {
-            activities,
-            window: Some(window),
-        } => {
-            let _ = ctx
-                .execute_activity_fan_out_raw_windowed(activities, window)
-                .await;
-        }
-        Op::ChildFanOut { children } => {
-            let _ = ctx.spawn_child_workflow_fan_out_raw(children).await;
+        Op::SignalTimeout { name, secs } => {
+            let timeout = std::time::Duration::from_secs(secs);
+            let _ = ctx.wait_for_signal_timeout(&name, timeout).await;
         }
         Op::Complete { output } => return Some(Ok(output)),
         Op::Fail { error } => return Some(Err(error)),
@@ -1287,6 +1462,51 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
                 None => ctx.continue_as_new(input).await,
             };
         }
+        Op::Concurrent { ops } => {
+            let runs = ops.into_iter().map(|op| Box::pin(run_op(ctx, op)));
+            // The first result in program order wins, as in a sequence.
+            return futures::future::join_all(runs)
+                .await
+                .into_iter()
+                .flatten()
+                .next();
+        }
+        other => run_external_op(ctx, other).await,
+    }
+    None
+}
+
+/// Runs a fan-out or a race, an op that starts a group of commands.
+async fn run_group_op(ctx: &WorkflowContext, op: Op) {
+    match op {
+        Op::FanOut {
+            activities,
+            window: None,
+            ..
+        } => {
+            let _ = ctx.execute_activity_fan_out_raw(activities).await;
+        }
+        Op::FanOut {
+            activities,
+            window: Some(window),
+            collect: false,
+        } => {
+            let _ = ctx
+                .execute_activity_fan_out_raw_windowed(activities, window)
+                .await;
+        }
+        Op::FanOut {
+            activities,
+            window: Some(window),
+            collect: true,
+        } => {
+            let _ = ctx
+                .execute_activity_fan_out_collect_raw_windowed(activities, window)
+                .await;
+        }
+        Op::ChildFanOut { children } => {
+            let _ = ctx.spawn_child_workflow_fan_out_raw(children).await;
+        }
         Op::Race { branches } => {
             let mut race = ctx.race();
             for branch in branches {
@@ -1300,18 +1520,8 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
             }
             let _ = race.run().await;
         }
-        Op::Concurrent { ops } => {
-            let runs = ops.into_iter().map(|op| Box::pin(run_op(ctx, op)));
-            // The first result in program order wins, as in a sequence.
-            return futures::future::join_all(runs)
-                .await
-                .into_iter()
-                .flatten()
-                .next();
-        }
-        other => run_external_op(ctx, other).await,
+        _ => {}
     }
-    None
 }
 
 /// Runs an op that captures a value in the same decision and never parks.
