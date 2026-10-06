@@ -29,7 +29,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 EVENT_ROW_PREFIX = "| `event.rs` |"
-COUNT_RE = re.compile(r"\b\d[\d,]*\s+variants\b")
+# A count beside "variant", in either order, with only separators between:
+# "41 variants", "49 Variants", "Variants: 49", "variants — 1,050".
+COUNT_RE = re.compile(
+    r"(?i)\b\d[\d,]*[\s:=—-]*variants?\b|\bvariants?\b[\s:=(—-]*\d"
+)
 # A semver core with an optional prerelease and build part. Heading
 # punctuation after it, such as "## 0.7.0: notes", is not part of it.
 SEMVER_ID = r"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*"
@@ -105,10 +109,22 @@ def line_of(text, offset):
     return text.count("\n", 0, offset) + 1
 
 
+def markdown_lines(text):
+    """Yield (line number, line) outside fenced blocks."""
+    fence = None
+    for n, line in enumerate(text.splitlines(), 1):
+        marker = re.match(r"\s*(```|~~~)", line)
+        if marker:
+            fence = None if fence == marker.group(1) else fence or marker.group(1)
+            continue
+        if fence is None:
+            yield n, line
+
+
 def event_row_count_findings(path, text):
     """Return a message for each variant count in an `event.rs` row."""
     found = []
-    for n, line in enumerate(text.splitlines(), 1):
+    for n, line in markdown_lines(text):
         if line.startswith(EVENT_ROW_PREFIX):
             for m in COUNT_RE.finditer(line):
                 found.append(
@@ -120,8 +136,12 @@ def event_row_count_findings(path, text):
 
 def duplicate_row_findings(path, text):
     """Return a message for each repeated first cell within one table."""
-    found, seen = [], None
-    for n, line in enumerate(text.splitlines(), 1):
+    found, seen, last = [], None, 0
+    for n, line in markdown_lines(text):
+        if n != last + 1:
+            # A fenced block between two lines ends the table.
+            seen = None
+        last = n
         if not line.startswith("|"):
             seen = None
             continue
@@ -193,14 +213,16 @@ def self_test():
     rows = (
         "| `event.rs` | 1 | `WorkflowEvent` enum (41 variants, tagged). |\n"
         "| `event.rs` | 1 | `WorkflowEvent` enum — 1,050 variants. |\n"
-        "| `event.rs` | 1 | `WorkflowEvent` enum. Issue #140 added `UpdateAdmitted`. |\n"
+        "| `event.rs` | 1 | `WorkflowEvent` enum. Variants: 49. |\n"
+        "| `event.rs` | 1 | `WorkflowEvent` enum (49 Variants). |\n"
+        "| `event.rs` | 1 | `WorkflowEvent` enum. Variants added in issue #140. |\n"
+        "```\n| `event.rs` | 1 | 7 variants, in a sample. |\n```\n"
         "| `queue.rs` | 2 | Handles 3 variants of `TaskType`. |\n"
         "Prose: `WorkflowEvent` has 2 variants for sessions.\n"
     )
     found = event_row_count_findings("x.md", rows)
-    assert len(found) == 2, found
-    assert found[0].startswith("x.md:1") and "41 variants" in found[0], found
-    assert found[1].startswith("x.md:2") and "1,050 variants" in found[1], found
+    assert [m.split(":")[1] for m in found] == ["1", "2", "3", "4"], found
+    assert "41 variants" in found[0] and "1,050 variants" in found[1], found
 
     table = (
         "| Module | P |\n|---|---|\n| `a.rs` | 1 |\n| `a.rs` | 2 |\n"
@@ -208,6 +230,10 @@ def self_test():
     )
     found = duplicate_row_findings("x.md", table)
     assert len(found) == 1 and "x.md:4" in found[0], found
+    sample = "```text\n| state |\n| state |\n```\n| `b.rs` | 1 |\n"
+    assert duplicate_row_findings("x.md", sample) == []
+    split = "| `c.rs` | 1 |\n```\nx\n```\n| `c.rs` | 2 |\n"
+    assert duplicate_row_findings("x.md", split) == []
 
     cargo = (
         '[workspace]\nmembers = []\n\n[workspace.package]\n'
