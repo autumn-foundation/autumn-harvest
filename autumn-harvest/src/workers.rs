@@ -4234,7 +4234,8 @@ mod tests {
     /// source rather than timing.
     #[test]
     fn the_cohort_key_reads_the_codec_keys_under_one_lock() {
-        let src = include_str!("workers.rs");
+        // A Windows checkout has CRLF line ends. The end search needs LF.
+        let src = include_str!("workers.rs").replace("\r\n", "\n");
         let start = src
             .find("pub fn cohort_key(&self)")
             .expect("cohort_key exists");
