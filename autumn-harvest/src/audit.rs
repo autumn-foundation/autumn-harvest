@@ -247,6 +247,12 @@ pub const OP_LOAD_SHED_CLEAR: &str = "load_shed.clear";
 /// The row has status `failed`, so the SIEM export marks it `ERROR`. The deny
 /// reason goes in `error_summary` and never into the response.
 pub const OP_AUTHZ_DENY: &str = "authz.deny";
+/// Audit operation: one API rate-limit bucket reached the sustained-rejection
+/// threshold in one window (issue #1827).
+///
+/// The row has status `failed`. The limiter writes it, not a route, so no
+/// `ALL_MUTATION_ROUTES` entry exists for it.
+pub const OP_API_RATE_LIMIT_SUSTAINED: &str = "api.rate_limit_sustained";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -959,6 +965,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // Build ramp guard (issue #1814). No route entry: the guard writes these
     // rows.
     OP_BUILD_RAMP_AUTO_ABORT,
+    // API rate limiting (issue #1827). No route entry: the limiter writes it.
+    OP_API_RATE_LIMIT_SUSTAINED,
 ];
 
 /// Routes explicitly excluded from audit.

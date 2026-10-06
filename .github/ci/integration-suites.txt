@@ -53,6 +53,7 @@ allos        autumn-harvest         integration                      testing    
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
 allos        autumn-harvest         property                         db                         -
+allos        autumn-harvest-plugin  api_rate_limit                   -                          -
 allos        autumn-harvest-plugin  connector_dependency_graph       -                          -
 allos        autumn-harvest-plugin  connector_example_budget         -                          -
 allos        autumn-harvest-plugin  contract_regression              -                          -
@@ -196,6 +197,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
+linux        autumn-harvest-plugin  api_rate_limit_integration       -                          -
 linux        autumn-harvest-plugin  api_scheduler_integration        -                          -
 linux        autumn-harvest-plugin  authz_integration                -                          -
 linux        autumn-harvest-plugin  awaitables_integration           -                          -

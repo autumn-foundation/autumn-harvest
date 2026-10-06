@@ -333,6 +333,7 @@ metric is emitted in the source code.
 | `harvest.load_shed.active` | Gauge | `load_shed.rs` — `sample_once`, the load-shed sampler. It writes 1 or 0 for every configured queue on every tick, also after a failed read (issue #1794) |
 | `harvest.load_shed.rejected` | Counter | `execution.rs` — `admit_fresh_start`, once per fresh start that load shedding refuses. The start and batch routes in `api.rs` (plugin) also count a throttled start that they shed before its defer (issue #1794) |
 | `harvest.build.ramp_aborted` | Counter | `ramp_guard.rs` — `guard_once`, once per build ramp that the ramp guard aborts. See `docs/operations/build-ramp-guard.md` (issue #1814) |
+| `harvest.api.rate_limited` | Counter | `api_rate_limit.rs` (plugin) — `enforce_api_rate_limit`, once per request the optional API rate limiter refuses with `429` (issue #1827) |
 | `harvest.queue.dispatched` | Counter | `worker.rs` — `dispatch_task`, once per dispatched task; lets operators confirm the live per-queue dispatch split matches `WorkerConfig::queue_weights` (issue #515) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
 | `harvest.shard.stranded_pending` | Gauge | `worker.rs` — `spawn_stranded_work_sampler`, periodic (`poll_interval`). Claimable pending tasks on a shard with **no covering live worker** (issue #522). Iterates **every** shard of the worker's `ShardedDbPool`, not just its assigned ones, so a writable shard nobody polls is still surfaced. Emits `0` for a covered shard so the gauge resets cleanly |
@@ -414,6 +415,7 @@ metric is emitted in the source code.
 | `harvest.load_shed.active` | `queue` — only queues with a load-shed policy (issue #1794) |
 | `harvest.load_shed.rejected` | `queue` — only queues with a load-shed policy (issue #1794) |
 | `harvest.build.ramp_aborted` | `queue`, `reason` (`failure_rate\|nd_block_rate\|unreported`) (issue #1814) |
+| `harvest.api.rate_limited` | `route_class` (`mutating`, `read`), `client_kind` (`token`, `ip`, `unknown`, `overflow`). Never the token id or address (issue #1827) |
 | `harvest.dlq.entries` | `shard` |
 | `harvest.shard.stranded_pending` | `shard` |
 | `harvest.shard.dispatched` | `shard` |
