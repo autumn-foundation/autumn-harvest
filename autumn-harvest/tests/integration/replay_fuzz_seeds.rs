@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use autumn_harvest::fuzzing::{ReplayCase, Verdict, check_case};
+use autumn_harvest::fuzzing::{Op, ReplayCase, Verdict, check_case};
 
 fn seed_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fuzz/seeds/fuzz_replay")
@@ -186,6 +186,28 @@ fn generated_cases_pass_the_oracles() {
         events >= cases * 3,
         "a mean history of {events}/{cases} events is too short"
     );
+}
+
+/// Every generated program survives the JSON round trip. The replayed
+/// workflow reads its program back from a JSON header, so a value that JSON
+/// cannot hold, such as a NaN `f64`, once crashed the fuzz target.
+#[test]
+fn generated_programs_round_trip_through_json() {
+    let mut programs = 0_usize;
+    for seed in 0..300 {
+        let Some(case) = ReplayCase::from_fuzz_bytes(&bytes(seed, 2048)) else {
+            continue;
+        };
+        let Some(program) = case.program else {
+            continue;
+        };
+        programs += 1;
+        let json = serde_json::to_string(&program).expect("a program serializes");
+        let back: Vec<Op> = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("input {seed}: the program does not read back: {e}"));
+        assert_eq!(back.len(), program.len(), "input {seed}");
+    }
+    assert!(programs >= 50, "only {programs} inputs carried a program");
 }
 
 /// The generator reaches every `WorkflowEvent` variant. A variant it cannot

@@ -204,6 +204,11 @@ fn text(u: &mut Unstructured<'_>) -> arbitrary::Result<String> {
     }
 }
 
+/// Reads an `f64`, or NaN for `null`, the JSON form of a non-finite value.
+fn f64_or_nan<'de, D: serde::Deserializer<'de>>(de: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(de)?.unwrap_or(f64::NAN))
+}
+
 fn fan_out_items(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<(String, Value, String)>> {
     let len = u.int_in_range(0..=MAX_ITEMS)?;
     (0..len)
@@ -265,7 +270,10 @@ pub enum Op {
     },
     /// `ctx.random_range(value..=value)` over `f64`.
     RandomFloat {
-        /// The value, which is also both bounds.
+        /// The value, which is also both bounds. JSON writes a non-finite
+        /// value as `null`, so `null` reads back as NaN.
+        #[arbitrary(with = finite_f64)]
+        #[serde(deserialize_with = "f64_or_nan")]
         value: f64,
     },
     /// `ctx.execute_activity_fan_out_raw` over `(name, input, queue)` items,
