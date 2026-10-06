@@ -341,3 +341,17 @@ fn record_retry_budget_exhausted_bridges_counter_with_activity_label() {
     let labels = labels_of(key);
     assert_eq!(labels, vec![("activity", "charge_card")], "issue #1793");
 }
+
+#[test]
+fn record_api_rate_limited_bridges_counter_with_class_and_kind() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_api_rate_limited("mutating", "token");
+    });
+    let key = find_key(&keys, "harvest.api.rate_limited", InstrumentKind::Counter);
+    let labels = labels_of(key);
+    assert_eq!(
+        labels,
+        vec![("route_class", "mutating"), ("client_kind", "token")],
+        "issue #1827"
+    );
+}
