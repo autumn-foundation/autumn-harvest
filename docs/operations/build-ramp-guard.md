@@ -219,11 +219,14 @@ The guard fails safe: when it cannot read, it does not abort.
   ramp with the same base. The
   match uses ids, not database clocks, so clock skew between pools does not
   matter. An operator ramp set after the abort has a new `ramp_id`, so the
-  guard does not clear it. A ramp set before the migration has no id, and the
-  guard cannot finish its partial abort after a restart. Its clear still
-  writes a marker under a report id that the guard picks for the abort, so
-  a failed report of it stays recoverable. Two replicas that abort the same
-  ramp with no id pick two report ids, so that abort can be reported twice.
+  guard does not clear it. A ramp set before the migration has no id. The
+  guard picks a report id for its abort and writes it as the `ramp_id` of
+  every pool that still holds the ramp, before any clear. The clear writes
+  its marker under the same id. So a later guard can finish a pool that did
+  not clear, also after a restart, and a failed report stays recoverable.
+  A pool that rejects that write keeps no id, and the guard cannot finish
+  it after a restart. Two replicas that abort the same ramp with no id pick
+  two report ids, so that abort can be reported twice.
 - A pool can hold an abort marker and a newer operator ramp at the same time.
   The guard reads the marker anyway. It clears only the pools whose `ramp_id`
   matches a marker. The newer ramp stays, and the next pass judges it on its
@@ -302,8 +305,10 @@ The guard fails safe: when it cannot read, it does not abort.
   pool misses its tombstone, the guard keeps the markers of that queue and
   tries again on the next pass.
   The tombstone write and both ramp writers take one advisory lock per
-  queue. A writer therefore commits before the tombstone, while the markers
-  still refuse the aborted id, or starts after it and meets the tombstone.
+  queue. A writer that starts after the tombstone meets it. A writer can
+  also commit just before the tombstone, on a pool that holds no marker,
+  for example a pool that the first fan-out missed. Under the same lock,
+  the tombstone write clears a live ramp with a tombstoned id on its pool.
 - A guard that reported but could not mark any of its markers causes a
   second report after the grace. A failed audit write also makes the counter count
   the abort twice. An extra report is better than an abort with none.

@@ -1155,7 +1155,10 @@ struct FleetRead {
 /// pool, within `bound`. Returns `true` when the write committed.
 ///
 /// The guard calls it on every pool before it prunes the markers of a
-/// reported abort. A ramp write then still refuses the aborted generation
+/// reported abort. Under the same lock it clears a live ramp with a
+/// tombstoned id. Only a write after the fleet read makes such a ramp, for
+/// example on a pool that the first fan-out missed. It would otherwise
+/// outlive the pruned markers. A ramp write then still refuses the aborted generation
 /// on that pool, as [`crate::build_routing::set_build_ramp_with_id`] reads
 /// the local ledger. Without the tombstone, only the audit pool would know
 /// the abort once the markers are gone. A tombstone row never starts a
@@ -1196,6 +1199,20 @@ async fn record_abort_tombstones(
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
+            let cleared = diesel::sql_query(
+                "UPDATE harvest_build_policies \
+                 SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, \
+                     updated_at = NOW() \
+                 WHERE queue_name = $1 AND ramp_id = ANY($2::uuid[])",
+            )
+            .bind::<Text, _>(queue)
+            .bind::<Array<diesel::sql_types::Uuid>, _>(ramp_ids)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+            if cleared > 0 {
+                tracing::info!(queue = %queue, pool = index, "ramp guard cleared a late write of an aborted ramp");
+            }
             Ok(())
         })
         .await
@@ -1210,6 +1227,66 @@ async fn record_abort_tombstones(
         Err(_) => {
             tracing::warn!(queue = %queue, pool = index, "ramp guard tombstone write timed out");
             false
+        }
+    }
+}
+
+/// Give the ramp of one pool step the report id, when it has no `ramp_id`,
+/// within `bound`.
+///
+/// The guard calls it on every pool before it clears a ramp with no
+/// `ramp_id`. The clear then writes a marker with the same id, so a pool
+/// that did not clear holds a ramp that the marker matches. A later guard
+/// can finish that pool after a restart. The write changes only
+/// `ramp_id`, so the step and the reset trigger leave the ramp as is. A
+/// failure only logs a warning: that pool then stays unmatched, as before.
+#[cfg(feature = "db")]
+async fn stamp_report_id(
+    pool: &crate::worker::DbPool,
+    index: usize,
+    (queue, base, target): &RampKey,
+    step: chrono::DateTime<chrono::Utc>,
+    report_id: uuid::Uuid,
+    bound: Duration,
+) {
+    use diesel::sql_types::{Text, Timestamptz};
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+
+    let timeout_ms = bound.as_millis().max(1);
+    let stamp = async {
+        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        conn.transaction(async |conn| -> crate::error::HarvestResult<()> {
+            for setting in ["lock_timeout", "statement_timeout"] {
+                diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            diesel::sql_query(
+                "UPDATE harvest_build_policies SET ramp_id = $5 \
+                 WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
+                   AND updated_at = $4 AND ramp_id IS NULL",
+            )
+            .bind::<Text, _>(queue)
+            .bind::<Text, _>(base)
+            .bind::<Text, _>(target)
+            .bind::<Timestamptz, _>(step)
+            .bind::<diesel::sql_types::Uuid, _>(report_id)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())
+    };
+    match tokio::time::timeout(bound.saturating_mul(2), stamp).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard report id stamp failed");
+        }
+        Err(_) => {
+            tracing::warn!(queue = %queue, pool = index, "ramp guard report id stamp timed out");
         }
     }
 }
@@ -1975,6 +2052,16 @@ impl RampGuard {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<RampAbort> {
         let report_id = ramp_id.unwrap_or_else(uuid::Uuid::new_v4);
+        if ramp_id.is_none() {
+            for &(index, step) in steps {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if let Some(pool) = pools.get(index) {
+                    stamp_report_id(pool, index, &key, step, report_id, bound).await;
+                }
+            }
+        }
         let mut outcomes = Vec::with_capacity(steps.len());
         let mut failed: Vec<PendingStep> = Vec::new();
         for &(index, step) in steps {
