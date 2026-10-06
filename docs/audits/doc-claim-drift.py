@@ -30,7 +30,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 EVENT_ROW_PREFIX = "| `event.rs` |"
 COUNT_RE = re.compile(r"\b\d[\d,]*\s+variants\b")
-VERSION_HEADING_RE = re.compile(r"^##\s+\[?v?(\d+\.\d+\.\d+[^\]\s]*)\]?", re.MULTILINE)
+# A semver core with an optional prerelease and build part. Heading
+# punctuation after it, such as "## 0.7.0: notes", is not part of it.
+SEMVER_ID = r"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*"
+VERSION_HEADING_RE = re.compile(
+    rf"^##\s+\[?v?(\d+\.\d+\.\d+(?:-{SEMVER_ID})?(?:\+{SEMVER_ID})?)", re.MULTILINE
+)
 FENCE_RE = re.compile(r"^(```|~~~).*?^\1", re.MULTILINE | re.DOTALL)
 CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 
@@ -212,6 +217,10 @@ def self_test():
     assert release_notes_findings("Pointer to CHANGELOG.md.\n", cargo) == []
     assert release_notes_findings("## [0.7.0] - x\n## [0.6.0] - y\n", cargo) == []
     assert release_notes_findings("```\n## [0.1.0]\n```\n## 0.7.0\n", cargo) == []
+    assert release_notes_findings("## 0.7.0: Release notes\n", cargo) == []
+    assert release_notes_findings("## v0.7.0.\n", cargo) == []
+    found = release_notes_findings("## [0.7.0-rc.1+b.5] - x\n", cargo)
+    assert len(found) == 1 and "0.7.0-rc.1+b.5" in found[0], found
     found = release_notes_findings("<!-- -->\n## [0.4.0] - x\n", cargo)
     assert len(found) == 1 and "0.4.0" in found[0], found
 
