@@ -755,6 +755,49 @@ async fn parent(ctx: &WorkflowContext, order: Order) -> Result<String, String> {
 
 **Lock-ordering convention for `materialize_due_child_timeout_deadlines` (Codex round-11 P2 ABBA fix).** The materializer acquires the **parent execution row `FOR UPDATE` FIRST, then the due `harvest_timers` rows `FOR UPDATE`** — the unified `harvest_workflow_executions` → `harvest_timers` order (documented in a convention comment at the materializer, mirroring the `harvest_external_tasks` task-row → execution-row convention documented in `timeout.rs` from the issue #609 round-9 hardening). This is load-bearing: the operator cancel/terminate path (`notify_awaited_parent_of_child_terminal`) already holds the parent execution row `FOR UPDATE` before calling the materializer, whereas the worker-wake (`wake_parent_for_child_completion`/`_failure`) and child-execution-timeout (`wake_parent_for_child_timeout`) callers reach it with **no** outer parent lock. Had the materializer taken the timer lock first, those two orderings would invert (ABBA): two concurrent wakes of the same overdue parent — one via a normal child completion/failure (timer-first) and one via an operator cancel/terminate of a *sibling* child (execution-row-first) — would deadlock, and Postgres would abort a healthy terminal notification. Locking the parent execution row first at the top of the materializer (a same-transaction no-op re-lock for the operator path) unifies every call site onto execution-row → timer, so no cycle is possible; a gone parent short-circuits to `Ok(0)` and the caller's own `append_single_event` surfaces the `NotFound` unchanged. The materializer is the **only** `harvest_timers FOR UPDATE` writer (the parent-claim `ingest_due_timers_and_signals` uses a plain `.load()` + `append_events`, taking no `FOR UPDATE` on either table), so forcing execution-first there introduces no new inversion. Deterministically pinned by `materializer_locks_execution_row_before_timers_no_abba` in `tests/integration/child_timeout_tests.rs`, which holds the parent execution row lock open and proves — via a `FOR UPDATE NOWAIT` probe while the materializer is blocked — that the timer row is not yet locked (a probe that would fail under the pre-fix timer-first order).
 
+#### Lock-order table
+
+This table lists the main lock-ordering rules in the engine (issue #1822). The
+argument above is the model for each row. When two paths take the same two
+locks in opposite order, Postgres aborts one of them with `40P01`.
+
+A new path that takes two locks from a row takes them in the order that row
+gives. A path that cannot do that adds a row under "Known cycles". It then runs
+its transaction under `tx_retry::run_with_conflict_retry`, or returns the error
+so the task runs again. Each retry increments `harvest.db.transaction_retry`. A
+steady `reason="deadlock"` rate in production points to a missing row.
+
+**Ordered paths.** Each row gives one order that every path on those locks
+follows. Rows 13 to 17 list the known exceptions.
+
+| # | Lock order | Where | Why | Pinned by |
+|---|---|---|---|---|
+| 1 | Execution row, then due `harvest_timers` rows | `materialize_due_child_timeout_deadlines` (issue #779) | The operator cancel path already holds the execution row. See the argument above. | `materializer_locks_execution_row_before_timers_no_abba` |
+| 2 | Execution row, then `harvest_task_queue` row | Workflow-task persist (`check_paused_and_park`, issue #383). `enforce_activity_timeout`, `finalize_activity_completion` and `resume_workflow_execution` (issue #619). | Pause, persist and timeout paths all start from the execution row. | `locked_deadline_reread_never_precedes_the_execution_lock` |
+| 3 | `harvest_external_tasks` row, then execution row | `external_task.rs` completion paths and the external-task timeout scanner (issue #609) | The completion paths lock the task row first. The scanner must match them. | — |
+| 4 | Queue advisory lock, then execution row, then task row | `schedule_to_start` enforcer and `resume_queue` (`queue_pause.rs`) | `resume_queue` takes the advisory lock, then the task rows. The claim path holds task rows and calls `try_lock_queue_for_claim`. That lock never waits. | `enforcer_takes_the_queue_lock_before_the_row_locks_no_abba` |
+| 5 | Admission advisory lock, then execution row | `lock_execution_admission` on every start path (issue #1596) | A signal-with-start locks the incumbent row. An ordinary start takes the advisory lock first. One order closes the cycle. | — |
+| 6 | Execution row, then cross-shard outbox row | Cross-shard child relay (`cross_shard_child.rs`) | The parent persist appends events, so it locks the parent row before it writes an outbox row. | — |
+| 7 | Child execution row, then parent execution row | Child completion and failure wake the parent. The re-park path locks child rows, then the parent task row. | The parent park path skips the child-row check, so it never takes the reverse order. | — |
+| 8 | Mutex advisory lock, then mutex lock and waiter rows | Every acquire, release, reclaim and sweep in `mutex.rs` (issue #691) | The terminal auto-release sweep runs inside the terminal commit. Advisory-first removes the inversion. | — |
+| 9 | Quota advisory locks, sorted | Scanner batches sort by lock id (`quota_lock_order.rs`, issues #1230, #1752). Child fan-out sorts by `(workflow_name, key)` (issues #946, #1228, #1484). | Two batches that need the same keys visit them in one order. The two sort keys differ, so a scanner batch and a fan-out are not ordered against each other. | `same_order_lock_acquisition_never_deadlocks`, `opposite_claim_orders_fire_keys_in_the_same_order` |
+| 10 | Execution row, then quota advisory lock | Each scanner fire and each direct start (`quota_lock_order.rs`) | A scanner that took every quota key first would wait on the uncommitted row of a direct start. | — |
+| 11 | Rate-limit bucket rows in byte order (`COLLATE "C"`) | Throttle scanner batch (`pre_lock_rate_limit_buckets_for_claimed_batch`, issue #1230). Dynamic-rate bucket registration sorts by key (issue #1127). | One statement locks the batch in sorted order. A locale collation would change the order. | `dedupes_and_sorts_the_same_regardless_of_claim_order` |
+| 12 | Two `ctx.mutex` keys in sorted key order | Workflow code (author rule, see "Cross-key deadlock" in the Durable Mutex section) | A durable mutex is held across transactions. Postgres does not detect this cycle, so no retry resolves it. Only the lease expiry ends it. | — |
+
+**Known cycles.** In each row, Postgres aborts one side as a whole. That side
+is safe to run again. Only rows 13 and 14 run again automatically.
+
+| # | Lock order | Where | Why | Pinned by |
+|---|---|---|---|---|
+| 13 | Own execution row, then the target execution row | Inline external signal and cancel (`persist_external_signal_inline`) | Two runs that target each other in one cycle invert. `tx_retry` runs the victim again (issue #1822). | `two_persist_transactions_deadlock_and_both_commit` |
+| 14 | Execution row, then a lock that another path holds | Any workflow-task persist | A conflict now resets the task, and replay runs the cycle again (issue #1822). | `a_deadlocked_terminal_persist_runs_the_cycle_again` |
+| 15 | Concurrency-key advisory lock and mutex advisory lock | `cancel_running` admission with `ctx.mutex` (issue #691). See `docs/sharding.md`. | The two features take the keys in opposite orders. The start aborts atomically. An API start returns the error. | — |
+| 16 | Source execution row, then the target `workflow_id` occupant | Re-run with a `workflow_id` override (`execution.rs`) | Two re-runs that name each other's `workflow_id` invert. No total order exists without another lock. | — |
+| 17 | Task row, then execution row (the reverse of row 2) | Poison-pill reclaim (issue #1182) | It reclaims only the task of a dead worker, so a live persist rarely meets it. The suspended-claim release probe uses `SKIP LOCKED` and never waits. | `a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_release` |
+
+#### Child-timeout race mechanics and caveats
+
 Mechanics: each call deterministically derives a race timer ID (`__child_timeout:{seq}:{workflow_name}` from a per-context `child_timeout_seq` counter, a namespace disjoint from `__signal_timeout:`) and, on first live execution, spawns the child and arms the deadline in **one** mixed `StartChildWorkflow + StartTimer` suspension batch — the child is spawned by this call itself, atomically co-persisted with the timer (a dedicated worker `extract_child_timeout_race`/`persist_child_timeout_race` path, with a child-terminal self-wake re-check so a child that finishes in the park window is not missed). `timeout` is rounded up to whole seconds.
 
 **Composition caveats** (mirroring `receive_signal_timeout`, enforced fail-loud):
@@ -1490,7 +1533,7 @@ The start `input` is a `SharedJson` (#1733), an `Arc<Value>` newtype in `shared_
 
 **Interaction notes.**
 
-- **`ctx.mutex` (#691)** — combining `cancel_running` with the durable mutex on the same terminal path can produce a Postgres-detected lock-ordering cycle (`40P01`) on the *start*. It aborts atomically and is safe to retry; it is a liveness hazard, not a correctness one. See `docs/sharding.md` for the full note.
+- **`ctx.mutex` (#691)** — combining `cancel_running` with the durable mutex on the same terminal path can produce a Postgres-detected lock-ordering cycle (`40P01`) on the *start*. It aborts atomically and is safe to retry; it is a liveness hazard, not a correctness one. A workflow-task persist that hits it runs again automatically (issue #1822). An API start still returns the error. See `docs/sharding.md` for the full note.
 - **Activity concurrency groups never latest-wins** — an activity task can carry a `concurrency_key` too (#247), but it is gated only at claim time and always defers; the supersede sheds workflow *executions* only.
 - **Nested admissions can leave a key transiently over its limit** — a superseded run's cancellation runs its terminal chokepoint, which can start a completion-trigger target inside the same transaction. That nested admission counts the still-uncommitted outer admission toward the key's population but structurally cannot cancel it (the caller is about to report that run as created). If the remaining overflow is entirely such protected in-flight admissions, the key stays over its limit until the next ordinary admission — which sees them unprotected and sheds them — and a `tracing::warn!` names the key and the gap. Same bounded-shed philosophy as `SUPERSEDE_SCAN_LIMIT`.
 - **Population** — the superseded set is *non-terminal runs* (`RUNNING`/`PAUSED` execution rows), which is a superset of what the #247 claim gate counts (`RUNNING` task rows with a live worker). A paused run, or one still deferred at the claim gate, occupies no dispatch slot yet is still superseded — that is the intended "at most `limit` non-terminal runs per key" reading.
