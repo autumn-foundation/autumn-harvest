@@ -18,6 +18,7 @@ mod activity_outcome_metrics_tests;
 mod activity_pause_tests;
 #[cfg(feature = "db")]
 mod activity_timeout_retry_tests;
+mod adaptive_limit_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
 mod alert_pack_docs;
@@ -289,6 +290,7 @@ mod start_source_tests;
 #[cfg(feature = "db")]
 mod sticky_default_tests;
 mod sticky_routing_tests;
+mod supply_chain_ci;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
 mod terminal_task_gc_tests;

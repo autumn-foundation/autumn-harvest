@@ -926,6 +926,33 @@ macro_rules! expired_runs_cte_sql {
     };
 }
 
+/// Leading marker of a saturated activity name in the `$6` claim array
+/// (issue #1836).
+///
+/// `$6` holds the names with unmet requirements. The worker also adds each
+/// activity type at its adaptive limit, with this marker in front.
+/// `Worker::new` rejects a registered name that starts with the marker.
+pub const SATURATED_ACTIVITY_MARKER: char = '\u{1}';
+
+/// The claim predicate that skips an activity type at its adaptive limit
+/// (issue #1836).
+///
+/// The `$6` gate above it does not apply to a row with
+/// `required_capabilities`. This gate applies to every activity row. The
+/// array subquery reads only `$6`, so Postgres runs it once per statement.
+macro_rules! saturated_activity_gate_sql {
+    () => {
+        "AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY(ARRAY( \
+                       SELECT substr(marked, 2) FROM unnest($6::text[]) AS marked \
+                       WHERE left(marked, 1) = chr(1) \
+                   ))) \
+               ) "
+    };
+}
+
 /// The `candidate` predicate that skips a task of an expired run (issue #1824).
 ///
 /// The task stays `PENDING`. No worker runs it, and the claim spends no
@@ -1200,8 +1227,9 @@ pub const fn claim_task_query() -> &'static str {
                    OR activity_name IS NULL \
                    OR required_capabilities IS NOT NULL \
                    OR NOT (activity_name = ANY($6)) \
-               ) \
-               AND ( \
+               ) ",
+        saturated_activity_gate_sql!(),
+        "AND ( \
                    task_type != 'activity' \
                    OR activity_name IS NULL \
                    OR NOT (activity_name = ANY(paused_activities.names)) \
@@ -2101,6 +2129,9 @@ pub struct DispatchProbe {
     /// Session rows never set it. A session pin is a hard pin that does not
     /// expire, so the reference must keep its normal backoff.
     pub pinned_elsewhere: bool,
+    /// The activity name of an activity row (issue #1836). A reference to a
+    /// type at its adaptive limit returns when a slot is likely free.
+    pub activity_name: Option<String>,
 }
 
 impl DispatchProbe {
@@ -2134,6 +2165,8 @@ pub async fn dispatch_probe(
         has_worker: bool,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         pinned_elsewhere: bool,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        activity_name: Option<String>,
     }
 
     let rows: Vec<Row> = diesel::sql_query(dispatch_probe_query())
@@ -2148,6 +2181,7 @@ pub async fn dispatch_probe(
         scheduled_at: row.scheduled_at,
         has_worker: row.has_worker,
         pinned_elsewhere: row.pinned_elsewhere,
+        activity_name: row.activity_name,
     }))
 }
 
@@ -2160,7 +2194,8 @@ pub const fn dispatch_probe_query() -> &'static str {
                 AND sticky_worker_id <> $2 \
                 AND sticky_until > NOW(), \
                 FALSE \
-            ) AS pinned_elsewhere \
+            ) AS pinned_elsewhere, \
+            activity_name \
      FROM harvest_task_queue \
      WHERE id = $1"
 }
@@ -2900,6 +2935,52 @@ pub(crate) async fn task_status_for_claim(
         .optional()
         .map_err(crate::error::database_error)?;
     Ok(row.map(|(state, error, held)| (state, error, held == Some(true))))
+}
+
+/// A task row's `error`, whether `claim` is current, and the current
+/// `schedule_to_close_at`, read without a lock (issue #1836).
+///
+/// A resume after a pause moves `schedule_to_close_at` forward while an
+/// attempt runs. This read gives the moved value.
+///
+/// Returns `None` when the row does not exist.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn task_deadline_for_claim(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<Option<TaskDeadline>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row = dsl::harvest_task_queue
+        .find(claim.task_id)
+        .select((
+            dsl::error,
+            claim_held(&claim.worker_id, claim.attempt),
+            dsl::schedule_to_close_at,
+        ))
+        .first::<(Option<String>, Option<bool>, Option<DateTime<Utc>>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.map(|(error, held, schedule_to_close_at)| TaskDeadline {
+        error,
+        claim_held: held == Some(true),
+        schedule_to_close_at,
+    }))
+}
+
+/// The row state that [`task_deadline_for_claim`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskDeadline {
+    /// The row's `error`.
+    pub(crate) error: Option<String>,
+    /// Whether the claim is current.
+    pub(crate) claim_held: bool,
+    /// The row's current `schedule_to_close_at`.
+    pub(crate) schedule_to_close_at: Option<DateTime<Utc>>,
 }
 
 /// Whether `claim` is current, read without a lock.
@@ -7916,6 +7997,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
         let due = claim_order_due_sql!();
         let expired_cte = expired_runs_cte_sql!();
         let expired_gate = expired_run_gate_sql!();
+        let saturated_gate = saturated_activity_gate_sql!();
         format!(
             "WITH worker_info AS ( \
                  SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
@@ -7988,6 +8070,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
                    OR required_capabilities IS NOT NULL \
                    OR NOT (activity_name = ANY($6)) \
                ) \
+               {saturated_gate}\
                AND ( \
                    task_type != 'activity' \
                    OR activity_name IS NULL \
@@ -9332,6 +9415,7 @@ mod tests {
             "required_build_id IS NULL",
             "task_type <> 'workflow'",
             "NOT (activity_name = ANY($6))",
+            "WHERE left(marked, 1) = chr(1)",
             "NOT (activity_name = ANY(paused_activities.names))",
             "required_capabilities IS NULL",
             "required_capabilities IS NOT NULL",
@@ -12732,6 +12816,7 @@ mod tests {
         "required_build_id IS NULL",
         "AND e.state = 'PAUSED'",
         "OR NOT (activity_name = ANY($6))",
+        "WHERE left(marked, 1) = chr(1)",
         "OR NOT (activity_name = ANY(paused_activities.names))",
         "required_capabilities IS NULL",
         "rate_limit_key IS NULL",
@@ -12964,6 +13049,7 @@ mod tests {
             scheduled_at: Utc::now(),
             has_worker: false,
             pinned_elsewhere: false,
+            activity_name: None,
         };
         assert!(probe("PENDING").is_pending());
         assert!(!probe("RUNNING").is_pending());
