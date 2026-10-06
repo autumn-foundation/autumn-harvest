@@ -970,6 +970,66 @@ async fn a_failed_report_of_a_partial_abort_is_retried() {
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
 }
 
+/// A guard clears pool 1, cannot clear pool 2, and fails its report. It then
+/// restarts with its pending report lost. Pool 2 still holds the ramp. The
+/// unreported marker on pool 1 is still recovered once the audit pool works.
+#[tokio::test]
+async fn an_unaudited_partial_abort_is_reported_after_a_restart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut locker = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect locker");
+    let ramp_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_ramp_with_id(conn, ramp_id).await;
+    }
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock pool 2 policy row");
+    // No server listens on port 1, so the first audit write fails.
+    let dead_audit = build_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = RampGuard::new(config)
+        .pass(&pools, &dead_audit, None, &never)
+        .await;
+    assert!(aborts.is_empty(), "the report failed: {aborts:?}");
+    assert!(!ramp_is_active(&mut conn_1).await, "pool 1 cleared");
+
+    // A restart drops the pending report. Pool 2 still rejects the clear.
+    let mut restarted = RampGuard::new(config);
+    let mut reported = Vec::new();
+    for _ in 0..2 {
+        reported.extend(restarted.pass(&pools, &pool_1, None, &never).await);
+    }
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert_eq!(reported.len(), 1, "the abort is reported: {reported:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+}
+
 /// A ramp write with the `ramp_id` of an aborted generation changes
 /// nothing. The abort marker refuses it, and after the markers are pruned
 /// the report ledger refuses it.

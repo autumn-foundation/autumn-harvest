@@ -311,8 +311,10 @@ The guard fails safe: when it cannot read, it does not abort.
   base.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
-  marker that is unreported, older than `report_grace`, and whose ramp no
-  pool holds. The pass looks at all markers of the abort on all pools. A
+  marker that is unreported and older than `report_grace`. A pool can still
+  hold its ramp, for example when a guard restarts while that pool rejects
+  the clear. The marker then stays, but the abort is still reported. The
+  report ledger keeps that report exactly-once. The pass looks at all markers of the abort on all pools. A
   claim younger than the lease on any pool holds the whole abort back. It
   claims the abort with a lease, and only the guard that took the claim
   reports. It tries the marker pools in order. A claim that fails or times

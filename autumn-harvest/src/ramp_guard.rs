@@ -115,8 +115,9 @@ impl RampGuardConfig {
     ///
     /// A guard can stop after its clear commits and before it reports the
     /// abort. The abort marker then stays unreported. Once the marker is
-    /// older than this grace and no pool holds its ramp, a pass reports the
-    /// abort with reason [`RampAbortReason::Unreported`]. The setter clamps
+    /// older than this grace, a pass reports the abort with reason
+    /// [`RampAbortReason::Unreported`]. It does so even while a pool still
+    /// holds the ramp. The setter clamps
     /// the value to [`MAX_REPORT_GRACE`]. Zero is allowed.
     #[must_use]
     pub fn with_report_grace(mut self, grace: Duration) -> Self {
@@ -1019,13 +1020,12 @@ async fn read_pool_ramps(
 /// matter. An operator ramp set after the abort has a new id, so it is not
 /// marked.
 ///
-/// A marker whose ramp no pool holds is finished. Every pool was read, so
-/// no pool can still hold that ramp. The read groups the finished markers
-/// of one abort over all pools:
+/// The read groups the abort markers of one abort over all pools. Every pool
+/// was read, so the read knows whether a pool still holds the ramp:
 ///
 /// - When every marker is reported and older than both `report_grace` and
 ///   [`MIN_MARKER_RETENTION`], the markers can go. The wait lets them finish
-///   a late fan-out write.
+///   a late fan-out write. A marker whose ramp a pool still holds stays.
 /// - When some are reported, a guard reported the abort and stopped while
 ///   it marked them. The rest only need the mark.
 /// - When none is reported, the abort is due for recovery once a marker is
@@ -1127,10 +1127,14 @@ fn classify_finished_markers(
     // Group the finished markers per abort, in pool order.
     let mut groups: std::collections::BTreeMap<(String, uuid::Uuid), Vec<(usize, StoredMarker)>> =
         std::collections::BTreeMap::new();
+    // A pool can still hold the ramp of a marker. Its markers are never
+    // pruned, but an unreported abort is still recovered. A guard can lose
+    // its pending report in a restart while that pool rejects the clear.
+    let mut held = std::collections::BTreeSet::new();
     for (index, pool_markers) in pool_markers_by_index.into_iter().enumerate() {
         for (queue, marker) in pool_markers {
             if live.contains(&(queue.clone(), marker.base.clone(), marker.id)) {
-                continue;
+                held.insert((queue.clone(), marker.id));
             }
             groups
                 .entry((queue, marker.id))
@@ -1145,6 +1149,9 @@ fn classify_finished_markers(
     for ((queue, ramp_id), entries) in groups {
         let reported = entries.iter().filter(|(_, marker)| marker.reported).count();
         if reported == entries.len() {
+            if held.contains(&(queue.clone(), ramp_id)) {
+                continue;
+            }
             // A ramp fan-out that is still in flight can write this
             // `ramp_id` to a later pool. The markers therefore stay for the
             // report grace, and at least for `MIN_MARKER_RETENTION`, so they
@@ -1207,7 +1214,8 @@ struct FleetRead {
     /// the marker ids. No pool holds the ramp of such a marker, and every
     /// marker of its abort is reported.
     finished_markers: Vec<(usize, String, Vec<uuid::Uuid>)>,
-    /// The finished aborts that no guard reported within the grace.
+    /// The aborts that no guard reported within the grace. A pool can still
+    /// hold the ramp of such an abort.
     unreported: Vec<UnreportedAbort>,
     /// The finished aborts that a guard reported but did not mark on every
     /// pool. Each holds the queue, the `ramp_id` and the pools that still
