@@ -46,7 +46,8 @@ const LOCK_ATTEMPTS: u32 = 5;
 /// The pause between two lock attempts.
 const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// The shared-cache in-memory databases that a runtime in this process holds.
+/// The named in-memory databases that a runtime in this process holds, keyed
+/// by VFS and decoded name.
 ///
 /// `SQLite` reports no file for such a database, so no OS lock applies. Every
 /// connection in the process can still open it, so this set stands in.
@@ -80,8 +81,9 @@ impl Drop for WriterLock {
 /// `SQLite` reports no path, which happens for a non-UTF-8 path.
 ///
 /// Returns `None` when `SQLite` reports an empty path for a private database:
-/// `:memory:` or a temporary file. A shared-cache in-memory URI, such as
-/// `file:name?mode=memory&cache=shared`, takes an in-process lock instead.
+/// `:memory:` or a temporary file. A named in-memory URI, such as
+/// `file:name?mode=memory&cache=shared` or `file:/name?vfs=memdb`, takes an
+/// in-process lock instead.
 ///
 /// # Errors
 ///
@@ -130,13 +132,17 @@ pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<Write
     }
 }
 
-/// Lock a shared-cache in-memory database in this process. A private one needs
-/// no lock.
+/// Lock a named in-memory database in this process. A private one needs no
+/// lock.
 ///
 /// The URI is read as `SQLite` reads it. The name is the part before `?`.
-/// Every query key and value has its `%HH` escapes decoded. Any `cache` value
-/// that matches `shared` without regard to case counts. When in doubt, the
-/// database takes the lock.
+/// Every query key and value has its `%HH` escapes decoded.
+///
+/// The rule fails closed. Several URI forms share one database by name, for
+/// example `cache=shared` or `vfs=memdb`. So every `file:` URI takes the lock,
+/// keyed by its decoded name and VFS. Only an empty or `:memory:` name without
+/// `cache=shared` is provably private and takes none. Two runtimes on one
+/// private named URI in one process therefore conflict. That is safe.
 fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
     let uri = requested.to_string_lossy();
     let Some(rest) = uri
@@ -149,24 +155,37 @@ fn acquire_shared_memory(requested: &Path) -> SqliteResult<Option<WriterLock>> {
     };
     let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
     let (raw_name, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let shared = query.split('&').any(|param| {
-        let (key, value) = param.split_once('=').unwrap_or((param, ""));
-        percent_decode(key) == "cache" && percent_decode(value).eq_ignore_ascii_case("shared")
-    });
-    if !shared {
+    let params: Vec<(String, String)> = query
+        .split('&')
+        .filter(|param| !param.is_empty())
+        .map(|param| {
+            let (key, value) = param.split_once('=').unwrap_or((param, ""));
+            (percent_decode(key), percent_decode(value))
+        })
+        .collect();
+    let cache_shared = params
+        .iter()
+        .any(|(key, value)| key == "cache" && value.eq_ignore_ascii_case("shared"));
+    let name = percent_decode(raw_name);
+    if !cache_shared && (name.is_empty() || name == ":memory:") {
         return Ok(None);
     }
-    let name = percent_decode(raw_name);
+    let vfs = params
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "vfs")
+        .map_or("", |(_, value)| value.as_str());
+    let key = format!("{vfs}\0{name}");
     let inserted = SHARED_MEMORY
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(name.clone());
+        .insert(key.clone());
     if !inserted {
         return Err(SqliteError::DatabaseLocked {
             path: requested.to_path_buf(),
         });
     }
-    Ok(Some(WriterLock::SharedMemory(name)))
+    Ok(Some(WriterLock::SharedMemory(key)))
 }
 
 /// Decode `%HH` escapes as `SQLite` does for a URI path. A malformed escape

@@ -317,3 +317,20 @@ fn an_encoded_cache_parameter_still_takes_the_lock() {
         );
     }
 }
+
+/// The `memdb` VFS shares a `/`-named database between connections without
+/// `cache=shared`. The lock fails closed: any named in-memory URI takes it.
+#[test]
+fn a_memdb_vfs_database_takes_the_lock() {
+    let uri = "file:/memdb_1834?vfs=memdb";
+    let _first = SqliteRuntime::open(uri).unwrap();
+
+    let err = SqliteRuntime::open(uri)
+        .err()
+        .expect("a memdb database is shared by name");
+    assert!(matches!(err, SqliteError::DatabaseLocked { .. }), "{err}");
+
+    // A private, unnamed in-memory URI still takes no lock.
+    let _a = SqliteRuntime::open("file::memory:").unwrap();
+    let _b = SqliteRuntime::open("file::memory:").unwrap();
+}

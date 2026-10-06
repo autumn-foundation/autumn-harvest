@@ -11,8 +11,8 @@ comes from the canonical database path, so a symlink maps to the same lock. A
 hard link or a bind mount gives a second lock. On Unix the lock file takes the
 database file's read and write bits. A read-only inspector connection still
 works. A non-UTF-8 path still takes the lock. A private in-memory database
-takes no lock. A shared-cache in-memory URI takes an in-process lock on its
-name. The open retries the lock for about 100 ms, so a lock that a forking
+takes no lock. A named in-memory URI (`cache=shared`, `vfs=memdb`) takes an
+in-process lock on its decoded name and VFS. That rule fails closed. The open retries the lock for about 100 ms, so a lock that a forking
 thread or a lagging release holds for a moment does not fail it. A new
 `SqliteError::Io` reports a lock file that cannot be opened.
 

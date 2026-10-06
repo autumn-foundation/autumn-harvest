@@ -391,9 +391,11 @@ second runtime in the same process.
   mount gives a second path, and so a second lock. Open the database through
   one path.
 - A read-only inspector connection still works. It never touches the lock.
-- A private in-memory database (`:memory:`) takes no lock. A shared-cache
-  in-memory URI (`file:name?mode=memory&cache=shared`) takes an in-process
-  lock on its name, because every connection in the process can open it.
+- A private in-memory database (`:memory:`, `file::memory:`) takes no lock. A
+  named in-memory URI, such as `file:name?mode=memory&cache=shared` or
+  `file:/name?vfs=memdb`, takes an in-process lock on its decoded name and VFS.
+  Other connections in the process can open it. The rule fails closed: any
+  named URI takes the lock.
 
 The lock file stays on disk after the runtime drops. **Do not delete it** while
 a runtime runs: a second process could then lock a new file. On Unix the lock
