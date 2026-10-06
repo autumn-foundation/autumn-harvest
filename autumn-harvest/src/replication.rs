@@ -570,12 +570,14 @@ impl DrMarkers {
 
     /// Whether this database is a DR standby that has not been promoted.
     ///
-    /// A DR subscription means a logical standby. Recovery means a physical
-    /// standby. No Harvest process may start on either. The runbook starts
-    /// workers only after promotion.
+    /// A subscription means a logical standby, whatever its name. `Enabled`
+    /// exists for replication that does not use the DR prefix, and the
+    /// tables of a subscriber stay writable. Recovery means a physical
+    /// standby. No fenced Harvest process may start on either. The runbook
+    /// starts workers only after promotion.
     #[must_use]
     pub const fn is_standby(&self) -> bool {
-        self.in_recovery || self.dr_subscriptions > 0
+        self.in_recovery || self.subscriptions > 0
     }
 }
 
@@ -2231,7 +2233,7 @@ mod db {
         }
         if probed.iter().flatten().any(DrMarkers::is_standby) {
             return Err(crate::error::HarvestError::Config(
-                "this database is a DR standby: it has a DR subscription or is in recovery. \
+                "this database is a DR standby: it has a logical subscription or is in recovery. \
                  No Harvest process may write to a standby. Promote it first (runbook step 2), \
                  or point this process at the primary."
                     .to_string(),
@@ -3725,6 +3727,23 @@ mod tests {
             ..DrMarkers::default()
         };
         assert!(subscription.is_dr());
+    }
+
+    /// Any logical subscription makes a standby, whatever its name (issue
+    /// #1823). `Enabled` exists for replication that does not use the DR
+    /// prefix, and subscriber tables stay writable.
+    #[test]
+    fn any_subscription_makes_a_standby() {
+        let custom = DrMarkers {
+            subscriptions: 1,
+            ..DrMarkers::default()
+        };
+        assert!(custom.is_standby());
+        assert!(
+            !custom.is_dr(),
+            "a custom subscription alone is not a DR marker"
+        );
+        assert!(!DrMarkers::default().is_standby());
     }
 
     #[test]

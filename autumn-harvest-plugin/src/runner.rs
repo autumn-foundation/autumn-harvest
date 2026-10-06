@@ -1150,7 +1150,9 @@ impl HarvestRunner {
             } else {
                 shard_id
             };
-            let fence = autumn_harvest::replication::begin_fenced_pass(shard_pool, fence_key)
+            // The sync rewrites a database-wide table, so it guards every
+            // pinned shard colocated on this database too.
+            let fence = autumn_harvest::replication::begin_fenced_group(shard_pool, fence_key)
                 .await
                 .map_err(|error| {
                     AutumnError::service_unavailable_msg(format!(
@@ -1164,7 +1166,7 @@ impl HarvestRunner {
             })?;
             // A lost fence session stops the sync. See `run_fenced_pass`.
             autumn_harvest::replication::run_fenced_pass(
-                fence.as_ref(),
+                &fence,
                 autumn_harvest::completion_trigger::sync_completion_triggers(
                     &mut conn,
                     &completion_triggers,

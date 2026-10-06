@@ -203,9 +203,9 @@ The log line says which rule it broke, and what to change:
   A shard database holds its own row only. One exception: a process on a
   single database may share it with processes for other logical shards. It
   logs a warning and provisions its own row beside theirs.
-- A fenced process on a DR **standby**: a database with a DR subscription, or
-  a server in recovery. No Harvest process writes to a standby. The runbook
-  starts processes only after promotion.
+- A fenced process on a DR **standby**: a database with a logical
+  subscription of any name, or a server in recovery. No Harvest process
+  writes to a standby. The runbook starts processes only after promotion.
 
 **Colocated shards.** Several logical shards can share one database, and
 one claim scan there serves them all. The scan is not filtered by shard, so
