@@ -6206,14 +6206,14 @@ async fn database_fence(
         );
         guarded.push(ShardId::new(shard));
     }
-    if !rows.is_empty() {
-        let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;
-        guards.push(
-            autumn_harvest::replication::freeze_generation_rows_on(conn, &guarded)
-                .await
-                .map_err(|e| e.to_string())?,
-        );
-    }
+    // Frozen even when the table is empty: the first row must not appear
+    // mid-command either.
+    let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;
+    guards.push(
+        autumn_harvest::replication::freeze_generation_rows_on(conn, &guarded)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
     Ok(guards)
 }
 

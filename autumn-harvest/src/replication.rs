@@ -1994,6 +1994,16 @@ mod db {
     ) -> HarvestResult<FencePassGuard> {
         use diesel_async::SimpleAsyncConnection as _;
         begin_guard_transaction(&mut conn).await?;
+        // A database migrated before the fence table has nothing to freeze.
+        let present: Vec<TableRow> = diesel::sql_query(
+            "SELECT to_regclass('harvest_shard_generation') IS NOT NULL AS present",
+        )
+        .load(&mut conn)
+        .await
+        .map_err(database_error)?;
+        if !<[TableRow]>::first(&present).is_some_and(|row| row.present) {
+            return Ok(keep_guard_alive(conn, -1));
+        }
         conn.batch_execute(&format!(
             "SET LOCAL lock_timeout = '{BUMP_LOCK_TIMEOUT_MS}ms'; \
              LOCK TABLE harvest_shard_generation IN SHARE MODE"

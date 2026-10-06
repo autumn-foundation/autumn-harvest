@@ -3526,6 +3526,20 @@ async fn a_row_freeze_blocks_new_rows_and_refuses_unguarded_ones() {
     ensure_generation_row(&mut conn, ShardId::new(0))
         .await
         .unwrap();
+    // An empty table is frozen too: the first row must wait.
+    let (empty_url, _empty) = require_db!("rowfreezeempty");
+    let mut empty_conn = connect(&empty_url).await;
+    let freeze = freeze_generation_rows_on(connect(&empty_url).await, &[])
+        .await
+        .expect("an empty table freezes");
+    let first = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        ensure_generation_row(&mut empty_conn, ShardId::new(0)),
+    )
+    .await;
+    assert!(first.is_err(), "the first row waits for the freeze");
+    drop(freeze);
+
     let freeze = freeze_generation_rows_on(connect(&url).await, &[ShardId::new(0)])
         .await
         .expect("every row is guarded");
