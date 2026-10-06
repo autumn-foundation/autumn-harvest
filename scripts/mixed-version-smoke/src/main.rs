@@ -10,8 +10,10 @@
 //! ran it. The script stops one version during the timer and starts the
 //! other. The output then shows which version ran each step.
 //!
-//! With `MV_SMOKE_CODEC=1`, the worker installs a test payload codec. A codec
-//! envelope that one version writes must then decode in the other.
+//! With `MV_SMOKE_CODEC=1`, the worker installs a test payload codec. The
+//! version that ends a run must then write an envelope that `check` decodes.
+//! When both versions apply the codec, replay also decodes the envelopes of
+//! the other version.
 
 mod compat;
 
@@ -33,7 +35,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// The queue for the workflow and its activities.
 const QUEUE: &str = "mixed-version-smoke";
 /// The time between the two activities. The script stops a worker in it.
-const GAP_SECS: u64 = 10;
+/// It must exceed the spread of the first steps plus the drain, on a slow
+/// runner too.
+const GAP_SECS: u64 = 30;
 /// The codec id. A change here is a change to the stored format.
 const CODEC_ID: &str = "mv-smoke-xor";
 /// The XOR mask of the test codec.
@@ -105,29 +109,48 @@ async fn main() -> Result<(), BoxError> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["worker"] => worker(url).await,
-        ["start", prefix, count] => start(&url, prefix, count.parse()?).await,
+        ["start", prefix, count] => start(&url, prefix, runs(count)?).await,
         ["wait-first", prefix, count, secs] => {
-            wait_first(&url, prefix, count.parse()?, secs.parse()?).await
+            wait_first(&url, prefix, runs(count)?, secs.parse()?).await
         }
         ["wait-done", prefix, count, secs] => {
-            wait_done(&url, prefix, count.parse()?, secs.parse()?).await
+            wait_done(&url, prefix, runs(count)?, secs.parse()?).await
         }
-        ["check", prefix, count, first, second] => {
-            check(&url, prefix, count.parse()?, first, second).await
+        ["check", prefix, count, first, second, flags @ ..] => {
+            let want = Want {
+                first,
+                second,
+                codec: flags.contains(&"codec"),
+                both: flags.contains(&"both"),
+            };
+            check(&url, prefix, runs(count)?, &want).await
         }
         _ => Err(USAGE.into()),
     }
 }
 
 const USAGE: &str = "usage: mixed-version-smoke <command>
-  worker                                    run a worker until SIGINT or SIGTERM
-  start      PREFIX COUNT                   start COUNT runs, ids PREFIX-0..
-  wait-first PREFIX COUNT SECS              wait until each run ends its first step
-  wait-done  PREFIX COUNT SECS              wait until each run completes
-  check      PREFIX COUNT FIRST SECOND      check the labels of each step; `*` is any";
+  worker                              run a worker until SIGINT or SIGTERM
+  start      PREFIX COUNT             start COUNT runs, ids PREFIX-0..
+  wait-first PREFIX COUNT SECS        wait until each run ends its first step
+  wait-done  PREFIX COUNT SECS        wait until each run completes
+  check      PREFIX COUNT FIRST SECOND [codec] [both]
+             check the label of each step; `*` is any label.
+             codec: the WorkflowCompleted event holds an envelope.
+             both: each version ran at least one step.";
+
+/// Parse a run count. Zero runs would make every check pass.
+fn runs(count: &str) -> Result<usize, BoxError> {
+    match count.parse()? {
+        0 => Err("the run count must be above zero".into()),
+        n => Ok(n),
+    }
+}
 
 /// Run a worker and a scheduler until SIGINT or SIGTERM.
 async fn worker(url: String) -> Result<(), BoxError> {
+    // Install the handlers first, so a signal also stops a slow start.
+    let mut stop = Box::pin(stop_signal()?);
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
     let pool = Pool::builder(manager).max_size(8).build()?;
     let config = HarvestRuntimeConfig {
@@ -141,31 +164,37 @@ async fn worker(url: String) -> Result<(), BoxError> {
         },
         ..HarvestRuntimeConfig::default()
     };
-    let runner = HarvestRunner::start(
+    let start = HarvestRunner::start(
         builder().try_build()?,
         &config,
         HarvestRunnerResources::new(pool),
-    )
-    .await
-    .map_err(|error| format!("the runner did not start: {error}"))?;
+    );
+    let runner = tokio::select! {
+        started = start => started.map_err(|error| format!("the runner did not start: {error}"))?,
+        () = &mut stop => return Err("stopped before the runner started".into()),
+    };
     tracing::info!("mixed-version-smoke worker ready");
-    stop_signal().await?;
+    stop.await;
     runner.stop().await;
     tracing::info!("mixed-version-smoke worker stopped");
     Ok(())
 }
 
-async fn stop_signal() -> Result<(), BoxError> {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
-        _ = term.recv() => {}
-    }
-    Ok(())
+/// Resolve on the first SIGINT or SIGTERM.
+fn stop_signal() -> Result<impl Future<Output = ()>, BoxError> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut term = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = int.recv() => {}
+            _ = term.recv() => {}
+        }
+    })
 }
 
 /// Start `count` runs with the start path of this version.
-async fn start(url: &str, prefix: &str, count: u32) -> Result<(), BoxError> {
+async fn start(url: &str, prefix: &str, count: usize) -> Result<(), BoxError> {
     let mut conn = AsyncPgConnection::establish(url).await?;
     for n in 0..count {
         let id = format!("{prefix}-{n}");
@@ -193,6 +222,12 @@ struct Run {
     output: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     error: Option<String>,
+    /// Set when replay found non-determinism. The run then stays `RUNNING`.
+    #[diesel(sql_type = Nullable<Text>)]
+    nd_block: Option<String>,
+    /// The `output` of the `WorkflowCompleted` event, as stored.
+    #[diesel(sql_type = Nullable<Text>)]
+    completed_event: Option<String>,
 }
 
 /// The pattern that matches the ids of one prefix.
@@ -216,31 +251,39 @@ async fn wait_first(url: &str, prefix: &str, count: usize, secs: u64) -> Result<
     .await
 }
 
-/// Wait until each run completes. Fail at once on a failed run.
+/// Wait until each run completes. Fail at once on a failed or blocked run.
 async fn wait_done(url: &str, prefix: &str, count: usize, secs: u64) -> Result<(), BoxError> {
     poll(url, secs, "completion", count, async |conn| {
-        let runs = runs(conn, prefix).await?;
-        if let Some(run) = runs
-            .iter()
-            .find(|run| !matches!(run.state.as_str(), "RUNNING" | "PENDING" | "COMPLETED"))
-        {
-            return Err(format!(
-                "{} is {}: {}",
-                run.workflow_id,
-                run.state,
-                run.error.as_deref().unwrap_or("no error text")
-            )
-            .into());
+        let runs = load_runs(conn, prefix).await?;
+        for run in &runs {
+            if let Some(reason) = &run.nd_block {
+                return Err(format!(
+                    "{} is blocked on non-determinism: {reason}",
+                    run.workflow_id
+                )
+                .into());
+            }
+            if !matches!(run.state.as_str(), "RUNNING" | "PENDING" | "COMPLETED") {
+                let error = run.error.as_deref().unwrap_or("no error text");
+                return Err(format!("{} is {}: {error}", run.workflow_id, run.state).into());
+            }
         }
         Ok(runs.iter().filter(|run| run.state == "COMPLETED").count())
     })
     .await
 }
 
-async fn runs(conn: &mut AsyncPgConnection, prefix: &str) -> Result<Vec<Run>, BoxError> {
-    let query = "SELECT workflow_id, state, output::text AS output, error
-        FROM harvest_workflow_executions
-        WHERE workflow_id LIKE $1 ORDER BY workflow_id";
+async fn load_runs(conn: &mut AsyncPgConnection, prefix: &str) -> Result<Vec<Run>, BoxError> {
+    let query = "SELECT w.workflow_id, w.state, w.output::text AS output, w.error,
+            CASE WHEN w.nd_blocked_at IS NULL THEN NULL
+                 ELSE coalesce(w.nd_block_reason, 'no reason') END AS nd_block,
+            (SELECT (e.event_data->'data'->'output')::text
+               FROM harvest_events e
+              WHERE e.workflow_exec_id = w.id
+                AND e.event_data->>'type' = 'WorkflowCompleted'
+              LIMIT 1) AS completed_event
+        FROM harvest_workflow_executions w
+        WHERE w.workflow_id LIKE $1 ORDER BY w.workflow_id";
     Ok(diesel::sql_query(query)
         .bind::<Text, _>(like(prefix))
         .load(conn)
@@ -273,43 +316,74 @@ where
     }
 }
 
+/// What `check` asserts.
+struct Want<'a> {
+    /// The label that must run step 1, or `*`.
+    first: &'a str,
+    /// The label that must run step 2, or `*`.
+    second: &'a str,
+    /// The `WorkflowCompleted` event must hold a codec envelope.
+    codec: bool,
+    /// Each of the two versions must run at least one step.
+    both: bool,
+}
+
 /// Check that each run completed and that the expected versions ran it.
-async fn check(
-    url: &str,
-    prefix: &str,
-    count: usize,
-    first: &str,
-    second: &str,
-) -> Result<(), BoxError> {
+async fn check(url: &str, prefix: &str, count: usize, want: &Want<'_>) -> Result<(), BoxError> {
     let mut conn = AsyncPgConnection::establish(url).await?;
-    let runs = runs(&mut conn, prefix).await?;
+    let runs = load_runs(&mut conn, prefix).await?;
     if runs.len() != count {
         return Err(format!("{prefix}: {} runs, want {count}", runs.len()).into());
     }
     let mut pairs = std::collections::BTreeMap::<(String, String), usize>::new();
     for run in &runs {
+        let id = &run.workflow_id;
         if run.state != "COMPLETED" {
-            return Err(format!("{} is {}, want COMPLETED", run.workflow_id, run.state).into());
+            return Err(format!("{id} is {}, want COMPLETED", run.state).into());
         }
         let stored = run
             .output
             .as_deref()
             .ok_or("a completed run has no output")?;
-        let output = decode(serde_json::from_str(stored)?)?;
+        let output: Value = serde_json::from_str(stored)?;
+        if want.codec {
+            check_envelope(id, run.completed_event.as_deref(), &output)?;
+        }
         let got = (label(&output, "first")?, label(&output, "second")?);
-        for (want, have, step) in [(first, &got.0, "first"), (second, &got.1, "second")] {
-            if want != "*" && want != have {
-                return Err(format!(
-                    "{}: {step} step ran on {have}, want {want}",
-                    run.workflow_id
-                )
-                .into());
+        for (need, have, step) in [
+            (want.first, &got.0, "first"),
+            (want.second, &got.1, "second"),
+        ] {
+            if need != "*" && need != have {
+                return Err(format!("{id}: {step} step ran on {have}, want {need}").into());
             }
         }
         *pairs.entry(got).or_default() += 1;
     }
-    for ((a, b), n) in pairs {
+    let ran: std::collections::BTreeSet<&str> = pairs
+        .keys()
+        .flat_map(|(a, b)| [a.as_str(), b.as_str()])
+        .collect();
+    for ((a, b), n) in &pairs {
         println!("{prefix}: {n} runs: first step on {a}, second step on {b}");
+    }
+    if want.both && !(ran.contains("previous") && ran.contains("current")) {
+        return Err(format!("{prefix}: only {ran:?} ran a step, want both versions").into());
+    }
+    Ok(())
+}
+
+/// The `WorkflowCompleted` event of a codec run must hold an envelope. The
+/// envelope must decode to the plain output on the execution row.
+fn check_envelope(id: &str, event: Option<&str>, output: &Value) -> Result<(), BoxError> {
+    let stored: Value = serde_json::from_str(event.ok_or("no WorkflowCompleted event")?)?;
+    if stored.get(ENVELOPE_KEY).is_none() {
+        return Err(
+            format!("{id}: the WorkflowCompleted output is not an envelope: {stored}").into(),
+        );
+    }
+    if decode(&stored)? != *output {
+        return Err(format!("{id}: the envelope does not decode to the run output").into());
     }
     Ok(())
 }
@@ -321,15 +395,12 @@ fn label(output: &Value, step: &str) -> Result<String, BoxError> {
         .ok_or_else(|| format!("no {step} label in {output}").into())
 }
 
-/// Decode a stored payload. A plain value passes through.
+/// Decode a version 1 codec envelope of the test codec.
 ///
 /// This reads the envelope by hand, not through the engine. A change to the
 /// stored envelope shape then fails here, as it fails for an older reader.
-fn decode(stored: Value) -> Result<Value, BoxError> {
-    let Some(envelope) = stored.get(ENVELOPE_KEY) else {
-        return Ok(stored);
-    };
-    if envelope.as_i64() != Some(1) || stored["codec_id"] != CODEC_ID {
+fn decode(stored: &Value) -> Result<Value, BoxError> {
+    if stored[ENVELOPE_KEY].as_i64() != Some(1) || stored["codec_id"] != CODEC_ID {
         return Err(format!("unexpected codec envelope: {stored}").into());
     }
     let data = stored["data"].as_str().ok_or("the envelope has no data")?;

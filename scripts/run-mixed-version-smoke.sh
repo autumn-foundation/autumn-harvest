@@ -13,7 +13,7 @@
 #      N-1 supports it.
 #
 # In steps 3 and 4 the first worker stops while each run waits on a timer.
-# The check then asserts which version ran each step of each run.
+# The check then asserts which version ran each step.
 #
 # Needs a Postgres database that it can reset, and git tags. Run it from a
 # checkout with tags fetched:
@@ -24,7 +24,7 @@
 # Environment:
 #   DATABASE_URL         required. The script drops and recreates its schema.
 #   MV_SMOKE_PREVIOUS    the previous release tag. Default: the highest
-#                        vX.Y.Z tag below the workspace version.
+#                        vX.Y.Z tag of an earlier minor version.
 #   MV_SMOKE_RUNS        runs per scenario. Default: 6.
 #   MV_SMOKE_TIMEOUT     seconds for each wait. Default: 180.
 
@@ -37,16 +37,25 @@ cd "$root"
 runs="${MV_SMOKE_RUNS:-6}"
 timeout="${MV_SMOKE_TIMEOUT:-180}"
 work="$root/target/mixed-version-smoke"
-export CARGO_TARGET_DIR="$work/build"
+# The default target directory, so that the CI cache keeps the dependencies.
+export CARGO_TARGET_DIR="$root/target"
+rm -rf "$work/logs"
 mkdir -p "$work/bin" "$work/logs"
 
 version="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/version = "([^"]*)"/\1/')"
 
-# Print the highest release tag below version $1. Pre-release tags do not count.
+# Print the highest release tag of a minor version below version $1. N-1 is
+# the previous minor release, so a patch of the same minor does not count.
+# Pre-release tags do not count either.
 previous_release() {
-  git tag -l 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-    | { cat; echo "v$1"; } | sort -uV | grep -B1 -x "v$1" | head -n1 \
-    | grep -vx "v$1" || true
+  local minor
+  minor="$(echo "$1" | sed -E 's/^([0-9]+)\.([0-9]+).*/\1 \2/')"
+  git tag -l 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V \
+    | awk -v cur="$minor" '
+        BEGIN { split(cur, c, " ") }
+        { split(substr($0, 2), v, ".")
+          if (v[1] < c[1] || (v[1] == c[1] && v[2] < c[2])) best = $0 }
+        END { if (best) print best }'
 }
 
 previous="${MV_SMOKE_PREVIOUS:-$(previous_release "$version")}"
@@ -62,13 +71,27 @@ case "$previous" in
   *) features="" ;;
 esac
 
+# The pids of the workers that run now.
 pids=()
+
+# Stop the worker with pid $1 and wait at most 60s, then kill it.
+# SIGTERM, because bash starts background jobs with SIGINT ignored.
+stop_pid() {
+  kill -TERM "$1" 2>/dev/null || return 0
+  for _ in $(seq 1 60); do
+    kill -0 "$1" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$1" 2>/dev/null; then
+    echo "worker $1 did not stop after 60s; killing it" >&2
+    kill -KILL "$1" 2>/dev/null || true
+  fi
+  # Return the exit status of the worker.
+  wait "$1"
+}
+
 cleanup() {
   status=$?
-  for pid in "${pids[@]}"; do
-    kill -INT "$pid" 2>/dev/null || true
-  done
-  wait 2>/dev/null || true
   if [ "$status" != "0" ]; then
     for log in "$work"/logs/*.log; do
       [ -f "$log" ] || continue
@@ -76,6 +99,9 @@ cleanup() {
       tail -n 60 "$log" >&2
     done
   fi
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    stop_pid "$pid" || true
+  done
 }
 trap cleanup EXIT
 
@@ -92,8 +118,13 @@ build() {
   cp "$CARGO_TARGET_DIR/debug/mixed-version-smoke" "$work/bin/$label"
 }
 
+# Check out N-1. Replace a stale or partial checkout.
 old_tree="$work/tree-$previous"
-if [ ! -d "$old_tree" ]; then
+git worktree prune
+if [ "$(git -C "$old_tree" rev-parse HEAD 2>/dev/null || true)" \
+  != "$(git rev-parse "$previous^{commit}")" ]; then
+  git worktree remove --force "$old_tree" 2>/dev/null || rm -rf "$old_tree"
+  git worktree prune
   git worktree add --detach "$old_tree" "$previous"
 fi
 build "$root" "" current
@@ -119,7 +150,7 @@ start_worker() {
   pids+=("$pid")
   printf -v "$2" '%s' "$pid"
   for _ in $(seq 1 60); do
-    if grep -q "mixed-version-smoke worker ready" "$log"; then
+    if grep -qs "mixed-version-smoke worker ready" "$log"; then
       return 0
     fi
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -134,13 +165,19 @@ start_worker() {
 
 # Stop the worker with pid $1. A graceful stop drains in-flight tasks.
 stop_worker() {
-  kill -INT "$1"
-  wait "$1"
+  local pid="$1" kept=()
+  stop_pid "$pid"
+  for p in ${pids[@]+"${pids[@]}"}; do
+    [ "$p" = "$pid" ] || kept+=("$p")
+  done
+  pids=(${kept[@]+"${kept[@]}"})
 }
 
 # Roll from version $1 to version $2 while runs wait on their timers.
+# $3 is the prefix. Further arguments go to `check`.
 roll() {
   local from="$1" to="$2" prefix="$3" from_pid to_pid
+  shift 3
   echo "== $prefix: $from starts the runs, $to finishes them"
   start_worker "$from" from_pid "$prefix"
   "$work/bin/$from" start "$prefix" "$runs"
@@ -148,32 +185,35 @@ roll() {
   stop_worker "$from_pid"
   start_worker "$to" to_pid "$prefix"
   "$current" wait-done "$prefix" "$runs" "$timeout"
-  "$current" check "$prefix" "$runs" "$from" "$to"
+  "$current" check "$prefix" "$runs" "$from" "$to" "$@"
   stop_worker "$to_pid"
 }
 
 # Run both versions on one queue. Each version starts half of the runs.
+# $1 is the prefix. Further arguments go to `check`.
 mixed() {
   local prefix="$1" old_pid new_pid
+  shift
   echo "== $prefix: both versions poll one queue"
   start_worker previous old_pid "$prefix"
   start_worker current new_pid "$prefix"
   "$work/bin/previous" start "$prefix-previous" "$runs"
   "$current" start "$prefix-current" "$runs"
-  for p in "$prefix-previous" "$prefix-current"; do
-    "$current" wait-done "$p" "$runs" "$timeout"
-    "$current" check "$p" "$runs" '*' '*'
-  done
+  "$current" wait-done "$prefix" "$((2 * runs))" "$timeout"
+  # The prefix matches the runs of both starters.
+  "$current" check "$prefix" "$((2 * runs))" '*' '*' both "$@"
   stop_worker "$old_pid"
   stop_worker "$new_pid"
 }
 
-# Run scenario $1 with the prefix $2.
+# Run scenario $1 with the prefix $2. Further arguments go to `check`.
 scenario() {
-  case "$1" in
-    roll-forward) roll previous current "$2" ;;
-    roll-back) roll current previous "$2" ;;
-    mixed) mixed "$2" ;;
+  local name="$1" prefix="$2"
+  shift 2
+  case "$name" in
+    roll-forward) roll previous current "$prefix" "$@" ;;
+    roll-back) roll current previous "$prefix" "$@" ;;
+    mixed) mixed "$prefix" "$@" ;;
   esac
 }
 
@@ -193,7 +233,7 @@ esac
 export MV_SMOKE_CODEC=1
 for name in $all; do
   if [[ " $codec_scenarios " == *" $name "* ]]; then
-    scenario "$name" "codec-$name"
+    scenario "$name" "codec-$name" codec
   else
     echo "== codec-$name: not supported with $previous (see Known limits)"
   fi

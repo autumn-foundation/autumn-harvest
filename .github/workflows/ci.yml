@@ -1701,10 +1701,19 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Two trees build here, so free the disk as the `test` job does.
+      - name: Free runner disk before two builds
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
       # See docs/upgrading/README.md, "How CI proves the contract".
       - name: Run the previous release and this tree on one database
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/mvsmoke
+          # No debug info: it halves the size of two debug builds.
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: ./scripts/run-mixed-version-smoke.sh
 
   openapi-client-smoke:
