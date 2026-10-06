@@ -15676,26 +15676,70 @@ fn past_attempt_deadline(
     elapsed >= budget
 }
 
-/// Whether an attempt timed out (issue #1836).
+/// What the worker knows about whether an attempt timed out (issue #1836).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutCheck {
+    /// The attempt did not time out.
+    NotTimedOut,
+    /// The attempt ran past its deadline.
+    TimedOut,
+    /// The timeout scanner may have taken the claim. Read the task row.
+    ReadRow,
+}
+
+/// Decide what to check for a timeout of one attempt (issue #1836).
 ///
-/// An attempt that ends after its deadline (`past_deadline`) timed out,
-/// even when the handler returned before the cancel observer saw the lost
-/// claim. A heartbeat timeout fires before that deadline. So for a
-/// cancelled attempt, the function also reads the task row, where the
-/// timeout scanner writes its timeout error. A failed read counts as no
-/// timeout.
+/// - A sealed transactional success held its claim when it committed, so it
+///   did not time out.
+/// - An attempt that ends after its deadline timed out, even when the
+///   handler returned before the cancel observer saw the lost claim.
+/// - When the claim may be lost, the task row tells. The timeout scanner
+///   writes its timeout error there.
+const fn timeout_check(
+    committed_transactionally: bool,
+    past_deadline: bool,
+    claim_may_be_lost: bool,
+) -> TimeoutCheck {
+    if committed_transactionally {
+        TimeoutCheck::NotTimedOut
+    } else if past_deadline {
+        TimeoutCheck::TimedOut
+    } else if claim_may_be_lost {
+        TimeoutCheck::ReadRow
+    } else {
+        TimeoutCheck::NotTimedOut
+    }
+}
+
+/// Whether the timeout scanner may have taken the claim of an attempt
+/// (issue #1836).
+///
+/// A cancel can mean a lost claim. A heartbeat timeout can fire before the
+/// attempt deadline, but only after `heartbeat_timeout` has elapsed. A
+/// handler can also answer before the cancel observer sees that loss.
+fn claim_may_be_lost(
+    was_cancelled: bool,
+    heartbeat_timeout: Option<Duration>,
+    elapsed: Duration,
+) -> bool {
+    was_cancelled || heartbeat_timeout.is_some_and(|timeout| elapsed >= timeout)
+}
+
+/// Whether an attempt timed out (issue #1836). See [`timeout_check`].
+///
+/// For [`TimeoutCheck::ReadRow`], the function reads the task row. A lost
+/// claim with the scanner's timeout error for this activity is a timeout. A
+/// failed read counts as no timeout.
 async fn attempt_timed_out(
     pool: &DbPool,
     claim: &queue::TaskClaim,
     activity_name: &str,
-    past_deadline: bool,
-    was_cancelled: bool,
+    check: TimeoutCheck,
 ) -> bool {
-    if past_deadline {
-        return true;
-    }
-    if !was_cancelled {
-        return false;
+    match check {
+        TimeoutCheck::NotTimedOut => return false,
+        TimeoutCheck::TimedOut => return true,
+        TimeoutCheck::ReadRow => {}
     }
     let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
         return false;
@@ -15866,6 +15910,33 @@ mod adaptive_limit_gate_tests {
             Some(SampleOutcome::Overloaded)
         );
         assert_eq!(limit_sample_outcome(None, None, false), None);
+    }
+
+    /// The timeout decision table (issue #1836).
+    #[test]
+    fn the_timeout_decision_follows_the_evidence() {
+        use super::{TimeoutCheck, timeout_check};
+        // A sealed transactional success held its claim, so it never timed
+        // out, whatever the clock says.
+        assert_eq!(timeout_check(true, true, true), TimeoutCheck::NotTimedOut);
+        assert_eq!(timeout_check(false, true, false), TimeoutCheck::TimedOut);
+        assert_eq!(timeout_check(false, false, true), TimeoutCheck::ReadRow);
+        assert_eq!(
+            timeout_check(false, false, false),
+            TimeoutCheck::NotTimedOut
+        );
+    }
+
+    /// The scanner can fire a heartbeat timeout only after the heartbeat
+    /// timeout has elapsed. So the row read runs then, or after a cancel.
+    #[test]
+    fn the_claim_may_be_lost_after_a_cancel_or_a_heartbeat_timeout() {
+        use super::claim_may_be_lost;
+        let ms = Duration::from_millis;
+        assert!(claim_may_be_lost(true, None, ms(0)));
+        assert!(!claim_may_be_lost(false, None, ms(10_000)));
+        assert!(!claim_may_be_lost(false, Some(ms(500)), ms(499)));
+        assert!(claim_may_be_lost(false, Some(ms(500)), ms(500)));
     }
 
     /// The deadline check uses the database-clock budget and the monotonic
@@ -17937,16 +18008,14 @@ async fn process_activity_task(
     // and free the slot. See `limit_sample_outcome` for which attempts give
     // no sample.
     if let Some(permit) = limit_permit.take() {
-        let past_deadline =
-            past_attempt_deadline(attempt_deadline, task.started_at, dispatched_at.elapsed());
-        let timed_out = attempt_timed_out(
-            pool,
-            &activity_claim,
-            activity_name,
-            past_deadline,
-            was_cancelled,
-        )
-        .await;
+        let elapsed = dispatched_at.elapsed();
+        let heartbeat_timeout = task.heartbeat_timeout.and_then(|d| d.to_std().ok());
+        let check = timeout_check(
+            committed_transactionally,
+            past_attempt_deadline(attempt_deadline, task.started_at, elapsed),
+            claim_may_be_lost(was_cancelled, heartbeat_timeout, elapsed),
+        );
+        let timed_out = attempt_timed_out(pool, &activity_claim, activity_name, check).await;
         let error_type = failure_info.as_ref().map(|(et, _, _)| et.as_str());
         match limit_sample_outcome(circuit_outcome, error_type, timed_out) {
             Some(outcome) => permit.complete(attempt_latency, outcome),
