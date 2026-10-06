@@ -269,9 +269,10 @@ async fn poll_once_still_attempts_every_broken_execution_in_one_pass() {
         COUNTING_BROKEN_ATTEMPTS.load(Ordering::SeqCst) - attempts_before >= 2,
         "both broken executions must be driven in the same pass, not just the first"
     );
+    // Issue #1834: the pass seals each broken execution `FAILED`.
     assert!(matches!(
         rt.outcome(second).unwrap(),
-        ExecutionOutcome::Running
+        ExecutionOutcome::Failed(_)
     ));
 }
 
@@ -419,4 +420,50 @@ async fn run_until_idle_strikes_a_panicking_execution_at_most_once_per_call() {
         "the unrelated multi-cycle execution must still converge fully in \
          the same call"
     );
+}
+
+/// Calls an activity that is never registered. Unlike an unsupported command,
+/// this error leaves the run `RUNNING` (issue #1834), so it stays broken on
+/// every pass.
+#[workflow]
+async fn unregistered_activity_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let v = ctx
+        .execute_activity_raw("never_registered", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(v.as_i64().unwrap_or_default())
+}
+
+/// Issue #1834 seals an unsupported run on its first pass. This case keeps
+/// the coverage of a run that fails on EVERY pass and stays `RUNNING`.
+#[tokio::test]
+async fn run_until_idle_converges_past_a_persistently_broken_running_execution() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&unregistered_activity_wf_info());
+    rt.register_workflow(&two_step_wf_info());
+    rt.register_activity_raw("increment", increment_activity());
+
+    let broken = rt
+        .start_workflow("unregistered_activity_wf", json!(1))
+        .unwrap();
+    let healthy_after = start_after(&mut rt, "two_step_wf", &json!(10), broken);
+
+    for _ in 1..=2 {
+        let err = rt
+            .run_until_idle()
+            .await
+            .expect_err("the broken execution's error must surface on every call");
+        assert!(
+            matches!(err, SqliteError::UnregisteredActivity(_)),
+            "expected UnregisteredActivity, got {err:?}"
+        );
+        assert!(
+            matches!(rt.outcome(broken).unwrap(), ExecutionOutcome::Running),
+            "a fixable error must leave the run RUNNING"
+        );
+    }
+    assert!(matches!(
+        rt.outcome(healthy_after).unwrap(),
+        ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(12)
+    ));
 }

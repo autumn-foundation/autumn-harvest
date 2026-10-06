@@ -26,6 +26,8 @@ mod review_fixes;
 mod review_fixes_48d54b2;
 mod runtime_robustness;
 mod signal_timeout;
+mod single_writer_lock;
 mod subsecond_timer;
 mod unknown_execution_id;
+mod unsupported_terminal;
 mod workflow_info_features;
