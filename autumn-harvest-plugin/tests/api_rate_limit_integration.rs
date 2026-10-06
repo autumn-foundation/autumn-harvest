@@ -208,28 +208,31 @@ async fn burst(app: &axum::Router, bearer: &str, n: usize) -> (usize, Vec<String
     (limited, retry_after)
 }
 
-async fn sustained_rows(conn: &mut AsyncPgConnection) -> Vec<(String, String)> {
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        actor: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        error_summary: String,
-    }
+#[derive(Debug, diesel::QueryableByName)]
+struct SustainedRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    actor: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    status: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    route: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    summary: String,
+}
+
+async fn sustained_rows(conn: &mut AsyncPgConnection) -> Vec<SustainedRow> {
     diesel::sql_query(
-        "SELECT actor, COALESCE(error_summary, '') AS error_summary FROM harvest_audit_log \
+        "SELECT actor, status, route_or_command AS route, \
+         COALESCE(error_summary, '') AS summary FROM harvest_audit_log \
          WHERE operation = 'api.rate_limit_sustained' ORDER BY occurred_at",
     )
-    .load::<Row>(conn)
+    .load::<SustainedRow>(conn)
     .await
     .unwrap()
-    .into_iter()
-    .map(|r| (r.actor, r.error_summary))
-    .collect()
 }
 
 /// Poll for the audit row. The limiter writes it off the request path.
-async fn await_sustained_rows(conn: &mut AsyncPgConnection, want: usize) -> Vec<(String, String)> {
+async fn await_sustained_rows(conn: &mut AsyncPgConnection, want: usize) -> Vec<SustainedRow> {
     for _ in 0..100 {
         let rows = sustained_rows(conn).await;
         if rows.len() >= want {
@@ -254,13 +257,15 @@ async fn a_burst_from_one_token_is_limited_and_another_token_is_not() {
     let metrics = Arc::new(CapturingMetrics::default());
     let app = limited_app(&pool, Arc::clone(&metrics), ten_per_second());
 
+    let started = std::time::Instant::now();
     let (limited, retry_after) = burst(&app, &noisy, 100).await;
+    let elapsed = started.elapsed();
     let (quiet_limited, _) = burst(&app, &quiet, 10).await;
 
     // The bucket refills during the burst, so a slow runner sees fewer 429s.
     assert!(
         (50..=90).contains(&limited),
-        "about 90 of 100 starts are refused, got {limited}"
+        "about 90 of 100 starts are refused, got {limited} in {elapsed:?}"
     );
     assert!(
         retry_after.iter().all(|v| v.parse::<u64>().unwrap() >= 1),
@@ -294,6 +299,7 @@ async fn sustained_rejections_write_one_audit_row() {
     let app = limited_app(&pool, Arc::default(), limit);
 
     let (limited, _) = burst(&app, &noisy, 100).await;
+    assert!(limited >= 20, "the burst crosses the threshold: {limited}");
     // At most ten rejections stay under the threshold of twenty.
     burst(&app, &quiet, 20).await;
     let rows = await_sustained_rows(&mut conn, 1).await;
@@ -301,14 +307,17 @@ async fn sustained_rejections_write_one_audit_row() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let rows_after = sustained_rows(&mut conn).await;
 
-    assert!(limited >= 20, "the burst crosses the threshold: {limited}");
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows_after.len(), 1, "one row per bucket per window");
-    let (actor, summary) = &rows[0];
-    assert_eq!(actor, &format!("token:{noisy_id}"));
-    assert!(
-        !summary.contains(&noisy),
-        "the secret never reaches the audit"
-    );
-    assert!(summary.contains("mutating"), "{summary}");
+    let row = &rows[0];
+    assert_eq!(row.actor, format!("token:{noisy_id}"));
+    assert_eq!(row.status, "failed");
+    assert_eq!(row.route, format!("POST {START}"));
+    for field in [&row.actor, &row.route, &row.summary] {
+        assert!(
+            !field.contains(&noisy),
+            "the secret never reaches the audit"
+        );
+    }
+    assert!(row.summary.contains("mutating"), "{}", row.summary);
 }

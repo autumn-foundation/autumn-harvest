@@ -180,9 +180,28 @@ async fn an_unclassified_get_counts_as_a_read() {
     let peer = Peer::Connect("192.0.2.1");
     count_429(&app, &Method::POST, START, peer, 20).await;
 
-    let limited = count_429(&app, &Method::GET, "/api/harvest/ui/", peer, 10).await;
+    let limited = count_429(&app, &Method::GET, "/api/harvest/ui", peer, 11).await;
 
-    assert_eq!(limited, 0);
+    assert_eq!(
+        limited, 1,
+        "the read bucket admits ten, not the empty mutating one"
+    );
+}
+
+/// `HEAD` counts as a read, on a classified route and on a Vantage page.
+#[tokio::test(start_paused = true)]
+async fn a_head_request_counts_as_a_read() {
+    let app = app(StandaloneAdminAuth::new().with_rate_limit(ten_per_second()));
+    let peer = Peer::Connect("192.0.2.1");
+
+    let heads = count_429(&app, &Method::HEAD, READ, peer, 5).await;
+    let ui_heads = count_429(&app, &Method::HEAD, "/api/harvest/ui", peer, 5).await;
+    let get = count_429(&app, &Method::GET, READ, peer, 1).await;
+    let post = count_429(&app, &Method::POST, START, peer, 1).await;
+
+    assert_eq!((heads, ui_heads), (0, 0));
+    assert_eq!(get, 1, "ten HEAD requests used up the read bucket");
+    assert_eq!(post, 0, "the mutating bucket is untouched");
 }
 
 /// Health probes and `OPTIONS` preflights are never limited.

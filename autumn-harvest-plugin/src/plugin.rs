@@ -622,7 +622,8 @@ impl HarvestPlugin {
     ///
     /// Each verified API token, or each client IP without one, gets one
     /// bucket for mutating routes and one for read routes. A client over its
-    /// limit gets `429` with `Retry-After`. Health routes are exempt. See
+    /// limit gets `429` with `Retry-After`. `PublicSafe` routes and `OPTIONS`
+    /// requests are exempt. See
     /// [`crate::api_rate_limit`].
     ///
     /// Default off: with no limiter the router is byte-for-byte unchanged.
@@ -2683,6 +2684,24 @@ mod tests {
             evaluate(&contract, AUTUMN_WEB_VERSION),
             ContractVerdict::Compatible
         );
+    }
+
+    /// The API rate limiter is off by default, and the builder keeps the
+    /// declared rates (issue #1827). `build` passes the field to
+    /// `apply_admin_auth_layers`, which the standalone suites exercise.
+    #[test]
+    fn api_rate_limit_is_off_by_default_and_kept_when_declared() {
+        use crate::api_rate_limit::{ApiRateLimit, BucketRate};
+
+        assert!(HarvestPlugin::new().api_rate_limit.is_none());
+
+        let limit = ApiRateLimit::new(BucketRate::per_second(10), BucketRate::per_second(50));
+        let plugin = HarvestPlugin::new().with_api_rate_limit(limit);
+        let kept = plugin
+            .api_rate_limit
+            .expect("the builder keeps the limiter");
+        assert_eq!(kept.mutating(), BucketRate::per_second(10));
+        assert_eq!(kept.read(), BucketRate::per_second(50));
     }
 
     /// The range excludes the previous and the next `autumn-web` series.

@@ -243,8 +243,8 @@ pub const OP_LOAD_SHED_CLEAR: &str = "load_shed.clear";
 /// The row has status `failed`, so the SIEM export marks it `ERROR`. The deny
 /// reason goes in `error_summary` and never into the response.
 pub const OP_AUTHZ_DENY: &str = "authz.deny";
-/// Audit operation: the API rate limiter refused one client many times in one
-/// window (issue #1827).
+/// Audit operation: one API rate-limit bucket reached the sustained-rejection
+/// threshold in one window (issue #1827).
 ///
 /// The row has status `failed`. The limiter writes it, not a route, so no
 /// `ALL_MUTATION_ROUTES` entry exists for it.

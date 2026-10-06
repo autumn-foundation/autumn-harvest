@@ -76,7 +76,7 @@ impl BucketRate {
 pub struct ApiRateLimit {
     mutating: BucketRate,
     read: BucketRate,
-    max_clients: usize,
+    max_buckets: usize,
     sustained_rejections: u32,
     sustained_window: Duration,
 }
@@ -99,18 +99,20 @@ impl ApiRateLimit {
         Self {
             mutating,
             read,
-            max_clients: DEFAULT_MAX_CLIENTS,
+            max_buckets: DEFAULT_MAX_BUCKETS,
             sustained_rejections: DEFAULT_SUSTAINED_REJECTIONS,
             sustained_window: DEFAULT_SUSTAINED_WINDOW,
         }
     }
 
-    /// Cap the number of buckets the limiter keeps. A zero cap counts as one.
+    /// Cap the number of address buckets the limiter keeps. A zero cap counts
+    /// as one.
     ///
-    /// At the cap, a new client shares one overflow bucket per route class.
+    /// One client uses up to two buckets, one per route class. At the cap, a
+    /// new address shares one overflow bucket per route class.
     #[must_use]
-    pub const fn with_max_clients(mut self, max_clients: usize) -> Self {
-        self.max_clients = if max_clients == 0 { 1 } else { max_clients };
+    pub const fn with_max_buckets(mut self, max_buckets: usize) -> Self {
+        self.max_buckets = if max_buckets == 0 { 1 } else { max_buckets };
         self
     }
 
@@ -149,7 +151,7 @@ impl ApiRateLimit {
     }
 }
 
-const DEFAULT_MAX_CLIENTS: usize = 10_000;
+const DEFAULT_MAX_BUCKETS: usize = 10_000;
 const DEFAULT_SUSTAINED_REJECTIONS: u32 = 100;
 const DEFAULT_SUSTAINED_WINDOW: Duration = Duration::from_secs(60);
 
@@ -175,7 +177,8 @@ impl LimitClass {
 pub(crate) enum ClientKey {
     /// A verified API token.
     Token(Uuid),
-    /// A client IP address. An IPv6 address is cut to its /64 prefix.
+    /// A client IP address. The key keeps only the /64 prefix of an IPv6
+    /// address.
     Ip(IpAddr),
     /// No token and no known address.
     Unknown,
@@ -206,7 +209,8 @@ pub(crate) enum Decision {
         /// Whole seconds until the bucket holds one token. Never zero.
         retry_after_secs: u64,
         /// The rejection count when this rejection makes the bucket
-        /// sustained. Set once per bucket per window.
+        /// sustained. The limiter sets it at most once per bucket per window.
+        /// The audit budget can suppress it.
         sustained: Option<u32>,
     },
 }
@@ -225,11 +229,16 @@ struct Inner {
 
 #[derive(Debug, Default)]
 struct LimiterState {
-    buckets: HashMap<(ClientKey, LimitClass), Bucket>,
-    /// The last time a full map was pruned. Pruning walks every bucket, so it
-    /// runs at most once per [`PRUNE_INTERVAL`].
+    /// Buckets of verified tokens. Only an admin can mint a token, so this map
+    /// has no cap. A token never shares the overflow bucket.
+    tokens: HashMap<(ClientKey, LimitClass), Bucket>,
+    /// Buckets of addresses, the unknown client and the overflow client. The
+    /// cap applies to this map.
+    addresses: HashMap<(ClientKey, LimitClass), Bucket>,
+    /// The time of the last prune of a full map. A prune walks every bucket,
+    /// so it runs at most once per [`PRUNE_INTERVAL`].
     last_prune: Option<Instant>,
-    /// The audit budget window (see [`MAX_SUSTAINED_AUDITS_PER_WINDOW`]).
+    /// The start of the audit budget window (see [`AUDIT_BUDGET_WINDOW`]).
     audit_window_start: Option<Instant>,
     audits_in_window: u32,
 }
@@ -238,11 +247,15 @@ struct LimiterState {
 const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The most sustained-rejection audit rows that all buckets together write in
-/// one window.
+/// one [`AUDIT_BUDGET_WINDOW`].
 ///
 /// Many clients can become sustained at once. Each audit row needs a pool
 /// connection, so this cap stops a wide flood from starving real work.
 const MAX_SUSTAINED_AUDITS_PER_WINDOW: u32 = 100;
+
+/// The fixed window of the shared audit budget. It does not follow the
+/// configured sustained window, so a short window cannot raise the write rate.
+const AUDIT_BUDGET_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct Bucket {
@@ -287,8 +300,12 @@ impl Bucket {
 
     /// Count one rejection. Return the count when the bucket first reaches
     /// `threshold` in the current window.
+    ///
+    /// A window starts at its first rejection. Thus a flood never splits
+    /// across a window that opened long before it.
     fn count_rejection(&mut self, now: Instant, threshold: u32, window: Duration) -> Option<u32> {
-        if now.saturating_duration_since(self.window_start) >= window {
+        if self.window_rejections == 0 || now.saturating_duration_since(self.window_start) >= window
+        {
             self.window_start = now;
             self.window_rejections = 0;
             self.window_reported = false;
@@ -311,8 +328,9 @@ impl Bucket {
 }
 
 impl LimiterState {
-    /// The key to charge. At the bucket cap, a new client is charged to the
-    /// overflow bucket, unless a prune frees room.
+    /// The key to charge. At the address cap, the limiter charges a new
+    /// address to the overflow bucket, unless a prune frees room. A token is
+    /// always charged to its own bucket.
     fn admit(
         &mut self,
         key: ClientKey,
@@ -320,7 +338,10 @@ impl LimiterState {
         now: Instant,
         config: &ApiRateLimit,
     ) -> ClientKey {
-        if self.buckets.len() < config.max_clients || self.buckets.contains_key(&(key, class)) {
+        if matches!(key, ClientKey::Token(_))
+            || self.addresses.len() < config.max_buckets
+            || self.addresses.contains_key(&(key, class))
+        {
             return key;
         }
         let prune_due = self
@@ -328,21 +349,40 @@ impl LimiterState {
             .is_none_or(|at| now.saturating_duration_since(at) >= PRUNE_INTERVAL);
         if prune_due {
             self.last_prune = Some(now);
-            self.buckets.retain(|(_, class), bucket| {
+            let idle = |(_, class): &(ClientKey, LimitClass), bucket: &mut Bucket| {
                 !bucket.is_idle(config.rate_for(*class), now, config.sustained_window)
-            });
-            if self.buckets.len() < config.max_clients {
+            };
+            self.addresses.retain(|k, b| idle(k, b));
+            self.tokens.retain(|k, b| idle(k, b));
+            if self.addresses.len() < config.max_buckets {
                 return key;
             }
         }
         ClientKey::Overflow
     }
 
+    /// The bucket of `key` and `class`. A new bucket starts full.
+    fn bucket(
+        &mut self,
+        key: ClientKey,
+        class: LimitClass,
+        rate: BucketRate,
+        now: Instant,
+    ) -> &mut Bucket {
+        let map = if matches!(key, ClientKey::Token(_)) {
+            &mut self.tokens
+        } else {
+            &mut self.addresses
+        };
+        map.entry((key, class))
+            .or_insert_with(|| Bucket::full(rate, now))
+    }
+
     /// Take one audit row from the shared budget.
-    fn take_audit(&mut self, now: Instant, window: Duration) -> bool {
+    fn take_audit(&mut self, now: Instant) -> bool {
         let expired = self
             .audit_window_start
-            .is_none_or(|at| now.saturating_duration_since(at) >= window);
+            .is_none_or(|at| now.saturating_duration_since(at) >= AUDIT_BUDGET_WINDOW);
         if expired {
             self.audit_window_start = Some(now);
             self.audits_in_window = 0;
@@ -388,10 +428,7 @@ impl ApiRateLimiter {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let key = state.admit(key, class, now, config);
-        let bucket = state
-            .buckets
-            .entry((key, class))
-            .or_insert_with(|| Bucket::full(rate, now));
+        let bucket = state.bucket(key, class, rate, now);
         bucket.refill(rate, now);
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -400,7 +437,7 @@ impl ApiRateLimiter {
         let retry_after_secs = bucket.retry_after_secs(rate);
         let sustained = bucket
             .count_rejection(now, config.sustained_rejections, config.sustained_window)
-            .filter(|_| state.take_audit(now, config.sustained_window));
+            .filter(|_| state.take_audit(now));
         drop(state);
         Decision::Reject {
             key,
@@ -412,12 +449,12 @@ impl ApiRateLimiter {
     /// The number of buckets the limiter holds.
     #[cfg(test)]
     fn bucket_count(&self) -> usize {
-        self.inner
+        let state = self
+            .inner
             .state
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .buckets
-            .len()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.tokens.len() + state.addresses.len()
     }
 }
 
@@ -474,9 +511,9 @@ fn client_key(request: &Request, client_addr: Option<ClientAddr>) -> ClientKey {
 
 /// Refuse a request over its client's limit with `429` (issue #1827).
 ///
-/// The layer runs inside the token layer, so a verified token is known. It
-/// runs before the read-only, authorizer and admin layers, so a refused
-/// request does no further work.
+/// The layer runs inside the token layer, so it can read the verified token.
+/// It runs before the read-only, authorizer and admin layers, so a refused
+/// request reaches no handler.
 pub(crate) async fn enforce_api_rate_limit(
     State((api_state, limiter)): State<(HarvestApiState, ApiRateLimiter)>,
     client_addr: Option<ClientAddr>,
@@ -541,7 +578,7 @@ fn describe(key: ClientKey) -> String {
 /// Log a sustained client and write one `api.rate_limit_sustained` row.
 ///
 /// The write runs on its own task, so the `429` never waits on the database.
-/// A failed write is logged.
+/// The task logs a failed or timed-out write.
 fn audit_sustained(
     api_state: &HarvestApiState,
     request: &Request,
@@ -617,6 +654,13 @@ mod tests {
 
     fn token() -> ClientKey {
         ClientKey::Token(Uuid::new_v4())
+    }
+
+    /// A new address key on each call.
+    fn addr() -> ClientKey {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ip_key(Ipv4Addr::from(0x0a00_0000 | n).into())
     }
 
     fn limiter(rate: u32) -> ApiRateLimiter {
@@ -802,36 +846,40 @@ mod tests {
     fn the_bucket_cap_sends_new_clients_to_overflow() {
         let limiter = ApiRateLimiter::new(
             ApiRateLimit::new(BucketRate::per_second(1), BucketRate::per_second(1))
-                .with_max_clients(2),
+                .with_max_buckets(2),
         );
         let now = Instant::now();
-        limiter.check(token(), LimitClass::Mutating, now);
-        limiter.check(token(), LimitClass::Mutating, now);
+        limiter.check(addr(), LimitClass::Mutating, now);
+        limiter.check(addr(), LimitClass::Mutating, now);
         // Both buckets are empty and young, so pruning frees nothing.
-        let third = token();
+        let third = addr();
         assert_eq!(
             limiter.check(third, LimitClass::Mutating, now),
             Decision::Allow
         );
-        match limiter.check(token(), LimitClass::Mutating, now) {
+        match limiter.check(addr(), LimitClass::Mutating, now) {
             Decision::Reject { key, .. } => assert_eq!(key, ClientKey::Overflow),
             Decision::Allow => panic!("the overflow bucket is shared and empty"),
         }
-        assert!(limiter.bucket_count() <= 4, "the cap bounds memory");
+        assert_eq!(
+            limiter.bucket_count(),
+            3,
+            "two capped buckets and one overflow"
+        );
     }
 
     #[test]
     fn idle_buckets_are_pruned_at_the_cap() {
         let limiter = ApiRateLimiter::new(
             ApiRateLimit::new(BucketRate::per_second(1), BucketRate::per_second(1))
-                .with_max_clients(2)
+                .with_max_buckets(2)
                 .with_sustained_audit(1, Duration::from_secs(1)),
         );
         let start = Instant::now();
-        limiter.check(token(), LimitClass::Mutating, start);
-        limiter.check(token(), LimitClass::Mutating, start);
+        limiter.check(addr(), LimitClass::Mutating, start);
+        limiter.check(addr(), LimitClass::Mutating, start);
         let later = start + Duration::from_secs(5);
-        let fresh = token();
+        let fresh = addr();
         limiter.check(fresh, LimitClass::Mutating, later);
         match limiter.check(fresh, LimitClass::Mutating, later) {
             Decision::Reject { key, .. } => assert_eq!(key, fresh, "no overflow after a prune"),
@@ -844,15 +892,15 @@ mod tests {
     fn a_full_bucket_with_no_rejections_is_pruned_inside_its_window() {
         let limiter = ApiRateLimiter::new(
             ApiRateLimit::new(BucketRate::per_second(10), BucketRate::per_second(10))
-                .with_max_clients(2)
+                .with_max_buckets(2)
                 .with_sustained_audit(1, Duration::from_secs(60)),
         );
         let start = Instant::now();
         // Two one-shot clients refill within 0.1 s and never reject.
-        limiter.check(token(), LimitClass::Mutating, start);
-        limiter.check(token(), LimitClass::Mutating, start);
+        limiter.check(addr(), LimitClass::Mutating, start);
+        limiter.check(addr(), LimitClass::Mutating, start);
         let later = start + Duration::from_secs(2);
-        let fresh = token();
+        let fresh = addr();
         for _ in 0..10 {
             limiter.check(fresh, LimitClass::Mutating, later);
         }
@@ -860,6 +908,81 @@ mod tests {
             Decision::Reject { key, .. } => assert_eq!(key, fresh, "no overflow after a prune"),
             Decision::Allow => panic!("a bucket of ten rejects its eleventh request"),
         }
+    }
+
+    #[test]
+    fn a_token_never_goes_to_the_overflow_bucket() {
+        let limiter = ApiRateLimiter::new(
+            ApiRateLimit::new(BucketRate::per_second(1), BucketRate::per_second(1))
+                .with_max_buckets(2),
+        );
+        let now = Instant::now();
+        let ip = |n: u8| ip_key(Ipv4Addr::new(192, 0, 2, n).into());
+        limiter.check(ip(1), LimitClass::Mutating, now);
+        limiter.check(ip(2), LimitClass::Mutating, now);
+        limiter.check(ip(3), LimitClass::Mutating, now);
+        let tokens: Vec<ClientKey> = (0..3).map(|_| token()).collect();
+        for &key in &tokens {
+            assert_eq!(
+                limiter.check(key, LimitClass::Mutating, now),
+                Decision::Allow
+            );
+            match limiter.check(key, LimitClass::Mutating, now) {
+                Decision::Reject { key: charged, .. } => assert_eq!(charged, key),
+                Decision::Allow => panic!("a bucket of one rejects its second request"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_sustained_window_starts_at_the_first_rejection() {
+        let limiter = ApiRateLimiter::new(
+            ApiRateLimit::new(BucketRate::per_second(1), BucketRate::per_second(1))
+                .with_sustained_audit(10, Duration::from_secs(60)),
+        );
+        let key = token();
+        let start = Instant::now();
+        limiter.check(key, LimitClass::Mutating, start);
+        // The flood starts 59 s after the bucket opens and spans 2 s.
+        let flood = start + Duration::from_secs(59);
+        let reported = (0..10_u64)
+            .filter(|n| {
+                let now = flood + Duration::from_millis(n * 200);
+                limiter.check(key, LimitClass::Mutating, now);
+                matches!(
+                    limiter.check(key, LimitClass::Mutating, now),
+                    Decision::Reject {
+                        sustained: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(reported, 1, "ten rejections in 2 s cross the threshold");
+    }
+
+    #[test]
+    fn the_audit_budget_is_per_minute_whatever_the_window() {
+        let limiter = ApiRateLimiter::new(
+            ApiRateLimit::new(BucketRate::per_second(1), BucketRate::per_second(1))
+                .with_sustained_audit(1, Duration::from_secs(1)),
+        );
+        let start = Instant::now();
+        let mut audits = 0;
+        for second in 0..3_u64 {
+            let now = start + Duration::from_secs(second);
+            for _ in 0..80 {
+                let key = token();
+                limiter.check(key, LimitClass::Mutating, now);
+                if let Decision::Reject {
+                    sustained: Some(_), ..
+                } = limiter.check(key, LimitClass::Mutating, now)
+                {
+                    audits += 1;
+                }
+            }
+        }
+        assert_eq!(audits, 100, "240 sustained buckets in 3 s, one budget");
     }
 
     #[test]

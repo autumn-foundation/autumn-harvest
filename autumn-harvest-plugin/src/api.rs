@@ -5609,10 +5609,10 @@ pub(crate) struct AdminAuthLayers {
 /// layer. It runs after both built-in gates, so it can only deny. It sees the
 /// `TokenPrincipal` the token layer sets.
 ///
-/// Issue #1827: the rate-limit layer is installed directly INSIDE the token
-/// layer. It keys a bucket on the verified `TokenPrincipal`, so an unverified
-/// bearer cannot open a new bucket. It runs before the read-only and
-/// authorizer layers, so a refused request does no further work.
+/// Issue #1827: the rate-limit layer sits directly INSIDE the token layer. It
+/// keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
+/// cannot open a new bucket. It runs before the read-only and authorizer
+/// layers, so a refused request reaches no handler.
 ///
 /// No layer is installed unless asked for, so a deployment that declares none
 /// does an identical amount of work as before.
@@ -6089,8 +6089,8 @@ pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteCl
 /// The `CLASSIFIED_ROUTES` class of a request, or `None` for an unclassified
 /// route.
 ///
-/// The API rate limiter (issue #1827) reads `None` by method. Use
-/// [`classify_route`] for an access decision, which fails closed.
+/// The API rate limiter (issue #1827) classes a `None` route by its method.
+/// Use [`classify_route`] for an access decision. It fails closed.
 pub(crate) fn classified_route(method: &axum::http::Method, path: &str) -> Option<RouteClass> {
     match_route(route_class_matchers(), method, path).map(|m| *m.value)
 }

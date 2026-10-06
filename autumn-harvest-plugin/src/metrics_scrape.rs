@@ -30,8 +30,9 @@
 //! but do back shipped dashboard panels — leaving those to the no-op default
 //! would make a dropped metric indistinguishable from an idle consumer. It
 //! also aggregates `harvest.api.rate_limited` from the plugin's own API rate
-//! limiter (issue #1827). Every
-//! other `MetricsRecorder` method keeps the trait's no-op default — an embedder
+//! limiter (issue #1827).
+//!
+//! Every other `MetricsRecorder` method keeps the trait's no-op default — an embedder
 //! who needs the full metric surface (e.g. `harvest.workflow.terminal`,
 //! `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`,
 //! and the rest of the starter alert pack in `docs/alerts/`) or OTLP export
