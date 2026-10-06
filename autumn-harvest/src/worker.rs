@@ -15656,21 +15656,42 @@ fn limit_sample_outcome(
     }
 }
 
+/// Whether an attempt ran past its deadline (issue #1836).
+///
+/// `deadline` and `started_at` both come from the database clock, so their
+/// difference is the attempt budget. `elapsed` runs on this host's monotonic
+/// clock from the claim. A host clock skew therefore cannot change the
+/// answer. The timeout scanner also judges the deadline by the database
+/// clock.
+fn past_attempt_deadline(
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    elapsed: Duration,
+) -> bool {
+    let (Some(deadline), Some(started_at)) = (deadline, started_at) else {
+        return false;
+    };
+    // A deadline before the claim leaves no budget.
+    let budget = (deadline - started_at).to_std().unwrap_or(Duration::ZERO);
+    elapsed >= budget
+}
+
 /// Whether an attempt timed out (issue #1836).
 ///
-/// An attempt that ends after its deadline timed out, even when the handler
-/// returned before the cancel observer saw the lost claim. A heartbeat
-/// timeout fires before that deadline. So for a cancelled attempt, the
-/// function also reads the task row, where the timeout scanner writes its
-/// timeout error. A failed read counts as no timeout.
+/// An attempt that ends after its deadline (`past_deadline`) timed out,
+/// even when the handler returned before the cancel observer saw the lost
+/// claim. A heartbeat timeout fires before that deadline. So for a
+/// cancelled attempt, the function also reads the task row, where the
+/// timeout scanner writes its timeout error. A failed read counts as no
+/// timeout.
 async fn attempt_timed_out(
     pool: &DbPool,
     claim: &queue::TaskClaim,
     activity_name: &str,
-    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    past_deadline: bool,
     was_cancelled: bool,
 ) -> bool {
-    if deadline.is_some_and(|d| chrono::Utc::now() >= d) {
+    if past_deadline {
         return true;
     }
     if !was_cancelled {
@@ -15845,6 +15866,25 @@ mod adaptive_limit_gate_tests {
             Some(SampleOutcome::Overloaded)
         );
         assert_eq!(limit_sample_outcome(None, None, false), None);
+    }
+
+    /// The deadline check uses the database-clock budget and the monotonic
+    /// elapsed time, so a host clock skew cannot change the answer.
+    #[test]
+    fn the_deadline_check_ignores_the_host_clock() {
+        use super::past_attempt_deadline;
+        use chrono::TimeZone as _;
+        // Database timestamps far from the host clock, as under a skew.
+        let started = chrono::Utc.with_ymd_and_hms(2001, 1, 1, 0, 0, 0).single();
+        let deadline = started.map(|s| s + chrono::Duration::milliseconds(300));
+        let ms = Duration::from_millis;
+        assert!(!past_attempt_deadline(deadline, started, ms(280)));
+        assert!(past_attempt_deadline(deadline, started, ms(300)));
+        assert!(past_attempt_deadline(deadline, started, ms(320)));
+        assert!(!past_attempt_deadline(None, started, ms(10_000)));
+        assert!(!past_attempt_deadline(deadline, None, ms(10_000)));
+        // A deadline before the claim leaves no budget.
+        assert!(past_attempt_deadline(started, deadline, ms(0)));
     }
 
     /// The scanner's timeout errors for this activity are timeouts. Other
@@ -17897,11 +17937,13 @@ async fn process_activity_task(
     // and free the slot. See `limit_sample_outcome` for which attempts give
     // no sample.
     if let Some(permit) = limit_permit.take() {
+        let past_deadline =
+            past_attempt_deadline(attempt_deadline, task.started_at, dispatched_at.elapsed());
         let timed_out = attempt_timed_out(
             pool,
             &activity_claim,
             activity_name,
-            attempt_deadline,
+            past_deadline,
             was_cancelled,
         )
         .await;
