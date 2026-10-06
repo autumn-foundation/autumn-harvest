@@ -33,3 +33,10 @@ under \"customer-42/invoice.pdf\"".
 **Toolchain.** The 1.100 nightlies that were tested fail to build the `db`
 feature, so the fuzz crate did not build on current nightly. The workflow
 and `fuzz/smoke.sh` pin `nightly-2026-08-14`.
+
+**Found by the fuzzer.** A history with two `WorkflowContinuedAsNew` events
+of different target types tripped a `debug_assert!` after a correct match.
+The check read the first continuation in the history, not the one just
+matched. It now reads the last one before the cursor. Release builds were
+not affected. The seed `fuzz-crash-continue-as-new-type-assert.json` pins
+the fix.

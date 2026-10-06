@@ -4872,15 +4872,22 @@ impl HistoryMatcher {
     /// Whether the recorded continue-as-new target type equals `expected`
     /// (issue #803).
     ///
-    /// Cursor-independent (it scans, rather than reading at the cursor) so it
-    /// can be consulted *after* [`Self::match_continue_as_new`] has advanced
-    /// past the event. Exists solely to back a `debug_assert!` on the
-    /// `Matched` arm, where the successor type is emitted from the live
-    /// argument rather than echoed from history; a history with no recorded
-    /// continuation reports `true` (there is nothing to contradict).
+    /// It scans back from the cursor, so it can be consulted *after*
+    /// [`Self::match_continue_as_new`] has advanced past the event. Exists
+    /// solely to back a `debug_assert!` on the `Matched` arm, where the
+    /// successor type is emitted from the live argument rather than echoed
+    /// from history; a history with no recorded continuation reports `true`
+    /// (there is nothing to contradict).
+    ///
+    /// It reads the last continuation before the cursor, which is the one
+    /// just matched. A malformed history can hold two continuations. The
+    /// fuzz target found that reading the first one then fired the assert on
+    /// a correct match (issue #1835).
     pub(crate) fn recorded_continue_as_new_type_matches(&self, expected: Option<&str>) -> bool {
-        self.events
+        let end = self.cursor.min(self.events.len());
+        self.events[..end]
             .iter()
+            .rev()
             .find_map(|e| match e {
                 WorkflowEvent::WorkflowContinuedAsNew {
                     new_workflow_type, ..
