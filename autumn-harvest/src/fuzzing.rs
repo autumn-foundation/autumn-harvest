@@ -938,6 +938,14 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
                     batch.resume_last();
                 }
             }
+            // A local activity runs on its own once a branch resumed. Its
+            // outcome arrives late and does not end the batch.
+            Some(op @ Op::LocalActivity { .. }) if batch.resumed_with_waiting() => {
+                batch.push(op, None);
+                if let WorkflowEvent::LocalActivityScheduled { activity_id, .. } = event {
+                    batch.late.insert(Pending::Activity(*activity_id));
+                }
+            }
             // A branch that resumed can end the run while a sibling still
             // waits. It can continue as new, or fail as in `try_join!`.
             Some(op @ (Op::ContinueAsNew { .. } | Op::Fail { .. } | Op::Complete { .. }))
@@ -1037,7 +1045,9 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
         | WorkflowEvent::ActivityFailed { activity_id, .. }
         | WorkflowEvent::ActivityTimedOut { activity_id, .. }
         | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
-        | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
+        | WorkflowEvent::ActivityFailedExternally { activity_id, .. }
+        | WorkflowEvent::LocalActivityCompleted { activity_id, .. }
+        | WorkflowEvent::LocalActivityExhausted { activity_id, .. } => {
             Some(Pending::Activity(*activity_id))
         }
         WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
@@ -1065,12 +1075,13 @@ fn settled_key(event: &WorkflowEvent) -> Option<Pending> {
 }
 
 /// The activity that `event` reports progress for, if it is a start, a
-/// heartbeat or a deadline extension.
+/// heartbeat, a deadline extension or a local attempt that will retry.
 const fn progress_key(event: &WorkflowEvent) -> Option<Pending> {
     match event {
         WorkflowEvent::ActivityStarted { activity_id, .. }
         | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
-        | WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
+        | WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. }
+        | WorkflowEvent::LocalActivityFailed { activity_id, .. } => {
             Some(Pending::Activity(*activity_id))
         }
         _ => None,

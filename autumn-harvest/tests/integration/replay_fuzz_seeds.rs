@@ -325,7 +325,8 @@ fn shape(ops: &[Op]) -> String {
 }
 
 /// A command right after the outcome of one `join!` branch continues that
-/// branch. A start or a heartbeat of a member does not end the batch. A
+/// branch. A start or a heartbeat of a member does not end the batch, and a
+/// local activity in a resumed branch does not either. A
 /// received signal settles its own branch. So does the outcome of an
 /// external operation, or the signal that wins a signal timeout or a race.
 /// The record of a race does not end the batch. A branch that resumed can
@@ -344,6 +345,10 @@ fn a_join_branch_continues_where_its_wait_ended() {
         (
             "baseline-join-branch-continues-past-heartbeat.json",
             "join(slow, seq(fast, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-past-local-activity.json",
+            "join(slow, seq(fast, local_activity, next)); complete",
         ),
         (
             "baseline-join-branch-continues-after-signal.json",
