@@ -1406,11 +1406,9 @@ impl FanOutGroup {
 /// no refill wave, the whole run counts.
 fn first_wave_cap(history: &[WorkflowEvent], start: usize, count: usize) -> usize {
     let rest = &history[start.min(history.len())..];
-    let run = rest
-        .iter()
-        .take_while(|e| is_schedule(e) || is_signal(e))
-        .filter(|e| is_schedule(e))
-        .count();
+    // A signal starts a new decision. A schedule after it is the command of
+    // the branch that the signal resumed, not a first-wave item.
+    let run = rest.iter().take_while(|e| is_schedule(e)).count();
     // The first run holds every item, so no refill wave follows. A later
     // schedule is the caller's own.
     if run >= count {
@@ -1450,12 +1448,12 @@ const fn is_signal(event: &WorkflowEvent) -> bool {
 /// first run are siblings.
 ///
 /// A wave starts only once every scheduled item settled. While an item
-/// still runs, a schedule right after a sibling's outcome is that sibling's
-/// next command, and any other schedule is the caller's own. Once the waves
+/// still runs, a schedule right after a sibling's outcome or a signal is
+/// another branch's command. Any other schedule is the caller's own. Once the waves
 /// hold every item, a later schedule is the caller's own too. A wave that
 /// runs past `count` shows that `k` is wrong, so the result is `None`.
 fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<usize>> {
-    let first = rest.iter().take_while(|e| is_schedule(e) || is_signal(e));
+    let first = rest.iter().take_while(|e| is_schedule(e));
     // The first `k` schedules are the group. Any outcome of another
     // command is a sibling's.
     let mut open: HashSet<Pending> = first.filter_map(pending_key).take(k).collect();
@@ -1463,7 +1461,7 @@ fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<us
     let mut current = 0;
     let mut items = k;
     let mut sibling_turn = false;
-    for event in rest.iter().skip_while(|e| is_schedule(e) || is_signal(e)) {
+    for event in rest.iter().skip_while(|e| is_schedule(e)) {
         match event {
             e if is_schedule(e) && items >= count && current > 0 => return None,
             e if is_schedule(e) && items >= count => break,
@@ -1474,7 +1472,9 @@ fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<us
                 items += 1;
                 open.extend(pending_key(e));
             }
-            e if is_signal(e) => {}
+            // A signal resumes some other branch, so a schedule right after
+            // it is that branch's command.
+            e if is_signal(e) => sibling_turn = true,
             e if activity_outcome(e).is_some() || child_outcome(e).is_some() => {
                 sibling_turn = !settled_key(e).is_some_and(|key| open.remove(&key));
                 if current > 0 {
@@ -2019,6 +2019,9 @@ fn mirror_saga(
                 running = None;
             }
             (_, Some((id, _))) if ids.contains(&id) => {}
+            // A signal can arrive for a sibling branch while a compensation
+            // runs.
+            (WorkflowEvent::SignalReceived { .. }, _) => {}
             // Any other command is a sibling. Its own events are passed over.
             (event, _) if pending_key(event).is_some() => siblings.extend(pending_key(event)),
             (event, _) if sibling_key(event).is_some_and(|key| siblings.contains(&key)) => {}

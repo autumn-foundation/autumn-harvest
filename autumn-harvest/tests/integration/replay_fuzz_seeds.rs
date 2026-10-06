@@ -451,6 +451,11 @@ fn a_join_branch_that_hits_an_engine_gap_keeps_its_shape() {
             "reserve; hold; join(saga unwind 2, child); complete",
             "expected: \"ActivityScheduled(unhold)\"",
         ),
+        (
+            "engine-gap-windowed-fan-out-beside-signal-branch.json",
+            "join(fan out window 2 fail fast, seq(signal go, next)); complete",
+            "expected: \"ActivityScheduled(task)\"",
+        ),
     ];
     let cases = seed("engine-gap-");
     for (name, want, stop) in expected {
@@ -537,5 +542,35 @@ fn an_unresolved_timer_beside_a_sibling_stays_awaited() {
             .find(|(seed, _)| seed == name)
             .unwrap_or_else(|| panic!("seed {name} is missing"));
         assert_eq!(shape(&mirror(&case.history)), want, "seed {name}");
+    }
+}
+
+/// A saga runs its compensations one by one. A sibling command or a signal
+/// for another branch can arrive while one runs. The saga still claims
+/// every compensation that its marker counts.
+#[test]
+fn a_saga_claims_its_compensations_past_siblings() {
+    let expected = [
+        (
+            "baseline-saga-then-activity.json",
+            "reserve; saga unwind 1; notify; complete",
+        ),
+        (
+            "baseline-saga-beside-signal.json",
+            "reserve; hold; join(saga unwind 2, signal go); complete",
+        ),
+    ];
+    let cases = seed("baseline-saga-");
+    for (name, want) in expected {
+        let (_, case) = cases
+            .iter()
+            .find(|(seed, _)| seed == name)
+            .unwrap_or_else(|| panic!("seed {name} is missing"));
+        assert_eq!(shape(&mirror(&case.history)), want, "seed {name}");
+        assert_eq!(
+            check_case(case),
+            Verdict::Replayed("ReplaySucceeded".to_string()),
+            "seed {name}"
+        );
     }
 }
