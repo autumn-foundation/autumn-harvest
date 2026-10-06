@@ -269,9 +269,10 @@ chained `seq`, its link and the newest `occurred_at` of the chain. An HMAC
 under the chain key covers all four. A database writer without the key cannot move it. So the
 verifier finds stripped links and a deleted tail.
 
-The exporter extends the chain only from a checkpoint that its key accepts.
-If the checkpoint is missing or does not verify, and rows are chained, the
-exporter does not stamp. New rows then stay unchained, and it logs an error.
+The exporter extends the chain only from a checkpoint that its key accepts,
+and only when its head is the newest sequenced row.
+If the checkpoint is missing, does not verify or lags, and rows are chained,
+the exporter does not stamp. New rows then stay unchained, and it logs an error.
 So a writer cannot move the head and have the exporter sign it. To recover,
 see **Re-anchor** below.
 
@@ -301,6 +302,7 @@ short queries, so it holds no long snapshot. It returns a `ChainReport`:
 | `HeadMismatch` | The newest chained row is not the checkpoint head. The newest rows were deleted, or their links were removed. |
 | `CheckpointMissing` | Chained rows exist, but the cursor has no signed checkpoint. Someone rebuilt or edited the cursor. The exporter stops the chain until you re-anchor. |
 | `CheckpointInvalid` | The checkpoint MAC does not verify, or only some checkpoint columns are set. Someone edited the cursor, or you passed the wrong key. |
+| `CursorBehindCheckpoint` | The checkpoint head is past the cursor's `last_assigned_seq`. Someone lowered the cursor. Retention never does. |
 | `RolledBack` | The chain ends before the `known_head`. Someone restored an older state of the table and the cursor. |
 | `KnownLinkMismatch` | The row at the `known_head` sequence has another link. Someone replaced the chain after a rollback. |
 
@@ -361,7 +363,9 @@ The canonical encoding always uses six digits. Then check that the HMAC of
   unchained between its insert and the next export tick. The SIEM copy covers
   that window.
 - Rows sequenced before you set the key stay unchained. If you remove the key,
-  later rows are unchained, and the verifier flags them.
+  later rows are unchained, and the verifier flags them. When you set the key
+  again, the exporter does not extend the chain over those rows. Re-anchor
+  the shard to chain them.
 - A writer who removes every link and the whole checkpoint leaves a table that
   looks unchained. A writer can also delete rows that every row chained before
   them shows are within one hour of the retention cutoff. Retention deletes

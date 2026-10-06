@@ -367,6 +367,14 @@ pub enum ChainFinding {
         /// The `seq` of the known head.
         seq: i64,
     },
+    /// The checkpoint head is past the cursor's `last_assigned_seq`. Someone
+    /// lowered the cursor. Retention never does.
+    CursorBehindCheckpoint {
+        /// The checkpoint head `seq`.
+        head_seq: i64,
+        /// The cursor's `last_assigned_seq`.
+        last_assigned_seq: i64,
+    },
 }
 
 /// A link that a check outside the database saw: an earlier verification or
@@ -768,7 +776,9 @@ pub(crate) struct ChainAnchor {
 ///
 /// The exporter signs a new checkpoint over each stamp. So it must not trust
 /// a head that a database writer can set. It extends a checkpoint only when
-/// `key` accepts its MAC. It starts a new chain only when the cursor has no
+/// `key` accepts its MAC and the head is `last_assigned_seq`. A head behind
+/// it means rows were sequenced without a link. Extending would skip them.
+/// It starts a new chain only when the cursor has no
 /// checkpoint and no row is chained. Any other state needs
 /// [`reanchor_shard_chain`].
 ///
@@ -782,7 +792,7 @@ pub(crate) async fn chain_anchor(
 ) -> crate::error::HarvestResult<Option<ChainAnchor>> {
     if let Some((checkpoint, mac)) = stored_checkpoint(cursor) {
         let valid = key.accepts(&checkpoint, cursor.shard_id, &mac)
-            && checkpoint.head_seq <= cursor.last_assigned_seq;
+            && checkpoint.head_seq == cursor.last_assigned_seq;
         return Ok(valid.then_some(ChainAnchor {
             head: Some(checkpoint.head),
             start_seq: Some(checkpoint.start_seq),
@@ -1086,6 +1096,19 @@ pub async fn verify_shard_chain_with(
     }
 
     let mut report = verifier.finish(checkpoint.as_ref());
+    // Retention never lowers the cursor. So a head past it is an edit, not a
+    // purged tail.
+    if let Some(checkpoint) = checkpoint
+        && checkpoint.head_seq > bound
+    {
+        report.findings.insert(
+            0,
+            ChainFinding::CursorBehindCheckpoint {
+                head_seq: checkpoint.head_seq,
+                last_assigned_seq: bound,
+            },
+        );
+    }
     if let Some(finding) = checkpoint_finding {
         report.findings.insert(0, finding);
     } else if checkpoint.is_none() && report.checked > 0 {

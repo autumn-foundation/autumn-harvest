@@ -889,3 +889,60 @@ async fn a_replayed_checkpoint_fails_against_the_known_head() {
         vec![ChainFinding::KnownLinkMismatch { seq: 5 }]
     );
 }
+
+#[tokio::test]
+async fn a_cursor_behind_its_checkpoint_is_not_retention() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    conn.batch_execute(
+        "UPDATE harvest_audit_log SET occurred_at = occurred_at - INTERVAL '100 days'",
+    )
+    .await
+    .expect("backdate");
+    export_tick(&mut conn, Some(&key())).await;
+    // Delete the tail and lower the cursor. The signed checkpoint stays.
+    conn.batch_execute(
+        "DELETE FROM harvest_audit_log WHERE export_seq = 3; \
+         UPDATE harvest_audit_export_cursor SET last_assigned_seq = 2, last_acked_seq = 2",
+    )
+    .await
+    .expect("lower the cursor");
+
+    let report = verify_with_retention(&mut conn).await;
+    assert_eq!(
+        report.findings,
+        vec![ChainFinding::CursorBehindCheckpoint {
+            head_seq: 3,
+            last_assigned_seq: 2,
+        }],
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_exporter_does_not_skip_rows_an_unkeyed_tick_sequenced() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, None).await;
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    let chained = count(
+        &mut conn,
+        "SELECT count(*) AS n FROM harvest_audit_log WHERE chain_hash IS NOT NULL",
+    )
+    .await;
+    assert_eq!(chained, 2, "the keyed tick must not jump over seq 3");
+
+    reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
+        .await
+        .expect("reanchor")
+        .expect("a chained row");
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.checked, 4);
+}
