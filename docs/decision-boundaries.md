@@ -62,8 +62,11 @@ A boundary still has an event id. It still counts toward the history length,
 - the history-bloat warning, which is a fraction of the hard cap;
 - the `history_bytes` quota.
 
-The hard-cap check of a run that stays running includes the boundary that
-its decision is about to write. See [Storage overhead](#storage-overhead).
+The hard-cap check before a decision does not count its boundary. Several
+of its estimates are upper bounds, so a reserved slot could fail a decision
+that writes nothing. Instead the boundary write skips the boundary when it
+would bring a running history to its cap. A run near its cap can therefore
+have decisions without a boundary. See [Storage overhead](#storage-overhead).
 
 ## How to read the boundaries
 
@@ -172,9 +175,8 @@ close to a history limit before this release, raise that limit.
   boundary. The next boundary then covers them.
 - A decision that the engine ends before it persists an outcome writes no
   boundary. Examples are the history cap and a non-determinism block.
-- A boundary never brings a running history to its event hard cap. The cap
-  check runs before persistence, so a row it cannot foresee can leave room
-  for the decision but not for its boundary. That decision has no boundary.
+- A boundary never brings a running history to its event hard cap. Such a
+  decision has no boundary. A terminal decision always writes its boundary.
 - The `event_count` of the decision's notification counts the boundary. Its
   `last_event_type` stays the type of the last outcome event, so a listener
   still sees, for example, `WorkflowCompleted`.

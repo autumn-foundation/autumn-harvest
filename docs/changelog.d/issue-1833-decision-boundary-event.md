@@ -35,8 +35,9 @@ A history now shows which build and which worker made each decision.
   `event_data`. With indexes, it adds about 438 bytes on disk. A boundary
   counts toward the event hard cap, the continue-as-new threshold, the
   timeout-scanner ceiling, the history-bloat warning and the history byte
-  quota. The hard-cap preflight of a run that stays running reserves the
-  boundary it is about to write. See `docs/decision-boundaries.md`.
+  quota. The hard-cap preflight does not count the boundary. The boundary
+  write skips the boundary when it would bring a running history to its
+  cap. See `docs/decision-boundaries.md`.
 - **Scope:** the SQLite backend writes no boundaries.
 - **Tests:** `event::tests::decision_committed_*`,
   `replay::tests::decision_boundaries_*` and `trailing_boundary_*`,

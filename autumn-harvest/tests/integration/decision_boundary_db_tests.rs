@@ -198,6 +198,51 @@ async fn boundary_pause_inline(
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// Races a fast activity against a slow one, then waits for `done`.
+///
+/// No worker polls the slow queue. Before the fast one completes, it marks
+/// the slow task done, as a completion that commits after the history load.
+#[workflow]
+async fn boundary_race_loser(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let queue = ctx.queue_name().to_string();
+    let slow_queue = input["slow_queue"].as_str().unwrap_or("idle").to_string();
+    ctx.race()
+        .activity_raw("boundary_race_fast", input, &queue)
+        .activity_raw("boundary_step", serde_json::Value::Null, &slow_queue)
+        .run()
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("done").await.map_err(|e| e.to_string())
+}
+
+/// The database the fast racer closes the slow task through.
+static RACE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Marks the open task on `slow_queue` completed, then returns.
+///
+/// The loser cancel then finds no open task and writes no event.
+#[activity(start_to_close = "30s")]
+async fn boundary_race_fast(
+    _ctx: &ActivityContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let url = RACE_URL.get().ok_or("no race URL")?;
+    let slow_queue = input["slow_queue"].as_str().ok_or("no slow queue")?;
+    let mut conn = connect(url).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'COMPLETED' \
+         WHERE queue_name = $1 AND state IN ('PENDING', 'RUNNING')",
+    )
+    .bind::<Text, _>(slow_queue)
+    .execute(&mut conn)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!("fast"))
+}
+
 #[activity(start_to_close = "30s")]
 async fn boundary_step(
     _ctx: &ActivityContext,
@@ -245,8 +290,9 @@ fn registry(policy: WorkflowHistoryPolicy, decisions: Arc<DecisionCount>) -> Arc
                 boundary_pause_inline_info(),
                 boundary_mutex_plain_info(),
                 boundary_late_row_info(),
+                boundary_race_loser_info(),
             ],
-            activities![boundary_step],
+            activities![boundary_step, boundary_race_fast],
             autumn_harvest::context::empty_shared_state(),
             telemetry,
         )
@@ -663,11 +709,12 @@ async fn a_contended_acquire_reserves_no_boundary_against_the_cap() {
 }
 
 #[tokio::test]
-async fn a_granted_acquire_reserves_its_boundary_against_the_cap() {
-    // A grant writes `MutexGranted` and a boundary. Under cap 4 the acquire
-    // loads 2 events, so the grant would leave a running history at the
-    // cap. The preflight must count both rows and fail the run before the
-    // grant, as it does for any other decision that reaches the cap.
+async fn a_granted_acquire_near_the_cap_skips_its_boundary() {
+    // The cap check reserves no slot for a boundary. Under cap 4 the
+    // acquire loads 2 events and counts 3, so the grant goes ahead. The
+    // grant leaves 3 rows, and a boundary would make 4 while the run still
+    // runs, so that decision has none. The terminal decision then writes
+    // its outcome and its boundary.
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
     let queue = unique("grantcap");
@@ -686,14 +733,19 @@ async fn a_granted_acquire_reserves_its_boundary_against_the_cap() {
     autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", serde_json::json!(1))
         .await
         .expect("send go");
-    wait_for_execution_state_with_timeout(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
     running.stop().await;
 
-    let events = history(&url, exec_id).await;
-    assert!(
-        !type_names(&events).contains(&"MutexGranted"),
-        "the cap must fail the run before the grant: {:?}",
-        type_names(&events)
+    assert_eq!(
+        type_names(&history(&url, exec_id).await),
+        [
+            "WorkflowStarted",
+            "SignalReceived",
+            "MutexGranted",
+            "WorkflowCompleted",
+            "DecisionCommitted",
+        ]
     );
 }
 
@@ -809,6 +861,54 @@ async fn a_free_mutex_with_queued_waiters_reserves_no_boundary() {
         type_names(&history(&url, exec_id).await),
         ["WorkflowStarted", "SignalReceived"],
         "the queued acquire writes nothing and the run stays live"
+    );
+}
+
+#[tokio::test]
+async fn a_race_loser_that_already_closed_reserves_no_boundary() {
+    // The race decision writes its race marker inline, then its boundary.
+    // The loser estimate adds one event per listed loser, as an upper
+    // bound. This loser closed before persistence, so its cancel writes
+    // nothing. A boundary slot on top of that estimate failed the run,
+    // although its real history stays under the cap.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("raceloser");
+    let slow_queue = unique("raceidle");
+    RACE_URL.set(url.clone()).expect("one test sets the URL");
+
+    // A first run without a cap gives the history length after the race.
+    let mut conn = connect(&url).await;
+    let input = serde_json::json!({ "slow_queue": slow_queue });
+    let running = Running::start(&queue, &pool, boundaries_on());
+    let probe = seed(&mut conn, "boundary_race_loser", &queue, input.clone()).await;
+    running.wait_parked_after(&mut conn, probe, 2).await;
+    running.stop().await;
+    let loaded = u64::try_from(history(&url, probe).await.len()).expect("fits");
+
+    // The check counts the history with the marker, which is `loaded - 1`
+    // rows. The phantom loser makes it `loaded`, under the cap. A boundary
+    // slot on top made it `loaded + 1`, at the cap.
+    let policy = boundaries_on().with_event_hard_cap(loaded + 1);
+    let running = Running::start(&queue, &pool, policy);
+    let exec_id = seed(&mut conn, "boundary_race_loser", &queue, input).await;
+    running.wait_parked_after(&mut conn, exec_id, 2).await;
+    running.stop().await;
+
+    let names = type_names(&history(&url, exec_id).await);
+    assert_eq!(
+        u64::try_from(names.len()).expect("fits"),
+        loaded,
+        "{names:?}"
+    );
+    assert!(
+        !names.contains(&"WorkflowFailed"),
+        "the race decision stays under the cap and must not fail: {names:?}"
+    );
+    assert_eq!(
+        names[names.len() - 2..],
+        ["MarkerRecorded", "DecisionCommitted"],
+        "the race decision keeps its boundary"
     );
 }
 

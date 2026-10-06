@@ -20442,35 +20442,12 @@ async fn handle_suspended_workflow(
 
 /// Returns 1 when the decision writes a boundary, else 0 (issue #1833).
 ///
-/// The history-cap checks and the history-size gauge add this value. Set
-/// `appends` when the decision grows the history. Only such a decision
-/// writes a boundary.
+/// The history-size gauge of a terminal decision adds this value. A
+/// terminal decision always writes its boundary when boundaries are on.
+/// The history-cap checks add nothing for a boundary: the boundary write
+/// never brings a running history to its cap.
 fn decision_boundary_reserve(registry: &HandlerRegistry, appends: bool) -> u64 {
     u64::from(appends && registry.history_policy().decision_boundaries())
-}
-
-/// Whether the solo `AcquireMutex` in `commands` would be granted now
-/// (issue #1833).
-///
-/// It counts the waiters already queued, because a new acquire joins the
-/// queue behind them. The read takes no lock, so the answer can change
-/// before persistence. A failed read answers `true`, which counts the
-/// grant's boundary against the history cap. The boundary write itself
-/// never brings a running history to its cap.
-async fn mutex_acquire_would_grant(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    commands: &[WorkflowCommand],
-) -> bool {
-    let Some(key) = commands.iter().find_map(|command| match command {
-        WorkflowCommand::AcquireMutex { key, .. } => Some(key.as_str()),
-        _ => None,
-    }) else {
-        return false;
-    };
-    crate::mutex::would_grant_acquire(conn, key, exec_id)
-        .await
-        .unwrap_or(true)
 }
 
 /// Appends the boundary of this decision when the policy allows it
@@ -24863,10 +24840,8 @@ async fn process_workflow_task(
                             }
                         };
                         history_events.extend(new_events);
-                        // The decision also appends its boundary (issue #1833).
-                        let current_history_event_count = u64::try_from(history_events.len())
-                            .unwrap_or(u64::MAX)
-                            .saturating_add(decision_boundary_reserve(registry, true));
+                        let current_history_event_count =
+                            u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                         if let Some(cap) = registry.history_policy().event_hard_cap()
                             && current_history_event_count >= cap
                         {
@@ -25042,10 +25017,8 @@ async fn process_workflow_task(
                 history_events.extend(new_events);
                 // Issue #1247: no emit_update_result_metrics call here either
                 // — see the comment on the HistoryCapReached arm above.
-                // The decision also appends its boundary (issue #1833).
-                let current_history_event_count = u64::try_from(history_events.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(decision_boundary_reserve(registry, true));
+                let current_history_event_count =
+                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
@@ -25211,10 +25184,8 @@ async fn process_workflow_task(
                     }
                 };
                 history_events.extend(new_events.clone());
-                // The decision also appends its boundary (issue #1833).
-                let current_history_event_count = u64::try_from(history_events.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(decision_boundary_reserve(registry, true));
+                let current_history_event_count =
+                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
@@ -25498,10 +25469,8 @@ async fn process_workflow_task(
                 resolved_inline_external = resolved_external_ids(&new_events);
                 let remaining_commands_with_unresolved = remaining_commands;
                 history_events.extend(new_events);
-                // The decision also appends its boundary (issue #1833).
-                let current_history_event_count = u64::try_from(history_events.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(decision_boundary_reserve(registry, true));
+                let current_history_event_count =
+                    u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
@@ -25980,28 +25949,14 @@ async fn process_workflow_task(
     let inline_appends = next_event_id > decision_start_event_id;
     let stays_running = matches!(&outcome, WorkflowOutcome::Suspended { .. });
     let decision_appends = inline_appends || pending_durable_event_count > 0 || !stays_running;
-    // A mutex acquire counts one event for a grant. A grant also writes a
-    // boundary, but a contended acquire only enqueues and writes nothing.
-    // So the boundary is reserved only when the acquire would be granted.
-    let estimated_only = match &outcome {
-        WorkflowOutcome::Suspended { commands }
-            if should_handle_mutex_acquire(commands)
-                && registry.history_policy().decision_boundaries() =>
-        {
-            u64::from(!mutex_acquire_would_grant(conn, prepared.exec_id, commands).await)
-        }
-        _ => 0,
-    };
-    let certainly_appends = inline_appends || pending_durable_event_count > estimated_only;
-    // The preflight never counts the terminal event. So it also skips the
-    // boundary after a terminal, and reserves it only for a running run.
+    // The preflight reserves no slot for the boundary. Several estimates
+    // above are upper bounds. Examples are a mutex acquire and the losers of
+    // a race. A reserved slot could then fail a decision that writes
+    // nothing. Instead the boundary write never brings a running history to
+    // its cap.
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
-        .saturating_add(pending_durable_event_count)
-        .saturating_add(decision_boundary_reserve(
-            registry,
-            certainly_appends && stays_running,
-        ));
+        .saturating_add(pending_durable_event_count);
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
         && current_history_event_count >= cap
