@@ -751,8 +751,18 @@ impl PreparedHarvestRuntime {
     fn build(
         built: BuiltHarvest,
         resources: HarvestRunnerResources,
+        worker_enabled: bool,
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
+        // An auto pool covers every pool shard, cell shards included. It
+        // would drain a tenant cell and void its isolation (issue #1837).
+        // This pure check runs first, before any step publishes global state.
+        refuse_auto_pool_over_cells(
+            &shard_router,
+            &built.worker_config().shard_assignments,
+            worker_enabled,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
         install_completion_callback_config(&built);
@@ -1100,7 +1110,7 @@ impl HarvestRunner {
         }
 
         let completion_triggers = built.completion_triggers().to_vec();
-        let mut prepared = PreparedHarvestRuntime::build(built, resources)?;
+        let mut prepared = PreparedHarvestRuntime::build(built, resources, config.worker_enabled)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
@@ -2291,6 +2301,50 @@ fn warn_uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId])
     }
 }
 
+/// Refuse a worker pool that would drain a tenant cell (issue #1837).
+///
+/// An API-only process (`worker_enabled == false`) claims nothing, so it
+/// passes. Otherwise see [`reserved_shards_under_auto_assignment`].
+fn refuse_auto_pool_over_cells(
+    router: &ShardRouter,
+    assignments: &[ShardId],
+    worker_enabled: bool,
+) -> Result<(), String> {
+    if !worker_enabled {
+        return Ok(());
+    }
+    let cells = reserved_shards_under_auto_assignment(router, assignments);
+    if cells.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "ShardRouter reserves shards {cells:?} for tenant cells, but this worker has no \
+         explicit shard assignments and would drain them; call \
+         WorkerConfig::with_shard_assignments with the shards this pool serves, or disable \
+         the worker on an API-only replica (see docs/sharding.md#tenant-cells-issue-1837)"
+    ))
+}
+
+/// Reserved shards that an auto-assigned worker would drain (issue #1837).
+///
+/// An empty `assignments` list means auto: the worker covers every pool
+/// shard. When the router reserves shards for tenant cells, such a worker
+/// also claims cell work. An explicit list is a deliberate choice. Startup
+/// accepts it, even when it names a cell shard.
+fn reserved_shards_under_auto_assignment(
+    router: &ShardRouter,
+    assignments: &[ShardId],
+) -> Vec<i32> {
+    if !assignments.is_empty() {
+        return Vec::new();
+    }
+    router
+        .reserved_shards()
+        .iter()
+        .map(|shard| shard.as_i32())
+        .collect()
+}
+
 fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
     let mut missing: Vec<ShardId> = router
         .readable_shards()
@@ -2356,7 +2410,8 @@ mod tests {
         );
     }
     use super::{
-        DeferredAuditExportInstall, HarvestRunnerResources, registered_workflow_type_names,
+        DeferredAuditExportInstall, HarvestRunnerResources, refuse_auto_pool_over_cells,
+        registered_workflow_type_names, reserved_shards_under_auto_assignment,
         resolve_runtime_storage_pool, select_runtime_gate_shards, select_runtime_shard0_pool,
         uncovered_writable_shards,
     };
@@ -2590,6 +2645,102 @@ mod tests {
         assert!(
             uncovered_writable_shards(&router, &[ShardId::new(0), ShardId::new(1)]).is_empty(),
             "a drained readable-only shard is not an uncovered *writable* shard",
+        );
+    }
+
+    // Issue #1837: a shared auto-assigned pool must not drain a cell shard.
+
+    fn cell_router() -> ShardRouter {
+        three_shard_router().with_reserved_shards([ShardId::new(1)])
+    }
+
+    #[test]
+    fn auto_assignment_is_refused_when_the_router_reserves_shards() {
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&cell_router(), &[]),
+            vec![1],
+            "an auto pool would drain the reserved shard",
+        );
+    }
+
+    #[test]
+    fn explicit_assignment_is_accepted_with_reserved_shards() {
+        let router = cell_router();
+        let none = Vec::<i32>::new();
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&router, &[ShardId::new(0)]),
+            none
+        );
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&router, &[ShardId::new(1)]),
+            none
+        );
+    }
+
+    #[test]
+    fn auto_assignment_is_accepted_without_reserved_shards() {
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&three_shard_router(), &[]),
+            Vec::<i32>::new()
+        );
+    }
+
+    #[test]
+    fn startup_refuses_an_auto_pool_over_a_cell() {
+        let error = refuse_auto_pool_over_cells(&cell_router(), &[], true)
+            .expect_err("an auto pool would drain the cell");
+        assert!(error.contains("[1]"), "the error names the cell: {error}");
+        assert!(error.contains("with_shard_assignments"), "{error}");
+    }
+
+    #[test]
+    fn startup_accepts_an_api_only_process_with_cells() {
+        assert_eq!(
+            refuse_auto_pool_over_cells(&cell_router(), &[], false),
+            Ok(())
+        );
+    }
+
+    /// A refused cell startup must publish no global state. The callback
+    /// config is the first thing `build` publishes, so the check runs before
+    /// it.
+    #[test]
+    fn a_refused_cell_startup_publishes_no_callback_config() {
+        const MARKER: u32 = 1837;
+        let built = autumn_harvest::HarvestBuilder::new()
+            .completion_callback_retry_policy(autumn_harvest::RetryPolicy {
+                max_attempts: MARKER,
+                ..autumn_harvest::RetryPolicy::default()
+            })
+            .build();
+        let pool = tagged_pool(1);
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(ShardId::new(0), pool.clone());
+        pools.insert(ShardId::new(1), tagged_pool(2));
+        pools.insert(ShardId::new(2), tagged_pool(3));
+        let resources = HarvestRunnerResources::new(pool)
+            .with_sharded_pool(ShardedDbPool::from_map(pools, ShardId::new(0)))
+            .with_shard_router(cell_router());
+
+        let refused = super::PreparedHarvestRuntime::build(built, resources, true);
+        assert!(refused.is_err(), "an auto pool over a cell must be refused");
+        let published = autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG
+            .read()
+            .expect("lock")
+            .clone()
+            .map(|config| config.retry_policy.max_attempts);
+        assert_ne!(
+            published,
+            Some(MARKER),
+            "the refused startup published its callback config"
+        );
+    }
+
+    #[test]
+    fn startup_accepts_an_explicit_pool_with_cells() {
+        assert_eq!(
+            refuse_auto_pool_over_cells(&cell_router(), &[ShardId::new(0)], true),
+            Ok(())
         );
     }
 

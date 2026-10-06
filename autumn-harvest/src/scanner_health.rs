@@ -180,12 +180,16 @@ pub enum Scanner {
     /// #1269). Previously folded into the timeout loop; split out to its own
     /// task so a slow sink delays nothing but its own next tick.
     AuditExport,
+    /// The rebalance-resume scanner
+    /// (`crate::rebalance_resume::spawn_rebalance_resume_scanner`, issue
+    /// #1839). It settles a shard migration that stalls after its cutover.
+    RebalanceResume,
 }
 
 impl Scanner {
     /// Every scanner, in a stable order. Used by tests and docs to enumerate
     /// the bounded label set.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Timeout,
         Self::Sla,
         Self::PoisonPill,
@@ -194,6 +198,7 @@ impl Scanner {
         Self::Schedule,
         Self::PauseAutoResume,
         Self::AuditExport,
+        Self::RebalanceResume,
     ];
 
     /// Stable string representation, suitable for a metric label value.
@@ -208,6 +213,7 @@ impl Scanner {
             Self::Schedule => "schedule",
             Self::PauseAutoResume => "pause_auto_resume",
             Self::AuditExport => "audit_export",
+            Self::RebalanceResume => "rebalance_resume",
         }
     }
 }

@@ -190,7 +190,7 @@ An activity attempt owns its task row only through its claim. The claim is the p
 
 *Invariant.* A task-row write takes effect only while its claim is current. So only the current claim writes the terminal event and the terminal row state.
 
-*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral, the retry-budget deferral and the drain release of a task that never started (issue #1813). Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
+*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release, the rate-limit deferral, the retry-budget deferral and the drain release of a task that never started (issue #1813). The adaptive-limit deferral (issue #1836) uses the retry-budget write. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
 
 The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue #1917). On an activity row it runs only on a worker without the handler, before the activity starts.
 
@@ -211,6 +211,8 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 *Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
 
 *Model.* `formal/tla/ActivityClaim.tla` models this protocol (issue #1819). TLC checks the invariant over every interleaving of a bounded model (3 workers, 5 claims). With the fence off, it reproduces the #1789 bug. See [`formal-methods.md`](testing/formal-methods.md).
+
+*Simulation.* `autumn_harvest::dst` drives the same protocol from a seed, with 3 workers, stalls and crashes (issue #1830). A differential test replays each run on Postgres through the production statements. With the fence off, a sweep reproduces the #1789 bug. See [`simulation.md`](testing/simulation.md).
 
 **10. Suspension readiness (issue #1797)**
 
@@ -280,6 +282,49 @@ The first delay is the time to the next refill token. Each later deferral gets t
 *Scope.* The state is in process, like the circuit breaker. N workers allow up to N budgets. The budget never touches the event log, so replay is unaffected. Local activities retry inline, outside the queue, so the budget does not gate them. The SQLite backend has its own worker and does not use this gate.
 
 *Metrics.* The gauge `harvest.retry.budget.available{activity}` shows the tokens left. The registry publishes it under the bucket lock after every access, so a stale sample cannot overwrite a newer one. It does not follow the time refill between accesses. The counter `harvest.retry.budget.exhausted{activity}` counts deferrals. Prometheus exports the counter as `harvest_retry_budget_exhausted_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
+
+**12. Adaptive concurrency limit per activity type (issue #1836)**
+
+The slot tuner grows the worker slots when tasks wait. When a dependency is the bottleneck, more calls only add latency and errors. An adaptive limit caps the in-flight attempts of one activity type on one worker. The cap follows the handler latency and the retryable failures. It never reads a queue wait or a permit wait. `adaptive_limit.rs` holds the limit. `poll_once`, `consume_reference` and `process_activity_task` in `worker.rs` hold the gates.
+
+*Policy.* `AdaptiveLimitPolicy` sets six values:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `min_limit` | `1` | Lowest cap. |
+| `max_limit` | `200` | Highest cap. |
+| `tolerance` | `1.25` | Latency inflation over the baseline at which the gradient starts to fall below 1. |
+| `backoff_ratio` | `0.9` | Factor that an overloaded window applies to the cap. |
+| `error_threshold` | `0.05` | Share of retryable failures above which a window is overloaded. |
+| `probe_interval` | `1000` | Samples between two baseline probes. |
+
+*Rules.* The limit collects samples in windows of about one cap. The cap moves once per window.
+
+1. The baseline is the lowest window mean latency since the last probe.
+2. The gradient is `tolerance × baseline / mean latency`, clamped to the range from 0.5 to 1. The cap moves 20 % of the way to `cap × gradient + 4`.
+3. A window is overloaded when the retryable failures pass `error_threshold` of its completions. An overloaded window cuts the cap by `backoff_ratio`. A rare failure is noise and does not cut the cap.
+4. A success is an answer. A timeout is a retryable failure, because a hung dependency is overload. An attempt that ends after its deadline is a timeout, even when the handler returns before the worker sees the lost claim. The check compares the attempt budget, `deadline - started_at` on the database clock, with the monotonic time since the claim, so a host clock skew cannot change it. A resume after a pause can move `schedule_to_close_at` forward while the attempt runs. So a late attempt with that deadline reads the current one from the task row. A heartbeat timeout fires earlier. So after a cancel, and for every task with a heartbeat timeout, the worker also reads the timeout error that the scanner writes to the task row. A sealed transactional success held its claim when it committed, so it is never a timeout. A non-retryable failure, a panic, a WASM module or runtime fault and any other cancelled attempt give no sample. A panic or a WASM fault gives no sample even when it ends past the deadline.
+5. A window that used less than half of the cap does not move it.
+6. After `probe_interval` samples, the next window that is not overloaded starts a probe. The cap drops to 4, or stays lower, and the baseline is cleared. Answers from attempts that started before the probe do not count. Their failures still count, but they cannot close the probe window. The probe window ends with its first answers and sets a fresh baseline at a low concurrency. Then the cap returns to its value from before the probe.
+
+Against a dependency whose latency grows in proportion to the concurrency above a knee, the cap settles at `tolerance × knee + 4`. A new type starts at 4, clamped to `[min_limit, max_limit]`.
+
+*Why not plain Gradient2.* Gradient2 compares the latency with a smoothed long-term average. Under steady load the average catches up with the latency, and the cap grows again. The cap ratchets up without bound. A probed minimum does not drift. The simulation tests fail when the baseline follows the window mean.
+
+*Gates.*
+
+- The claim skips a type at its cap. `Worker::claim_exclusions` adds each saturated type to `$6` of the claim query, with `queue::SATURATED_ACTIVITY_MARKER` in front. A separate gate reads the marked names. Unlike the ineligible-activity gate, it also applies to a row with `required_capabilities`. `Worker::new` rejects a registered activity name that starts with the marker. The tasks stay `PENDING` for another worker or a later poll. When no type is saturated, the check reads one atomic and takes no lock. While a type is at its cap, or after a claim skipped one, a freed slot wakes the idle poll loop as a freed dispatch permit does (issue #1787). Otherwise the backlog would wait a full poll interval after each batch. Under a dispatch channel, the by-id claim skips a saturated type too. Its reference then returns after the limit delay, one to two baselines, instead of the gate backoff. A freed slot cannot wake a released reference.
+- A claim can still race past the cap, for example when two pollers claim at once. `process_activity_task` then takes a slot after the circuit breaker and before the retry budget. At the cap, it defers the row with `queue::defer_claimed_retry_for_budget`. The deferral uses no attempt and appends no event. A deferral of a rate-limited activity without a circuit breaker also refunds the claim-time token. The delay is one to two baselines, from 50 ms to 5 s. The counter `harvest.activity.concurrency_deferred` counts these deferrals.
+- A circuit short-circuit and a half-open probe take no slot.
+- The worker frees the slot after the handler returns and the retry policy loads. Any return before that point frees it without a sample.
+
+*Configuration.* The limit is off by default. `WorkerConfig::with_adaptive_limit` takes an `AdaptiveLimitConfig`. `with_default` sets the policy for all types. `with_activity(name, policy)` overrides one type, and `None` turns the limit off for that type. An override for an unregistered name logs a warning. `GET /admin/config` reports `adaptive_limit_default` and `adaptive_limit_overrides` from the `WorkerConfig`. An embedder who builds the `HandlerRegistry` directly must also call `HandlerRegistry::with_adaptive_limit`, as for the retry budget.
+
+*Composition.* The limit, the retry budget and the circuit breaker are independent. The limit caps concurrency. The budget caps retry rate. The breaker stops calls to a failed dependency. The static `max_concurrent` cap is fleet-wide and still applies.
+
+*Scope.* The state is in process and per worker. N workers allow up to N caps. The limit never touches the event log, so replay is unaffected. Local activities and the SQLite backend do not use it. The limit suits request and response calls. A long activity gives few samples, so its cap moves slowly. Each probe drains the in-flight attempts down to 4, so at a high cap a probe costs some throughput. Raise `probe_interval` to probe less often.
+
+*Metrics.* Three gauges, each labeled by `activity`: `harvest.activity.concurrency_limit`, `harvest.activity.concurrency_in_flight` and `harvest.activity.latency_baseline_seconds`. The registry publishes them under its lock after every change. A call that changes nothing publishes nothing. The counter `harvest.activity.concurrency_deferred{activity}` counts deferrals. Prometheus exports it as `harvest_activity_concurrency_deferred_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
 
 ### Sharding
 
@@ -361,8 +406,9 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `debounce.rs` | 3.31 | Debounced workflow starts (issue #499): `DebouncePolicy { key_expr, window, max_wait }` (`Copy`, mirrors `ConcurrencyPolicy`); `resolve_debounce_key(expr, input)` delegates to `concurrency::resolve_concurrency_key`; `compute_fire_deadline(now, window, first_seen, max_wait)` pure deadline logic (no DB); DB-gated `admit_debounced_start` (upsert, trailing-edge, last-input-wins), `fire_due_debounced_starts` (scanner: claim, start, delete in one txn), `list_pending_debounce` (management API). Key scoping: shard-local. **Semantics**: trailing-edge, burst collapse, last-input-wins, max-wait cap (default 1h, overridable via `WorkerConfig::default_debounce_max_wait`). See `examples/debounce_webhook.rs`. |
 | `throttle.rs` | 3.47 | Workflow-start throttle — pace admissions, defer the excess (issue #607): `ThrottlePolicy { refill_per_sec, burst, key_expr: Option<&'static str>, schedule_to_start: Option<Duration> }`; pure `parse_rate("100/m")`/`ThrottlePolicy::from_rate_str` (rate-string parsing, burst defaults to the per-period count); `resolve_throttle_key` delegates to `concurrency::resolve_concurrency_key`; `bucket_key`/`compute_expiry` pure helpers (no DB). DB-gated `reserve_or_defer` (the admission primitive: FIFO backlog guard → `queue::try_consume_rate_limit_token` against the reused `harvest_rate_limit_buckets` table → `Reserved` (proceed immediately) or `Deferred` (durable row in `harvest_start_throttle`, written before `WorkflowStarted`)), `fire_due_throttled_starts` (scanner mirroring `debounce::fire_due_debounced_starts`: claim oldest-first, drop if past `schedule_to_start`, else debit-and-start-or-leave-for-next-tick), `throttle_backlog_by_key`/`list_pending_throttle` (management API). Key scoping: shard-local (per-shard buckets — cross-shard global rate coordination is an explicit, documented out-of-scope limitation). **Semantics**: token-bucket/GCRA pacing, defer-don't-drop (contrast debounce's collapse-to-one — a throttle preserves *every* start as its own pending row), id-reuse short-circuits refund their token. See `examples/throttle_fanout.rs`. |
 | `metrics_rs_adapter.rs` | 4 | `metrics-rs` feature flag adapter: `MetricsRsRecorder` bridges `MetricsRecorder` → `metrics` crate global registry. See `docs/telemetry.md` for recipe. |
-| `poison_pill.rs` | 3.17 | Poison-pill task quarantine (issue #367): pure `quarantine_decision`/`ReclaimAction` (no DB dep), `orphaned_running_tasks_query` (worker-liveness reclaim, independent of per-task timeouts), `reclaim_orphaned_tasks` (increment `crash_strikes`, requeue-or-quarantine), `spawn_poison_pill_reclaimer`. Quarantine → `harvest_dead_letters` with `DeadLetterReason::PoisonPill` + terminal `WorkflowFailed` (no new event variant). `WorkerConfig::poison_pill_threshold` (default 3, 0 disables). Shard-local. |
+| `poison_pill.rs` | 3.17 | Poison-pill task quarantine (issue #367): pure `quarantine_decision`/`ReclaimAction` (no DB dep), `orphaned_running_tasks_query` (worker-liveness reclaim, independent of per-task timeouts), `reclaim_orphaned_tasks` (increment `crash_strikes`, requeue-or-quarantine), `spawn_poison_pill_reclaimer`. Quarantine → `harvest_dead_letters` with `DeadLetterReason::PoisonPill` + terminal `WorkflowFailed` (no new event variant). `WorkerConfig::poison_pill_threshold` (default 3, 0 disables). Shard-local. Issue #1876: each pass locks a task row with `FOR UPDATE SKIP LOCKED`. A pass skips a row that another session holds. The next pass retries it. A timeout or a deadlock on one row skips that row, not the pass. |
 | `circuit_breaker.rs` | 3.18 | Per-activity circuit breaker (issue #369): `CircuitBreakerRegistry` (closed/open/half-open, rolling-window failure count, single half-open probe, `on_dispatch`/`on_result`, `force_open`/`force_close`, `snapshot`/`list`), `CircuitPhase`, `DispatchDecision`, `CircuitTransition`, `CircuitSnapshot`. Pure/in-process, per-shard; consulted by the worker before dispatch and shared with the management API via `HandlerRegistry::circuit_breakers()`. No new event variant, no migration. |
+| `adaptive_limit.rs` | 3.18 | Adaptive concurrency limit per activity type (issue #1836): `AdaptiveLimitConfig`, `AdaptiveLimitRegistry` (`try_acquire`/`saturated`/`snapshot`), `Acquire`, `LimitPermit`, `SampleOutcome`. In process, per worker. The claim skips a type at its cap. See design decision 12. No new event variant, no migration. |
 | `retry_budget.rs` | 3.18 | Per-activity-type retry budget (issue #1793): `RetryBudgetConfig`, `RetryBudgetRegistry` (`admit`/`commit`/`release`/`cancel_deferral`/`wake_delay`/`available`), `Admission`, `BudgetTicket`, `SlotReservation`. In process, per worker. The worker consults it before dispatch and defers a retry when the bucket is empty. See design decision 11. No new event variant, no migration. |
 | `slot_tuner.rs` | 3.42 | Adaptive worker dispatch-slot tuner (issue #548): `SlotTuner` trait, `DefaultSlotTuner` (pool-pressure shrink / saturated-and-waiting grow / hold), `SlotTunerConfig { min_slots, max_slots, tuner }` (`::new`/`::with_tuner`), pure helpers `initial_target`/`apply_action`/`validate_band`/`tuned_available`, `TunedSlotRuntime` (owns withheld `OwnedSemaphorePermit`s; `resize_toward`/`release_all_withheld`), `spawn_slot_tuner_loop`. Opt-in via `WorkerConfig::with_slot_tuner`; `None` (default) is byte-identical to the pre-#548 fixed-concurrency semaphore. No new event variant, no migration, no replay surface — purely an in-process semaphore control constructed inside `worker.rs::spawn_monitoring_tasks` (never stored on `Worker` itself, to avoid clippy's significant-drop propagation into every `Worker`-holding test). See [`docs/operations/adaptive-slot-tuner.md`](operations/adaptive-slot-tuner.md). |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
@@ -1743,6 +1789,9 @@ randomized- and model-checking-based testing layers:
 * [`docs/testing/formal-methods.md`](testing/formal-methods.md) — TLA+
   models of the core protocols and Kani proofs of the pure kernels
   (issue #1819).
+* [`docs/testing/simulation.md`](testing/simulation.md) — seeded,
+  deterministic simulation of the activity claim protocol, with a Postgres
+  differential test (issue #1830).
 
 ---
 

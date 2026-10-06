@@ -676,6 +676,33 @@ for the mechanism. Security-relevant properties:
 
 ---
 
+## Multi-tenant deployment (issue #1837)
+
+[ADR 0004](./adr/0004-tenant-isolation-cells.md) records the decision.
+
+- **Harvest supports cooperative multi-tenancy.** Many tenants of one
+  operator can share a deployment. Quotas, throttles and concurrency caps bound a
+  tenant on a shared shard. A **cell** gives a tenant its own shard and its
+  own worker pool. See [Tenant cells](./sharding.md#tenant-cells-issue-1837).
+- **A cell is not a security boundary between tenants.** It bounds load,
+  not access. Any caller that may start a workflow may also pin it into any
+  cell. To confine a caller to its tenant, install an
+  [authorizer hook](#authorizer-hook-issue-1803). On a pinned start, check
+  the shard. On a route where the hook sees no shard, check the target in
+  `path`, or deny it.
+- **A workflow can pin a child into a cell.** `ChildPlacement::Shard` and
+  `ChildPlacement::ResidencyKey` place a child on any shard. The hook does
+  not see that decision. Do not build a child pin from caller input.
+- **The tenant header is not an identity.** The caller declares
+  `x-harvest-tenant`. Harvest does not bind it to stored executions.
+- **Name cells, not tenants.** A cell residency key appears in requests,
+  CLI calls and audit rows. Use `cell-a`, not a customer name. Keep the
+  tenant-to-cell map in the application.
+- **Harvest has no namespaces.** All tenants on one shard share its
+  tables. Harvest has no per-tenant row scoping.
+
+---
+
 ## Business-key targeting for signal/cancel (issue #751)
 
 `WorkflowContext::signal_external_workflow_by_id` and
@@ -1009,6 +1036,78 @@ byte-identical across a sweep with this codec.
 
 ---
 
+## Supply chain (issue #1826)
+
+The plan is in
+[`plans/2026-10-06-supply-chain.md`](plans/2026-10-06-supply-chain.md).
+
+### Daily advisory scan
+
+`.github/workflows/advisory-scan.yml` runs `cargo deny check advisories` every
+day at 05:37 UTC. The CI `dependency-audit` job runs on code changes only, and
+a new RUSTSEC advisory needs no code change. Both jobs install the same
+`cargo-deny` version.
+
+A failed scheduled scan opens the issue "Advisory scan: cargo deny check
+advisories failed", or comments on it. The body lists each RUSTSEC id and
+quotes the scan output. To close the issue, fix each finding or add a reasoned
+`ignore` entry to `deny.toml`. The next clean scan closes the issue.
+
+### Pinned actions and Dependabot
+
+Each `uses:` pins a commit SHA, with a `# <tag>` comment. A tag can move to new
+code, and a SHA cannot. `docs/audits/action-sha-pin.py` fails the `lint` job on
+any other form.
+
+`.github/dependabot.yml` opens weekly update pull requests against `trunk-dev`,
+for `cargo` and `github-actions`. Dependabot changes the SHA and the comment
+together.
+
+### Verifying a release
+
+Each release archive ships with a CycloneDX SBOM (`.cdx.json`) and a Sigstore
+bundle (`.sigstore.json`) for each file. The TypeScript client tarball
+(`.tgz`) ships the same way. The binaries are built with `cargo auditable`, so
+each binary holds its own dependency list.
+
+The bundles are the trust anchor. `SHA256SUMS` is not signed. Use it only to
+check a download for damage.
+
+Verify the signature. Replace the version in each name:
+
+```sh
+cosign verify-blob \
+  --bundle harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
+  --certificate-identity https://github.com/autumn-foundation/autumn-harvest/.github/workflows/release.yml@refs/tags/v0.8.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Verify the build provenance and the SBOM attestation. Always pass the tag
+and the workflow. `--repo` alone accepts an attestation from any workflow
+run of this repository.
+
+```sh
+gh attestation verify harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo autumn-foundation/autumn-harvest \
+  --source-ref refs/tags/v0.8.0 \
+  --signer-workflow autumn-foundation/autumn-harvest/.github/workflows/release.yml
+gh attestation verify harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo autumn-foundation/autumn-harvest \
+  --source-ref refs/tags/v0.8.0 \
+  --signer-workflow autumn-foundation/autumn-harvest/.github/workflows/release.yml \
+  --predicate-type https://cyclonedx.org/bom
+```
+
+Scan an extracted binary for advisories with `cargo audit bin <path>`.
+
+A manual run of the Release workflow is a dry run. So is a pull request that
+changes `release.yml`. A dry run builds, writes the SBOM and signs, but
+writes no attestation and publishes nothing. Its files are in the
+`signed-<target>` workflow artifacts. A fork or Dependabot pull request gets
+no OIDC token, so its dry run does not sign. It keeps the `unsigned-<target>`
+artifacts only.
+
 ## Production-readiness checklist
 
 Before deploying the Harvest management API to a production environment, verify
@@ -1092,6 +1191,10 @@ record. Without it, records default to `"anonymous"`.
 Authentication middleware applies uniformly across all shards because it wraps
 the router layer, not individual handlers. No extra configuration is needed for
 multi-shard deployments.
+
+A deployment with tenant cells needs one more check. The authorizer hook
+must refuse a pin into a cell the caller does not own. See
+[Multi-tenant deployment](#multi-tenant-deployment-issue-1837).
 
 ### 6. The API rate limiter is on
 

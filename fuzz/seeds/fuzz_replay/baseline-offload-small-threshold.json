@@ -1,0 +1,59 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 8,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": {
+          "order": 11,
+          "lines": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000b1",
+        "name": "price",
+        "input": {
+          "sku": "long-enough-to-offload"
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000b1",
+        "output": {
+          "cents": 12345,
+          "currency": "EUR"
+        }
+      }
+    },
+    {
+      "type": "SignalReceived",
+      "data": {
+        "signal_name": "approve",
+        "payload": {
+          "by": "ops-team"
+        }
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": {
+          "total": 12345
+        }
+      }
+    }
+  ]
+}
