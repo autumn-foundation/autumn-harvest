@@ -804,8 +804,7 @@ mod scanner {
     /// queue with a [`PoisonPill`](super::super::dlq::DeadLetterReason) reason,
     /// mark the queue row `FAILED`, and fail the owning workflow terminally.
     ///
-    /// Returns `true` if the task was quarantined, `false` if a concurrent
-    /// actor already handled the row.
+    /// Returns what happened to the row. See [`QuarantineOutcome`].
     #[allow(clippy::too_many_lines)]
     async fn quarantine_orphan(
         conn: &mut AsyncPgConnection,
@@ -817,7 +816,7 @@ mod scanner {
         metrics: &dyn MetricsRecorder,
         // Issue #1243: forwarded to the owning-workflow failure write.
         codecs: &crate::payload_codec::PayloadCodecs,
-    ) -> HarvestResult<bool> {
+    ) -> HarvestResult<QuarantineOutcome> {
         use crate::dlq::{DeadLetterReason, NewDeadLetterEntry, dead_letter};
         use crate::schema::harvest_task_queue::dsl;
 
@@ -888,6 +887,9 @@ mod scanner {
         // regardless, so `buffered_settled_in_background` hands the hint to
         // the existing non-blocking background publisher instead of
         // awaiting it inline.
+        // Issue #1879: set when the locked re-check finds the worker fresh.
+        let worker_alive = std::sync::atomic::AtomicBool::new(false);
+        let worker_alive = &worker_alive;
         let (acted, failed_workflow, deferred_starts, closed_children, pending_cancel_metrics) =
             crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
                 bool,
@@ -938,6 +940,7 @@ mod scanner {
                         _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
                     }
                     if !worker_still_dead(conn, &worker_id, dead_secs).await? {
+                        worker_alive.store(true, std::sync::atomic::Ordering::Relaxed);
                         return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                     }
 
@@ -1057,7 +1060,25 @@ mod scanner {
                 start.spawn();
             }
         }
-        Ok(acted)
+        Ok(if acted {
+            QuarantineOutcome::Quarantined
+        } else if worker_alive.load(std::sync::atomic::Ordering::Relaxed) {
+            QuarantineOutcome::WorkerFresh
+        } else {
+            QuarantineOutcome::Skipped
+        })
+    }
+
+    /// What [`quarantine_orphan`] did with one row.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum QuarantineOutcome {
+        /// The task went to the dead-letter queue.
+        Quarantined,
+        /// The locked re-check found the worker fresh (issue #1879). The
+        /// witness must forget the claim, because the watch has a break.
+        WorkerFresh,
+        /// Another actor changed the row, or the row was locked.
+        Skipped,
     }
 
     /// Whether `error` ends the work on one row but leaves the pass able to
@@ -1078,10 +1099,11 @@ mod scanner {
     }
 
     /// Turn a row conflict into a skip (issue #1876).
-    fn skip_on_row_conflict(
-        outcome: HarvestResult<bool>,
+    fn skip_on_row_conflict<T>(
+        outcome: HarvestResult<T>,
         task: &TaskQueueItem,
-    ) -> HarvestResult<bool> {
+        skipped: T,
+    ) -> HarvestResult<T> {
         match outcome {
             Err(e) if is_row_conflict(&e) => {
                 tracing::warn!(
@@ -1089,7 +1111,7 @@ mod scanner {
                     error = %e,
                     "orphan reclaim skipped a task after a row conflict; the next pass retries it"
                 );
-                Ok(false)
+                Ok(skipped)
             }
             other => other,
         }
@@ -1294,13 +1316,22 @@ mod scanner {
                     let outcome =
                         quarantine_orphan(conn, &task, new_strikes, dead_secs, metrics, codecs)
                             .await;
-                    if skip_on_row_conflict(outcome, &task)? {
-                        summary.quarantined += 1;
+                    match skip_on_row_conflict(outcome, &task, QuarantineOutcome::Skipped)? {
+                        QuarantineOutcome::Quarantined => summary.quarantined += 1,
+                        // Issue #1879: a fresh worker breaks the watch.
+                        QuarantineOutcome::WorkerFresh => {
+                            if let (Some((witness, _)), Some(claim)) =
+                                (watch.as_mut(), orphan_claim(&task))
+                            {
+                                witness.forget(&claim);
+                            }
+                        }
+                        QuarantineOutcome::Skipped => {}
                     }
                 }
                 ReclaimAction::Requeue => {
                     let outcome = requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await;
-                    if skip_on_row_conflict(outcome, &task)? {
+                    if skip_on_row_conflict(outcome, &task, false)? {
                         summary.requeued += 1;
                         // Dispatch hint (issue #1312). The orphan is `PENDING`
                         // again and its inner transaction has committed, so the
@@ -1320,7 +1351,7 @@ mod scanner {
                 .map_err(crate::error::database_error)?;
             for task in stuck.into_iter().filter(|task| !held.contains(&task.id)) {
                 let outcome = requeue_stuck_task(conn, &task, stuck_running_secs).await;
-                if skip_on_row_conflict(outcome, &task)? {
+                if skip_on_row_conflict(outcome, &task, false)? {
                     summary.stuck_requeued += 1;
                     crate::queue::record_pending_hints(conn, &[task.id]).await;
                 }
