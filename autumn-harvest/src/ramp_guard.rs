@@ -1298,7 +1298,7 @@ async fn record_abort_tombstones(
     bound: Duration,
 ) -> bool {
     use diesel::sql_types::{Array, Text};
-    use diesel_async::{AsyncConnection, RunQueryDsl};
+    use diesel_async::RunQueryDsl;
 
     let timeout_ms = bound.as_millis().max(1);
     let caller_target = crate::build_routing::ramp_caller_target_id_sql(
@@ -1309,7 +1309,9 @@ async fn record_abort_tombstones(
     let caller_target = caller_target.as_str();
     let write = async {
         let mut conn = pool.get().await.map_err(|e| e.to_string())?;
-        conn.transaction(async |conn| -> crate::error::HarvestResult<()> {
+        conn.build_transaction()
+        .read_committed()
+        .run(async |conn| -> crate::error::HarvestResult<()> {
             for setting in ["lock_timeout", "statement_timeout"] {
                 diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
                     .execute(conn)

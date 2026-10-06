@@ -447,19 +447,24 @@ pub async fn set_build_policy_with_ramp_id(
     deployment_name: Option<&str>,
     ramp_id: Uuid,
 ) -> HarvestResult<BuildPolicy> {
-    use diesel_async::AsyncConnection as _;
-
-    conn.transaction(async |conn| {
-        lock_ramp_generations(conn, queue_name).await?;
-        let old = current_ramp_id(conn, queue_name).await?;
-        let policy =
-            upsert_build_policy_with_ramp_id(conn, queue_name, build_id, deployment_name, ramp_id)
-                .await?;
-        let new = current_ramp_id(conn, queue_name).await?;
-        retire_replaced_ramp_id(conn, queue_name, old, new).await?;
-        Ok(policy)
-    })
-    .await
+    conn.build_transaction()
+        .read_committed()
+        .run(async |conn| {
+            lock_ramp_generations(conn, queue_name).await?;
+            let old = current_ramp_id(conn, queue_name).await?;
+            let policy = upsert_build_policy_with_ramp_id(
+                conn,
+                queue_name,
+                build_id,
+                deployment_name,
+                ramp_id,
+            )
+            .await?;
+            let new = current_ramp_id(conn, queue_name).await?;
+            retire_replaced_ramp_id(conn, queue_name, old, new).await?;
+            Ok(policy)
+        })
+        .await
 }
 
 /// The write of [`set_build_policy_with_ramp_id`], under the ramp
@@ -623,19 +628,20 @@ pub async fn set_build_ramp_with_id(
     percent: i32,
     ramp_id: Uuid,
 ) -> HarvestResult<BuildPolicy> {
-    use diesel_async::AsyncConnection as _;
-
     validate_ramp_percent(percent)?;
-    conn.transaction(async |conn| {
-        lock_ramp_generations(conn, queue_name).await?;
-        let old = current_ramp_id(conn, queue_name).await?;
-        let policy =
-            update_build_ramp_with_id(conn, queue_name, target_build_id, percent, ramp_id).await?;
-        let new = current_ramp_id(conn, queue_name).await?;
-        retire_replaced_ramp_id(conn, queue_name, old, new).await?;
-        Ok(policy)
-    })
-    .await
+    conn.build_transaction()
+        .read_committed()
+        .run(async |conn| {
+            lock_ramp_generations(conn, queue_name).await?;
+            let old = current_ramp_id(conn, queue_name).await?;
+            let policy =
+                update_build_ramp_with_id(conn, queue_name, target_build_id, percent, ramp_id)
+                    .await?;
+            let new = current_ramp_id(conn, queue_name).await?;
+            retire_replaced_ramp_id(conn, queue_name, old, new).await?;
+            Ok(policy)
+        })
+        .await
 }
 
 /// The write of [`set_build_ramp_with_id`], under the ramp generation lock
@@ -692,7 +698,13 @@ async fn update_build_ramp_with_id(
 }
 
 /// Take the transaction advisory lock of the ramp generations of
-/// `queue_name` (issue #1814). Call it inside a transaction.
+/// `queue_name` (issue #1814).
+///
+/// Call it inside a `READ COMMITTED` transaction. Under `REPEATABLE READ`
+/// the lock statement fixes the snapshot before the wait, so a later
+/// statement could miss the commit of the lock holder before it. Each
+/// caller pins its transaction for that reason, whatever the database
+/// default is.
 ///
 /// The ramp guard takes it before it writes the abort tombstones of a
 /// queue. [`set_build_ramp_with_id`] and [`set_build_policy_with_ramp_id`]
@@ -878,28 +890,28 @@ pub async fn clear_build_ramp(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
 ) -> HarvestResult<Option<BuildPolicy>> {
-    use diesel_async::AsyncConnection as _;
-
     // The clear retires the ramp's id, so a stale keyed retry of the request
     // that set it cannot restore the ramp (issue #1814).
-    conn.transaction(async |conn| {
-        lock_ramp_generations(conn, queue_name).await?;
-        let old = current_ramp_id(conn, queue_name).await?;
-        let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
-            "UPDATE harvest_build_policies \
+    conn.build_transaction()
+        .read_committed()
+        .run(async |conn| {
+            lock_ramp_generations(conn, queue_name).await?;
+            let old = current_ramp_id(conn, queue_name).await?;
+            let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
+                "UPDATE harvest_build_policies \
              SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, \
                  ramp_caller_id = NULL, updated_at = NOW() \
              WHERE queue_name = $1 \
              RETURNING {BUILD_POLICY_COLUMNS}"
-        ))
-        .bind::<diesel::sql_types::Text, _>(queue_name)
-        .load(conn)
+            ))
+            .bind::<diesel::sql_types::Text, _>(queue_name)
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+            retire_replaced_ramp_id(conn, queue_name, old, [None, None]).await?;
+            Ok(rows.into_iter().next().map(BuildPolicy::from))
+        })
         .await
-        .map_err(database_error)?;
-        retire_replaced_ramp_id(conn, queue_name, old, [None, None]).await?;
-        Ok(rows.into_iter().next().map(BuildPolicy::from))
-    })
-    .await
 }
 
 /// Declare that workers running `build_id` are compatible with executions

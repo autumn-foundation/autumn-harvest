@@ -360,6 +360,10 @@ The guard fails safe: when it cannot read, it does not abort.
   also commit just before the tombstone, on a pool that holds no marker,
   for example a pool that the first fan-out missed. Under the same lock,
   the tombstone write clears a live ramp with a tombstoned id on its pool.
+  Each of these transactions runs at `READ COMMITTED`, whatever the
+  database default is. Under `REPEATABLE READ` the lock statement would fix
+  the snapshot before the wait, and the next statement could miss the
+  commit of the lock holder.
 - A guard that reported but could not mark any of its markers causes a
   second report after the grace. A failed audit write also makes the counter count
   the abort twice. An extra report is better than an abort with none.

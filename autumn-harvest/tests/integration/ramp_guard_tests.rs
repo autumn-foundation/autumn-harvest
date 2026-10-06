@@ -1734,6 +1734,62 @@ async fn ramp_writers_wait_for_the_ramp_generation_lock() {
         .expect("rollback");
 }
 
+/// A ramp writer sees the commit of the lock holder before it, also when the
+/// database defaults to `repeatable read`. Its snapshot must start after the
+/// lock wait, so it sees a caller id that the holder retired.
+#[tokio::test]
+async fn a_ramp_writer_sees_the_lock_holders_commit_under_repeatable_read() {
+    let (url, _c) = setup().await;
+    let mut admin = AsyncPgConnection::establish(&url).await.expect("connect");
+    diesel::sql_query(
+        "DO $$ BEGIN EXECUTE format( \
+             'ALTER DATABASE %I SET default_transaction_isolation = ''repeatable read''', \
+             current_database()); END $$",
+    )
+    .execute(&mut admin)
+    .await
+    .expect("default to repeatable read");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut holder = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect holder");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    let caller = uuid::Uuid::new_v4();
+    diesel::sql_query("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    lock_ramp_generations(&mut holder, QUEUE)
+        .await
+        .expect("hold the lock");
+    diesel::sql_query("INSERT INTO harvest_ramp_retired_ids (queue_name, ramp_id) VALUES ($1, $2)")
+        .bind::<Text, _>(QUEUE)
+        .bind::<diesel::sql_types::Uuid, _>(caller)
+        .execute(&mut holder)
+        .await
+        .expect("retire the caller id");
+
+    let writer = tokio::spawn(async move {
+        let result = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, caller).await;
+        (result, conn)
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!writer.is_finished(), "the writer waits for the lock");
+    diesel::sql_query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("commit");
+
+    let (result, mut conn) = writer.await.expect("writer task");
+    assert!(
+        matches!(result, Err(autumn_harvest::HarvestError::Config(_))),
+        "the retired caller id is refused: {result:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+}
+
 /// The guard writes no tombstone, and so prunes no marker, while a ramp
 /// writer of the queue holds the advisory lock (issue #1814).
 #[tokio::test]
