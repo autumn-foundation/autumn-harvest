@@ -1631,8 +1631,8 @@ mod db {
         lost: tokio_util::sync::CancellationToken,
         keepalive: tokio::task::JoinHandle<()>,
         /// A slot of [`FENCE_GUARD_SLOTS`]. It is held only to be freed when
-        /// the guard drops. It is boxed as `dyn Send`, so the guard keeps
-        /// the drop behaviour it had before the slot: callers hold a guard
+        /// the guard drops. It is boxed as `dyn Send`. The guard then keeps
+        /// the drop behaviour it had before the slot. Callers hold a guard
         /// for a whole pass on purpose.
         #[allow(dead_code)]
         slot: Option<Box<dyn Send + Sync>>,
