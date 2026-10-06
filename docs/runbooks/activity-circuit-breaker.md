@@ -23,6 +23,10 @@ failure.
 This is opt-in per activity. Activities without a declared policy keep today's
 behaviour exactly (no breaker; the full retry policy applies).
 
+A breaker reacts when a dependency fails. For a dependency that slows down
+under load, pair it with an
+[adaptive concurrency limit](activity-concurrency-limit.md).
+
 ## State model
 
 ```

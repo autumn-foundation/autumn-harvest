@@ -3879,7 +3879,19 @@ async fn persist_external_signal_inline(
     // deliver it, and append the terminal first, leaving the inline path to
     // append the same terminal at a now-stale `next_event_id` — a history write
     // conflict that fails the caller even though delivery succeeded (issue #492).
-    let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = Box::pin(conn
+    // Issue #1822: two workflows that signal each other in one cycle lock
+    // their own row, then the row of the peer. Postgres aborts one side with
+    // `40P01`. The retry runs the whole transaction again. A conflict after
+    // the last retry passes through `fail_execution_on_error`, so the task
+    // runs again and the workflow does not fail. Follow-up work runs after the
+    // commit, below. A completion-trigger counter inside an inline cancel can
+    // count twice.
+    let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = Box::pin(crate::tx_retry::run_with_conflict_retry(
+        conn,
+        crate::tx_retry::SITE_PERSIST,
+        metrics,
+        crate::tx_retry::TxRetryPolicy::DEFAULT,
+        async |conn| Box::pin(conn
         .transaction::<InlinePersistResult, HarvestError, _>(async |conn| {
             // For await-bearing batches, take the awaiter row `FOR UPDATE`
             // lock and read the TRUE `next_event_id` under it. Whichever of
@@ -3920,7 +3932,7 @@ async fn persist_external_signal_inline(
             let multi_shard_deployment =
                 crate::external_target_location::deployment_is_multi_shard();
 
-            for item in items {
+            for item in items.iter().cloned() {
                 match item {
                     SignalBatchItem::Marker(event) => {
                         store::append_events_with_codecs(conn, exec_id, std::slice::from_ref(&event), next, codecs)
@@ -4321,8 +4333,9 @@ async fn persist_external_signal_inline(
             }
 
             Ok((new_events, next, deferred_starts, cancel_metrics, deferred_checks))
-        }))
-        .await?;
+        })).await,
+    ))
+    .await?;
 
     // The inline batch is durably committed: now spawn trigger/cascade follow-up
     // starts and record terminal metrics for any targets cancelled above.
@@ -20470,6 +20483,13 @@ pub async fn fail_execution_on_error<T>(
     if error.terminal_write_claim_ambiguous().is_some() {
         return Err(error);
     }
+    // Issue #1822: Postgres aborted the write to break a deadlock or a
+    // serialization conflict. The workload made no error, so pass it
+    // through. The dispatcher resets the task, and the cycle runs again.
+    // This also covers a conflict that outlasts the retries of a wired site.
+    if crate::tx_retry::classify_conflict(&error).is_some() {
+        return Err(error);
+    }
     fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await?;
     Err(error)
 }
@@ -26496,6 +26516,18 @@ async fn process_workflow_task(
             // un-failed); a suspended/simple-terminal persist failure
             // (including this one) propagates so the caller can act on it.
             //
+            // Issue #1822: a deadlock or serialization abort rolled the whole
+            // cycle back. Return the error on every path. The dispatcher then
+            // resets the task to `PENDING`, and replay derives the same decision
+            // again. The persist closure records metrics before it commits, so
+            // an in-place re-run would count them twice.
+            if let Some(conflict) = crate::tx_retry::classify_conflict(&error) {
+                registry.telemetry().metrics.record_db_transaction_retry(
+                    crate::tx_retry::SITE_WORKFLOW_TASK,
+                    conflict.as_str(),
+                );
+                return Err(error);
+            }
             // Issue #946, Codex round-3/round-4 review: `persist_terminal_
             // outcome_commands` calls `create_detached_child_executions`
             // directly, so a `QuotaExceeded` from a detached child's target
@@ -33843,18 +33875,22 @@ impl Worker {
 
         let circuit_breakers = self.registry.circuit_breakers();
         let exclusions = self.claim_exclusions();
-        let claimed = queue::claim_task_by_id_on_shard(
-            &mut conn,
-            lease.task_id,
-            &self.config.queues,
-            &self.config.worker_id,
-            &self.config.build_id,
-            self.config.priority_aging_secs,
-            circuit_breakers.tracked_activity_names(),
-            &exclusions,
-            shard,
-        )
-        .await;
+        let claimed = self
+            .claim_with_conflict_retry(&mut conn, async |conn| {
+                queue::claim_task_by_id_on_shard(
+                    conn,
+                    lease.task_id,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    self.config.priority_aging_secs,
+                    circuit_breakers.tracked_activity_names(),
+                    &exclusions,
+                    shard,
+                )
+                .await
+            })
+            .await;
 
         match claimed {
             Ok(Some(task)) => {
@@ -34845,6 +34881,34 @@ impl Worker {
         }
     }
 
+    /// Run one claim transaction and run it again after a conflict abort.
+    ///
+    /// Each claim function opens and commits its own transaction. A
+    /// rolled-back claim leaves its row `PENDING`, so a re-run is safe.
+    /// See [`crate::tx_retry`] (issue #1822).
+    async fn claim_with_conflict_retry<F>(
+        &self,
+        conn: &mut AsyncPgConnection,
+        claim: F,
+    ) -> HarvestResult<Option<TaskQueueItem>>
+    where
+        for<'r> F: AsyncFnMut(&'r mut AsyncPgConnection) -> HarvestResult<Option<TaskQueueItem>>
+            + crate::tx_retry::TxAttempt<
+                &'r mut AsyncPgConnection,
+                HarvestResult<Option<TaskQueueItem>>,
+                Fut: Send,
+            > + Send,
+    {
+        crate::tx_retry::run_with_conflict_retry(
+            conn,
+            crate::tx_retry::SITE_CLAIM,
+            &*self.registry.telemetry().metrics,
+            crate::tx_retry::TxRetryPolicy::DEFAULT,
+            claim,
+        )
+        .await
+    }
+
     /// The activity names that a claim must skip: the names with unmet
     /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
@@ -34952,18 +35016,22 @@ impl Worker {
                 // permutation. A claim that succeeds on the first
                 // (typically highest-weight) queue never pays for the rest.
                 let single_queue = [(*queue_name).to_owned()];
-                match queue::claim_task_of_kind_on_shard(
-                    &mut conn,
-                    &single_queue,
-                    &self.config.worker_id,
-                    &self.config.build_id,
-                    self.config.priority_aging_secs,
-                    circuit_breaker_activities,
-                    &exclusions,
-                    shard,
-                    kind,
-                )
-                .await
+                match self
+                    .claim_with_conflict_retry(&mut conn, async |conn| {
+                        queue::claim_task_of_kind_on_shard(
+                            conn,
+                            &single_queue,
+                            &self.config.worker_id,
+                            &self.config.build_id,
+                            self.config.priority_aging_secs,
+                            circuit_breaker_activities,
+                            &exclusions,
+                            shard,
+                            kind,
+                        )
+                        .await
+                    })
+                    .await
                 {
                     Ok(Some(task)) => {
                         tracing::debug!(
@@ -34996,18 +35064,22 @@ impl Worker {
         }
 
         // --- Default (unweighted) path: original single ANY($2) query ---
-        match queue::claim_task_of_kind_on_shard(
-            &mut conn,
-            &self.config.queues,
-            &self.config.worker_id,
-            &self.config.build_id,
-            self.config.priority_aging_secs,
-            circuit_breaker_activities,
-            &exclusions,
-            shard,
-            kind,
-        )
-        .await
+        match self
+            .claim_with_conflict_retry(&mut conn, async |conn| {
+                queue::claim_task_of_kind_on_shard(
+                    conn,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    self.config.priority_aging_secs,
+                    circuit_breaker_activities,
+                    &exclusions,
+                    shard,
+                    kind,
+                )
+                .await
+            })
+            .await
         {
             Ok(Some(task)) => {
                 tracing::debug!(
@@ -36449,11 +36521,16 @@ pub async fn quarantine_workflow_task_timeout(
 /// a session timeout (issue #1788) no scanner would then find it, and the
 /// orphan reclaimer skips a live worker. Release it too. The handler may
 /// already have run, so the activity can run again. That is the
-/// at-least-once contract a crash gives as well. Another database error is
-/// not released: it may repeat, and a release would skip the retry policy.
+/// at-least-once contract a crash gives as well. A deadlock or serialization
+/// abort is released for the same reason (issue #1822). Postgres rolled the
+/// write back, and `fail_execution_on_error` passes the error through. Another
+/// database error is not released: it may repeat, and a release would skip
+/// the retry policy.
 fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
     task_type == "workflow"
-        || (task_type == "activity" && crate::pool::is_transient_db_error(error))
+        || (task_type == "activity"
+            && (crate::pool::is_transient_db_error(error)
+                || crate::tx_retry::classify_conflict(error).is_some()))
 }
 
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
@@ -39753,6 +39830,22 @@ mod tests {
         assert!(!releases_claim_after_error("activity", &other));
         assert!(releases_claim_after_error("workflow", &timeout));
         assert!(releases_claim_after_error("workflow", &other));
+    }
+
+    /// A conflict abort releases an activity claim (issue #1822).
+    ///
+    /// `fail_execution_on_error` passes a conflict through without failing
+    /// the task. Postgres rolled the write back. Without a release, an
+    /// activity with no deadline would stay `RUNNING` under a live worker.
+    #[test]
+    fn a_conflict_abort_releases_an_activity_claim() {
+        let deadlock = crate::error::HarvestError::Database("deadlock detected".into());
+        let serialization = crate::error::HarvestError::Database(
+            "could not serialize access due to concurrent update".into(),
+        );
+        assert!(releases_claim_after_error("activity", &deadlock));
+        assert!(releases_claim_after_error("activity", &serialization));
+        assert!(releases_claim_after_error("workflow", &deadlock));
     }
 
     /// A setup error after `on_dispatch` admitted the half-open probe must
