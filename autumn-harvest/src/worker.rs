@@ -30824,7 +30824,8 @@ impl Worker {
         };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         tokio::join!(bookkeeping, self.drain_in_flight());
-        self.keep_lease_while_handlers_run(vec![pool.clone()]);
+        // A single pool names its shard through the default pin.
+        self.keep_lease_while_handlers_run(vec![(None, pool.clone())]);
 
         // A decision that parked during the drain pinned its task again.
         // Release once more. A task that outlived the drain keeps its pin.
@@ -33024,7 +33025,10 @@ impl Worker {
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
         tokio::join!(bookkeeping, self.drain_in_flight());
         self.keep_lease_while_handlers_run(
-            shard_targets.iter().map(|(_, pool)| pool.clone()).collect(),
+            shard_targets
+                .iter()
+                .map(|(shard, pool)| (Some(*shard), pool.clone()))
+                .collect(),
         );
         for (_, shard_pool) in shard_targets {
             self.release_sticky_pins(shard_pool, acquire_bound).await;
@@ -34015,7 +34019,7 @@ impl Worker {
     /// [`observe_task_cancellation`]. Two live instances with the same worker
     /// id share one lease row, so each hides the other while both run. That
     /// is true of the normal heartbeat too.
-    fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
+    fn keep_lease_while_handlers_run(&self, pools: Vec<(Option<crate::types::ShardId>, DbPool)>) {
         if skip_fenced_shutdown_write(&self.config.worker_id, "shutdown lease keeper") {
             return;
         }
@@ -34023,11 +34027,12 @@ impl Worker {
         if self.dispatched.tracker.is_empty() {
             // Every body ended in the drain. One of them can still have left
             // its claim `RUNNING` after a failed write, so sweep anyway.
-            for pool in pools {
+            for (shard, pool) in pools {
                 let worker_id = self.config.worker_id.clone();
                 let live_claims = Arc::clone(&self.dispatched.live);
                 tokio::spawn(async move {
-                    final_abandoned_claim_sweep(&pool, &worker_id, &live_claims, interval).await;
+                    final_abandoned_claim_sweep(&pool, shard, &worker_id, &live_claims, interval)
+                        .await;
                 });
             }
             return;
@@ -34041,7 +34046,7 @@ impl Worker {
         // One task for each pool, so a stalled shard pool cannot stop the
         // refresh of another shard. Detached on purpose: the handlers they
         // guard are detached too.
-        for pool in pools {
+        for (shard, pool) in pools {
             let dispatched = self.dispatched.tracker.clone();
             let worker_id = self.config.worker_id.clone();
             let live_claims = Arc::clone(&self.dispatched.live);
@@ -34059,12 +34064,26 @@ impl Worker {
                             // A replacement worker with the same id can keep
                             // the row fresh, so orphan reclaim may never take
                             // that claim. Sweep until it succeeds.
-                            final_abandoned_claim_sweep(&pool, &worker_id, &live_claims, interval)
-                                .await;
+                            final_abandoned_claim_sweep(
+                                &pool, shard, &worker_id, &live_claims, interval,
+                            )
+                            .await;
                             return;
                         }
                         () = tokio::time::sleep_until(next) => {
-                            let touched = tokio::time::timeout(bound, async {
+                            // Issue #1823: this task outlives the sampler, so
+                            // each refresh checks the fence itself.
+                            let fence = match keeper_fence(&pool, shard, &worker_id).await {
+                                KeeperFence::Stop => return,
+                                KeeperFence::Skip => None,
+                                KeeperFence::Write(fence) => Some(fence),
+                            };
+                            let Some(fence) = fence else {
+                                next = tokio::time::Instant::now()
+                                    + next_lease_refresh(interval, false);
+                                continue;
+                            };
+                            let touched = tokio::time::timeout(bound, crate::replication::run_fenced_pass(&fence, Box::pin(async {
                                 let mut conn = crate::pool::acquire(&pool, bound).await?;
                                 let touched =
                                     crate::workers::touch_worker_liveness(&mut conn, &worker_id)
@@ -34083,8 +34102,10 @@ impl Worker {
                                 // each claim that no body holds.
                                 release_abandoned_claims(&mut conn, &worker_id, &live_claims)
                                     .await
-                            })
-                            .await;
+                            })))
+                            .await
+                            .map(|done| done.and_then(|done| done));
+                            drop(fence);
                             let error = match touched {
                                 Ok(Ok(_)) => None,
                                 Ok(Err(error)) => Some(error.to_string()),
@@ -34181,6 +34202,7 @@ fn next_lease_refresh(heartbeat_interval: Duration, refreshed: bool) -> Duration
 /// the first failure is logged.
 async fn final_abandoned_claim_sweep(
     pool: &DbPool,
+    shard: Option<crate::types::ShardId>,
     worker_id: &str,
     claims: &LiveClaims,
     heartbeat_interval: Duration,
@@ -34196,11 +34218,31 @@ async fn final_abandoned_claim_sweep(
         if !pending {
             return;
         }
-        let swept = tokio::time::timeout(bound, async {
-            let mut conn = crate::pool::acquire(pool, bound).await?;
-            release_abandoned_claims(&mut conn, worker_id, claims).await
-        })
-        .await;
+        // Issue #1823: this task outlives the sampler, so each attempt
+        // checks the fence itself.
+        let fence = match keeper_fence(pool, shard, worker_id).await {
+            KeeperFence::Stop => return,
+            KeeperFence::Skip => None,
+            KeeperFence::Write(fence) => Some(fence),
+        };
+        let swept = match &fence {
+            Some(fence) => tokio::time::timeout(
+                bound,
+                crate::replication::run_fenced_pass(
+                    fence,
+                    Box::pin(async {
+                        let mut conn = crate::pool::acquire(pool, bound).await?;
+                        release_abandoned_claims(&mut conn, worker_id, claims).await
+                    }),
+                ),
+            )
+            .await
+            .map(|done| done.and_then(|done| done)),
+            None => Ok(Err(crate::error::HarvestError::Database(
+                "the shard is held or its fence check failed".to_string(),
+            ))),
+        };
+        drop(fence);
         if matches!(swept, Ok(Ok(_))) {
             return;
         }
@@ -34212,6 +34254,54 @@ async fn final_abandoned_claim_sweep(
             );
         }
         tokio::time::sleep(next_lease_refresh(heartbeat_interval, true)).await;
+    }
+}
+
+/// What a shutdown lease-keeper write may do (issue #1823).
+enum KeeperFence {
+    /// Write under these guards. Empty when this process pins nothing.
+    Write(Vec<crate::replication::FencePassGuard>),
+    /// Skip this attempt and try again later: the shard is held, or the
+    /// fence could not be read.
+    Skip,
+    /// Stop for good: this process lost write authority.
+    Stop,
+}
+
+/// Open the fence for one lease-keeper write (issue #1823).
+///
+/// The keeper outlives the sampler, so it checks the fence on each write. A
+/// superseded pin marks the process fenced out, and the keeper stops.
+async fn keeper_fence(
+    pool: &DbPool,
+    shard: Option<crate::types::ShardId>,
+    worker_id: &str,
+) -> KeeperFence {
+    if crate::replication::FenceRegistry::is_fenced_out() {
+        return KeeperFence::Stop;
+    }
+    if crate::replication::shard_writes_held(shard) {
+        return KeeperFence::Skip;
+    }
+    let key = shard.unwrap_or(crate::types::ShardId::UNENCODED);
+    match crate::replication::begin_fenced_group(pool, key).await {
+        Ok(fence) => KeeperFence::Write(fence),
+        Err(
+            error @ (crate::error::HarvestError::ShardFenced { .. }
+            | crate::error::HarvestError::Config(_)),
+        ) => {
+            tracing::error!(
+                worker_id,
+                %error,
+                "the shutdown lease keeper stops: this process lost DR write authority"
+            );
+            crate::replication::FenceRegistry::mark_fenced_out();
+            KeeperFence::Stop
+        }
+        Err(error) => {
+            tracing::warn!(worker_id, %error, "the shutdown lease keeper could not read the fence");
+            KeeperFence::Skip
+        }
     }
 }
 
@@ -38796,6 +38886,38 @@ mod tests {
         assert_eq!(
             drain_cancel_at(start, deadline, Duration::from_secs(5)),
             start
+        );
+    }
+
+    /// The shutdown lease keeper checks the fence on each write (issue
+    /// #1823). A held shard and an unreadable fence each skip the write. The
+    /// keeper then tries again later.
+    #[test]
+    fn the_lease_keeper_skips_a_write_it_cannot_fence() {
+        use crate::replication::{FenceRegistry, ShardGeneration};
+        let _serial = crate::replication::tests::registry_guard();
+        FenceRegistry::clear();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/keeper");
+        let shard = crate::types::ShardId::new(3);
+
+        FenceRegistry::hold(&[shard], shard).expect("hold");
+        let held = runtime.block_on(keeper_fence(&pool, Some(shard), "w"));
+        FenceRegistry::clear();
+        FenceRegistry::publish(&[(shard, ShardGeneration::INITIAL)], shard).expect("pin");
+        let unreadable = runtime.block_on(keeper_fence(&pool, Some(shard), "w"));
+        FenceRegistry::clear();
+
+        assert!(
+            matches!(held, KeeperFence::Skip),
+            "a held shard gets no keeper write"
+        );
+        assert!(
+            matches!(unreadable, KeeperFence::Skip),
+            "an unreadable fence skips the write"
         );
     }
 

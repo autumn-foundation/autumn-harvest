@@ -362,7 +362,9 @@ for a pass in flight on that shard. A pass that starts after the bump sees
 the new generation and stops. Each shard has its own lock. A pass on one
 shard does not delay a bump of another shard on the same database.
 The bump waits at most 5 seconds. A pass that runs longer makes the bump
-fail with a lock timeout. Run `harvest dr fence` again.
+fail with a lock timeout. Run `harvest dr fence` again. After the bump gets
+the lock, it waits 2 more seconds before it commits. A pass that lost its
+barrier stops in that time, and a short write it sent commits first.
 
 These direct-database commands are exempt, by design:
 
@@ -384,7 +386,7 @@ cannot commit while any of them writes.
 
 Three limits, stated plainly:
 
-- A barrier opens one extra connection per shard. A process holds at most
+- A barrier opens one extra connection per database. A process holds at most
   64 of these at once. A barrier past that waits up to 10 seconds for a
   free slot, then fails closed: an admin write answers `503`. On a DR node
   every admin write, scheduler pass and partition pass pays that cost. The
@@ -392,9 +394,10 @@ Three limits, stated plainly:
   server frees the lock. The pass then stops: a scheduler pass before it
   fires, a partition pass or a rebalance at once, with an error. An admin
   write or a webhook answers `503`. A statement the server already runs is
-  not cancelled. It can still commit after a bump, within one second plus
-  its own run time. History appends are not exposed: each checks the fence
-  in its own transaction.
+  not cancelled. The bump's 2-second wait covers a short statement. A
+  statement that runs longer than about one second can still commit after
+  a bump. History appends are not exposed: each checks the fence in its own
+  transaction.
 - The check reads every shard of the storage pool, and every pinned shard
   colocated with one, on each admin write. If one cannot be read, every
   admin write on the node answers `503`. That fails closed. A node that has

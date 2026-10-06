@@ -3060,6 +3060,66 @@ async fn a_pass_stops_when_its_fence_guard_is_lost() {
     assert!(outcome.is_err(), "a stopped pass reports an error");
 }
 
+/// A bump waits out a write that a lost pass already sent (issue #1823).
+/// The pass sees the loss within one keepalive interval and stops. A short
+/// statement it sent before then must commit before the bump.
+#[tokio::test]
+async fn a_bump_waits_out_a_write_a_lost_pass_already_sent() {
+    let (url, db) = require_db!("passstraggler");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    diesel::sql_query("CREATE TABLE dr_straggler (id int PRIMARY KEY, written bool NOT NULL)")
+        .execute(&mut conn)
+        .await
+        .expect("create the probe table");
+    diesel::sql_query("INSERT INTO dr_straggler VALUES (1, false)")
+        .execute(&mut conn)
+        .await
+        .expect("seed the probe row");
+    #[derive(diesel::QueryableByName)]
+    struct Probe {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        written: bool,
+    }
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    // The pass sends a write. The server still runs it when the guard ends.
+    let writer_url = url.clone();
+    let write = tokio::spawn(async move {
+        let mut writer = connect(&writer_url).await;
+        diesel::sql_query("UPDATE dr_straggler SET written = true WHERE pg_sleep(0.8) IS NOT NULL")
+            .execute(&mut writer)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    diesel::sql_query(format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("terminate the guard backend");
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    let written: Vec<Probe> = diesel::sql_query("SELECT written FROM dr_straggler")
+        .load(&mut conn)
+        .await
+        .expect("read the probe row");
+    write.await.expect("join").expect("the write commits");
+    drop(guard);
+
+    assert!(
+        <[Probe]>::first(&written).is_some_and(|row| row.written),
+        "a write sent before the loss must commit before the bump"
+    );
+}
+
 /// A pass on one shard does not block a bump of another shard on the same
 /// database (issue #1823). Generations are per shard, so the barrier is too.
 #[tokio::test]
@@ -3281,7 +3341,7 @@ async fn a_background_tick_guards_every_colocated_shard() {
     drop(guards);
     let _ = bump.await;
 
-    assert_eq!(count, 2, "one barrier per colocated shard");
+    assert_eq!(count, 1, "one guard holds both colocated shards");
     assert!(waited, "a bump of a colocated shard waits for the tick");
 
     // A scheduler pass on that database takes the same group.
@@ -3601,6 +3661,38 @@ async fn provisioning_a_row_waits_for_a_running_pass() {
     .await;
     drop(guard);
     assert!(matches!(again, Ok(Ok(_))), "an existing row does not wait");
+}
+
+/// A group larger than the guard cap still gets a guard (issue #1823). One
+/// connection holds the barrier of every shard in the group, so the group
+/// takes one slot, not one per shard.
+#[tokio::test]
+async fn a_group_larger_than_the_guard_cap_gets_a_guard() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("biggroup");
+    let pool = dr_pool(&url);
+    let assigned: Vec<ShardId> = (0..70).map(ShardId::new).collect();
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments(assigned.clone()),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    pin_worker_fence(DrFencing::Enabled, DR_PREFIX, targets, &pool, &assigned)
+        .await
+        .expect("70 colocated shards pin");
+
+    let group = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        autumn_harvest::replication::begin_fenced_group(&pool, ShardId::UNENCODED),
+    )
+    .await
+    .expect("the group must not wait for 70 slots")
+    .expect("the group gets a guard");
+    assert_eq!(group.len(), 1, "one guard for the whole group");
+    let pools = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+    let tick = autumn_harvest::replication::begin_fenced_tick(&pools)
+        .await
+        .expect("a tick over 70 shards gets a guard");
+    assert_eq!(tick.len(), 1);
 }
 
 /// A held shard that turns out to carry a DR marker stops the worker. A pin

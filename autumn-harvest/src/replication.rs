@@ -81,6 +81,15 @@
 #[cfg(feature = "db")]
 const BUMP_LOCK_TIMEOUT_MS: u64 = 5_000;
 
+/// How long a bump waits after it takes the pass lock (issue #1823).
+///
+/// A pass whose guard session ends sees the loss within one keepalive
+/// interval of one second. It then sends no more writes. A write it sent
+/// before that point can still run on the server. The second interval lets
+/// a short write commit before the bump does.
+#[cfg(feature = "db")]
+const BUMP_WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Per-statement ceiling for `advance_sequences_after_promotion`.
 ///
 /// Generous, because a `MAX(col)` over a large un-indexed serial column on a
@@ -1370,9 +1379,9 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
     use super::{
-        BUMP_LOCK_TIMEOUT_MS, DrMarkers, FenceRegistry, PROMOTE_STATEMENT_TIMEOUT_MS,
-        ReplicationStatus, ShardGeneration, SlotLag, StandbyLag, WatermarkReading, qualified,
-        quote_ident,
+        BUMP_LOCK_TIMEOUT_MS, BUMP_WRITER_GRACE, DrMarkers, FenceRegistry,
+        PROMOTE_STATEMENT_TIMEOUT_MS, ReplicationStatus, ShardGeneration, SlotLag, StandbyLag,
+        WatermarkReading, qualified, quote_ident,
     };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ShardId;
@@ -1507,6 +1516,9 @@ mod db {
     /// racy read: this cannot commit while an in-flight persist holds the row,
     /// and every persist that starts afterwards sees the new epoch.
     ///
+    /// A bump takes at least two seconds. That wait lets a pass
+    /// that lost its guard stop before the bump commits.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::error::HarvestError::Database`] on query failure, or
@@ -1539,6 +1551,10 @@ mod db {
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
+                // A lost guard frees the lock while its pass can still
+                // write. Wait until that pass stops and its write commits.
+                // The table lock comes after, so appends do not wait.
+                tokio::time::sleep(BUMP_WRITER_GRACE).await;
                 diesel::sql_query("LOCK TABLE harvest_shard_generation IN ACCESS EXCLUSIVE MODE")
                     .execute(conn)
                     .await
@@ -1685,12 +1701,12 @@ mod db {
     /// The pool discards a connection in a transaction state, so the server
     /// rolls that transaction back.
     ///
-    /// Known limit: dropping `pass` does not cancel a statement the server
-    /// already runs. An autocommit statement sent before the loss is seen
-    /// can still commit after a bump. The loss is seen within one keepalive
-    /// interval, so the window is that interval plus that statement's run
-    /// time. History appends do not depend on this guard: each asserts the
-    /// fence in its own transaction.
+    /// Dropping `pass` does not cancel a statement the server already runs.
+    /// The loss is seen within one keepalive interval. A bump waits two
+    /// intervals after it takes the lock, so a short statement commits
+    /// first. Known limit: a statement that runs longer than about one
+    /// interval can still commit after a bump. History appends do not
+    /// depend on this guard: each asserts the fence in its own transaction.
     ///
     /// # Errors
     ///
@@ -1796,13 +1812,12 @@ mod db {
         shard: ShardId,
     ) -> HarvestResult<Vec<FencePassGuard>> {
         let bindings = FenceRegistry::claim_bindings(shard).unwrap_or_default();
-        let mut guards = Vec::new();
-        for (index, (pinned, generation)) in bindings.iter().enumerate() {
-            // The first guard also checks for rows this process did not pin.
-            let allowed = if index == 0 { &bindings[..] } else { &[] };
-            guards.push(begin_checked_pass(pool, *pinned, *generation, allowed).await?);
+        if bindings.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(guards)
+        // One guard holds the barrier of every shard in the group, on one
+        // connection. It also checks for rows this process did not pin.
+        Ok(vec![begin_checked_pass(pool, &bindings, &bindings).await?])
     }
 
     /// Fail when the database holds a generation row that this process did
@@ -1867,18 +1882,18 @@ mod db {
         for (shard, shard_pool) in pool.iter_shards() {
             let key = if single { ShardId::UNENCODED } else { shard };
             let bindings = FenceRegistry::claim_bindings(key).unwrap_or_default();
-            let mut checked = false;
-            for (pinned, generation) in &bindings {
-                if guarded.contains(pinned) {
-                    continue;
-                }
-                guarded.push(*pinned);
-                // The first guard on this database also checks for rows this
-                // process did not pin.
-                let allowed = if checked { &[][..] } else { &bindings[..] };
-                checked = true;
-                guards.push(begin_checked_pass(shard_pool, *pinned, *generation, allowed).await?);
+            let fresh: Vec<(ShardId, ShardGeneration)> = bindings
+                .iter()
+                .filter(|(pinned, _)| !guarded.contains(pinned))
+                .copied()
+                .collect();
+            if fresh.is_empty() {
+                continue;
             }
+            guarded.extend(fresh.iter().map(|(pinned, _)| *pinned));
+            // One guard per database holds the barrier of every shard there,
+            // and checks for rows this process did not pin.
+            guards.push(begin_checked_pass(shard_pool, &fresh, &bindings).await?);
         }
         Ok(guards)
     }
@@ -1894,17 +1909,19 @@ mod db {
         shard: ShardId,
         expected: ShardGeneration,
     ) -> HarvestResult<FencePassGuard> {
-        begin_checked_pass(pool, shard, expected, &[]).await
+        begin_checked_pass(pool, &[(shard, expected)], &[]).await
     }
 
-    /// [`begin_fenced_pass_at`], and fail when the database holds a row
-    /// outside `allowed` (issue #1823). An empty `allowed` skips that check.
-    /// The check runs on the guard's own connection, so it never waits for
-    /// a pool connection.
+    /// One guard for every shard in `shards`, on one connection, and fail
+    /// when the database holds a row outside `allowed` (issue #1823). An
+    /// empty `allowed` skips that check. The check runs on the guard's own
+    /// connection, so it never waits for a pool connection.
+    ///
+    /// The guard takes one slot of [`FENCE_GUARD_LIMIT`], however many shards
+    /// it covers. A group of any size therefore fits.
     async fn begin_checked_pass(
         pool: &crate::worker::DbPool,
-        shard: ShardId,
-        expected: ShardGeneration,
+        shards: &[(ShardId, ShardGeneration)],
         allowed: &[(ShardId, ShardGeneration)],
     ) -> HarvestResult<FencePassGuard> {
         use deadpool::managed::Manager as _;
@@ -1927,7 +1944,7 @@ mod db {
                 )
             })?
             .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
-        let mut guard = begin_pass_on(conn, shard, expected, allowed).await?;
+        let mut guard = begin_pass_on(conn, shards, allowed).await?;
         guard.slot = Some(Box::new(slot));
         Ok(guard)
     }
@@ -1944,23 +1961,29 @@ mod db {
         shard: ShardId,
         expected: ShardGeneration,
     ) -> HarvestResult<FencePassGuard> {
-        begin_pass_on(conn, shard, expected, &[]).await
+        begin_pass_on(conn, &[(shard, expected)], &[]).await
     }
 
-    /// The guard itself. See [`begin_checked_pass`] for `allowed`.
+    /// The guard itself: the pass lock of every shard in `shards`, on one
+    /// connection. See [`begin_checked_pass`] for `allowed`.
     async fn begin_pass_on(
         mut conn: AsyncPgConnection,
-        shard: ShardId,
-        expected: ShardGeneration,
+        shards: &[(ShardId, ShardGeneration)],
         allowed: &[(ShardId, ShardGeneration)],
     ) -> HarvestResult<FencePassGuard> {
         use diesel_async::SimpleAsyncConnection as _;
         begin_guard_transaction(&mut conn).await?;
-        diesel::sql_query(FENCE_PASS_LOCK_SHARED)
-            .bind::<BigInt, _>(fence_pass_lock_key(shard.as_i32()))
-            .execute(&mut conn)
-            .await
-            .map_err(database_error)?;
+        // Taken in shard order. A bump takes one pass lock only, so no order
+        // of these shared locks can deadlock with it.
+        let mut ordered = shards.to_vec();
+        ordered.sort_by_key(|(shard, _)| *shard);
+        for (shard, _) in &ordered {
+            diesel::sql_query(FENCE_PASS_LOCK_SHARED)
+                .bind::<BigInt, _>(fence_pass_lock_key(shard.as_i32()))
+                .execute(&mut conn)
+                .await
+                .map_err(database_error)?;
+        }
         // A new row on this database waits for this pass. See
         // `PROVISION_LOCK_KEY`.
         diesel::sql_query(FENCE_PASS_LOCK_SHARED)
@@ -1974,14 +1997,17 @@ mod db {
         conn.batch_execute("SAVEPOINT harvest_fence_check")
             .await
             .map_err(database_error)?;
-        assert_generation(&mut conn, shard, expected).await?;
+        for (shard, expected) in &ordered {
+            assert_generation(&mut conn, *shard, *expected).await?;
+        }
         if !allowed.is_empty() {
             assert_no_unpinned_rows(&mut conn, allowed).await?;
         }
         conn.batch_execute("ROLLBACK TO SAVEPOINT harvest_fence_check")
             .await
             .map_err(database_error)?;
-        Ok(keep_guard_alive(conn, shard.as_i32()))
+        let label = <[_]>::first(&ordered).map_or(-1, |(shard, _)| shard.as_i32());
+        Ok(keep_guard_alive(conn, label))
     }
 
     /// Open a transaction on `conn` that a long guard holds (issue #1823).
@@ -3570,14 +3596,15 @@ pub use db::{
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// [`FenceRegistry`] is process-global, so the tests that mutate it must
     /// not interleave with each other under the default parallel harness.
+    /// Tests in other modules take the same lock.
     static REGISTRY_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
         REGISTRY_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
