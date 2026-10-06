@@ -23,6 +23,9 @@ decision.
 - The terminal-task janitor keeps a finished row while its timed-out-claim
   record is outstanding, up to 7 days past its normal cutoff. The owner
   takes the record after its cancellation grace.
+- A worker rejects a `cancellation_grace_period` above 24 hours at startup
+  (`MAX_CANCELLATION_GRACE_PERIOD`). The default is 5 s. The bound keeps the
+  grace inside the janitor's 7-day hold.
 - Only the dispatch that debited a rate-limit token refunds it, and at most
   once. A worker whose attempt never runs its handler refunds its own debit:
   the claim debit of an untracked activity, or the dispatch debit of one that

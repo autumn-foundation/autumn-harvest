@@ -148,6 +148,13 @@ pub fn labels_to_clear<S: std::hash::BuildHasher>(
     previous.difference(current).cloned().collect()
 }
 
+/// The longest cancellation grace a worker accepts (issue #1809).
+///
+/// A timed-out owner takes its timeout record after the grace ends. The
+/// terminal-task janitor keeps a row with an untaken record for at least 7
+/// days. A grace within this bound always ends first.
+pub const MAX_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Validated, runtime-ready worker configuration.
 ///
 /// Built from [`WorkerConfig`] (the user-facing builder) via `From`, which
@@ -323,12 +330,20 @@ impl WorkerRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Config`] if `queues` is empty.
+    /// Returns [`HarvestError::Config`] if `queues` is empty, or if
+    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
                 "worker must poll at least one queue".into(),
             ));
+        }
+        if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
+            return Err(HarvestError::Config(format!(
+                "cancellation_grace_period of {}s exceeds the maximum of {}s",
+                self.cancellation_grace_period.as_secs(),
+                MAX_CANCELLATION_GRACE_PERIOD.as_secs()
+            )));
         }
         // Warn when queue_weights contains keys that are not in the queues list.
         // Those entries are silently ignored by effective_queue_weights, which
@@ -37313,6 +37328,23 @@ mod tests {
         // reported via tracing::warn! only (issue #548, queue_weights
         // precedent).
         assert!(cfg.validate().is_ok());
+    }
+
+    /// The cancellation grace has an upper bound (issue #1809). A timed-out
+    /// owner takes its timeout record after the grace. The terminal-task
+    /// janitor keeps that record for at least 7 days, so a longer grace could
+    /// lose it.
+    #[test]
+    fn runtime_config_validate_bounds_the_cancellation_grace() {
+        let mut cfg = default_runtime_config();
+        cfg.cancellation_grace_period = MAX_CANCELLATION_GRACE_PERIOD;
+        assert!(cfg.validate().is_ok());
+        cfg.cancellation_grace_period = MAX_CANCELLATION_GRACE_PERIOD + Duration::from_secs(1);
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cancellation_grace_period"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -7285,7 +7285,9 @@ const TERMINAL_TASK_CURSOR: &str = "AND (t.completed_at, t.id) > ($3, $4) ";
 ///   (issue #1809). Its owner takes the entry after its cancellation grace,
 ///   which can outlast the shortest window. Without it, the owner misses a
 ///   timeout that another process enforced. An owner that crashed never
-///   takes its entry, so the row goes 7 days after the cutoff.
+///   takes its entry, so the row goes 7 days after the cutoff. The grace is
+///   at most [`crate::worker::MAX_CANCELLATION_GRACE_PERIOD`], so a live
+///   owner always takes its entry first.
 #[must_use]
 fn terminal_task_predicates() -> String {
     let terminal = crate::erase::sql_literal_list(TERMINAL_TASK_STATES);
