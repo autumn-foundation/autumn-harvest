@@ -1,6 +1,8 @@
 # Dependency ledger harness (Ballast). Run locally with `cargo deny check`;
 # CI runs the same command in .github/workflows/ci.yml's `dependency-audit`
 # job on every push/PR that touches Cargo.toml/Cargo.lock/this file.
+# .github/workflows/advisory-scan.yml also runs the advisory check every day,
+# because a new advisory needs no code change (issue #1826).
 #
 # Every `ignore`/`exceptions` entry below is a documented pin: it carries the
 # reason it's deferred and the trigger that should bring it back for review.

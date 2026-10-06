@@ -283,6 +283,7 @@ mod start_source_tests;
 #[cfg(feature = "db")]
 mod sticky_default_tests;
 mod sticky_routing_tests;
+mod supply_chain_ci;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
 mod terminal_task_gc_tests;

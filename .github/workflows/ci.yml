@@ -51,7 +51,7 @@ jobs:
       # can be resolved reliably.
       base_sha: ${{ steps.filter.outputs.base_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - id: filter
@@ -120,13 +120,14 @@ jobs:
       # base with the target branch, and a shallow clone has no merge base to
       # find. Without it that step silently degrades to report-only and stops
       # gating. This is the cheap job, so the extra fetch is affordable here.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check default-run for multi-binary packages
         # Guards the defect class that silently broke `cargo run -p
         # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
@@ -694,7 +695,7 @@ jobs:
       #
       # `setup-python` because the image's system Python refuses `pip install`
       # (PEP 668). The validator is pinned so its releases cannot redden lint.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - name: Validate the OpenAPI document
@@ -714,6 +715,14 @@ jobs:
         run: |
           python3 -m pip install --quiet --disable-pip-version-check "PyYAML==6.0.2"
           python3 docs/audits/workflow-yaml-parse.py
+
+      # Supply-chain pin lint (issue #1826, docs/audits/action-sha-pin.py).
+      # A tag or branch ref can move to new code. Each `uses:` must pin a
+      # commit SHA with a `# <tag>` comment. The self-test runs first.
+      - name: Action SHA pins (docs/audits/action-sha-pin.py)
+        run: |
+          python3 docs/audits/action-sha-pin.py --self-test
+          python3 docs/audits/action-sha-pin.py
 
       # The contract is what the OpenAPI document is generated from, so a
       # status or a mandatory field missing there is missing from every
@@ -774,9 +783,11 @@ jobs:
       # conclusion. The expensive cargo steps below carry the docs-only guard;
       # when they all skip, the leg reports success — keeping the required
       # `Test (<os>)` contexts satisfied without running the matrix work.
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run no-db tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features
@@ -866,9 +877,11 @@ jobs:
         shard: [0, 1, 2, 3]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Shared across a given OS's 4 shards (they build the same
           # Cargo.lock), so a shard needing a binary another shard already
@@ -1367,9 +1380,11 @@ jobs:
       SEMAPHORE_SHARD_COUNT: "21"
       SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # One cache shared across all shards (they all build against the
           # same Cargo.lock) rather than rust-cache's default per-job-name
@@ -1488,9 +1503,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build quickstart
         run: cargo build -p quickstart
       - name: Run the exact README quickstart command and assert a workflow reaches COMPLETED
@@ -1641,9 +1658,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # One package per command. The chapter runs each with `cargo run -p`,
       # and a joint build resolves other features, so it would not be reused.
       - name: Build the chapter's crate and the CLI
@@ -1688,10 +1707,12 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
       - name: Build quickstart
@@ -1756,8 +1777,8 @@ jobs:
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
       # The script retries each npm registry call once. A type or test error
@@ -1793,9 +1814,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
@@ -1877,9 +1900,11 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: 1.88.0
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check MSRV compiles
         run: cargo check --workspace
       # `cargo check --workspace` builds default features only, so the
@@ -1916,9 +1941,11 @@ jobs:
     env:
       RUSTFLAGS: "--cfg loom"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run loom models
         run: cargo test -p autumn-harvest --no-default-features --test loom_models --release
 
@@ -1936,9 +1963,11 @@ jobs:
     env:
       RUSTFLAGS: "--cfg shuttle"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run Shuttle models (random and PCT schedulers)
         run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
 
@@ -1956,7 +1985,7 @@ jobs:
     # A full run takes about 40 seconds. The runner image has Java.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Model-check every manifest row with TLC
         run: scripts/check-formal-models.sh
 
@@ -1972,9 +2001,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install Kani
         run: |
           cargo install --locked kani-verifier --version 0.68.0
@@ -1991,6 +2022,11 @@ jobs:
   # and sources (registry/git origin pinning). Pure metadata + advisory-DB
   # checks against Cargo.lock, so it needs neither the DB/Docker services nor
   # the build/test matrix below.
+  #
+  # cargo-deny comes from `taiki-e/install-action` at an exact version, not
+  # from `cargo-deny-action`. The daily scan (advisory-scan.yml, issue #1826)
+  # installs the same version, and `supply_chain_ci` checks that the two
+  # agree. 0.20.2 is the version that `cargo-deny-action` v2.1.1 bundles.
   dependency-audit:
     name: Dependency ledger (cargo-deny)
     needs: changes
@@ -2000,9 +2036,12 @@ jobs:
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        with:
+          tool: cargo-deny@0.20.2
       - name: cargo deny check (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        run: cargo deny --all-features check
 
   # Issue #962: the semantic (MIR-level) determinism analyzer, `harvest-verify`.
   # This is the SECOND line behind the syntactic HVG/DET guardrails — opt-in, and
@@ -2039,9 +2078,11 @@ jobs:
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ". -> target"
           cache-directories: target/harvest-verify
@@ -2100,9 +2141,11 @@ jobs:
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ". -> target"
           cache-directories: target/harvest-verify
@@ -2134,9 +2177,11 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fuzz
       - name: Install cargo-fuzz

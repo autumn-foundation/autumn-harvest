@@ -36,7 +36,7 @@ jobs:
     # is a cancel, and then the report step does not run.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         timeout-minutes: 2
       - name: Alert when no scheduled chaos run succeeded in 48 h
         timeout-minutes: 3

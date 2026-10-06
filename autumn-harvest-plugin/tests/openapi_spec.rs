@@ -1014,7 +1014,7 @@ fn the_release_pipeline_builds_and_attaches_the_client() {
         "the client must build before the release exists"
     );
     assert!(
-        job[create..].contains("files: ${{ steps.client.outputs.tarball }}"),
+        job[create..].contains("files: |\n            ${{ steps.client.outputs.tarball }}\n"),
         "the release step must attach the client tarball"
     );
     assert!(
