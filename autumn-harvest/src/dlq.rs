@@ -469,15 +469,8 @@ async fn redrive_callback_dead_letter(
             ))
         })?;
 
-    // `not_before` is on the database clock. The callback scanner compares
-    // `next_attempt_at` with the host clock, so move it onto that clock.
-    let not_before = match not_before {
-        Some(at) => {
-            let db_now = crate::queue::db_now(conn).await?;
-            Some(to_host_clock(at, db_now, Utc::now()))
-        }
-        None => None,
-    };
+    // The callback scanner reads `next_attempt_at` on the host clock.
+    let not_before = slot_on_host_clock(conn, not_before).await?;
 
     match crate::completion_callback::redrive_delivery_at(
         conn,
@@ -498,6 +491,21 @@ async fn redrive_callback_dead_letter(
             )))
         }
     }
+}
+
+/// Move a database-clock spread slot onto the host clock (issue #1832).
+///
+/// [`spread_schedule`] reads the database clock. The callback scanner and
+/// the workflow timeout scanner compare their deadlines with the host clock.
+async fn slot_on_host_clock(
+    conn: &mut AsyncPgConnection,
+    not_before: Option<DateTime<Utc>>,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let Some(at) = not_before else {
+        return Ok(None);
+    };
+    let db_now = crate::queue::db_now(conn).await?;
+    Ok(Some(to_host_clock(at, db_now, Utc::now())))
 }
 
 /// Move a database-clock instant onto the host clock (issue #1832).
@@ -1401,12 +1409,14 @@ pub async fn redrive_dead_letter_at(
                     // sealed FAILED at quarantine time so it can resume.
                     "FAILED" => {
                         let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
+                        // The timeout scanner reads `deadline_at` on the host clock.
+                        let slot = slot_on_host_clock(conn, not_before).await?;
                         crate::execution::reactivate_failed_execution_at(
                             conn,
                             exec_id,
                             dead_letter_id,
                             reason,
-                            not_before,
+                            slot,
                         )
                         .await?;
                     }

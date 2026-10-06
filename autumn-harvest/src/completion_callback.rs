@@ -1516,20 +1516,43 @@ pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<std::time::D
         let secs = value.parse::<u64>().unwrap_or(u64::MAX);
         return Some(std::time::Duration::from_secs(secs));
     }
-    let at = parse_http_date(value)?;
+    let at = parse_http_date(value, now)?;
     Some((at - now).to_std().unwrap_or(std::time::Duration::ZERO))
 }
 
 /// Parse an HTTP-date in any of its three forms (RFC 9110 section 5.6.7).
-fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+fn parse_http_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     if let Ok(at) = DateTime::parse_from_rfc2822(value) {
         return Some(at.with_timezone(&Utc));
     }
-    // RFC 850, for example `Sunday, 06-Nov-94 08:49:37 GMT`, and asctime,
-    // for example `Sun Nov  6 08:49:37 1994`. Both are always in GMT.
-    ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]
-        .iter()
-        .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+    // asctime, for example `Sun Nov  6 08:49:37 1994`. It is always in GMT.
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y") {
+        return Some(naive.and_utc());
+    }
+    parse_rfc850_date(value, now)
+}
+
+/// Parse an RFC 850 date, for example `Sunday, 06-Nov-94 08:49:37 GMT`.
+///
+/// The two-digit year is in the century of `now`. A year more than 50 years
+/// after `now` moves back 100 years (RFC 9110 section 5.6.7). Chrono's `%y`
+/// uses a fixed pivot instead, so this code sets the century itself.
+fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let (weekday, rest) = value.split_once(", ")?;
+    let (date, time) = rest.split_once(' ')?;
+    let (day_month, two_digit_year) = date.rsplit_once('-')?;
+    if two_digit_year.len() != 2 {
+        return None;
+    }
+    let yy: i32 = two_digit_year.parse().ok()?;
+    let now_year = chrono::Datelike::year(&now);
+    let mut year = now_year - now_year.rem_euclid(100) + yy;
+    if year > now_year + 50 {
+        year -= 100;
+    }
+    let full = format!("{weekday}, {day_month}-{year} {time}");
+    chrono::NaiveDateTime::parse_from_str(&full, "%A, %d-%b-%Y %H:%M:%S GMT")
+        .ok()
         .map(|naive| naive.and_utc())
 }
 
@@ -1601,6 +1624,21 @@ mod deliverer_trait_tests {
             thirty
         );
         assert_eq!(parse_retry_after("Thu Jan  1 00:00:30 2026", now()), thirty);
+    }
+
+    #[test]
+    fn parse_retry_after_resolves_an_rfc_850_year_relative_to_now() {
+        // RFC 9110 section 5.6.7: a two-digit year is in the current
+        // century unless that puts it more than 50 years ahead.
+        // 2075 is 49 years ahead of 2026, so `75` means 2075.
+        let in_2075 = parse_retry_after("Tuesday, 01-Jan-75 00:00:00 GMT", now())
+            .expect("a valid RFC 850 date");
+        assert!(in_2075 > std::time::Duration::from_secs(48 * 365 * 86_400));
+        // 2077 is 51 years ahead, so `77` means 1977, in the past.
+        assert_eq!(
+            parse_retry_after("Saturday, 01-Jan-77 00:00:00 GMT", now()),
+            Some(std::time::Duration::ZERO)
+        );
     }
 
     #[test]

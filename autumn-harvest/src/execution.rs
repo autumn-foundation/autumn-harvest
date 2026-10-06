@@ -5694,6 +5694,9 @@ pub async fn reactivate_failed_execution(
 /// slot cannot use up the execution timeout before the task runs. `None`
 /// starts both windows now.
 ///
+/// `not_before` is on the host clock, because the timeout scanner compares
+/// `deadline_at` with the host clock.
+///
 /// # Errors
 ///
 /// The same as [`reactivate_failed_execution`].
