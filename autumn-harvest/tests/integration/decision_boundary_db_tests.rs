@@ -629,6 +629,41 @@ async fn a_contended_acquire_reserves_no_boundary_against_the_cap() {
 }
 
 #[tokio::test]
+async fn a_granted_acquire_reserves_its_boundary_against_the_cap() {
+    // A grant writes `MutexGranted` and a boundary. Under cap 4 the acquire
+    // loads 2 events, so the grant would leave a running history at the
+    // cap. The preflight must count both rows and fail the run before the
+    // grant, as it does for any other decision that reaches the cap.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("grantcap");
+    let key = format!("k1833-{}", Uuid::new_v4().simple());
+    let policy = boundaries_on().with_event_hard_cap(4);
+    let running = Running::start(&queue, &pool, policy);
+    let mut conn = connect(&url).await;
+    let exec_id = seed(
+        &mut conn,
+        "boundary_mutex_plain",
+        &queue,
+        serde_json::json!({ "key": key }),
+    )
+    .await;
+    running.wait_parked_after(&mut conn, exec_id, 1).await;
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", serde_json::json!(1))
+        .await
+        .expect("send go");
+    wait_for_execution_state_with_timeout(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
+    running.stop().await;
+
+    let events = history(&url, exec_id).await;
+    assert!(
+        !type_names(&events).contains(&"MutexGranted"),
+        "the cap must fail the run before the grant: {:?}",
+        type_names(&events)
+    );
+}
+
+#[tokio::test]
 async fn the_default_records_no_boundary() {
     // Boundaries are opt-in in this release. A process of the previous
     // release cannot decode one, and the rolling-deploy contract forbids

@@ -19729,6 +19729,28 @@ fn decision_boundary_reserve(registry: &HandlerRegistry, appends: bool) -> u64 {
     u64::from(appends && registry.history_policy().decision_boundaries())
 }
 
+/// Whether the solo `AcquireMutex` in `commands` would be granted now
+/// (issue #1833).
+///
+/// The read takes no lock, so the answer can change before persistence.
+/// A failed read answers `true`. Both errors count the grant's boundary
+/// against the history cap, which is the safe direction.
+async fn mutex_acquire_would_grant(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> bool {
+    let Some(key) = commands.iter().find_map(|command| match command {
+        WorkflowCommand::AcquireMutex { key, .. } => Some(key.as_str()),
+        _ => None,
+    }) else {
+        return false;
+    };
+    crate::mutex::is_grantable_head(conn, key, exec_id)
+        .await
+        .unwrap_or(true)
+}
+
 /// Appends the boundary of this decision when the policy allows it
 /// (issue #1833).
 ///
@@ -25221,11 +25243,16 @@ async fn process_workflow_task(
     let inline_appends = next_event_id > decision_start_event_id;
     let stays_running = matches!(&outcome, WorkflowOutcome::Suspended { .. });
     let decision_appends = inline_appends || pending_durable_event_count > 0 || !stays_running;
-    // A contended mutex acquire only enqueues and writes nothing. The
-    // estimate still counts one event for a grant. That slot also holds the
-    // boundary of a grant, so the acquire alone reserves no second slot.
+    // A mutex acquire counts one event for a grant. A grant also writes a
+    // boundary, but a contended acquire only enqueues and writes nothing.
+    // So the boundary is reserved only when the acquire would be granted.
     let estimated_only = match &outcome {
-        WorkflowOutcome::Suspended { commands } if should_handle_mutex_acquire(commands) => 1,
+        WorkflowOutcome::Suspended { commands }
+            if should_handle_mutex_acquire(commands)
+                && registry.history_policy().decision_boundaries() =>
+        {
+            u64::from(!mutex_acquire_would_grant(conn, prepared.exec_id, commands).await)
+        }
         _ => 0,
     };
     let certainly_appends = inline_appends || pending_durable_event_count > estimated_only;
