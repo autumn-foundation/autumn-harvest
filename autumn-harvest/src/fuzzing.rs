@@ -314,7 +314,7 @@ pub enum Op {
     /// Runs the ops concurrently, as `join!` does.
     Concurrent {
         /// The ops of one command batch.
-        ops: Vec<Op>,
+        ops: Vec<Self>,
     },
     /// Return `Ok(output)`.
     Complete {
