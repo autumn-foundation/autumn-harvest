@@ -1182,6 +1182,10 @@ async fn record_abort_tombstones(
                     .await
                     .map_err(crate::error::database_error)?;
             }
+            // A ramp writer of the queue holds this lock for its whole write.
+            // So no write can read the ledger before the tombstone and the
+            // row after the prune.
+            crate::build_routing::lock_ramp_generations(conn, queue).await?;
             diesel::sql_query(
                 "INSERT INTO harvest_ramp_abort_reports (ramp_id, queue_name) \
                  SELECT id, $1 FROM unnest($2::uuid[]) AS t(id) \

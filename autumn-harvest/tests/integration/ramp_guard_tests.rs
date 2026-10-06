@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::build_routing::{
-    clear_build_ramp, get_build_policy, ramp_bucket, ramp_generation_id, set_build_policy,
-    set_build_policy_with_ramp_id, set_build_ramp, set_build_ramp_with_id,
+    clear_build_ramp, get_build_policy, lock_ramp_generations, ramp_bucket, ramp_generation_id,
+    set_build_policy, set_build_policy_with_ramp_id, set_build_ramp, set_build_ramp_with_id,
 };
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::info::WorkflowInfo;
@@ -1566,6 +1566,100 @@ async fn a_policy_update_drops_a_retained_ramp_whose_new_generation_was_aborted(
     assert_eq!(policy.target_build_id, None, "the aborted ramp is dropped");
     assert_eq!(policy.ramp_percent, None);
     assert_eq!(policy_ramp_id(&mut conn).await, None);
+}
+
+/// The tombstone write and the ramp writers of a queue take one advisory
+/// lock (issue #1814). A ramp write waits while the lock is held. So its
+/// statement cannot read the ledger before a tombstone and the row after
+/// the prune.
+#[tokio::test]
+async fn ramp_writers_wait_for_the_ramp_generation_lock() {
+    use diesel_async::AsyncConnection as _;
+
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut holder = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect holder");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    lock_ramp_generations(&mut holder, QUEUE)
+        .await
+        .expect("hold the lock");
+
+    let ramp = tokio::time::timeout(
+        Duration::from_millis(500),
+        set_build_ramp_with_id(
+            &mut conn,
+            QUEUE,
+            BUILD_B,
+            RAMP_PERCENT,
+            uuid::Uuid::new_v4(),
+        ),
+    )
+    .await;
+    assert!(ramp.is_err(), "the ramp write waits: {ramp:?}");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("reconnect");
+    let policy = tokio::time::timeout(
+        Duration::from_millis(500),
+        set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, None, uuid::Uuid::new_v4()),
+    )
+    .await;
+    assert!(policy.is_err(), "the policy write waits: {policy:?}");
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("rollback");
+}
+
+/// The guard writes no tombstone, and so prunes no marker, while a ramp
+/// writer of the queue holds the advisory lock (issue #1814).
+#[tokio::test]
+async fn markers_stay_while_a_ramp_writer_holds_the_lock() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut holder = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect holder");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    mark_abort_reported(&mut conn, QUEUE, stored(ramp_id), CLEAR_BOUND)
+        .await
+        .expect("mark");
+    age_markers(&mut conn, MIN_MARKER_RETENTION + Duration::from_secs(60)).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    lock_ramp_generations(&mut holder, QUEUE)
+        .await
+        .expect("hold the lock");
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn).await, 1, "the marker stays");
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("rollback");
+
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn).await, 0, "then it goes");
 }
 
 /// A guard can stop after its clear commits and before its report. A later

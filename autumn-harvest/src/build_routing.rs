@@ -425,6 +425,25 @@ pub async fn set_build_policy_with_ramp_id(
     deployment_name: Option<&str>,
     ramp_id: Uuid,
 ) -> HarvestResult<BuildPolicy> {
+    use diesel_async::AsyncConnection as _;
+
+    conn.transaction(async |conn| {
+        lock_ramp_generations(conn, queue_name).await?;
+        upsert_build_policy_with_ramp_id(conn, queue_name, build_id, deployment_name, ramp_id).await
+    })
+    .await
+}
+
+/// The write of [`set_build_policy_with_ramp_id`], under the ramp
+/// generation lock of the queue.
+#[cfg(feature = "db")]
+async fn upsert_build_policy_with_ramp_id(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    build_id: &str,
+    deployment_name: Option<&str>,
+    ramp_id: Uuid,
+) -> HarvestResult<BuildPolicy> {
     let derived = ramp_generation_id_sql(
         "$5",
         "EXCLUDED.queue_name",
@@ -567,8 +586,26 @@ pub async fn set_build_ramp_with_id(
     percent: i32,
     ramp_id: Uuid,
 ) -> HarvestResult<BuildPolicy> {
-    validate_ramp_percent(percent)?;
+    use diesel_async::AsyncConnection as _;
 
+    validate_ramp_percent(percent)?;
+    conn.transaction(async |conn| {
+        lock_ramp_generations(conn, queue_name).await?;
+        update_build_ramp_with_id(conn, queue_name, target_build_id, percent, ramp_id).await
+    })
+    .await
+}
+
+/// The write of [`set_build_ramp_with_id`], under the ramp generation lock
+/// of the queue.
+#[cfg(feature = "db")]
+async fn update_build_ramp_with_id(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    target_build_id: &str,
+    percent: i32,
+    ramp_id: Uuid,
+) -> HarvestResult<BuildPolicy> {
     let derived = ramp_generation_id_sql("$4", "$1", "build_id", "$2");
     let aborted = generation_aborted_sql(&derived);
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
@@ -605,6 +642,36 @@ pub async fn set_build_ramp_with_id(
         return Err(aborted_generation_error(queue_name, target_build_id));
     }
     Ok(policy)
+}
+
+/// Take the transaction advisory lock of the ramp generations of
+/// `queue_name` (issue #1814). Call it inside a transaction.
+///
+/// The ramp guard takes it before it writes the abort tombstones of a
+/// queue. [`set_build_ramp_with_id`] and [`set_build_policy_with_ramp_id`]
+/// take it before their write. A writer can commit before the tombstone.
+/// The abort markers then still refuse the aborted generation. Otherwise
+/// its statement starts after the tombstone, and the ledger refuses it.
+/// Without the lock, an upsert could read the ledger from before the
+/// tombstone and the row from after the marker prune.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure, for example when a
+/// `lock_timeout` expires.
+#[cfg(feature = "db")]
+pub async fn lock_ramp_generations(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+) -> HarvestResult<()> {
+    diesel::sql_query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('harvest_ramp_generation:' || $1, 0))",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .execute(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(())
 }
 
 /// The SQL test that the ramp guard aborted the generation `{id}`, for the

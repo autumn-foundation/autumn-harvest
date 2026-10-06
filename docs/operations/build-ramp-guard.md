@@ -301,6 +301,9 @@ The guard fails safe: when it cannot read, it does not abort.
   `ramp_id` is refused on every pool, also after the retention. When a
   pool misses its tombstone, the guard keeps the markers of that queue and
   tries again on the next pass.
+  The tombstone write and both ramp writers take one advisory lock per
+  queue. A writer therefore commits before the tombstone, while the markers
+  still refuse the aborted id, or starts after it and meets the tombstone.
 - A guard that reported but could not mark any of its markers causes a
   second report after the grace. A failed audit write also makes the counter count
   the abort twice. An extra report is better than an abort with none.
