@@ -31,7 +31,7 @@ use std::sync::Mutex;
 
 use autumn_harvest::dlq::{
     BulkDlqFilter, NewDeadLetterEntry, RedriveFilter, RedriveOutcome, bulk_replay_dead_letters,
-    dead_letter, redrive_dead_letter, redrive_dead_letters,
+    dead_letter, redrive_dead_letter, redrive_dead_letter_at, redrive_dead_letters,
 };
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::telemetry::MetricsRecorder;
@@ -758,4 +758,55 @@ async fn bulk_redrive_with_zero_spread_is_due_at_once() {
     .expect("count not due")
     .n;
     assert_eq!(not_due, 0, "a zero window must not delay any task");
+}
+
+// Issue #1832: a spread slot must not eat the execution timeout. The
+// reactivated deadline starts when the redriven task becomes due.
+#[tokio::test]
+async fn redrive_deadline_starts_at_the_spread_slot() {
+    let (mut conn, _c) = setup_db().await;
+    let (exec_id, dlq_id) =
+        seed_failed_with_dlq(&mut conn, "slot_wf", "wf-slot", "slotq", "boom").await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+         SET execution_timeout = interval '10 seconds', sla = interval '20 seconds' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("set timeouts");
+
+    let not_before = db_clock(&mut conn).await + chrono::Duration::seconds(120);
+    let outcome = redrive_dead_letter_at(&mut conn, dlq_id, None, None, Some(not_before))
+        .await
+        .expect("redrive");
+    assert!(matches!(outcome, RedriveOutcome::Redriven(_)));
+
+    #[derive(diesel::QueryableByName)]
+    struct Deadlines {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let row: Deadlines = diesel::sql_query(
+        "SELECT deadline_at, sla_deadline_at FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut conn)
+    .await
+    .expect("deadlines");
+    let slack = chrono::Duration::milliseconds(1);
+    assert!(
+        row.deadline_at.expect("deadline") >= not_before + chrono::Duration::seconds(10) - slack,
+        "the timeout must start at the slot {not_before}, got {:?}",
+        row.deadline_at
+    );
+    assert!(
+        row.sla_deadline_at.expect("sla deadline")
+            >= not_before + chrono::Duration::seconds(20) - slack,
+        "the SLA must start at the slot {not_before}, got {:?}",
+        row.sla_deadline_at
+    );
 }

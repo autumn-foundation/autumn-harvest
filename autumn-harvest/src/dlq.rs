@@ -1401,11 +1401,12 @@ pub async fn redrive_dead_letter_at(
                     // sealed FAILED at quarantine time so it can resume.
                     "FAILED" => {
                         let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
-                        crate::execution::reactivate_failed_execution(
+                        crate::execution::reactivate_failed_execution_at(
                             conn,
                             exec_id,
                             dead_letter_id,
                             reason,
+                            not_before,
                         )
                         .await?;
                     }

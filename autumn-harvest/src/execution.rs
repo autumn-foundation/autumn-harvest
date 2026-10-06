@@ -5683,6 +5683,27 @@ pub async fn reactivate_failed_execution(
     dead_letter_id: Uuid,
     reason: Option<&str>,
 ) -> HarvestResult<()> {
+    reactivate_failed_execution_at(conn, exec_id, dead_letter_id, reason, None).await
+}
+
+/// [`reactivate_failed_execution`] for a task that becomes due at
+/// `not_before` (issue #1832).
+///
+/// A bulk redrive spreads its tasks over a window. The fresh timeout and SLA
+/// windows start when the task becomes due, not at the redrive. So a late
+/// slot cannot use up the execution timeout before the task runs. `None`
+/// starts both windows now.
+///
+/// # Errors
+///
+/// The same as [`reactivate_failed_execution`].
+pub async fn reactivate_failed_execution_at(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    dead_letter_id: Uuid,
+    reason: Option<&str>,
+    not_before: Option<chrono::DateTime<Utc>>,
+) -> HarvestResult<()> {
     let execution = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
@@ -5715,9 +5736,11 @@ pub async fn reactivate_failed_execution(
     // that were set when the execution first started. Without this, a FAILED
     // execution with a non-NULL `deadline_at` in the past would be immediately
     // re-killed by `enforce_workflow_execution_timeouts` on the next scan tick.
+    // A spread redrive starts both windows at the task's slot (issue #1832).
     let now = Utc::now();
-    let new_deadline_at = execution.execution_timeout.map(|d| now + d);
-    let new_sla_deadline_at = execution.sla.map(|d| now + d);
+    let window_start = not_before.map_or(now, |at| at.max(now));
+    let new_deadline_at = execution.execution_timeout.map(|d| window_start + d);
+    let new_sla_deadline_at = execution.sla.map(|d| window_start + d);
 
     // Undecoded: this reads `next_event_id` only (see the loader's docs).
     let history = store::load_history_undecoded(conn, exec_id).await?;

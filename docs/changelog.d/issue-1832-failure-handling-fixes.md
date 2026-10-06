@@ -26,10 +26,14 @@ slot. The base instant is the database clock (issue #1807).
 - On a sharded cluster, every shard uses the window of the whole call.
 - A completion-callback dead letter gets its next delivery attempt in the
   window (`redrive_delivery_at`).
+- A reactivated `FAILED` execution starts its timeout and SLA windows at
+  its task's slot, not at the redrive (`reactivate_failed_execution_at`).
+  So a late slot does not use up the execution timeout.
 - The CLI flag is `--spread-secs`.
 - New core API: `redrive_spread_window`, `redrive_spread_offset`,
   `redrive_schedule`, `replay_dead_letter_at`, `redrive_dead_letter_at`,
-  `replay_dead_letter_batch` and `redrive_delivery_at`.
+  `replay_dead_letter_batch`, `redrive_delivery_at` and
+  `reactivate_failed_execution_at`.
 
 No migration and no new `WorkflowEvent` variant.
 
