@@ -199,6 +199,8 @@ pub fn test_partitioned_layout_requested() -> bool {
 
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
+/// Adaptive concurrency limit per activity type (issue #1836).
+pub mod adaptive_limit;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
 /// AES-256-GCM payload codec and data-key providers (issue #1825).
@@ -298,6 +300,8 @@ pub mod diagnostic;
 /// Task dispatch channel seam (issue #1312): Postgres stays the source of
 /// truth, a [`dispatch::TaskDispatch`] carries task references.
 pub mod dispatch;
+/// Deterministic simulation of the activity claim protocol (issue #1830).
+pub mod dst;
 /// Effective runtime-configuration introspection (issue #695).
 ///
 /// [`effective_config::EffectiveConfigView`] is the serialisable, secret-free
@@ -543,6 +547,7 @@ pub mod worker;
 #[cfg(feature = "db")]
 pub mod workers;
 
+pub use adaptive_limit::AdaptiveLimitConfig;
 pub use admission_gate::{
     AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateMode, GateScope,
     MAX_ACTIVE_GATES, ProducerContractEntry, ProducerGateStatus, StartProducer, check_admission,
@@ -576,12 +581,13 @@ pub use completion_trigger::{
 };
 pub use context::{
     ActivityContext, ActivityExecutionInfo, ActivityIdentity, AutoHeartbeatGuard,
-    DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
-    DEFAULT_SESSION_ACQUISITION_TIMEOUT, DEFAULT_WORKFLOW_LOG_MAX_LINES,
-    DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, MutexGuard, MutexHandle, RaceBuilder, RaceWinner,
-    Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand, WorkflowContext,
-    WorkflowExecutionInfo, WorkflowHistoryPolicy, WorkflowLogLevel, WorkflowLogPolicy,
-    WorkflowLogger, is_reserved_session_activity_name,
+    DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
+    DEFAULT_HISTORY_BYTE_HARD_CAP, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
+    DEFAULT_HISTORY_EVENT_HARD_CAP, DEFAULT_SESSION_ACQUISITION_TIMEOUT,
+    DEFAULT_WORKFLOW_LOG_MAX_LINES, DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, MutexGuard,
+    MutexHandle, RaceBuilder, RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome,
+    WorkflowCommand, WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
+    WorkflowLogLevel, WorkflowLogPolicy, WorkflowLogger, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
@@ -673,8 +679,9 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
-    Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    AdaptiveLimitPolicy, CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy,
+    RetryBudgetPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
+    WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;

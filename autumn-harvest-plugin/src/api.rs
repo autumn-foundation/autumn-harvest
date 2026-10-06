@@ -5417,6 +5417,7 @@ pub struct StandaloneAdminAuth {
     allow_unauthenticated_mutations: bool,
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
+    rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
 }
 
 impl StandaloneAdminAuth {
@@ -5459,6 +5460,20 @@ impl StandaloneAdminAuth {
     #[must_use]
     pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
         self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
+        self
+    }
+
+    /// Install the per-client rate limiter (issue #1827).
+    ///
+    /// Each verified token, or each client IP without one, gets one bucket
+    /// for mutating routes and one for read routes. See
+    /// [`crate::api_rate_limit`].
+    #[must_use]
+    pub const fn with_rate_limit(
+        mut self,
+        rate_limit: crate::api_rate_limit::ApiRateLimit,
+    ) -> Self {
+        self.rate_limit = Some(rate_limit);
         self
     }
 
@@ -5546,6 +5561,7 @@ impl StandaloneAdminAuth {
                 api_tokens: self.api_tokens,
                 read_only_role: self.read_only_role,
                 authorizer: self.authorizer.clone(),
+                rate_limit: self.rate_limit.clone(),
             },
         );
         if self.api_tokens && !self.admin_auth_boundary {
@@ -5566,6 +5582,8 @@ pub(crate) struct AdminAuthLayers {
     pub read_only_role: bool,
     /// The authorizer hook (issue #1803).
     pub authorizer: Option<crate::authz::SharedAuthorizer>,
+    /// The per-client rate limiter (issue #1827).
+    pub rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
 }
 
 /// Wrap a composed Harvest router in the admin-auth layer stack.
@@ -5591,6 +5609,11 @@ pub(crate) struct AdminAuthLayers {
 /// layer. It runs after both built-in gates, so it can only deny. It sees the
 /// `TokenPrincipal` the token layer sets.
 ///
+/// Issue #1827: the rate-limit layer sits directly INSIDE the token layer. It
+/// keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
+/// cannot open a new bucket. It runs before the read-only and authorizer
+/// layers, so a refused request reaches no handler.
+///
 /// No layer is installed unless asked for, so a deployment that declares none
 /// does an identical amount of work as before.
 pub(crate) fn apply_admin_auth_layers(
@@ -5607,6 +5630,15 @@ pub(crate) fn apply_admin_auth_layers(
     }
     if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
+    }
+    if let Some(rate_limit) = &layers.rate_limit {
+        router = router.layer(middleware::from_fn_with_state(
+            (
+                api_state.clone(),
+                crate::api_rate_limit::ApiRateLimiter::new(rate_limit.clone()),
+            ),
+            crate::api_rate_limit::enforce_api_rate_limit,
+        ));
     }
     if layers.api_tokens {
         router = router.layer(middleware::from_fn_with_state(
@@ -6103,7 +6135,16 @@ fn route_class_matchers() -> &'static RouteMatchers<RouteClass> {
 /// read class rather than fail closed to `Mutating` and 403 a read-only
 /// dashboard's existence/size probe.
 pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
-    match_route(route_class_matchers(), method, path).map_or(RouteClass::Mutating, |m| *m.value)
+    classified_route(method, path).unwrap_or(RouteClass::Mutating)
+}
+
+/// The `CLASSIFIED_ROUTES` class of a request, or `None` for an unclassified
+/// route.
+///
+/// The API rate limiter (issue #1827) classes a `None` route by its method.
+/// Use [`classify_route`] for an access decision. It fails closed.
+pub(crate) fn classified_route(method: &axum::http::Method, path: &str) -> Option<RouteClass> {
+    match_route(route_class_matchers(), method, path).map(|m| *m.value)
 }
 
 /// Path prefixes under which every mutation is admin-only (issue #1803).

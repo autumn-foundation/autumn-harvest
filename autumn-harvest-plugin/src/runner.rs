@@ -3259,17 +3259,17 @@ mod tests {
     /// then replace a still-active multi-shard runner with no intervening
     /// `stop()`. If that connect failed, the multi-shard runner lost every
     /// dispatch channel it owned, and fell back to Postgres for no reason
-    /// of its own. This drives a connect failure with a `rediss://` URL.
-    /// `RedisDispatch::connect` rejects it before any network I/O, since
-    /// this release carries no TLS transport — deterministic and fast on
-    /// every platform, unlike a black-holed address. A sandboxed CI
+    /// of its own. This drives a connect failure with a URL whose scheme is
+    /// not Redis. `RedisDispatch::connect` rejects it while it parses the
+    /// URL, before any network I/O — deterministic and fast on every
+    /// platform, unlike a black-holed address. A sandboxed CI
     /// runner's network policy is not guaranteed to reproduce that
     /// connect-timeout failure. Checks that a per-shard channel installed
     /// before the call is still there after it fails.
     ///
     /// Gated on the `redis` feature. The no-feature stub of
     /// `install_dispatch_channel` never inspects `config.redis.url` at
-    /// all, so it would return `Ok` here regardless of the `rediss://`
+    /// all, so it would return `Ok` here regardless of the URL
     /// scheme. This test's own `is_err()` assertion would then fail for a
     /// reason that has nothing to do with the connect-failure behavior it
     /// means to pin.
@@ -3291,7 +3291,7 @@ mod tests {
 
         let config = crate::config::HarvestRuntimeConfig {
             redis: super::HarvestRedisConfig {
-                url: Some("rediss://127.0.0.1:6379".to_string()),
+                url: Some("http://127.0.0.1:6379".to_string()),
                 ..super::HarvestRedisConfig::default()
             },
             ..crate::config::HarvestRuntimeConfig::default()
@@ -3300,7 +3300,7 @@ mod tests {
         let result = block_on(super::install_dispatch_channel(&config, None));
         assert!(
             result.is_err(),
-            "a rediss:// URL must fail the call before any connection attempt"
+            "a non-Redis URL must fail the call before any connection attempt"
         );
         assert!(
             autumn_harvest::dispatch::installed_for_shard(active_shard).is_some(),
@@ -3673,10 +3673,10 @@ mod tests {
     /// all. The old topology was already cleared, and the new one never
     /// finished installing. The fix connects every shard into a local list
     /// first, and only clears and installs once every shard has succeeded.
-    /// This test drives a connect failure with a `rediss://` URL.
-    /// `RedisDispatch::connect` rejects it before any network I/O, since
-    /// this release carries no TLS transport — deterministic and fast on
-    /// every platform, unlike a black-holed address. A sandboxed CI
+    /// This test drives a connect failure with a URL whose scheme
+    /// is not Redis. `RedisDispatch::connect` rejects it while it parses
+    /// the URL, before any network I/O — deterministic and fast on every
+    /// platform, unlike a black-holed address. A sandboxed CI
     /// runner's network policy is not guaranteed to reproduce that
     /// connect-timeout failure. It checks that a channel installed before
     /// the call is still there after it fails.
@@ -3707,7 +3707,7 @@ mod tests {
 
         let config = crate::config::HarvestRuntimeConfig {
             redis: super::HarvestRedisConfig {
-                url: Some("rediss://127.0.0.1:6379".to_string()),
+                url: Some("http://127.0.0.1:6379".to_string()),
                 ..super::HarvestRedisConfig::default()
             },
             ..crate::config::HarvestRuntimeConfig::default()
@@ -3719,7 +3719,7 @@ mod tests {
         ));
         assert!(
             result.is_err(),
-            "a rediss:// URL must fail the call before any connection attempt"
+            "a non-Redis URL must fail the call before any connection attempt"
         );
         assert!(
             autumn_harvest::dispatch::installed().is_some(),

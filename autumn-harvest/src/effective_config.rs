@@ -271,6 +271,13 @@ pub struct WorkerConfigView {
     /// policy turns the budget off for that type.
     pub retry_budget_overrides:
         std::collections::BTreeMap<String, Option<crate::policy::RetryBudgetPolicy>>,
+    /// Adaptive limit policy for activity types without an override
+    /// (issue #1836). `null` = no default limit.
+    pub adaptive_limit_default: Option<crate::policy::AdaptiveLimitPolicy>,
+    /// Per-activity-type adaptive limit overrides (issue #1836). A `null`
+    /// policy turns the limit off for that type.
+    pub adaptive_limit_overrides:
+        std::collections::BTreeMap<String, Option<crate::policy::AdaptiveLimitPolicy>>,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -432,6 +439,7 @@ impl WorkerConfigView {
             codec_rotation_batch_size,
             scanner,
             retry_budget,
+            adaptive_limit,
             // REDACTED — the registry holds live codec handles that may close
             // over key material. Only the operator-chosen key IDENTIFIERS are
             // safe to report, and those are served by
@@ -502,6 +510,8 @@ impl WorkerConfigView {
             timeout_scan_batch_size: scanner.timeout_batch_size,
             retry_budget_default: retry_budget.default_policy(),
             retry_budget_overrides: retry_budget.overrides(),
+            adaptive_limit_default: adaptive_limit.default_policy(),
+            adaptive_limit_overrides: adaptive_limit.overrides(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),
@@ -834,6 +844,28 @@ mod tests {
 
         assert!(view.notification_channel_configured);
         assert_eq!(view.shard_notification_channels_configured, 1);
+    }
+
+    /// The view reports the adaptive limit config (issue #1836).
+    #[test]
+    fn view_reports_the_adaptive_limit() {
+        let worker = WorkerConfig::default().with_adaptive_limit(
+            crate::adaptive_limit::AdaptiveLimitConfig::disabled().with_activity(
+                "charge_card",
+                Some(crate::policy::AdaptiveLimitPolicy::new(2, 32)),
+            ),
+        );
+        let view = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(json["adaptive_limit_default"], serde_json::Value::Null);
+        assert_eq!(
+            json["adaptive_limit_overrides"]["charge_card"]["min_limit"],
+            2
+        );
+        assert_eq!(
+            json["adaptive_limit_overrides"]["charge_card"]["max_limit"],
+            32
+        );
     }
 
     #[test]

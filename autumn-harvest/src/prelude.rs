@@ -4,6 +4,7 @@
 //! use autumn_harvest::prelude::*;
 //! ```
 
+pub use crate::adaptive_limit::AdaptiveLimitConfig;
 pub use crate::builder::{HarvestBuilder, WorkerConfig};
 pub use crate::calendar::{
     Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
@@ -42,8 +43,9 @@ pub use crate::interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
 };
 pub use crate::policy::{
-    CircuitBreakerPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy,
-    RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    AdaptiveLimitPolicy, CircuitBreakerPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy,
+    RetryBudgetPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
+    WorkflowSchedule,
 };
 pub use crate::query::QueryRegistry;
 pub use crate::retry_budget::RetryBudgetConfig;

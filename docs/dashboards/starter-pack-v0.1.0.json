@@ -1417,7 +1417,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_workflow_history_bloat (docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat) At-least-once early warning: fires when an execution's recorded harvest_events count first crosses history_bloat_warn_fraction * event_hard_cap (issue #704, default 75%) -- either (1) while still RUNNING, observation-only, the run keeps executing normally, or (2) in the SAME decision that also reaches the event-count hard cap and terminally fails the execution. Emitted once per crossing per run outside a rare crash-window duplicate (deliberately biased toward a duplicate over a lost-forever signal). Requires event_hard_cap to be configured for the workflow type via WorkflowHistoryPolicy; otherwise this stays flat at zero (disabled), not an outage. Discover and rank offending executions with GET /api/harvest/workflows?history_bloat_min_events=<N> or harvest workflow list --history-bloat-min-events <N>."
+          "description": "Alert: harvest_workflow_history_bloat (docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat) At-least-once early warning: fires when an execution's recorded harvest_events count first crosses history_bloat_warn_fraction * event_hard_cap (issue #704, default 20.48%, so 10,240 events under the default 50,000-event cap) -- either (1) while still RUNNING, observation-only, the run keeps executing normally, or (2) in the SAME decision that also reaches the event-count hard cap and terminally fails the execution. Emitted once per crossing per run outside a rare crash-window duplicate (deliberately biased toward a duplicate over a lost-forever signal). Stays flat at zero only when the signal is disabled (an unlimited event cap or a warn fraction of 0), not an outage. Discover and rank offending executions with GET /api/harvest/workflows?history_bloat_min_events=<N> or harvest workflow list --history-bloat-min-events <N>."
         }
       ]
     },
@@ -1971,6 +1971,55 @@
             }
           ],
           "description": "New starts refused by automatic load shedding (issue #1794). See docs/operations/load-shedding.md."
+        },
+        {
+          "id": 182701,
+          "type": "timeseries",
+          "title": "API rate-limit rejections",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 86
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (route_class, client_kind) (rate(harvest_api_rate_limited_total[$__rate_interval]))",
+              "legendFormat": "{{route_class}} / {{client_kind}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Management API requests the optional per-client rate limiter refused with 429 (issue #1827). See docs/security-posture.md#api-rate-limiting."
         }
       ]
     },
@@ -2295,7 +2344,7 @@
     {
       "id": 39,
       "type": "row",
-      "title": "Circuit breakers and retry budget",
+      "title": "Circuit breakers, retry budget and adaptive limit",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -2499,6 +2548,202 @@
             }
           ],
           "description": "Retries that the retry budget deferred in the last hour, per activity type. A deferred retry is not lost. It runs later (issue #1793)."
+        },
+        {
+          "id": 185257,
+          "type": "timeseries",
+          "title": "Adaptive concurrency limit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "min by (activity) (harvest_activity_concurrency_limit)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Lowest adaptive cap on in-flight attempts per activity type across workers. It falls when latency inflates or retryable failures occur (issue #1836)."
+        },
+        {
+          "id": 185258,
+          "type": "timeseries",
+          "title": "Adaptive limit slots in flight",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity) (harvest_activity_concurrency_in_flight)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "In-flight attempts that hold an adaptive limit slot, per activity type, summed across workers. At the cap, a worker claims no more tasks of that type (issue #1836)."
+        },
+        {
+          "id": 185259,
+          "type": "timeseries",
+          "title": "Adaptive limit latency baseline",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 66
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (activity) (harvest_activity_latency_baseline_seconds)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "No-load handler latency estimate of the adaptive limit, per activity type, highest across workers. Above tolerance times this value, the cap grows more slowly and then settles (issue #1836)."
+        },
+        {
+          "id": 185260,
+          "type": "timeseries",
+          "title": "Claims deferred by the adaptive limit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 66
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity) (increase(harvest_activity_concurrency_deferred_total[1h]))",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Claimed attempts that the adaptive limit deferred in the last hour, per activity type. The claim skips a type at its cap, so a steady rate means claims race past the cap (issue #1836)."
         }
       ]
     },
