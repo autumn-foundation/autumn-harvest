@@ -725,6 +725,16 @@ jobs:
           python3 docs/audits/action-sha-pin.py --self-test
           python3 docs/audits/action-sha-pin.py
 
+      # Issue #1828. The rolling-deploy contract page and the
+      # `mixed-version-smoke` job must both exist and name each other.
+      - name: Mixed-version contract guard (docs/audits/mixed-version-contract.py)
+        run: |
+          python3 docs/audits/mixed-version-contract.py --self-test
+          python3 docs/audits/mixed-version-contract.py
+      # The smoke crate is not a workspace member, so `cargo fmt --all` skips it.
+      - name: Format check of the mixed-version smoke crate
+        run: rustfmt --edition 2024 --check scripts/mixed-version-smoke/src/*.rs
+
       # The contract is what the OpenAPI document is generated from, so a
       # status or a mandatory field missing there is missing from every
       # generated client. Reads api.rs and the contract, builds nothing.
@@ -1680,6 +1690,53 @@ jobs:
           set -o pipefail
           cargo test -p autumn-harvest-plugin --features metrics,webhooks --doc EmbeddingDocSnippets 2>&1 | tee embedding-doctests.log
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' embedding-doctests.log
+
+  mixed-version-smoke:
+    name: "Mixed-version smoke: this tree and the previous release (issue #1828)"
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mvsmoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Full history: the script finds the previous release by its tag.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Two trees build here, so free the disk as the `test` job does.
+      - name: Free runner disk before two builds
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      # See docs/upgrading/README.md, "How CI proves the contract".
+      - name: Run the previous release and this tree on one database
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/mvsmoke
+          # No debug info: it halves the size of two debug builds.
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: ./scripts/run-mixed-version-smoke.sh
 
   openapi-client-smoke:
     name: Generated TypeScript client drives a running plugin

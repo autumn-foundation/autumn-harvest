@@ -7,6 +7,8 @@
 #![warn(clippy::expect_used, clippy::unwrap_used)]
 
 pub mod api;
+/// Optional per-client rate limiting for the management API (issue #1827).
+pub mod api_rate_limit;
 /// Scoped API tokens + rotation for the management API (issue #942).
 pub mod api_token;
 /// Pluggable authorizer hook for the management API (issue #1803).
