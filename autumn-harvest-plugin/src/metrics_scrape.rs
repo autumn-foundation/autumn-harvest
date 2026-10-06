@@ -30,7 +30,8 @@
 //! but do back shipped dashboard panels — leaving those to the no-op default
 //! would make a dropped metric indistinguishable from an idle consumer. It
 //! also aggregates `harvest.api.rate_limited` from the plugin's own API rate
-//! limiter (issue #1827).
+//! limiter (issue #1827), and `harvest.build.ramp_aborted` from the build
+//! ramp guard (issue #1814).
 //!
 //! Every other `MetricsRecorder` method keeps the trait's no-op default — an embedder
 //! who needs the full metric surface (e.g. `harvest.workflow.terminal`,
@@ -194,6 +195,9 @@ struct Inner {
     notify_queue_usage: Gauge,
     // Issue #1827: the plugin's own API rate limiter records here.
     api_rate_limited: Counter,
+    // Issue #1814: the ramp guard records each automatic abort here. The
+    // starter dashboard reads it on the built-in scrape path.
+    build_ramp_aborted: Counter,
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
@@ -530,6 +534,12 @@ impl MetricsRecorder for HarvestMetricsRecorder {
             .incr(vec![route_class.to_owned(), client_kind.to_owned()], 1);
     }
 
+    fn record_build_ramp_aborted(&self, queue: &str, reason: &str) {
+        self.0
+            .build_ramp_aborted
+            .incr(vec![queue.to_owned(), reason.to_owned()], 1);
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn record_connector_lag(&self, source: &str, lag: i64) {
         // A level, not an accumulation: last-write-wins per source, so a
@@ -836,6 +846,17 @@ fn push_api_rate_limit_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) 
     );
 }
 
+/// The ramp guard abort family (issue #1814).
+fn push_build_ramp_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
+    push_counter(
+        families,
+        "harvest_build_ramp_aborted_total",
+        "Total number of build ramps that the ramp guard aborted, per queue and reason",
+        &[METRIC_LABEL_QUEUE, METRIC_LABEL_REASON],
+        inner.build_ramp_aborted.snapshot(),
+    );
+}
+
 impl MetricsSource for HarvestMetricsRecorder {
     fn collect(&self) -> Vec<MetricFamily> {
         let mut families = Vec::new();
@@ -843,6 +864,7 @@ impl MetricsSource for HarvestMetricsRecorder {
         push_sampler_adjacent_metrics(&mut families, &self.0);
         push_connector_metrics(&mut families, &self.0);
         push_api_rate_limit_metrics(&mut families, &self.0);
+        push_build_ramp_metrics(&mut families, &self.0);
         families
     }
 }
@@ -1176,6 +1198,32 @@ mod tests {
         assert_eq!(f.samples.len(), 1);
         assert_eq!(f.samples[0].labels.len(), 0);
         assert_eq!(f.samples[0].value, 0.5);
+    }
+
+    #[test]
+    fn ramp_guard_aborts_reach_the_built_in_scrape_endpoint() {
+        // Issue #1814: without an override, the scrape drops every abort, and
+        // the starter dashboard panel stays flat.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_build_ramp_aborted("default", "failure_rate");
+        recorder.record_build_ramp_aborted("default", "failure_rate");
+        recorder.record_build_ramp_aborted("billing", "nd_block_rate");
+
+        let families = recorder.collect();
+
+        let aborted = family(&families, "harvest_build_ramp_aborted_total");
+        assert_eq!(aborted.kind, MetricKind::Counter);
+        assert_eq!(
+            sample_value(aborted, &[("queue", "default"), ("reason", "failure_rate")]),
+            2.0
+        );
+        assert_eq!(
+            sample_value(
+                aborted,
+                &[("queue", "billing"), ("reason", "nd_block_rate")]
+            ),
+            1.0
+        );
     }
 
     #[test]

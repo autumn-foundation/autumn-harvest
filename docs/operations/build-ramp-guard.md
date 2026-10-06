@@ -155,7 +155,9 @@ After the clear, the guard does these steps once per abort:
   `harvest.build.ramp_aborted{queue, reason}` and logs a warning. The audit
   row is the durable record. The counter is process-local: a process that
   stops between the commit and the increment loses that one count, and its
-  restart resets the counter anyway.
+  restart resets the counter anyway. Both the `metrics-rs` adapter and the
+  built-in scrape endpoint (`HarvestPlugin::with_metrics_scrape`) export it
+  as `harvest_build_ramp_aborted_total`.
 - `RampGuard::pass` and `guard_once` return only the aborts that this pass
   reported. An abort whose report failed is not returned, and a later pass
   reports it.

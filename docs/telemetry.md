@@ -62,7 +62,9 @@ discarded. It also covers the four broker-connector families
 (`harvest.connector.received`, `harvest.connector.dispatched`,
 `harvest.connector.poisoned`, `harvest.connector.lag`), which back the shipped
 connector dashboard panels — without them a dropped metric would be
-indistinguishable from an idle consumer. **It does not back the full starter alert pack**
+indistinguishable from an idle consumer. It also covers
+`harvest.build.ramp_aborted` from the build ramp guard (issue #1814), which
+backs the starter dashboard's ramp-abort panel. **It does not back the full starter alert pack**
 (`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
 endpoint never emits (e.g. `harvest_workflow_terminal_total`,
 `harvest_activity_attempts_total`/`retries_total`,
