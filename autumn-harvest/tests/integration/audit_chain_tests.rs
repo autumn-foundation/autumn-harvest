@@ -6,7 +6,10 @@
 //! test starts its own container.
 
 use autumn_harvest::audit::{self, OP_WORKFLOW_CANCEL, STATUS_SUCCEEDED, TARGET_WORKFLOW};
-use autumn_harvest::audit_chain::{ChainFinding, MIN_CHAIN_KEY_BYTES, verify_shard_chain};
+use autumn_harvest::audit_chain::{
+    ChainFinding, ChainVerifyOptions, MIN_CHAIN_KEY_BYTES, verify_shard_chain,
+    verify_shard_chain_with,
+};
 use autumn_harvest::audit_export::{
     ExportBackoff, RewindRequest, SinkAttempt, apply_outcome, claim_shard, claim_shard_chained,
     classify_export_outcome, ensure_cursor_row, rewind_cursor, serialize_batch,
@@ -258,7 +261,13 @@ async fn a_deleted_newest_row_does_not_match_the_cursor_head() {
     let report = verify_shard_chain(&mut conn, SHARD, &key())
         .await
         .expect("verify");
-    assert_eq!(report.findings, vec![ChainFinding::HeadMismatch { seq: 2 }]);
+    assert_eq!(
+        report.findings,
+        vec![ChainFinding::HeadMismatch {
+            expected_seq: 3,
+            found_seq: Some(2),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -283,6 +292,13 @@ async fn a_rebuilt_cursor_keeps_the_chain_head() {
     conn.batch_execute("DELETE FROM harvest_audit_export_cursor")
         .await
         .expect("drop cursor");
+    ensure_cursor_row(&mut conn, SHARD).await.expect("rebuild");
+    // The rebuilt checkpoint has no MAC until the next keyed stamp.
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(report.findings, vec![ChainFinding::CheckpointMissing]);
+
     insert_rows(&mut conn, 1).await;
     // The rebuilt cursor re-delivers rows 1 and 2, then row 3.
     export_tick(&mut conn, Some(&key())).await;
@@ -321,5 +337,185 @@ async fn a_wrong_key_does_not_verify() {
     let report = verify_shard_chain(&mut conn, SHARD, &other)
         .await
         .expect("verify");
-    assert_eq!(report.findings, vec![ChainFinding::Tampered { seq: 1 }]);
+    assert_eq!(
+        report.findings,
+        vec![
+            ChainFinding::CheckpointInvalid,
+            ChainFinding::Tampered { seq: 1 },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stripping_every_link_is_detected() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    conn.batch_execute(
+        "UPDATE harvest_audit_log SET chain_prev = NULL, chain_hash = NULL, \
+         actor = 'mallory' WHERE export_seq = 2; \
+         UPDATE harvest_audit_log SET chain_prev = NULL, chain_hash = NULL",
+    )
+    .await
+    .expect("strip");
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert!(!report.is_intact(), "{report:?}");
+    assert!(
+        report
+            .findings
+            .contains(&ChainFinding::Unchained { seq: 2 })
+    );
+}
+
+#[tokio::test]
+async fn moving_the_head_after_deleting_the_tail_is_detected() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    conn.batch_execute(
+        "DELETE FROM harvest_audit_log WHERE export_seq = 3; \
+         UPDATE harvest_audit_export_cursor c SET \
+             last_assigned_seq = 2, last_acked_seq = 2, chain_head_seq = 2, \
+             chain_head = a.chain_hash, chain_head_occurred_at = a.occurred_at \
+         FROM harvest_audit_log a WHERE a.export_seq = 2",
+    )
+    .await
+    .expect("move the head");
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(report.findings, vec![ChainFinding::CheckpointInvalid]);
+}
+
+#[tokio::test]
+async fn retention_gaps_verify_with_the_cutoff_and_fail_without_it() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 1).await;
+    audit::insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: "ops",
+            operation: audit::OP_AUDIT_EXPORT_REACTIVATE,
+            target_type: "shard",
+            target_id: Some("0"),
+            route_or_command: "POST /admin/audit-export/0/reactivate",
+            request_id: None,
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: Some(SHARD),
+            source: "api",
+        },
+    )
+    .await
+    .expect("lifecycle row");
+    insert_rows(&mut conn, 1).await;
+    // Seq 1 to 3 are 100 days old. Seq 2 is the lifecycle row retention keeps.
+    conn.batch_execute(
+        "UPDATE harvest_audit_log SET occurred_at = occurred_at - INTERVAL '100 days'",
+    )
+    .await
+    .expect("backdate");
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+
+    let purged = audit::purge_old_audit_records(&mut conn, 90, false, &[SHARD], &[])
+        .await
+        .expect("purge");
+    assert_eq!(purged, 2, "retention deletes seq 1 and 3, and keeps seq 2");
+
+    let strict = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert!(!strict.is_intact(), "{strict:?}");
+
+    let key = key();
+    let options = ChainVerifyOptions {
+        keys: std::slice::from_ref(&key),
+        retention_cutoff: Some(chrono::Utc::now() - chrono::TimeDelta::days(90)),
+    };
+    let report = verify_shard_chain_with(&mut conn, SHARD, &options)
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.retention_gaps.len(), 2, "{report:?}");
+    assert_eq!(report.checked, 3);
+}
+
+#[tokio::test]
+async fn an_unkeyed_tick_after_a_keyed_one_leaves_unchained_rows() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, None).await;
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(report.findings, vec![ChainFinding::Unchained { seq: 3 }]);
+}
+
+#[tokio::test]
+async fn a_rotated_key_verifies_with_both_keys() {
+    let (mut conn, _c) = fresh_db().await;
+    let new = CallbackSecret::new(vec![43_u8; MIN_CHAIN_KEY_BYTES]);
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&new)).await;
+
+    let ring = [key(), new.clone()];
+    let options = ChainVerifyOptions {
+        keys: &ring,
+        retention_cutoff: None,
+    };
+    let report = verify_shard_chain_with(&mut conn, SHARD, &options)
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.checked, 4);
+
+    let only_new = verify_shard_chain(&mut conn, SHARD, &new)
+        .await
+        .expect("verify");
+    assert!(!only_new.is_intact());
+}
+
+#[tokio::test]
+async fn a_siem_can_recompute_each_link_from_the_export() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 3).await;
+    let body = export_tick(&mut conn, Some(&key())).await;
+
+    let mut previous: Option<String> = None;
+    for line in std::str::from_utf8(&body).expect("utf8").lines() {
+        let record: autumn_harvest::audit_export::AuditExportRecord =
+            serde_json::from_str(line).expect("record");
+        let prev_hex = record.chain_prev.clone().expect("chain_prev");
+        if let Some(previous) = &previous {
+            assert_eq!(&prev_hex, previous, "chain_prev names the previous link");
+        }
+        let prev = hex_bytes(&prev_hex);
+        let hash = autumn_harvest::audit_chain::link(&key(), &prev, &record);
+        assert_eq!(
+            Some(autumn_harvest::audit_chain::to_hex(&hash)),
+            record.chain_hash
+        );
+        previous = record.chain_hash;
+    }
+}
+
+fn hex_bytes(hex: &str) -> [u8; 32] {
+    let mut out = [0_u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex");
+    }
+    out
 }

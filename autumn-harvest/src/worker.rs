@@ -29890,9 +29890,14 @@ impl Worker {
                 for (shard, shard_pool) in seed_targets {
                     match acquire_shard_conn(shard_pool, seed_acquire_bound).await {
                         Ok(mut conn) => {
+                            let policy = self
+                                .registry
+                                .wasm_store()
+                                .and_then(|store| store.trust_policy());
                             if let Err(e) = crate::wasm_store::seed_registered_wasm_modules(
                                 &mut conn,
                                 registrations,
+                                policy.as_deref(),
                             )
                             .await
                             {

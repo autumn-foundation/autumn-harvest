@@ -451,6 +451,59 @@ async fn the_scanner_stamps_the_audit_chain_with_the_configured_key() {
     assert_eq!(report.checked, 3);
 }
 
+#[tokio::test]
+async fn the_dedicated_export_task_stamps_the_audit_chain() {
+    let _guard = TEST_SERIAL.lock().await;
+    let key = CallbackSecret::new(vec![4_u8; autumn_harvest::audit_chain::MIN_CHAIN_KEY_BYTES]);
+    let sink = Arc::new(RecordingSink::new(200));
+    autumn_harvest::audit_export::set_global_audit_export_config(Some(Arc::new(
+        AuditExportRuntimeConfig {
+            sink: sink.clone(),
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 100,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(60),
+            chain_key: Some(key.clone()),
+        },
+    )));
+    let (mut conn, url, _c) = make_conn_any().await;
+    insert_audit_rows(&mut conn, 3).await;
+
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool: DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(2)
+        .build()
+        .expect("pool");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(ShardId::new(0)),
+        None,
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sink.all_seqs().len() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            sink.all_seqs()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+
+    let report = autumn_harvest::audit_chain::verify_shard_chain(&mut conn, 0, &key)
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.checked, 3);
+}
+
 // ── AC4: dense, strictly monotonic per-shard sequences ───────────────────────
 
 #[tokio::test]

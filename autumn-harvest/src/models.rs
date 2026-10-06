@@ -1134,6 +1134,14 @@ pub struct AuditExportCursor {
     pub retired_at: Option<DateTime<Utc>>,
     /// Newest audit-chain link on this shard (issue #1838).
     pub chain_head: Option<Vec<u8>>,
+    /// First chained `export_seq` on this shard (issue #1838).
+    pub chain_start_seq: Option<i64>,
+    /// `export_seq` of the newest chained row (issue #1838).
+    pub chain_head_seq: Option<i64>,
+    /// `occurred_at` of the newest chained row (issue #1838).
+    pub chain_head_occurred_at: Option<DateTime<Utc>>,
+    /// Keyed MAC over the checkpoint columns (issue #1838).
+    pub chain_mac: Option<Vec<u8>>,
 }
 
 // ── ApiToken ──────────────────────────────────────────────────────────────────

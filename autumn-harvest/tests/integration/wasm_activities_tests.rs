@@ -355,11 +355,11 @@ async fn seed_registered_modules_are_resolvable() {
         ("echo".to_string(), echo_bytes(), None),
         ("beta".to_string(), echo_bytes_v2(), None),
     ];
-    seed_registered_wasm_modules(&mut conn, &regs)
+    seed_registered_wasm_modules(&mut conn, &regs, None)
         .await
         .expect("batch seed");
     // idempotent re-run
-    seed_registered_wasm_modules(&mut conn, &regs)
+    seed_registered_wasm_modules(&mut conn, &regs, None)
         .await
         .expect("batch seed again");
 
@@ -409,7 +409,7 @@ async fn seed_registered_batch_helper_does_not_clobber_an_active_version() {
     // Old worker restarts; its builder-registered v1 flows through the batch
     // startup helper.
     let regs = vec![("echo".to_string(), v1.clone(), None)];
-    seed_registered_wasm_modules(&mut conn, &regs)
+    seed_registered_wasm_modules(&mut conn, &regs, None)
         .await
         .expect("batch seed v1");
 
@@ -712,7 +712,7 @@ async fn duplicate_registration_seeds_the_later_bytes() {
     let mut conn = pool.get().await.expect("conn");
     scrub(&mut conn).await;
 
-    seed_registered_wasm_modules(&mut conn, built.wasm_module_registrations())
+    seed_registered_wasm_modules(&mut conn, built.wasm_module_registrations(), None)
         .await
         .expect("seed registered modules");
 
@@ -2189,14 +2189,37 @@ async fn a_signed_publish_refuses_a_bad_signature_before_any_write() {
     scrub(&mut conn).await;
 
     let wrong = sign_wasm_module(&publisher(), "other", &echo_bytes());
+    let malformed = "zz".repeat(64);
     let policy = trust_policy();
-    for signature in [None, Some(wrong.as_str())] {
+    for signature in [None, Some(wrong.as_str()), Some(malformed.as_str())] {
         let result =
             publish_signed_wasm_module(&mut conn, "echo", &echo_bytes(), signature, Some(&policy))
                 .await;
-        assert!(result.is_err(), "{signature:?} must be refused");
+        assert!(
+            matches!(
+                &result,
+                Err(autumn_harvest::HarvestError::Config(message)) if message.contains("refused")
+            ),
+            "{signature:?} must be refused, got {result:?}"
+        );
     }
     assert_eq!(list_wasm_modules(&mut conn).await.expect("list").len(), 0);
+
+    // A refused republish leaves the signed, active row as it was.
+    let good = sign_wasm_module(&publisher(), "echo", &echo_bytes());
+    publish_signed_wasm_module(&mut conn, "echo", &echo_bytes(), Some(&good), Some(&policy))
+        .await
+        .expect("signed publish");
+    let refused = publish_signed_wasm_module(
+        &mut conn,
+        "echo",
+        &echo_bytes(),
+        Some(&wrong),
+        Some(&policy),
+    )
+    .await;
+    assert!(refused.is_err());
+    assert_eq!(stored_signature(&mut conn, "echo").await, Some(good));
 }
 
 #[tokio::test]
@@ -2250,10 +2273,12 @@ async fn dispatch_refuses_a_cached_module_once_its_signature_is_gone() {
         WasmDispatch::Fail(payload) => panic!("expected invoke, got: {payload}"),
     }
     // The compiled module is now cached. The check must still run.
-    diesel::sql_query("UPDATE harvest_wasm_modules SET signature = NULL")
-        .execute(&mut conn)
-        .await
-        .expect("strip");
+    diesel::sql_query(
+        "UPDATE harvest_wasm_modules SET signature = NULL WHERE activity_name = 'echo'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("strip");
     assert_refused(dispatch_echo(&mut conn, &store).await);
 }
 
@@ -2265,7 +2290,7 @@ async fn a_seeded_registration_keeps_its_signature() {
 
     let signature = sign_wasm_module(&publisher(), "echo", &echo_bytes());
     let regs = vec![("echo".to_string(), echo_bytes(), Some(signature.clone()))];
-    seed_registered_wasm_modules(&mut conn, &regs)
+    seed_registered_wasm_modules(&mut conn, &regs, None)
         .await
         .expect("seed");
     assert_eq!(stored_signature(&mut conn, "echo").await, Some(signature));
@@ -2302,6 +2327,92 @@ async fn without_a_trust_policy_an_unsigned_module_still_runs() {
         .expect("publish");
     assert!(matches!(
         dispatch_echo(&mut conn, &Arc::new(WasmModuleStore::new())).await,
+        WasmDispatch::Invoke(_)
+    ));
+}
+
+#[tokio::test]
+async fn an_unverified_signature_never_replaces_a_stored_one() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let good = sign_wasm_module(&publisher(), "echo", &echo_bytes());
+    publish_signed_wasm_module(&mut conn, "echo", &echo_bytes(), Some(&good), None)
+        .await
+        .expect("signed publish");
+    publish_signed_wasm_module(&mut conn, "echo", &echo_bytes(), Some("garbage"), None)
+        .await
+        .expect("an unverified republish succeeds");
+    assert_eq!(
+        stored_signature(&mut conn, "echo").await,
+        Some(good.clone())
+    );
+
+    let regs = vec![(
+        "echo".to_string(),
+        echo_bytes(),
+        Some("garbage".to_string()),
+    )];
+    seed_registered_wasm_modules(&mut conn, &regs, None)
+        .await
+        .expect("seed");
+    assert_eq!(stored_signature(&mut conn, "echo").await, Some(good));
+}
+
+#[tokio::test]
+async fn a_signed_seed_fills_an_unsigned_row() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    seed_registered_wasm_modules(&mut conn, &[("echo".to_string(), echo_bytes(), None)], None)
+        .await
+        .expect("unsigned seed");
+    assert_eq!(stored_signature(&mut conn, "echo").await, None);
+
+    let signature = sign_wasm_module(&publisher(), "echo", &echo_bytes());
+    let regs = vec![("echo".to_string(), echo_bytes(), Some(signature.clone()))];
+    seed_registered_wasm_modules(&mut conn, &regs, None)
+        .await
+        .expect("signed seed");
+    assert_eq!(stored_signature(&mut conn, "echo").await, Some(signature));
+}
+
+#[tokio::test]
+async fn a_seed_after_a_key_rotation_stores_the_new_signature() {
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    let old_signature = sign_wasm_module(&publisher(), "echo", &echo_bytes());
+    let old_regs = vec![("echo".to_string(), echo_bytes(), Some(old_signature))];
+    seed_registered_wasm_modules(&mut conn, &old_regs, Some(&trust_policy()))
+        .await
+        .expect("seed under the old key");
+
+    // The operator replaces the old key with a new one and re-signs.
+    let new_key = autumn_harvest::wasm_signing::SigningKey::from_bytes(&[6; 32]);
+    let new_policy =
+        WasmTrustPolicy::from_public_keys(&[new_key.verifying_key().to_bytes()]).expect("key");
+    let new_signature = sign_wasm_module(&new_key, "echo", &echo_bytes());
+    let new_regs = vec![(
+        "echo".to_string(),
+        echo_bytes(),
+        Some(new_signature.clone()),
+    )];
+    seed_registered_wasm_modules(&mut conn, &new_regs, Some(&new_policy))
+        .await
+        .expect("seed under the new key");
+    assert_eq!(
+        stored_signature(&mut conn, "echo").await,
+        Some(new_signature)
+    );
+
+    let store = Arc::new(WasmModuleStore::new());
+    store.set_trust_policy(Some(new_policy));
+    assert!(matches!(
+        dispatch_echo(&mut conn, &store).await,
         WasmDispatch::Invoke(_)
     ));
 }

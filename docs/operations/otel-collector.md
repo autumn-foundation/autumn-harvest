@@ -30,6 +30,10 @@ no native OTLP exporter: [`docs/adr/0004-security-extras.md`](../adr/0004-securi
 Each copy also gets `messaging.system = harvest`. The other labels of the
 source stay on the copy.
 
+The OTel messaging conventions still have Development status. A later semconv
+release can rename these metrics. Then this table and the recipe change
+together.
+
 The source of truth is `telemetry::SEMCONV_METRIC_MAPPINGS`. The test
 `otel_semconv_docs` renders the recipe below from that table. If you change the
 table, paste the rendered recipe here.
@@ -47,8 +51,9 @@ Other metrics keep their Harvest names only:
 
 ## Recipe
 
-Change the scrape target and the OTLP endpoint for your deployment. Add TLS
-settings to the exporter for a remote backend.
+Change the scrape target and the OTLP endpoint for your deployment. The `otlp`
+exporter uses TLS by default. For a plaintext backend, add
+`tls: {insecure: true}` to the exporter.
 
 ```yaml
 receivers:

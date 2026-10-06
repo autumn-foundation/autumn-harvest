@@ -1996,6 +1996,11 @@ impl HarvestBuilder {
     /// [`try_build`](Self::try_build) fails. The worker also checks the
     /// signature of each module before it runs it. See
     /// [`crate::wasm_signing`].
+    ///
+    /// The policy covers WASM activity modules on the store this builder
+    /// creates. A `HandlerRegistry` built by hand needs
+    /// `WasmModuleStore::set_trust_policy` instead. Hot-swap workflow modules
+    /// keep their own HMAC check.
     #[cfg(feature = "wasm-activities")]
     #[must_use]
     pub fn wasm_trusted_publisher_key(mut self, public_key: [u8; 32]) -> Self {
@@ -8530,6 +8535,46 @@ mod tests {
             .and_then(|store| store.trust_policy())
             .expect("the store carries the trust policy");
         assert_eq!(policy.len(), 1);
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn a_trusted_key_set_after_the_registration_still_applies() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        let result = HarvestBuilder::new()
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::WasmModuleSignatureRejected { .. })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn a_re_registration_keeps_the_later_signature() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        let later = vec![4, 5, 6];
+        let signature =
+            crate::wasm_signing::sign_wasm_module(&wasm_publisher(), "checksum", &later);
+        let built = HarvestBuilder::new()
+            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", later).with_signature(signature.clone()),
+            )
+            .try_build()
+            .expect("the later, signed registration builds");
+        assert_eq!(
+            built.wasm_module_registrations()[0].2.as_deref(),
+            Some(signature.as_str())
+        );
     }
 
     #[cfg(feature = "wasm-activities")]

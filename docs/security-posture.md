@@ -665,7 +665,8 @@ rows. See [The audit hash chain](audit-export.md#the-audit-hash-chain) and
 
 No HTTP route publishes a WASM module. A future route under `/modules` or
 `/admin/modules` needs the `admin` scope. As defence in depth, a worker can
-also require a publisher signature on every module:
+also require a publisher signature on every WASM activity module. Hot-swap
+workflow modules keep their own HMAC check.
 
 - Sign offline with `wasm_signing::sign_wasm_module` and a key that workers
   never hold.
@@ -674,10 +675,18 @@ also require a publisher signature on every module:
 - Publish with `wasm_store::publish_signed_wasm_module`, or attach the
   signature to a registration with `WasmActivityRegistration::with_signature`.
 
+The signing helper needs the `wasm-activities` feature. A publisher tool that
+uses it therefore compiles `wasmtime`.
+
 The worker checks the signature before each run. A module written by direct
 SQL, or published without a signature, fails with the non-retryable
-`WasmModuleInvalid` error. Remove a key from the trusted set to revoke every
-module it signed. See [ADR 0004](adr/0004-security-extras.md).
+`WasmModuleInvalid` error.
+
+A signature covers the activity name and the module hash. It has no version
+and no expiry. So anyone who can write the module table can reactivate any
+version a trusted key ever signed, including an old, vulnerable one. To
+revoke a version, remove its key from the trusted set and re-sign the
+versions you keep with a new key. See [ADR 0004](adr/0004-security-extras.md).
 
 ---
 

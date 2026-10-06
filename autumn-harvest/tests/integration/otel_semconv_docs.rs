@@ -183,14 +183,68 @@ fn telemetry_docs_link_the_collector_recipe() {
 fn the_adr_records_a_decision_for_each_sub_item() {
     let adr = read(ADR);
     assert!(adr.contains("#1838"));
+    let sections: Vec<&str> = adr.split("\n## ").collect();
     for heading in [
-        "## 1. Tamper-evident audit log",
-        "## 2. Signed WASM modules",
-        "## 3. OTel semantic conventions",
+        "1. Tamper-evident audit log",
+        "2. Signed WASM modules",
+        "3. OTel semantic conventions",
     ] {
-        assert!(adr.contains(heading), "{ADR} lacks {heading}");
+        let section = sections
+            .iter()
+            .find(|section| section.starts_with(heading))
+            .unwrap_or_else(|| panic!("{ADR} lacks the section {heading}"));
+        assert!(
+            section.contains("**Decision: implemented"),
+            "{heading} records no decision"
+        );
+        assert!(
+            section.contains("**Declined:**"),
+            "{heading} records no declined option"
+        );
     }
-    for decision in ["**Decision: implemented.**", "**Declined:**"] {
-        assert!(adr.contains(decision), "{ADR} lacks {decision}");
+}
+
+/// `(const name, value)` for each single-line `pub const METRIC_*`.
+fn metric_consts() -> Vec<(String, String)> {
+    read("autumn-harvest/src/telemetry.rs")
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("pub const ")?;
+            let (name, value) = rest.split_once(": &str = \"")?;
+            Some((name.to_owned(), value.split('"').next()?.to_owned()))
+        })
+        .collect()
+}
+
+#[test]
+fn every_mapped_metric_carries_its_destination_label() {
+    let consts = metric_consts();
+    let name_of = |value: &str, prefix: &str| {
+        consts
+            .iter()
+            .find(|(name, v)| v == value && name.starts_with(prefix))
+            .map_or_else(
+                || panic!("no {prefix}* constant has the value {value}"),
+                |(name, _)| name.clone(),
+            )
+    };
+    let adapter = read("autumn-harvest/src/metrics_rs_adapter.rs");
+    for mapping in SEMCONV_METRIC_MAPPINGS {
+        let metric = name_of(mapping.source, "METRIC_");
+        let label = name_of(mapping.destination_label, "METRIC_LABEL_");
+        let calls: Vec<&str> = adapter
+            .match_indices(&format!("{metric},"))
+            .filter(|(at, _)| adapter[..*at].trim_end().ends_with("!("))
+            .map(|(at, _)| {
+                let call = &adapter[at..];
+                // The statement ends at the `;` after `.record(..)` or
+                // `.increment(..)`.
+                &call[..call.find(';').unwrap_or(call.len())]
+            })
+            .collect();
+        assert!(!calls.is_empty(), "the adapter never emits {metric}");
+        for call in calls {
+            assert!(call.contains(&label), "{metric} is emitted without {label}");
+        }
     }
 }

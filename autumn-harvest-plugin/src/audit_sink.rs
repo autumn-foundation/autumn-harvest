@@ -242,6 +242,7 @@ mod tests {
             status: "SUCCEEDED".to_string(),
             error_summary: None,
             source: "api".to_string(),
+            chain_prev: None,
             chain_hash: None,
         }
     }

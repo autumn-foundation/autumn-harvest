@@ -1932,6 +1932,15 @@ pub const METRIC_LABEL_ROLE: &str = "role";
 /// Bounded: `claim` or `heartbeat_flush`.
 pub const METRIC_LABEL_SITE: &str = "site";
 
+/// `shard` label value for a control loop that is **not** per-shard (issue #797).
+///
+/// The `retention` and `schedule` loops run once per process rather than once
+/// per assigned shard, and a single-shard deployment's per-shard loops have no
+/// shard id to report. They emit this sentinel so every
+/// [`METRIC_SCANNER_TICK`] series carries the same label set — a family with a
+/// sometimes-present label is awkward to query and easy to mis-aggregate.
+pub const SCANNER_SHARD_LABEL_NONE: &str = "none";
+
 /// The `messaging.system` value for Harvest's own task queues (issue #1838).
 pub const SEMCONV_MESSAGING_SYSTEM: &str = "harvest";
 
@@ -1990,14 +1999,6 @@ pub const SEMCONV_METRIC_MAPPINGS: &[SemconvMapping] = &[
         destination_label: METRIC_LABEL_QUEUE,
     },
 ];
-/// `shard` label value for a control loop that is **not** per-shard (issue #797).
-///
-/// The `retention` and `schedule` loops run once per process rather than once
-/// per assigned shard, and a single-shard deployment's per-shard loops have no
-/// shard id to report. They emit this sentinel so every
-/// [`METRIC_SCANNER_TICK`] series carries the same label set — a family with a
-/// sometimes-present label is awkward to query and easy to mis-aggregate.
-pub const SCANNER_SHARD_LABEL_NONE: &str = "none";
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)

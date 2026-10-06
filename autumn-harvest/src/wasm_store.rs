@@ -433,8 +433,10 @@ pub async fn publish_wasm_module(
 /// Publish like [`publish_wasm_module`], and store a publisher `signature`
 /// (issue #1838).
 ///
-/// With a `policy`, the signature must verify before anything is written. A
-/// republish of identical bytes without a signature keeps the stored one.
+/// With a `policy`, the signature must verify before anything is written, and
+/// it then replaces a stored one. Without a `policy`, a signature only fills a
+/// row that has none. So an unverified signature never replaces a valid one.
+/// A republish without a signature keeps the stored one.
 ///
 /// # Errors
 ///
@@ -510,9 +512,9 @@ pub async fn publish_signed_wasm_module(
                     m::published_at.eq(diesel::dsl::now),
                     m::signature.eq(diesel::dsl::sql::<
                         diesel::sql_types::Nullable<diesel::sql_types::Text>,
-                    >(
-                        "COALESCE(excluded.signature, harvest_wasm_modules.signature)",
-                    )),
+                    >(signature_upsert_sql(
+                        policy.is_some(),
+                    ))),
                 ))
                 .execute(conn)
                 .await
@@ -556,13 +558,15 @@ pub async fn seed_wasm_module(
     activity_name: &str,
     bytes: &[u8],
 ) -> HarvestResult<String> {
-    seed_signed_wasm_module(conn, activity_name, bytes, None).await
+    seed_signed_wasm_module(conn, activity_name, bytes, None, None).await
 }
 
 /// Seed like [`seed_wasm_module`], and store a publisher `signature`
 /// (issue #1838).
 ///
-/// A signature fills a row that has none. It never replaces a stored one.
+/// A signature that `policy` verifies replaces a stored one. So a module
+/// re-signed after a key rotation runs again. Any other signature only fills
+/// a row that has none.
 ///
 /// # Errors
 ///
@@ -572,6 +576,7 @@ pub async fn seed_signed_wasm_module(
     activity_name: &str,
     bytes: &[u8],
     signature: Option<&str>,
+    policy: Option<&crate::wasm_signing::WasmTrustPolicy>,
 ) -> HarvestResult<String> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -584,6 +589,8 @@ pub async fn seed_signed_wasm_module(
     }
 
     let hash = WasmModuleStore::compute_hash(bytes);
+    let verified = signature.is_some()
+        && policy.is_some_and(|policy| policy.verify(activity_name, &hash, signature).is_ok());
     let hash_for_txn = hash.clone();
     let name = activity_name.to_owned();
 
@@ -618,16 +625,22 @@ pub async fn seed_signed_wasm_module(
                 .await
                 .map_err(database_error)?;
             if let Some(signature) = signature {
-                diesel::update(
-                    m::harvest_wasm_modules
-                        .filter(m::hash.eq(&hash_for_txn))
-                        .filter(m::activity_name.eq(&name))
-                        .filter(m::signature.is_null()),
-                )
-                .set(m::signature.eq(signature))
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
+                let row = m::harvest_wasm_modules
+                    .filter(m::hash.eq(&hash_for_txn))
+                    .filter(m::activity_name.eq(&name));
+                if verified {
+                    diesel::update(row)
+                        .set(m::signature.eq(signature))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+                } else {
+                    diesel::update(row.filter(m::signature.is_null()))
+                        .set(m::signature.eq(signature))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+                }
             }
 
             // 2. Activate the seeded version ONLY when no active version exists
@@ -670,11 +683,24 @@ pub async fn seed_signed_wasm_module(
 pub async fn seed_registered_wasm_modules(
     conn: &mut diesel_async::AsyncPgConnection,
     registrations: &[(String, Vec<u8>, Option<String>)],
+    policy: Option<&crate::wasm_signing::WasmTrustPolicy>,
 ) -> HarvestResult<()> {
     for (name, bytes, signature) in registrations {
-        seed_signed_wasm_module(conn, name, bytes, signature.as_deref()).await?;
+        seed_signed_wasm_module(conn, name, bytes, signature.as_deref(), policy).await?;
     }
     Ok(())
+}
+
+/// The SQL for the stored signature on an upsert conflict (issue #1838).
+///
+/// A verified signature replaces the stored one. An unverified one only fills
+/// an empty column.
+const fn signature_upsert_sql(verified: bool) -> &'static str {
+    if verified {
+        "COALESCE(excluded.signature, harvest_wasm_modules.signature)"
+    } else {
+        "COALESCE(harvest_wasm_modules.signature, excluded.signature)"
+    }
 }
 
 /// Resolve the active module **hash** for `activity_name`, if any (issue #965).

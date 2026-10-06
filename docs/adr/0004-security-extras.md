@@ -32,14 +32,20 @@ that the exporter sequences.
   path gets no new lock and no new work.
 - Each link is `HMAC-SHA256(key, domain || chain_prev || canonical row)`. The
   key lives outside the database, so a database writer cannot forge a link.
-- Each row stores `chain_prev` and `chain_hash`. The cursor stores
-  `chain_head`. A row stays verifiable after retention deletes its
-  predecessor.
-- `audit_chain::verify_shard_chain` reports four problems apart: a changed
-  row, a broken link, a missing sequence number, and a missing newest row.
-- Exported records carry `chain_hash`. A SIEM that holds the key can verify
-  the chain on its side. A deployment without a key ships the same bytes as
-  before.
+- Each row stores `chain_prev` and `chain_hash`. A row stays verifiable
+  after retention deletes its predecessor.
+- The cursor stores a keyed checkpoint: the chain start, the newest link, its
+  `seq` and its `occurred_at`, under one HMAC. A database writer cannot move
+  it. So stripped links and a deleted tail show.
+- `audit_chain::verify_shard_chain` reports changed rows, broken links,
+  unchained rows, missing sequence numbers, a missing newest row, and a
+  missing or invalid checkpoint.
+- With a retention cutoff, gaps at the old end of the chain count as
+  retention, not as findings. Retention keeps some old rows, so these gaps
+  are normal.
+- Exported records carry `chain_prev` and `chain_hash`. A SIEM that holds the
+  key can verify the chain on its side. A deployment without a key ships the
+  same bytes as before.
 - Turn it on with `HarvestBuilder::audit_export_chain_key`. The key must be at
   least 32 bytes.
 
@@ -49,8 +55,13 @@ that the exporter sequences.
   next export tick. The SIEM copy covers that window.
 - A process that holds the key can forge links. The chain protects against
   database-level tampering, not a compromised Harvest process.
-- Retention near its cutoff can leave a sequence gap. Compare a gap with the
-  SIEM copy before you treat it as tampering.
+- A writer who removes every link and the whole checkpoint leaves a table
+  that looks unchained. A writer can also hide a deletion near the retention
+  cutoff. Only the SIEM copy detects these cases.
+- Each sequenced row is written twice: once for `export_seq`, once for the
+  chain columns. Only a deployment with a chain key pays this cost.
+- Every exporter must hold the same key. Set it after a rolling upgrade
+  ends.
 
 **Declined:**
 
@@ -81,7 +92,23 @@ activity modules.
   module written by direct SQL, or by the unsigned publish call, does not run.
 - With a trusted key set, `try_build` refuses a registered module that has no
   valid signature.
+- A signature replaces a stored one only after a trust policy verifies it.
+  So an unverified signature cannot disable a signed module. A re-signed
+  module after a key rotation runs again.
 - Without a trusted key, behavior is unchanged.
+- The policy covers WASM activity modules. Hot-swap workflow modules keep
+  their own HMAC check.
+
+**Limits.**
+
+- A signature has no version and no expiry. Anyone who can write the module
+  table can reactivate any version a trusted key signed. Revoke by removing
+  the key and re-signing the versions you keep.
+- `wasm_signing` re-exports `SigningKey` and `VerifyingKey` from
+  `ed25519-dalek` 2. A major version bump of that crate is an API change
+  here.
+- The signing helper needs the `wasm-activities` feature, so a publisher
+  tool compiles `wasmtime`.
 
 **Context correction.** No HTTP route publishes a WASM module today. Publish
 is a library call. A future route under `/modules` or `/admin/modules` needs
@@ -105,8 +132,8 @@ cannot publish code. The signature is defence in depth.
 declined.
 
 - `telemetry::SEMCONV_METRIC_MAPPINGS` maps `harvest.*` metrics to the OTel
-  messaging conventions where the meaning matches:
-  `harvest.queue.dispatched` to `messaging.client.consumed.messages`, and
+  messaging conventions where the meaning matches. It maps
+  `harvest.queue.dispatched` to `messaging.client.consumed.messages`. It maps
   `harvest.activity.duration` to `messaging.process.duration`.
 - [`docs/operations/otel-collector.md`](../operations/otel-collector.md)
   publishes the Collector recipe. It scrapes the Prometheus endpoint and
@@ -135,7 +162,9 @@ declined.
 
 - Two migrations add nullable columns: the audit chain columns and the WASM
   module `signature`. Neither needs a table rewrite.
+- New public struct fields and changed function signatures break code that
+  builds these structs by hand. The changelog fragment lists them.
 - No `WorkflowEvent` variant and no change to `harvest_events`. Replay is not
   affected.
 - All three features are opt-in. A deployment that sets nothing sees no
-  change in behavior or wire bytes.
+  change in runtime behavior or wire bytes.

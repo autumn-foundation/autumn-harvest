@@ -102,6 +102,7 @@
 //! | `shard_id` | `attributes["harvest.shard.id"]` — the shard the operation itself named, which can differ from `shard` |
 //! | `actor`, `target_type`, `target_id`, `route_or_command`, `request_id`, `idempotency_key`, `source` | `attributes["harvest.audit.<field>"]` |
 //! | `id` | `attributes["harvest.audit.id"]` |
+//! | `chain_prev`, `chain_hash` | `attributes["harvest.audit.chain_prev"]`, `attributes["harvest.audit.chain_hash"]`, when present |
 //!
 //! See `docs/audit-export.md` for the full receiver contract.
 
@@ -148,7 +149,8 @@ pub const MAX_EXPORT_BATCH_SIZE: i64 = 5_000;
 /// index mappings depend on them. Do not reorder, rename, or drop a field
 /// without a compatibility plan. Optional fields serialize as an explicit
 /// `null` rather than being omitted, so a SIEM's schema inference sees a
-/// stable object shape across every batch.
+/// stable object shape across every batch. The two chain fields are the
+/// exception: they are omitted when absent (issue #1838).
 ///
 /// Carries no workflow payloads, activity inputs, or signal bodies: the
 /// audit trail deliberately is not a second PII store ([`crate::audit`]),
@@ -183,11 +185,15 @@ pub struct AuditExportRecord {
     pub status: String,
     pub error_summary: Option<String>,
     pub source: String,
-    /// Lowercase hex of the row's audit-chain link (issue #1838).
+    /// Lowercase hex of the link before this row (issue #1838).
     ///
     /// Present only on rows the chain covers. The field is omitted, not
     /// `null`, when absent. So a deployment without a chain key ships the
     /// same bytes as before. See [`crate::audit_chain`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_prev: Option<String>,
+    /// Lowercase hex of the row's audit-chain link (issue #1838). Omitted
+    /// when absent, as [`Self::chain_prev`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_hash: Option<String>,
 }
@@ -216,13 +222,18 @@ impl AuditExportRecord {
             status: row.status,
             error_summary: row.error_summary,
             source: row.source,
-            chain_hash: row
-                .chain_hash
-                .as_deref()
-                .and_then(crate::audit_chain::from_bytes)
-                .map(|hash| crate::audit_chain::to_hex(&hash)),
+            chain_prev: chain_hex(row.chain_prev.as_deref()),
+            chain_hash: chain_hex(row.chain_hash.as_deref()),
         })
     }
+}
+
+/// Lowercase hex of a stored 32-byte link.
+#[cfg(feature = "db")]
+fn chain_hex(bytes: Option<&[u8]>) -> Option<String> {
+    bytes
+        .and_then(crate::audit_chain::from_bytes)
+        .map(|hash| crate::audit_chain::to_hex(&hash))
 }
 
 /// Serialize a batch as JSON lines — one compact JSON object per line,
@@ -936,19 +947,25 @@ fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntime
 /// That clear marks export as disabled (issue #1506). Each export tick then
 /// reports its shards as unobserved until a sink is configured again.
 pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExportBuilderConfig) {
-    let Some(sink) = config.sink.clone() else {
-        if config.webhook_url.is_some() {
-            tracing::warn!(
-                "audit_export_webhook(...) was configured but this runtime was built \
-                 through the direct core worker path, which ships no HTTP client -- no \
-                 audit records will be exported. Supply audit_export_sink(...) with your \
-                 own AuditSink, or run through autumn-harvest-plugin, which provides the \
-                 default reqwest signed-webhook sink."
-            );
-        }
-        set_global_audit_export_config(None);
-        return;
-    };
+    if config.sink.is_none() && config.webhook_url.is_some() {
+        tracing::warn!(
+            "audit_export_webhook(...) was configured but this runtime was built \
+             through the direct core worker path, which ships no HTTP client -- no \
+             audit records will be exported. Supply audit_export_sink(...) with your \
+             own AuditSink, or run through autumn-harvest-plugin, which provides the \
+             default reqwest signed-webhook sink."
+        );
+    }
+    set_global_audit_export_config(direct_worker_runtime_config(config).map(std::sync::Arc::new));
+}
+
+/// The runtime config the direct core worker path installs for `config`.
+///
+/// `None` without an embedder-supplied sink.
+fn direct_worker_runtime_config(
+    config: &AuditExportBuilderConfig,
+) -> Option<AuditExportRuntimeConfig> {
+    let sink = config.sink.clone()?;
     let secret = config.secret.clone().unwrap_or_else(|| {
         tracing::warn!(
             "audit-export HMAC secret was never configured via \
@@ -958,14 +975,14 @@ pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExport
         );
         CallbackSecret::new(Vec::new())
     });
-    set_global_audit_export_config(Some(std::sync::Arc::new(AuditExportRuntimeConfig {
+    Some(AuditExportRuntimeConfig {
         sink,
         secret,
         batch_size: config.effective_batch_size(),
         backoff: config.backoff.clone(),
         lease: config.effective_lease(),
         chain_key: config.chain_key.clone(),
-    })));
+    })
 }
 
 /// `true` after a live export config was removed and none replaced it.
@@ -1103,6 +1120,14 @@ pub struct ClaimedBatch {
     pub lease_until: DateTime<Utc>,
 }
 
+/// Whether an upsert inserted its row.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct Inserted {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    inserted: bool,
+}
+
 /// Create this shard's cursor row if it does not exist, and heartbeat it if it
 /// does. **Never reactivates a retired cursor** — see issue #1273.
 ///
@@ -1162,22 +1187,47 @@ pub async fn ensure_cursor_row(
     // Resuming a retired shard is [`reactivate_cursor`]: an explicit, audited
     // operator action, not a side effect of the exporter noticing new work.
     //
-    // The INSERT arm seeds `chain_head` from the newest sequenced row for the
-    // same reason (issue #1838). A rebuilt cursor then continues the chain,
-    // and does not restart it from the genesis link.
-    diesel::sql_query(
-        "INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq, chain_head) \
-         SELECT $1, COALESCE(MAX(export_seq), 0), \
-                (SELECT chain_hash FROM harvest_audit_log \
-                 WHERE export_seq IS NOT NULL ORDER BY export_seq DESC LIMIT 1) \
-         FROM harvest_audit_log \
+    // `RETURNING` yields a row only when the upsert inserts or heartbeats.
+    // `xmax = 0` marks an insert (issue #1838).
+    let inserted = diesel::sql_query(
+        "INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq) \
+         SELECT $1, COALESCE(MAX(export_seq), 0) FROM harvest_audit_log \
          ON CONFLICT (shard_id) DO UPDATE SET updated_at = NOW() \
-         WHERE harvest_audit_export_cursor.retired_at IS NULL",
+         WHERE harvest_audit_export_cursor.retired_at IS NULL \
+         RETURNING (xmax = 0) AS inserted",
     )
     .bind::<diesel::sql_types::Integer, _>(shard_id)
-    .execute(conn)
+    .load::<Inserted>(conn)
     .await
-    .map_err(crate::error::database_error)?;
+    .map_err(crate::error::database_error)?
+    .iter()
+    .any(|row| row.inserted);
+
+    // A fresh row also seeds the chain head and start from the stored rows
+    // (issue #1838), for the same reason as `last_assigned_seq` above. A
+    // rebuilt cursor then continues the chain, not a new one from the genesis
+    // link. The seed cannot compute the checkpoint MAC. So the verifier
+    // reports the checkpoint as missing until the next keyed stamp signs it.
+    // It runs only on insert, because its lookups scan unchained rows.
+    if inserted {
+        diesel::sql_query(
+            "WITH head AS ( \
+                 SELECT chain_hash, export_seq, occurred_at FROM harvest_audit_log \
+                 WHERE chain_hash IS NOT NULL ORDER BY export_seq DESC LIMIT 1 \
+             ) \
+             UPDATE harvest_audit_export_cursor SET \
+                 chain_head = head.chain_hash, \
+                 chain_head_seq = head.export_seq, \
+                 chain_head_occurred_at = head.occurred_at, \
+                 chain_start_seq = (SELECT MIN(export_seq) FROM harvest_audit_log \
+                                    WHERE chain_hash IS NOT NULL) \
+             FROM head WHERE shard_id = $1",
+        )
+        .bind::<diesel::sql_types::Integer, _>(shard_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    }
     Ok(())
 }
 
@@ -2353,7 +2403,7 @@ pub async fn claim_shard_chained(
             //
             // Rows sequenced on an earlier tick keep whatever they had. So a
             // key set later starts the chain at the next sequence.
-            let stamped_head = match chain_key {
+            let stamped = match chain_key {
                 Some(key) if last_assigned_seq > cursor.last_assigned_seq => {
                     crate::audit_chain::stamp_chain(
                         conn,
@@ -2364,11 +2414,21 @@ pub async fn claim_shard_chained(
                         cursor.chain_head.as_deref(),
                     )
                     .await?
+                    .map(|stamped| (key, stamped))
                 }
                 _ => None,
             };
-            let chain_head =
-                stamped_head.map_or_else(|| cursor.chain_head.clone(), |head| Some(head.to_vec()));
+            // The keyed checkpoint moves with the head (issue #1838). A
+            // rebuilt cursor keeps its seeded start.
+            let checkpoint = stamped.map(|(key, stamped)| {
+                let checkpoint = crate::audit_chain::ChainCheckpoint {
+                    start_seq: cursor.chain_start_seq.unwrap_or(stamped.first_seq),
+                    head_seq: stamped.head_seq,
+                    head: stamped.head,
+                    head_occurred_at: stamped.head_occurred_at,
+                };
+                (checkpoint, checkpoint.mac(key, shard_id))
+            });
 
             // ── Load the batch to deliver ─────────────────────────────────
             //
@@ -2390,12 +2450,24 @@ pub async fn claim_shard_chained(
                 diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
                     .set((
                         cur::last_assigned_seq.eq(last_assigned_seq),
-                        cur::chain_head.eq(&chain_head),
                         cur::updated_at.eq(now),
                     ))
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
+                if let Some((checkpoint, mac)) = checkpoint {
+                    diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
+                        .set((
+                            cur::chain_start_seq.eq(checkpoint.start_seq),
+                            cur::chain_head_seq.eq(checkpoint.head_seq),
+                            cur::chain_head.eq(checkpoint.head.to_vec()),
+                            cur::chain_head_occurred_at.eq(checkpoint.head_occurred_at),
+                            cur::chain_mac.eq(mac.to_vec()),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                }
             }
 
             if rows.is_empty() {
@@ -4216,6 +4288,7 @@ mod tests {
             status: "SUCCEEDED".to_string(),
             error_summary: None,
             source: "api".to_string(),
+            chain_prev: None,
             chain_hash: None,
         }
     }
@@ -4282,6 +4355,28 @@ mod tests {
         // Tamper-evidence identity fields (AC4) are always present.
         assert_eq!(parsed["shard"], serde_json::json!(3));
         assert_eq!(parsed["seq"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn the_direct_worker_config_keeps_the_chain_key() {
+        struct Nowhere;
+        impl AuditSink for Nowhere {
+            fn deliver<'a>(&'a self, _batch: &'a AuditBatch<'a>) -> SinkFuture<'a> {
+                Box::pin(async { SinkAttempt::success(200) })
+            }
+        }
+        let config = AuditExportBuilderConfig {
+            sink: Some(std::sync::Arc::new(Nowhere)),
+            secret: Some(CallbackSecret::new(b"s".to_vec())),
+            chain_key: Some(CallbackSecret::new(vec![1_u8; 32])),
+            ..AuditExportBuilderConfig::default()
+        };
+        let runtime = direct_worker_runtime_config(&config).expect("a sink is set");
+        assert_eq!(
+            runtime.chain_key.as_ref().map(CallbackSecret::as_bytes),
+            Some(&[1_u8; 32][..])
+        );
+        assert!(direct_worker_runtime_config(&AuditExportBuilderConfig::default()).is_none());
     }
 
     #[test]

@@ -639,6 +639,14 @@ diesel::table! {
         retired_at -> Nullable<Timestamptz>,
         /// Newest audit-chain link on this shard (issue #1838).
         chain_head -> Nullable<Bytea>,
+        /// First chained `export_seq` on this shard (issue #1838).
+        chain_start_seq -> Nullable<Int8>,
+        /// `export_seq` of the newest chained row (issue #1838).
+        chain_head_seq -> Nullable<Int8>,
+        /// `occurred_at` of the newest chained row (issue #1838).
+        chain_head_occurred_at -> Nullable<Timestamptz>,
+        /// Keyed MAC over the checkpoint columns (issue #1838).
+        chain_mac -> Nullable<Bytea>,
     }
 }
 

@@ -2332,6 +2332,32 @@ pub(crate) fn injected_runtime_state(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_plugin_audit_export_config_keeps_the_chain_key() {
+        struct Nowhere;
+        impl autumn_harvest::audit_export::AuditSink for Nowhere {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a autumn_harvest::audit_export::AuditBatch<'a>,
+            ) -> autumn_harvest::audit_export::SinkFuture<'a> {
+                Box::pin(async { autumn_harvest::audit_export::SinkAttempt::success(200) })
+            }
+        }
+        let built = autumn_harvest::HarvestBuilder::new()
+            .audit_export_sink(Nowhere)
+            .audit_export_chain_key(vec![2_u8; 32])
+            .try_build()
+            .expect("builds");
+        let config = super::prepare_audit_export_config(&built).expect("a sink is set");
+        assert_eq!(
+            config
+                .chain_key
+                .as_ref()
+                .map(autumn_harvest::completion_callback::CallbackSecret::as_bytes),
+            Some(&[2_u8; 32][..])
+        );
+    }
     use super::{
         DeferredAuditExportInstall, HarvestRunnerResources, registered_workflow_type_names,
         resolve_runtime_storage_pool, select_runtime_gate_shards, select_runtime_shard0_pool,
