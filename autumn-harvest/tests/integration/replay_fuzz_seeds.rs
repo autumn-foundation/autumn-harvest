@@ -574,6 +574,18 @@ fn a_saga_claims_its_compensations_past_siblings() {
             "baseline-saga-beside-signal.json",
             "reserve; hold; join(saga unwind 2, signal go); complete",
         ),
+        (
+            "baseline-saga-signal-then-compensation.json",
+            "reserve; hold; join(saga unwind 2, seq(signal go, next)); complete",
+        ),
+        // The signal branch was polled first here. History cannot tell a
+        // compensation from a sibling command, so the saga claims `next`.
+        // The mirrored saga is polled first, so each command still meets
+        // its own recorded schedule.
+        (
+            "baseline-saga-signal-branch-polled-first.json",
+            "reserve; hold; join(saga unwind 2, seq(signal go, unhold)); complete",
+        ),
     ];
     let cases = seed("baseline-saga-");
     for (name, want) in expected {
