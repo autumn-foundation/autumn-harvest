@@ -1302,7 +1302,7 @@ pub const fn claim_task_query() -> &'static str {
 /// shard this connection serves; `None` — the overwhelmingly common case —
 /// when DR fencing was never enabled, which is what keeps the unfenced claim
 /// path byte-for-byte unchanged.
-fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(i32, i64)> {
+fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(Vec<i32>, Vec<i64>)> {
     use crate::replication::FenceRegistry;
 
     // One acquire load; short-circuits before any lock for every deployment
@@ -1312,9 +1312,17 @@ fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(i32, i64)> {
     }
     // One registry call, so the `UNENCODED` → default-shard rule lives in
     // `replication` alone and the hot path takes one read lock, not two.
+    // A claim scan is not filtered by shard. On a database that several
+    // logical shards share, it checks every pin colocated there (issue
+    // #1823), so a bump of any of them stops it.
     let shard = shard.unwrap_or(crate::types::ShardId::UNENCODED);
-    let (resolved, generation) = FenceRegistry::binding(shard)?;
-    Some((resolved.as_i32(), generation.as_i64()))
+    let bindings = FenceRegistry::claim_bindings(shard)?;
+    Some(
+        bindings
+            .into_iter()
+            .map(|(shard, generation)| (shard.as_i32(), generation.as_i64()))
+            .unzip(),
+    )
 }
 
 /// The claim query with the cross-region DR write-authority fence spliced in
@@ -1369,10 +1377,15 @@ pub fn claim_task_query_fenced() -> &'static str {
 /// single-row claim and the batched claim both use this splice. So one probe
 /// text guards every claim path.
 fn splice_dr_fence(base: &str, shard_bind: &str, generation_bind: &str) -> String {
+    // One row when every listed shard is at its pinned generation, and none
+    // otherwise. The lists hold the claim's shard and its colocated peers.
     let fence_cte = format!(
         "WITH fence AS MATERIALIZED ( \
-             SELECT 1 AS ok FROM harvest_shard_generation \
-             WHERE shard_id = {shard_bind} AND generation = {generation_bind} \
+             SELECT 1 AS ok FROM harvest_shard_generation g \
+             JOIN unnest({shard_bind}::int4[], {generation_bind}::int8[]) \
+                 AS p(shard_id, generation) \
+                 ON g.shard_id = p.shard_id AND g.generation = p.generation \
+             HAVING count(*) = cardinality({shard_bind}::int4[]) \
          ), "
     );
     #[expect(clippy::expect_used, reason = "every claim query is a constant")]
@@ -1678,7 +1691,7 @@ pub async fn claim_task_of_kind_on_shard(
                             .load(conn)
                             .await
                     }
-                    Some((fence_shard, generation)) => {
+                    Some((fence_shards, generations)) => {
                         let query = kind.map_or_else(claim_task_query_fenced, |kind| {
                             claim_task_query_for_kind(kind, true)
                         });
@@ -1695,8 +1708,12 @@ pub async fn claim_task_of_kind_on_shard(
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
                                 ineligible_activities,
                             )
-                            .bind::<diesel::sql_types::Integer, _>(fence_shard)
-                            .bind::<diesel::sql_types::BigInt, _>(generation)
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(
+                                fence_shards,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(
+                                generations,
+                            )
                             .load(conn)
                             .await
                     }
@@ -2055,7 +2072,7 @@ pub async fn claim_task_by_id_on_shard(
                             .load(conn)
                             .await
                     }
-                    Some((fence_shard, generation)) => {
+                    Some((fence_shards, generations)) => {
                         diesel::sql_query(claim_task_by_id_query_fenced())
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
@@ -2069,8 +2086,12 @@ pub async fn claim_task_by_id_on_shard(
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
                                 ineligible_activities,
                             )
-                            .bind::<diesel::sql_types::Integer, _>(fence_shard)
-                            .bind::<diesel::sql_types::BigInt, _>(generation)
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(
+                                fence_shards,
+                            )
+                            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(
+                                generations,
+                            )
                             .bind::<diesel::sql_types::Uuid, _>(task_id)
                             .load(conn)
                             .await
@@ -8332,7 +8353,7 @@ async fn fetch_claim_batch(
     ineligible_activities: &[String],
     cursor: Option<BatchCursor>,
     batch_size: i64,
-    fence: Option<(i32, i64)>,
+    fence: Option<&(Vec<i32>, Vec<i64>)>,
 ) -> HarvestResult<Vec<BatchedClaimCandidate>> {
     let query = if fence.is_some() {
         claim_task_batched_candidates_query_fenced()
@@ -8360,10 +8381,10 @@ async fn fetch_claim_batch(
         .bind::<diesel::sql_types::BigInt, _>(batch_size);
     let rows: Result<Vec<BatchedClaimCandidate>, diesel::result::Error> = match fence {
         None => query.load(conn).await,
-        Some((fence_shard, generation)) => {
+        Some((fence_shards, generations)) => {
             query
-                .bind::<diesel::sql_types::Integer, _>(fence_shard)
-                .bind::<diesel::sql_types::BigInt, _>(generation)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(fence_shards)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(generations)
                 .load(conn)
                 .await
         }
@@ -8573,7 +8594,7 @@ pub async fn claim_task_batched_on_shard(
                         ineligible_activities,
                         cursor,
                         batch_size,
-                        fence,
+                        fence.as_ref(),
                     )
                     .await?;
                     let fetched = batch.len();
@@ -8946,12 +8967,12 @@ mod tests {
             "exactly one generation probe"
         );
         assert!(
-            fenced.contains("shard_id = $7"),
-            "shard id binds at $7: {fenced}"
+            fenced.contains("unnest($7::int4[], $8::int8[])"),
+            "shard ids bind at $7: {fenced}"
         );
         assert!(
-            fenced.contains("generation = $8"),
-            "pinned generation binds at $8: {fenced}"
+            fenced.contains("cardinality($7::int4[])"),
+            "every listed shard must match: {fenced}"
         );
         assert_eq!(
             fenced.matches("CROSS JOIN fence").count(),
@@ -8998,13 +9019,15 @@ mod tests {
         let fenced = claim_task_batched_candidates_query_fenced();
         assert!(!base.contains("harvest_shard_generation"));
         assert_eq!(fenced.matches("FROM harvest_shard_generation").count(), 1);
-        assert!(fenced.contains("WHERE shard_id = $13 AND generation = $14"));
+        assert!(fenced.contains("unnest($13::int4[], $14::int8[])"));
         assert!(!base.contains("$13"), "the base scan binds $1..$12 only");
         assert!(!fenced.contains("FOR SHARE"), "the probe takes no row lock");
         let unspliced = fenced
             .replacen(
-                "WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation \
-                 WHERE shard_id = $13 AND generation = $14 ), ",
+                "WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation g \
+                 JOIN unnest($13::int4[], $14::int8[]) AS p(shard_id, generation) \
+                 ON g.shard_id = p.shard_id AND g.generation = p.generation \
+                 HAVING count(*) = cardinality($13::int4[]) ), ",
                 "WITH ",
                 1,
             )
@@ -9017,8 +9040,10 @@ mod tests {
     fn the_shared_splice_keeps_the_single_row_fenced_query_text() {
         let unspliced = claim_task_query_fenced()
             .replacen(
-                "WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation \
-                 WHERE shard_id = $7 AND generation = $8 ), ",
+                "WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation g \
+                 JOIN unnest($7::int4[], $8::int8[]) AS p(shard_id, generation) \
+                 ON g.shard_id = p.shard_id AND g.generation = p.generation \
+                 HAVING count(*) = cardinality($7::int4[]) ), ",
                 "WITH ",
                 1,
             )
@@ -12806,7 +12831,7 @@ mod tests {
             );
         }
         assert!(fenced.contains("FROM harvest_shard_generation"));
-        assert!(fenced.contains("WHERE shard_id = $7 AND generation = $8"));
+        assert!(fenced.contains("unnest($7::int4[], $8::int8[])"));
         assert!(fenced.contains("CROSS JOIN worker_info CROSS JOIN fence "));
     }
 

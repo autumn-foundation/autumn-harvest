@@ -654,6 +654,10 @@ struct Pinned {
     /// process can hold the same shard. The sentinel goes only when the last
     /// one releases it.
     holders: BTreeMap<i32, usize>,
+    /// The other pinned shards that share each shard's database (issue
+    /// #1823). A claim scan there is not filtered by shard, so it checks
+    /// them all.
+    colocated: BTreeMap<i32, Vec<i32>>,
 }
 
 /// A [`FenceRegistry::publish`] rejected because the shard is already pinned at
@@ -1072,6 +1076,61 @@ impl FenceRegistry {
                 .generations
                 .get(&resolved.as_i32())
                 .map(|g| (resolved, *g))
+        });
+        drop(guard);
+        found
+    }
+
+    /// Record that `shards` share one database (issue #1823).
+    ///
+    /// A claim on one of them then checks the pins of all of them. See
+    /// [`Self::claim_bindings`].
+    pub fn colocate(shards: &[ShardId]) {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinned = guard.get_or_insert_with(Pinned::default);
+        for shard in shards {
+            let peers = pinned.colocated.entry(shard.as_i32()).or_default();
+            for peer in shards {
+                if peer != shard && !peers.contains(&peer.as_i32()) {
+                    peers.push(peer.as_i32());
+                }
+            }
+        }
+        drop(guard);
+    }
+
+    /// The pins a claim on `shard` checks (issue #1823): the shard's own
+    /// [`Self::binding`], then each pinned shard colocated with it.
+    ///
+    /// `None` when `shard` itself is not pinned.
+    #[must_use]
+    pub fn claim_bindings(shard: ShardId) -> Option<Vec<(ShardId, ShardGeneration)>> {
+        if !Self::is_enabled() {
+            return None;
+        }
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard.as_ref().and_then(|pinned| {
+            let resolved = if shard.is_unencoded() {
+                pinned.default_shard?
+            } else {
+                shard
+            };
+            let own = *pinned.generations.get(&resolved.as_i32())?;
+            let mut bindings = vec![(resolved, own)];
+            for peer in pinned
+                .colocated
+                .get(&resolved.as_i32())
+                .map_or(&[][..], Vec::as_slice)
+            {
+                if let Some(generation) = pinned.generations.get(peer) {
+                    bindings.push((ShardId::new(*peer), *generation));
+                }
+            }
+            Some(bindings)
         });
         drop(guard);
         found
@@ -2249,8 +2308,26 @@ mod db {
             FenceRegistry::hold(&held_shards, default_shard)
                 .map_err(|conflict| crate::error::HarvestError::Config(conflict.to_string()))?;
         }
-        FenceRegistry::publish(&pins, default_shard)
-            .map_err(|conflict| crate::error::HarvestError::Config(conflict.to_string()))?;
+        if let Err(conflict) = FenceRegistry::publish(&pins, default_shard) {
+            // This startup fails, so it drops the holds it just added.
+            // Otherwise the sentinel stays, and every worker in this process
+            // treats the shard as unwritable.
+            for shard in &held_shards {
+                FenceRegistry::release_held(*shard);
+            }
+            return Err(crate::error::HarvestError::Config(conflict.to_string()));
+        }
+        // Logical shards that share one database share one claim scan.
+        for (shard, pool) in &targets {
+            let peers: Vec<ShardId> = targets
+                .iter()
+                .filter(|(_, peer_pool)| same_pool(peer_pool, pool))
+                .map(|(peer, _)| *peer)
+                .collect();
+            if peers.len() > 1 && peers[0] == *shard {
+                FenceRegistry::colocate(&peers);
+            }
+        }
         for (shard, generation) in &pins {
             tracing::info!(
                 shard_id = shard.as_i32(),

@@ -3156,6 +3156,98 @@ async fn an_unfenced_worker_refuses_to_join_a_pinned_process() {
     );
 }
 
+/// A claim on a database shared by several logical shards checks every one
+/// of their pins (issue #1823). The claim scan is not filtered by shard, so
+/// a bump of any colocated shard must stop it.
+#[tokio::test]
+async fn a_colocated_claim_stops_when_any_colocated_shard_is_bumped() {
+    use autumn_harvest::queue::claim_task_on_shard;
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("colocclaim");
+    let pool = dr_pool(&url);
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_shard_assignments([ShardId::new(0), ShardId::new(1)]),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    let assigned = [ShardId::new(0), ShardId::new(1)];
+    pin_worker_fence(DrFencing::Enabled, DR_PREFIX, targets, &pool, &assigned)
+        .await
+        .expect("both colocated shards pin");
+    let mut conn = connect(&url).await;
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-coloc",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+
+    bump_generation(&mut conn, ShardId::new(1), "promote", "oncall")
+        .await
+        .unwrap();
+    let queues = ["q-dr-coloc".to_string()];
+    let claimed = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    assert!(
+        claimed.is_none(),
+        "a bump of a colocated shard must stop the claim"
+    );
+}
+
+/// A failed publish releases the holds that the same startup added (issue
+/// #1823). Otherwise the sentinel stays in the process-wide registry, and
+/// other workers treat the shard as unwritable forever.
+#[tokio::test]
+async fn a_failed_publish_releases_its_holds() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holdleak");
+    let mut conn = connect(&url).await;
+    let current = ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .unwrap();
+    FenceRegistry::publish(
+        &[(ShardId::new(1), ShardGeneration::new(current.as_i64() + 5))],
+        ShardId::new(1),
+    )
+    .expect("an older worker pinned shard 1 at another generation");
+    let unreachable = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    let reachable = dr_pool(&url);
+    let targets = Some((
+        vec![
+            (ShardId::new(0), unreachable),
+            (ShardId::new(1), reachable.clone()),
+        ],
+        ShardId::new(1),
+    ));
+    let refused = pin_worker_fence(
+        DrFencing::Auto,
+        DR_PREFIX,
+        targets,
+        &reachable,
+        &[ShardId::new(1)],
+    )
+    .await;
+
+    assert!(refused.is_err(), "a pin conflict refuses the worker");
+    assert!(
+        !FenceRegistry::is_held(ShardId::new(0)),
+        "a refused startup must not leave its hold behind"
+    );
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

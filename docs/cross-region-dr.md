@@ -207,6 +207,11 @@ The log line says which rule it broke, and what to change:
   a server in recovery. No Harvest process writes to a standby. The runbook
   starts processes only after promotion.
 
+**Colocated shards.** Several logical shards can share one database, and
+one claim scan there serves them all. The scan is not filtered by shard, so
+a claim checks the pin of every logical shard on that database. A fence on
+any one of them stops claims for all of them.
+
 **Shard identity.** A pin needs a shard number. A worker takes it from its
 sharded pool or from `with_shard_assignments`. With neither, the process
 reads it from the database: exactly one `harvest_shard_generation` row names
