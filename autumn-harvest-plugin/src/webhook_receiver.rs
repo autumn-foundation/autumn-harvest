@@ -605,7 +605,13 @@ async fn handle_webhook(
         workflow_id: workflow_id.as_str(),
         delivery_id: ctx.delivery_id.as_deref(),
     };
-    reshape_dispatch_response(metrics.as_ref(), path, dispatch_response, audit_ctx).await
+    // The reshape writes an audit row, so it runs under the same guards. A
+    // lost fence session skips it and answers `503`.
+    crate::api::run_dr_fenced(
+        &fence,
+        reshape_dispatch_response(metrics.as_ref(), path, dispatch_response, audit_ctx),
+    )
+    .await
 }
 
 /// Context needed to write the `webhook.trigger` audit row for one dispatch

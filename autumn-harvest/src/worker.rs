@@ -27250,6 +27250,9 @@ fn spawn_replication_sampler(
                 .await
                 {
                     ShardSample::Fenced => {
+                        // Shutdown skips its database writes after this. See
+                        // `FenceRegistry::is_fenced_out` (issue #1823).
+                        crate::replication::FenceRegistry::mark_fenced_out();
                         cancel.cancel();
                         return;
                     }
@@ -27263,6 +27266,21 @@ fn spawn_replication_sampler(
             }
         }
     })
+}
+
+/// Whether a shutdown write must be skipped because this process lost write
+/// authority (issue #1823). Another region owns the rows now, and may reuse
+/// this worker id. The new region's orphan reclaim recovers the claims.
+fn skip_fenced_shutdown_write(worker_id: &str, what: &str) -> bool {
+    let fenced = crate::replication::FenceRegistry::is_fenced_out();
+    if fenced {
+        tracing::warn!(
+            worker_id,
+            what,
+            "skipping a shutdown write: this process lost DR write authority"
+        );
+    }
+    fenced
 }
 
 /// What one shard's DR sample concluded.
@@ -29063,6 +29081,9 @@ impl UnstartedClaim {
         let Some(claim) = self.claim else {
             return;
         };
+        if skip_fenced_shutdown_write(&claim.worker_id, "unstarted-claim release") {
+            return;
+        }
         let mut conn =
             match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
                 Ok(conn) => conn,
@@ -32887,6 +32908,9 @@ impl Worker {
     /// Best effort. A failure only makes a peer wait up to one sticky window.
     async fn release_sticky_pins(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
         let worker_id = self.config.worker_id.as_str();
+        if skip_fenced_shutdown_write(worker_id, "sticky-pin release") {
+            return;
+        }
         match acquire_shard_conn(pool, acquire_bound).await {
             Ok(mut conn) => match queue::release_worker_sticky_pins(&mut conn, worker_id).await {
                 Ok(released) => {
@@ -32964,6 +32988,9 @@ impl Worker {
         status: crate::workers::WorkerStatus,
         acquire_bound: Option<Duration>,
     ) {
+        if skip_fenced_shutdown_write(&self.config.worker_id, "fleet status update") {
+            return;
+        }
         match acquire_shard_conn(pool, acquire_bound).await {
             Ok(mut conn) => {
                 if let Err(error) =
@@ -33932,6 +33959,9 @@ impl Worker {
     /// id share one lease row, so each hides the other while both run. That
     /// is true of the normal heartbeat too.
     fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
+        if skip_fenced_shutdown_write(&self.config.worker_id, "shutdown lease keeper") {
+            return;
+        }
         let interval = keeper_interval(self.config.worker_heartbeat_interval);
         if self.dispatched.tracker.is_empty() {
             // Every body ended in the drain. One of them can still have left

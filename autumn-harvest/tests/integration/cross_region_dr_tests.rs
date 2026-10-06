@@ -3410,6 +3410,31 @@ async fn a_late_peer_row_fails_claims_and_ticks_closed() {
     assert!(tick.is_err(), "an unpinned row must stop a background tick");
 }
 
+/// A fenced worker refuses to join a process that already runs an unfenced
+/// worker (issue #1823). Its pins are process-wide, so the unfenced worker
+/// would check its writes against another database's generation.
+#[tokio::test]
+async fn a_fenced_worker_refuses_to_join_an_unfenced_process() {
+    let _serial = registry_guard().await;
+    let (plain_url, _plain) = require_db!("unfencedfirst");
+    let plain = dr_pool(&plain_url);
+    let plain_targets = Some((vec![(ShardId::new(0), plain.clone())], ShardId::new(0)));
+    let (fenced, _) = pin_worker_fence(DrFencing::Auto, DR_PREFIX, plain_targets, &plain, &[])
+        .await
+        .expect("a plain database runs unfenced");
+    assert!(fenced.is_none());
+
+    let (dr_url, _dr) = require_db!("fencedsecond");
+    let dr = dr_pool(&dr_url);
+    let dr_targets = Some((vec![(ShardId::new(0), dr.clone())], ShardId::new(0)));
+    let refused = pin_worker_fence(DrFencing::Enabled, DR_PREFIX, dr_targets, &dr, &[]).await;
+    assert!(
+        refused.is_err(),
+        "a fenced worker must not pin shards an unfenced worker already uses"
+    );
+    assert!(!FenceRegistry::is_enabled(), "nothing is published");
+}
+
 /// A held shard that turns out to carry a DR marker stops the worker. A pin
 /// is fixed for the life of a process, so it restarts and pins at startup.
 #[tokio::test]

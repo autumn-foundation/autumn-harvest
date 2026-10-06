@@ -660,6 +660,14 @@ struct Pinned {
     /// #1823). A claim scan there is not filtered by shard, so it checks
     /// them all.
     colocated: BTreeMap<i32, Vec<i32>>,
+    /// Whether a worker in this process started unfenced (issue #1823). A
+    /// later pin would apply to that worker's database too, so a fenced
+    /// worker then refuses to start.
+    unfenced_worker: bool,
+    /// Whether this process found one of its pins superseded (issue #1823).
+    /// Shutdown then skips its database bookkeeping. Another region owns
+    /// those rows now.
+    fenced_out: bool,
 }
 
 /// A [`FenceRegistry::publish`] rejected because the shard is already pinned at
@@ -1079,6 +1087,52 @@ impl FenceRegistry {
                 .get(&resolved.as_i32())
                 .map(|g| (resolved, *g))
         });
+        drop(guard);
+        found
+    }
+
+    /// Record that this process lost write authority (issue #1823). The
+    /// sampler calls it before it stops the worker.
+    pub fn mark_fenced_out() {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get_or_insert_with(Pinned::default).fenced_out = true;
+        drop(guard);
+    }
+
+    /// Whether this process lost write authority (issue #1823). Shutdown
+    /// writes check it and skip, because another region owns the rows.
+    #[must_use]
+    pub fn is_fenced_out() -> bool {
+        if !Self::is_enabled() {
+            return false;
+        }
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard.as_ref().is_some_and(|pinned| pinned.fenced_out);
+        drop(guard);
+        found
+    }
+
+    /// Record that a worker in this process started unfenced (issue #1823).
+    /// This sets no pin and does not turn the fence on.
+    pub fn mark_unfenced() {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get_or_insert_with(Pinned::default).unfenced_worker = true;
+        drop(guard);
+    }
+
+    /// Whether a worker in this process started unfenced (issue #1823).
+    #[must_use]
+    pub fn has_unfenced_worker() -> bool {
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard.as_ref().is_some_and(|pinned| pinned.unfenced_worker);
         drop(guard);
         found
     }
@@ -2323,7 +2377,19 @@ mod db {
                     .to_string(),
             ));
         }
+        // The reverse order: an unfenced worker already runs here. A pin
+        // published now would apply to that worker's database too.
+        if fence && FenceRegistry::has_unfenced_worker() {
+            return Err(crate::error::HarvestError::Config(
+                "this process already runs a worker whose databases carry no DR marker. The \
+                 fence registry is process-wide, so pinning DR shards now would check that \
+                 worker's writes against another database. Run this worker in its own \
+                 process, or set DrFencing::Enabled on both."
+                    .to_string(),
+            ));
+        }
         if !fence {
+            FenceRegistry::mark_unfenced();
             if !held.is_empty() {
                 let default_shard = targets
                     .as_ref()
@@ -3997,6 +4063,23 @@ mod tests {
 
         FenceRegistry::clear();
         assert!(!FenceRegistry::is_enabled());
+    }
+
+    /// A fenced-out process skips its shutdown writes (issue #1823). The flag
+    /// counts only while the fence is on, and a clear resets it.
+    #[test]
+    fn the_fenced_out_flag_follows_the_registry() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::mark_fenced_out();
+        assert!(
+            !FenceRegistry::is_fenced_out(),
+            "an unfenced process is never fenced out"
+        );
+        FenceRegistry::register(ShardId::new(0), ShardGeneration(1)).expect("pin");
+        assert!(FenceRegistry::is_fenced_out());
+        FenceRegistry::clear();
+        assert!(!FenceRegistry::is_fenced_out());
     }
 
     #[test]

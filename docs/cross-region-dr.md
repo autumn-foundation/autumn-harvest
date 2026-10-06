@@ -254,8 +254,13 @@ shard is plain:
   logical standby.
 - A process that pins DR shards refuses a worker whose databases carry no
   DR marker. The pins are process-wide, so that worker would check its
-  writes against another database. Run it in its own process, or set
-  `DrFencing::Enabled`.
+  writes against another database. The reverse order is refused too: a
+  process that runs an unfenced worker refuses a fenced one. Run each in
+  its own process, or set `DrFencing::Enabled` on both.
+- A worker that finds its pin superseded stops. Its shutdown then skips
+  its database writes: fleet status, sticky-pin release, claim release and
+  the lease keeper. Another region owns those rows. Its orphan reclaim
+  recovers the claims.
 - A fenced worker with an assigned shard it cannot reach refuses to start.
   It cannot pin that shard.
 - A fenced worker holds an unassigned shard it cannot reach, and it serves
