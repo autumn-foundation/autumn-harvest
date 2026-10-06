@@ -286,7 +286,8 @@ def duplicate_row_findings(path, text):
     for table in markdown_tables(text):
         seen = {}
         for n, cells in table:
-            cell = cells[0]
+            # Compare what a reader sees: `a.rs` and **a.rs** are one name.
+            cell = plain_markdown(cells[0])
             if not cell:
                 continue
             if cell in seen:
@@ -381,6 +382,9 @@ def self_test():
         "| `x \\| y` | 1 |\n| `x \\| z` | 1 |\n\n| `a.rs` | 3 |\n"
     )
     found = duplicate_row_findings("x.md", table)
+    assert len(found) == 1 and "x.md:4" in found[0], found
+    styled = "| M | P |\n|---|---|\n| `event.rs` | 1 |\n| **event.rs** | 2 |\n"
+    found = duplicate_row_findings("x.md", styled)
     assert len(found) == 1 and "x.md:4" in found[0], found
     sample = "```text\n| state |\n| state |\n```\n| `b.rs` | 1 |\n"
     assert duplicate_row_findings("x.md", sample) == []
