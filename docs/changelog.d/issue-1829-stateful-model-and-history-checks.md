@@ -9,7 +9,8 @@ cancel, worker death, worker revival and orphan reclaim. Each operation runs
 against a real Postgres and against a reference model. After each step the
 test compares the result, the rows of the case, the lifecycle events and
 the dead-letter count. It checks each run state change against
-`lifecycle::TRANSITIONS`, and the claim order against `scheduled_at`. A coverage check fails a run that misses a
+`lifecycle::TRANSITIONS`, and the claim order against the claim-order due
+time. A coverage check fails a run that misses a
 branch. CI runs 128 cases through a `linux` manifest row. The new nightly
 workflow `proptest-nightly.yml` runs 100000 cases of the `property` target
 and 100000 lifecycle cases in 8 shards. A failed scheduled run opens an

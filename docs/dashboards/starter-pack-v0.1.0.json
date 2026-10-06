@@ -6162,6 +6162,55 @@
             }
           ],
           "description": "Iterations completed per loop over 3h (issue #797) -- the low-frequency companion to the rate panel, and the panel to judge `retention` on. The window is deliberately LONGER than the slowest loop's cadence: the janitor polls hourly by default, so any window under an hour legitimately contains zero increments for much of every healthy hour and the \"zero means wedged\" reading would be false exactly where it is supposed to be authoritative. At 3h a healthy janitor floors at ~3. A series that stops incrementing is the wedge signal -- note that on the log axis a zero reads as a BREAK in the line rather than a dip to the baseline. The axis is log because a sub-second loop contributes ~21,600 ticks over the same window against the janitor's ~3, and a linear scale would pin retention indistinguishably to zero -- the exact illegibility this panel exists to fix. Retune alongside the alert's 3h window if you have changed the retention tick interval. Per-instance so one replica's wedged loop is not hidden by its healthy peers. A multi-shard worker runs one timeout/poison_pill/pause_auto_resume loop PER SHARD under one label, and the metric carries no shard label -- to catch a single-shard wedge use the scanner_liveness check in GET /admin/preflight, which names the wedged instance's shard."
+        },
+        {
+          "id": 934,
+          "type": "timeseries",
+          "title": "Scanner passes by role",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 132
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (scanner, shard, role, instance) (rate(harvest_scanner_pass_total[$__rate_interval]))",
+              "legendFormat": "{{scanner}} shard={{shard}} {{role}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Timeout-checker ticks by election role (issue #1795). One replica per shard should show `leader`. The others show `standby`. The non-standby rate summed over a shard is that shard's scan load: about one tick rate with election, N tick rates without it. A non-zero `fail_open` rate means the lease query fails on that replica, so it runs the pass unelected. This differs from `unelected`, where an operator turned election off. Check the harvest_scanner_leases migration, its grants, and lease row locks. Bounded labels: scanner, shard, role (4 values). See docs/runbooks/ha-deployment.md."
         }
       ]
     },
