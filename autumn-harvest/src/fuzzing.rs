@@ -677,18 +677,11 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
 /// that follows a parking one in the same run joins that batch too. A batch
 /// runs as one [`Op::Concurrent`], so the replayer matches all of it.
 pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
-    // A timer id that history cancels came from the cancellable timer API.
-    let cancellable: HashSet<&str> = history
-        .iter()
-        .filter_map(|event| match event {
-            WorkflowEvent::TimerCancelled { timer_id } => Some(timer_id.as_str()),
-            _ => None,
-        })
-        .collect();
+    let armed = armed_timer_starts(history);
     let mut program = Vec::new();
     let mut batch = Vec::new();
-    for event in history {
-        match mirror_event(event, &cancellable) {
+    for (index, event) in history.iter().enumerate() {
+        match mirror_event(event, armed.contains(&index)) {
             Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => batch.push(op),
             other => {
                 flush_batch(&mut program, &mut batch);
@@ -698,6 +691,34 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     }
     flush_batch(&mut program, &mut batch);
     program
+}
+
+/// The indexes of the `TimerStarted` events that the cancellable timer API
+/// wrote. Such a start is followed by a `TimerCancelled` for its id before
+/// any `TimerFired`. An id can be reused, so each start is judged alone.
+fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
+    let mut next_is_cancel: HashMap<&str, bool> = HashMap::new();
+    let mut armed = HashSet::new();
+    for (index, event) in history.iter().enumerate().rev() {
+        match event {
+            WorkflowEvent::TimerCancelled { timer_id } => {
+                next_is_cancel.insert(timer_id.as_str(), true);
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                next_is_cancel.insert(timer_id.as_str(), false);
+            }
+            WorkflowEvent::TimerStarted { timer_id, .. } => {
+                // The start consumes the next event, so an earlier start of a
+                // reused id looks further back.
+                let next = next_is_cancel.remove(timer_id.as_str());
+                if next == Some(true) {
+                    armed.insert(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    armed
 }
 
 fn flush_batch(program: &mut Vec<Op>, batch: &mut Vec<Op>) {
@@ -757,7 +778,7 @@ impl Op {
 }
 
 /// The op behind a lifecycle, activity, timer, signal or marker event.
-fn mirror_event(event: &WorkflowEvent, cancellable: &HashSet<&str>) -> Option<Op> {
+fn mirror_event(event: &WorkflowEvent, armed_timer: bool) -> Option<Op> {
     match event {
         WorkflowEvent::ActivityScheduled {
             name, input, queue, ..
@@ -773,7 +794,7 @@ fn mirror_event(event: &WorkflowEvent, cancellable: &HashSet<&str>) -> Option<Op
         WorkflowEvent::TimerStarted {
             timer_id,
             duration_secs,
-        } if cancellable.contains(timer_id.as_str()) => Some(Op::ArmTimer {
+        } if armed_timer => Some(Op::ArmTimer {
             id: timer_id.as_str().to_string(),
             secs: *duration_secs,
         }),
