@@ -459,6 +459,16 @@ async fn redrive_callback_dead_letter(
             ))
         })?;
 
+    // `not_before` is on the database clock. The callback scanner compares
+    // `next_attempt_at` with the host clock, so move it onto that clock.
+    let not_before = match not_before {
+        Some(at) => {
+            let db_now = crate::queue::db_now(conn).await?;
+            Some(to_host_clock(at, db_now, Utc::now()))
+        }
+        None => None,
+    };
+
     match crate::completion_callback::redrive_delivery_at(
         conn,
         exec_id,
@@ -478,6 +488,18 @@ async fn redrive_callback_dead_letter(
             )))
         }
     }
+}
+
+/// Move a database-clock instant onto the host clock (issue #1832).
+///
+/// The result is as far after `host_now` as `at` is after `db_now`.
+#[must_use]
+fn to_host_clock(
+    at: DateTime<Utc>,
+    db_now: DateTime<Utc>,
+    host_now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    host_now + (at - db_now)
 }
 
 /// The enqueue parameters that put `entry` back on its queue.
@@ -2753,6 +2775,20 @@ mod tests {
         assert_eq!(
             redrive_spread_offset(5, 10, StdDuration::ZERO, 7),
             StdDuration::ZERO
+        );
+    }
+
+    #[test]
+    fn to_host_clock_keeps_the_offset_across_clock_skew() {
+        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // The host runs 30 s ahead of the database.
+        let host_now = db_now + chrono::Duration::seconds(30);
+        let at = db_now + chrono::Duration::seconds(45);
+        assert_eq!(
+            to_host_clock(at, db_now, host_now),
+            host_now + chrono::Duration::seconds(45)
         );
     }
 
