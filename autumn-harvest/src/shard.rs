@@ -795,15 +795,14 @@ impl ShardRouter {
         if self.reserved_shards.is_empty() {
             return rendezvous_pick(&self.writable_shards, primary, secondary);
         }
-        rendezvous_pick(&self.unreserved_writable_shards(), primary, secondary)
+        // Never empty: `with_reserved_shards` keeps one writable shard free.
+        let candidates = self.without_reserved(&self.writable_shards);
+        rendezvous_pick(&candidates, primary, secondary)
     }
 
-    /// The writable shards that unpinned placement may pick (issue #1837).
-    ///
-    /// Never empty when `writable_shards` is not empty.
-    /// [`Self::with_reserved_shards`] refuses a set that would empty it.
-    fn unreserved_writable_shards(&self) -> Vec<ShardId> {
-        self.writable_shards
+    /// `shards` minus the reserved ones, in the same order (issue #1837).
+    fn without_reserved(&self, shards: &[ShardId]) -> Vec<ShardId> {
+        shards
             .iter()
             .copied()
             .filter(|shard| !self.is_reserved(*shard))
@@ -899,14 +898,9 @@ impl ShardRouter {
         } else {
             &self.writable_shards
         };
-        if self.reserved_shards.is_empty() {
-            return rendezvous_pick(primary, dag_name, "");
-        }
-        let candidates: Vec<ShardId> = primary
-            .iter()
-            .copied()
-            .filter(|shard| !self.is_reserved(*shard))
-            .collect();
+        let candidates = self.without_reserved(primary);
+        // Empty only when no shard is writable and all readable shards are
+        // reserved. The pick then keeps the pre-#1837 behaviour.
         if candidates.is_empty() {
             return rendezvous_pick(primary, dag_name, "");
         }
