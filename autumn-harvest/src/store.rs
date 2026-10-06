@@ -220,8 +220,8 @@ async fn insert_event_rows(
 ) -> HarvestResult<usize> {
     // Cross-region DR write-authority fence (issue #954).
     //
-    // Below the empty-append early return — an empty append writes nothing, so
-    // there is nothing to fence — and, when fencing is on, in the **same
+    // Callers skip an empty append — it writes nothing, so there is nothing to
+    // fence. When fencing is on, the fence runs in the **same
     // transaction** as the INSERT. That pairing is the whole guarantee: the
     // fence read's `ACCESS SHARE` is what blocks `bump_generation`'s
     // `ACCESS EXCLUSIVE`, and a lock taken by an autocommit statement is
@@ -257,15 +257,16 @@ async fn insert_event_rows(
 
 /// Append a decision boundary when the decision grew the history (issue #1833).
 ///
-/// `decision_start` is the next event id when the decision loaded its
-/// history. The boundary goes in only when the history grew since then, so a
-/// wake that writes nothing adds no row.
+/// Call it only for a decision that writes events of its own. As a second
+/// guard, the boundary goes in only when the history grew since
+/// `decision_start`, the next event id when the decision loaded its history.
 ///
 /// Call it inside the transaction that persists the decision outcome. The
 /// `FOR UPDATE` lock in [`next_event_id_for`] keeps the id valid.
 ///
 /// The insert stages no NOTIFY. The events of the decision already staged
-/// one, and the boundary must not change its `last_event_type`.
+/// one, and the boundary must not change its `last_event_type`. So the
+/// `event_count` of that notification does not count the boundary.
 ///
 /// Returns `true` when it appended the boundary.
 ///

@@ -982,7 +982,7 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
         resolved_payload: _,
         event_facts: l_facts,
         signal_name: l_signal,
-        // A display projection of `event_facts`.
+        // Attribution only. `event_facts` normalizes it, so a diff ignores it.
         decision: _,
         // Code-derived: a divergence is a code-vs-history mismatch, not a
         // property of the recording. `step_diff_kind` owns it.

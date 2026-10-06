@@ -935,6 +935,7 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Decision committed (build {}, worker {})",
+                    // Plain text: Mermaid can read `<none>` as an HTML tag.
                     if build_id.is_legacy() {
                         "none".to_string()
                     } else {
@@ -2030,6 +2031,19 @@ mod tests {
         let diagram = export_mermaid_sequence(&[decision_committed()]).expect("export");
         assert!(
             diagram.contains("Note over WF: Decision committed (build build-9, worker node-a)"),
+            "{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_names_a_missing_build_and_escapes_operator_text() {
+        let event = WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::legacy(),
+            worker_id: crate::types::WorkerId::new("node \"a\"\nx"),
+        };
+        let diagram = export_mermaid_sequence(&[event]).expect("export");
+        assert!(
+            diagram.contains("Note over WF: Decision committed (build none, worker node 'a' x)"),
             "{diagram}"
         );
     }

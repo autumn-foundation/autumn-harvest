@@ -429,10 +429,11 @@ impl ResidentWorkflow {
         delta: &'a [WorkflowEvent],
     ) -> Result<&'a WorkflowEvent, ResumeDeclined> {
         let mut events = delta.iter().filter(|event| !event.is_decision_boundary());
+        // A delta shorter than the own events is checked as far as it goes.
         let own_match = self
             .own_events
             .iter()
-            .all(|expected| events.next().is_some_and(|event| expected.matches(event)));
+            .all(|expected| events.next().is_none_or(|event| expected.matches(event)));
         if !own_match {
             return Err(ResumeDeclined::OwnEventsMismatch);
         }

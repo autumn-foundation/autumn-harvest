@@ -9,7 +9,8 @@
 //! suite starts a testcontainers Postgres 16.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use autumn_harvest::context::WorkflowHistoryPolicy;
 use autumn_harvest::event::WorkflowEvent;
@@ -80,11 +81,37 @@ async fn boundary_step(
 // Helpers.
 // ---------------------------------------------------------------------------
 
-fn registry(policy: WorkflowHistoryPolicy) -> Arc<HandlerRegistry> {
+/// Counts decisions. Each decision records one cache hit or one miss.
+#[derive(Default)]
+struct DecisionCount(AtomicU64);
+
+impl DecisionCount {
+    fn get(&self) -> u64 {
+        AtomicU64::load(&self.0, Ordering::SeqCst)
+    }
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for DecisionCount {
+    fn record_workflow_cache_hit(&self, _workflow_name: &str, _queue: &str) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_workflow_cache_miss(&self, _workflow_name: &str, _queue: &str) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn registry(policy: WorkflowHistoryPolicy, decisions: Arc<DecisionCount>) -> Arc<HandlerRegistry> {
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: decisions,
+        ..Default::default()
+    });
     Arc::new(
-        HandlerRegistry::new(
+        HandlerRegistry::with_state_and_telemetry(
             vec![boundary_two_steps_info(), boundary_signal_wait_info()],
             activities![boundary_step],
+            autumn_harvest::context::empty_shared_state(),
+            telemetry,
         )
         .with_history_policy(policy),
     )
@@ -95,6 +122,7 @@ struct Running {
     worker: Arc<Worker>,
     handle: tokio::task::JoinHandle<()>,
     worker_id: String,
+    decisions: Arc<DecisionCount>,
 }
 
 impl Running {
@@ -103,12 +131,33 @@ impl Running {
         let mut config = runtime_config(&worker_id, 2, 2, Duration::from_secs(10));
         config.queues = vec![queue.to_string()];
         config.build_id = BUILD_ID.to_string();
-        let worker = Arc::new(Worker::new(config, registry(policy)).expect("worker builds"));
+        let decisions = Arc::new(DecisionCount::default());
+        let worker = Arc::new(
+            Worker::new(config, registry(policy, Arc::clone(&decisions))).expect("worker builds"),
+        );
         let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
         Self {
             worker,
             handle,
             worker_id,
+            decisions,
+        }
+    }
+
+    /// Waits until `count` decisions ran and the workflow task is parked.
+    async fn wait_parked_after(
+        &self,
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        count: u64,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while self.decisions.get() < count || !is_parked(conn, exec_id).await {
+            assert!(
+                Instant::now() < deadline,
+                "workflow did not park after {count} decision(s)"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -197,6 +246,24 @@ async fn seed(
         .await
         .expect("enqueue workflow task");
     exec_id
+}
+
+/// A parked workflow task is `RUNNING` with no worker.
+async fn is_parked(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> bool {
+    #[derive(diesel::QueryableByName)]
+    struct Parked {
+        #[diesel(sql_type = BigInt)]
+        parked: i64,
+    }
+    diesel::sql_query(
+        "SELECT COUNT(*) AS parked FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow' \
+           AND state = 'RUNNING' AND worker_id IS NULL",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .get_result::<Parked>(conn)
+    .await
+    .is_ok_and(|row| row.parked == 1)
 }
 
 async fn history(url: &str, exec_id: ExecutionId) -> Vec<WorkflowEvent> {
@@ -289,12 +356,18 @@ async fn a_wake_that_appends_nothing_records_no_boundary() {
     )
     .await;
 
-    // The first decision only parks on the signal wait.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Decision 1 only parks on the signal wait.
+    running.wait_parked_after(&mut conn, exec_id, 1).await;
     autumn_harvest::signal::send_signal(&mut conn, exec_id, "other", serde_json::json!(1))
         .await
         .expect("send other");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Decision 2 reads `other` and parks again. It appends nothing.
+    running.wait_parked_after(&mut conn, exec_id, 2).await;
+    assert_eq!(
+        type_names(&history(&url, exec_id).await),
+        ["WorkflowStarted", "SignalReceived"],
+        "two no-op decisions must write no boundary"
+    );
     autumn_harvest::signal::send_signal(&mut conn, exec_id, "approve", serde_json::json!(2))
         .await
         .expect("send approve");
@@ -395,7 +468,7 @@ async fn measure_boundary_storage_overhead() {
         .expect("other rows");
     println!("issue #1833 storage: {rows:#?}");
     assert_eq!(boundary.rows, 3);
-    // The JSON text of one boundary here is about 100 bytes: the type tag,
+    // The JSON text of one boundary here is about 115 bytes: the type tag,
     // two keys, a 10-byte build id and a 38-byte worker id. The jsonb form
     // adds a header and offsets. 160 bytes catches a field added by mistake.
     let per_boundary = boundary.data_bytes / boundary.rows;

@@ -252,23 +252,6 @@ impl WorkflowHistoryPolicy {
         self.history_bloat_warn_fraction
     }
 
-    /// Override the history-bloat soft-warning fraction (issue #704). The
-    /// value is **clamped** into `[0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]`
-    /// (strictly below `1.0` -- see that constant's doc comment for why).
-    /// `0.0` disables the signal entirely (AC4) -- a naive threshold of
-    /// `cap * 0.0 == 0` would instead fire on the very first recorded event,
-    /// which is never the intent.
-    ///
-    /// `f64::NAN` is normalized to [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`]
-    /// rather than silently passed through (PR #1139 review, P2): `f64::clamp`
-    /// leaves `NAN` untouched (both of its internal comparisons against `NAN`
-    /// are `false`, so neither bound is ever applied), and a stored `NAN`
-    /// would make every later `cap as f64 * NAN` compute `NAN`, which casts to
-    /// `0` -- tripping the soft threshold on the very first suspended cycle of
-    /// *every* execution regardless of its actual history size. Normalizing
-    /// to the documented default (rather than to `0.0`/disabled) is the safer
-    /// failure mode for a garbage/corrupted config value: it keeps the signal
-    /// behaving as if unconfigured instead of silently going dark forever.
     /// Whether each decision appends a
     /// [`DecisionCommitted`](crate::event::WorkflowEvent::DecisionCommitted)
     /// boundary (issue #1833). Defaults to `true`.
@@ -288,6 +271,23 @@ impl WorkflowHistoryPolicy {
         self
     }
 
+    /// Override the history-bloat soft-warning fraction (issue #704). The
+    /// value is **clamped** into `[0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]`
+    /// (strictly below `1.0` -- see that constant's doc comment for why).
+    /// `0.0` disables the signal entirely (AC4) -- a naive threshold of
+    /// `cap * 0.0 == 0` would instead fire on the very first recorded event,
+    /// which is never the intent.
+    ///
+    /// `f64::NAN` is normalized to [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`]
+    /// rather than silently passed through (PR #1139 review, P2): `f64::clamp`
+    /// leaves `NAN` untouched (both of its internal comparisons against `NAN`
+    /// are `false`, so neither bound is ever applied), and a stored `NAN`
+    /// would make every later `cap as f64 * NAN` compute `NAN`, which casts to
+    /// `0` -- tripping the soft threshold on the very first suspended cycle of
+    /// *every* execution regardless of its actual history size. Normalizing
+    /// to the documented default (rather than to `0.0`/disabled) is the safer
+    /// failure mode for a garbage/corrupted config value: it keeps the signal
+    /// behaving as if unconfigured instead of silently going dark forever.
     #[must_use]
     pub const fn with_history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
         self.history_bloat_warn_fraction = if fraction.is_nan() {

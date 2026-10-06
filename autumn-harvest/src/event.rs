@@ -917,12 +917,13 @@ pub enum WorkflowEvent {
     // ── Decision boundary (issue #1833) ───────────────────────────────────────
     /// A worker committed one decision. This event closes that decision.
     ///
-    /// The events since the previous boundary were committed while this
-    /// decision ran. The worker writes the boundary in the transaction that
-    /// persists the decision outcome.
+    /// The worker writes it in the transaction that persists the decision
+    /// outcome, just after the outcome events. Other writers also add events
+    /// between two boundaries, for example activity results and signals. The
+    /// boundary does not attribute those events.
     ///
-    /// Replay never matches this event. It is transparent to every scan, so
-    /// a history with or without boundaries replays the same way.
+    /// Replay never matches this event. The matcher marks it consumed, as it
+    /// does for pause and resume. It still counts toward the history length.
     DecisionCommitted {
         /// Build id of the worker. Empty when the worker has no build id.
         build_id: BuildId,

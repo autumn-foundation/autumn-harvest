@@ -18892,9 +18892,11 @@ async fn handle_suspended_workflow(
     .await
 }
 
-/// The boundary row a decision adds to its history, for the history-size
-/// counts (issue #1833). `appends` is `true` when the decision grows the
-/// history, because only such a decision writes a boundary.
+/// Returns 1 when the decision writes a boundary, else 0 (issue #1833).
+///
+/// The history-cap checks and the history-size gauge add this value. Set
+/// `appends` when the decision grows the history. Only such a decision
+/// writes a boundary.
 fn decision_boundary_reserve(registry: &HandlerRegistry, appends: bool) -> u64 {
     u64::from(appends && registry.history_policy().decision_boundaries())
 }
@@ -18902,17 +18904,19 @@ fn decision_boundary_reserve(registry: &HandlerRegistry, appends: bool) -> u64 {
 /// Appends the boundary of this decision when the policy allows it
 /// (issue #1833).
 ///
-/// It runs in the transaction that persists the decision outcome. A decision
-/// that appended no event since `decision_start` gets no boundary.
+/// It runs in the transaction that persists the decision outcome. `appends`
+/// tells whether this decision writes events of its own. A decision that
+/// writes none gets no boundary, even when another writer appended meanwhile.
 async fn record_decision_boundary(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     exec_id: ExecutionId,
     decision_start: i32,
+    appends: bool,
     worker_id: &str,
     build_id: &str,
 ) -> HarvestResult<()> {
-    if !registry.history_policy().decision_boundaries() {
+    if !appends || !registry.history_policy().decision_boundaries() {
         return Ok(());
     }
     let boundary = WorkflowEvent::DecisionCommitted {
@@ -24217,14 +24221,21 @@ async fn process_workflow_task(
         // Issue #1797: returned at the gate above; it appends no event.
         WorkflowOutcome::TaskFailed { .. } => 0,
     };
-    // The decision also appends its boundary when it grows the history
-    // (issue #1833).
-    let decision_appends =
-        pending_durable_event_count > 0 || next_event_id > decision_start_event_id;
+    // Whether this decision writes events of its own (issue #1833). Inline
+    // steps already advanced `next_event_id`. A terminal outcome always
+    // writes its terminal event.
+    let inline_appends = next_event_id > decision_start_event_id;
+    let stays_running = matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    let decision_appends = inline_appends || pending_durable_event_count > 0 || !stays_running;
+    // The preflight never counts the terminal event. So it also skips the
+    // boundary after a terminal, and reserves it only for a running run.
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
         .saturating_add(pending_durable_event_count)
-        .saturating_add(decision_boundary_reserve(registry, decision_appends));
+        .saturating_add(decision_boundary_reserve(
+            registry,
+            decision_appends && stays_running,
+        ));
 
     if let Some(cap) = registry.history_policy().event_hard_cap()
         && current_history_event_count >= cap
@@ -24515,6 +24526,7 @@ async fn process_workflow_task(
                     registry,
                     prepared.exec_id,
                     decision_start_event_id,
+                    inline_appends,
                     worker_id,
                     build_id,
                 )
@@ -24586,6 +24598,7 @@ async fn process_workflow_task(
                 registry,
                 prepared.exec_id,
                 decision_start_event_id,
+                decision_appends,
                 worker_id,
                 build_id,
             )
