@@ -311,6 +311,11 @@ pub enum Op {
         /// Lock key.
         key: String,
     },
+    /// Runs the ops concurrently, as `join!` does.
+    Concurrent {
+        /// The ops of one command batch.
+        ops: Vec<Op>,
+    },
     /// Return `Ok(output)`.
     Complete {
         /// Workflow output.
@@ -641,8 +646,51 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
 /// the other events itself, or reports them. The match lists every variant,
 /// so a new variant needs a decision here: an op, or `None`.
 #[must_use]
+///
+/// Consecutive commands that park, with no other event between them, came
+/// from one batch, such as a `join!` of two activities. They run as one
+/// [`Op::Concurrent`], so the replayer matches the whole batch.
 pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
-    history.iter().filter_map(mirror_event).collect()
+    let mut program = Vec::new();
+    let mut batch = Vec::new();
+    for event in history {
+        match mirror_event(event) {
+            Some(op) if op.parks() => batch.push(op),
+            other => {
+                flush_batch(&mut program, &mut batch);
+                program.extend(other);
+            }
+        }
+    }
+    flush_batch(&mut program, &mut batch);
+    program
+}
+
+fn flush_batch(program: &mut Vec<Op>, batch: &mut Vec<Op>) {
+    match batch.len() {
+        0 => {}
+        1 => program.append(batch),
+        _ => program.push(Op::Concurrent {
+            ops: std::mem::take(batch),
+        }),
+    }
+}
+
+impl Op {
+    /// True for an op that waits on a later event, such as an activity
+    /// result. Only such ops can share a batch. A local activity cannot
+    /// join a batch, so it is not one.
+    const fn parks(&self) -> bool {
+        matches!(
+            self,
+            Self::Activity { .. }
+                | Self::Timer { .. }
+                | Self::Signal { .. }
+                | Self::Child { .. }
+                | Self::ExternalActivity { .. }
+                | Self::AwaitExternal { .. }
+        )
+    }
 }
 
 /// The op behind a lifecycle, activity, timer, signal or marker event.
@@ -846,6 +894,15 @@ async fn run_op(ctx: &WorkflowContext, op: Op) -> Option<Result<Value, String>> 
         }
         Op::Complete { output } => return Some(Ok(output)),
         Op::Fail { error } => return Some(Err(error)),
+        Op::Concurrent { ops } => {
+            let runs = ops.into_iter().map(|op| Box::pin(run_op(ctx, op)));
+            // The first result in program order wins, as in a sequence.
+            return futures::future::join_all(runs)
+                .await
+                .into_iter()
+                .flatten()
+                .next();
+        }
         other => run_external_op(ctx, other).await,
     }
     None
