@@ -378,10 +378,32 @@ pub fn ramp_generation_id(ramp_id: Uuid, queue: &str, base: &str, target: &str) 
     Uuid::from_bytes(bytes)
 }
 
+/// The retired id of one caller's ramp to one target on `queue`, whatever its
+/// base (issue #1814).
+///
+/// The ramp guard retires it on every pool when it aborts a ramp. A fan-out
+/// can miss a pool, and a retry there can have another base. Its stored
+/// [`ramp_generation_id`] then differs, but this id is the same. It holds
+/// the target, so one policy fan-out that keeps two targets under one
+/// caller id keeps them apart. It is [`ramp_generation_id`] with an empty
+/// base, so a real empty base gives the same id for the same caller and
+/// target.
+#[must_use]
+pub fn ramp_caller_target_id(caller: Uuid, queue: &str, target: &str) -> Uuid {
+    ramp_generation_id(caller, queue, "", target)
+}
+
+/// The SQL form of [`ramp_caller_target_id`]. The arguments are SQL
+/// expressions.
+#[cfg(feature = "db")]
+pub(crate) fn ramp_caller_target_id_sql(caller: &str, queue: &str, target: &str) -> String {
+    ramp_generation_id_sql(caller, queue, "''", target)
+}
+
 /// The SQL form of [`ramp_generation_id`]. `{id}`, `{queue}`, `{base}` and
 /// `{target}` are SQL expressions.
 #[cfg(feature = "db")]
-fn ramp_generation_id_sql(id: &str, queue: &str, base: &str, target: &str) -> String {
+pub(crate) fn ramp_generation_id_sql(id: &str, queue: &str, base: &str, target: &str) -> String {
     format!(
         "encode(substring(sha256(convert_to({id}::text \
          || '/' || octet_length(convert_to({queue}, 'UTF8')) || ':' || {queue} \
@@ -456,7 +478,12 @@ async fn upsert_build_policy_with_ramp_id(
         "EXCLUDED.build_id",
         "harvest_build_policies.target_build_id",
     );
-    let aborted = generation_aborted_sql(&derived);
+    let caller_target = ramp_caller_target_id_sql(
+        "$5",
+        "EXCLUDED.queue_name",
+        "harvest_build_policies.target_build_id",
+    );
+    let aborted = generation_aborted_sql(&derived, &caller_target);
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "INSERT INTO harvest_build_policies (id, queue_name, build_id, deployment_name) \
          VALUES ($1, $2, $3, $4) \
@@ -622,7 +649,8 @@ async fn update_build_ramp_with_id(
     ramp_id: Uuid,
 ) -> HarvestResult<BuildPolicy> {
     let derived = ramp_generation_id_sql("$4", "$1", "build_id", "$2");
-    let aborted = generation_aborted_sql(&derived);
+    let caller_target = ramp_caller_target_id_sql("$4", "$1", "$2");
+    let aborted = generation_aborted_sql(&derived, &caller_target);
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "UPDATE harvest_build_policies \
          SET target_build_id = $2, ramp_percent = $3, ramp_id = {derived}, \
@@ -656,7 +684,8 @@ async fn update_build_ramp_with_id(
         ))
     })?;
     let stored = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
-    if ramp_generation_aborted(conn, queue_name, &[stored, ramp_id]).await? {
+    let caller_target = ramp_caller_target_id(ramp_id, queue_name, target_build_id);
+    if ramp_generation_aborted(conn, queue_name, &[stored, ramp_id, caller_target]).await? {
         return Err(aborted_generation_error(queue_name, target_build_id));
     }
     Ok(policy)
@@ -760,16 +789,18 @@ async fn retire_replaced_ramp_id(
 /// It reads the abort markers of the row, the report ledger of this
 /// database and its retired ids. The guard prunes markers after a while,
 /// but the ledger keeps the id of every reported abort. A ramp writer or a
-/// manual clear records each id that it removes as retired.
+/// manual clear records each id that it removes as retired. The guard's
+/// abort retires `{caller_target}`, the [`ramp_caller_target_id`] of the
+/// request, on every pool.
 #[cfg(feature = "db")]
-fn generation_aborted_sql(id: &str) -> String {
+fn generation_aborted_sql(id: &str, caller_target: &str) -> String {
     format!(
         "(harvest_build_policies.ramp_aborted \
               @> jsonb_build_array(jsonb_build_object('id', ({id})::text)) \
           OR EXISTS (SELECT 1 FROM harvest_ramp_abort_reports r WHERE r.ramp_id = {id}) \
           OR EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x \
                      WHERE x.queue_name = harvest_build_policies.queue_name \
-                       AND x.ramp_id = {id}))"
+                       AND x.ramp_id IN ({id}, {caller_target})))"
     )
 }
 

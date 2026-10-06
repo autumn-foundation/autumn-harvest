@@ -311,6 +311,20 @@ The guard fails safe: when it cannot read, it does not abort.
   is refused all the same. The guard's abort retires it in the same
   statement as the clear, so an aborted ramp also stays aborted on a new
   base.
+- The abort retires the caller id together with the target, as
+  `ramp_caller_target_id`. One policy fan-out can give one caller id to
+  ramps with different targets on different pools. An abort of one target
+  then leaves the other alone.
+- A fan-out can miss a pool, so that pool holds no row of the aborted ramp.
+  The abort marker keeps the caller id as `caller`. Right after the clear,
+  and again on each pass while the marker lives, the guard retires it on
+  every pool. It does so under the ramp generation lock, and it clears a
+  live ramp of that caller and target. A late retry on the missed pool is
+  then refused, whatever its base. A pass prunes a marker only after every
+  pool has that tombstone.
+- A writer from before the `ramp_id` column keeps the old caller id when it
+  changes a ramp. The reset trigger drops that stale `ramp_caller_id` along
+  with the stale `ramp_id`.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported and older than `report_grace`. A pool can still

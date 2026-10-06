@@ -48144,9 +48144,11 @@ async fn refuse_aborted_ramp(
     ramp_id: uuid::Uuid,
 ) -> Result<(), axum::response::Response> {
     use autumn_harvest::build_routing::{
-        aborted_generation_error, get_build_policy, ramp_generation_aborted, ramp_generation_id,
+        aborted_generation_error, get_build_policy, ramp_caller_target_id, ramp_generation_aborted,
+        ramp_generation_id,
     };
 
+    let caller_target = ramp_caller_target_id(ramp_id, queue_name, target_build_id);
     let refused = || conflict_from(aborted_generation_error(queue_name, target_build_id));
     let unchecked = |shard: ShardId, error: &dyn std::fmt::Display| {
         AutumnError::service_unavailable_msg(format!(
@@ -48170,7 +48172,7 @@ async fn refuse_aborted_ramp(
             continue;
         };
         let generation = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
-        if ramp_generation_aborted(&mut conn, queue_name, &[generation, ramp_id])
+        if ramp_generation_aborted(&mut conn, queue_name, &[generation, ramp_id, caller_target])
             .await
             .map_err(|e| unchecked(shard_id, &e))?
         {
@@ -48178,7 +48180,7 @@ async fn refuse_aborted_ramp(
         }
         generations.push(generation);
     }
-    generations.push(ramp_id);
+    generations.extend([ramp_id, caller_target]);
     let mut conn = acquire_conn(pool.default_pool())
         .await
         .map_err(axum::response::IntoResponse::into_response)?;

@@ -423,6 +423,13 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
 ///
 /// The same statement retires the row's `ramp_caller_id`. A retry after a
 /// base change derives another stored id, so only the caller id refuses it.
+/// It retires the [`ramp_caller_target_id`] of the caller id and the target,
+/// not the raw caller id. One policy fan-out can give one caller id to two
+/// targets, and an abort of one must not refuse the other. The marker keeps
+/// that id as `caller`. A later pass retires it on every pool, also on a pool
+/// that the fan-out missed. The subquery is the SQL form of that id.
+///
+/// [`ramp_caller_target_id`]: crate::build_routing::ramp_caller_target_id
 /// The retire reads the output of the clear, so it retires an id only when
 /// the clear changed that row. The subquery reads the caller id before the
 /// clear. A concurrent writer changes `updated_at`, so the pinned step
@@ -433,13 +440,18 @@ pub const fn abort_ramp_query() -> &'static str {
          UPDATE harvest_build_policies \
          SET ramp_aborted = jsonb_build_array(jsonb_build_object( \
                      'id', COALESCE(ramp_id, $5), 'base', build_id, \
-                     'target', target_build_id, 'reported', false, \
+                     'target', target_build_id, 'caller', old.caller, \
+                     'reported', false, \
                      'at', (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)) \
                      || ramp_aborted, \
              ramp_id = NULL, ramp_caller_id = NULL, target_build_id = NULL, \
              ramp_percent = NULL, updated_at = NOW() \
-         FROM (SELECT ramp_caller_id AS caller FROM harvest_build_policies \
-               WHERE queue_name = $1) AS old \
+         FROM (SELECT encode(substring(sha256(convert_to(ramp_caller_id::text \
+                   || '/' || octet_length(convert_to(queue_name, 'UTF8')) || ':' || queue_name \
+                   || '/0:' \
+                   || '/' || octet_length(convert_to(target_build_id, 'UTF8')) || ':' \
+                   || target_build_id, 'UTF8')) FROM 1 FOR 16), 'hex')::uuid AS caller \
+               FROM harvest_build_policies WHERE queue_name = $1) AS old \
          WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
            AND updated_at = $4 \
          RETURNING queue_name, old.caller, (ramp_aborted -> 0 ->> 'id')::uuid AS marker_id \
@@ -727,6 +739,9 @@ struct PoolRamp {
     /// The ramp's identity, or `None` for a ramp set before the column
     /// existed.
     ramp_id: Option<uuid::Uuid>,
+    /// The [`crate::build_routing::ramp_caller_target_id`] of the request
+    /// that set the ramp.
+    caller: Option<uuid::Uuid>,
     ramp_percent: i32,
     base: BuildOutcomeStats,
     target: BuildOutcomeStats,
@@ -745,6 +760,9 @@ struct ObservedRamp {
     /// `true` when a guard abort marker holds the `ramp_id` of this
     /// generation. That is the trace of a partial clear.
     abort_marked: bool,
+    /// The [`crate::build_routing::ramp_caller_target_id`]s of the requests
+    /// that the pools hold for this generation.
+    callers: std::collections::BTreeSet<uuid::Uuid>,
 }
 
 /// A guard abort marker on one pool: the queue, the base build and the
@@ -797,6 +815,7 @@ fn merge_partial_stamps(merged: &mut std::collections::BTreeMap<GenerationKey, O
             whole.target = whole.target.plus(part.target);
             whole.steps.extend(part.steps);
             whole.steps.sort_unstable();
+            whole.callers.extend(part.callers);
         }
     }
 }
@@ -811,6 +830,9 @@ struct StoredMarker {
     id: uuid::Uuid,
     /// The target build of the cleared ramp, when the marker holds it.
     target: Option<String>,
+    /// The [`crate::build_routing::ramp_caller_target_id`] of the cleared
+    /// ramp, when the marker holds it.
+    caller: Option<uuid::Uuid>,
     /// `true` when a guard reported the abort.
     reported: bool,
     /// The age of the marker in milliseconds, by the clock of its own pool.
@@ -894,6 +916,8 @@ struct PolicyRow {
     ramp_percent: Option<i32>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     ramp_id: Option<uuid::Uuid>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    ramp_caller_id: Option<uuid::Uuid>,
     #[diesel(sql_type = diesel::sql_types::Jsonb)]
     ramp_aborted: serde_json::Value,
     /// The pool clock in epoch milliseconds, to age the markers.
@@ -922,6 +946,10 @@ fn abort_markers(
                 .get("target")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            let caller = entry
+                .get("caller")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|caller| caller.parse().ok());
             let reported = entry
                 .get("reported")
                 .and_then(serde_json::Value::as_bool)
@@ -938,6 +966,7 @@ fn abort_markers(
                 base,
                 id,
                 target,
+                caller,
                 reported,
                 age_ms,
                 claim_age_ms,
@@ -968,7 +997,7 @@ async fn read_pool_ramps(
                 .map_err(crate::error::database_error)?;
             let policies: Vec<PolicyRow> = diesel::sql_query(
                 "SELECT queue_name, build_id, updated_at, target_build_id, ramp_percent, \
-                        ramp_id, ramp_aborted, \
+                        ramp_id, ramp_caller_id, ramp_aborted, \
                         (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint AS now_ms \
                  FROM harvest_build_policies ORDER BY queue_name",
             )
@@ -993,10 +1022,14 @@ async fn read_pool_ramps(
                     continue;
                 }
                 let (base, target_stats) = read_step_stats(conn, &policy, &target).await?;
+                let caller = policy.ramp_caller_id.map(|caller| {
+                    crate::build_routing::ramp_caller_target_id(caller, &policy.queue_name, &target)
+                });
                 ramps.push(PoolRamp {
                     key: (policy.queue_name.clone(), policy.build_id.clone(), target),
                     step: policy.updated_at,
                     ramp_id: policy.ramp_id,
+                    caller,
                     ramp_percent: percent,
                     base,
                     target: target_stats,
@@ -1061,6 +1094,7 @@ async fn read_ramps(
             slot.base = slot.base.plus(ramp.base);
             slot.target = slot.target.plus(ramp.target);
             slot.steps.push((index, ramp.step));
+            slot.callers.extend(ramp.caller);
         }
         markers.extend(
             pool_markers
@@ -1080,24 +1114,30 @@ async fn read_ramps(
             ramp_id.map(|ramp_id| (queue.clone(), base.clone(), ramp_id))
         })
         .collect();
-    let (unreported, half_marked, finished_markers) =
+    let (unreported, half_marked, finished_markers, marker_callers) =
         classify_finished_markers(pool_markers_by_index, &live, report_grace, claim_lease);
     Some(FleetRead {
         ramps: merged,
         finished_markers,
         unreported,
         half_marked,
+        marker_callers,
     })
 }
 
 /// The marker work of one pass: the unreported aborts, the half-marked
-/// aborts and the finished markers.
+/// aborts, the finished markers and the caller ids of every marker.
 #[cfg(feature = "db")]
 type MarkerWork = (
     Vec<UnreportedAbort>,
     Vec<(String, uuid::Uuid, Vec<usize>)>,
     Vec<(usize, String, Vec<uuid::Uuid>)>,
+    MarkerCallers,
 );
+
+/// The caller ids of the abort markers on any pool, per queue.
+#[cfg(feature = "db")]
+type MarkerCallers = std::collections::BTreeMap<String, std::collections::BTreeSet<uuid::Uuid>>;
 
 /// A finished abort that no guard reported, from its unreported markers.
 #[cfg(feature = "db")]
@@ -1131,8 +1171,12 @@ fn classify_finished_markers(
     // pruned, but an unreported abort is still recovered. A guard can lose
     // its pending report in a restart while that pool rejects the clear.
     let mut held = std::collections::BTreeSet::new();
+    let mut callers = MarkerCallers::new();
     for (index, pool_markers) in pool_markers_by_index.into_iter().enumerate() {
         for (queue, marker) in pool_markers {
+            if let Some(caller) = marker.caller {
+                callers.entry(queue.clone()).or_default().insert(caller);
+            }
             if live.contains(&(queue.clone(), marker.base.clone(), marker.id)) {
                 held.insert((queue.clone(), marker.id));
             }
@@ -1202,7 +1246,7 @@ fn classify_finished_markers(
         .into_iter()
         .map(|((index, queue), ids)| (index, queue, ids))
         .collect();
-    (unreported, half_marked, finished)
+    (unreported, half_marked, finished, callers)
 }
 
 /// One read of every pool.
@@ -1221,6 +1265,8 @@ struct FleetRead {
     /// pool. Each holds the queue, the `ramp_id` and the pools that still
     /// need the mark.
     half_marked: Vec<(String, uuid::Uuid, Vec<usize>)>,
+    /// The caller ids of the abort markers on any pool, per queue.
+    marker_callers: MarkerCallers,
 }
 
 /// Write a tombstone for each of `ramp_ids` into the report ledger of one
@@ -1236,18 +1282,31 @@ struct FleetRead {
 /// the abort once the markers are gone. A tombstone row never starts a
 /// report. Only the audit pool's ledger elects a reporter, and the guard
 /// prunes only the markers of a reported abort.
+///
+/// The same write retires each of `callers` on the pool, and clears a live
+/// ramp of one. Each is a [`crate::build_routing::ramp_caller_target_id`]. A
+/// fan-out can miss a pool, so that pool holds no row of the aborted ramp. A
+/// late retry there can have another base and so another stored id. Only
+/// its caller id and target refuse it.
 #[cfg(feature = "db")]
 async fn record_abort_tombstones(
     pool: &crate::worker::DbPool,
     index: usize,
     queue: &str,
     ramp_ids: &[uuid::Uuid],
+    callers: &[uuid::Uuid],
     bound: Duration,
 ) -> bool {
     use diesel::sql_types::{Array, Text};
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
     let timeout_ms = bound.as_millis().max(1);
+    let caller_target = crate::build_routing::ramp_caller_target_id_sql(
+        "ramp_caller_id",
+        "queue_name",
+        "target_build_id",
+    );
+    let caller_target = caller_target.as_str();
     let write = async {
         let mut conn = pool.get().await.map_err(|e| e.to_string())?;
         conn.transaction(async |conn| -> crate::error::HarvestResult<()> {
@@ -1271,28 +1330,40 @@ async fn record_abort_tombstones(
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
-            // A late write of an aborted ramp holds a caller id too. Retire it,
-            // so a retry after a base change is refused as well.
             diesel::sql_query(
                 "INSERT INTO harvest_ramp_retired_ids (queue_name, ramp_id) \
-                 SELECT queue_name, ramp_caller_id FROM harvest_build_policies \
-                 WHERE queue_name = $1 AND ramp_id = ANY($2::uuid[]) \
-                   AND ramp_caller_id IS NOT NULL \
+                 SELECT $1, id FROM unnest($2::uuid[]) AS t(id) \
                  ON CONFLICT (queue_name, ramp_id) DO NOTHING",
             )
+            .bind::<Text, _>(queue)
+            .bind::<Array<diesel::sql_types::Uuid>, _>(callers)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+            // A late write of an aborted ramp holds a caller id too. Retire it,
+            // so a retry after a base change is refused as well.
+            diesel::sql_query(format!(
+                "INSERT INTO harvest_ramp_retired_ids (queue_name, ramp_id) \
+                 SELECT queue_name, {caller_target} FROM harvest_build_policies \
+                 WHERE queue_name = $1 AND ramp_id = ANY($2::uuid[]) \
+                   AND ramp_caller_id IS NOT NULL \
+                 ON CONFLICT (queue_name, ramp_id) DO NOTHING"
+            ))
             .bind::<Text, _>(queue)
             .bind::<Array<diesel::sql_types::Uuid>, _>(ramp_ids)
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
-            let cleared = diesel::sql_query(
+            let cleared = diesel::sql_query(format!(
                 "UPDATE harvest_build_policies \
                  SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, \
                      ramp_caller_id = NULL, updated_at = NOW() \
-                 WHERE queue_name = $1 AND ramp_id = ANY($2::uuid[])",
-            )
+                 WHERE queue_name = $1 \
+                   AND (ramp_id = ANY($2::uuid[]) OR {caller_target} = ANY($3::uuid[]))"
+            ))
             .bind::<Text, _>(queue)
             .bind::<Array<diesel::sql_types::Uuid>, _>(ramp_ids)
+            .bind::<Array<diesel::sql_types::Uuid>, _>(callers)
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -2039,6 +2110,7 @@ impl RampGuard {
             finished_markers,
             unreported,
             half_marked,
+            marker_callers,
         }) = read
         else {
             return aborts;
@@ -2079,13 +2151,14 @@ impl RampGuard {
                 target: ramp.target,
                 incomplete: false,
             };
+            let callers: Vec<uuid::Uuid> = ramp.callers.iter().copied().collect();
             if let Some(abort) = self
                 .abort(
                     pools,
                     audit_pool,
                     metrics,
                     generation,
-                    &ramp.steps,
+                    (&ramp.steps, &callers),
                     abort,
                     bound,
                     cancel,
@@ -2100,7 +2173,7 @@ impl RampGuard {
                 pools,
                 audit_pool,
                 metrics,
-                (unreported, half_marked, finished_markers),
+                (unreported, half_marked, finished_markers, marker_callers),
                 bound,
                 cancel,
             )
@@ -2118,7 +2191,7 @@ impl RampGuard {
         pools: &[crate::worker::DbPool],
         audit_pool: &crate::worker::DbPool,
         metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
-        (unreported, half_marked, finished_markers): MarkerWork,
+        (unreported, half_marked, finished_markers, marker_callers): MarkerWork,
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<RampAbort> {
@@ -2146,31 +2219,39 @@ impl RampGuard {
         }
         // Every pool gets a tombstone of a finished abort before any pool
         // loses its marker. A pool that misses the tombstone keeps the
-        // markers of that queue until a later pass writes it.
-        let mut finished: std::collections::BTreeMap<
-            String,
-            std::collections::BTreeSet<uuid::Uuid>,
-        > = std::collections::BTreeMap::new();
+        // markers of that queue until a later pass writes it. The caller ids
+        // of every marker go to every pool on each pass. So a pool that a
+        // fan-out missed, or that was down, still retires them.
+        let mut finished = MarkerCallers::new();
         for (_, queue, ramp_ids) in &finished_markers {
             finished
                 .entry(queue.clone())
                 .or_default()
                 .extend(ramp_ids.iter().copied());
         }
+        let queues: std::collections::BTreeSet<&String> =
+            finished.keys().chain(marker_callers.keys()).collect();
         let mut tombstoned = std::collections::BTreeSet::new();
-        for (queue, ramp_ids) in finished {
-            let ramp_ids: Vec<uuid::Uuid> = ramp_ids.into_iter().collect();
+        for queue in queues {
+            let ramp_ids: Vec<uuid::Uuid> = finished
+                .get(queue)
+                .map(|ids| ids.iter().copied().collect())
+                .unwrap_or_default();
+            let callers: Vec<uuid::Uuid> = marker_callers
+                .get(queue)
+                .map(|ids| ids.iter().copied().collect())
+                .unwrap_or_default();
             let mut all = true;
             for (index, pool) in pools.iter().enumerate() {
                 if cancel.is_cancelled()
-                    || !record_abort_tombstones(pool, index, &queue, &ramp_ids, bound).await
+                    || !record_abort_tombstones(pool, index, queue, &ramp_ids, &callers, bound)
+                        .await
                 {
                     all = false;
-                    break;
                 }
             }
             if all {
-                tombstoned.insert(queue);
+                tombstoned.insert(queue.clone());
             }
         }
         for (index, queue, ramp_ids) in finished_markers {
@@ -2195,7 +2276,7 @@ impl RampGuard {
         audit_pool: &crate::worker::DbPool,
         metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
         (key, ramp_id): GenerationKey,
-        steps: &[(usize, chrono::DateTime<chrono::Utc>)],
+        (steps, callers): (&[(usize, chrono::DateTime<chrono::Utc>)], &[uuid::Uuid]),
         mut abort: RampAbort,
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
@@ -2243,6 +2324,17 @@ impl RampGuard {
                 failed.push((index, step, outcome == ClearOutcome::Ambiguous));
             }
             outcomes.push(outcome);
+        }
+        // Retire the caller ids on every pool now, also on a pool that the
+        // fan-out missed. A failed write is retried on the next pass from
+        // the markers.
+        if !callers.is_empty() && outcomes.contains(&ClearOutcome::Cleared) {
+            for (index, pool) in pools.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                record_abort_tombstones(pool, index, &key.0, &[], callers, bound).await;
+            }
         }
         abort.incomplete = !failed.is_empty();
         let decision = disposition(&outcomes);
@@ -2916,6 +3008,7 @@ mod tests {
                 base: "a".to_owned(),
                 id,
                 target: None,
+                caller: None,
                 reported: true,
                 age_ms: 0,
                 claim_age_ms: None,
@@ -2936,6 +3029,13 @@ mod tests {
         ]);
         let marker = abort_markers(&list, 1000).next().expect("one marker");
         assert_eq!(marker.claim_age_ms, Some(100));
+        // The caller id comes from the entry too.
+        let caller = uuid::Uuid::new_v4();
+        let list = serde_json::json!([
+            {"id": id.to_string(), "base": "a", "caller": caller.to_string()},
+        ]);
+        let marker = abort_markers(&list, 0).next().expect("one marker");
+        assert_eq!(marker.caller, Some(caller));
     }
 
     #[cfg(feature = "db")]

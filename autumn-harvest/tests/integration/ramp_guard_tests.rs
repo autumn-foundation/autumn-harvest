@@ -1030,6 +1030,62 @@ async fn an_unaudited_partial_abort_is_reported_after_a_restart() {
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
 }
 
+/// A fan-out reaches pool 1 only, and the guard aborts it there. Pool 2 has
+/// another base, so a late retry there derives another stored id. The abort
+/// retires the caller id on pool 2 too, so the retry is refused.
+#[tokio::test]
+async fn an_abort_retires_the_caller_id_on_a_pool_the_fan_out_missed() {
+    #[derive(diesel::QueryableByName)]
+    struct Caller {
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        caller: Option<String>,
+    }
+
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let caller = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, caller).await;
+    set_build_policy(&mut conn_2, QUEUE, BUILD_C, None)
+        .await
+        .expect("pool 2 base policy");
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let aborts = RampGuard::new(guard_config())
+        .pass(&pools, &pool_1, None, &never)
+        .await;
+    assert_eq!(aborts.len(), 1, "pool 1 is aborted: {aborts:?}");
+    // The marker holds the caller id as the Rust derivation gives it.
+    let marker: Caller = diesel::sql_query(
+        "SELECT ramp_aborted -> 0 ->> 'caller' AS caller FROM harvest_build_policies \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .get_result(&mut conn_1)
+    .await
+    .expect("read marker");
+    let want = autumn_harvest::build_routing::ramp_caller_target_id(caller, QUEUE, BUILD_B);
+    assert_eq!(marker.caller, Some(want.to_string()));
+
+    let retry = set_build_ramp_with_id(&mut conn_2, QUEUE, BUILD_B, RAMP_PERCENT, caller).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "the late retry on pool 2 is refused: {retry:?}"
+    );
+    assert!(!ramp_is_active(&mut conn_2).await);
+}
+
 /// A ramp write with the `ramp_id` of an aborted generation changes
 /// nothing. The abort marker refuses it, and after the markers are pruned
 /// the report ledger refuses it.
@@ -3054,7 +3110,7 @@ async fn finishing_an_unreported_abort_keeps_it_unreported() {
 
 /// A reported marker stays for the report grace before a pass prunes it. In
 /// that window, a fan-out still in flight can write the same `ramp_id` to a
-/// later pool. The marker then still finishes that ramp.
+/// later pool. The marker's caller id refuses that write there.
 #[tokio::test]
 async fn a_reported_marker_outlives_a_late_fan_out_write() {
     let (url_1, _c1) = setup().await;
@@ -3089,10 +3145,13 @@ async fn a_reported_marker_outlives_a_late_fan_out_write() {
     assert!(aborts.is_empty(), "{aborts:?}");
     assert_eq!(abort_marker_count(&mut conn_1).await, 1, "the marker stays");
 
-    // The late fan-out write reaches pool 2, and the marker finishes it.
-    set_build_ramp_with_id(&mut conn_2, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id)
-        .await
-        .expect("late fan-out write");
+    // The late fan-out write reaches pool 2. The pass retired the caller id
+    // on pool 2 from the marker, so the write is refused.
+    let late = set_build_ramp_with_id(&mut conn_2, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id).await;
+    assert!(
+        matches!(late, Err(autumn_harvest::HarvestError::Config(_))),
+        "the late write is refused: {late:?}"
+    );
     let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
     assert!(aborts.is_empty(), "{aborts:?}");
     assert!(

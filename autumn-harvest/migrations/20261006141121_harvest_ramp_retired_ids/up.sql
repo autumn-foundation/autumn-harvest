@@ -25,3 +25,25 @@ CREATE TABLE IF NOT EXISTS harvest_ramp_retired_ids (
     retired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (queue_name, ramp_id)
 );
+
+-- The guard's abort retires the caller id of the cleared ramp on every pool.
+-- A writer from before the `ramp_id` column changes a ramp but keeps the old
+-- caller id. That id would then let an old abort clear the new ramp. The
+-- reset trigger already drops a stale `ramp_id` on such a write. It now
+-- drops the stale `ramp_caller_id` too.
+CREATE OR REPLACE FUNCTION harvest_build_policies_reset_ramp_id()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF NEW.ramp_id IS NOT DISTINCT FROM OLD.ramp_id
+       AND (NEW.target_build_id IS DISTINCT FROM OLD.target_build_id
+            OR NEW.ramp_percent IS DISTINCT FROM OLD.ramp_percent
+            OR NEW.updated_at IS DISTINCT FROM OLD.updated_at) THEN
+        NEW.ramp_id := NULL;
+        NEW.ramp_caller_id := NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
