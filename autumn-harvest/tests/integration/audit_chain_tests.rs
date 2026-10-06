@@ -343,6 +343,15 @@ async fn a_rebuilt_cursor_keeps_the_chain_head() {
     assert!(report.is_intact(), "{report:?}");
     assert_eq!((report.checked, report.unchained_prefix), (1, 3));
     assert_eq!(report.anchor_seq, Some(4));
+    // The new chain starts like any first link.
+    let first_links = count(
+        &mut conn,
+        "SELECT count(*) AS n FROM harvest_audit_log WHERE export_seq = 4 \
+         AND chain_prev = '\\x0000000000000000000000000000000000000000000000000000000000000000' \
+         AND chain_newest_before IS NULL",
+    )
+    .await;
+    assert_eq!(first_links, 1, "the first link after a re-anchor");
 }
 
 #[tokio::test]

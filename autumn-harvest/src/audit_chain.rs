@@ -9,8 +9,9 @@
 //! under the cursor row lock. The chain is stamped at that same point. So it
 //! adds no lock and no work to the audit insert path.
 //!
-//! A row is unchained from its insert until the next export tick stamps it.
-//! The SIEM copy covers that window. See `docs/audit-export.md`.
+//! A row is unprotected from its insert until the next export tick stamps it.
+//! A database writer can change or delete it in that window, and nothing
+//! detects that. The SIEM has no copy yet. See `docs/audit-export.md`.
 //!
 //! # What one link holds
 //!
@@ -741,10 +742,13 @@ pub(crate) async fn chain_anchor(
     if let Some((checkpoint, mac)) = stored_checkpoint(cursor) {
         let valid = key.accepts(&checkpoint, cursor.shard_id, &mac)
             && checkpoint.head_seq == cursor.last_assigned_seq;
+        // An empty re-anchored chain starts like a new one: genesis, and no
+        // newest time before the first link.
+        let empty = checkpoint.head_seq < checkpoint.start_seq;
         return Ok(valid.then_some(ChainAnchor {
-            head: Some(checkpoint.head),
+            head: (!empty).then_some(checkpoint.head),
             start_seq: Some(checkpoint.start_seq),
-            newest_at: Some(checkpoint.newest_at),
+            newest_at: (!empty).then_some(checkpoint.newest_at),
         }));
     }
     if has_checkpoint_column(cursor) || any_chained_row(conn, cursor.last_assigned_seq).await? {

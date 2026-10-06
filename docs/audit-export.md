@@ -362,9 +362,11 @@ The canonical encoding always uses six digits. Then check that the HMAC of
 
 **Limits.**
 
-- The chain covers a row from the moment the exporter sequences it. A row is
-  unchained between its insert and the next export tick. The SIEM copy covers
-  that window.
+- The chain covers a row from the moment the exporter sequences it. Before
+  that, nothing protects the row. A database writer can change or delete it
+  between its insert and the next export tick, and nothing detects that. The
+  SIEM has no copy yet, and a deleted row never gets a `seq`, so it leaves no
+  gap. A short export interval keeps the window small.
 - Rows sequenced before you set the key stay unchained. If you remove the key,
   later rows are unchained, and the verifier flags them. When you set the key
   again, the exporter does not extend the chain over those rows. Re-anchor

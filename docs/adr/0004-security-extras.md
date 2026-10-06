@@ -62,8 +62,10 @@ that the exporter sequences.
 
 **Limits.**
 
-- The chain needs audit export. A row is unchained from its insert until the
-  next export tick. The SIEM copy covers that window.
+- The chain needs audit export. Nothing protects a row from its insert until
+  the next export tick. A database writer can change or delete it in that
+  window, and nothing detects that. An insert-time chain would close the
+  window; this ADR declines it below.
 - A process that holds the key can forge links. The chain protects against
   database-level tampering, not a compromised Harvest process.
 - A writer who removes every link and the whole checkpoint leaves a table
@@ -83,8 +85,10 @@ that the exporter sequences.
 
 **Declined:**
 
-- *A chain at insert time.* It needs one lock per shard on every audited
-  request. The export-time chain gives the same evidence at no insert cost.
+- *A chain at insert time.* It would cover a row from its insert, not from
+  the next export tick. But it needs one lock per shard on every audited
+  request. The export-time chain adds no insert cost, and the window before
+  the first tick is a stated limit.
 - *A database trigger that computes the chain.* It needs `pgcrypto` and the
   same per-shard lock. It also puts the key in the database.
 - *Signed export batches.* Batches already carry an HMAC signature (issue
