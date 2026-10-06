@@ -28,7 +28,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-EVENT_ROW_PREFIX = "| `event.rs` |"
+EVENT_ROW_CELL = "`event.rs`"
 # A count beside "variant", in either order, with only separators between:
 # "41 variants", "49 Variants", "Variants: 49", "variants — 1,050".
 COUNT_RE = re.compile(
@@ -43,6 +43,7 @@ VERSION_HEADING_RE = re.compile(
 # A CommonMark fence: up to 3 spaces, then 3 or more backticks or tildes.
 FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
+DELIMITER_CELL_RE = re.compile(r":?-+:?")
 
 # (path, pattern, the fact that makes the claim false)
 #
@@ -134,12 +135,56 @@ def markdown_lines(text):
             fence = None
 
 
+def table_cells(line):
+    """Split a GFM table line into cells, or return None if it has no pipe.
+
+    Up to 3 spaces of indent and the outer pipes are optional.
+    """
+    if len(line) - len(line.lstrip(" ")) > 3 or not CELL_SPLIT_RE.search(line):
+        return None
+    body = line.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    return [c.strip() for c in CELL_SPLIT_RE.split(body)]
+
+
+def markdown_tables(text):
+    """Yield each GFM table as a list of (line number, cells) body rows.
+
+    A table is a header row, then a delimiter row such as `|---|:--:|`, then
+    the body rows up to the first line without a pipe. Fenced blocks are
+    skipped, and a fence ends a table.
+    """
+    lines, prev, table = list(markdown_lines(text)), None, None
+    for i, (n, line) in enumerate(lines):
+        cells = table_cells(line)
+        contiguous = prev is not None and n == prev[0] + 1
+        if table is not None and cells is not None and contiguous:
+            table.append((n, cells))
+        else:
+            if table:
+                yield table
+            table = None
+            is_delimiter = cells is not None and all(
+                DELIMITER_CELL_RE.fullmatch(c) for c in cells
+            )
+            if is_delimiter and contiguous and prev[1] is not None:
+                table = []
+        prev = (n, cells)
+    if table:
+        yield table
+
+
 def event_row_count_findings(path, text):
     """Return a message for each variant count in an `event.rs` row."""
     found = []
-    for n, line in markdown_lines(text):
-        if line.startswith(EVENT_ROW_PREFIX):
-            for m in COUNT_RE.finditer(line):
+    for table in markdown_tables(text):
+        for n, cells in table:
+            if cells[0] != EVENT_ROW_CELL:
+                continue
+            for m in COUNT_RE.finditer(" | ".join(cells)):
                 found.append(
                     f"{path}:{n}: the `event.rs` row states \"{m.group()}\". "
                     "Drop the count: it drifts from event.rs."
@@ -148,25 +193,18 @@ def event_row_count_findings(path, text):
 
 
 def duplicate_row_findings(path, text):
-    """Return a message for each repeated first cell within one table."""
-    found, seen, last = [], None, 0
-    for n, line in markdown_lines(text):
-        if n != last + 1:
-            # A fenced block between two lines ends the table.
-            seen = None
-        last = n
-        if not line.startswith("|"):
-            seen = None
-            continue
-        if seen is None:
-            seen = {}
-        cell = CELL_SPLIT_RE.split(line)[1].strip()
-        if not cell or set(cell) <= set("-: "):
-            continue
-        if cell in seen:
-            found.append(f"{path}:{n}: row {cell} repeats line {seen[cell]}")
-        else:
-            seen[cell] = n
+    """Return a message for each repeated first cell within one table body."""
+    found = []
+    for table in markdown_tables(text):
+        seen = {}
+        for n, cells in table:
+            cell = cells[0]
+            if not cell:
+                continue
+            if cell in seen:
+                found.append(f"{path}:{n}: row {cell} repeats line {seen[cell]}")
+            else:
+                seen[cell] = n
     return found
 
 
@@ -225,6 +263,7 @@ def run():
 
 def self_test():
     rows = (
+        "| Module | Phase | Purpose |\n|---|---|---|\n"
         "| `event.rs` | 1 | `WorkflowEvent` enum (41 variants, tagged). |\n"
         "| `event.rs` | 1 | `WorkflowEvent` enum — 1,050 variants. |\n"
         "| `event.rs` | 1 | `WorkflowEvent` enum. Variants: 49. |\n"
@@ -235,8 +274,19 @@ def self_test():
         "Prose: `WorkflowEvent` has 2 variants for sessions.\n"
     )
     found = event_row_count_findings("x.md", rows)
-    assert [m.split(":")[1] for m in found] == ["1", "2", "3", "4"], found
+    assert [m.split(":")[1] for m in found] == ["3", "4", "5", "6"], found
     assert "41 variants" in found[0] and "1,050 variants" in found[1], found
+
+    # Legal GFM forms: up to 3 spaces of indent, no outer pipes.
+    indented = "   | Module | Purpose |\n   |---|---|\n   | `event.rs` | 50 variants |\n"
+    assert len(event_row_count_findings("x.md", indented)) == 1
+    bare = "Module | Purpose\n:--- | ---\n`event.rs` | 50 variants\n`a.rs` | x\n`a.rs` | y\n"
+    assert len(event_row_count_findings("x.md", bare)) == 1
+    found = duplicate_row_findings("x.md", bare)
+    assert len(found) == 1 and "x.md:5" in found[0], found
+    # Four spaces of indent make a code block, not a table.
+    code = "    | M | P |\n    |---|---|\n    | `event.rs` | 50 variants |\n"
+    assert event_row_count_findings("x.md", code) == []
 
     table = (
         "| Module | P |\n|---|---|\n| `a.rs` | 1 |\n| `a.rs` | 2 |\n"
