@@ -31,7 +31,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::context::WorkflowContext;
+use crate::context::{CHILD_TIMEOUT_TIMER_PREFIX, SESSION_ACQUIRE_ACTIVITY_NAME, WorkflowContext};
 use crate::erase::ERASURE_TOMBSTONE_KEY;
 use crate::event::{SideEffectKind, WorkflowEvent};
 use crate::failure::ERROR_TYPE_HANDLER_PANIC;
@@ -41,6 +41,7 @@ use crate::payload_codec::{
 use crate::payload_store::{
     OFFLOAD_ENVELOPE_KEY, PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
 };
+use crate::replay::HistoryMatcher;
 use crate::telemetry::NoOpMetrics;
 use crate::testing::{ReplayReport, WorkflowReplayer};
 use crate::types::{ActivityExecId, ExecutionId, ExternalTarget, ParentClosePolicy};
@@ -362,6 +363,21 @@ pub enum Op {
     Mutex {
         /// Lock key.
         key: String,
+    },
+    /// `ctx.spawn_child_workflow_timeout`, a child bounded by a timer.
+    ChildTimeout {
+        /// Workflow name of the child.
+        name: String,
+        /// Input of the child.
+        #[arbitrary(with = value)]
+        input: Value,
+        /// Timeout in seconds.
+        secs: u64,
+    },
+    /// `ctx.create_session` on `queue`.
+    Session {
+        /// Queue of the session-acquire activity.
+        queue: String,
     },
     /// `ctx.wait_for_signal_timeout`, a signal wait bounded by a timer.
     SignalTimeout {
@@ -753,6 +769,15 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     let last_redrive = history
         .iter()
         .rposition(|event| matches!(event, WorkflowEvent::WorkflowRedriven { .. }));
+    // Records that a redrive superseded: the failure, abandoned dispatches
+    // and the rest of that cycle's tail. The matcher passes over them, so
+    // the mirror does too.
+    let superseded: HashSet<usize> = last_redrive.map_or_else(HashSet::new, |redrive| {
+        let matcher = HistoryMatcher::new(history.to_vec());
+        (0..redrive)
+            .filter(|i| matcher.is_transparent(*i))
+            .collect()
+    });
     let mut race_timers: HashSet<&str> = HashSet::new();
     // Commands that a fan-out or race claimed. They are passed over, so the
     // group can share a batch with a sibling command.
@@ -769,6 +794,7 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         let event = &history[index];
         index += 1;
         let op = match event {
+            _ if superseded.contains(&(index - 1)) => continue,
             WorkflowEvent::MarkerRecorded { name, details } if name.starts_with("fan_out:") => {
                 let count = details.as_u64().and_then(|n| usize::try_from(n).ok());
                 Some(mirror_fan_out(
@@ -798,35 +824,10 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
             {
                 None
             }
-            WorkflowEvent::WorkflowFailed { .. } if last_redrive.is_some_and(|r| r >= index) => {
-                None
-            }
-            WorkflowEvent::TimerStarted {
-                timer_id,
-                duration_secs,
-            } if signal_timeout_name(timer_id.as_str()).is_some() => {
-                let name = signal_timeout_name(timer_id.as_str()).unwrap_or_default();
-                *timeouts.entry(name).or_default() += 1;
-                Some(Op::SignalTimeout {
-                    name: name.to_string(),
-                    secs: *duration_secs,
-                })
-            }
-            WorkflowEvent::SignalReceived { signal_name, .. }
-                if take_one(&mut timeouts, signal_name.as_str()) =>
-            {
-                None
-            }
-            WorkflowEvent::TimerFired { timer_id } | WorkflowEvent::TimerCancelled { timer_id }
-                if signal_timeout_name(timer_id.as_str()).is_some() =>
-            {
-                take_one(
-                    &mut timeouts,
-                    signal_timeout_name(timer_id.as_str()).unwrap_or_default(),
-                );
-                None
-            }
-            _ => mirror_event(event, armed.contains(&(index - 1))),
+            _ => match paired_op(history, index, &mut claimed, &mut timeouts) {
+                Paired::Mapped(op) => op,
+                Paired::Other => mirror_event(event, armed.contains(&(index - 1))),
+            },
         };
         match op {
             Some(op) if op.parks() || (!batch.is_empty() && op.is_immediate()) => batch.push(op),
@@ -1244,6 +1245,97 @@ fn place_race_branches(
         .collect()
 }
 
+/// What [`paired_op`] made of an event.
+enum Paired {
+    /// The event belongs to a paired API. It maps to this op, or to none.
+    Mapped(Option<Op>),
+    /// Any other event.
+    Other,
+}
+
+/// The op of an event that a paired API wrote with its neighbour: a worker
+/// session, a child or signal wait bounded by a timer. `next` is the index
+/// after the event.
+fn paired_op<'h>(
+    history: &'h [WorkflowEvent],
+    next: usize,
+    claimed: &mut HashSet<usize>,
+    timeouts: &mut HashMap<&'h str, usize>,
+) -> Paired {
+    match &history[next - 1] {
+        WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("session:") => {
+            let queue = match history.get(next) {
+                Some(WorkflowEvent::ActivityScheduled { name, queue, .. })
+                    if name == SESSION_ACQUIRE_ACTIVITY_NAME =>
+                {
+                    claimed.insert(next);
+                    queue.clone()
+                }
+                _ => "default".to_string(),
+            };
+            Paired::Mapped(Some(Op::Session { queue }))
+        }
+        WorkflowEvent::ChildWorkflowStarted {
+            workflow_name,
+            input,
+            ..
+        } if child_timeout_secs(history.get(next), workflow_name).is_some() => {
+            claimed.insert(next);
+            Paired::Mapped(Some(Op::ChildTimeout {
+                name: workflow_name.clone(),
+                input: input.clone(),
+                secs: child_timeout_secs(history.get(next), workflow_name).unwrap_or_default(),
+            }))
+        }
+        WorkflowEvent::TimerFired { timer_id } | WorkflowEvent::TimerCancelled { timer_id }
+            if timer_id.as_str().starts_with(CHILD_TIMEOUT_TIMER_PREFIX) =>
+        {
+            Paired::Mapped(None)
+        }
+        WorkflowEvent::TimerStarted {
+            timer_id,
+            duration_secs,
+        } if signal_timeout_name(timer_id.as_str()).is_some() => {
+            let name = signal_timeout_name(timer_id.as_str()).unwrap_or_default();
+            *timeouts.entry(name).or_default() += 1;
+            Paired::Mapped(Some(Op::SignalTimeout {
+                name: name.to_string(),
+                secs: *duration_secs,
+            }))
+        }
+        WorkflowEvent::SignalReceived { signal_name, .. }
+            if take_one(timeouts, signal_name.as_str()) =>
+        {
+            Paired::Mapped(None)
+        }
+        WorkflowEvent::TimerFired { timer_id } | WorkflowEvent::TimerCancelled { timer_id }
+            if signal_timeout_name(timer_id.as_str()).is_some() =>
+        {
+            take_one(
+                timeouts,
+                signal_timeout_name(timer_id.as_str()).unwrap_or_default(),
+            );
+            Paired::Mapped(None)
+        }
+        _ => Paired::Other,
+    }
+}
+
+/// The timeout of a `spawn_child_workflow_timeout` call, when `next` is the
+/// `__child_timeout:{seq}:{name}` timer that it starts right after the child.
+fn child_timeout_secs(next: Option<&WorkflowEvent>, workflow_name: &str) -> Option<u64> {
+    let Some(WorkflowEvent::TimerStarted {
+        timer_id,
+        duration_secs,
+    }) = next
+    else {
+        return None;
+    };
+    let rest = timer_id.as_str().strip_prefix(CHILD_TIMEOUT_TIMER_PREFIX)?;
+    let (_, name) = rest.split_once(':')?;
+    (name == workflow_name).then_some(*duration_secs)
+}
+
 /// The signal name in a `__signal_timeout:{seq}:{name}` timer id, which
 /// `wait_for_signal_timeout` and a timer-and-signal race write.
 fn signal_timeout_name(timer_id: &str) -> Option<&str> {
@@ -1326,6 +1418,8 @@ impl Op {
                 | Self::ChildFanOut { .. }
                 | Self::SignalTimeout { .. }
                 | Self::Race { .. }
+                | Self::ChildTimeout { .. }
+                | Self::Session { .. }
         )
     }
 
@@ -1749,6 +1843,17 @@ fn run_capture_op(ctx: &WorkflowContext, op: Op) {
 /// the others.
 async fn run_external_op(ctx: &WorkflowContext, op: Op) {
     match op {
+        Op::ChildTimeout { name, input, secs } => {
+            let timeout = std::time::Duration::from_secs(secs);
+            let _ = ctx
+                .spawn_child_workflow_timeout(&name, input, timeout)
+                .await;
+        }
+        Op::Session { queue } => {
+            let _ = ctx
+                .create_session(crate::context::SessionOptions::new(queue))
+                .await;
+        }
         Op::Child { name, input } => {
             let _ = ctx.spawn_child_workflow_raw(&name, input).await;
         }

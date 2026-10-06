@@ -1353,6 +1353,15 @@ impl HistoryMatcher {
         matches!(event, WorkflowEvent::WorkflowRedriven { .. })
     }
 
+    /// Whether command-dispatch replay passes over the event at `index`: a
+    /// pause pair, post-terminal bookkeeping, or a record that a redrive
+    /// superseded. The fuzz harness skips the superseded records when it
+    /// mirrors a history (issue #1835).
+    #[cfg(feature = "fuzzing")]
+    pub(crate) fn is_transparent(&self, index: usize) -> bool {
+        self.transparent_events.contains(&index)
+    }
+
     /// Returns `true` if the event at `index` has already been consumed out-of-order.
     fn is_consumed(&self, index: usize) -> bool {
         self.consumed_out_of_order_events.contains(&index)
