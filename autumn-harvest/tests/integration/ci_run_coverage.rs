@@ -1156,6 +1156,11 @@ const DEBT_REASONS: &[&str] = &[
     ALLOWLIST_WEBHOOKS_IGNORED_REASON,
 ];
 
+/// True when an allowlist entry with `reason` is debt that needs an owner.
+fn entry_is_debt(reason: &str) -> bool {
+    DEBT_REASONS.contains(&reason)
+}
+
 /// One table row: the suite key, the owner and the reason.
 struct TrackingRow {
     key: String,
@@ -1213,7 +1218,7 @@ fn tracking_table_lists_every_allowlist_entry_with_an_owner_or_reason() {
     for row in &rows {
         let &(_, reason) = ALLOWLIST.iter().find(|&&(k, _)| k == row.key).unwrap();
         assert!(!row.reason.is_empty(), "{}: the reason is empty", row.key);
-        if DEBT_REASONS.contains(&reason) {
+        if entry_is_debt(reason) {
             assert!(
                 names_an_owner(&row.owner),
                 "{}: debt needs an `@login` or `#issue` owner, got {:?}",
@@ -1240,6 +1245,32 @@ fn tracking_table_parser_reads_owner_and_reason() {
     assert_eq!(rows[1].owner, WONT_WIRE);
     assert!(!names_an_owner(&rows[1].owner));
     assert_eq!(rows[1].reason, "manual");
+
+    let padded = "<!-- allowlist-tracking:begin -->\n| `core:a` | #12 | debt |  \n<!-- allowlist-tracking:end -->";
+    assert_eq!(
+        parse_tracking_table(padded).len(),
+        1,
+        "trailing spaces do not add a column"
+    );
+}
+
+#[test]
+fn names_an_owner_needs_a_login_or_an_issue_number() {
+    for owner in ["@madmax983", "#1959", "@madmax983 (#1959)"] {
+        assert!(names_an_owner(owner), "{owner:?} names an owner");
+    }
+    for owner in ["#", "@", "(#)", "won't wire (#1959)", "TBD"] {
+        assert!(!names_an_owner(owner), "{owner:?} names no owner");
+    }
+}
+
+/// A new reason is debt until it is listed as by design. A forgotten list
+/// edit then asks for an owner, not for "won't wire".
+#[test]
+fn a_new_reason_counts_as_debt() {
+    assert!(entry_is_debt("a reason that no list names"));
+    assert!(entry_is_debt(ALLOWLIST_MCP_IGNORED_REASON));
+    assert!(!entry_is_debt(ALLOWLIST_CHAOS_REASON));
 }
 
 // ── Feature-gate coverage (DB or not) ───────────────────────────────────────
