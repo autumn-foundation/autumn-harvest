@@ -410,7 +410,7 @@ async fn moving_the_head_after_deleting_the_tail_is_detected() {
         "DELETE FROM harvest_audit_log WHERE export_seq = 3; \
          UPDATE harvest_audit_export_cursor c SET \
              last_assigned_seq = 2, last_acked_seq = 2, chain_head_seq = 2, \
-             chain_head = a.chain_hash, chain_head_occurred_at = a.occurred_at \
+             chain_head = a.chain_hash, chain_newest_at = a.occurred_at \
          FROM harvest_audit_log a WHERE a.export_seq = 2",
     )
     .await
@@ -533,7 +533,8 @@ async fn a_siem_can_recompute_each_link_from_the_export() {
             assert_eq!(&prev_hex, previous, "chain_prev names the previous link");
         }
         let prev = hex_bytes(&prev_hex);
-        let hash = autumn_harvest::audit_chain::link(&key(), &prev, &record);
+        let hash =
+            autumn_harvest::audit_chain::link(&key(), &prev, record.chain_newest_before, &record);
         assert_eq!(
             Some(autumn_harvest::audit_chain::to_hex(&hash)),
             record.chain_hash
@@ -593,7 +594,7 @@ async fn the_exporter_does_not_extend_a_forged_checkpoint() {
     roll_back_the_tail(
         &mut conn,
         "chain_head_seq = 2, chain_head = a.chain_hash, \
-         chain_head_occurred_at = a.occurred_at",
+         chain_newest_at = a.occurred_at",
     )
     .await;
 
@@ -620,7 +621,7 @@ async fn the_exporter_does_not_reseed_a_removed_checkpoint() {
     roll_back_the_tail(
         &mut conn,
         "chain_start_seq = NULL, chain_head_seq = NULL, chain_head = NULL, \
-         chain_head_occurred_at = NULL, chain_mac = NULL",
+         chain_newest_at = NULL, chain_mac = NULL",
     )
     .await;
 
@@ -686,7 +687,7 @@ async fn reanchoring_after_a_forged_checkpoint_restores_the_chain() {
     roll_back_the_tail(
         &mut conn,
         "chain_head_seq = 2, chain_head = a.chain_hash, \
-         chain_head_occurred_at = a.occurred_at",
+         chain_newest_at = a.occurred_at",
     )
     .await;
     insert_rows(&mut conn, 1).await;
@@ -727,4 +728,80 @@ async fn reanchoring_with_no_chained_row_clears_the_checkpoint() {
     assert!(report.is_intact(), "{report:?}");
     assert_eq!(report.unchained_prefix, 2);
     assert_eq!(report.anchor_seq, Some(3));
+}
+
+/// Verify with a 90-day retention cutoff.
+async fn verify_with_retention(
+    conn: &mut AsyncPgConnection,
+) -> autumn_harvest::audit_chain::ChainReport {
+    let key = key();
+    let options = ChainVerifyOptions {
+        keys: std::slice::from_ref(&key),
+        retention_cutoff: Some(chrono::Utc::now() - chrono::TimeDelta::days(90)),
+    };
+    verify_shard_chain_with(conn, SHARD, &options)
+        .await
+        .expect("verify")
+}
+
+/// Seq 1 is old and seq 2 is recent. Then seq 2 is deleted, and seq 3 gets
+/// an old `occurred_at`, as a late commit or a planted row can.
+async fn hide_a_recent_row_behind_an_old_one(conn: &mut AsyncPgConnection) {
+    insert_rows(conn, 1).await;
+    conn.batch_execute(
+        "UPDATE harvest_audit_log SET occurred_at = occurred_at - INTERVAL '100 days'",
+    )
+    .await
+    .expect("backdate seq 1");
+    insert_rows(conn, 1).await;
+    export_tick(conn, Some(&key())).await;
+
+    conn.batch_execute("DELETE FROM harvest_audit_log WHERE export_seq = 2")
+        .await
+        .expect("delete the recent row");
+    insert_rows(conn, 1).await;
+    conn.batch_execute(
+        "UPDATE harvest_audit_log SET occurred_at = occurred_at - INTERVAL '100 days' \
+         WHERE export_seq IS NULL",
+    )
+    .await
+    .expect("backdate the new row");
+    export_tick(conn, Some(&key())).await;
+}
+
+#[tokio::test]
+async fn a_deleted_recent_row_before_an_old_one_is_not_retention() {
+    let (mut conn, _c) = fresh_db().await;
+    hide_a_recent_row_behind_an_old_one(&mut conn).await;
+
+    let report = verify_with_retention(&mut conn).await;
+    assert_eq!(
+        report.findings,
+        vec![ChainFinding::Gap {
+            after_seq: 1,
+            before_seq: 3,
+        }],
+        "{report:?}"
+    );
+    assert!(report.retention_gaps.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+async fn a_deleted_recent_tail_is_not_retention() {
+    let (mut conn, _c) = fresh_db().await;
+    hide_a_recent_row_behind_an_old_one(&mut conn).await;
+    // Seq 3, the head, is old. Seq 2 was recent, so the tail is not retention.
+    conn.batch_execute("DELETE FROM harvest_audit_log WHERE export_seq = 3")
+        .await
+        .expect("delete the tail");
+
+    let report = verify_with_retention(&mut conn).await;
+    assert_eq!(
+        report.findings,
+        vec![ChainFinding::HeadMismatch {
+            expected_seq: 3,
+            found_seq: Some(1),
+        }],
+        "{report:?}"
+    );
 }

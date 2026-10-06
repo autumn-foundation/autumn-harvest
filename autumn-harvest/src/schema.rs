@@ -612,6 +612,8 @@ diesel::table! {
         export_seq -> Nullable<Int8>,
         /// Audit-chain link of the previous `export_seq` (issue #1838).
         chain_prev -> Nullable<Bytea>,
+        /// Newest `occurred_at` chained before this row (issue #1838).
+        chain_newest_before -> Nullable<Timestamptz>,
         /// Audit-chain link of this row (issue #1838).
         chain_hash -> Nullable<Bytea>,
     }
@@ -643,8 +645,8 @@ diesel::table! {
         chain_start_seq -> Nullable<Int8>,
         /// `export_seq` of the newest chained row (issue #1838).
         chain_head_seq -> Nullable<Int8>,
-        /// `occurred_at` of the newest chained row (issue #1838).
-        chain_head_occurred_at -> Nullable<Timestamptz>,
+        /// Newest `occurred_at` of the chain, through the head (issue #1838).
+        chain_newest_at -> Nullable<Timestamptz>,
         /// Keyed MAC over the checkpoint columns (issue #1838).
         chain_mac -> Nullable<Bytea>,
     }

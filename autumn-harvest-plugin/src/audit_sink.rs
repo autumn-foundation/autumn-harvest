@@ -243,6 +243,7 @@ mod tests {
             error_summary: None,
             source: "api".to_string(),
             chain_prev: None,
+            chain_newest_before: None,
             chain_hash: None,
         }
     }

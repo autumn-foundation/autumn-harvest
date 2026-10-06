@@ -7,18 +7,18 @@ runtime behavior or wire bytes.
 **Audit hash chain.** `HarvestBuilder::audit_export_chain_key` turns on a
 keyed HMAC-SHA256 chain over the audit rows that the exporter sequences. The
 exporter stamps the chain together with `export_seq`, under the cursor row
-lock, so the insert path gets no new lock. Each row stores `chain_prev` and
-`chain_hash`. The cursor stores a keyed checkpoint: the chain start, the head
-link, its `seq` and its `occurred_at`. `audit_chain::verify_shard_chain` and
+lock, so the insert path gets no new lock. Each row stores `chain_prev`,
+`chain_newest_before` and `chain_hash`. The cursor stores a keyed checkpoint:
+the chain start, the head link, its `seq` and the newest `occurred_at`. `audit_chain::verify_shard_chain` and
 `verify_shard_chain_with` report changed rows, broken links, unchained rows,
 gaps, a missing head and a missing or invalid checkpoint. The exporter
 extends only a checkpoint that its key accepts. A missing or invalid
 checkpoint stops the chain until an operator calls
 `audit_chain::reanchor_shard_chain`. `HarvestBuilder::audit_export_chain_accept_key`
-adds a key for a two-step rotation. With a retention
-cutoff, gaps at the old end of the chain go to `retention_gaps`. Exported
-records carry `chain_prev` and `chain_hash`. Both fields are omitted when
-absent. A key shorter than 32 bytes fails `try_build` with
+adds a key for a two-step rotation. With a retention cutoff, a gap goes to
+`retention_gaps` only when the keyed `chain_newest_before` after it is old.
+Exported records carry `chain_prev`, `chain_newest_before` and `chain_hash`.
+These fields are omitted when absent. A key shorter than 32 bytes fails `try_build` with
 `AuditChainKeyTooShort`. The runtime config and `claim_shard_chained` take an
 `audit_chain::AuditChainKey`, which only `AuditChainKey::new` can build, so a
 short key cannot reach the stamp path by any route.
@@ -40,7 +40,8 @@ declines native OTLP export, emitter renames and RPC mappings.
 **Breaking change.** Code that builds these structs with a literal, or calls
 these functions, must change:
 
-- New public fields: `AuditExportRecord::{chain_prev, chain_hash}`,
+- New public fields: `AuditExportRecord::{chain_prev, chain_newest_before,
+  chain_hash}`,
   `AuditExportBuilderConfig::{chain_key, chain_accept_keys}`,
   `AuditExportRuntimeConfig::chain_key`,
   `WasmActivityRegistration::signature`, and new columns on

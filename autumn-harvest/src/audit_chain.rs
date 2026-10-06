@@ -14,10 +14,12 @@
 //!
 //! # What one link holds
 //!
-//! `chain_hash = HMAC-SHA256(key, CHAIN_DOMAIN || chain_prev || canonical(row))`.
-//! `chain_prev` is the hash of the row with the previous `export_seq`. The
-//! first row uses [`GENESIS`]. The canonical row includes `shard` and `seq`,
-//! so a row cannot move to another position.
+//! `chain_hash = HMAC-SHA256(key, CHAIN_DOMAIN || chain_prev ||
+//! newest_before || canonical(row))`. `chain_prev` is the hash of the row
+//! with the previous `export_seq`. The first row uses [`GENESIS`].
+//! `newest_before` is the newest `occurred_at` of every row chained before
+//! this one. The canonical row includes `shard` and `seq`, so a row cannot
+//! move to another position.
 //!
 //! Each row stores its own `chain_prev`. So a row stays verifiable after
 //! retention deletes its predecessor. A missing row shows as a sequence gap.
@@ -26,8 +28,8 @@
 //! # The keyed checkpoint
 //!
 //! The cursor holds a [`ChainCheckpoint`]: the first chained `seq`, the
-//! newest chained `seq`, its link and its `occurred_at`. A MAC under the chain
-//! key covers all four. A writer without the key cannot move the checkpoint.
+//! newest chained `seq`, its link and the newest `occurred_at` of the chain.
+//! A MAC under the chain key covers all four. A writer without the key cannot move the checkpoint.
 //! So the verifier finds a stripped row and a deleted tail.
 //!
 //! The exporter extends only a checkpoint that its key accepts. Otherwise a
@@ -42,10 +44,12 @@
 //!
 //! Retention deletes old rows, so it leaves gaps. It keeps some old rows, such
 //! as export decommission records. Pass the retention cutoff to
-//! [`ChainVerifyOptions`]. A gap then counts as retention while every row
-//! before it is older than the cutoff. After the first newer row, a gap is a
-//! finding. A writer can therefore hide a deletion only at the old end of the
-//! chain, near the cutoff.
+//! [`ChainVerifyOptions`]. A gap then counts as retention only when the row
+//! after it proves that every row before it is old. The proof is its
+//! `newest_before`, under the MAC. The ages of the surviving rows are no
+//! proof, because a late commit can carry an old `occurred_at`. A writer can
+//! therefore delete only rows that retention deletes within
+//! [`RETENTION_SLACK`].
 //!
 //! # Why a key
 //!
@@ -150,8 +154,8 @@ pub const CHECKPOINT_DOMAIN: &[u8] = b"harvest-audit-chain-checkpoint-v1";
 
 /// Clock slack for the retention test.
 ///
-/// A late commit can carry an `occurred_at` older than the rows before it. A
-/// row counts as old when it is older than the cutoff plus this slack.
+/// A time counts as old when it is older than the cutoff plus this slack. The
+/// slack absorbs late commits near the cutoff.
 pub const RETENTION_SLACK: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// Length marker for an absent field in [`canonical_record`].
@@ -169,9 +173,7 @@ pub fn canonical_record(record: &AuditExportRecord) -> Vec<u8> {
     let seq = record.seq.to_string();
     let id = record.id.hyphenated().to_string();
     let shard_id = record.shard_id.map(|id| id.to_string());
-    let occurred_at = record
-        .occurred_at
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let occurred_at = canonical_time(record.occurred_at);
     let fields: [Option<&str>; 15] = [
         Some(&shard),
         Some(&seq),
@@ -191,32 +193,59 @@ pub fn canonical_record(record: &AuditExportRecord) -> Vec<u8> {
     ];
     let mut out = Vec::with_capacity(256);
     for field in fields {
-        match field {
-            Some(text) => {
-                // An audit field longer than 4 GiB cannot reach the table.
-                let len = u32::try_from(text.len()).unwrap_or(ABSENT - 1);
-                out.extend_from_slice(&len.to_be_bytes());
-                out.extend_from_slice(text.as_bytes());
-            }
-            None => out.extend_from_slice(&ABSENT.to_be_bytes()),
-        }
+        push_field(&mut out, field);
     }
     out
 }
 
 /// Compute the link for `record` after `prev`.
 ///
+/// `newest_before` is the newest `occurred_at` of every row chained before
+/// `record`, or `None` for the first link. It is encoded as a canonical
+/// field. The MAC covers it, so the verifier can trust it for retention.
+///
 /// # Panics
 /// Never: HMAC-SHA256 accepts a key of any length.
 #[must_use]
-pub fn link(key: &CallbackSecret, prev: &ChainHash, record: &AuditExportRecord) -> ChainHash {
+pub fn link(
+    key: &CallbackSecret,
+    prev: &ChainHash,
+    newest_before: Option<DateTime<Utc>>,
+    record: &AuditExportRecord,
+) -> ChainHash {
     #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length")]
     let mut mac =
         Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
     mac.update(CHAIN_DOMAIN);
     mac.update(prev);
+    let mut newest = Vec::with_capacity(32);
+    push_field(&mut newest, newest_before.map(canonical_time).as_deref());
+    mac.update(&newest);
     mac.update(&canonical_record(record));
     mac.finalize().into_bytes().into()
+}
+
+/// A time as the canonical encoding writes it: RFC 3339, UTC, six digits.
+fn canonical_time(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// Append one length-prefixed field, or the absent marker.
+fn push_field(out: &mut Vec<u8>, field: Option<&str>) {
+    match field {
+        Some(text) => {
+            // An audit field longer than 4 GiB cannot reach the table.
+            let len = u32::try_from(text.len()).unwrap_or(ABSENT - 1);
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+        None => out.extend_from_slice(&ABSENT.to_be_bytes()),
+    }
+}
+
+/// The newest of `newest_before` and `at`.
+fn newest_through(newest_before: Option<DateTime<Utc>>, at: DateTime<Utc>) -> DateTime<Utc> {
+    newest_before.map_or(at, |newest| newest.max(at))
 }
 
 /// Lowercase hex of a chain hash.
@@ -246,8 +275,8 @@ pub struct ChainCheckpoint {
     pub head_seq: i64,
     /// The link of the newest chained row.
     pub head: ChainHash,
-    /// The `occurred_at` of the newest chained row.
-    pub head_occurred_at: DateTime<Utc>,
+    /// The newest `occurred_at` of every chained row, through the head.
+    pub newest_at: DateTime<Utc>,
 }
 
 impl ChainCheckpoint {
@@ -265,7 +294,7 @@ impl ChainCheckpoint {
         mac.update(&self.start_seq.to_be_bytes());
         mac.update(&self.head_seq.to_be_bytes());
         mac.update(&self.head);
-        mac.update(&self.head_occurred_at.timestamp_micros().to_be_bytes());
+        mac.update(&self.newest_at.timestamp_micros().to_be_bytes());
         mac.finalize().into_bytes().into()
     }
 }
@@ -279,6 +308,8 @@ pub struct ChainRow {
     pub prev: Option<ChainHash>,
     /// The stored `chain_hash`, if the row is chained.
     pub hash: Option<ChainHash>,
+    /// The stored `chain_newest_before`. It is `None` for the first link.
+    pub newest_before: Option<DateTime<Utc>>,
 }
 
 /// One problem the verifier found.
@@ -353,10 +384,18 @@ pub struct ChainVerifier<'k> {
     keys: &'k [CallbackSecret],
     retention_cutoff: Option<DateTime<Utc>>,
     report: ChainReport,
-    /// The `seq` and stored hash of the previous row, once the chain starts.
-    previous: Option<(i64, Option<ChainHash>)>,
-    /// `true` after a row of the chain that retention cannot have reached.
-    seen_recent: bool,
+    /// The previous row, once the chain starts. See [`Previous`].
+    previous: Option<Previous>,
+}
+
+/// The verifier state for the previous row.
+#[derive(Debug, Clone, Copy)]
+struct Previous {
+    seq: i64,
+    /// The stored hash. `None` for an unchained row.
+    hash: Option<ChainHash>,
+    /// The newest `occurred_at` through this row. `None` for an unchained row.
+    newest: Option<DateTime<Utc>>,
 }
 
 impl<'k> ChainVerifier<'k> {
@@ -376,7 +415,6 @@ impl<'k> ChainVerifier<'k> {
             retention_cutoff: None,
             report: ChainReport::default(),
             previous: None,
-            seen_recent: false,
         }
     }
 
@@ -406,13 +444,14 @@ impl<'k> ChainVerifier<'k> {
 
     /// Record a gap as a finding, or as retention.
     ///
-    /// Retention explains a gap only while every row before it is old.
-    fn gap(&mut self, after_seq: i64, before_seq: i64) {
+    /// Retention explains a gap only when `newest_before`, the verified
+    /// newest time before the row after the gap, is old.
+    fn gap(&mut self, after_seq: i64, before_seq: i64, newest_before: Option<DateTime<Utc>>) {
         let gap = ChainFinding::Gap {
             after_seq,
             before_seq,
         };
-        if self.retention_cutoff.is_some() && !self.seen_recent {
+        if newest_before.is_some_and(|newest| self.is_old(newest)) {
             self.report.retention_gaps.push(gap);
         } else {
             self.report.findings.push(gap);
@@ -430,9 +469,12 @@ impl<'k> ChainVerifier<'k> {
             return;
         }
 
+        // Only a link that verifies can explain a gap.
+        let valid = self.own_hash_matches(row);
+        let newest_before = row.newest_before.filter(|_| valid);
         match self.previous {
-            Some((previous_seq, _)) if seq != previous_seq + 1 => {
-                self.gap(previous_seq, seq);
+            Some(previous) if seq != previous.seq + 1 => {
+                self.gap(previous.seq, seq, newest_before);
             }
             None => {
                 // Rows between the checkpoint start and the first row found
@@ -440,24 +482,29 @@ impl<'k> ChainVerifier<'k> {
                 if let Some(start) = self.report.start_seq
                     && seq > start
                 {
-                    self.gap(start - 1, seq);
+                    self.gap(start - 1, seq, newest_before);
                 }
             }
             Some(_) => {}
         }
 
-        if !self.is_old(row.record.occurred_at) {
-            self.seen_recent = true;
-        }
         if row.hash.is_none() {
             self.report.findings.push(ChainFinding::Unchained { seq });
-            self.previous = Some((seq, None));
+            self.previous = Some(Previous {
+                seq,
+                hash: None,
+                newest: None,
+            });
             return;
         }
         // A link check needs both neighbours present and chained.
-        if let Some((previous_seq, Some(previous_hash))) = self.previous
+        if let Some(Previous {
+            seq: previous_seq,
+            hash: Some(previous_hash),
+            newest,
+        }) = self.previous
             && seq == previous_seq + 1
-            && row.prev != Some(previous_hash)
+            && (row.prev != Some(previous_hash) || row.newest_before != newest)
         {
             self.report
                 .findings
@@ -466,30 +513,32 @@ impl<'k> ChainVerifier<'k> {
         if self.report.anchor_seq.is_none() {
             self.report.anchor_seq = Some(seq);
         }
-        self.check_own_hash(row);
-    }
-
-    /// Check a chained row against its stored `chain_prev` and record it.
-    fn check_own_hash(&mut self, row: &ChainRow) {
-        let seq = row.record.seq;
-        let matches = row.prev.is_some_and(|prev| {
-            self.keys
-                .iter()
-                .any(|key| row.hash == Some(link(key, &prev, &row.record)))
-        });
-        if !matches {
+        if !valid {
             self.report.findings.push(ChainFinding::Tampered { seq });
         }
         self.report.checked += 1;
         self.report.last_seq = Some(seq);
         self.report.last_hash = row.hash;
-        self.previous = Some((seq, row.hash));
+        self.previous = Some(Previous {
+            seq,
+            hash: row.hash,
+            newest: Some(newest_through(row.newest_before, row.record.occurred_at)),
+        });
+    }
+
+    /// `true` when the row's stored hash is its link under some key.
+    fn own_hash_matches(&self, row: &ChainRow) -> bool {
+        row.prev.is_some_and(|prev| {
+            self.keys
+                .iter()
+                .any(|key| row.hash == Some(link(key, &prev, row.newest_before, &row.record)))
+        })
     }
 
     /// End the verification against the cursor's verified `checkpoint`.
     ///
     /// The newest chained row must be the checkpoint head. Rows missing after
-    /// it count as retention only when the head and every row found are old.
+    /// it count as retention only when the checkpoint's newest time is old.
     #[must_use]
     pub fn finish(mut self, checkpoint: Option<&ChainCheckpoint>) -> ChainReport {
         let Some(checkpoint) = checkpoint else {
@@ -500,8 +549,7 @@ impl<'k> ChainVerifier<'k> {
             return self.report;
         }
         let tail_purged = found.is_none_or(|(seq, _)| seq < checkpoint.head_seq)
-            && !self.seen_recent
-            && self.is_old(checkpoint.head_occurred_at);
+            && self.is_old(checkpoint.newest_at);
         if tail_purged {
             let after_seq = self.report.last_seq.unwrap_or(checkpoint.start_seq - 1);
             self.report.retention_gaps.push(ChainFinding::Gap {
@@ -528,8 +576,8 @@ pub(crate) struct Stamped {
     pub(crate) head_seq: i64,
     /// The link of the newest row.
     pub(crate) head: ChainHash,
-    /// The `occurred_at` of the newest row.
-    pub(crate) head_occurred_at: DateTime<Utc>,
+    /// The newest `occurred_at` of the chain, through the newest row.
+    pub(crate) newest_at: DateTime<Utc>,
 }
 
 /// Rows the verifier reads per query.
@@ -544,8 +592,8 @@ pub(crate) struct StoredChainState {
     pub(crate) head: ChainHash,
     /// The `export_seq` of the newest chained row.
     pub(crate) head_seq: i64,
-    /// The `occurred_at` of the newest chained row.
-    pub(crate) head_occurred_at: DateTime<Utc>,
+    /// The newest time the chained rows record.
+    pub(crate) newest_at: DateTime<Utc>,
     /// The first chained `export_seq`.
     pub(crate) start_seq: i64,
 }
@@ -558,20 +606,21 @@ struct StoredChainRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     head_seq: Option<i64>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    head_occurred_at: Option<DateTime<Utc>>,
+    newest_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     start_seq: Option<i64>,
 }
 
-/// Read the newest link and the chain start from rows up to `through_seq`.
+/// Read the newest link, the newest time and the chain start from the
+/// chained rows up to `through_seq`.
 ///
-/// Returns `None` when no row is chained. It scans the unchained rows, so
-/// the exporter calls it only for a cursor with no checkpoint.
+/// Returns `None` when no row is chained. It reads every chained row, so
+/// only the re-anchor calls it.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
 #[cfg(feature = "db")]
-pub(crate) async fn stored_chain_state(
+async fn stored_chain_state(
     conn: &mut diesel_async::AsyncPgConnection,
     through_seq: i64,
 ) -> crate::error::HarvestResult<Option<StoredChainState>> {
@@ -579,12 +628,15 @@ pub(crate) async fn stored_chain_state(
 
     let row: StoredChainRow = diesel::sql_query(
         "SELECT h.chain_hash AS head, h.export_seq AS head_seq, \
-             h.occurred_at AS head_occurred_at, \
-             (SELECT MIN(export_seq) FROM harvest_audit_log \
-              WHERE chain_hash IS NOT NULL AND export_seq <= $1) AS start_seq \
-         FROM (SELECT 1) AS one \
+             s.newest_at, s.start_seq \
+         FROM ( \
+             SELECT MIN(export_seq) AS start_seq, \
+                 GREATEST(MAX(occurred_at), MAX(chain_newest_before)) AS newest_at \
+             FROM harvest_audit_log \
+             WHERE chain_hash IS NOT NULL AND export_seq <= $1 \
+         ) AS s \
          LEFT JOIN ( \
-             SELECT chain_hash, export_seq, occurred_at FROM harvest_audit_log \
+             SELECT chain_hash, export_seq FROM harvest_audit_log \
              WHERE chain_hash IS NOT NULL AND export_seq <= $1 \
              ORDER BY export_seq DESC LIMIT 1 \
          ) AS h ON true",
@@ -597,20 +649,56 @@ pub(crate) async fn stored_chain_state(
         Some(StoredChainState {
             head,
             head_seq: row.head_seq?,
-            head_occurred_at: row.head_occurred_at?,
+            newest_at: row.newest_at?,
             start_seq: row.start_seq?,
         })
     }))
 }
 
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct AnyChained {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    present: bool,
+}
+
+/// `true` when a row up to `through_seq` is chained.
+///
+/// It can scan the unchained rows, so the exporter calls it only for a
+/// cursor with no checkpoint.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+async fn any_chained_row(
+    conn: &mut diesel_async::AsyncPgConnection,
+    through_seq: i64,
+) -> crate::error::HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    let row: AnyChained = diesel::sql_query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM harvest_audit_log \
+             WHERE chain_hash IS NOT NULL AND export_seq <= $1 \
+         ) AS present",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(through_seq)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(row.present)
+}
+
 /// The point the exporter extends the chain from.
 #[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ChainAnchor {
     /// The link to extend, or `None` for a new chain.
     pub(crate) head: Option<ChainHash>,
     /// The first chained `export_seq`, or `None` for a new chain.
     pub(crate) start_seq: Option<i64>,
+    /// The newest time of the chain so far, or `None` for a new chain.
+    pub(crate) newest_at: Option<DateTime<Utc>>,
 }
 
 /// The anchor for the next stamp on `cursor`, or `None` to refuse the stamp.
@@ -635,21 +723,18 @@ pub(crate) async fn chain_anchor(
         return Ok(valid.then_some(ChainAnchor {
             head: Some(checkpoint.head),
             start_seq: Some(checkpoint.start_seq),
+            newest_at: Some(checkpoint.newest_at),
         }));
     }
     let partial = cursor.chain_head.is_some()
         || cursor.chain_start_seq.is_some()
         || cursor.chain_head_seq.is_some()
-        || cursor.chain_head_occurred_at.is_some()
+        || cursor.chain_newest_at.is_some()
         || cursor.chain_mac.is_some();
-    if partial {
+    if partial || any_chained_row(conn, cursor.last_assigned_seq).await? {
         return Ok(None);
     }
-    let stored = stored_chain_state(conn, cursor.last_assigned_seq).await?;
-    Ok(stored.is_none().then_some(ChainAnchor {
-        head: None,
-        start_seq: None,
-    }))
+    Ok(Some(ChainAnchor::default()))
 }
 
 /// Write `checkpoint` and its MAC under the active key to the cursor.
@@ -674,7 +759,7 @@ pub(crate) async fn write_checkpoint(
             cur::chain_start_seq.eq(checkpoint.start_seq),
             cur::chain_head_seq.eq(checkpoint.head_seq),
             cur::chain_head.eq(checkpoint.head.to_vec()),
-            cur::chain_head_occurred_at.eq(checkpoint.head_occurred_at),
+            cur::chain_newest_at.eq(checkpoint.newest_at),
             cur::chain_mac.eq(mac.to_vec()),
         ))
         .execute(conn)
@@ -729,7 +814,7 @@ pub async fn reanchor_shard_chain(
                         cur::chain_start_seq.eq(None::<i64>),
                         cur::chain_head_seq.eq(None::<i64>),
                         cur::chain_head.eq(None::<Vec<u8>>),
-                        cur::chain_head_occurred_at.eq(None::<DateTime<Utc>>),
+                        cur::chain_newest_at.eq(None::<DateTime<Utc>>),
                         cur::chain_mac.eq(None::<Vec<u8>>),
                     ))
                     .execute(conn)
@@ -737,20 +822,25 @@ pub async fn reanchor_shard_chain(
                     .map_err(crate::error::database_error)?;
                 return Ok(None);
             };
+            let anchor = ChainAnchor {
+                head: Some(seed.head),
+                start_seq: Some(seed.start_seq),
+                newest_at: Some(seed.newest_at),
+            };
             let stamped = stamp_chain(
                 conn,
                 shard_id,
                 key.secret(),
                 seed.head_seq,
                 cursor.last_assigned_seq,
-                Some(seed.head.as_slice()),
+                &anchor,
             )
             .await?;
             let checkpoint = ChainCheckpoint {
                 start_seq: seed.start_seq,
                 head_seq: stamped.map_or(seed.head_seq, |s| s.head_seq),
                 head: stamped.map_or(seed.head, |s| s.head),
-                head_occurred_at: stamped.map_or(seed.head_occurred_at, |s| s.head_occurred_at),
+                newest_at: stamped.map_or(seed.newest_at, |s| s.newest_at),
             };
             write_checkpoint(conn, shard_id, &checkpoint, key).await?;
             Ok(Some(checkpoint))
@@ -761,8 +851,7 @@ pub async fn reanchor_shard_chain(
 
 /// Stamp the chain over the rows with `after_seq < export_seq <= through_seq`.
 ///
-/// `head` is the cursor's `chain_head`, or `None` for the first link. Returns
-/// `None` when no row is in the range. The caller holds the cursor row lock,
+/// It continues from `anchor`. Returns `None` when no row is in the range. The caller holds the cursor row lock,
 /// so no other exporter stamps the same rows.
 ///
 /// # Errors
@@ -774,10 +863,10 @@ pub(crate) async fn stamp_chain(
     key: &CallbackSecret,
     after_seq: i64,
     through_seq: i64,
-    head: Option<&[u8]>,
+    anchor: &ChainAnchor,
 ) -> crate::error::HarvestResult<Option<Stamped>> {
     use diesel::prelude::*;
-    use diesel::sql_types::{Array, Bytea};
+    use diesel::sql_types::{Array, Bytea, Nullable, Timestamptz};
     use diesel_async::RunQueryDsl;
 
     use crate::schema::harvest_audit_log::dsl as log;
@@ -791,9 +880,11 @@ pub(crate) async fn stamp_chain(
         .await
         .map_err(crate::error::database_error)?;
 
-    let mut prev = head.and_then(from_bytes).unwrap_or(GENESIS);
+    let mut prev = anchor.head.unwrap_or(GENESIS);
+    let mut newest = anchor.newest_at;
     let mut ids = Vec::with_capacity(rows.len());
     let mut prevs = Vec::with_capacity(rows.len());
+    let mut newests = Vec::with_capacity(rows.len());
     let mut hashes = Vec::with_capacity(rows.len());
     let mut stamped: Option<Stamped> = None;
     for row in rows {
@@ -801,16 +892,19 @@ pub(crate) async fn stamp_chain(
         let Some(record) = AuditExportRecord::from_row(shard_id, row) else {
             continue;
         };
-        let hash = link(key, &prev, &record);
+        let hash = link(key, &prev, newest, &record);
         ids.push(id);
         prevs.push(prev.to_vec());
+        newests.push(newest);
         hashes.push(hash.to_vec());
         prev = hash;
+        let newest_at = newest_through(newest, record.occurred_at);
+        newest = Some(newest_at);
         stamped = Some(Stamped {
             first_seq: stamped.map_or(record.seq, |s| s.first_seq),
             head_seq: record.seq,
             head: hash,
-            head_occurred_at: record.occurred_at,
+            newest_at,
         });
     }
     if ids.is_empty() {
@@ -819,12 +913,13 @@ pub(crate) async fn stamp_chain(
 
     diesel::sql_query(
         "UPDATE harvest_audit_log a \
-         SET chain_prev = v.prev, chain_hash = v.hash \
-         FROM unnest($1, $2, $3) AS v(id, prev, hash) \
+         SET chain_prev = v.prev, chain_newest_before = v.newest, chain_hash = v.hash \
+         FROM unnest($1, $2, $3, $4) AS v(id, prev, newest, hash) \
          WHERE a.id = v.id",
     )
     .bind::<Array<diesel::sql_types::Uuid>, _>(&ids)
     .bind::<Array<Bytea>, _>(&prevs)
+    .bind::<Array<Nullable<Timestamptz>>, _>(&newests)
     .bind::<Array<Bytea>, _>(&hashes)
     .execute(conn)
     .await
@@ -924,8 +1019,14 @@ pub async fn verify_shard_chain_with(
         for row in rows {
             let prev = row.chain_prev.as_deref().and_then(from_bytes);
             let hash = row.chain_hash.as_deref().and_then(from_bytes);
+            let newest_before = row.chain_newest_before;
             if let Some(record) = AuditExportRecord::from_row(shard_id, row) {
-                verifier.push(&ChainRow { record, prev, hash });
+                verifier.push(&ChainRow {
+                    record,
+                    prev,
+                    hash,
+                    newest_before,
+                });
             }
         }
         after_seq = last_seq;
@@ -950,7 +1051,7 @@ pub(crate) fn stored_checkpoint(
             start_seq: cursor.chain_start_seq?,
             head_seq: cursor.chain_head_seq?,
             head: cursor.chain_head.as_deref().and_then(from_bytes)?,
-            head_occurred_at: cursor.chain_head_occurred_at?,
+            newest_at: cursor.chain_newest_at?,
         },
         cursor.chain_mac.as_deref().and_then(from_bytes)?,
     ))
@@ -986,24 +1087,33 @@ mod tests {
             error_summary: None,
             source: "api".into(),
             chain_prev: None,
+            chain_newest_before: None,
             chain_hash: None,
         }
     }
 
     /// A correctly chained run of rows for `seqs`, starting at [`GENESIS`].
     fn chain(seqs: &[i64]) -> Vec<ChainRow> {
+        chain_records(seqs.iter().map(|&seq| rec(seq)).collect())
+    }
+
+    /// `records`, chained in order from [`GENESIS`], as the exporter does.
+    fn chain_records(records: Vec<AuditExportRecord>) -> Vec<ChainRow> {
         let key = key();
         let mut prev = GENESIS;
-        seqs.iter()
-            .map(|&seq| {
-                let record = rec(seq);
-                let hash = link(&key, &prev, &record);
+        let mut newest = None;
+        records
+            .into_iter()
+            .map(|record| {
+                let hash = link(&key, &prev, newest, &record);
                 let row = ChainRow {
-                    record,
                     prev: Some(prev),
                     hash: Some(hash),
+                    newest_before: newest,
+                    record,
                 };
                 prev = hash;
+                newest = Some(newest_through(newest, row.record.occurred_at));
                 row
             })
             .collect()
@@ -1017,7 +1127,7 @@ mod tests {
             start_seq: first.record.seq,
             head_seq: last.record.seq,
             head: last.hash?,
-            head_occurred_at: last.record.occurred_at,
+            newest_at: rows.iter().map(|row| row.record.occurred_at).max()?,
         })
     }
 
@@ -1100,31 +1210,45 @@ mod tests {
         }
         assert_eq!(canonical_record(&rec(1)), expected);
         assert_eq!(
-            to_hex(&link(&key(), &GENESIS, &rec(1))),
-            "53a9a78bc5cefd88056afff7bb0bc0c7b33ac96b245a352685cd6e43529b2fe2"
+            to_hex(&link(&key(), &GENESIS, None, &rec(1))),
+            "5ee3864c95187c4f68b36457c90ea9a06943ff4509e7949866cd9abe0e271aa8"
+        );
+        assert_eq!(
+            to_hex(&link(&key(), &[1; 32], Some(at(1_700_000_000)), &rec(1))),
+            "b911ece96316f2fa5b264dea4d4c86605e469aa43f2c7132b0405b1b64b21365"
         );
     }
 
     #[test]
     fn link_depends_on_key_prev_and_every_field() {
         let key = key();
-        let base = link(&key, &GENESIS, &rec(1));
+        let base = link(&key, &GENESIS, None, &rec(1));
         assert_ne!(base, GENESIS);
-        assert_eq!(base, link(&key, &GENESIS, &rec(1)));
+        assert_eq!(base, link(&key, &GENESIS, None, &rec(1)));
         assert_ne!(
             base,
-            link(&CallbackSecret::new(vec![8_u8; 32]), &GENESIS, &rec(1))
+            link(
+                &CallbackSecret::new(vec![8_u8; 32]),
+                &GENESIS,
+                None,
+                &rec(1)
+            )
         );
-        assert_ne!(base, link(&key, &[1; 32], &rec(1)));
+        assert_ne!(base, link(&key, &[1; 32], None, &rec(1)));
+        assert_ne!(base, link(&key, &GENESIS, Some(at(0)), &rec(1)));
+        assert_ne!(
+            link(&key, &GENESIS, Some(at(0)), &rec(1)),
+            link(&key, &GENESIS, Some(at(1)), &rec(1))
+        );
         let mut changed = rec(1);
         changed.status = "failed".into();
-        assert_ne!(base, link(&key, &GENESIS, &changed));
+        assert_ne!(base, link(&key, &GENESIS, None, &changed));
         let mut moved = rec(1);
         moved.seq = 2;
-        assert_ne!(base, link(&key, &GENESIS, &moved));
+        assert_ne!(base, link(&key, &GENESIS, None, &moved));
         let mut other_shard = rec(1);
         other_shard.shard = 3;
-        assert_ne!(base, link(&key, &GENESIS, &other_shard));
+        assert_ne!(base, link(&key, &GENESIS, None, &other_shard));
     }
 
     #[test]
@@ -1171,8 +1295,51 @@ mod tests {
     }
 
     #[test]
+    fn an_old_row_after_a_deleted_recent_row_does_not_make_the_gap_retention() {
+        let day = 86_400;
+        // Row 3 is a late commit: it is older than row 2.
+        let rows = chain_at(&[(1, 0), (2, 100 * day), (3, day)]);
+        let cp = checkpoint(&rows);
+        let survivors = [rows[0].clone(), rows[2].clone()];
+        let report = verify_with(&survivors, cp, Some(at(10 * day)));
+        assert_eq!(
+            report.findings,
+            vec![ChainFinding::Gap {
+                after_seq: 1,
+                before_seq: 3,
+            }]
+        );
+        assert!(report.retention_gaps.is_empty(), "{report:?}");
+
+        // The tail goes too. The head is old, but the chain's newest time is not.
+        let report = verify_with(&rows[..1], cp, Some(at(10 * day)));
+        assert_eq!(
+            report.findings,
+            vec![ChainFinding::HeadMismatch {
+                expected_seq: 3,
+                found_seq: Some(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_changed_newest_before_is_reported() {
+        let mut rows = chain(&[1, 2, 3]);
+        let cp = checkpoint(&rows);
+        rows[2].newest_before = Some(at(0));
+        let report = verify(&rows, cp);
+        assert_eq!(
+            report.findings,
+            vec![
+                ChainFinding::LinkMismatch { seq: 3 },
+                ChainFinding::Tampered { seq: 3 },
+            ]
+        );
+    }
+
+    #[test]
     fn hex_and_bytes_round_trip() {
-        let hash = link(&key(), &GENESIS, &rec(1));
+        let hash = link(&key(), &GENESIS, None, &rec(1));
         let hex = to_hex(&hash);
         assert_eq!(hex.len(), 64);
         assert!(
@@ -1207,7 +1374,7 @@ mod tests {
                 ..base
             },
             ChainCheckpoint {
-                head_occurred_at: at(0),
+                newest_at: at(0),
                 ..base
             },
         ] {
@@ -1289,23 +1456,16 @@ mod tests {
 
     /// Rows at `seconds` after a base time, chained from [`GENESIS`].
     fn chain_at(times: &[(i64, i64)]) -> Vec<ChainRow> {
-        let key = key();
-        let mut prev = GENESIS;
-        times
-            .iter()
-            .map(|&(seq, seconds)| {
-                let mut record = rec(seq);
-                record.occurred_at = at(seconds);
-                let hash = link(&key, &prev, &record);
-                let row = ChainRow {
-                    record,
-                    prev: Some(prev),
-                    hash: Some(hash),
-                };
-                prev = hash;
-                row
-            })
-            .collect()
+        chain_records(
+            times
+                .iter()
+                .map(|&(seq, seconds)| {
+                    let mut record = rec(seq);
+                    record.occurred_at = at(seconds);
+                    record
+                })
+                .collect(),
+        )
     }
 
     #[test]
@@ -1423,15 +1583,17 @@ mod tests {
                 record: rec(seq),
                 prev: None,
                 hash: None,
+                newest_before: None,
             })
             .collect();
         let key = key();
         let record = rec(3);
-        let hash = link(&key, &GENESIS, &record);
+        let hash = link(&key, &GENESIS, None, &record);
         rows.push(ChainRow {
             record,
             prev: Some(GENESIS),
             hash: Some(hash),
+            newest_before: None,
         });
         let report = verify(&rows, checkpoint(&rows[2..]));
         assert!(report.is_intact(), "{report:?}");
@@ -1491,19 +1653,22 @@ mod tests {
         let old = key();
         let new = CallbackSecret::new(vec![8_u8; 32]);
         let first = rec(1);
-        let h1 = link(&old, &GENESIS, &first);
+        let h1 = link(&old, &GENESIS, None, &first);
         let second = rec(2);
-        let h2 = link(&new, &h1, &second);
+        let newest = Some(first.occurred_at);
+        let h2 = link(&new, &h1, newest, &second);
         let rows = [
             ChainRow {
                 record: first,
                 prev: Some(GENESIS),
                 hash: Some(h1),
+                newest_before: None,
             },
             ChainRow {
                 record: second,
                 prev: Some(h1),
                 hash: Some(h2),
+                newest_before: newest,
             },
         ];
         let cp = checkpoint(&rows);

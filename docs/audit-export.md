@@ -161,9 +161,10 @@ Compare with a constant-time comparison.
 Optional fields serialize as an explicit `null` rather than being omitted, so
 a SIEM's schema inference sees a stable object shape across every batch.
 
-Two fields are the exception: `chain_prev` and `chain_hash` (issue #1838).
-They appear only on rows the audit hash chain covers, and they are the last
-fields. A deployment without a chain key ships the same bytes as before. See
+Three fields are the exception: `chain_prev`, `chain_newest_before` and
+`chain_hash` (issue #1838). They appear only on rows the audit hash chain
+covers, and they are the last fields. The first chained row has no
+`chain_newest_before`. A deployment without a chain key ships the same bytes as before. See
 [The audit hash chain](#the-audit-hash-chain).
 
 ### Verifying completeness: `(shard, seq)`
@@ -216,7 +217,7 @@ collector:
 | `shard` | `attributes["harvest.audit.source_shard"]` — the shard whose **database this record was read from**. Together with `seq` it is the dedup and gap-detection key, *not* an operation attribute |
 | `seq` | `attributes["harvest.audit.seq"]` |
 | `id` | `attributes["harvest.audit.id"]` |
-| `chain_prev`, `chain_hash` | `attributes["harvest.audit.chain_prev"]`, `attributes["harvest.audit.chain_hash"]`, when present |
+| `chain_prev`, `chain_newest_before`, `chain_hash` | `attributes["harvest.audit.chain_prev"]`, `attributes["harvest.audit.chain_newest_before"]`, `attributes["harvest.audit.chain_hash"]`, when present |
 | `actor`, `target_type`, `target_id`, `route_or_command`, `request_id`, `idempotency_key`, `source` | `attributes["harvest.audit.<field>"]` |
 
 **`shard` and `shard_id` are different things and both are exported.** They
@@ -242,14 +243,17 @@ HarvestBuilder::new()
     .audit_export_chain_key(chain_key)
 ```
 
-The exporter stamps the chain when it assigns `seq`. Each row then holds two
-32-byte values:
+The exporter stamps the chain when it assigns `seq`. Each row then holds
+three values:
 
-- `chain_prev`: the link the chain held before this row. Normally that is the
-  `chain_hash` of the row with the previous `seq`. The first chained row uses
-  32 zero bytes.
+- `chain_prev`: the link the chain held before this row, 32 bytes. Normally
+  that is the `chain_hash` of the row with the previous `seq`. The first
+  chained row uses 32 zero bytes.
+- `chain_newest_before`: the newest `occurred_at` of every row chained before
+  this one. It is absent on the first chained row.
 - `chain_hash`: `HMAC-SHA256(key, "harvest-audit-chain-v1" || chain_prev ||
-  canonical row)`.
+  newest || canonical row)`, 32 bytes. `newest` is `chain_newest_before`,
+  encoded as one canonical field.
 
 The canonical row is these fields, in this order: `shard`, `seq`, `id`,
 `shard_id`, `occurred_at`, `actor`, `operation`, `target_type`, `target_id`,
@@ -261,8 +265,8 @@ RFC 3339 in UTC with exactly six fractional digits, for example
 `2026-08-31T04:11:02.117000Z`.
 
 The cursor also holds a keyed checkpoint: the first chained `seq`, the newest
-chained `seq`, its link and its `occurred_at`. An HMAC under the chain key
-covers all four. A database writer without the key cannot move it. So the
+chained `seq`, its link and the newest `occurred_at` of the chain. An HMAC
+under the chain key covers all four. A database writer without the key cannot move it. So the
 verifier finds stripped links and a deleted tail.
 
 The exporter extends the chain only from a checkpoint that its key accepts.
@@ -306,10 +310,12 @@ the SIEM copy.
 old rows, such as the `audit_export.decommission` and
 `audit_export.reactivate` records. Set `retention_cutoff` in
 `ChainVerifyOptions` to `now - audit_retention_days`. A gap then goes to
-`retention_gaps`, not to `findings`, while every row before it is older than
-the cutoff plus one hour. After the first newer row, a gap is a finding. A
-missing tail counts as retention only when the checkpoint head is that old
-too.
+`retention_gaps`, not to `findings`, when the row after it has a verified
+`chain_newest_before` older than the cutoff plus one hour. That value proves
+that every row before it, the missing rows too, was old. The ages of the
+surviving rows prove nothing, because a late commit can carry an old
+`occurred_at`. A missing tail counts as retention only when the checkpoint's
+newest time is that old too.
 
 **Key rotation.** Rotate in two steps, so that each exporter accepts the
 checkpoint that any other exporter signed:
@@ -332,11 +338,12 @@ and signs a new checkpoint. Rows that lost their links before that link stay
 export tick starts a new chain.
 
 **Verify from the SIEM.** A SIEM that holds the key can also verify the chain.
-Each chained record carries `chain_prev` and `chain_hash`. Build the canonical
-row from the parsed record, not from the JSON text. The JSON writes
-`occurred_at` with as few fractional digits as it needs. The canonical row
-always uses six digits. Then check that the HMAC of `chain_prev` and the
-canonical row equals `chain_hash`.
+Each chained record carries `chain_prev`, `chain_newest_before` and
+`chain_hash`. Build the canonical fields from the parsed record, not from the
+JSON text. The JSON writes a time with as few fractional digits as it needs.
+The canonical encoding always uses six digits. Then check that the HMAC of
+`chain_prev`, `chain_newest_before` and the canonical row equals
+`chain_hash`.
 
 **Limits.**
 
@@ -346,8 +353,9 @@ canonical row equals `chain_hash`.
 - Rows sequenced before you set the key stay unchained. If you remove the key,
   later rows are unchained, and the verifier flags them.
 - A writer who removes every link and the whole checkpoint leaves a table that
-  looks unchained. A writer can also hide a deletion near the retention cutoff.
-  Only the SIEM copy detects these cases.
+  looks unchained. A writer can also delete rows that every row chained before
+  them shows are within one hour of the retention cutoff. Retention deletes
+  those rows within the hour anyway. Only the SIEM copy detects these cases.
 - A re-anchor accepts the stored rows. It hides any deletion at the tail that
   happened before it. Compare with the SIEM copy before you re-anchor.
 - Each sequenced row is written twice: once for `export_seq`, once for the

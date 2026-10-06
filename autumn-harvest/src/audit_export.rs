@@ -102,7 +102,7 @@
 //! | `shard_id` | `attributes["harvest.shard.id"]` — the shard the operation itself named, which can differ from `shard` |
 //! | `actor`, `target_type`, `target_id`, `route_or_command`, `request_id`, `idempotency_key`, `source` | `attributes["harvest.audit.<field>"]` |
 //! | `id` | `attributes["harvest.audit.id"]` |
-//! | `chain_prev`, `chain_hash` | `attributes["harvest.audit.chain_prev"]`, `attributes["harvest.audit.chain_hash"]`, when present |
+//! | `chain_prev`, `chain_newest_before`, `chain_hash` | `attributes["harvest.audit.chain_prev"]`, `attributes["harvest.audit.chain_newest_before"]`, `attributes["harvest.audit.chain_hash"]`, when present |
 //!
 //! See `docs/audit-export.md` for the full receiver contract.
 
@@ -192,6 +192,11 @@ pub struct AuditExportRecord {
     /// same bytes as before. See [`crate::audit_chain`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_prev: Option<String>,
+    /// The newest `occurred_at` of every row chained before this one (issue
+    /// #1838). The link covers it. Omitted when absent, as
+    /// [`Self::chain_prev`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_newest_before: Option<DateTime<Utc>>,
     /// Lowercase hex of the row's audit-chain link (issue #1838). Omitted
     /// when absent, as [`Self::chain_prev`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +228,7 @@ impl AuditExportRecord {
             error_summary: row.error_summary,
             source: row.source,
             chain_prev: chain_hex(row.chain_prev.as_deref()),
+            chain_newest_before: row.chain_newest_before,
             chain_hash: chain_hex(row.chain_hash.as_deref()),
         })
     }
@@ -2410,7 +2416,7 @@ pub async fn claim_shard_chained(
                             key.secret(),
                             cursor.last_assigned_seq,
                             last_assigned_seq,
-                            anchor.head.as_ref().map(<[u8; 32]>::as_slice),
+                            &anchor,
                         )
                         .await?
                         .map(|stamped| (key, stamped, anchor.start_seq))
@@ -2432,7 +2438,7 @@ pub async fn claim_shard_chained(
                     start_seq: start_seq.unwrap_or(stamped.first_seq),
                     head_seq: stamped.head_seq,
                     head: stamped.head,
-                    head_occurred_at: stamped.head_occurred_at,
+                    newest_at: stamped.newest_at,
                 };
                 (checkpoint, key)
             });
@@ -4286,6 +4292,7 @@ mod tests {
             error_summary: None,
             source: "api".to_string(),
             chain_prev: None,
+            chain_newest_before: None,
             chain_hash: None,
         }
     }
@@ -4397,7 +4404,7 @@ mod tests {
             start_seq: 1,
             head_seq: 1,
             head: crate::audit_chain::GENESIS,
-            head_occurred_at: DateTime::<Utc>::UNIX_EPOCH,
+            newest_at: DateTime::<Utc>::UNIX_EPOCH,
         };
         let old = CallbackSecret::new(vec![2_u8; 32]);
         let short = CallbackSecret::new(vec![3_u8; 31]);

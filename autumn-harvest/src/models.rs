@@ -1106,6 +1106,8 @@ pub struct AuditExportRow {
     pub export_seq: Option<i64>,
     /// Audit-chain link of the previous row (issue #1838).
     pub chain_prev: Option<Vec<u8>>,
+    /// Newest `occurred_at` chained before this row (issue #1838).
+    pub chain_newest_before: Option<DateTime<Utc>>,
     /// Audit-chain link of this row (issue #1838).
     pub chain_hash: Option<Vec<u8>>,
 }
@@ -1138,8 +1140,8 @@ pub struct AuditExportCursor {
     pub chain_start_seq: Option<i64>,
     /// `export_seq` of the newest chained row (issue #1838).
     pub chain_head_seq: Option<i64>,
-    /// `occurred_at` of the newest chained row (issue #1838).
-    pub chain_head_occurred_at: Option<DateTime<Utc>>,
+    /// Newest `occurred_at` of the chain, through the head (issue #1838).
+    pub chain_newest_at: Option<DateTime<Utc>>,
     /// Keyed MAC over the checkpoint columns (issue #1838).
     pub chain_mac: Option<Vec<u8>>,
 }

@@ -30,12 +30,14 @@ that the exporter sequences.
 - The exporter already gives each row a dense per-shard `export_seq` under the
   cursor row lock. The chain is stamped at that same point. The audit insert
   path gets no new lock and no new work.
-- Each link is `HMAC-SHA256(key, domain || chain_prev || canonical row)`. The
-  key lives outside the database, so a database writer cannot forge a link.
+- Each link is `HMAC-SHA256(key, domain || chain_prev || newest_before ||
+  canonical row)`. The key lives outside the database, so a database writer
+  cannot forge a link. `newest_before` is the newest `occurred_at` of every
+  row chained before this one.
 - Each row stores `chain_prev` and `chain_hash`. A row stays verifiable
   after retention deletes its predecessor.
 - The cursor stores a keyed checkpoint: the chain start, the newest link, its
-  `seq` and its `occurred_at`, under one HMAC. A database writer cannot move
+  `seq` and the newest `occurred_at` of the chain, under one HMAC. A database writer cannot move
   it. So stripped links and a deleted tail show.
 - The exporter extends only a checkpoint that its key accepts. Otherwise a
   writer could move the head and have the exporter sign it. A missing or
@@ -46,10 +48,13 @@ that the exporter sequences.
 - `audit_chain::verify_shard_chain` reports changed rows, broken links,
   unchained rows, missing sequence numbers, a missing newest row, and a
   missing or invalid checkpoint.
-- With a retention cutoff, gaps at the old end of the chain count as
-  retention, not as findings. Retention keeps some old rows, so these gaps
-  are normal.
-- Exported records carry `chain_prev` and `chain_hash`. A SIEM that holds the
+- With a retention cutoff, a gap counts as retention, not as a finding, when
+  the keyed `newest_before` of the row after it is old. Retention keeps some
+  old rows, so these gaps are normal. The ages of the surviving rows are no
+  proof, because a late commit or a planted row can carry an old
+  `occurred_at`.
+- Exported records carry `chain_prev`, `chain_newest_before` and
+  `chain_hash`. A SIEM that holds the
   key can verify the chain on its side. A deployment without a key ships the
   same bytes as before.
 - Turn it on with `HarvestBuilder::audit_export_chain_key`. The key must be at
@@ -62,8 +67,8 @@ that the exporter sequences.
 - A process that holds the key can forge links. The chain protects against
   database-level tampering, not a compromised Harvest process.
 - A writer who removes every link and the whole checkpoint leaves a table
-  that looks unchained. A writer can also hide a deletion near the retention
-  cutoff. Only the SIEM copy detects these cases.
+  that looks unchained. A writer can also delete rows that retention deletes
+  within the hour. Only the SIEM copy detects these cases.
 - Each sequenced row is written twice: once for `export_seq`, once for the
   chain columns. Only a deployment with a chain key pays this cost.
 - Every exporter must hold the same key. Set it after a rolling upgrade
