@@ -616,6 +616,8 @@ diesel::table! {
         chain_newest_before -> Nullable<Timestamptz>,
         /// Audit-chain link of this row (issue #1838).
         chain_hash -> Nullable<Bytea>,
+        /// The shard whose exporter made the links (issue #1838).
+        chain_shard -> Nullable<Int4>,
     }
 }
 

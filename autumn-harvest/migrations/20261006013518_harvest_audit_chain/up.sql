@@ -25,7 +25,8 @@ SET LOCAL lock_timeout = '5s';
 ALTER TABLE harvest_audit_log
     ADD COLUMN IF NOT EXISTS chain_prev BYTEA,
     ADD COLUMN IF NOT EXISTS chain_newest_before TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS chain_hash BYTEA;
+    ADD COLUMN IF NOT EXISTS chain_hash BYTEA,
+    ADD COLUMN IF NOT EXISTS chain_shard INTEGER;
 
 ALTER TABLE harvest_audit_export_cursor
     ADD COLUMN IF NOT EXISTS chain_head BYTEA,
@@ -40,6 +41,9 @@ COMMENT ON COLUMN harvest_audit_log.chain_hash IS
 COMMENT ON COLUMN harvest_audit_log.chain_prev IS
     'Audit-chain link of the previous export_seq (issue #1838). 32 zero bytes '
     'for the first chained row.';
+COMMENT ON COLUMN harvest_audit_log.chain_shard IS
+    'The shard whose exporter made the links (issue #1838). Another shard on '
+    'the same database exports the row without them.';
 COMMENT ON COLUMN harvest_audit_log.chain_newest_before IS
     'Newest occurred_at of every row chained before this one (issue #1838). '
     'The link covers it. NULL for the first chained row.';

@@ -380,6 +380,15 @@ pub enum ChainFinding {
     /// share the `export_seq` space, so the exporter does not stamp the
     /// chain here.
     SharedDatabase,
+    /// The checkpoint head is behind the cursor's `last_assigned_seq`. Rows
+    /// were sequenced without a link. The exporter does not extend the chain
+    /// until a re-anchor.
+    CheckpointBehindCursor {
+        /// The checkpoint head `seq`.
+        head_seq: i64,
+        /// The cursor's `last_assigned_seq`.
+        last_assigned_seq: i64,
+    },
     /// The checkpoint head is past the cursor's `last_assigned_seq`. Someone
     /// lowered the cursor. Retention never does.
     CursorBehindCheckpoint {
@@ -978,7 +987,8 @@ pub(crate) async fn stamp_chain(
 
     diesel::sql_query(
         "UPDATE harvest_audit_log a \
-         SET chain_prev = v.prev, chain_newest_before = v.newest, chain_hash = v.hash \
+         SET chain_prev = v.prev, chain_newest_before = v.newest, chain_hash = v.hash, \
+             chain_shard = $5 \
          FROM unnest($1, $2, $3, $4) AS v(id, prev, newest, hash) \
          WHERE a.id = v.id",
     )
@@ -986,6 +996,7 @@ pub(crate) async fn stamp_chain(
     .bind::<Array<Bytea>, _>(&prevs)
     .bind::<Array<Nullable<Timestamptz>>, _>(&newests)
     .bind::<Array<Bytea>, _>(&hashes)
+    .bind::<diesel::sql_types::Integer, _>(shard_id)
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -1077,9 +1088,19 @@ pub async fn verify_shard_chain_with(
             break;
         };
         for row in rows {
-            let prev = row.chain_prev.as_deref().and_then(from_bytes);
-            let hash = row.chain_hash.as_deref().and_then(from_bytes);
-            let newest_before = row.chain_newest_before;
+            // Links another shard made do not belong to this chain.
+            let own = row.chain_shard == Some(shard_id);
+            let prev = row
+                .chain_prev
+                .as_deref()
+                .filter(|_| own)
+                .and_then(from_bytes);
+            let hash = row
+                .chain_hash
+                .as_deref()
+                .filter(|_| own)
+                .and_then(from_bytes);
+            let newest_before = row.chain_newest_before.filter(|_| own);
             if let Some(record) = AuditExportRecord::from_row(shard_id, row) {
                 verifier.push(&ChainRow {
                     record,
@@ -1097,17 +1118,22 @@ pub async fn verify_shard_chain_with(
         report.findings.insert(0, ChainFinding::SharedDatabase);
     }
     // Retention never lowers the cursor. So a head past it is an edit, not a
-    // purged tail.
-    if let Some(checkpoint) = checkpoint
-        && checkpoint.head_seq > bound
-    {
-        report.findings.insert(
-            0,
-            ChainFinding::CursorBehindCheckpoint {
+    // purged tail. A head behind it means rows were sequenced without a link.
+    if let Some(checkpoint) = checkpoint {
+        let finding = match checkpoint.head_seq.cmp(&bound) {
+            std::cmp::Ordering::Greater => Some(ChainFinding::CursorBehindCheckpoint {
                 head_seq: checkpoint.head_seq,
                 last_assigned_seq: bound,
-            },
-        );
+            }),
+            std::cmp::Ordering::Less => Some(ChainFinding::CheckpointBehindCursor {
+                head_seq: checkpoint.head_seq,
+                last_assigned_seq: bound,
+            }),
+            std::cmp::Ordering::Equal => None,
+        };
+        if let Some(finding) = finding {
+            report.findings.insert(0, finding);
+        }
     }
     if let Some(finding) = checkpoint_finding {
         report.findings.insert(0, finding);

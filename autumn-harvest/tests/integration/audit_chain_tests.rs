@@ -504,7 +504,16 @@ async fn an_unkeyed_tick_after_a_keyed_one_leaves_unchained_rows() {
     let report = verify_shard_chain(&mut conn, SHARD, &key())
         .await
         .expect("verify");
-    assert_eq!(report.findings, vec![ChainFinding::Unchained { seq: 3 }]);
+    assert_eq!(
+        report.findings,
+        vec![
+            ChainFinding::CheckpointBehindCursor {
+                head_seq: 2,
+                last_assigned_seq: 3,
+            },
+            ChainFinding::Unchained { seq: 3 },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -694,7 +703,16 @@ async fn a_new_key_without_the_old_one_does_not_extend_the_chain() {
     let report = verify_shard_chain_with(&mut conn, SHARD, &options)
         .await
         .expect("verify");
-    assert_eq!(report.findings, vec![ChainFinding::Unchained { seq: 3 }]);
+    assert_eq!(
+        report.findings,
+        vec![
+            ChainFinding::CheckpointBehindCursor {
+                head_seq: 2,
+                last_assigned_seq: 3,
+            },
+            ChainFinding::Unchained { seq: 3 },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1031,4 +1049,62 @@ async fn the_chain_stays_off_in_a_database_two_shards_export() {
         .await
         .expect("verify");
     assert_eq!(report.findings, vec![ChainFinding::SharedDatabase]);
+}
+
+#[tokio::test]
+async fn a_checkpoint_behind_the_cursor_is_a_finding() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    insert_rows(&mut conn, 3).await;
+    export_tick(&mut conn, None).await;
+    conn.batch_execute("DELETE FROM harvest_audit_log WHERE export_seq > 2")
+        .await
+        .expect("delete the unchained rows");
+
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert_eq!(
+        report.findings,
+        vec![ChainFinding::CheckpointBehindCursor {
+            head_seq: 2,
+            last_assigned_seq: 5,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn another_shard_never_exports_links_this_shard_stamped() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 2).await;
+    let first = export_tick(&mut conn, Some(&key())).await;
+
+    // A second logical shard joins this database and exports the same rows.
+    ensure_cursor_row(&mut conn, SHARD + 1)
+        .await
+        .expect("a second shard's cursor");
+    let key = chain_key(&key());
+    let claim = claim_shard_chained(
+        &mut conn,
+        SHARD + 1,
+        500,
+        LEASE,
+        chrono::Utc::now(),
+        Some(&key),
+    )
+    .await
+    .expect("claim")
+    .expect("a batch");
+    assert_eq!(claim.records.len(), 2);
+    for record in &claim.records {
+        assert_eq!(record.chain_hash, None, "{record:?}");
+        assert_eq!(record.chain_prev, None, "{record:?}");
+    }
+
+    // The stamping shard's redrive stays byte-identical.
+    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert_eq!(export_tick(&mut conn, None).await, first);
 }

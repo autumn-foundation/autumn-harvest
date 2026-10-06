@@ -210,7 +210,11 @@ impl AuditExportRecord {
     /// Returns `None` for a row with no `export_seq`. A fabricated sequence
     /// would corrupt the receiver's gap accounting.
     #[must_use]
+    ///
+    /// The chain fields come along only when `shard` made the links. Another
+    /// shard on the same database ships the row without them.
     pub fn from_row(shard: i32, row: crate::models::AuditExportRow) -> Option<Self> {
+        let own = row.chain_shard == Some(shard);
         Some(Self {
             shard,
             seq: row.export_seq?,
@@ -227,9 +231,9 @@ impl AuditExportRecord {
             status: row.status,
             error_summary: row.error_summary,
             source: row.source,
-            chain_prev: chain_hex(row.chain_prev.as_deref()),
-            chain_newest_before: row.chain_newest_before,
-            chain_hash: chain_hex(row.chain_hash.as_deref()),
+            chain_prev: chain_hex(row.chain_prev.as_deref().filter(|_| own)),
+            chain_newest_before: row.chain_newest_before.filter(|_| own),
+            chain_hash: chain_hex(row.chain_hash.as_deref().filter(|_| own)),
         })
     }
 }

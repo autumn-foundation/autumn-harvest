@@ -8,7 +8,8 @@ runtime behavior or wire bytes.
 keyed HMAC-SHA256 chain over the audit rows that the exporter sequences. The
 exporter stamps the chain together with `export_seq`, under the cursor row
 lock, so the insert path gets no new lock. Each row stores `chain_prev`,
-`chain_newest_before` and `chain_hash`. The cursor stores a keyed checkpoint:
+`chain_newest_before`, `chain_hash` and `chain_shard`, the shard that made
+the links. The cursor stores a keyed checkpoint:
 the chain start, the head link, its `seq` and the newest `occurred_at`. `audit_chain::verify_shard_chain` and
 `verify_shard_chain_with` report changed rows, broken links, unchained rows,
 gaps, a missing head and a missing or invalid checkpoint. The exporter

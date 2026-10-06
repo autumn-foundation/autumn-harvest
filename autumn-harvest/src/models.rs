@@ -1110,6 +1110,8 @@ pub struct AuditExportRow {
     pub chain_newest_before: Option<DateTime<Utc>>,
     /// Audit-chain link of this row (issue #1838).
     pub chain_hash: Option<Vec<u8>>,
+    /// The shard whose exporter made the links (issue #1838).
+    pub chain_shard: Option<i32>,
 }
 
 /// The per-shard audit-export delivery cursor (issue #953).
