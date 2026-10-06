@@ -20,12 +20,11 @@ decision.
   `PENDING` until the next probe. `CircuitOpenMode::FailFast` keeps the old
   `CircuitOpen` failure.
 - A timeout feeds the breaker only when the attempt's handler started.
-- A timeout of an attempt whose handler never started refunds the claim's
-  rate-limit token, on a retry or a final failure. That attempt made no
-  downstream call. An activity that a circuit breaker tracks debits at
-  dispatch, not at the claim, so the enforcer refunds nothing for it. A
-  tracked WASM activity whose claim is lost before its guest starts gets its
-  dispatch debit back from the worker instead.
+- Only the dispatch that debited a rate-limit token refunds it, and at most
+  once. A worker whose attempt never runs its handler refunds its own debit:
+  the claim debit of an untracked activity, or the dispatch debit of one that
+  a circuit breaker tracks. The timeout enforcer refunds nothing, so a
+  timeout and the owner never both credit the same debit.
 - A fleet that mixes 0.6 and 0.7 workers must keep timeouts terminal until
   the upgrade ends. See the 0.7.0 upgrade guide, §1.7.
 

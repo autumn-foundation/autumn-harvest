@@ -1240,6 +1240,18 @@ async fn run_echo_with_start_marker_trigger_and_bucket(
     action: &str,
     bucket: Option<&'static str>,
 ) -> (Vec<WorkflowEvent>, Option<f64>) {
+    run_echo_with_start_marker_trigger_and_debit(queue, worker_id, action, bucket, true).await
+}
+
+/// [`run_echo_with_start_marker_trigger_and_bucket`]. Without `tracked`, no
+/// circuit breaker tracks the activity, so its claim debits the token.
+async fn run_echo_with_start_marker_trigger_and_debit(
+    queue: &str,
+    worker_id: &str,
+    action: &str,
+    bucket: Option<&'static str>,
+    tracked: bool,
+) -> (Vec<WorkflowEvent>, Option<f64>) {
     use diesel_async::SimpleAsyncConnection as _;
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -1293,11 +1305,9 @@ async fn run_echo_with_start_marker_trigger_and_bucket(
                 activity.rate_limit_rps = Some(1.0);
                 activity.rate_limit_burst = Some(2.0);
                 activity.rate_limit_key = Some(key);
-                activity.circuit_breaker = Some(CircuitBreakerPolicy::new(
-                    100,
-                    Duration::from_secs(60),
-                    Duration::from_secs(60),
-                ));
+                activity.circuit_breaker = tracked.then(|| {
+                    CircuitBreakerPolicy::new(100, Duration::from_secs(60), Duration::from_secs(60))
+                });
             }
         },
     );
@@ -1387,6 +1397,31 @@ async fn wasm_dispatch_debit_comes_back_when_the_guest_never_starts() {
     assert!(
         (tokens - 1.0).abs() < 0.01,
         "the dispatch debit comes back, so the bucket holds its one token: {tokens}"
+    );
+}
+
+/// An untracked WASM activity debits its token at the claim. When the claim
+/// is lost before the guest starts, the worker refunds that debit itself.
+/// Only the dispatch that made a debit refunds it (issue #1809).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_claim_debit_comes_back_when_the_guest_never_starts() {
+    let (history, tokens) = run_echo_with_start_marker_trigger_and_debit(
+        "q-wasm-lost-claim-debit",
+        "w-wasm-lost-claim-debit",
+        "RETURN NULL",
+        Some("t1809-wasm-claim-bucket"),
+        false,
+    )
+    .await;
+    assert_eq!(
+        find_activity_completed(&history),
+        None,
+        "the guest must not run: {history:?}"
+    );
+    let tokens = tokens.expect("a bucket");
+    assert!(
+        (tokens - 1.0).abs() < 0.01,
+        "the claim debit comes back, so the bucket holds its one token: {tokens}"
     );
 }
 

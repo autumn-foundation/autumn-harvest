@@ -1088,10 +1088,11 @@ async fn bucket_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
         .tokens
 }
 
-/// A retried timeout of an attempt whose handler never started refunds the
-/// claim's rate-limit token. The attempt made no downstream call.
+/// A retried timeout of an attempt whose handler never started leaves the
+/// claim's rate-limit token to the claim's owner. Only the dispatch that made
+/// a debit refunds it, so the enforcer and the owner never both credit it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unstarted_timeout_retry_refunds_its_rate_limit_token() {
+async fn unstarted_timeout_retry_leaves_the_refund_to_the_owner() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let queue = unique("t1809-refund");
@@ -1117,8 +1118,8 @@ async fn unstarted_timeout_retry_refunds_its_rate_limit_token() {
     );
     let tokens = bucket_tokens(&mut conn, &key).await;
     assert!(
-        tokens >= 0.99,
-        "the unstarted attempt gives its token back: {tokens}"
+        tokens < 0.01,
+        "the enforcer refunds nothing; the owner refunds its own debit: {tokens}"
     );
 }
 
@@ -1153,10 +1154,10 @@ async fn started_timeout_retry_keeps_its_rate_limit_debit() {
     );
 }
 
-/// A terminal timeout of a claim whose handler never started refunds the
-/// claim's rate-limit token, as a retry does.
+/// A terminal timeout of a claim whose handler never started also leaves the
+/// claim's rate-limit token to its owner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unstarted_terminal_timeout_refunds_its_rate_limit_token() {
+async fn unstarted_terminal_timeout_leaves_the_refund_to_the_owner() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let queue = unique("t1809-refund-final");
@@ -1179,13 +1180,13 @@ async fn unstarted_terminal_timeout_refunds_its_rate_limit_token() {
     );
     let tokens = bucket_tokens(&mut conn, &key).await;
     assert!(
-        tokens >= 0.99,
-        "the unstarted attempt gives its token back: {tokens}"
+        tokens < 0.01,
+        "the enforcer refunds nothing; the owner refunds its own debit: {tokens}"
     );
 }
 
 /// A circuit breaker that tracks an activity moves its debit to dispatch, so
-/// its claim debits nothing. An unstarted timeout then refunds nothing.
+/// its claim debits nothing. The enforcer refunds nothing for it either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unstarted_timeout_of_a_tracked_activity_refunds_nothing() {
     let (url, _container) = setup_db().await;

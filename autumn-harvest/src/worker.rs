@@ -15816,8 +15816,9 @@ const DRAIN_BEFORE_START_ERROR: &str = "the handler never started";
 /// matches a later claim. The release skips the retry delay and the attempt
 /// cap, as orphan reclaim does. A deploy must not fail an activity. A lost
 /// claim is a no-op. An applied release counts one enqueued retry in the
-/// metrics, as the normal retry path does. When the handler was never
-/// polled, the release also refunds the attempt's rate-limit debit.
+/// metrics, as the normal retry path does. With `refund_debit`, the release
+/// also refunds the attempt's rate-limit debit: the handler was never
+/// polled, and the debit is still out.
 ///
 /// Returns whether the release applied under this claim (issue #1809).
 async fn release_drained_activity(
@@ -15826,7 +15827,7 @@ async fn release_drained_activity(
     payload: &str,
     activity_name: &str,
     metrics: &dyn crate::telemetry::MetricsRecorder,
-    handler_started: bool,
+    refund_debit: bool,
 ) -> HarvestResult<bool> {
     let claim = claim_of_task(task)?;
     let message = crate::failure::parse_error_payload_full(payload).message;
@@ -15848,7 +15849,7 @@ async fn release_drained_activity(
     }
     // No handler call used the rate-limit token, so give it back. As for an
     // unstarted claim, the refund does not depend on the release.
-    if !handler_started
+    if refund_debit
         && let Some(key) = task.rate_limit_key.as_deref()
         && let Err(error) = queue::refund_rate_limit_token(conn, key).await
     {
@@ -17156,6 +17157,16 @@ async fn process_activity_task(
         } else {
             (None, None)
         };
+    // The token this dispatch holds (issue #1809): the dispatch debit of a
+    // tracked activity, or the claim debit of an untracked one. Only this
+    // dispatch refunds it, and at most once, so no other path can credit
+    // the same debit again.
+    let own_debit: Option<&str> = debited_key.or_else(|| {
+        task.rate_limit_key
+            .as_deref()
+            .filter(|_| activity.circuit_breaker.is_none())
+    });
+    let own_debit_returned = std::cell::Cell::new(false);
 
     // Setup phase: append ActivityStarted, then drop the connection so the pool
     // slot is free before the handler runs (prevents a deadlock when
@@ -17236,9 +17247,7 @@ async fn process_activity_task(
             if let Some(token) = circuit_token {
                 circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
             }
-            if circuit_token.is_some()
-                && activity.circuit_breaker.is_some()
-                && let Some(key) = task.rate_limit_key.as_deref()
+            if let Some(key) = own_debit
                 && let Some(conn) = conn.as_mut()
                 && let Err(error) = queue::refund_rate_limit_token(conn, key).await
             {
@@ -17554,9 +17563,10 @@ async fn process_activity_task(
                             Ok(queue::ClaimWrite::LeaseLost) => {
                                 use crate::failure::IntoActivityErrorString as _;
                                 log_lease_lost(task, "wasm handler start marker");
-                                // The guest never runs, so the dispatch debit
-                                // goes back. The enforcer cannot see that debit.
-                                refund_debited_token(&mut conn, debited_key).await;
+                                // The guest never runs, so this dispatch's
+                                // debit goes back.
+                                refund_debited_token(&mut conn, own_debit).await;
+                                own_debit_returned.set(true);
                                 cancel.cancel();
                                 crate::wasm_store::WasmDispatch::Fail(
                                     crate::failure::ActivityFailure::retryable(
@@ -17573,8 +17583,8 @@ async fn process_activity_task(
                                     error = %error,
                                     "could not record the wasm handler start; the guest does not start"
                                 );
-                                refund_after_start_error(pool, Some(conn), debited_key, &error)
-                                    .await;
+                                refund_after_start_error(pool, Some(conn), own_debit, &error).await;
+                                own_debit_returned.set(true);
                                 cancel.cancel();
                                 crate::wasm_store::WasmDispatch::Fail(
                                     crate::failure::ActivityFailure::retryable(
@@ -17996,7 +18006,7 @@ async fn process_activity_task(
                         payload,
                         activity_name,
                         registry.telemetry().metrics.as_ref(),
-                        started,
+                        !started && !own_debit_returned.get(),
                     )
                     .await
                 }
