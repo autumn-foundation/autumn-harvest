@@ -111,17 +111,39 @@ def line_of(text, offset):
     return text.count("\n", 0, offset) + 1
 
 
+def strip_html_comments(line, in_comment):
+    """Return the visible part of a line, and whether a comment stays open."""
+    out, i = [], 0
+    while i < len(line):
+        if in_comment:
+            end = line.find("-->", i)
+            if end < 0:
+                return "".join(out), True
+            i, in_comment = end + 3, False
+        else:
+            start = line.find("<!--", i)
+            if start < 0:
+                out.append(line[i:])
+                break
+            out.append(line[i:start])
+            i, in_comment = start + 4, True
+    return "".join(out), in_comment
+
+
 def markdown_lines(text):
-    """Yield (line number, line) outside fenced blocks.
+    """Yield (line number, line) for rendered text outside fenced blocks.
 
     As in CommonMark, a fence closes only on a run of the same character, at
     least as long as the opener, with nothing after it. So a four-backtick
-    fence can show a three-backtick block inside it.
+    fence can show a three-backtick block inside it. HTML comment text is not
+    rendered, so it is blanked. A line keeps its number.
     """
-    fence = None
-    for n, line in enumerate(text.splitlines(), 1):
-        marker = FENCE_RE.fullmatch(line)
+    fence, in_comment = None, False
+    for n, raw in enumerate(text.splitlines(), 1):
+        marker = FENCE_RE.fullmatch(raw)
         if fence is None:
+            line, in_comment = strip_html_comments(raw, in_comment)
+            marker = FENCE_RE.fullmatch(line)
             if marker and not (marker.group(1)[0] == "`" and "`" in marker.group(2)):
                 fence = marker.group(1)
                 continue
@@ -303,6 +325,13 @@ def self_test():
     assert [n for n, _ in markdown_lines(nested)] == [7]
     assert [n for n, _ in markdown_lines("~~~\n```\nx\n~~~\ny\n")] == [5]
     assert [n for n, _ in markdown_lines("```\nx\n``` not a close\n```\ny\n")] == [5]
+    hidden = (
+        "<!--\n| M | P |\n|---|---|\n| `event.rs` | 41 variants |\n| `event.rs` | x |\n-->\n"
+        "a <!-- b --> c\n"
+    )
+    assert event_row_count_findings("x.md", hidden) == []
+    assert duplicate_row_findings("x.md", hidden) == []
+    assert list(markdown_lines(hidden))[-1] == (7, "a  c")
 
     cargo = (
         '[workspace]\nmembers = []\n\n[workspace.package]\n'
@@ -317,6 +346,7 @@ def self_test():
     assert release_notes_findings("## v0.7.0.\n", cargo) == []
     found = release_notes_findings("## [0.7.0-rc.1+b.5] - x\n", cargo)
     assert len(found) == 1 and "0.7.0-rc.1+b.5" in found[0], found
+    assert release_notes_findings("<!--\n## [0.4.0] - x\n-->\n## [0.7.0]\n", cargo) == []
     found = release_notes_findings("<!-- -->\n## [0.4.0] - x\n", cargo)
     assert len(found) == 1 and "0.4.0" in found[0], found
 
