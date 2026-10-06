@@ -33,16 +33,6 @@ pub enum RedisAdapterError {
     #[error("invalid redis dispatch configuration: {0}")]
     InvalidConfig(String),
 
-    /// A `rediss://` URL was given, but this release carries no TLS
-    /// transport (issue #1429).
-    ///
-    /// The message never repeats the URL. A dispatch URL carries the
-    /// password, so it never reaches an error string.
-    #[error(
-        "TLS is not supported in this release: use a redis:// url (issue #1429 tracks rediss://)"
-    )]
-    TlsUnavailable,
-
     /// The connection was not established inside the connect timeout.
     #[error("redis connect timed out after {0:?}")]
     ConnectTimeout(std::time::Duration),

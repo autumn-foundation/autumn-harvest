@@ -268,6 +268,13 @@ deny = []
 skip = []
 skip-tree = []
 
+# Issue #1834: the Redis TLS client must always verify the server. These
+# `redis` features add a way to turn certificate checks off (the
+# `#insecure` URL fragment, `danger_accept_invalid_hostnames`). Keep them out.
+[[bans.features]]
+crate = "redis"
+deny = ["tls-rustls-insecure", "tls-native-tls"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

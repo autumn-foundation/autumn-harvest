@@ -9,8 +9,7 @@
 //! worker URL. The test reads state through a second proxy that has no
 //! toxics. Each test then checks the sweep oracle, [`assert_converged`]:
 //! every workflow `COMPLETED`, no stranded task, and one terminal event per
-//! execution. Two tests expect or accept one known `FAILED` outcome, see
-//! [`Accept`].
+//! execution. One test accepts one known `FAILED` outcome, see [`Accept`].
 //!
 //! Each test also asserts proof that its fault landed. A fault that does not
 //! land fails the test, so a healthy run cannot pass in its place.
@@ -121,9 +120,11 @@ fn count(counter: &AtomicUsize) -> usize {
 /// With `input.hold_attempts`, attempt 1 waits for [`RELEASE_FIRST_ATTEMPTS`],
 /// and attempt 2 waits for [`RELEASE_SECOND_ATTEMPTS`].
 ///
-/// A lost result write recovers only through `start_to_close`. The retry
-/// policy must then start a new attempt, but bug #1870 fails the workflow.
-/// The timeout is long, so a pause or a partition does not reach it.
+/// A result write that fails after its repeats gives the claim back, so the
+/// activity runs again. When the give-back also fails, only `start_to_close`
+/// recovers the task. The retry policy must then start a new attempt, but bug
+/// #1870 fails the workflow. The timeout is long, so a pause or a partition
+/// does not reach it.
 #[activity(
     start_to_close = "30s",
     retry = autumn_harvest::policy::RetryPolicy::fixed(5, Duration::from_millis(200))
@@ -600,16 +601,14 @@ async fn start_workload(
 /// The outcomes that [`converge`] accepts.
 ///
 /// The known failure is `FAILED` after one activity `StartToClose` timeout.
-/// Bug #1871: the worker does not retry a lost result write. Bug #1870: the
-/// timeout ignores the retry policy. When both bugs are fixed, the known
-/// failure becomes `COMPLETED`. Then remove the two known-failure variants.
+/// A crash restart can make every repeat of a result write fail, and the
+/// claim give-back too. Bug #1870: the timeout then ignores the retry policy.
+/// When #1870 is fixed, the known failure becomes `COMPLETED`. Then remove the
+/// known-failure variant.
 #[derive(Clone, Copy, Debug)]
 enum Accept<'a> {
     /// Every workflow is `COMPLETED`.
     Completed,
-    /// Every workflow ends in the known failure. A `COMPLETED` workflow fails
-    /// the check, so a fix for the bugs makes this test fail on purpose.
-    KnownFailure,
     /// The listed workflows are `COMPLETED` or end in the known failure. All
     /// other workflows are `COMPLETED`.
     CompletedOrKnownFailure(&'a [ExecutionId]),
@@ -652,12 +651,10 @@ async fn converge(
     let mut completed = Vec::new();
     for (exec_id, state) in states {
         let accepted = match (state.as_str(), accept) {
-            ("COMPLETED", Accept::KnownFailure) => false,
             ("COMPLETED", _) => {
                 completed.push(exec_id);
                 true
             }
-            ("FAILED", Accept::KnownFailure) => known_failure(&mut conn, exec_id).await,
             ("FAILED", Accept::CompletedOrKnownFailure(allowed)) => {
                 allowed.contains(&exec_id) && known_failure(&mut conn, exec_id).await
             }
@@ -693,6 +690,22 @@ async fn one_activity_result(conn: &mut AsyncPgConnection, exec_id: ExecutionId)
     .get_result::<BoolRow>(conn)
     .await
     .expect("count activity terminal events")
+    .ok
+}
+
+/// Return true when the activity of `exec_id` ran once. It has one activity
+/// task at attempt 1 and one `ActivityStarted` event.
+async fn one_activity_attempt(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> bool {
+    diesel::sql_query(
+        "SELECT (SELECT COUNT(*) = 1 AND MAX(attempt) = 1 FROM harvest_task_queue \
+                 WHERE workflow_exec_id = $1 AND task_type = 'activity') \
+            AND (SELECT COUNT(*) = 1 FROM harvest_events \
+                 WHERE workflow_exec_id = $1 AND event_type = 'ActivityStarted') AS ok",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<BoolRow>(conn)
+    .await
+    .expect("count activity attempts")
     .ok
 }
 
@@ -882,13 +895,22 @@ async fn terminate_backend_in_commit(site: CommitSite, fate: CommitFate) {
         }
     }
 
-    // A rolled-back result write always ends in the known failure.
-    let accept = match (site, fate) {
-        (CommitSite::Append, CommitFate::RolledBack) => Accept::KnownFailure,
-        _ => Accept::Completed,
-    };
     let diag = format!("{site:?} {fate:?}");
-    converge(&db.admin_url, &execs, activity_wf, accept, &diag).await;
+    converge(&db.admin_url, &execs, activity_wf, Accept::Completed, &diag).await;
+
+    // After a dropped connection, the worker writes the result again on a new
+    // connection (#1871). The handler must not run a second time. Only the
+    // rolled-back test needs the repeat. In the ack-lost test, the commit
+    // landed, so the repeat must change nothing.
+    if matches!(site, CommitSite::Append) {
+        let mut conn = connect(&db.admin_url).await;
+        for exec_id in &execs {
+            if !one_activity_attempt(&mut conn, *exec_id).await {
+                let history = history_dump(&mut conn, &execs).await;
+                panic!("{diag}: workflow {exec_id:?} ran its activity more than once\n{history}");
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

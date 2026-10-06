@@ -629,6 +629,19 @@ jobs:
       - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
         run: python3 docs/audits/audit-catalog-coverage.py
 
+      # Issue #1831: a tracked binary or a patch leftover fails the build.
+      # The script lists the binaries that the repository needs.
+      - name: Tracked artifacts (docs/audits/tracked-artifacts.py)
+        run: |
+          python3 docs/audits/tracked-artifacts.py --self-test
+          python3 docs/audits/tracked-artifacts.py
+
+      # Issue #1831: a doc claim that shipped code made false fails the build.
+      - name: Doc claim drift (docs/audits/doc-claim-drift.py)
+        run: |
+          python3 docs/audits/doc-claim-drift.py --self-test
+          python3 docs/audits/doc-claim-drift.py
+
       # Issue #1614: the standalone getting-started chapter shows the files of
       # examples/standalone-quickstart byte for byte, and keeps the markers
       # that the `standalone-chapter` job runs.
@@ -1407,17 +1420,19 @@ jobs:
       # `postgres:11-alpine` (the unoverridden default -- `autumn-web`'s own
       # `TestDb`, used by e.g. the webhook suites), `postgres:16` (the tag
       # ~220 of this repo's own DB suites request via `.with_tag("16")`),
-      # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
+      # `postgres:16-alpine` (one outlier suite's override), `redis:5.0`
       # (Redis's default, un-overridden anywhere; needed by the issue #1312
       # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
-      # below), and `softwaremill/elasticmq:1.5.2` on the one shard that runs the
+      # below), `redis:7.4-alpine` (the TLS-only server of the issue #1834
+      # `tls_redis` suite; Redis 5 has no TLS), and
+      # `softwaremill/elasticmq:1.5.2` on the one shard that runs the
       # `connector_sqs_broker` suite (its ElasticMQ default, which "bytes
       # remaining on stream" failed on PR #1773 because it was not pre-pulled).
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
-          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0"
+          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 redis:7.4-alpine"
           # Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
           # The dry run prints this shard's cargo invocations without running
           # them, so no shard number is hardcoded here. It is captured first:
