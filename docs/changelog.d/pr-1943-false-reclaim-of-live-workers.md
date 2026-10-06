@@ -33,7 +33,11 @@ are true:
   clock cannot shorten the window, and a slow sweep does not reset it.
 - A worker with no row has no heartbeat age. A live worker can lose its row
   for a short time, for example during a registration retry. So the
-  reclaimer must see such a claim without a break for the full window.
+  reclaimer must see such a claim without a break for the full window. A
+  fresh sighting of the worker breaks the watch, so the time starts again.
+- The final quarantine locks the row and checks the whole claim, `attempt`
+  and `started_at` included. A new claim of the row in the meantime is
+  left alone.
 
 Until then the row stays `RUNNING` and gets no strike. The stuck-running pass
 skips a held row, because its requeue counts no strike. A worker that
@@ -78,7 +82,8 @@ No migration. No new `WorkflowEvent` variant. `harvest_events` is not touched.
   database-clock sighting query.
 - DB tests: the last strike waits for a second sweep; it waits while the
   worker is only late; a worker with no row waits the full window; a new
-  attempt by the same worker restarts the witness; a late worker that heartbeats again keeps its task;
+  attempt by the same worker restarts the witness; a fresh sighting
+  restarts the witness time; a late worker that heartbeats again keeps its task;
   the stuck pass skips a held row; a requeue stays immediate; the heartbeat
   write returns the status; the tick still detects a remote drain.
 - A DB test of the spawned reclaimer loop: it holds a late worker's task, then

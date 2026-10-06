@@ -139,6 +139,12 @@ impl OrphanWitness {
             .collect();
     }
 
+    /// Forget `claim`. A fresh sighting of its worker breaks the watch, so
+    /// a later sighting starts a new hold.
+    pub fn forget(&mut self, claim: &OrphanClaim) {
+        self.first_seen.remove(claim);
+    }
+
     /// Tell if the last two sweeps both saw `claim` as an orphan.
     #[must_use]
     pub fn seen_twice(&self, claim: &OrphanClaim) -> bool {
@@ -772,6 +778,15 @@ mod scanner {
         ))
     }
 
+    /// State, worker, strikes, attempt and start time of a locked task row.
+    type LockedClaim = (
+        String,
+        Option<String>,
+        i32,
+        i32,
+        Option<chrono::DateTime<Utc>>,
+    );
+
     /// Quarantine an orphaned poison-pill task: move it to the dead-letter
     /// queue with a [`PoisonPill`](super::super::dlq::DeadLetterReason) reason,
     /// mark the queue row `FAILED`, and fail the owning workflow terminally.
@@ -820,6 +835,8 @@ mod scanner {
         let task_id = task.id;
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
+        let prior_attempt = task.attempt;
+        let prior_started_at = task.started_at;
 
         let entry = NewDeadLetterEntry {
             original_task_id: task.id,
@@ -878,19 +895,30 @@ mod scanner {
                     // `worker_still_dead` below is deliberately a separate,
                     // later statement instead. It runs only once this lock is
                     // already ours, so it is guaranteed a fresh snapshot.
-                    let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                    // Issue #1879: `attempt` and `started_at` fence the claim
+                    // too. A reset keeps `crash_strikes`, and the same worker
+                    // can claim the row again between the scan and this lock.
+                    let current: Option<LockedClaim> = dsl::harvest_task_queue
                         .find(task_id)
                         .for_update()
-                        .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                        .select((
+                            dsl::state,
+                            dsl::worker_id,
+                            dsl::crash_strikes,
+                            dsl::attempt,
+                            dsl::started_at,
+                        ))
                         .first(conn)
                         .await
                         .optional()
                         .map_err(crate::error::database_error)?;
                     match current {
-                        Some((state, Some(wid), strikes))
+                        Some((state, Some(wid), strikes, attempt, started_at))
                             if state == "RUNNING"
                                 && wid == worker_id
-                                && strikes == prior_strikes => {}
+                                && strikes == prior_strikes
+                                && attempt == prior_attempt
+                                && started_at == prior_started_at => {}
                         _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
                     }
                     if !worker_still_dead(conn, &worker_id, dead_secs).await? {
@@ -1120,7 +1148,7 @@ mod scanner {
     async fn hold_last_strike(
         conn: &mut AsyncPgConnection,
         task: &TaskQueueItem,
-        witness: &OrphanWitness,
+        witness: &mut OrphanWitness,
         now: std::time::Instant,
         confirm_secs: i64,
     ) -> HarvestResult<bool> {
@@ -1132,7 +1160,12 @@ mod scanner {
         }
         Ok(
             match worker_sighting(conn, &claim.worker_id, confirm_secs).await? {
-                WorkerSighting::Fresh => true,
+                // A fresh heartbeat breaks the watch. Time seen before it
+                // must not count toward a later hold.
+                WorkerSighting::Fresh => {
+                    witness.forget(&claim);
+                    true
+                }
                 WorkerSighting::Stale => false,
                 // A live worker can lose its row for a short time, for
                 // example during a registration retry. So the reclaimer
@@ -1186,7 +1219,7 @@ mod scanner {
                     // Issue #1879: the strike is permanent and the quarantine
                     // is terminal. Hold the row until the death of the worker
                     // is confirmed. A late worker is not a dead one.
-                    let (wait, dead_secs) = match watch.as_ref() {
+                    let (wait, dead_secs) = match watch.as_mut() {
                         Some((witness, now)) => (
                             hold_last_strike(conn, &task, witness, *now, confirm_secs).await?,
                             confirm_secs,
@@ -1590,6 +1623,18 @@ mod tests {
         witness.observe([claim(1, "w", 2)], at(222));
         assert!(!witness.seen_for(&claim(1, "w", 2), at(241), CONFIRM));
         assert!(witness.seen_for(&claim(1, "w", 2), at(242), CONFIRM));
+    }
+
+    /// Issue #1879: a forgotten claim starts a new watch.
+    #[test]
+    fn witness_restarts_a_forgotten_claim() {
+        let mut witness = OrphanWitness::default();
+        witness.observe([claim(1, "w", 2)], at(300));
+        witness.observe([claim(1, "w", 2)], at(301));
+        witness.forget(&claim(1, "w", 2));
+        witness.observe([claim(1, "w", 2)], at(320));
+        assert!(!witness.seen_twice(&claim(1, "w", 2)));
+        assert!(!witness.seen_for(&claim(1, "w", 2), at(320), CONFIRM));
     }
 
     /// Issue #1879: the heartbeat age comes from the database clock. A host

@@ -990,6 +990,44 @@ async fn new_attempt_by_the_same_worker_restarts_the_witness() {
     assert_eq!((state.as_str(), strikes), ("RUNNING", 2));
 }
 
+/// Issue #1879: a fresh sighting breaks the watch. A late worker that is
+/// inside the confirm window and then loses its row must start a new hold.
+/// Time seen before the fresh sighting must not count.
+#[tokio::test]
+async fn fresh_sighting_restarts_the_witness_time() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-fresh-break").await;
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "flappy-worker", 2).await;
+    insert_worker_with_heartbeat_age(&mut conn, "flappy-worker", LATE_SECS).await;
+    let metrics = RecordingMetrics::default();
+    let mut witness = OrphanWitness::default();
+    let t0 = std::time::Instant::now();
+    let confirm = std::time::Duration::from_secs(2 * STALE_SECS.unsigned_abs());
+
+    let first = witnessed_sweep_at(&mut conn, &mut witness, None, &metrics, t0).await;
+    assert_eq!(first.held, 1, "setup: the first sight holds the row");
+    let at = t0 + std::time::Duration::from_secs(1);
+    let second = witnessed_sweep_at(&mut conn, &mut witness, None, &metrics, at).await;
+    assert_eq!(
+        second.held, 1,
+        "setup: a late worker is fresh in the confirm window"
+    );
+
+    diesel::sql_query("DELETE FROM harvest_workers WHERE worker_id = $1")
+        .bind::<diesel::sql_types::Text, _>("flappy-worker")
+        .execute(&mut conn)
+        .await
+        .expect("drop the worker row, as a registration retry does");
+    let summary = witnessed_sweep_at(&mut conn, &mut witness, None, &metrics, t0 + confirm).await;
+    assert_eq!(
+        (summary.quarantined, summary.held),
+        (0, 1),
+        "time from before the fresh sighting must not confirm the death"
+    );
+    let (state, strikes, _) = task_state(&mut conn, task_id).await;
+    assert_eq!((state.as_str(), strikes), ("RUNNING", 2));
+}
+
 /// Issue #1879: a worker that is late but not silent for two stale windows
 /// is not confirmed dead, however many sweeps see it.
 #[tokio::test]
