@@ -1475,10 +1475,15 @@ impl DeliveryAttempt {
     /// `true` for a 4xx status that a retry cannot fix (issue #1832).
     ///
     /// 408, 421, 425 and 429 are transient. RFC 9110, RFC 8470 and RFC 6585 let
-    /// a client retry them. Every other 4xx is permanent.
+    /// a client retry them. A 413 with `Retry-After` is transient too (RFC 9110
+    /// section 15.5.14). Every other 4xx is permanent.
     #[must_use]
     pub fn is_permanent_failure(&self) -> bool {
-        matches!(self.status, Some(s) if (400..500).contains(&s) && !matches!(s, 408 | 421 | 425 | 429))
+        match self.status {
+            Some(408 | 421 | 425 | 429) | None => false,
+            Some(413) => self.retry_after.is_none(),
+            Some(s) => (400..500).contains(&s),
+        }
     }
 }
 
@@ -1931,6 +1936,18 @@ mod classify_outcome_tests {
                 "a {status} response must back off, got {action:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_413_with_retry_after_is_temporary() {
+        // RFC 9110 section 15.5.14: `Retry-After` marks a 413 as temporary.
+        let outcome = DeliveryAttempt::success(413).with_retry_after(StdDuration::from_secs(30));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(30));
+        // Without the header, a 413 is permanent.
+        let outcome = DeliveryAttempt::success(413);
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
     }
 
     #[test]

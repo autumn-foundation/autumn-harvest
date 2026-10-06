@@ -4,7 +4,8 @@ Three fixes from the September 2026 resilience gap analysis (epic #1786).
 
 **Completion callbacks: permanent 4xx and `Retry-After`.**
 `classify_outcome` dead-letters a permanent 4xx response on the first
-attempt. 408, 421, 425 and 429 are transient and still back off. The DLQ reason
+attempt. 408, 421, 425 and 429 are transient and still back off. So does
+a 413 with `Retry-After` (RFC 9110 section 15.5.14). The DLQ reason
 stays `CallbackDeliveryExhausted`, with `attempts: 1`. An alert on that
 reason now also fires on one 400.
 
