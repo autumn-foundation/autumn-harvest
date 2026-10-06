@@ -1,7 +1,7 @@
 {
-  "codec": "keyed",
+  "codec": "identity",
   "stored": false,
-  "offload_threshold": 16,
+  "offload_threshold": 1048576,
   "history": [
     {
       "type": "WorkflowStarted",

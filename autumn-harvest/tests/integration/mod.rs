@@ -221,7 +221,7 @@ mod redrive_tests;
 mod replay_canary_tests;
 #[cfg(feature = "testing")]
 mod replay_drift_tests;
-#[cfg(feature = "arbitrary")]
+#[cfg(feature = "fuzzing")]
 mod replay_fuzz_seeds;
 mod replay_tests;
 #[cfg(feature = "testing")]

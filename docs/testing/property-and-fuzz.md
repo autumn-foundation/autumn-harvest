@@ -138,8 +138,8 @@ self-tests at the end of the file.
 
 The pin is `env.FUZZ_TOOLCHAIN` in `.github/workflows/fuzz-nightly.yml`.
 The 1.100 nightlies that were tested (2026-09-01 and later) fail to build the
-`db` feature: E0275 or a recursion-limit error in the diesel transaction
-futures. Move the pin forward, in the workflow and in
+`db` feature: E0275, a recursion-limit error or an ICE in the diesel
+transaction futures. Move the pin forward, in the workflow and in
 `fuzz/smoke.sh`, once a newer nightly compiles the crate. The guard
 `fuzz_toolchain_pins_agree` keeps the two pins equal.
 
@@ -165,10 +165,14 @@ the deserializer) and keeps the body minimal.
 ### The replay target (issue #1835)
 
 `fuzz_replay` feeds an arbitrary `Vec<WorkflowEvent>` to the replayer. The
-`arbitrary` feature of `autumn-harvest` derives `arbitrary::Arbitrary` for
-`WorkflowEvent`, so a new variant is fuzzed with no edit. A new
-`serde_json::Value` field needs a `crate::fuzzing::value` attribute. Clippy
-runs with `--all-features`, so a missing attribute fails the `lint` job.
+`fuzzing` feature of `autumn-harvest` derives `arbitrary::Arbitrary` for
+`WorkflowEvent` and its field types. The feature is not a stable API and is
+not covered by semver. Clippy runs with `--all-features`, so these edits fail
+the `lint` job until they are made:
+
+- A new `serde_json::Value` field needs a `crate::fuzzing::value` attribute.
+- A new variant needs an arm in `fuzzing::mirror`. A variant that a command
+  records also needs an `Op`, so that replay can pass it.
 
 The JSON generator builds the reserved `_harvest_*` shapes on purpose: codec
 envelopes, offload references, erasure tombstones and undecodable markers.
@@ -181,13 +185,18 @@ decode) and the replayer. The replayed workflow issues the commands that
 the history records, so replay goes past the first event. The oracles:
 
 1. Nothing panics.
-2. A history that the write path stores reads back unchanged. A read error
-   on such a row is a failure too.
+2. A history that the write path stores reads back unchanged, through the
+   strict read and through the lossy read of history export. A write error
+   or a read error on such a history is a failure too.
 3. Both runs give the same report.
 
 The oracle compares after a JSON text round trip. Storage keeps text, and
 serde_json parses some floats back one digit off. That loss is not a
-pipeline defect.
+pipeline defect. A history with a NUL character is skipped, because
+Postgres `jsonb` cannot store it.
+
+The replayer's own inflate path is not fuzzed. `replay_from_db` decodes
+before it inflates, the reverse of the worker's read order.
 
 Input that starts with `{` is a JSON case, not `arbitrary` bytes. The seeds
 in `fuzz/seeds/fuzz_replay/` use this form, so they stay valid when the
@@ -196,12 +205,20 @@ generator changes. The seed corpus holds the #1253 and #1758 reproducers.
 over fixed bytes, on stable Rust in CI:
 
 ```bash
-cargo test -p autumn-harvest --no-default-features --features arbitrary \
+cargo test -p autumn-harvest --no-default-features --features fuzzing \
   --test integration replay_fuzz_seeds::
 ```
 
 To add a reproducer, write the JSON case to `fuzz/seeds/fuzz_replay/` with
-the issue number in its name.
+the issue number in its name. Check that the seed fails with the fix
+reverted. A codec or offload setting can hide the bug.
+
+A raw crash input decodes through `arbitrary`, so it stops reproducing when
+the generator changes. Convert it to a JSON case before you commit it:
+
+```bash
+FUZZ_REPLAY_PRINT_JSON=1 cargo +nightly-2026-08-14 fuzz run fuzz_replay path/to/crash-<hash>
+```
 
 ### Running them
 
@@ -240,11 +257,12 @@ seconds, one job per target (issue #1835).
 - **Crash.** The crash input is uploaded as `fuzz-artifacts-<target>`. A
   failed scheduled run opens the issue "Fuzz nightly: a scheduled run
   failed", or comments on the open one. Fix the bug and commit the input to
-  `fuzz/seeds/<target>/`.
+  `fuzz/seeds/<target>/`. For `fuzz_replay`, commit the JSON form (see above).
 - **Manual run.** Run the workflow from the Actions tab. The `seconds`
   input sets the time per target.
-- **Pull request.** A change under `fuzz/`, to the workflow or to
-  `autumn-harvest/src/fuzzing.rs` runs each target for 60 seconds.
+- **Pull request.** A change under `fuzz/`, to the workflow, to
+  `rust-toolchain.toml`, or to the `autumn-harvest` files that carry the
+  derives runs each target for 60 seconds. A draft PR skips it.
 
 The guard `fuzz_nightly_wiring.rs` keeps the target lists of
 `fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow equal. It also checks

@@ -35,8 +35,8 @@ tls = [
 testing = []
 # Replay fuzz harness (issue #1835). Derives `arbitrary::Arbitrary` for
 # `WorkflowEvent` and adds the `fuzzing` module. For the `fuzz/` crate and its
-# seed test only. Not a stable API.
-arbitrary = ["testing", "dep:arbitrary", "chrono/arbitrary", "uuid/arbitrary"]
+# seed test only. Not a stable API and not covered by semver.
+fuzzing = ["testing", "dep:arbitrary", "chrono/arbitrary", "uuid/arbitrary"]
 # Time-travel replay debugger (issue #949): a stepping/diff API over the existing
 # replay machinery. Read-only by construction -- no new `WorkflowEvent` variant, no
 # migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`

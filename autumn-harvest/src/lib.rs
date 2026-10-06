@@ -329,7 +329,7 @@ pub mod external_target_location;
 pub mod external_task;
 pub mod failure;
 /// Replay fuzz harness (issue #1835). Not a stable API.
-#[cfg(feature = "arbitrary")]
+#[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 #[allow(
     clippy::expect_used,

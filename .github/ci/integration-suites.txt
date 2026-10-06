@@ -49,7 +49,7 @@
 allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
-allos        autumn-harvest         integration                      arbitrary                  replay_fuzz_seeds
+allos        autumn-harvest         integration                      fuzzing                    replay_fuzz_seeds
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter

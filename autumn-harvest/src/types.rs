@@ -160,7 +160,7 @@ impl fmt::Display for ShardId {
 /// assert_eq!(sentinel.shard(), ShardId::UNENCODED);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExecutionId(Uuid);
 
 impl ExecutionId {
@@ -323,7 +323,7 @@ impl FromStr for ExecutionId {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum ExternalTarget {
     /// A specific, immutable execution.
     ExecutionId(ExecutionId),
@@ -387,7 +387,7 @@ impl fmt::Display for ExternalTarget {
 /// let id = ActivityExecId::new();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ActivityExecId(Uuid);
 
 impl ActivityExecId {
@@ -461,7 +461,7 @@ impl FromStr for ActivityExecId {
 /// assert!(!id.as_uuid().is_nil());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct UpdateId(Uuid);
 
 impl UpdateId {
@@ -519,7 +519,7 @@ impl FromStr for UpdateId {
 /// assert!(!token.as_uuid().is_nil());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalActivityToken(Uuid);
 
 impl ExternalActivityToken {
@@ -574,7 +574,7 @@ impl FromStr for ExternalActivityToken {
 /// `ExternalSignalFailed` events so the request can be correlated with its
 /// outcome during replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalSignalId(Uuid);
 
 impl ExternalSignalId {
@@ -623,7 +623,7 @@ impl FromStr for ExternalSignalId {
 /// `ExternalCancelFailed` events so the request can be correlated with its
 /// outcome during replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalCancelId(Uuid);
 
 impl ExternalCancelId {
@@ -672,7 +672,7 @@ impl FromStr for ExternalCancelId {
 /// `ExternalAwaitFailed` events so the request can be correlated with its
 /// outcome during replay. Exact clone of [`ExternalCancelId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalAwaitId(Uuid);
 
 impl ExternalAwaitId {
@@ -773,7 +773,7 @@ impl FromStr for SessionId {
 /// assert_eq!(id.as_str(), "timer-1");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct TimerId(String);
 
 impl TimerId {
@@ -824,7 +824,7 @@ impl fmt::Display for TimerId {
 /// assert_eq!(id.as_str(), "worker-1");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct WorkerId(String);
 
 impl WorkerId {
@@ -1230,7 +1230,7 @@ impl fmt::Display for IdempotencyKey {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum ParentClosePolicy {
     /// Children continue independently — no cascade when the parent closes.
     ///

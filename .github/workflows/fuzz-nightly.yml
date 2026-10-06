@@ -22,8 +22,9 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: Fuzz time per target, in seconds
-        default: "600"
+        description: Fuzz time per target, in seconds (at most 1800)
+        type: number
+        default: 600
   schedule:
     # Nightly at 02:47 UTC, away from the proptest and chaos runs.
     - cron: "47 2 * * *"
@@ -33,7 +34,13 @@ on:
     paths:
       - "fuzz/**"
       - ".github/workflows/fuzz-nightly.yml"
+      - "autumn-harvest/Cargo.toml"
+      - "autumn-harvest/src/error.rs"
+      - "autumn-harvest/src/event.rs"
       - "autumn-harvest/src/fuzzing.rs"
+      - "autumn-harvest/src/policy.rs"
+      - "autumn-harvest/src/types.rs"
+      - "rust-toolchain.toml"
 
 concurrency:
   group: fuzz-nightly-${{ github.ref }}
@@ -45,7 +52,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # The 1.100 nightlies that were tested (2026-09-01 and later) fail to build
-  # the `db` feature: E0275 or a recursion-limit error in the diesel
+  # the `db` feature: E0275, a recursion-limit error or an ICE in the diesel
   # transaction futures. Move this pin forward once a newer nightly builds
   # the crate. `fuzz/smoke.sh` has the same default.
   FUZZ_TOOLCHAIN: nightly-2026-08-14
@@ -53,6 +60,8 @@ env:
 jobs:
   fuzz:
     name: Fuzz ${{ matrix.target }}
+    # Draft-skip, as in ci.yml. A schedule or a dispatch always runs.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -72,12 +81,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      # One build cache for all targets. Its key names the nightly, because
+      # rust-cache reads the version of the toolchain that rust-toolchain.toml
+      # pins. Only the nightly fuzz_replay job saves it.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-          key: ${{ matrix.target }}
+          shared-key: fuzz-${{ env.FUZZ_TOOLCHAIN }}
+          save-if: ${{ github.event_name == 'schedule' && matrix.target == 'fuzz_replay' }}
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+      - name: Build the target
+        id: build
+        working-directory: fuzz
+        # The fuzz crate has its own workspace and no lockfile in git. Start
+        # from the root lockfile, so it builds the versions that CI tests.
+        run: |
+          cp ../Cargo.lock Cargo.lock
+          cargo +"${FUZZ_TOOLCHAIN}" fuzz build "${TARGET}"
       - name: Restore the corpus
         uses: actions/cache/restore@v4
         with:
@@ -94,10 +115,12 @@ jobs:
           echo "corpus size before: $(find "corpus/${TARGET}" -type f | wc -l)"
           dirs=("corpus/${TARGET}")
           if [ -d "seeds/${TARGET}" ]; then dirs+=("seeds/${TARGET}"); fi
+          # Stay well inside the job timeout, so the corpus save still runs.
+          secs=$(( SECONDS_PER_TARGET > 1800 ? 1800 : SECONDS_PER_TARGET ))
           cargo +"${FUZZ_TOOLCHAIN}" fuzz run "${TARGET}" "${dirs[@]}" -- \
-            -max_total_time="${SECONDS_PER_TARGET}" -timeout=30
+            -max_total_time="${secs}" -timeout=30
       - name: Minimize the corpus
-        if: always() && steps.fuzz.outcome != 'skipped'
+        if: always() && steps.build.outcome == 'success'
         # A failed minimization keeps the corpus as it is.
         continue-on-error: true
         working-directory: fuzz
@@ -133,7 +156,7 @@ jobs:
       - name: Open or update the alert issue
         run: |
           title="Fuzz nightly: a scheduled run failed"
-          body="The nightly fuzz run failed: ${RUN_URL}. Download the fuzz-artifacts-<target> artifact and reproduce with \`cargo +${FUZZ_TOOLCHAIN} fuzz run <target> <input>\` (docs/testing/property-and-fuzz.md). Add the input to fuzz/seeds/<target>/ with the fix."
+          body="The nightly fuzz run failed: ${RUN_URL}. A build error fails the run too, so read the failed job log first. For a crash, download the fuzz-artifacts-<target> artifact and reproduce with \`cargo +${FUZZ_TOOLCHAIN} fuzz run <target> <input>\` (docs/testing/property-and-fuzz.md). Add the input to fuzz/seeds/<target>/ with the fix."
           issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title \"$title\"" --json number,title \
             --jq "map(select(.title == \"$title\")) | .[0].number // empty")"

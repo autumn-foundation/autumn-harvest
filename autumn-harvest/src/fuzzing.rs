@@ -15,8 +15,10 @@
 //!
 //! The write path is codec encode, then offload. The read path is inflate,
 //! then codec decode, as in `store::load_history_inflated`. The replayer then
-//! runs the read history. It gets no offloader, because the read path has
-//! already inflated every payload. The replayed workflow issues the commands
+//! runs the read history with no offloader, because the read path has
+//! already inflated every payload. The replayer's own inflate path is not
+//! fuzzed: `replay_from_db` decodes before it inflates, which is the reverse
+//! order. The replayed workflow issues the commands
 //! of an [`Op`] program. By default the program mirrors the history, so
 //! replay goes past the first event.
 
@@ -160,12 +162,38 @@ fn shape(u: &mut Unstructured<'_>, depth: u32) -> arbitrary::Result<Value> {
     Ok(Value::Object(map))
 }
 
+/// Generates a finite `f64`. JSON has no NaN or infinity, so `serde_json`
+/// writes them as `null`, and the value then does not read back.
+///
+/// # Errors
+///
+/// Returns the error of the underlying [`Unstructured`] draw.
+pub fn finite_f64(u: &mut Unstructured<'_>) -> arbitrary::Result<f64> {
+    let x: f64 = u.arbitrary()?;
+    Ok(if x.is_finite() { x } else { 0.0 })
+}
+
 fn number(u: &mut Unstructured<'_>) -> arbitrary::Result<Value> {
     Ok(match u.choose_index(3)? {
         0 => Value::from(u.arbitrary::<i64>()?),
         1 => Value::from(u.arbitrary::<u64>()?),
-        _ => serde_json::Number::from_f64(u.arbitrary()?).map_or(Value::Null, Value::Number),
+        _ => stable_float(u.arbitrary()?),
     })
+}
+
+/// A float that reads back unchanged from JSON text, else an integer.
+/// `serde_json` parses some floats one digit off, and such a case would
+/// have no stable JSON form.
+fn stable_float(x: f64) -> Value {
+    let Some(number) = serde_json::Number::from_f64(x) else {
+        return Value::Null;
+    };
+    let text = number.to_string();
+    if serde_json::from_str::<f64>(&text).ok() == Some(x) {
+        Value::Number(number)
+    } else {
+        Value::from(x.to_bits())
+    }
 }
 
 fn text(u: &mut Unstructured<'_>) -> arbitrary::Result<String> {
@@ -248,8 +276,6 @@ pub enum Codec {
 /// One fuzz input.
 #[derive(Debug, Clone, Serialize, Deserialize, Arbitrary)]
 pub struct ReplayCase {
-    /// The events to store and replay.
-    pub history: Vec<WorkflowEvent>,
     /// The program of the replayed workflow. `None` mirrors the history.
     #[serde(default)]
     pub program: Option<Vec<Op>>,
@@ -263,6 +289,34 @@ pub struct ReplayCase {
     /// Payloads over this many bytes are offloaded.
     #[serde(default = "default_threshold")]
     pub offload_threshold: u32,
+    /// The events to store and replay.
+    #[arbitrary(with = history)]
+    pub history: Vec<WorkflowEvent>,
+}
+
+/// The most events that the generator puts in one history.
+const MAX_EVENTS: usize = 16;
+
+/// Generates a history of 1 to [`MAX_EVENTS`] events.
+///
+/// Each event gets an equal share of the remaining input. A derived `Vec`
+/// lets one `String` take the whole input, so most histories would hold
+/// one event or none.
+fn history(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<WorkflowEvent>> {
+    let count = u.int_in_range(1..=MAX_EVENTS)?;
+    let share = (u.len() / count).max(1);
+    let mut events = Vec::with_capacity(count);
+    for _ in 0..count {
+        if u.is_empty() {
+            break;
+        }
+        let bytes = u.bytes(share.min(u.len()))?;
+        // A share too short for an event is skipped, not fatal.
+        if let Ok(event) = WorkflowEvent::arbitrary_take_rest(Unstructured::new(bytes)) {
+            events.push(event);
+        }
+    }
+    Ok(events)
 }
 
 const fn default_threshold() -> u32 {
@@ -271,20 +325,36 @@ const fn default_threshold() -> u32 {
 
 impl ReplayCase {
     /// Decodes fuzz input. Input that starts with `{` is a JSON case, as the
-    /// seed files are. Other input feeds the `arbitrary` generator.
+    /// seed files are. A UTF-8 byte order mark and leading white space are
+    /// ignored for that check. Other input, and JSON that does not parse,
+    /// feeds the `arbitrary` generator.
     #[must_use]
     pub fn from_fuzz_bytes(data: &[u8]) -> Option<Self> {
-        if data.first() == Some(&b'{') {
-            return serde_json::from_slice(data).ok();
+        Self::from_json(data).or_else(|| Self::arbitrary_take_rest(Unstructured::new(data)).ok())
+    }
+
+    /// Decodes a JSON case, or `None`.
+    #[must_use]
+    pub fn from_json(data: &[u8]) -> Option<Self> {
+        let text = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+        if !Self::is_json(text) {
+            return None;
         }
-        Self::arbitrary_take_rest(Unstructured::new(data)).ok()
+        serde_json::from_slice(text).ok()
+    }
+
+    /// Reports whether `data` is a JSON case. See [`Self::from_fuzz_bytes`].
+    #[must_use]
+    pub fn is_json(data: &[u8]) -> bool {
+        let text = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+        text.trim_ascii_start().first() == Some(&b'{')
     }
 }
 
 /// The outcome of a case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// The history has no stable JSON form, or the write path refused it.
+    /// The history has no stable JSON form, so storage cannot hold it.
     Unstorable(String),
     /// The read path refused the stored rows.
     Unreadable(String),
@@ -326,18 +396,30 @@ pub fn check_case(case: &ReplayCase) -> Verdict {
 /// because `serde_json` parses floats without `float_roundtrip`. The oracle
 /// compares against this form, so it reports only a change that the
 /// pipeline makes.
+///
+/// A history with a NUL character is `None` too. Postgres `jsonb` refuses
+/// `\u0000`, so production can never store it.
 fn normalize(history: &[WorkflowEvent]) -> Option<Vec<WorkflowEvent>> {
-    let once = text_round_trip(history)?;
-    let twice = text_round_trip(&once)?;
-    (to_json(&once) == to_json(&twice)).then_some(twice)
+    let mut current = text_round_trip(history)?;
+    for _ in 0..4 {
+        let next = text_round_trip(&current)?;
+        if to_json(&next) == to_json(&current) {
+            return Some(next);
+        }
+        current = next;
+    }
+    None
 }
 
 fn text_round_trip(history: &[WorkflowEvent]) -> Option<Vec<WorkflowEvent>> {
     history
         .iter()
         .map(|event| {
-            let text = serde_json::to_vec(event).ok()?;
-            serde_json::from_slice(&text).ok()
+            let text = serde_json::to_string(event).ok()?;
+            if text.contains("\\u0000") {
+                return None;
+            }
+            serde_json::from_str(&text).ok()
         })
         .collect()
 }
@@ -363,12 +445,17 @@ async fn run_once(case: &ReplayCase, history: &[WorkflowEvent]) -> (Verdict, Str
         };
         match row {
             Ok(row) => rows.push(row),
-            Err(error) => return verdict_only(Verdict::Unstorable(error)),
+            // The codec and the store here never fail, so a write error is
+            // an engine defect, such as refusing a look-alike value.
+            Err(error) => panic!("the write path refused a stored history: {error}"),
         }
     }
 
     let mut read = Vec::with_capacity(rows.len());
     for row in rows {
+        if !case.stored {
+            assert_lossy_read(&codecs, &offloader, row.clone()).await;
+        }
         match read_row(&codecs, &offloader, row).await {
             Ok(event) => read.push(event),
             // A row that this write path stored must read back.
@@ -434,6 +521,29 @@ async fn read_row(
     codecs.decode_event(row).map_err(|e| e.to_string())
 }
 
+/// The operator read path, such as history export, decodes with
+/// `decode_value_lossy`. That walk looks for envelopes at every depth, so it
+/// must also return the stored value and mark nothing undecodable.
+async fn assert_lossy_read(codecs: &PayloadCodecs, offloader: &PayloadOffloader, mut row: Value) {
+    let Ok(()) = offloader.inflate_event_value(&mut row).await else {
+        // The strict read below reports the error.
+        return;
+    };
+    let mut lossy = row.clone();
+    let outcome = codecs.decode_value_lossy(&mut lossy);
+    let strict = codecs
+        .decode_event(row)
+        .ok()
+        .map(|event| serde_json::to_value(event).expect("a decoded event serializes"));
+    assert_eq!(
+        outcome.failed, 0,
+        "the lossy read marked a stored value undecodable"
+    );
+    if let Some(strict) = strict {
+        assert_eq!(lossy, strict, "the lossy read and the strict read disagree");
+    }
+}
+
 /// The executor contains a workflow panic as a `HandlerPanic` failure.
 /// [`program_workflow`] never panics, so such a failure is an engine panic.
 /// A `Fail` op that returns the same text is not one.
@@ -444,8 +554,10 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
     let from_program = program
         .iter()
         .any(|op| matches!(op, Op::Fail { error } if error == message));
+    let panicked = crate::failure::parse_workflow_typed_payload(message)
+        .is_some_and(|failure| failure.error_type == ERROR_TYPE_HANDLER_PANIC);
     assert!(
-        from_program || !message.contains(ERROR_TYPE_HANDLER_PANIC),
+        from_program || !panicked,
         "the engine panicked inside the replayed workflow: {message}"
     );
 }
@@ -453,7 +565,8 @@ fn assert_no_contained_panic(report: &ReplayReport, program: &[Op]) {
 /// The program that issues the command behind each recorded event.
 ///
 /// Only events that a command creates map to an op. The replayer matches
-/// the other events itself, or reports them.
+/// the other events itself, or reports them. The match lists every variant,
+/// so a new variant needs a decision here: an op, or `None`.
 #[must_use]
 pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     history
@@ -495,7 +608,49 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
             WorkflowEvent::WorkflowFailed { error, .. } => Some(Op::Fail {
                 error: error.clone(),
             }),
-            _ => None,
+            // Every other variant, listed so that a new one fails to compile here.
+            WorkflowEvent::WorkflowStarted { .. }
+            | WorkflowEvent::WorkflowCancelled { .. }
+            | WorkflowEvent::ActivityStarted { .. }
+            | WorkflowEvent::ActivityCompleted { .. }
+            | WorkflowEvent::ActivityFailed { .. }
+            | WorkflowEvent::ActivityTimedOut { .. }
+            | WorkflowEvent::ActivityHeartbeat { .. }
+            | WorkflowEvent::TimerFired { .. }
+            | WorkflowEvent::ChildWorkflowStarted { .. }
+            | WorkflowEvent::ChildWorkflowCompleted { .. }
+            | WorkflowEvent::ChildWorkflowFailed { .. }
+            | WorkflowEvent::WorkflowContinuedAsNew { .. }
+            | WorkflowEvent::LocalActivityCompleted { .. }
+            | WorkflowEvent::LocalActivityFailed { .. }
+            | WorkflowEvent::ActivityAwaitingExternal { .. }
+            | WorkflowEvent::ActivityCompletedExternally { .. }
+            | WorkflowEvent::ActivityFailedExternally { .. }
+            | WorkflowEvent::ActivityExternalDeadlineExtended { .. }
+            | WorkflowEvent::UpdateAdmitted { .. }
+            | WorkflowEvent::UpdateCompleted { .. }
+            | WorkflowEvent::UpdateFailed { .. }
+            | WorkflowEvent::WorkflowResetFork { .. }
+            | WorkflowEvent::WorkflowResetTerminated { .. }
+            | WorkflowEvent::LocalActivityExhausted { .. }
+            | WorkflowEvent::ExternalSignalRequested { .. }
+            | WorkflowEvent::ExternalSignalDelivered { .. }
+            | WorkflowEvent::ExternalSignalFailed { .. }
+            | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+            | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+            | WorkflowEvent::WorkflowExecutionTimedOut { .. }
+            | WorkflowEvent::WorkflowExecutionPaused { .. }
+            | WorkflowEvent::WorkflowExecutionResumed { .. }
+            | WorkflowEvent::ExternalCancelRequested { .. }
+            | WorkflowEvent::ExternalCancelDelivered { .. }
+            | WorkflowEvent::ExternalCancelFailed { .. }
+            | WorkflowEvent::WorkflowRedriven { .. }
+            | WorkflowEvent::WorkflowRetryScheduled { .. }
+            | WorkflowEvent::TimerCancelled { .. }
+            | WorkflowEvent::ExternalAwaitRequested { .. }
+            | WorkflowEvent::ExternalAwaitResolved { .. }
+            | WorkflowEvent::ExternalAwaitFailed { .. }
+            | WorkflowEvent::MutexGranted { .. } => None,
         })
         .collect()
 }
@@ -511,7 +666,7 @@ fn program_workflow(
     Box::pin(async move {
         let program: Vec<Op> = ctx
             .header(PROGRAM_HEADER)
-            .and_then(|json| serde_json::from_str(json).ok())
+            .map(|json| serde_json::from_str(json).expect("the program header parses"))
             .unwrap_or_default();
         for op in program {
             match op {

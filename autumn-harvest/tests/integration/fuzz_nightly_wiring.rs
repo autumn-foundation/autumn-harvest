@@ -84,28 +84,52 @@ fn str_at<'a>(node: &'a serde_yaml::Value, path: &[&str]) -> &'a str {
 /// True when a job restores the corpus before it fuzzes and saves it after.
 ///
 /// The restore step must fall back to the newest earlier corpus through
-/// `restore-keys`. The save step must use a key unique to the run, because a
-/// cache key is immutable. It must run also after a failed step, so a crash
-/// does not discard the corpus that the run grew.
+/// `restore-keys`, and the save key must start with that prefix. The save
+/// key must be unique to the run, because a cache key is immutable. The save
+/// must run also after a failed step, so a crash does not discard the corpus
+/// that the run grew. The fuzz step must not hide its own failure.
 fn persists_the_corpus(job: &serde_yaml::Value) -> bool {
     let steps = steps(job);
-    let position = |pred: &dyn Fn(&serde_yaml::Value) -> bool| steps.iter().position(|s| pred(s));
-    let restore = position(&|s| {
-        str_at(s, &["uses"]).starts_with("actions/cache/restore@")
-            && str_at(s, &["with", "path"]) == CORPUS_PATH
-            && !str_at(s, &["with", "restore-keys"]).is_empty()
-    });
-    let fuzz = position(&|s| {
+    let find = |uses: &str| {
+        steps.iter().position(|s| {
+            str_at(s, &["uses"]).starts_with(uses) && str_at(s, &["with", "path"]) == CORPUS_PATH
+        })
+    };
+    let (Some(r), Some(sv)) = (find("actions/cache/restore@"), find("actions/cache/save@")) else {
+        return false;
+    };
+    let fuzz = steps.iter().position(|s| {
         let run = str_at(s, &["run"]);
-        run.contains(" fuzz run ") && run.contains("corpus/") && run.contains("seeds/")
+        ungated(s)
+            && run.contains(" fuzz run ")
+            && run.contains("corpus/")
+            && run.contains("seeds/")
     });
-    let save = position(&|s| {
-        str_at(s, &["uses"]).starts_with("actions/cache/save@")
-            && str_at(s, &["with", "path"]) == CORPUS_PATH
-            && str_at(s, &["with", "key"]).contains("${{ github.run_id }}")
-            && str_at(s, &["if"]).contains("always()")
-    });
-    matches!((restore, fuzz, save), (Some(r), Some(f), Some(s)) if r < f && f < s)
+    let (restore, save) = (steps[r], steps[sv]);
+    let prefix = str_at(restore, &["with", "restore-keys"]);
+    let key = str_at(save, &["with", "key"]);
+    !prefix.is_empty()
+        && key.starts_with(prefix)
+        && key == str_at(restore, &["with", "key"])
+        && key.contains("${{ github.run_id }}")
+        && str_at(save, &["if"]).contains("always()")
+        && fuzz.is_some_and(|f| r < f && f < sv)
+}
+
+/// The draft-skip condition that `ci.yml` uses. A schedule always runs.
+const DRAFT_SKIP: &str =
+    "github.event_name != 'pull_request' || github.event.pull_request.draft == false";
+
+/// True when a job has no `continue-on-error` and no `if` but [`DRAFT_SKIP`].
+fn runs_on_every_schedule(job: &serde_yaml::Value) -> bool {
+    let soft = job
+        .get("continue-on-error")
+        .is_some_and(|v| v.as_bool() != Some(false));
+    !soft
+        && matches!(
+            job.get("if").map(serde_yaml::Value::as_str),
+            None | Some(Some(DRAFT_SKIP))
+        )
 }
 
 /// True when a job opens an issue for a failed scheduled run of `needs`.
@@ -179,8 +203,8 @@ fn fuzz_nightly_runs_on_a_cron_with_a_persisted_corpus() {
     );
     let fuzz = &doc["jobs"]["fuzz"];
     assert!(
-        ungated(fuzz),
-        "the `fuzz` job must have no `if` and no `continue-on-error`"
+        runs_on_every_schedule(fuzz),
+        "the `fuzz` job must have no `continue-on-error` and no `if` but the draft-skip"
     );
     assert!(
         persists_the_corpus(fuzz),
@@ -231,6 +255,35 @@ fn corpus_check_rejects_a_broken_cycle() {
         !job(&format!("{restore}{no_seeds}{save}")),
         "no seed corpus"
     );
+    let soft_fuzz = format!("{fuzz}        continue-on-error: true\n");
+    assert!(
+        !job(&format!("{restore}{soft_fuzz}{save}")),
+        "a fuzz step that hides a crash"
+    );
+    let other_prefix = restore.replace("restore-keys: k-", "restore-keys: other-");
+    assert!(
+        !job(&format!("{other_prefix}{fuzz}{save}")),
+        "a save key that restore-keys never matches"
+    );
+    let other_key = save.replace("key: k-", "key: k-x-");
+    assert!(
+        !job(&format!("{restore}{fuzz}{other_key}")),
+        "restore and save keys that differ"
+    );
+}
+
+/// Self-test: only the draft-skip `if` may gate the fuzz job.
+#[test]
+fn schedule_gate_accepts_only_the_draft_skip() {
+    let job = |extra: &str| {
+        let text = format!("jobs:\n  fuzz:\n    runs-on: x\n{extra}");
+        let doc = parse_workflow_text(&text).expect("synthetic workflow must parse");
+        runs_on_every_schedule(&doc["jobs"]["fuzz"])
+    };
+    assert!(job(""));
+    assert!(job(&format!("    if: {DRAFT_SKIP}\n")));
+    assert!(!job("    if: github.event_name == 'workflow_dispatch'\n"));
+    assert!(!job("    continue-on-error: true\n"));
 }
 
 /// Self-test: the target parsers read the shapes the files use.

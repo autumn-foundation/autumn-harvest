@@ -36,7 +36,7 @@ pub fn compute_retry_delay(
 /// The default is [`Full`](Self::Full), so tasks that fail together do not
 /// retry together (issue #1792). Use [`None`](Self::None) for exact timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum JitterPolicy {
     /// Exact backoff, with no jitter.
     None,
@@ -152,13 +152,14 @@ pub fn compute_retry_delay_with_seed(
 /// assert_eq!(policy.max_attempts, 3);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct RetryPolicy {
     /// Maximum number of attempts (including the first). 1 = no retries.
     pub max_attempts: u32,
     /// Delay before the first retry.
     pub initial_interval: Duration,
     /// Multiplier applied after each retry (`1.0` = fixed delay).
+    #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::finite_f64))]
     pub backoff_coefficient: f64,
     /// Upper bound on delay between retries.
     pub max_interval: Duration,
