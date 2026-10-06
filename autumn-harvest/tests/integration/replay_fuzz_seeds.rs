@@ -189,7 +189,7 @@ fn generated_cases_pass_the_oracles() {
 }
 
 /// Every generated program survives the JSON round trip. The replayed
-/// workflow reads its program back from a JSON header, so a value that JSON
+/// workflow reads its program back from a JSON header. A value that JSON
 /// cannot hold, such as a NaN `f64`, once crashed the fuzz target.
 #[test]
 fn generated_programs_round_trip_through_json() {
