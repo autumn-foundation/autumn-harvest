@@ -33567,6 +33567,12 @@ async fn query_dead_letters_for_api_bulk(
     }
 }
 
+/// Applies `selector`'s predicates to a boxed dead-letter query.
+///
+/// Clone class (issue #613): the six `BulkDlqFilter` branches below repeat
+/// `count_bulk_filter_matches` and `query_dead_letters_for_bulk` in
+/// `autumn-harvest::dlq`. Update all three together. `dead_letter_id` and
+/// `task_type` are API-only additions with no `autumn-harvest::dlq` sibling.
 fn apply_api_bulk_filters<'a>(
     mut query: harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg>,
     selector: &DlqBulkSelector,

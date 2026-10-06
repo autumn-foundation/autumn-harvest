@@ -716,6 +716,10 @@ pub async fn count_bulk_filter_matches(
 
     let mut query = dsl::harvest_dead_letters.into_boxed();
 
+    // Clone class (issue #613): query_dead_letters_for_bulk below applies
+    // this same six-filter `BulkDlqFilter` predicate set. So does
+    // apply_api_bulk_filters in autumn-harvest-plugin/src/api.rs. Update all
+    // three together.
     if let Some(ref name) = filter.activity_name {
         query = query.filter(dsl::activity_name.eq(name.clone()));
     }
@@ -780,6 +784,10 @@ async fn query_dead_letters_for_bulk(
         query = query.limit(filter.effective_limit());
     }
 
+    // Clone class (issue #613): count_bulk_filter_matches above applies this
+    // same six-filter `BulkDlqFilter` predicate set. So does
+    // apply_api_bulk_filters in autumn-harvest-plugin/src/api.rs. Update all
+    // three together.
     if let Some(ref name) = filter.activity_name {
         query = query.filter(dsl::activity_name.eq(name.clone()));
     }
