@@ -329,8 +329,8 @@ fn shape(ops: &[Op]) -> String {
 }
 
 /// A command right after the outcome of one `join!` branch continues that
-/// branch. A start or a heartbeat of a member does not end the batch, and a
-/// local activity in a resumed branch does not either. A
+/// branch. A start or a heartbeat of a member does not end the batch. Nor
+/// does a local activity in a resumed branch, or a pause pair. A
 /// received signal settles its own branch. So does the outcome of an
 /// external operation, or the signal that wins a signal timeout or a race.
 /// The record of a race does not end the batch. A branch that resumed can
@@ -353,6 +353,10 @@ fn a_join_branch_continues_where_its_wait_ended() {
         (
             "baseline-join-branch-continues-past-local-activity.json",
             "join(slow, seq(fast, local_activity, next)); complete",
+        ),
+        (
+            "baseline-join-branch-continues-past-pause.json",
+            "join(slow, seq(fast, next)); complete",
         ),
         (
             "baseline-join-branch-continues-after-signal.json",
@@ -470,6 +474,16 @@ fn a_join_branch_that_hits_an_engine_gap_keeps_its_shape() {
             "engine-gap-windowed-collect-all-beside-sibling.json",
             "join(fan out window 2 collect, slow); complete",
             "actual: \"ActivityScheduled(slow)\"",
+        ),
+        (
+            "engine-gap-windowed-first-run-holds-sibling.json",
+            "join(fan out window 2 fail fast, slow); complete",
+            "actual: \"ActivityScheduled(slow)\"",
+        ),
+        (
+            "engine-gap-windowed-fan-out-beside-local-activity.json",
+            "join(fan out window 2 fail fast, seq(signal go, local_activity)); complete",
+            "actual: \"LocalActivityScheduled\"",
         ),
     ];
     let cases = seed("engine-gap-");

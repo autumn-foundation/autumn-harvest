@@ -884,6 +884,10 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
         let mut absorbed = false;
         let op = match event {
             _ if superseded.contains(&(index - 1)) => continue,
+            // The matcher passes over a pause pair with or without a redrive.
+            // It records no command, so it does not end a batch either.
+            WorkflowEvent::WorkflowExecutionPaused { .. }
+            | WorkflowEvent::WorkflowExecutionResumed { .. } => continue,
             WorkflowEvent::MarkerRecorded { name, details } if name.starts_with("fan_out:") => {
                 // The count comes from the input. Padding allocates that many
                 // items, so a huge count would exhaust memory in the harness.
@@ -1281,8 +1285,13 @@ fn mirror_fan_out(
             event if sibling_key(event).is_some_and(|key| siblings.contains(&key)) => {
                 continue;
             }
-            // An immediate command, such as a side effect, is a sibling's.
+            // An immediate command, such as a side effect, is a sibling's. So
+            // is a local activity, which a fan-out never schedules.
             event if is_immediate_command(event) => continue,
+            WorkflowEvent::LocalActivityScheduled { activity_id, .. } => {
+                siblings.insert(Pending::Activity(*activity_id));
+                continue;
+            }
             WorkflowEvent::ActivityScheduled {
                 activity_id,
                 name,
@@ -1418,13 +1427,11 @@ fn first_wave_cap(history: &[WorkflowEvent], start: usize, count: usize) -> usiz
     // A signal starts a new decision. A schedule after it is the command of
     // the branch that the signal resumed, not a first-wave item.
     let run = rest.iter().take_while(|e| is_schedule(e)).count();
-    // The first run holds every item, so no refill wave follows. A later
-    // schedule is the caller's own.
-    if run >= count {
-        return count;
-    }
-    let mut best = (run, 0);
-    for k in (1..=run).rev() {
+    // A run as long as the count can still hold a sibling. The candidates
+    // decide that too.
+    let longest = run.min(count);
+    let mut best = (longest, 0);
+    for k in (1..=longest).rev() {
         let Some(waves) = refill_waves(rest, k, count) else {
             continue;
         };
@@ -1453,6 +1460,27 @@ fn is_immediate_command(event: &WorkflowEvent) -> bool {
     mirror_event(event, false).is_some_and(|op| op.is_immediate())
 }
 
+/// True for a local activity's schedule, attempt or outcome.
+const fn is_local_activity_event(event: &WorkflowEvent) -> bool {
+    matches!(
+        event,
+        WorkflowEvent::LocalActivityScheduled { .. }
+            | WorkflowEvent::LocalActivityCompleted { .. }
+            | WorkflowEvent::LocalActivityFailed { .. }
+            | WorkflowEvent::LocalActivityExhausted { .. }
+    )
+}
+
+/// True for the failure or timeout of an activity or a child.
+const fn is_failure(event: &WorkflowEvent) -> bool {
+    matches!(
+        event,
+        WorkflowEvent::ActivityFailed { .. }
+            | WorkflowEvent::ActivityTimedOut { .. }
+            | WorkflowEvent::ChildWorkflowFailed { .. }
+    )
+}
+
 /// True for a buffered signal, which can arrive between a group's items.
 const fn is_signal(event: &WorkflowEvent) -> bool {
     matches!(event, WorkflowEvent::SignalReceived { .. })
@@ -1476,9 +1504,20 @@ fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<us
     let mut current = 0;
     let mut items = k;
     let mut sibling_turn = false;
+    let mut failed = false;
     for event in rest.iter().skip_while(|e| is_schedule(e)) {
         match event {
             e if is_schedule(e) && items >= count && current > 0 => return None,
+            // Every item is out. A schedule while one still runs needs a
+            // cause: a failed item, a signal or a sibling's outcome.
+            e if is_schedule(e)
+                && items >= count
+                && !open.is_empty()
+                && !sibling_turn
+                && !failed =>
+            {
+                return None;
+            }
             e if is_schedule(e) && items >= count => break,
             e if is_schedule(e) && current == 0 && !open.is_empty() && sibling_turn => {}
             e if is_schedule(e) && current == 0 && !open.is_empty() => break,
@@ -1490,9 +1529,11 @@ fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<us
             // A signal resumes some other branch, so a schedule right after
             // it is that branch's command.
             e if is_signal(e) => sibling_turn = true,
-            e if is_immediate_command(e) => {}
+            e if is_immediate_command(e) || is_local_activity_event(e) => {}
             e if activity_outcome(e).is_some() || child_outcome(e).is_some() => {
-                sibling_turn = !settled_key(e).is_some_and(|key| open.remove(&key));
+                let ours = settled_key(e).is_some_and(|key| open.remove(&key));
+                failed |= ours && is_failure(e);
+                sibling_turn = !ours;
                 if current > 0 {
                     waves.push(current);
                     current = 0;
@@ -1510,9 +1551,9 @@ fn refill_waves(rest: &[WorkflowEvent], k: usize, count: usize) -> Option<Vec<us
 /// True when `rest` holds a run of at least `need` schedules once the group's
 /// own progress and terminal events are passed over. The events of a known
 /// sibling in the same `join!`, signals and immediate commands are passed
-/// over too. A collect-all group
-/// schedules such a wave after a failed item. A fail-fast caller that catches
-/// the error schedules its own work instead, which is seldom a full wave.
+/// over too. A collect-all group schedules such a wave after a failed item.
+/// A fail-fast caller that catches the error schedules its own work
+/// instead, which is seldom a full wave.
 fn next_wave_is_full(
     rest: &[WorkflowEvent],
     group: &HashSet<ActivityExecId>,
