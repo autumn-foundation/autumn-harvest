@@ -2425,6 +2425,14 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = producer;
     }
 
+    /// The API rate limiter refused one request with `429` (issue #1827).
+    ///
+    /// `route_class` is `"mutating"` or `"read"`. `client_kind` is
+    /// `"token"`, `"ip"`, `"unknown"` or `"overflow"`.
+    fn record_api_rate_limited(&self, route_class: &str, client_kind: &str) {
+        let _ = (route_class, client_kind);
+    }
+
     /// The load-shed state of `queue` after one sample (issue #1794).
     ///
     /// `active` is `true` while the queue sheds new starts. The sampler calls

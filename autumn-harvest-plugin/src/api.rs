@@ -5417,6 +5417,7 @@ pub struct StandaloneAdminAuth {
     allow_unauthenticated_mutations: bool,
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
+    rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
 }
 
 impl StandaloneAdminAuth {
@@ -5459,6 +5460,17 @@ impl StandaloneAdminAuth {
     #[must_use]
     pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
         self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
+        self
+    }
+
+    /// Install the per-client rate limiter (issue #1827).
+    ///
+    /// Each verified token, or each client IP without one, gets one bucket
+    /// for mutating routes and one for read routes. See
+    /// [`crate::api_rate_limit`].
+    #[must_use]
+    pub fn with_rate_limit(mut self, rate_limit: crate::api_rate_limit::ApiRateLimit) -> Self {
+        self.rate_limit = Some(rate_limit);
         self
     }
 
@@ -5546,6 +5558,7 @@ impl StandaloneAdminAuth {
                 api_tokens: self.api_tokens,
                 read_only_role: self.read_only_role,
                 authorizer: self.authorizer.clone(),
+                rate_limit: self.rate_limit.clone(),
             },
         );
         if self.api_tokens && !self.admin_auth_boundary {
@@ -5566,6 +5579,8 @@ pub(crate) struct AdminAuthLayers {
     pub read_only_role: bool,
     /// The authorizer hook (issue #1803).
     pub authorizer: Option<crate::authz::SharedAuthorizer>,
+    /// The per-client rate limiter (issue #1827).
+    pub rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
 }
 
 /// Wrap a composed Harvest router in the admin-auth layer stack.

@@ -239,6 +239,9 @@ pub struct HarvestPlugin {
     /// The authorizer hook (issue #1803). Set via [`Self::with_authorizer`].
     /// `None` installs no layer, so the router is unchanged.
     authorizer: Option<crate::authz::SharedAuthorizer>,
+    /// The per-client API rate limiter (issue #1827). Set via
+    /// [`Self::with_api_rate_limit`]. `None` installs no layer.
+    api_rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
     /// Opt-out that opens mutating routes with no auth (issue #1802). Set
     /// true by [`Self::allow_unauthenticated_mutations`]. Default off.
     allow_unauthenticated_mutations: bool,
@@ -341,6 +344,7 @@ impl HarvestPlugin {
             role_auth_enabled: false,
             api_tokens_enabled: false,
             authorizer: None,
+            api_rate_limit: None,
             allow_unauthenticated_mutations: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             canary_config: None,
@@ -611,6 +615,20 @@ impl HarvestPlugin {
     #[must_use]
     pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
         self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
+        self
+    }
+
+    /// Rate-limit each client of the management API (issue #1827).
+    ///
+    /// Each verified API token, or each client IP without one, gets one
+    /// bucket for mutating routes and one for read routes. A client over its
+    /// limit gets `429` with `Retry-After`. Health routes are exempt. See
+    /// [`crate::api_rate_limit`].
+    ///
+    /// Default off: with no limiter the router is byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_api_rate_limit(mut self, rate_limit: crate::api_rate_limit::ApiRateLimit) -> Self {
+        self.api_rate_limit = Some(rate_limit);
         self
     }
 
@@ -1169,6 +1187,7 @@ impl Plugin for HarvestPlugin {
             role_auth_enabled,
             api_tokens_enabled,
             authorizer,
+            api_rate_limit,
             allow_unauthenticated_mutations,
             status_thresholds,
             canary_config,
@@ -1571,6 +1590,7 @@ impl Plugin for HarvestPlugin {
                     api_tokens: api_tokens_enabled,
                     read_only_role: role_auth_enabled,
                     authorizer,
+                    rate_limit: api_rate_limit,
                 },
             );
             if let Some(mw) = api_middleware {
@@ -1582,7 +1602,7 @@ impl Plugin for HarvestPlugin {
             // extractor for it.
             app.nest(&path, router.with_state(()))
         } else {
-            let _ = (api_tokens_enabled, authorizer);
+            let _ = (api_tokens_enabled, authorizer, api_rate_limit);
             app
         }
     }
