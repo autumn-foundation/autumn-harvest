@@ -379,6 +379,16 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
 
+Every API request has a timeout (issue #1832). Set it with
+`--http-timeout-secs` or `HARVEST_HTTP_TIMEOUT_SECS` (default 30, range
+1–3600). A request to an endpoint that never answers fails with
+`request timed out`. Two kinds of command get more time. `workflow update
+--wait completed` gets its `--timeout-secs` plus 10 s. A bulk DLQ command
+that writes gets at least 300 s. `events tail` applies the timeout to the
+response headers only. After that, it fails only when no data arrives for
+60 s or the timeout, whichever is longer. Server keepalives every 15 s keep
+a live stream open.
+
 The CLI sends `Accept: application/json` on every JSON request (issue
 #1579). Send the same header from `curl` or any other direct client of
 a JSON route. `curl` sends a bare `Accept: */*` by default. Autumn's

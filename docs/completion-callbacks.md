@@ -153,6 +153,21 @@ retry/backoff/DLQ machinery rather than inventing new machinery:
   overridable via `completion_callback_retry_policy(...)`. The policy is
   frozen into the delivery row at enqueue time, so a later config change
   doesn't retroactively alter an in-flight delivery's schedule.
+- **Permanent 4xx dead-letters at once (issue #1832).** A retry cannot fix
+  a 4xx such as 400, 401, 404 or 422. The scanner dead-letters it on the
+  first attempt, with the same typed reason as exhaustion and `attempts: 1`.
+  408, 425 and 429 are transient. They take the normal backoff.
+- **Receiver misconfiguration.** A rotated HMAC secret, a WAF that returns
+  403 or an ingress that returns 404 during a deploy dead-letters every
+  completion in that time. Fix the receiver first. Then run `harvest dlq
+  redrive --queue completion-callback` to send them all again. The redrive
+  spreads the next attempts over a window, so the receiver does not get a
+  burst.
+- **`Retry-After` is honoured (issue #1832).** A `Retry-After` in
+  delta-seconds or in any HTTP-date form sets the minimum backoff for that
+  retry. The engine's `Retry-After` ceiling (15 minutes, issue #744) caps
+  it, so a receiver cannot delay a delivery past that. A hint shorter than
+  the policy backoff changes nothing. The hint does not add attempts.
 - **Dead-letter on exhaustion**: `DeadLetterReason::CallbackDeliveryExhausted
   { delivery_id, attempts, last_status, target }` — a typed reason distinct
   from `PoisonPill`/`WorkflowTaskTimeout`/plain task-retry exhaustion. The
@@ -186,7 +201,8 @@ pub trait CompletionCallbackDeliverer: Send + Sync {
 `completion_callback_deliverer(...)`. It disables redirect-following
 (`redirect::Policy::none()`) — an allowlisted host could otherwise 302 to an
 internal address, silently bypassing the SSRF guard — and applies a hard
-request timeout. HMAC signing, SSRF validation, envelope construction,
+request timeout. It reads `Retry-After` from the response and reports it on
+the `DeliveryAttempt`. HMAC signing, SSRF validation, envelope construction,
 retry/backoff, and the DLQ all stay in core; the trait is a thin "send these
 bytes+headers to this URL, tell me the status or transport error" seam.
 
