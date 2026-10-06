@@ -33358,7 +33358,8 @@ async fn bulk_replay_from_shards(
         .filter(|(shard_id, _)| selector.shard_id.is_none_or(|w| w == shard_id.as_i32()))
         .count();
     let mut spread_secs = selector.filter.spread_secs;
-    if spread_secs.is_none() && shards > 1 {
+    // A dry run schedules nothing, so it skips the extra count.
+    if spread_secs.is_none() && shards > 1 && !selector.dry_run() {
         // Size the shared window from the rows the call selects.
         let mut matched = 0_usize;
         for (shard_id, shard_pool) in pool.iter_shards() {
@@ -33540,7 +33541,8 @@ async fn redrive_from_shards(
         .filter(|(shard_id, _)| request.shard_id.is_none_or(|w| w == shard_id.as_i32()))
         .count();
     let mut spread_secs = request.filter.spread_secs;
-    if spread_secs.is_none() && shards > 1 {
+    // A dry run schedules nothing, so it skips the extra count.
+    if spread_secs.is_none() && shards > 1 && !request.filter.dry_run {
         // Size the shared window from the rows the call selects.
         let mut matched = 0_usize;
         for (shard_id, shard_pool) in pool.iter_shards() {
