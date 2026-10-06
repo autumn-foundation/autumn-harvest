@@ -75,13 +75,14 @@ fn op_depth(ops: &[Op]) -> usize {
 /// Generates the ops nested in a [`Op::Concurrent`] or [`Op::Race`]. Past
 /// [`MAX_OP_DEPTH`] it returns none.
 fn nested_ops(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<Op>> {
-    let depth = OP_DEPTH.with(std::cell::Cell::get);
+    // The op that holds these ops is one level already.
+    let depth = OP_DEPTH.with(std::cell::Cell::get) + 1;
     if depth >= MAX_OP_DEPTH {
         return Ok(Vec::new());
     }
-    OP_DEPTH.with(|d| d.set(depth + 1));
-    let ops = Vec::<Op>::arbitrary(u);
     OP_DEPTH.with(|d| d.set(depth));
+    let ops = Vec::<Op>::arbitrary(u);
+    OP_DEPTH.with(|d| d.set(depth - 1));
     ops
 }
 
@@ -913,48 +914,55 @@ fn mirror_fan_out(
     count: usize,
     claimed: &mut HashSet<usize>,
 ) -> Op {
-    let mut activities = Vec::new();
-    let mut children = Vec::new();
-    let mut activity_ids = HashSet::new();
-    let mut child_ids = HashSet::new();
+    let mut group = FanOutGroup::default();
     // The first wave is the run of schedules right after the marker. After
     // it, each completed item lets one more schedule refill its slot.
     let mut first_wave = true;
-    let mut first_wave_len = 0;
     let mut refills = 0usize;
-    let mut collect = false;
+    let first_cap = first_wave_cap(history, start, count);
+    let mut siblings = HashSet::new();
     for (index, event) in history.iter().enumerate().skip(start) {
-        if activities.len() + children.len() >= count {
+        if group.activities.len() + group.children.len() >= count {
             break;
         }
-        let open = first_wave || refills > 0;
+        let open = (first_wave && group.first_wave_len < first_cap) || refills > 0;
         match event {
+            // A sibling command in the same `join!`, past the first wave.
+            WorkflowEvent::ActivityScheduled { activity_id, .. } if first_wave && !open => {
+                siblings.insert(*activity_id);
+                continue;
+            }
+            event if activity_outcome(event).is_some_and(|(id, _)| siblings.contains(&id)) => {
+                continue;
+            }
             WorkflowEvent::ActivityScheduled {
                 activity_id,
                 name,
                 input,
                 queue,
-            } if open && children.is_empty() => {
-                activities.push((name.clone(), input.clone(), queue.clone()));
-                activity_ids.insert(*activity_id);
+            } if open && group.children.is_empty() => {
+                group
+                    .activities
+                    .push((name.clone(), input.clone(), queue.clone()));
+                group.activity_ids.insert(*activity_id);
             }
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
                 workflow_name,
                 input,
-            } if open && activities.is_empty() => {
-                children.push((workflow_name.clone(), input.clone()));
-                child_ids.insert(*child_id);
+            } if open && group.activities.is_empty() => {
+                group.children.push((workflow_name.clone(), input.clone()));
+                group.child_ids.insert(*child_id);
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. }
-                if activity_ids.contains(activity_id) =>
+                if group.activity_ids.contains(activity_id) =>
             {
                 first_wave = false;
                 refills += 1;
                 continue;
             }
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
-                if child_ids.contains(child_id) =>
+                if group.child_ids.contains(child_id) =>
             {
                 first_wave = false;
                 refills += 1;
@@ -962,7 +970,7 @@ fn mirror_fan_out(
             }
             WorkflowEvent::ActivityStarted { activity_id, .. }
             | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
-                if activity_ids.contains(activity_id) =>
+                if group.activity_ids.contains(activity_id) =>
             {
                 first_wave = false;
                 continue;
@@ -971,15 +979,15 @@ fn mirror_fan_out(
             // on, and its next wave is a full run of schedules.
             WorkflowEvent::ActivityFailed { activity_id, .. }
             | WorkflowEvent::ActivityTimedOut { activity_id, .. }
-                if activity_ids.contains(activity_id)
-                    && (collect
+                if group.activity_ids.contains(activity_id)
+                    && (group.collect
                         || next_wave_is_full(
                             &history[index + 1..],
-                            &activity_ids,
-                            first_wave_len.min(count - activities.len()),
+                            &group.activity_ids,
+                            group.first_wave_len.min(count - group.activities.len()),
                         )) =>
             {
-                collect = true;
+                group.collect = true;
                 first_wave = false;
                 refills += 1;
                 continue;
@@ -991,32 +999,93 @@ fn mirror_fan_out(
             _ => break,
         }
         if first_wave {
-            first_wave_len += 1;
+            group.first_wave_len += 1;
         } else {
             refills -= 1;
         }
         claimed.insert(index);
     }
-    // A windowed or unfinished fan-out schedules fewer items than its
-    // marker counts. The count must still match, so the last item repeats.
-    // Replay never reaches the repeats, because history ends first.
-    if children.is_empty() {
-        pad_to(&mut activities, count);
-        let window = (first_wave_len > 0 && first_wave_len < count).then_some(first_wave_len);
+    group.into_op(&history[start..], count)
+}
+
+/// The items of a fan-out group, as [`mirror_fan_out`] collects them.
+#[derive(Default)]
+struct FanOutGroup {
+    activities: Vec<(String, Value, String)>,
+    children: Vec<(String, Value)>,
+    activity_ids: HashSet<ActivityExecId>,
+    child_ids: HashSet<ExecutionId>,
+    /// The size of the first wave.
+    first_wave_len: usize,
+    /// True once a failed item was followed by a full wave.
+    collect: bool,
+}
+
+impl FanOutGroup {
+    /// The op that replays the group. `rest` starts after the marker.
+    fn into_op(self, rest: &[WorkflowEvent], count: usize) -> Op {
+        if !self.children.is_empty() {
+            let collect = settles_after_failure(rest, &self.child_ids, child_outcome);
+            return Op::ChildFanOut {
+                children: pad_to(self.children, count),
+                collect,
+            };
+        }
+        let first = self.first_wave_len;
+        let window = (first > 0 && first < count).then_some(first);
         let collect = if window.is_some() {
-            collect
+            self.collect
         } else {
-            settles_after_failure(&history[start..], &activity_ids, activity_outcome)
+            settles_after_failure(rest, &self.activity_ids, activity_outcome)
         };
         Op::FanOut {
-            activities,
+            activities: pad_to(self.activities, count),
             window,
             collect,
         }
-    } else {
-        pad_to(&mut children, count);
-        let collect = settles_after_failure(&history[start..], &child_ids, child_outcome);
-        Op::ChildFanOut { children, collect }
+    }
+}
+
+/// How many schedules of the run right after a fan-out marker belong to the
+/// group. A sibling command in the same `join!` can follow the first wave in
+/// that run. The next wave shows the window. When it is the last wave, the
+/// first one held `count - next`. When a later wave follows, the window is
+/// `next`. With no next wave, the whole run counts.
+fn first_wave_cap(history: &[WorkflowEvent], start: usize, count: usize) -> usize {
+    let is_schedule = |e: &WorkflowEvent| {
+        matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { .. } | WorkflowEvent::ChildWorkflowStarted { .. }
+        )
+    };
+    let is_signal = |e: &WorkflowEvent| matches!(e, WorkflowEvent::SignalReceived { .. });
+    let rest = &history[start.min(history.len())..];
+    let first = rest.iter().take_while(|e| is_schedule(e) || is_signal(e));
+    let run = first.filter(|e| is_schedule(e)).count();
+    let mut waves = Vec::new();
+    let mut current = 0;
+    for event in rest.iter().skip_while(|e| is_schedule(e) || is_signal(e)) {
+        match event {
+            e if is_schedule(e) => current += 1,
+            e if is_signal(e) => {}
+            e if activity_outcome(e).is_some() || child_outcome(e).is_some() => {
+                if current > 0 {
+                    waves.push(current);
+                    current = 0;
+                }
+            }
+            _ => break,
+        }
+    }
+    if current > 0 {
+        waves.push(current);
+    }
+    match waves.as_slice() {
+        [next, _, ..] if *next < run => *next,
+        [next] if count.saturating_sub(*next) < run && count.saturating_sub(*next) >= *next => {
+            count - next
+        }
+        _ => run,
     }
 }
 
@@ -1109,11 +1178,15 @@ fn settles_after_failure<K: Copy + Eq + std::hash::Hash>(
     failed && settled.len() == group.len()
 }
 
-/// Repeats the last item until `items` holds `count` items.
-fn pad_to<T: Clone>(items: &mut Vec<T>, count: usize) {
+/// Repeats the last item until `items` holds `count` items. A windowed or
+/// unfinished fan-out schedules fewer items than its marker counts. The
+/// count must still match, so the last item repeats. Replay never reaches
+/// the repeats, because history ends first.
+fn pad_to<T: Clone>(mut items: Vec<T>, count: usize) -> Vec<T> {
     if let Some(last) = items.last().cloned() {
         items.resize(count.max(items.len()), last);
     }
+    items
 }
 
 /// The `{seq}` of a `race:{seq}` marker. A `race_winner:` marker has none.
@@ -1507,16 +1580,41 @@ fn take_one(counts: &mut HashMap<&str, usize>, name: &str) -> bool {
     }
 }
 
+/// True for an event that wakes the workflow for a new decision, such as a
+/// completed activity or a fired timer.
+const fn is_decision_boundary(event: &WorkflowEvent) -> bool {
+    matches!(
+        event,
+        WorkflowEvent::ActivityCompleted { .. }
+            | WorkflowEvent::ActivityFailed { .. }
+            | WorkflowEvent::ActivityTimedOut { .. }
+            | WorkflowEvent::ChildWorkflowCompleted { .. }
+            | WorkflowEvent::ChildWorkflowFailed { .. }
+            | WorkflowEvent::TimerFired { .. }
+            | WorkflowEvent::SignalReceived { .. }
+    )
+}
+
 /// The indexes of the `TimerStarted` events that the cancellable timer API
 /// wrote. Such a start is followed by a `TimerCancelled` for its id before
-/// any `TimerFired`. A start with neither event, in a history that ends the
-/// run, is also cancellable: it stayed armed, and a classic timer cannot.
+/// any `TimerFired`. A start with neither event is also cancellable when the
+/// history ends the run, or when a later decision issues a command. A
+/// classic timer parks the workflow until it fires, so it allows neither.
 /// An id can be reused, so each start is judged alone.
 fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
     let mut next_is_cancel: HashMap<&str, bool> = HashMap::new();
     let mut armed = HashSet::new();
     let mut run_ends = false;
+    // A command seen later, and a decision boundary followed by a command.
+    let mut command_later = false;
+    let mut later_decision = false;
     for (index, event) in history.iter().enumerate().rev() {
+        if is_decision_boundary(event) && command_later {
+            later_decision = true;
+        }
+        if mirror_event(event, false).is_some() {
+            command_later = true;
+        }
         match event {
             WorkflowEvent::WorkflowCompleted { .. }
             | WorkflowEvent::WorkflowFailed { .. }
@@ -1531,7 +1629,7 @@ fn armed_timer_starts(history: &[WorkflowEvent]) -> HashSet<usize> {
                 // The start consumes the next event, so an earlier start of a
                 // reused id looks further back.
                 let next = next_is_cancel.remove(timer_id.as_str());
-                if next == Some(true) || (next.is_none() && run_ends) {
+                if next == Some(true) || (next.is_none() && (run_ends || later_decision)) {
                     armed.insert(index);
                 }
             }
