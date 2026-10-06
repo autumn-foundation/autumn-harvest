@@ -40,7 +40,8 @@ SEMVER_ID = r"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*"
 VERSION_HEADING_RE = re.compile(
     rf"^##\s+\[?v?(\d+\.\d+\.\d+(?:-{SEMVER_ID})?(?:\+{SEMVER_ID})?)", re.MULTILINE
 )
-FENCE_RE = re.compile(r"^(```|~~~).*?^\1", re.MULTILINE | re.DOTALL)
+# A CommonMark fence: up to 3 spaces, then 3 or more backticks or tildes.
+FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 
 # (path, pattern, the fact that makes the claim false)
@@ -110,15 +111,27 @@ def line_of(text, offset):
 
 
 def markdown_lines(text):
-    """Yield (line number, line) outside fenced blocks."""
+    """Yield (line number, line) outside fenced blocks.
+
+    As in CommonMark, a fence closes only on a run of the same character, at
+    least as long as the opener, with nothing after it. So a four-backtick
+    fence can show a three-backtick block inside it.
+    """
     fence = None
     for n, line in enumerate(text.splitlines(), 1):
-        marker = re.match(r"\s*(```|~~~)", line)
-        if marker:
-            fence = None if fence == marker.group(1) else fence or marker.group(1)
-            continue
+        marker = FENCE_RE.fullmatch(line)
         if fence is None:
+            if marker and not (marker.group(1)[0] == "`" and "`" in marker.group(2)):
+                fence = marker.group(1)
+                continue
             yield n, line
+        elif (
+            marker
+            and marker.group(1)[0] == fence[0]
+            and len(marker.group(1)) >= len(fence)
+            and not marker.group(2).strip()
+        ):
+            fence = None
 
 
 def event_row_count_findings(path, text):
@@ -158,7 +171,8 @@ def duplicate_row_findings(path, text):
 
 
 def release_notes_findings(notes, cargo_toml):
-    headings = VERSION_HEADING_RE.findall(FENCE_RE.sub("", notes))
+    outside = "\n".join(line for _, line in markdown_lines(notes))
+    headings = VERSION_HEADING_RE.findall(outside)
     if not headings:
         return []
     try:
@@ -234,6 +248,11 @@ def self_test():
     assert duplicate_row_findings("x.md", sample) == []
     split = "| `c.rs` | 1 |\n```\nx\n```\n| `c.rs` | 2 |\n"
     assert duplicate_row_findings("x.md", split) == []
+    nested = "````md\n```\n| d |\n```\n| d |\n````\n| `e.rs` | 1 |\n"
+    assert duplicate_row_findings("x.md", nested) == []
+    assert [n for n, _ in markdown_lines(nested)] == [7]
+    assert [n for n, _ in markdown_lines("~~~\n```\nx\n~~~\ny\n")] == [5]
+    assert [n for n, _ in markdown_lines("```\nx\n``` not a close\n```\ny\n")] == [5]
 
     cargo = (
         '[workspace]\nmembers = []\n\n[workspace.package]\n'
@@ -243,6 +262,7 @@ def self_test():
     assert release_notes_findings("Pointer to CHANGELOG.md.\n", cargo) == []
     assert release_notes_findings("## [0.7.0] - x\n## [0.6.0] - y\n", cargo) == []
     assert release_notes_findings("```\n## [0.1.0]\n```\n## 0.7.0\n", cargo) == []
+    assert release_notes_findings("````\n```\n## [0.1.0]\n````\n## 0.7.0\n", cargo) == []
     assert release_notes_findings("## 0.7.0: Release notes\n", cargo) == []
     assert release_notes_findings("## v0.7.0.\n", cargo) == []
     found = release_notes_findings("## [0.7.0-rc.1+b.5] - x\n", cargo)
