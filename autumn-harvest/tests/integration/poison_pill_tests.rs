@@ -853,12 +853,13 @@ async fn set_heartbeat_age(conn: &mut AsyncPgConnection, worker_id: &str, age_se
     .expect("age the worker heartbeat");
 }
 
-/// Run one witnessed sweep.
-async fn witnessed_sweep(
+/// Run one witnessed sweep at `now`.
+async fn witnessed_sweep_at(
     conn: &mut AsyncPgConnection,
     witness: &mut OrphanWitness,
     stuck_running_secs: Option<i64>,
     metrics: &RecordingMetrics,
+    now: std::time::Instant,
 ) -> autumn_harvest::poison_pill::ReclaimSummary {
     reclaim_orphaned_tasks_witnessed(
         conn,
@@ -868,9 +869,27 @@ async fn witnessed_sweep(
         metrics,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
         witness,
+        now,
     )
     .await
     .expect("witnessed reclaim")
+}
+
+/// Run one witnessed sweep now.
+async fn witnessed_sweep(
+    conn: &mut AsyncPgConnection,
+    witness: &mut OrphanWitness,
+    stuck_running_secs: Option<i64>,
+    metrics: &RecordingMetrics,
+) -> autumn_harvest::poison_pill::ReclaimSummary {
+    witnessed_sweep_at(
+        conn,
+        witness,
+        stuck_running_secs,
+        metrics,
+        std::time::Instant::now(),
+    )
+    .await
 }
 
 /// Issue #1879: the first sight of an orphan never takes the last strike.
@@ -900,6 +919,41 @@ async fn last_strike_waits_for_a_second_sweep() {
     let (state, strikes, _) = task_state(&mut conn, task_id).await;
     assert_eq!(state, "FAILED");
     assert_eq!(strikes, 3);
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");
+}
+
+/// Issue #1879: a worker with no row has no heartbeat age. A live worker can
+/// lose its row for a short time, for example during a registration retry.
+/// So the reclaimer must see the claim for the full confirm window.
+#[tokio::test]
+async fn absent_worker_row_waits_the_full_confirm_window() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-no-row").await;
+    let task_id = insert_running_task(&mut conn, Some(exec_id), "rowless-worker", 2).await;
+    let metrics = RecordingMetrics::default();
+    let mut witness = OrphanWitness::default();
+    let t0 = std::time::Instant::now();
+    let confirm = std::time::Duration::from_secs(2 * STALE_SECS.unsigned_abs());
+
+    for (sweep, at) in [t0, t0 + std::time::Duration::from_secs(1)]
+        .into_iter()
+        .enumerate()
+    {
+        let summary = witnessed_sweep_at(&mut conn, &mut witness, None, &metrics, at).await;
+        assert_eq!(
+            (summary.quarantined, summary.held),
+            (0, 1),
+            "sweep {sweep}: a missing row is not yet a confirmed death"
+        );
+    }
+    let (state, strikes, _) = task_state(&mut conn, task_id).await;
+    assert_eq!((state.as_str(), strikes), ("RUNNING", 2));
+
+    let summary = witnessed_sweep_at(&mut conn, &mut witness, None, &metrics, t0 + confirm).await;
+    assert_eq!(
+        summary.quarantined, 1,
+        "a full confirm window confirms the death"
+    );
     assert_eq!(workflow_state(&mut conn, exec_id).await, "FAILED");
 }
 

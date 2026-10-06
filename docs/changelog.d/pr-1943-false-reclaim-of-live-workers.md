@@ -26,8 +26,12 @@ are true:
   after a database pause sees every heartbeat as old. The next sweep sees the
   heartbeats of the live workers again.
 - The worker wrote no heartbeat for two stale windows
-  (`quarantine_confirm_secs`). The age comes from `last_heartbeat_at`, which
-  the database stamps. A slow sweep therefore does not reset the hold.
+  (`quarantine_confirm_secs`). The age compares `last_heartbeat_at` with
+  `clock_timestamp()`, so both sides use the database clock. A skewed host
+  clock cannot shorten the window, and a slow sweep does not reset it.
+- A worker with no row has no heartbeat age. A live worker can lose its row
+  for a short time, for example during a registration retry. So the
+  reclaimer must see such a claim without a break for the full window.
 
 Until then the row stays `RUNNING` and gets no strike. The stuck-running pass
 skips a held row, because its requeue counts no strike. A worker that
@@ -68,9 +72,10 @@ No migration. No new `WorkflowEvent` variant. `harvest_events` is not touched.
 
 - Paused-time tests drive the real heartbeat loop. They pin the fixed rate,
   the no-burst delay, the first tick, the zero-interval floor and the cancel.
-- Unit tests for `OrphanWitness` and `quarantine_confirm_secs`.
+- Unit tests for `OrphanWitness`, `quarantine_confirm_secs` and the
+  database-clock sighting query.
 - DB tests: the last strike waits for a second sweep; it waits while the
-  worker is only late; a late worker that heartbeats again keeps its task;
+  worker is only late; a worker with no row waits the full window; a late worker that heartbeats again keeps its task;
   the stuck pass skips a held row; a requeue stays immediate; the heartbeat
   write returns the status; the tick still detects a remote drain.
 - A DB test of the spawned reclaimer loop: it holds a late worker's task, then
