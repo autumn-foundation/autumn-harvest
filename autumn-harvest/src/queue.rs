@@ -7281,6 +7281,11 @@ const TERMINAL_TASK_CURSOR: &str = "AND (t.completed_at, t.id) > ($3, $4) ";
 /// - **Dead letter.** A terminal `workflow` row also stays while a dead
 ///   letter exists for its execution. A DLQ redrive can move a `FAILED`
 ///   execution back to `RUNNING`, and the supersede scan then needs the row.
+/// - **Timeout record.** A row stays while `timed_out_claims` holds an entry
+///   (issue #1809). Its owner takes the entry after its cancellation grace,
+///   which can outlast the shortest window. Without it, the owner misses a
+///   timeout that another process enforced. An owner that crashed never
+///   takes its entry, so the row goes 7 days after the cutoff.
 #[must_use]
 fn terminal_task_predicates() -> String {
     let terminal = crate::erase::sql_literal_list(TERMINAL_TASK_STATES);
@@ -7288,6 +7293,8 @@ fn terminal_task_predicates() -> String {
     format!(
         "t.state IN ({terminal}) \
          AND t.completed_at < $1 \
+         AND (COALESCE(cardinality(t.timed_out_claims), 0) = 0 \
+              OR t.completed_at < $1 - INTERVAL '7 days') \
          AND (t.task_type = 'activity' OR ( \
              NOT EXISTS ( \
                  SELECT 1 FROM harvest_workflow_executions e \

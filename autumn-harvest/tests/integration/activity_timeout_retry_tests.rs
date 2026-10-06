@@ -1277,6 +1277,60 @@ async fn a_failed_result_write_honours_the_timeout_record() {
     );
 }
 
+/// The terminal-task janitor keeps a row whose timed-out-claim record its
+/// owner has not taken yet (issue #1809). The owner reads the record after
+/// its cancellation grace, which can outlast the janitor's shortest window.
+/// Without the record, it would miss a timeout that another process enforced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_task_gc_keeps_a_row_with_an_outstanding_timeout_record() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-gc");
+    let activity = "t1809_gc";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 1, timeouts).await;
+    let claimed = claim(&mut conn, &queue, "w-gc").await;
+    start(&mut conn, &claimed, exec_id, activity).await;
+    age_claim(&mut conn, task_id).await;
+    enforce(&mut conn, None).await;
+    let row = task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "FAILED", "the only attempt times out for good");
+    assert_eq!(row.timed_out_claims, Some(vec![row.started_at]));
+
+    set_task(
+        &mut conn,
+        task_id,
+        "completed_at = NOW() - INTERVAL '2 hours'",
+    )
+    .await;
+    let cutoff = Utc::now() - chrono::Duration::hours(1);
+    queue::sweep_terminal_tasks(&mut conn, cutoff, 1000, false)
+        .await
+        .expect("sweep");
+    let kept: i64 = harvest_task_queue::table
+        .filter(harvest_task_queue::id.eq(task_id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(kept, 1, "the owner has not taken its record yet");
+
+    set_task(&mut conn, task_id, "timed_out_claims = '{}'").await;
+    queue::sweep_terminal_tasks(&mut conn, cutoff, 1000, false)
+        .await
+        .expect("sweep");
+    let kept: i64 = harvest_task_queue::table
+        .filter(harvest_task_queue::id.eq(task_id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(kept, 0, "a settled row ages out as before");
+}
+
 /// ADR 0005 §2, on the retry path: a retried timeout of a started attempt
 /// feeds the breaker. A later claim is a new attempt, so the start of an
 /// earlier attempt does not mark it started.

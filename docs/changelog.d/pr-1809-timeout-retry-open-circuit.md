@@ -20,6 +20,9 @@ decision.
   `PENDING` until the next probe. `CircuitOpenMode::FailFast` keeps the old
   `CircuitOpen` failure.
 - A timeout feeds the breaker only when the attempt's handler started.
+- The terminal-task janitor keeps a finished row while its timed-out-claim
+  record is outstanding, up to 7 days past its normal cutoff. The owner
+  takes the record after its cancellation grace.
 - Only the dispatch that debited a rate-limit token refunds it, and at most
   once. A worker whose attempt never runs its handler refunds its own debit:
   the claim debit of an untracked activity, or the dispatch debit of one that
