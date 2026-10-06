@@ -1856,6 +1856,60 @@ mod db {
         Ok(())
     }
 
+    #[derive(diesel::QueryableByName)]
+    struct PinnedRow {
+        #[diesel(sql_type = Integer)]
+        shard_id: i32,
+        #[diesel(sql_type = BigInt)]
+        generation: i64,
+    }
+
+    /// Fail when this database holds a generation row that this process does
+    /// not pin at that generation (issue #1823).
+    ///
+    /// It needs no shard, so a write that cannot name its shard uses it. An
+    /// audit row is one. It reads every row `FOR SHARE`. Run it in the
+    /// write's own transaction, so a bump cannot commit in between. A process
+    /// that pins nothing pays one atomic load.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::ShardFenced`] for a superseded or held
+    /// row. [`crate::error::HarvestError::Config`] for a row this process did
+    /// not pin. [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn assert_database_fence(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+        if !FenceRegistry::is_enabled() {
+            return Ok(());
+        }
+        let rows: Vec<PinnedRow> = diesel::sql_query(
+            "SELECT shard_id, generation FROM harvest_shard_generation \
+             ORDER BY shard_id FOR SHARE",
+        )
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        for row in rows {
+            match FenceRegistry::expected(ShardId::new(row.shard_id)) {
+                Some(pinned) if pinned.as_i64() == row.generation => {}
+                Some(pinned) => {
+                    return Err(crate::error::HarvestError::ShardFenced {
+                        shard_id: row.shard_id,
+                        pinned: pinned.as_i64(),
+                        current: Some(row.generation),
+                    });
+                }
+                None => {
+                    return Err(crate::error::HarvestError::Config(format!(
+                        "this database holds the generation row of shard {}, which this \
+                         process did not pin. Restart the process to pin it.",
+                        row.shard_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Open a [`FencePassGuard`] for `shard` and each pinned shard colocated
     /// with it on `pool` (issue #1823). A pass whose work is not filtered by
     /// shard holds them all. See [`FenceRegistry::claim_bindings`].
@@ -3654,12 +3708,12 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority, assert_fence,
-    assert_fence_group, begin_fenced_group, begin_fenced_pass, begin_fenced_pass_at,
-    begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
-    ensure_generation_row, freeze_generation_rows_on, measure_rpo, pin_process_fence,
-    pin_worker_fence, probe_dr_markers, query_replication_status, record_replication_heartbeat,
-    resolve_held, run_fenced_pass,
+    FencePassGuard, advance_sequences_after_promotion, assert_admin_write_authority,
+    assert_database_fence, assert_fence, assert_fence_group, begin_fenced_group, begin_fenced_pass,
+    begin_fenced_pass_at, begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick,
+    bump_generation, current_generation, ensure_generation_row, freeze_generation_rows_on,
+    measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
+    record_replication_heartbeat, resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]

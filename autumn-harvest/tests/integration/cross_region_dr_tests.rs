@@ -2095,6 +2095,232 @@ async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
     autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
 }
 
+/// A worker's shutdown writes check the live fence (issue #1823). The
+/// sampler stops with the worker, so a bump during shutdown never sets the
+/// fenced-out flag. The fleet row must still not change after the bump.
+#[tokio::test]
+async fn a_shutdown_after_a_bump_leaves_the_fleet_row_alone() {
+    #[derive(diesel::QueryableByName)]
+    struct Status {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        status: String,
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("shutdownfence");
+    let shard = ShardId::new(3);
+    let hour = std::time::Duration::from_secs(3600);
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig {
+        fencing: DrFencing::Enabled,
+        sample_interval: hour,
+        watermark_retain: hour,
+        slot_prefix: DR_PREFIX.to_string(),
+    });
+    // Neither the sampler nor the heartbeat may see the bump first.
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_dr_fencing(true)
+            .with_replication_sample_interval(hour),
+    );
+    config.shard_assignments = vec![shard];
+    config.worker_heartbeat_interval = hour;
+    let worker_id = config.worker_id.clone();
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(config, registry).expect("worker builds"),
+    );
+    let pool = dr_pool(&url);
+    let runner = std::sync::Arc::clone(&worker);
+    let run = tokio::spawn(async move { runner.run(&pool).await });
+    let status = |url: String, worker_id: String| async move {
+        let mut conn = connect(&url).await;
+        let rows: Vec<Status> =
+            diesel::sql_query("SELECT status FROM harvest_workers WHERE worker_id = $1")
+                .bind::<diesel::sql_types::Text, _>(worker_id)
+                .load(&mut conn)
+                .await
+                .unwrap_or_default();
+        <[Status]>::first(&rows).map(|row| row.status.clone())
+    };
+    eventually(
+        "the worker to register",
+        std::time::Duration::from_secs(30),
+        || {
+            let (url, worker_id) = (url.clone(), worker_id.clone());
+            async move { status(url, worker_id).await.as_deref() == Some("Active") }
+        },
+    )
+    .await;
+
+    {
+        let mut conn = connect(&url).await;
+        bump_generation(&mut conn, shard, "failover", "test")
+            .await
+            .expect("bump");
+    }
+    worker.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(60), run)
+        .await
+        .expect("the worker stops")
+        .expect("the worker task must not panic");
+
+    assert_eq!(
+        status(url.clone(), worker_id.clone()).await.as_deref(),
+        Some("Active"),
+        "a worker that lost write authority must not write its fleet status"
+    );
+}
+
+/// A detached completion-trigger relay holds its own fence (issue #1823).
+/// It runs after the caller returns, so the caller's fence no longer covers
+/// it. A source shard whose pin is superseded keeps its outbox row.
+#[tokio::test]
+async fn a_detached_trigger_relay_writes_nothing_on_a_fenced_source() {
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        rows: i64,
+    }
+    let _serial = registry_guard().await;
+    let (source_url, _source_db) = require_db!("relaysrc");
+    let (target_url, _target_db) = require_db!("relaytgt");
+    let (source, target) = (ShardId::new(0), ShardId::new(1));
+    let source_pool = dr_pool(&source_url);
+    let pools: std::collections::BTreeMap<_, _> = [
+        (source, source_pool.clone()),
+        (target, dr_pool(&target_url)),
+    ]
+    .into_iter()
+    .collect();
+    let sharded = autumn_harvest::shard::ShardedDbPool::from_map(pools, source);
+
+    let outbox_id = uuid::Uuid::new_v4();
+    let source_exec_id = ExecutionId::new_for_shard(source).as_uuid();
+    let mut conn = connect(&source_url).await;
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox \
+            (id, source_exec_id, trigger_id, target_shard, target_workflow_name, \
+             target_workflow_id, target_input, queue_name, priority, max_workflow_input_bytes) \
+         VALUES ($1, $2, $3, 1, 'dr_relay_target', 'dr-relay', '{}'::jsonb, \
+                 'default', '0'::jsonb, 1048576)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+    .bind::<diesel::sql_types::Uuid, _>(source_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
+    .execute(&mut conn)
+    .await
+    .expect("insert the outbox row");
+    // The source pin is superseded: another region owns the source shard.
+    let pinned = ensure_generation_row(&mut conn, source).await.unwrap();
+    FenceRegistry::publish(&[(source, pinned)], source).expect("pin");
+    bump_generation(&mut conn, source, "failover", "test")
+        .await
+        .expect("bump");
+
+    autumn_harvest::completion_trigger::DeferredTriggerStart {
+        outbox_id,
+        source_exec_id,
+        trigger_id: uuid::Uuid::new_v4(),
+        source_shard: source,
+        target_shard: target,
+        target_workflow_name: "dr_relay_target".to_string(),
+        target_workflow_id: "dr-relay".to_string(),
+        target_input: serde_json::json!({}),
+        queue_name: Some("default".to_string()),
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 1_048_576,
+        trigger_name: "dr_relay".to_string(),
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla: None,
+        retry_policy: None,
+        max_workflow_attempts_ceiling: None,
+        codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
+    }
+    .spawn();
+    // The relay is fire-and-forget. Give it time to run.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let remaining: Vec<Rows> =
+        diesel::sql_query("SELECT count(*) AS rows FROM harvest_completion_trigger_outbox")
+            .load(&mut conn)
+            .await
+            .expect("count the outbox");
+    let _ = autumn_harvest::shard::ShardedDbPool::single(source_pool);
+    drop(sharded);
+
+    assert_eq!(
+        <[Rows]>::first(&remaining).map(|row| row.rows),
+        Some(1),
+        "a relay must not write a source shard whose pin is superseded"
+    );
+}
+
+/// An audit write checks the fence in its own transaction (issue #1823). A
+/// read route such as the event stream writes audit rows but takes no fence
+/// barrier. A process whose pin is superseded must write none.
+#[tokio::test]
+async fn a_superseded_pin_writes_no_audit_row() {
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        rows: i64,
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("auditfence");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    let record = autumn_harvest::models::NewAuditRecord {
+        actor: "reader",
+        operation: "execution.stream.open",
+        target_type: "execution",
+        target_id: None,
+        route_or_command: "GET /executions/{exec_id}/events/stream",
+        request_id: None,
+        idempotency_key: None,
+        status: autumn_harvest::audit::STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: Some(0),
+        source: "api",
+    };
+
+    let single = autumn_harvest::audit::insert_audit(&mut conn, &record).await;
+    let batch =
+        autumn_harvest::audit::insert_audit_batch(&mut conn, std::slice::from_ref(&record)).await;
+    let rows: Vec<Rows> = diesel::sql_query("SELECT count(*) AS rows FROM harvest_audit_log")
+        .load(&mut conn)
+        .await
+        .expect("count the audit rows");
+
+    assert!(
+        matches!(
+            single,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a superseded pin must not write an audit row: {single:?}"
+    );
+    assert!(
+        matches!(
+            batch,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a superseded pin must not write an audit batch: {batch:?}"
+    );
+    assert_eq!(<[Rows]>::first(&rows).map(|row| row.rows), Some(0));
+}
+
 // ── Fence on by default where DR is configured (issue #1823) ───────────────
 
 #[tokio::test]

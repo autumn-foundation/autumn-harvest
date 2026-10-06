@@ -1329,18 +1329,43 @@ impl DeferredTriggerStart {
                 )
             };
 
-            if let Err(e) = relay_gate_checked_start(
-                &mut target_conn,
-                &mut source_conn,
-                params,
-                self.outbox_id,
-                self.source_exec_id,
-                self.trigger_id,
-                metrics_ref,
-                &self.codecs,
+            // Issue #1823: this relay runs detached, after its caller's fence
+            // ends. It writes the source and the target shard, so it holds the
+            // fence of both while it writes. A fenced or held shard leaves the
+            // outbox row for the scanner.
+            let mut fence = Vec::new();
+            for (shard, shard_pool) in [
+                (self.source_shard, &source_pool),
+                (self.target_shard, &pool),
+            ] {
+                match crate::replication::begin_fenced_group(shard_pool, shard).await {
+                    Ok(guards) => fence.extend(guards),
+                    Err(error) => {
+                        tracing::warn!(
+                            shard_id = shard.as_i32(),
+                            %error,
+                            "[completion_trigger] the DR fence forbids this relay; leaving the outbox row for the scanner"
+                        );
+                        return;
+                    }
+                }
+            }
+            let relayed = crate::replication::run_fenced_pass(
+                &fence,
+                Box::pin(relay_gate_checked_start(
+                    &mut target_conn,
+                    &mut source_conn,
+                    params,
+                    self.outbox_id,
+                    self.source_exec_id,
+                    self.trigger_id,
+                    metrics_ref,
+                    &self.codecs,
+                )),
             )
             .await
-            {
+            .and_then(|relayed| relayed);
+            if let Err(e) = relayed {
                 // A start error (e.g. PayloadTooLarge) leaves the outbox row for the
                 // scanner to handle (which deletes an oversized-payload row).
                 tracing::error!(

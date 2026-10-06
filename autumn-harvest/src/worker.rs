@@ -28327,6 +28327,37 @@ fn skip_fenced_shutdown_write(worker_id: &str, what: &str) -> bool {
     fenced
 }
 
+/// Run one shutdown write under the shard's live fence (issue #1823).
+///
+/// The fenced-out flag alone is not enough. The sampler stops with the
+/// worker, so a bump during shutdown never sets it. The guard holds the
+/// barrier while the write runs, so a bump cannot commit in between.
+///
+/// `None` means the write was skipped. The process lost write authority, the
+/// shard is held, the fence is unreadable, or the guard session ended.
+async fn fenced_shutdown_write<T>(
+    pool: &DbPool,
+    shard: Option<crate::types::ShardId>,
+    worker_id: &str,
+    what: &str,
+    write: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if skip_fenced_shutdown_write(worker_id, what) {
+        return None;
+    }
+    let KeeperFence::Write(fence) = keeper_fence(pool, shard, worker_id, what).await else {
+        tracing::warn!(
+            worker_id,
+            what,
+            "skipping a shutdown write: the shard fence forbids it"
+        );
+        return None;
+    };
+    crate::replication::run_fenced_pass(&fence, write)
+        .await
+        .ok()
+}
+
 /// What one shard's DR sample concluded.
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30112,6 +30143,9 @@ struct UnstartedClaim {
     /// claim settled, so the lease keeper never counts it as abandoned.
     claims: LiveClaims,
     key: Option<ClaimKey>,
+    /// The task's shard, from its execution id. The release runs under that
+    /// shard's fence (issue #1823).
+    shard: crate::types::ShardId,
 }
 
 impl UnstartedClaim {
@@ -30128,6 +30162,11 @@ impl UnstartedClaim {
             key: task
                 .started_at
                 .map(|started_at| (task.id, task.attempt, started_at)),
+            shard: task
+                .workflow_exec_id
+                .map_or(crate::types::ShardId::UNENCODED, |id| {
+                    crate::types::ShardId::from_uuid(&id)
+                }),
         }
     }
 
@@ -30141,12 +30180,25 @@ impl UnstartedClaim {
     /// does not drop the release or the refund. The body stays live
     /// meanwhile, so the lease keeper does not release this claim too.
     async fn release(self, pool: &DbPool) {
+        let Some(worker_id) = self.claim.as_ref().map(|claim| claim.worker_id.clone()) else {
+            return;
+        };
+        let shard = Some(self.shard);
+        fenced_shutdown_write(
+            pool,
+            shard,
+            &worker_id,
+            "unstarted-claim release",
+            Box::pin(self.release_now(pool)),
+        )
+        .await;
+    }
+
+    /// [`Self::release`], once the fence allows the write.
+    async fn release_now(self, pool: &DbPool) {
         let Some(claim) = self.claim else {
             return;
         };
-        if skip_fenced_shutdown_write(&claim.worker_id, "unstarted-claim release") {
-            return;
-        }
         let mut conn =
             match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
                 Ok(conn) => conn,
@@ -31369,9 +31421,10 @@ impl Worker {
             .await;
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
-        for (_, shard_pool) in &shard_targets {
+        for (shard, shard_pool) in &shard_targets {
             self.transition_fleet_status(
                 shard_pool,
+                Some(*shard),
                 crate::workers::WorkerStatus::Stopped,
                 shutdown_acquire_bound,
             )
@@ -31853,9 +31906,9 @@ impl Worker {
         // from the signal. A slow pool cannot spend the grace period on
         // this bookkeeping first (issue #1813).
         let bookkeeping = async {
-            self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
+            self.transition_fleet_status(pool, None, crate::workers::WorkerStatus::Draining, None)
                 .await;
-            self.release_sticky_pins(pool, None).await;
+            self.release_sticky_pins(pool, None, None).await;
         };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         tokio::join!(bookkeeping, self.drain_in_flight());
@@ -31864,11 +31917,11 @@ impl Worker {
 
         // A decision that parked during the drain pinned its task again.
         // Release once more. A task that outlived the drain keeps its pin.
-        self.release_sticky_pins(pool, None).await;
+        self.release_sticky_pins(pool, None, None).await;
         self.close_workflow_cache().await;
 
         // All tasks complete — mark Stopped, then stop the heartbeat task.
-        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped, None)
+        self.transition_fleet_status(pool, None, crate::workers::WorkerStatus::Stopped, None)
             .await;
         heartbeat_cancel.cancel();
 
@@ -34054,32 +34107,45 @@ impl Worker {
     /// Release the sticky pins of this worker on one pool (issue #1798).
     ///
     /// Best effort. A failure only makes a peer wait up to one sticky window.
-    async fn release_sticky_pins(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
+    async fn release_sticky_pins(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        acquire_bound: Option<Duration>,
+    ) {
         let worker_id = self.config.worker_id.as_str();
-        if skip_fenced_shutdown_write(worker_id, "sticky-pin release") {
-            return;
-        }
-        match acquire_shard_conn(pool, acquire_bound).await {
-            Ok(mut conn) => match queue::release_worker_sticky_pins(&mut conn, worker_id).await {
-                Ok(released) => {
-                    tracing::debug!(worker_id, released, "released sticky pins at shutdown");
-                }
+        let release = async {
+            match acquire_shard_conn(pool, acquire_bound).await {
+                Ok(mut conn) => match queue::release_worker_sticky_pins(&mut conn, worker_id).await
+                {
+                    Ok(released) => {
+                        tracing::debug!(worker_id, released, "released sticky pins at shutdown");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            worker_id,
+                            error = %error,
+                            "failed to release sticky pins at shutdown"
+                        );
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(
                         worker_id,
                         error = %error,
-                        "failed to release sticky pins at shutdown"
+                        "failed to get pool connection to release sticky pins"
                     );
                 }
-            },
-            Err(error) => {
-                tracing::warn!(
-                    worker_id,
-                    error = %error,
-                    "failed to get pool connection to release sticky pins"
-                );
             }
-        }
+        };
+        fenced_shutdown_write(
+            pool,
+            shard,
+            worker_id,
+            "sticky-pin release",
+            Box::pin(release),
+        )
+        .await;
     }
 
     /// Drain in-flight tasks of a multi-shard worker, with a sticky-pin
@@ -34100,16 +34166,18 @@ impl Worker {
         acquire_bound: Option<Duration>,
     ) {
         let bookkeeping = async {
-            for (_, shard_pool) in shard_targets {
+            for (shard, shard_pool) in shard_targets {
                 self.transition_fleet_status(
                     shard_pool,
+                    Some(*shard),
                     crate::workers::WorkerStatus::Draining,
                     acquire_bound,
                 )
                 .await;
             }
-            for (_, shard_pool) in shard_targets {
-                self.release_sticky_pins(shard_pool, acquire_bound).await;
+            for (shard, shard_pool) in shard_targets {
+                self.release_sticky_pins(shard_pool, Some(*shard), acquire_bound)
+                    .await;
             }
         };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
@@ -34120,8 +34188,9 @@ impl Worker {
                 .map(|(shard, pool)| (Some(*shard), pool.clone()))
                 .collect(),
         );
-        for (_, shard_pool) in shard_targets {
-            self.release_sticky_pins(shard_pool, acquire_bound).await;
+        for (shard, shard_pool) in shard_targets {
+            self.release_sticky_pins(shard_pool, Some(*shard), acquire_bound)
+                .await;
         }
         self.close_workflow_cache().await;
     }
@@ -34136,34 +34205,42 @@ impl Worker {
     async fn transition_fleet_status(
         &self,
         pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
         status: crate::workers::WorkerStatus,
         acquire_bound: Option<Duration>,
     ) {
-        if skip_fenced_shutdown_write(&self.config.worker_id, "fleet status update") {
-            return;
-        }
-        match acquire_shard_conn(pool, acquire_bound).await {
-            Ok(mut conn) => {
-                if let Err(error) =
-                    crate::workers::transition_status(&mut conn, &self.config.worker_id, status)
-                        .await
-                {
+        let update = async {
+            match acquire_shard_conn(pool, acquire_bound).await {
+                Ok(mut conn) => {
+                    if let Err(error) =
+                        crate::workers::transition_status(&mut conn, &self.config.worker_id, status)
+                            .await
+                    {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            ?status,
+                            error = %error,
+                            "failed to update worker fleet status"
+                        );
+                    }
+                }
+                Err(error) => {
                     tracing::warn!(
                         worker_id = %self.config.worker_id,
-                        ?status,
                         error = %error,
-                        "failed to update worker fleet status"
+                        "failed to get pool connection for fleet status update"
                     );
                 }
             }
-            Err(error) => {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "failed to get pool connection for fleet status update"
-                );
-            }
-        }
+        };
+        fenced_shutdown_write(
+            pool,
+            shard,
+            &self.config.worker_id,
+            "fleet status update",
+            Box::pin(update),
+        )
+        .await;
     }
 
     /// Emit rate-limit throttle metrics for all bound queues.
@@ -35190,7 +35267,7 @@ impl Worker {
                         () = tokio::time::sleep_until(next) => {
                             // Issue #1823: this task outlives the sampler, so
                             // each refresh checks the fence itself.
-                            let fence = match keeper_fence(&pool, shard, &worker_id).await {
+                            let fence = match keeper_fence(&pool, shard, &worker_id, "shutdown lease keeper").await {
                                 KeeperFence::Stop => return,
                                 KeeperFence::Skip => None,
                                 KeeperFence::Write(fence) => Some(fence),
@@ -35337,7 +35414,7 @@ async fn final_abandoned_claim_sweep(
         }
         // Issue #1823: this task outlives the sampler, so each attempt
         // checks the fence itself.
-        let fence = match keeper_fence(pool, shard, worker_id).await {
+        let fence = match keeper_fence(pool, shard, worker_id, "abandoned-claim sweep").await {
             KeeperFence::Stop => return,
             KeeperFence::Skip => None,
             KeeperFence::Write(fence) => Some(fence),
@@ -35393,6 +35470,7 @@ async fn keeper_fence(
     pool: &DbPool,
     shard: Option<crate::types::ShardId>,
     worker_id: &str,
+    what: &str,
 ) -> KeeperFence {
     if crate::replication::FenceRegistry::is_fenced_out() {
         return KeeperFence::Stop;
@@ -35409,14 +35487,15 @@ async fn keeper_fence(
         ) => {
             tracing::error!(
                 worker_id,
+                what,
                 %error,
-                "the shutdown lease keeper stops: this process lost DR write authority"
+                "a shutdown write stops: this process lost DR write authority"
             );
             crate::replication::FenceRegistry::mark_fenced_out();
             KeeperFence::Stop
         }
         Err(error) => {
-            tracing::warn!(worker_id, %error, "the shutdown lease keeper could not read the fence");
+            tracing::warn!(worker_id, what, %error, "a shutdown write could not read the fence");
             KeeperFence::Skip
         }
     }
@@ -40097,10 +40176,10 @@ mod tests {
         let shard = crate::types::ShardId::new(3);
 
         FenceRegistry::hold(&[shard], shard).expect("hold");
-        let held = runtime.block_on(keeper_fence(&pool, Some(shard), "w"));
+        let held = runtime.block_on(keeper_fence(&pool, Some(shard), "w", "test"));
         FenceRegistry::clear();
         FenceRegistry::publish(&[(shard, ShardGeneration::INITIAL)], shard).expect("pin");
-        let unreadable = runtime.block_on(keeper_fence(&pool, Some(shard), "w"));
+        let unreadable = runtime.block_on(keeper_fence(&pool, Some(shard), "w", "test"));
         FenceRegistry::clear();
 
         assert!(

@@ -266,7 +266,9 @@ shard is plain:
   activity heartbeat flusher stop at once. Its shutdown skips its database
   writes: fleet status,
   sticky-pin release, claim release and the lease keeper. Another region
-  owns those rows. Its orphan reclaim recovers the claims.
+  owns those rows. Its orphan reclaim recovers the claims. Each shutdown
+  write also holds the shard's fence barrier, because the sampler stops
+  with the worker. A bump during shutdown therefore stops these writes too.
 - A fenced worker with an assigned shard it cannot reach refuses to start.
   It cannot pin that shard.
 - A fenced worker holds an unassigned shard it cannot reach, and it serves
@@ -383,8 +385,12 @@ rebalance or a partition command holds one for every shard with a row on
 each database it changes, at the stated epoch, until that database's work
 ends. It also holds `harvest_shard_generation` in `SHARE` mode, so no new
 shard row can appear mid-command. A colocated shard with no stated epoch is
-refused. The runner's startup trigger sync holds one too. A bump therefore
-cannot commit while any of them writes.
+refused. The runner's startup trigger sync holds one too. A cross-shard
+completion-trigger relay runs after its caller returns, so it holds its own
+barrier on its source and target shards. A bump therefore cannot commit
+while any of them writes. A read route takes no barrier, but some write
+audit rows, such as the event stream. Each audit write checks the fence in
+its own transaction, so a stale node writes no audit row.
 
 Three limits, stated plainly:
 
