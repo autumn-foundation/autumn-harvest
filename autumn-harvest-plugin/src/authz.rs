@@ -260,6 +260,18 @@ fn truncate(s: &str, max: usize) -> &str {
 ///
 /// Best effort: a failed write is logged. The caller returns the deny anyway.
 pub(crate) async fn audit_deny(conn: &mut AsyncPgConnection, deny: &DenyAudit<'_>) {
+    audit_route_event(conn, OP_AUTHZ_DENY, deny).await;
+}
+
+/// Write one failed-request row for `operation` to the control shard.
+///
+/// The API rate limiter (issue #1827) writes its sustained rows with this. The
+/// fields are cut to the same limits as an `authz.deny` row.
+pub(crate) async fn audit_route_event(
+    conn: &mut AsyncPgConnection,
+    operation: &str,
+    deny: &DenyAudit<'_>,
+) {
     let route = format!(
         "{} {}",
         deny.method,
@@ -267,7 +279,7 @@ pub(crate) async fn audit_deny(conn: &mut AsyncPgConnection, deny: &DenyAudit<'_
     );
     let record = NewAuditRecord {
         actor: truncate(deny.actor, MAX_AUDITED_HEADER_LEN),
-        operation: OP_AUTHZ_DENY,
+        operation,
         target_type: TARGET_ROUTE,
         target_id: None,
         route_or_command: &route,
@@ -281,7 +293,12 @@ pub(crate) async fn audit_deny(conn: &mut AsyncPgConnection, deny: &DenyAudit<'_
         source: deny.source,
     };
     if let Err(e) = audit::insert_audit(conn, &record).await {
-        tracing::error!(error = %e, route = %route, "harvest: failed to audit authz deny");
+        tracing::error!(
+            error = %e,
+            route = %route,
+            operation,
+            "harvest: failed to audit route event"
+        );
     }
 }
 
