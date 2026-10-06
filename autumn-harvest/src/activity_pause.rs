@@ -12,7 +12,7 @@
 //! |---|---|---|---|---|
 //! | Admission gate | workflow **starts** | manual | halts new starts; in-flight runs keep scheduling activities | #377 / #618 |
 //! | Queue pause | a whole **task queue** | manual | holds dispatch for every activity on that queue | #619 |
-//! | Circuit breaker | one **activity type** | *automatic*, reactive | **fast-fails** dispatch after failures accumulate | #369 |
+//! | Circuit breaker | one **activity type** | *automatic*, reactive | **short-circuits** dispatch after failures accumulate (defers by default, #1809) | #369 |
 //! | **Activity pause (this)** | one **activity type** | *manual*, proactive | **holds** dispatch: nothing fails, retries, or dead-letters | **#807** |
 //!
 //! The breaker and this feature share a granularity but not a job. The breaker
