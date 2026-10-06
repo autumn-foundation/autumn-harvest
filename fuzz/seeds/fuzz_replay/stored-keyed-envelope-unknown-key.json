@@ -1,0 +1,25 @@
+{
+  "codec": "keyed",
+  "stored": true,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": {
+          "_harvest_codec_envelope": 2,
+          "codec_id": "fuzz-xor",
+          "data": "AAAA",
+          "kid": "retired-key"
+        },
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": null
+      }
+    }
+  ]
+}

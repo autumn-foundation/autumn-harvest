@@ -1,0 +1,52 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1000000,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": {
+          "invoice": "customer-42"
+        },
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000001",
+        "name": "fetch_invoice",
+        "input": {
+          "id": 42
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000001",
+        "output": {
+          "_harvest_offload_envelope": 1,
+          "store_id": "s3-prod",
+          "key": "customer-42/invoice.pdf",
+          "len": 1234,
+          "checksum": "abc123"
+        }
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": {
+          "_harvest_offload_envelope": 1,
+          "store_id": "s3-prod",
+          "key": "customer-42/invoice.pdf",
+          "len": 1234,
+          "checksum": "abc123"
+        }
+      }
+    }
+  ]
+}
