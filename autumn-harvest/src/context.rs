@@ -266,6 +266,11 @@ impl WorkflowHistoryPolicy {
     /// failure mode for a garbage/corrupted config value: it keeps the signal
     /// behaving as if unconfigured instead of silently going dark forever.
     #[must_use]
+    pub const fn with_decision_boundaries(self, _enabled: bool) -> Self {
+        self
+    }
+
+    #[must_use]
     pub const fn with_history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
         self.history_bloat_warn_fraction = if fraction.is_nan() {
             DEFAULT_HISTORY_BLOAT_WARN_FRACTION

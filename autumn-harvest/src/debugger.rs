@@ -347,9 +347,21 @@ pub struct DebugStep {
     /// The signal name, when this step consumed a `SignalReceived` event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal_name: Option<String>,
+    /// The build and worker, when this step consumed a decision boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionAttribution>,
     /// A non-determinism divergence detected while replaying this prefix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub divergence: Option<StepDivergence>,
+}
+
+/// The build and worker that committed one decision (issue #1833).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DecisionAttribution {
+    /// Build id of the worker. Empty when the worker has no build id.
+    pub build_id: String,
+    /// Id of the worker that made the decision.
+    pub worker_id: String,
 }
 
 /// The full stepped trace of one recorded history.
@@ -411,6 +423,7 @@ impl ReplayTrace {
                 resolved_payload: resolved_payload(event),
                 event_facts: normalized_event_facts(event),
                 signal_name: signal_name_of(event),
+                decision: None,
                 divergence: None,
             });
         }
@@ -955,6 +968,8 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
         resolved_payload: _,
         event_facts: l_facts,
         signal_name: l_signal,
+        // A display projection of `event_facts`.
+        decision: _,
         // Code-derived: a divergence is a code-vs-history mismatch, not a
         // property of the recording. `step_diff_kind` owns it.
         divergence: _,

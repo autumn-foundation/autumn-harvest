@@ -13484,6 +13484,26 @@ mod tests {
     }
 
     #[test]
+    fn event_label_shows_build_and_worker_per_decision() {
+        let data = serde_json::json!({
+            "type": "DecisionCommitted",
+            "data": {"build_id": "build-7", "worker_id": "worker-eu-1"},
+        });
+        assert_eq!(
+            event_human_label("DecisionCommitted", &data, "RUNNING"),
+            "Decision committed: build build-7, worker worker-eu-1"
+        );
+        let legacy = serde_json::json!({
+            "type": "DecisionCommitted",
+            "data": {"build_id": "", "worker_id": "w"},
+        });
+        assert_eq!(
+            event_human_label("DecisionCommitted", &legacy, "RUNNING"),
+            "Decision committed: build <none>, worker w"
+        );
+    }
+
+    #[test]
     fn layout_escapes_title_but_keeps_body_markup() {
         let body = html! { p { "hello" } };
         let html = layout("<evil>", &body, "", None).into_string();

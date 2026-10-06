@@ -1333,4 +1333,22 @@ mod tests {
         );
         assert!(next.is_none(), "a completed run is not resident");
     }
+
+    #[tokio::test]
+    async fn a_decision_boundary_in_the_delta_is_skipped() {
+        let (resident, own, id) = suspended_activity().await;
+        let boundary = WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("b"),
+            worker_id: crate::types::WorkerId::new("w"),
+        };
+        let delta = [own, vec![boundary, completed(id)]].concat();
+        let (outcome, _) = resident
+            .resume(&delta)
+            .await
+            .expect("a boundary must not decline a warm resume");
+        assert!(
+            matches!(outcome, WorkflowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+    }
 }

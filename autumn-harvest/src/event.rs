@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::error::TimeoutType;
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
-    ExternalSignalId, TimerId, UpdateId, WorkerId,
+    ActivityExecId, BuildId, ExecutionId, ExternalActivityToken, ExternalAwaitId,
+    ExternalCancelId, ExternalSignalId, TimerId, UpdateId, WorkerId,
 };
 
 fn default_error_type() -> String {
@@ -913,6 +913,22 @@ pub enum WorkflowEvent {
         /// Wall-clock instant the lock was granted.
         acquired_at: DateTime<Utc>,
     },
+
+    // ── Decision boundary (issue #1833) ───────────────────────────────────────
+    /// A worker committed one decision. This event closes that decision.
+    ///
+    /// The events since the previous boundary were committed while this
+    /// decision ran. The worker writes the boundary in the transaction that
+    /// persists the decision outcome.
+    ///
+    /// Replay never matches this event. It is transparent to every scan, so
+    /// a history with or without boundaries replays the same way.
+    DecisionCommitted {
+        /// Build id of the worker. Empty when the worker has no build id.
+        build_id: BuildId,
+        /// Id of the worker that made the decision.
+        worker_id: WorkerId,
+    },
 }
 
 impl WorkflowEvent {
@@ -1042,7 +1058,14 @@ impl WorkflowEvent {
             Self::ExternalAwaitResolved { .. } => "ExternalAwaitResolved",
             Self::ExternalAwaitFailed { .. } => "ExternalAwaitFailed",
             Self::MutexGranted { .. } => "MutexGranted",
+            Self::DecisionCommitted { .. } => "DecisionCommitted",
         }
+    }
+
+    /// Returns `true` for a [`Self::DecisionCommitted`] boundary (issue #1833).
+    #[must_use]
+    pub const fn is_decision_boundary(&self) -> bool {
+        false
     }
 
     /// Returns `true` for terminal lifecycle events that are appended by the
@@ -1702,11 +1725,15 @@ mod tests {
                 details: None,
                 non_retryable: None,
             },
+            WorkflowEvent::DecisionCommitted {
+                build_id: crate::types::BuildId::new("b-1"),
+                worker_id: WorkerId::new("w-1"),
+            },
         ];
 
-        assert_eq!(events.len(), 49);
+        assert_eq!(events.len(), 50);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 49, "duplicate type names detected");
+        assert_eq!(names.len(), 50, "duplicate type names detected");
     }
 
     // ── TimerCancelled tests (issue #768) ─────────────────────────────────────
@@ -2559,5 +2586,49 @@ mod tests {
             other => panic!("wrong variant: {}", other.type_name()),
         }
         Ok(())
+    }
+
+    // ── DecisionCommitted tests (issue #1833) ────────────────────────────────
+
+    #[test]
+    fn decision_committed_round_trips() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("build-7"),
+            worker_id: WorkerId::new("node-a-pid-12"),
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "DecisionCommitted",
+                "data": {"build_id": "build-7", "worker_id": "node-a-pid-12"},
+            })
+        );
+        assert_eq!(event.type_name(), "DecisionCommitted");
+        let back: WorkflowEvent = serde_json::from_value(value)?;
+        let WorkflowEvent::DecisionCommitted {
+            build_id,
+            worker_id,
+        } = back
+        else {
+            panic!("expected DecisionCommitted, got {}", back.type_name());
+        };
+        assert_eq!(build_id.as_str(), "build-7");
+        assert_eq!(worker_id.as_str(), "node-a-pid-12");
+        Ok(())
+    }
+
+    #[test]
+    fn decision_committed_is_a_boundary_and_not_terminal() {
+        let event = WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::legacy(),
+            worker_id: WorkerId::new("w"),
+        };
+        assert!(event.is_decision_boundary());
+        assert!(!event.is_terminal_lifecycle());
+        let other = WorkflowEvent::WorkflowCompleted {
+            output: serde_json::Value::Null,
+        };
+        assert!(!other.is_decision_boundary());
     }
 }

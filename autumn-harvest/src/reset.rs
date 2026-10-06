@@ -2424,6 +2424,37 @@ mod tests {
     }
 
     #[test]
+    fn last_workflow_task_skips_a_decision_boundary_after_the_terminal() {
+        // started(0), scheduled(1), completed(2), boundary(3),
+        // workflow completed(4), boundary(5). A boundary is never a reset
+        // point, so the result is index 2 (issue #1833).
+        let act_id = crate::types::ActivityExecId::new();
+        let boundary = || WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("b"),
+            worker_id: crate::types::WorkerId::new("w"),
+        };
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: act_id,
+                name: "a".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            activity_completed(act_id),
+            boundary(),
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            boundary(),
+        ];
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Ok(2),
+        );
+    }
+
+    #[test]
     fn reset_point_field_is_backward_compatible_on_wire() {
         // A legacy body without `reset_point` must deserialize with reset_point = None
         // and a legacy serialized form must NOT include the field.

@@ -597,7 +597,8 @@ impl MermaidExporter {
                 WorkflowEvent::SignalReceived { .. }
                 | WorkflowEvent::MarkerRecorded { .. }
                 | WorkflowEvent::SideEffectRecorded { .. }
-                | WorkflowEvent::MutexGranted { .. } => {
+                | WorkflowEvent::MutexGranted { .. }
+                | WorkflowEvent::DecisionCommitted { .. } => {
                     self.handle_misc_event(event)?;
                 }
                 WorkflowEvent::ActivityAwaitingExternal { .. }
@@ -1993,5 +1994,30 @@ mod tests {
             "Redacted export must contain neither plaintext nor the envelope: {json}"
         );
         assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
+    }
+
+    // ── DecisionCommitted (issue #1833) ──────────────────────────────────────
+
+    fn decision_committed() -> WorkflowEvent {
+        WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("build-9"),
+            worker_id: crate::types::WorkerId::new("node-a"),
+        }
+    }
+
+    #[test]
+    fn mermaid_shows_build_and_worker_per_decision() {
+        let diagram = export_mermaid_sequence(&[decision_committed()]).expect("export");
+        assert!(
+            diagram.contains("Note over WF: Decision committed (build build-9, worker node-a)"),
+            "{diagram}"
+        );
+    }
+
+    #[test]
+    fn redacted_export_keeps_build_and_worker() {
+        let value = redacted_event_value(&decision_committed()).expect("redact");
+        assert_eq!(value["data"]["build_id"], "build-9");
+        assert_eq!(value["data"]["worker_id"], "node-a");
     }
 }
