@@ -1084,4 +1084,224 @@ mod tests {
             json!({"user": "alice"})
         );
     }
+
+    // ── Coverage boundary: failure text (issue #1920) ───────────────────
+
+    const MSG_SECRET: &str = "msg-secret-111";
+    const PAYLOAD_SECRET: &str = "payload-secret-222";
+
+    /// A failure event: variant, clear-text field, event, and whether it has a payload field.
+    type FailureRow = (&'static str, &'static str, WorkflowEvent, bool);
+
+    /// One event per variant that the security doc lists as uncovered.
+    #[allow(clippy::too_many_lines)]
+    fn failure_rows() -> Vec<FailureRow> {
+        use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId};
+        let msg = || MSG_SECRET.to_string();
+        let payload = || Some(json!({"ssn": PAYLOAD_SECRET}));
+        let now = chrono::Utc::now;
+        vec![
+            (
+                "WorkflowStarted",
+                "last_error",
+                WorkflowEvent::WorkflowStarted {
+                    input: json!({"ssn": PAYLOAD_SECRET}),
+                    timestamp: now(),
+                    last_completion_result: None,
+                    last_error: Some(msg()),
+                    scheduled_time: None,
+                },
+                true,
+            ),
+            (
+                "WorkflowFailed",
+                "error",
+                WorkflowEvent::WorkflowFailed {
+                    error: msg(),
+                    error_type: None,
+                    details: payload(),
+                    non_retryable: None,
+                },
+                true,
+            ),
+            (
+                "ActivityFailed",
+                "error",
+                WorkflowEvent::ActivityFailed {
+                    activity_id: ActivityExecId::new(),
+                    error: msg(),
+                    attempt: 1,
+                    error_type: "Error".into(),
+                    non_retryable: false,
+                    details: payload(),
+                },
+                true,
+            ),
+            (
+                "ChildWorkflowFailed",
+                "error",
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id: ExecutionId::new(),
+                    error: msg(),
+                    error_type: None,
+                    details: payload(),
+                    non_retryable: None,
+                },
+                true,
+            ),
+            (
+                "ActivityFailedExternally",
+                "error",
+                WorkflowEvent::ActivityFailedExternally {
+                    activity_id: ActivityExecId::new(),
+                    token: ExternalActivityToken::new(),
+                    error: msg(),
+                    retryable: false,
+                },
+                false,
+            ),
+            (
+                "LocalActivityFailed",
+                "error",
+                WorkflowEvent::LocalActivityFailed {
+                    activity_id: ActivityExecId::new(),
+                    error: msg(),
+                    attempt: 1,
+                },
+                false,
+            ),
+            (
+                "LocalActivityExhausted",
+                "error",
+                WorkflowEvent::LocalActivityExhausted {
+                    activity_id: ActivityExecId::new(),
+                    error: msg(),
+                    attempt: 1,
+                },
+                false,
+            ),
+            (
+                "UpdateFailed",
+                "error",
+                WorkflowEvent::UpdateFailed {
+                    update_id: crate::types::UpdateId::new(),
+                    error: msg(),
+                },
+                false,
+            ),
+            (
+                "WorkflowCancelled",
+                "reason",
+                WorkflowEvent::WorkflowCancelled { reason: msg() },
+                false,
+            ),
+            (
+                "WorkflowResetFork",
+                "reason",
+                WorkflowEvent::WorkflowResetFork {
+                    reset_from_exec_id: ExecutionId::new(),
+                    reset_to_event_id: 1,
+                    reason: msg(),
+                    operator_id: "op".into(),
+                },
+                false,
+            ),
+            (
+                "WorkflowResetTerminated",
+                "reason",
+                WorkflowEvent::WorkflowResetTerminated {
+                    reset_to_exec_id: ExecutionId::new(),
+                    reason: msg(),
+                    operator_id: "op".into(),
+                },
+                false,
+            ),
+            (
+                "WorkflowExecutionPaused",
+                "reason",
+                WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at: now(),
+                    reason: Some(msg()),
+                    actor: "op".into(),
+                },
+                false,
+            ),
+            (
+                "WorkflowRedriven",
+                "reason",
+                WorkflowEvent::WorkflowRedriven {
+                    redriven_at: now(),
+                    dead_letter_id: uuid::Uuid::new_v4(),
+                    reason: Some(msg()),
+                },
+                false,
+            ),
+            (
+                "ExternalAwaitFailed",
+                "message",
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id: ExternalAwaitId::new(),
+                    reason_code: "code".into(),
+                    message: Some(msg()),
+                    error_type: None,
+                    details: payload(),
+                    non_retryable: None,
+                },
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn failure_text_stays_in_clear_but_payload_fields_do_not() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        for (variant, field, event, has_payload) in failure_rows() {
+            let stored = codecs.encode_event(&event).unwrap();
+            let text = stored.to_string();
+            assert!(
+                stored["data"][field].as_str() == Some(MSG_SECRET),
+                "{variant}.{field}: failure text is in clear by design"
+            );
+            if has_payload {
+                assert!(
+                    !text.contains(PAYLOAD_SECRET),
+                    "{variant}: the payload field is encrypted"
+                );
+                assert!(
+                    text.contains(crate::payload_codec::CODEC_ENVELOPE_KEY),
+                    "{variant}: the codec ran"
+                );
+            }
+            let decoded = codecs.decode_event(stored).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(&event).unwrap(),
+                "{variant}: the round trip is lossless"
+            );
+        }
+    }
+
+    #[test]
+    fn the_security_posture_doc_lists_failure_text_as_uncovered() {
+        const HEADING: &str = "### What the codec does not cover";
+        let doc = include_str!("../../docs/security-posture.md");
+        let start = doc.find(HEADING).expect("heading is missing from the doc");
+        let body = &doc[start + HEADING.len()..];
+        let end = ["\n## ", "\n### "]
+            .iter()
+            .filter_map(|h| body.find(h))
+            .min()
+            .unwrap_or(body.len());
+        let bullets: Vec<&str> = body[..end].split("\n- ").collect();
+        for (variant, field, _, _) in failure_rows() {
+            assert!(
+                bullets
+                    .iter()
+                    .any(|b| b.contains(&format!("`{field}`"))
+                        && b.contains(&format!("`{variant}`"))),
+                "the doc must list `{field}` in `{variant}`"
+            );
+        }
+    }
 }

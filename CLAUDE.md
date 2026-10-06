@@ -87,6 +87,13 @@ finds them): the upgrade guide's migration table, the changelog fragment and any
 plan or design doc that cites it. Those are how an operator matches a migration
 on disk to the note explaining what it does.
 
+### Bound every lock on a hot table
+
+`migration_lock_safety` (issue #1810) gates every new migration in CI's `lint`
+job. Set `SET LOCAL lock_timeout = '5s'` before the first lock on a hot table.
+Build or drop a hot-table index with `CONCURRENTLY`, or annotate the guarded
+build. Read `docs/upgrading/online-migrations.md` before you write a migration.
+
 ## Engine Invariants
 
 ### `harvest_events` is append-only — the sanctioned exceptions

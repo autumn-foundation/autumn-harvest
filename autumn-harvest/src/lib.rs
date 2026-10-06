@@ -432,6 +432,8 @@ pub mod run_chain;
 pub mod saga;
 /// Background control-loop liveness heartbeats (issue #797).
 pub mod scanner_health;
+/// One active background scanner per shard, elected by a lease (issue #1795).
+pub mod scanner_lease;
 /// Workflow payload-schema contract baseline and replay-compatibility diffing (issue #794).
 ///
 /// Deliberately ungated: the CLI links `autumn-harvest` with

@@ -120,6 +120,7 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod drain_release_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 mod event_batch_tests;
@@ -166,6 +167,7 @@ mod metrics_rs_adapter;
 mod migrate_tests;
 mod migrating_from_temporal_docs;
 mod migration_hygiene;
+mod migration_lock_safety;
 #[cfg(feature = "db")]
 mod mixed_suspension_tests;
 #[cfg(feature = "db")]
@@ -235,6 +237,7 @@ mod retry_chain_routing_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;
 mod saga_tests;
+mod scanner_lease_tests;
 mod scanner_liveness_tests;
 mod scanner_tick_db_tests;
 mod schedule_decisions;

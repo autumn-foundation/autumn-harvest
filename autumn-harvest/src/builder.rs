@@ -69,6 +69,13 @@ pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
 /// Default activity `start_to_close` timeout (issue #1808): 10 minutes.
 pub const DEFAULT_ACTIVITY_START_TO_CLOSE: Duration = Duration::from_secs(10 * 60);
 
+/// Default worker drain budget (issue #1813): 25 seconds.
+///
+/// It ends 5 seconds before the Kubernetes default
+/// `terminationGracePeriodSeconds` (30 seconds). The worker can then mark
+/// itself stopped before the platform sends `SIGKILL`.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+
 /// Default sticky routing window (issue #1798): 5 seconds.
 ///
 /// A follow-up task of a suspended execution waits up to this long for the
@@ -3574,7 +3581,14 @@ pub struct WorkerConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions on this worker.
     pub max_concurrent_activities: usize,
-    /// Graceful shutdown timeout.
+    /// The drain budget on shutdown or on a remote drain without a deadline.
+    ///
+    /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
+    /// below the platform grace period, for example Kubernetes
+    /// `terminationGracePeriodSeconds`. The drain cancels running activities
+    /// one join window before it ends. The join window is
+    /// [`Self::cancellation_grace_period`], capped at half the drain. See
+    /// `docs/getting-started/10-operations.md`.
     pub shutdown_timeout: Duration,
     /// Maximum cached in-memory workflow states (LRU eviction).
     pub workflow_cache_size: usize,
@@ -3594,6 +3608,9 @@ pub struct WorkerConfig {
     /// is cooperative -- activities should poll [`crate::context::ActivityContext::is_cancelled`]
     /// or call [`crate::context::ActivityContext::heartbeat`], but an uncooperative handler must
     /// not block a worker slot indefinitely.
+    ///
+    /// It is also the drain's join window (issue #1813). A drain never aborts
+    /// the handler. See [`Self::shutdown_timeout`].
     pub cancellation_grace_period: Duration,
     /// Shards this worker is responsible for polling.
     ///
@@ -3962,6 +3979,12 @@ pub struct WorkerConfig {
     /// keyed codec is registered, so this costs nothing on a deployment that has
     /// not adopted key rotation. Set via `with_codec_rotation_batch_size`.
     pub codec_rotation_batch_size: i64,
+    /// Per-shard scanner election, cadence, and batch size (issue #1795).
+    ///
+    /// By default one replica per shard runs the timeout checker. The others
+    /// stand by and take over within the lease TTL. Set via
+    /// `with_scanner_config`.
+    pub scanner: crate::scanner_lease::ScannerConfig,
     /// Per-activity-type retry budgets (issue #1793).
     ///
     /// **On by default.** Every activity type gets the default
@@ -4087,7 +4110,7 @@ impl Default for WorkerConfig {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
-            shutdown_timeout: Duration::from_secs(30),
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
             sticky_timeout: DEFAULT_STICKY_TIMEOUT,
@@ -4122,6 +4145,7 @@ impl Default for WorkerConfig {
             sharded_pool: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            scanner: crate::scanner_lease::ScannerConfig::default(),
             retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
         }
     }
@@ -4201,6 +4225,9 @@ impl WorkerConfig {
     /// or [`crate::context::ActivityContext::heartbeat`]) and unwind cleanly. If it is still
     /// running at the end of the grace period the worker aborts the handler
     /// task and marks the activity as cancelled.
+    ///
+    /// It also sets the drain's join window. A drain never aborts the
+    /// handler. See [`WorkerConfig::shutdown_timeout`].
     #[must_use]
     pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
         self.cancellation_grace_period = grace_period;
@@ -4677,6 +4704,17 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_codec_rotation_batch_size(mut self, rows: i64) -> Self {
         self.codec_rotation_batch_size = rows;
+        self
+    }
+
+    /// Set the per-shard scanner election, cadence, and batch size (issue
+    /// #1795). See [`WorkerConfig::scanner`].
+    #[must_use]
+    pub const fn with_scanner_config(
+        mut self,
+        scanner: crate::scanner_lease::ScannerConfig,
+    ) -> Self {
+        self.scanner = scanner;
         self
     }
 
@@ -6453,6 +6491,25 @@ mod tests {
         assert_eq!(
             configured.default_activity_start_to_close,
             Some(Duration::from_secs(300)),
+        );
+    }
+
+    // ── Shutdown timeout default (issue #1813) ────────────────────────────
+
+    /// The default drain ends before the Kubernetes default grace period. The
+    /// headroom lets the worker mark itself stopped before a `SIGKILL`.
+    #[test]
+    fn default_shutdown_timeout_ends_before_the_kubernetes_grace_period() {
+        let kubernetes_grace_period = Duration::from_secs(30);
+        let headroom = Duration::from_secs(5);
+        assert_eq!(
+            WorkerConfig::default().shutdown_timeout,
+            DEFAULT_SHUTDOWN_TIMEOUT
+        );
+        assert!(
+            WorkerConfig::default().shutdown_timeout + headroom <= kubernetes_grace_period,
+            "shutdown_timeout {:?} leaves less than {headroom:?} before SIGKILL",
+            WorkerConfig::default().shutdown_timeout,
         );
     }
 
