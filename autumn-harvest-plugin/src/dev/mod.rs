@@ -1208,9 +1208,23 @@ mod server_panic_tests {
     }
 }
 
+/// Limit on one readiness probe, connect phase included (issue #1832).
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Limit on the connect phase of one readiness probe (issue #1832).
+const HEALTH_PROBE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The client for the readiness probe in `wait_until_ready`.
+///
+/// Each probe ends within [`HEALTH_PROBE_TIMEOUT`]. Without it, a server
+/// that accepts but never answers holds the loop past its deadline.
 fn health_probe_client() -> reqwest::Client {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .timeout(HEALTH_PROBE_TIMEOUT)
+        .connect_timeout(HEALTH_PROBE_CONNECT_TIMEOUT)
+        .build()
+        // Only a TLS backend that cannot start fails here. The probe then
+        // keeps the unbounded client, and the old behaviour.
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

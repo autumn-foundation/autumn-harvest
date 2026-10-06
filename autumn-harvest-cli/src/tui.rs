@@ -27,6 +27,10 @@ use crate::CliError;
 /// Returns `CliError` if terminal initialization fails, if the API client fails
 /// to fetch data, or if there is an error drawing to the terminal.
 pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
+    // A bounded client, so one stuck refresh cannot freeze the UI (issue #1832).
+    // It is built first, so its error cannot leave the terminal in raw mode.
+    let client = crate::http_client(cli.http_timeout())?;
+
     // Setup terminal
     enable_raw_mode().map_err(|e| CliError::ReadJson {
         label: "setup raw mode",
@@ -46,7 +50,6 @@ pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
         source: e,
     })?;
 
-    let client = reqwest::Client::new();
     let url = format!("{}/workflows?limit=50", cli.base_url.trim_end_matches('/'));
 
     let res = run_app(&mut terminal, &client, &url, cli).await;

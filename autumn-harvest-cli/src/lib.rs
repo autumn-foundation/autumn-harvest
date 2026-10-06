@@ -28,6 +28,13 @@ use thiserror::Error;
 const DEFAULT_BASE_URL: &str = "http://localhost:3000/api/harvest";
 /// Default for `--http-timeout-secs` (issue #1832).
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+/// Upper bound on the TCP and TLS connect phase (issue #1832).
+const MAX_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Longest silence between two SSE reads (issue #1832).
+///
+/// The server sends a keepalive every 15 s by default. So 60 s is four
+/// missed keepalives, and a dead stream fails instead of hanging.
+const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Characters percent-encoded when a caller-supplied value becomes one URL path
 /// segment.
 ///
@@ -7674,7 +7681,8 @@ fn print_new_next_steps(names: &ScaffoldNames, target: &Path) {
 /// API returns a non-success status, or the response body is not valid JSON.
 pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     let request = cli.api_request()?;
-    let client = reqwest::Client::new();
+    let timeout = cli.http_timeout();
+    let client = http_client(timeout)?;
     let url = format!("{}{}", cli.base_url.trim_end_matches('/'), request.path);
     let builder = match request.method {
         ApiMethod::Get => client.get(url),
@@ -7714,9 +7722,15 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         builder
     };
 
-    let response = builder.send().await?;
+    let response = builder
+        .send()
+        .await
+        .map_err(|e| transport_error(e, timeout))?;
     let status = response.status();
-    let body = response.text().await?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| transport_error(e, timeout))?;
     if !status.is_success() {
         return Err(CliError::Http { status, body });
     }
@@ -7725,6 +7739,40 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     }
 
     serde_json::from_str(&body).map_err(CliError::ParseResponse)
+}
+
+/// An HTTP client whose every request ends within `timeout` (issue #1832).
+///
+/// # Errors
+///
+/// Returns [`CliError::Request`] if the TLS backend fails to start.
+pub(crate) fn http_client(timeout: std::time::Duration) -> Result<reqwest::Client, CliError> {
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
+        .build()?)
+}
+
+/// An HTTP client for an SSE stream (issue #1832).
+///
+/// A total timeout would cut a live stream. So this client bounds only the
+/// connect phase and the silence between two reads.
+fn sse_client(timeout: std::time::Duration) -> Result<reqwest::Client, CliError> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
+        .read_timeout(timeout.max(SSE_IDLE_TIMEOUT))
+        .build()?)
+}
+
+/// Map a transport error. A timeout names the limit that expired.
+fn transport_error(error: reqwest::Error, timeout: std::time::Duration) -> CliError {
+    if error.is_timeout() {
+        CliError::Timeout {
+            seconds: timeout.as_secs(),
+        }
+    } else {
+        CliError::Request(error)
+    }
 }
 
 /// Open the SSE stream for `execution_id` and print events to stdout.
@@ -7744,7 +7792,8 @@ async fn run_events_tail(
         path
     );
 
-    let client = reqwest::Client::new();
+    let timeout = cli.http_timeout();
+    let client = sse_client(timeout)?;
     let mut builder = client
         .get(&url)
         .header("Accept", "text/event-stream")
@@ -7757,10 +7806,20 @@ async fn run_events_tail(
         builder = builder.header("Last-Event-ID", id.to_string());
     }
 
-    let response = builder.send().await?;
+    // Bound the wait for the response headers by the timeout. The stream
+    // after the headers may run for as long as the execution does.
+    let response = tokio::time::timeout(timeout, builder.send())
+        .await
+        .map_err(|_| CliError::Timeout {
+            seconds: timeout.as_secs(),
+        })?
+        .map_err(|e| transport_error(e, timeout))?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| transport_error(e, timeout))?;
         return Err(CliError::Http { status, body });
     }
 
@@ -7772,7 +7831,10 @@ async fn run_events_tail(
     let mut ev_data = String::new();
 
     loop {
-        let chunk = response.chunk().await?;
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| transport_error(e, timeout.max(SSE_IDLE_TIMEOUT)))?;
         let Some(bytes) = chunk else {
             // Server closed the connection.
             break;
@@ -12021,10 +12083,9 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             failure_signature,
             limit,
             dry_run,
-            spread_secs: _,
-        } => ApiRequest::post(
-            "/dead-letters/replay",
-            Some(build_bulk_dlq_body(
+            spread_secs,
+        } => {
+            let mut body = build_bulk_dlq_body(
                 activity_name.as_deref(),
                 workflow_name.as_deref(),
                 queue_name.as_deref(),
@@ -12036,8 +12097,10 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 failure_signature.as_deref(),
                 *limit,
                 *dry_run,
-            )),
-        ),
+            );
+            insert_spread_secs(&mut body, *spread_secs);
+            ApiRequest::post("/dead-letters/replay", Some(body))
+        }
         DeadLetterCommand::BulkDiscard {
             activity_name,
             workflow_name,
@@ -12125,10 +12188,9 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             max,
             reason,
             dry_run,
-            spread_secs: _,
-        } => ApiRequest::post(
-            "/dlq/redrive",
-            Some(build_redrive_dlq_body(
+            spread_secs,
+        } => {
+            let mut body = build_redrive_dlq_body(
                 queue.as_deref(),
                 workflow_name.as_deref(),
                 dead_lettered_after.as_deref(),
@@ -12138,8 +12200,10 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 *max,
                 reason.as_deref(),
                 *dry_run,
-            )),
-        ),
+            );
+            insert_spread_secs(&mut body, *spread_secs);
+            ApiRequest::post("/dlq/redrive", Some(body))
+        }
     }
 }
 
@@ -12207,6 +12271,13 @@ fn build_bulk_dlq_body(
         body.insert("dry_run".to_string(), json!(true));
     }
     Value::Object(body)
+}
+
+/// Add `--spread-secs` to a redrive or bulk-replay body (issue #1832).
+fn insert_spread_secs(body: &mut Value, spread_secs: Option<u64>) {
+    if let (Value::Object(map), Some(secs)) = (body, spread_secs) {
+        map.insert("spread_secs".to_string(), json!(secs));
+    }
 }
 
 fn gate_request(command: &GateCommand) -> Result<ApiRequest, CliError> {
