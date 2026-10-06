@@ -251,31 +251,79 @@ pub struct RedriveResult {
     pub failures: Vec<BulkDlqFailure>,
 }
 
-/// The window over which a bulk redrive of `rows` rows spreads its tasks.
+/// The window over which a bulk redrive of `rows` rows spreads its tasks
+/// (issue #1832).
+///
+/// `Some(secs)` sets the window, capped at [`MAX_REDRIVE_SPREAD_SECS`].
+/// `Some(0)` makes every task due at once. `None` pro-rates
+/// [`DEFAULT_REDRIVE_SPREAD`] by `rows / MAX_BULK_LIMIT`. So a full batch
+/// spreads over 60 s, and one row waits at most 60 ms.
 #[must_use]
-pub fn redrive_spread_window(_spread_secs: Option<u64>, _rows: usize) -> std::time::Duration {
-    std::time::Duration::ZERO
+pub fn redrive_spread_window(spread_secs: Option<u64>, rows: usize) -> std::time::Duration {
+    match spread_secs {
+        Some(secs) => std::time::Duration::from_secs(secs.min(MAX_REDRIVE_SPREAD_SECS)),
+        None => {
+            let rows = u32::try_from(rows)
+                .unwrap_or(MAX_BULK_LIMIT)
+                .min(MAX_BULK_LIMIT);
+            DEFAULT_REDRIVE_SPREAD * rows / MAX_BULK_LIMIT
+        }
+    }
 }
 
-/// The offset of row `index` of `count` inside `window`.
+/// The offset of row `index` of `count` inside `window` (issue #1832).
+///
+/// The window has `count` equal slots. Row `index` lands in slot `index`,
+/// and `seed` sets its place inside that slot. So the rows cover the window
+/// evenly, and no two rows become due in lockstep.
 #[must_use]
 pub fn redrive_spread_offset(
-    _index: usize,
-    _count: usize,
-    _window: std::time::Duration,
-    _seed: u64,
+    index: usize,
+    count: usize,
+    window: std::time::Duration,
+    seed: u64,
 ) -> std::time::Duration {
-    std::time::Duration::ZERO
+    let count = u128::try_from(count.max(1)).unwrap_or(u128::MAX);
+    let index = u128::try_from(index).unwrap_or(u128::MAX);
+    let slot = window.as_nanos() / count;
+    // `mix64` is below 2^64, so the jitter is below one slot.
+    let jitter = (slot * u128::from(mix64(seed))) >> 64;
+    let nanos = slot.saturating_mul(index).saturating_add(jitter);
+    std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
-/// The `scheduled_at` for each row of a bulk redrive.
+/// The `scheduled_at` for each row of a bulk redrive (issue #1832).
+///
+/// Row `index` becomes due at `now` plus its [`redrive_spread_offset`]. The
+/// row id seeds the jitter. A zero window gives `None` for every row, so
+/// each task keeps the default, immediate `scheduled_at`.
 #[must_use]
 pub fn redrive_schedule(
-    _now: DateTime<Utc>,
-    _window: std::time::Duration,
+    now: DateTime<Utc>,
+    window: std::time::Duration,
     ids: &[Uuid],
 ) -> Vec<Option<DateTime<Utc>>> {
-    vec![None; ids.len()]
+    if window.is_zero() {
+        return vec![None; ids.len()];
+    }
+    ids.iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let (high, low) = id.as_u64_pair();
+            let offset = redrive_spread_offset(index, ids.len(), window, high ^ low);
+            chrono::Duration::from_std(offset)
+                .ok()
+                .and_then(|offset| now.checked_add_signed(offset))
+        })
+        .collect()
+}
+
+/// The `SplitMix64` finalizer. It spreads close seeds over all of `u64`.
+const fn mix64(seed: u64) -> u64 {
+    let mut z = seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// Outcome of redriving a single dead-letter entry.
@@ -601,6 +649,23 @@ pub async fn replay_dead_letter(
     dead_letter_id: Uuid,
     registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<Uuid> {
+    replay_dead_letter_at(conn, dead_letter_id, registry, None).await
+}
+
+/// [`replay_dead_letter`] with a `scheduled_at` for the new task (issue #1832).
+///
+/// `None` makes the task due at once. A completion-callback entry ignores
+/// `not_before`, because its delivery row keeps its own schedule.
+///
+/// # Errors
+///
+/// The same as [`replay_dead_letter`].
+pub async fn replay_dead_letter_at(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    registry: Option<&HandlerRegistry>,
+    not_before: Option<DateTime<Utc>>,
+) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
     // The re-enqueue below writes a `PENDING` task row, so it raises a dispatch
@@ -643,6 +708,9 @@ pub async fn replay_dead_letter(
             params.workflow_exec_id = entry.workflow_exec_id;
             params.activity_name = entry.activity_name;
             params.max_attempts = entry.attempts.max(1);
+            if let Some(at) = not_before {
+                params.scheduled_at = at;
+            }
 
             // Restore required_build_id and concurrency policy from the owning
             // execution so the replayed task is subject to the same constraints.
@@ -883,37 +951,72 @@ pub async fn bulk_replay_dead_letters(
         });
     }
 
-    let mut acted_on = 0usize;
-    let mut skipped = 0usize;
-    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
-    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let mut result = replay_dead_letter_batch(conn, &ids, filter.spread_secs, registry).await?;
+    result.matched = matched;
+    Ok(result)
+}
 
-    for row in &rows {
-        match replay_dead_letter(conn, row.id, registry).await {
+/// Replay the dead letters `ids`, spread over a window (issue #1832).
+///
+/// [`redrive_spread_window`] sets the window from `spread_secs`. Each row
+/// goes through [`replay_dead_letter_at`] on its own, so a per-row failure
+/// does not roll back other rows. A missing row counts as skipped. The
+/// result has `matched` at zero. The caller sets it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the database clock read fails.
+/// Per-row errors go into [`BulkDlqResult::failures`].
+pub async fn replay_dead_letter_batch(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+    spread_secs: Option<u64>,
+    registry: Option<&HandlerRegistry>,
+) -> HarvestResult<BulkDlqResult> {
+    let mut result = BulkDlqResult {
+        matched: 0,
+        acted_on: 0,
+        skipped: 0,
+        ids: Vec::with_capacity(ids.len()),
+        dry_run: false,
+        failures: Vec::new(),
+    };
+    let schedule = spread_schedule(conn, spread_secs, ids).await?;
+
+    for (&id, not_before) in ids.iter().zip(schedule) {
+        match replay_dead_letter_at(conn, id, registry, not_before).await {
             Ok(_task_id) => {
-                acted_on += 1;
-                acted_ids.push(row.id.to_string());
+                result.acted_on += 1;
+                result.ids.push(id.to_string());
             }
-            Err(HarvestError::NotFound(_)) => {
-                skipped += 1;
-            }
-            Err(e) => {
-                failures.push(BulkDlqFailure {
-                    id: row.id.to_string(),
-                    reason: e.to_string(),
-                });
-            }
+            Err(HarvestError::NotFound(_)) => result.skipped += 1,
+            Err(e) => result.failures.push(BulkDlqFailure {
+                id: id.to_string(),
+                reason: e.to_string(),
+            }),
         }
     }
 
-    Ok(BulkDlqResult {
-        matched,
-        acted_on,
-        skipped,
-        ids: acted_ids,
-        dry_run: false,
-        failures,
-    })
+    Ok(result)
+}
+
+/// The per-row `scheduled_at` for a bulk redrive of `ids` (issue #1832).
+///
+/// The base instant is the database clock, not the host clock. Workers
+/// compare `scheduled_at` with the database `NOW()` (issue #1807). A zero
+/// window reads no clock.
+async fn spread_schedule(
+    conn: &mut AsyncPgConnection,
+    spread_secs: Option<u64>,
+    ids: &[Uuid],
+) -> HarvestResult<Vec<Option<DateTime<Utc>>>> {
+    let window = redrive_spread_window(spread_secs, ids.len());
+    if window.is_zero() {
+        return Ok(vec![None; ids.len()]);
+    }
+    let now = crate::queue::db_now(conn).await?;
+    Ok(redrive_schedule(now, window, ids))
 }
 
 /// Delete several dead-letter rows by id in one statement.
@@ -1148,6 +1251,24 @@ pub async fn redrive_dead_letter(
     registry: Option<&HandlerRegistry>,
     reason: Option<&str>,
 ) -> HarvestResult<RedriveOutcome> {
+    redrive_dead_letter_at(conn, dead_letter_id, registry, reason, None).await
+}
+
+/// [`redrive_dead_letter`] with a `scheduled_at` for the new task (issue #1832).
+///
+/// `None` makes the task due at once. A completion-callback entry ignores
+/// `not_before`, because its delivery row keeps its own schedule.
+///
+/// # Errors
+///
+/// The same as [`redrive_dead_letter`].
+pub async fn redrive_dead_letter_at(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    registry: Option<&HandlerRegistry>,
+    reason: Option<&str>,
+    not_before: Option<DateTime<Utc>>,
+) -> HarvestResult<RedriveOutcome> {
     use crate::schema::harvest_dead_letters::dsl;
 
     // Same buffering scope as `replay_dead_letter`: the re-enqueue raises a
@@ -1193,6 +1314,9 @@ pub async fn redrive_dead_letter(
             params.workflow_exec_id = entry.workflow_exec_id;
             params.activity_name = entry.activity_name.clone();
             params.max_attempts = entry.attempts.max(1);
+            if let Some(at) = not_before {
+                params.scheduled_at = at;
+            }
 
             if let Some(exec_uuid) = entry.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -1308,9 +1432,11 @@ pub async fn redrive_dead_letters(
     let mut skipped = 0usize;
     let mut ids: Vec<String> = Vec::with_capacity(rows.len());
     let mut failures: Vec<BulkDlqFailure> = Vec::new();
+    let row_ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let schedule = spread_schedule(conn, filter.spread_secs, &row_ids).await?;
 
-    for row in &rows {
-        match redrive_dead_letter(conn, row.id, registry, reason).await {
+    for (row, not_before) in rows.iter().zip(schedule) {
+        match redrive_dead_letter_at(conn, row.id, registry, reason, not_before).await {
             Ok(RedriveOutcome::Redriven(_task_id)) => {
                 redriven += 1;
                 ids.push(row.id.to_string());

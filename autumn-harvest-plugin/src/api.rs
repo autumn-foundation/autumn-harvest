@@ -7091,6 +7091,7 @@ pub const fn management_api_request_fields()
                 "shard_id",
                 "limit",
                 "dry_run",
+                "spread_secs",
             ]),
         ),
         ("POST", "/dead-letters/{id}/replay", Some(&[])),
@@ -7108,6 +7109,7 @@ pub const fn management_api_request_fields()
                 "max",
                 "dry_run",
                 "reason",
+                "spread_secs",
             ]),
         ),
         // ── external activity handoff ─────────────────────────────────────────
@@ -32540,6 +32542,8 @@ struct BulkDlqApiBody {
     limit: Option<u32>,
     #[serde(default)]
     dry_run: bool,
+    #[serde(default)]
+    spread_secs: Option<u64>,
 }
 
 impl BulkDlqApiBody {
@@ -32570,7 +32574,7 @@ impl BulkDlqApiBody {
                 failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
-                spread_secs: None,
+                spread_secs: self.spread_secs,
             },
             dead_letter_id: self.dead_letter_id,
             task_type,
@@ -32650,6 +32654,8 @@ struct RedriveApiBody {
     shard_id: Option<i32>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    spread_secs: Option<u64>,
 }
 
 impl RedriveApiBody {
@@ -32664,7 +32670,7 @@ impl RedriveApiBody {
                 dead_letter_ids: self.dead_letter_ids,
                 max: self.max,
                 dry_run: self.dry_run,
-                spread_secs: None,
+                spread_secs: self.spread_secs,
             },
             shard_id: self.shard_id,
             reason: self.reason,
@@ -32780,6 +32786,10 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
                 selector.filter.failed_before = Some(parse_utc_datetime(value, "failed_before")?);
             }
             "limit" => selector.filter.limit = Some(parse_u32_field(value, "limit")?),
+            "spread_secs" => {
+                selector.filter.spread_secs =
+                    Some(u64::from(parse_u32_field(value, "spread_secs")?));
+            }
             "dry_run" => selector.filter.dry_run = parse_bool_field(value, "dry_run")?,
             "shard_id" => selector.shard_id = Some(parse_i32_field(value, "shard_id")?),
             "return_to" => return_to = Some(value.to_string()),
@@ -33605,35 +33615,23 @@ async fn bulk_replay_dead_letters_for_selector(
         .await
         .map(|n| usize::try_from(n).unwrap_or(0))?;
     let rows = query_dead_letters_for_api_bulk(conn, selector).await?;
-    let mut result = dlq::BulkDlqResult {
-        matched,
-        acted_on: 0,
-        skipped: 0,
-        ids: Vec::new(),
-        dry_run: selector.dry_run(),
-        failures: Vec::new(),
-    };
 
     if selector.dry_run() {
-        result.ids = rows.into_iter().map(|row| row.id.to_string()).collect();
-        return Ok(result);
+        return Ok(dlq::BulkDlqResult {
+            matched,
+            acted_on: 0,
+            skipped: 0,
+            ids: rows.into_iter().map(|row| row.id.to_string()).collect(),
+            dry_run: true,
+            failures: Vec::new(),
+        });
     }
 
-    for row in rows {
-        let id = row.id;
-        match dlq::replay_dead_letter(conn, id, registry).await {
-            Ok(_) => {
-                result.acted_on += 1;
-                result.ids.push(id.to_string());
-            }
-            Err(HarvestError::NotFound(_)) => result.skipped += 1,
-            Err(error) => result.failures.push(dlq::BulkDlqFailure {
-                id: id.to_string(),
-                reason: error.to_string(),
-            }),
-        }
-    }
-
+    // The core batch spreads the replayed tasks over a window (issue #1832).
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
+    let mut result =
+        dlq::replay_dead_letter_batch(conn, &ids, selector.filter.spread_secs, registry).await?;
+    result.matched = matched;
     Ok(result)
 }
 

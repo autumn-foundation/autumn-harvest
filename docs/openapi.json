@@ -6640,6 +6640,10 @@
                     "description": "Scope the operation to one shard.",
                     "type": "integer"
                   },
+                  "spread_secs": {
+                    "description": "Window in seconds over which the replayed tasks become due (issue #1832). Each task gets a jittered slot in the window. Default: 60 s for a 1000-row batch, pro-rated for a smaller batch. 0 makes every task due at once. Capped at 3600.",
+                    "type": "integer"
+                  },
                   "task_type": {
                     "description": "Restrict the cohort to one task type. Alias: task_kind.",
                     "type": "string"
@@ -6789,6 +6793,10 @@
                   },
                   "shard_id": {
                     "description": "Scope the operation to one shard.",
+                    "type": "integer"
+                  },
+                  "spread_secs": {
+                    "description": "Window in seconds over which the redriven tasks become due (issue #1832). Each task gets a jittered slot in the window. Default: 60 s for a 1000-row batch, pro-rated for a smaller batch. 0 makes every task due at once. Capped at 3600.",
                     "type": "integer"
                   },
                   "workflow_name": {
