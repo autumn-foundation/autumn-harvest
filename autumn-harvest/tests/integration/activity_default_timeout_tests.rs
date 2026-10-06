@@ -27,6 +27,7 @@ use autumn_harvest::error::TimeoutType;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::telemetry::NoOpMetrics;
@@ -193,6 +194,13 @@ fn hang_info(
         requires: None,
         handler: hang,
     }
+}
+
+/// Give `info` one attempt. A timeout with attempts left retries (issue
+/// #1870), so only the last attempt fails the call.
+fn one_attempt(mut info: ActivityInfo) -> ActivityInfo {
+    info.default_retry_policy = Some(RetryPolicy::fixed(1, Duration::from_millis(50)));
+    info
 }
 
 // ---------------------------------------------------------------------------
@@ -423,8 +431,10 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
     let mut conn = connect(&url).await;
     let exec_id = seed_workflow(&mut conn, queue, "hang").await;
 
-    let registry =
-        registry_from_builder(WorkerConfig::default(), hang_info("hang", None, None, None));
+    let registry = registry_from_builder(
+        WorkerConfig::default(),
+        one_attempt(hang_info("hang", None, None, None)),
+    );
     let worker = build_worker(queue, queue, registry);
     let pool = build_pool(&url);
     let runner = Arc::clone(&worker);
@@ -467,7 +477,7 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
     .await
     .expect("timeout sweep");
 
-    // The timeout fails the activity call. It does not retry.
+    // The activity has one attempt, so the timeout fails the activity call.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while load_execution(&url, exec_id).await.state != "FAILED" {
         assert!(

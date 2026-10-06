@@ -5069,7 +5069,7 @@ fn wasm_effective_deadline(
         .or(default_start_to_close)
 }
 
-fn configured_retry_policy(task: &TaskQueueItem) -> HarvestResult<Option<RetryPolicy>> {
+pub(crate) fn configured_retry_policy(task: &TaskQueueItem) -> HarvestResult<Option<RetryPolicy>> {
     task.retry_policy
         .clone()
         .map(serde_json::from_value)
@@ -5212,7 +5212,7 @@ pub(crate) fn chrono_duration_from_secs(
     })
 }
 
-fn next_retry_delay(
+pub(crate) fn next_retry_delay(
     task: &TaskQueueItem,
     error: &str,
     retry_policy: Option<&RetryPolicy>,
@@ -15089,7 +15089,7 @@ pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) 
 ///
 /// Pure so both the claim-time snapshot check and the in-transaction fresh
 /// re-check (issue #609 post-review hardening) share one decision rule.
-fn deadline_would_be_exceeded(
+pub(crate) fn deadline_would_be_exceeded(
     deadline: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
     retry_delay: chrono::Duration,

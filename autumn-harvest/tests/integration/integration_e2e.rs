@@ -3402,7 +3402,12 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 vec![ActivityInfo {
                     name: "slow_activity",
                     module: "integration_e2e",
-                    default_retry_policy: None,
+                    // One attempt, so the first timeout fails the call. With
+                    // attempts left, a timeout retries (issue #1870).
+                    default_retry_policy: Some(autumn_harvest::policy::RetryPolicy::fixed(
+                        1,
+                        Duration::from_millis(50),
+                    )),
                     default_start_to_close: Some(Duration::from_millis(100)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,

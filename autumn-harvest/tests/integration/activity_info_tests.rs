@@ -686,10 +686,10 @@ fn wf_checkpointing(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'
     })
 }
 
-/// Negative control: identical, but WITHOUT the deadline guard. It is killed
-/// mid-item by the `start_to_close` scanner — a terminal, non-retryable
-/// timeout — so the remaining items are never processed at all and the run
-/// fails. This is the failure mode `ctx.time_remaining()` exists to avoid.
+/// Negative control: identical, but WITHOUT the deadline guard. The
+/// `start_to_close` scanner kills it mid-item. It has one attempt, so the
+/// timeout is terminal and the run fails. This is the failure mode
+/// `ctx.time_remaining()` exists to avoid.
 fn unguarded_activity(
     ctx: &autumn_harvest::ActivityContext,
     _input: serde_json::Value,
@@ -1321,10 +1321,12 @@ async fn checkpointing_activity_loses_zero_completed_work() {
 
     // --- Negative control: same work, no deadline guard. ---
     //
-    // Without the guard the attempt is killed by the `start_to_close` scanner,
-    // which is terminal (non-retryable), so the run fails with strictly fewer
-    // than TOTAL_ITEMS processed. This is what makes the guarded result above
-    // attributable to `ctx.is_expiring_within` rather than to luck.
+    // Without the guard the `start_to_close` scanner kills the attempt. The
+    // control has one attempt, so the timeout is terminal and the run fails.
+    // A timeout with attempts left retries (issue #1870). Then the next
+    // attempt resumes from the heartbeat, and the control loses only the item
+    // in flight. This is what makes the guarded result above attributable to
+    // `ctx.is_expiring_within` rather than to luck.
     let (exec2, _) = seed_workflow(&mut conn, "unguarded_wf", serde_json::json!({})).await;
     let (registry2, observed2) = build_registry(
         vec![workflow_info("unguarded_wf", wf_unguarded)],
@@ -1332,7 +1334,7 @@ async fn checkpointing_activity_loses_zero_completed_work() {
             "unguarded_activity",
             unguarded_activity,
             ATTEMPT_BUDGET,
-            RetryPolicy::fixed(5, Duration::from_millis(50)),
+            RetryPolicy::fixed(1, Duration::from_millis(50)),
         )],
     );
     let worker2 = build_worker("w-info-f2", registry2);
