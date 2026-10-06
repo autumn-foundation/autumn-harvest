@@ -918,10 +918,15 @@ fn mirror_fan_out(
     if children.is_empty() {
         pad_to(&mut activities, count);
         let window = (first_wave_len > 0 && first_wave_len < count).then_some(first_wave_len);
+        let collect = if window.is_some() {
+            collect
+        } else {
+            settles_after_failure(&history[start..], &activity_ids)
+        };
         Op::FanOut {
             activities,
             window,
-            collect: collect && window.is_some(),
+            collect,
         }
     } else {
         pad_to(&mut children, count);
@@ -948,6 +953,34 @@ fn next_wave_is_full(rest: &[WorkflowEvent], group: &HashSet<ActivityExecId>, ne
         .take_while(|event| matches!(event, WorkflowEvent::ActivityScheduled { .. }))
         .count();
     need > 0 && wave >= need
+}
+
+/// True when an item of an unbounded group failed and every item settled
+/// before the next command. Only the collect-all form waits for every item.
+/// A fail-fast caller goes on at the first failure, while items still run.
+fn settles_after_failure(rest: &[WorkflowEvent], group: &HashSet<ActivityExecId>) -> bool {
+    let mut settled = HashSet::new();
+    let mut failed = false;
+    for event in rest {
+        match event {
+            WorkflowEvent::ActivityScheduled { activity_id, .. }
+            | WorkflowEvent::ActivityStarted { activity_id, .. }
+            | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                if group.contains(activity_id) => {}
+            WorkflowEvent::ActivityCompleted { activity_id, .. } if group.contains(activity_id) => {
+                settled.insert(*activity_id);
+            }
+            WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                if group.contains(activity_id) =>
+            {
+                settled.insert(*activity_id);
+                failed = true;
+            }
+            _ => break,
+        }
+    }
+    failed && settled.len() == group.len()
 }
 
 /// Repeats the last item until `items` holds `count` items.
@@ -1482,9 +1515,16 @@ async fn run_group_op(ctx: &WorkflowContext, op: Op) {
         Op::FanOut {
             activities,
             window: None,
-            ..
+            collect: false,
         } => {
             let _ = ctx.execute_activity_fan_out_raw(activities).await;
+        }
+        Op::FanOut {
+            activities,
+            window: None,
+            collect: true,
+        } => {
+            let _ = ctx.execute_activity_fan_out_collect_raw(activities).await;
         }
         Op::FanOut {
             activities,
