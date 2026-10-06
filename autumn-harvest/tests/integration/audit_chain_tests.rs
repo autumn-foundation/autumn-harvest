@@ -323,20 +323,26 @@ async fn a_rebuilt_cursor_keeps_the_chain_head() {
         ]
     );
 
-    // The operator re-anchors. That chains row 3 and signs a checkpoint.
+    // The operator re-anchors. A new chain starts at row 4.
     let checkpoint = reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
         .await
         .expect("reanchor")
-        .expect("a chained row");
-    assert_eq!((checkpoint.start_seq, checkpoint.head_seq), (1, 3));
-    insert_rows(&mut conn, 1).await;
-    export_tick(&mut conn, Some(&key())).await;
-
+        .expect("a cursor");
+    assert_eq!((checkpoint.start_seq, checkpoint.head_seq), (4, 3));
     let report = verify_shard_chain(&mut conn, SHARD, &key())
         .await
         .expect("verify");
     assert!(report.is_intact(), "{report:?}");
-    assert_eq!(report.checked, 4);
+    assert_eq!((report.checked, report.unchained_prefix), (0, 3));
+
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
+    let report = verify_shard_chain(&mut conn, SHARD, &key())
+        .await
+        .expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!((report.checked, report.unchained_prefix), (1, 3));
+    assert_eq!(report.anchor_seq, Some(4));
 }
 
 #[tokio::test]
@@ -699,16 +705,18 @@ async fn reanchoring_after_a_forged_checkpoint_restores_the_chain() {
     reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
         .await
         .expect("reanchor")
-        .expect("a chained row");
+        .expect("a cursor");
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
     let report = verify_shard_chain(&mut conn, SHARD, &key())
         .await
         .expect("verify");
     assert!(report.is_intact(), "{report:?}");
-    assert_eq!(report.checked, 3);
+    assert_eq!((report.checked, report.unchained_prefix), (1, 3));
 }
 
 #[tokio::test]
-async fn reanchoring_with_no_chained_row_clears_the_checkpoint() {
+async fn reanchoring_over_stripped_rows_starts_a_new_chain() {
     let (mut conn, _c) = fresh_db().await;
     insert_rows(&mut conn, 2).await;
     export_tick(&mut conn, Some(&key())).await;
@@ -716,12 +724,10 @@ async fn reanchoring_with_no_chained_row_clears_the_checkpoint() {
         .await
         .expect("strip");
 
-    assert!(
-        reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
-            .await
-            .expect("reanchor")
-            .is_none()
-    );
+    reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
+        .await
+        .expect("reanchor")
+        .expect("a cursor");
     insert_rows(&mut conn, 1).await;
     export_tick(&mut conn, Some(&key())).await;
 
@@ -936,13 +942,63 @@ async fn the_exporter_does_not_skip_rows_an_unkeyed_tick_sequenced() {
     .await;
     assert_eq!(chained, 2, "the keyed tick must not jump over seq 3");
 
+    // The re-anchor leaves seq 3 and 4 as they were, and starts at seq 5.
     reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
         .await
         .expect("reanchor")
-        .expect("a chained row");
+        .expect("a cursor");
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, Some(&key())).await;
     let report = verify_shard_chain(&mut conn, SHARD, &key())
         .await
         .expect("verify");
     assert!(report.is_intact(), "{report:?}");
-    assert_eq!(report.checked, 4);
+    assert_eq!((report.checked, report.unchained_prefix), (1, 4));
+}
+
+/// The chain columns of every sequenced row, as text.
+async fn chain_columns(conn: &mut AsyncPgConnection) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct Columns {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        columns: String,
+    }
+    diesel::sql_query(
+        "SELECT COALESCE(string_agg( \
+             concat_ws('|', export_seq, encode(chain_prev, 'hex'), \
+                 chain_newest_before, encode(chain_hash, 'hex')), \
+             ',' ORDER BY export_seq), '') AS columns \
+         FROM harvest_audit_log WHERE export_seq IS NOT NULL",
+    )
+    .get_result::<Columns>(conn)
+    .await
+    .expect("chain columns")
+    .columns
+}
+
+#[tokio::test]
+async fn reanchoring_never_changes_a_sequenced_row() {
+    let (mut conn, _c) = fresh_db().await;
+    insert_rows(&mut conn, 2).await;
+    export_tick(&mut conn, Some(&key())).await;
+    insert_rows(&mut conn, 1).await;
+    export_tick(&mut conn, None).await;
+    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), chrono::Utc::now())
+        .await
+        .expect("rewind");
+    let before = export_tick(&mut conn, None).await;
+    let columns = chain_columns(&mut conn).await;
+
+    let checkpoint = reanchor_shard_chain(&mut conn, SHARD, &chain_key(&key()))
+        .await
+        .expect("reanchor")
+        .expect("a cursor");
+    assert_eq!((checkpoint.start_seq, checkpoint.head_seq), (4, 3));
+    assert_eq!(chain_columns(&mut conn).await, columns);
+
+    // A redrive of the rows sequenced before the re-anchor is byte-identical.
+    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert_eq!(export_tick(&mut conn, Some(&key())).await, before);
 }

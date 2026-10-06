@@ -73,7 +73,9 @@ that the exporter sequences.
   chain columns. Only a deployment with a chain key pays this cost.
 - Every exporter must hold the same key. Set it after a rolling upgrade
   ends. Rotate in two steps with an accept key.
-- A re-anchor accepts the stored rows. An operator compares them with the
+- A re-anchor starts a new chain after the sequenced rows. It never changes
+  a sequenced row, so a redrive stays byte-identical. The verifier does not
+  check the rows before the new start. An operator compares them with the
   SIEM copy first.
 - A signed checkpoint does not prove that it is the newest one. A writer can
   restore an older table and cursor. The verifier detects that only with a

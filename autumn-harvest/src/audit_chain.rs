@@ -38,7 +38,8 @@
 //!
 //! The exporter extends only a checkpoint that its key accepts. Otherwise a
 //! writer could move the head and have the exporter sign it. A missing or
-//! invalid checkpoint stops the chain until [`reanchor_shard_chain`] runs.
+//! invalid checkpoint stops the chain until [`reanchor_shard_chain`] starts a
+//! new one after the sequenced rows.
 //!
 //! A writer who
 //! removes every chain value and the whole checkpoint leaves a table that
@@ -511,9 +512,21 @@ impl<'k> ChainVerifier<'k> {
     /// Check one row against its own hash and the row before it.
     pub fn push(&mut self, row: &ChainRow) {
         let seq = row.record.seq;
-        let in_chain = self.previous.is_some()
-            || row.hash.is_some()
-            || self.report.start_seq.is_some_and(|start| seq >= start);
+        // The known link holds wherever it is, before the start too.
+        if let Some(known) = self.known_head
+            && known.seq == seq
+            && row.hash != Some(known.hash)
+        {
+            self.report
+                .findings
+                .push(ChainFinding::KnownLinkMismatch { seq });
+        }
+        // A re-anchor starts a new chain after chained rows. The checkpoint
+        // start therefore decides, when there is one.
+        let in_chain = match self.report.start_seq {
+            Some(start) => seq >= start,
+            None => self.previous.is_some() || row.hash.is_some(),
+        };
         if !in_chain {
             self.report.unchained_prefix += 1;
             return;
@@ -538,14 +551,6 @@ impl<'k> ChainVerifier<'k> {
             Some(_) => {}
         }
 
-        if let Some(known) = self.known_head
-            && known.seq == seq
-            && row.hash != Some(known.hash)
-        {
-            self.report
-                .findings
-                .push(ChainFinding::KnownLinkMismatch { seq });
-        }
         if row.hash.is_none() {
             self.report.findings.push(ChainFinding::Unchained { seq });
             self.previous = Some(Previous {
@@ -620,6 +625,10 @@ impl<'k> ChainVerifier<'k> {
         if found == Some((checkpoint.head_seq, checkpoint.head)) {
             return;
         }
+        // A re-anchored chain with no row yet.
+        if found.is_none() && checkpoint.head_seq < checkpoint.start_seq {
+            return;
+        }
         let tail_purged = found.is_none_or(|(seq, _)| seq < checkpoint.head_seq)
             && self.is_old(checkpoint.newest_at);
         if tail_purged {
@@ -654,77 +663,6 @@ pub(crate) struct Stamped {
 /// Rows the verifier reads per query.
 #[cfg(feature = "db")]
 const VERIFY_PAGE_ROWS: i64 = 1_000;
-
-/// The chain state the stored rows hold.
-#[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct StoredChainState {
-    /// The link of the newest chained row.
-    pub(crate) head: ChainHash,
-    /// The `export_seq` of the newest chained row.
-    pub(crate) head_seq: i64,
-    /// The newest time the chained rows record.
-    pub(crate) newest_at: DateTime<Utc>,
-    /// The first chained `export_seq`.
-    pub(crate) start_seq: i64,
-}
-
-#[cfg(feature = "db")]
-#[derive(diesel::QueryableByName)]
-struct StoredChainRow {
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Bytea>)]
-    head: Option<Vec<u8>>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
-    head_seq: Option<i64>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    newest_at: Option<DateTime<Utc>>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
-    start_seq: Option<i64>,
-}
-
-/// Read the newest link, the newest time and the chain start from the
-/// chained rows up to `through_seq`.
-///
-/// Returns `None` when no row is chained. It reads every chained row, so
-/// only the re-anchor calls it.
-///
-/// # Errors
-/// Returns `HarvestError` on a database failure.
-#[cfg(feature = "db")]
-async fn stored_chain_state(
-    conn: &mut diesel_async::AsyncPgConnection,
-    through_seq: i64,
-) -> crate::error::HarvestResult<Option<StoredChainState>> {
-    use diesel_async::RunQueryDsl;
-
-    let row: StoredChainRow = diesel::sql_query(
-        "SELECT h.chain_hash AS head, h.export_seq AS head_seq, \
-             s.newest_at, s.start_seq \
-         FROM ( \
-             SELECT MIN(export_seq) AS start_seq, \
-                 GREATEST(MAX(occurred_at), MAX(chain_newest_before)) AS newest_at \
-             FROM harvest_audit_log \
-             WHERE chain_hash IS NOT NULL AND export_seq <= $1 \
-         ) AS s \
-         LEFT JOIN ( \
-             SELECT chain_hash, export_seq FROM harvest_audit_log \
-             WHERE chain_hash IS NOT NULL AND export_seq <= $1 \
-             ORDER BY export_seq DESC LIMIT 1 \
-         ) AS h ON true",
-    )
-    .bind::<diesel::sql_types::BigInt, _>(through_seq)
-    .get_result(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-    Ok(row.head.as_deref().and_then(from_bytes).and_then(|head| {
-        Some(StoredChainState {
-            head,
-            head_seq: row.head_seq?,
-            newest_at: row.newest_at?,
-            start_seq: row.start_seq?,
-        })
-    }))
-}
 
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
@@ -836,19 +774,19 @@ pub(crate) async fn write_checkpoint(
     Ok(())
 }
 
-/// Sign a new checkpoint over the stored chain on `shard_id`.
+/// Start a new chain on `shard_id` after its sequenced rows.
 ///
-/// The exporter does not extend a chain whose checkpoint is missing or does
-/// not verify. New rows then stay unchained. An operator calls this to
+/// The exporter does not extend a chain whose checkpoint is missing, does not
+/// verify or lags. New rows then stay unchained. An operator calls this to
 /// recover, for example after a cursor rebuild.
 ///
-/// It accepts the stored rows as they are. So compare the chain with the
-/// SIEM copy first. It chains the unchained rows after the newest link, up to
-/// `last_assigned_seq`. It then signs the checkpoint with the active key.
+/// It never changes a sequenced row. Those rows may already be exported, and
+/// a redrive must send the same bytes. It signs an empty checkpoint that
+/// starts at `last_assigned_seq + 1`. The next export tick chains from there.
+/// The verifier then skips the rows before the new start, so compare them
+/// with the SIEM copy first.
 ///
-/// Returns the new checkpoint. Returns `None` when the cursor is missing or
-/// no row is chained. In the second case it clears the checkpoint, and the
-/// next export tick starts a new chain.
+/// Returns the new checkpoint, or `None` when the cursor is missing.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -865,50 +803,24 @@ pub async fn reanchor_shard_chain(
 
     Box::pin(
         conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
-            let cursor: Option<crate::models::AuditExportCursor> = cur::harvest_audit_export_cursor
+            let last_assigned_seq: Option<i64> = cur::harvest_audit_export_cursor
                 .find(shard_id)
-                .select(crate::models::AuditExportCursor::as_select())
+                .select(cur::last_assigned_seq)
                 .for_update()
                 .first(conn)
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?;
-            let Some(cursor) = cursor else {
+            let Some(last_assigned_seq) = last_assigned_seq else {
                 return Ok(None);
             };
-            let Some(seed) = stored_chain_state(conn, cursor.last_assigned_seq).await? else {
-                diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
-                    .set((
-                        cur::chain_start_seq.eq(None::<i64>),
-                        cur::chain_head_seq.eq(None::<i64>),
-                        cur::chain_head.eq(None::<Vec<u8>>),
-                        cur::chain_newest_at.eq(None::<DateTime<Utc>>),
-                        cur::chain_mac.eq(None::<Vec<u8>>),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-                return Ok(None);
-            };
-            let anchor = ChainAnchor {
-                head: Some(seed.head),
-                start_seq: Some(seed.start_seq),
-                newest_at: Some(seed.newest_at),
-            };
-            let stamped = stamp_chain(
-                conn,
-                shard_id,
-                key.secret(),
-                seed.head_seq,
-                cursor.last_assigned_seq,
-                &anchor,
-            )
-            .await?;
+            // No row in the new chain yet. The head is the genesis link, one
+            // before the start. The newest time is now, a safe upper bound.
             let checkpoint = ChainCheckpoint {
-                start_seq: seed.start_seq,
-                head_seq: stamped.map_or(seed.head_seq, |s| s.head_seq),
-                head: stamped.map_or(seed.head, |s| s.head),
-                newest_at: stamped.map_or(seed.newest_at, |s| s.newest_at),
+                start_seq: last_assigned_seq + 1,
+                head_seq: last_assigned_seq,
+                head: GENESIS,
+                newest_at: Utc::now(),
             };
             write_checkpoint(conn, shard_id, &checkpoint, key).await?;
             Ok(Some(checkpoint))
@@ -919,8 +831,9 @@ pub async fn reanchor_shard_chain(
 
 /// Stamp the chain over the rows with `after_seq < export_seq <= through_seq`.
 ///
-/// It continues from `anchor`. Returns `None` when no row is in the range. The caller holds the cursor row lock,
-/// so no other exporter stamps the same rows.
+/// It continues from `anchor`. Returns `None` when no row is in the range.
+/// The caller holds the cursor row lock, so no other exporter stamps the same
+/// rows.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -1476,6 +1389,50 @@ mod tests {
             run(&replaced, checkpoint(&replaced)),
             vec![ChainFinding::KnownLinkMismatch { seq: 3 }]
         );
+    }
+
+    #[test]
+    fn a_reanchored_chain_skips_the_rows_before_its_start() {
+        let old = chain(&[1, 2]);
+        // An empty new chain that starts at seq 4. Seq 3 is unchained.
+        let mut rows = old.clone();
+        rows.push(ChainRow {
+            record: rec(3),
+            prev: None,
+            hash: None,
+            newest_before: None,
+        });
+        let empty = ChainCheckpoint {
+            start_seq: 4,
+            head_seq: 3,
+            head: GENESIS,
+            newest_at: at(0),
+        };
+        let report = verify(&rows, Some(empty));
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!((report.checked, report.unchained_prefix), (0, 3));
+
+        let new = chain_records(vec![rec(4)]);
+        rows.extend(new.iter().cloned());
+        let report = verify(
+            &rows,
+            Some(ChainCheckpoint {
+                start_seq: 4,
+                ..checkpoint(&new).unwrap_or(empty)
+            }),
+        );
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.anchor_seq, Some(4));
+
+        // The empty checkpoint still finds a new row deleted after it.
+        let report = verify(
+            &old,
+            Some(ChainCheckpoint {
+                head_seq: 5,
+                ..empty
+            }),
+        );
+        assert!(!report.is_intact(), "{report:?}");
     }
 
     #[test]

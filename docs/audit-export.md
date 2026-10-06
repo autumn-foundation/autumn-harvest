@@ -343,11 +343,12 @@ any key in that list.
 
 **Re-anchor.** After a cursor rebuild or a checkpoint finding, the exporter
 leaves new rows unchained. First compare the chain with the SIEM copy. Then
-call `audit_chain::reanchor_shard_chain(conn, shard, &key)`. It accepts the
-stored rows as they are. It chains the unchained rows after the newest link
-and signs a new checkpoint. Rows that lost their links before that link stay
-`Unchained`. If no row is chained, it clears the checkpoint, and the next
-export tick starts a new chain.
+call `audit_chain::reanchor_shard_chain(conn, shard, &key)`. It never changes
+a row that has a `seq`, because that row may already be exported, and a
+redrive must send the same bytes. It signs a new, empty checkpoint that
+starts after `last_assigned_seq`. The next export tick chains from there. The
+verifier then counts the rows before the new start as `unchained_prefix` and
+does not check them. The SIEM copy covers them.
 
 **Verify from the SIEM.** A SIEM that holds the key can also verify the chain.
 Each chained record carries `chain_prev`, `chain_newest_before` and
@@ -372,8 +373,9 @@ The canonical encoding always uses six digits. Then check that the HMAC of
   those rows within the hour anyway. Only the SIEM copy detects these cases.
 - Without a `known_head`, the verifier cannot detect a restored older state
   of the table and the cursor.
-- A re-anchor accepts the stored rows. It hides any deletion at the tail that
-  happened before it. Compare with the SIEM copy before you re-anchor.
+- After a re-anchor, the verifier does not check the rows before the new
+  start. It hides any change to them. Compare with the SIEM copy before you
+  re-anchor.
 - Each sequenced row is written twice: once for `export_seq`, once for the
   chain columns. This cost applies only when you set a chain key.
 
