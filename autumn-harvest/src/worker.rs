@@ -30263,6 +30263,8 @@ impl Worker {
             self.shutdown.cancel();
             return;
         };
+        // A fence anywhere in this process stops this worker too (issue #1823).
+        crate::replication::FenceRegistry::register_worker_shutdown(&self.shutdown);
         let _held_resolver = self.spawn_held_resolver(held);
 
         // The retry guards live as long as this run (issue #1788).
@@ -30734,6 +30736,8 @@ impl Worker {
             self.shutdown.cancel();
             return;
         };
+        // A fence anywhere in this process stops this worker too (issue #1823).
+        crate::replication::FenceRegistry::register_worker_shutdown(&self.shutdown);
         let _held_resolver = self.spawn_held_resolver(held);
 
         // A held or fenced shard gets no startup write (issue #1823). The

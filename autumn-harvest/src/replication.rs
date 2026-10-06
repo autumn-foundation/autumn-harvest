@@ -648,6 +648,11 @@ const HELD: ShardGeneration = ShardGeneration(i64::MIN);
 /// acquisition.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// The shutdown tokens of the workers in this process (issue #1823). See
+/// [`FenceRegistry::register_worker_shutdown`].
+static WORKER_SHUTDOWNS: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>> =
+    std::sync::Mutex::new(Vec::new());
+
 #[derive(Debug, Default)]
 struct Pinned {
     generations: BTreeMap<i32, ShardGeneration>,
@@ -1095,12 +1100,39 @@ impl FenceRegistry {
 
     /// Record that this process lost write authority (issue #1823). The
     /// sampler calls it before it stops the worker.
+    ///
+    /// The pins are process-wide, so every worker in this process stops:
+    /// each registered shutdown token is cancelled. See
+    /// [`Self::register_worker_shutdown`].
     pub fn mark_fenced_out() {
         let mut guard = PINNED
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.get_or_insert_with(Pinned::default).fenced_out = true;
         drop(guard);
+        let tokens = WORKER_SHUTDOWNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for token in tokens.iter() {
+            token.cancel();
+        }
+        drop(tokens);
+    }
+
+    /// Register a worker's shutdown token (issue #1823). When this process
+    /// is fenced out, every registered worker stops, not only the one whose
+    /// sampler saw the bump. A token registered after that is cancelled at
+    /// once.
+    pub fn register_worker_shutdown(token: &tokio_util::sync::CancellationToken) {
+        let mut tokens = WORKER_SHUTDOWNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.retain(|known| !known.is_cancelled());
+        tokens.push(token.clone());
+        drop(tokens);
+        if Self::is_fenced_out() {
+            token.cancel();
+        }
     }
 
     /// Whether this process lost write authority (issue #1823). Shutdown
@@ -1598,7 +1630,28 @@ mod db {
     pub struct FencePassGuard {
         lost: tokio_util::sync::CancellationToken,
         keepalive: tokio::task::JoinHandle<()>,
+        /// A slot of [`FENCE_GUARD_SLOTS`]. It is held only to be freed when
+        /// the guard drops. It is boxed as `dyn Send`, so the guard keeps
+        /// the drop behaviour it had before the slot: callers hold a guard
+        /// for a whole pass on purpose.
+        #[allow(dead_code)]
+        slot: Option<Box<dyn Send + Sync>>,
     }
+
+    /// How many guard sessions this process may hold at once (issue #1823).
+    ///
+    /// A guard opens its own connection outside the pool, and an admin write
+    /// holds one for each pinned shard until its handler returns. Without a
+    /// cap, heavy admin traffic could open sessions without limit and use up
+    /// the server's connections. A guard past the cap waits for a free slot,
+    /// for at most [`FENCE_PASS_CONNECT_TIMEOUT`], then fails closed.
+    pub const FENCE_GUARD_LIMIT: usize = 64;
+
+    /// The slots behind [`FENCE_GUARD_LIMIT`].
+    static FENCE_GUARD_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(FENCE_GUARD_LIMIT))
+        });
 
     impl FencePassGuard {
         /// Whether the guard's session has ended (issue #1823).
@@ -1855,6 +1908,17 @@ mod db {
         allowed: &[(ShardId, ShardGeneration)],
     ) -> HarvestResult<FencePassGuard> {
         use deadpool::managed::Manager as _;
+        let slot = tokio::time::timeout(
+            FENCE_PASS_CONNECT_TIMEOUT,
+            std::sync::Arc::clone(&FENCE_GUARD_SLOTS).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            crate::error::HarvestError::Database(format!(
+                "all {FENCE_GUARD_LIMIT} DR fence guard slots stayed busy; try again"
+            ))
+        })?
+        .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
         let conn = tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
             .await
             .map_err(|_| {
@@ -1863,7 +1927,9 @@ mod db {
                 )
             })?
             .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
-        begin_pass_on(conn, shard, expected, allowed).await
+        let mut guard = begin_pass_on(conn, shard, expected, allowed).await?;
+        guard.slot = Some(Box::new(slot));
+        Ok(guard)
     }
 
     /// [`begin_fenced_pass_at`] on a connection the caller opened (issue
@@ -1967,7 +2033,11 @@ mod db {
                 }
             }
         });
-        FencePassGuard { lost, keepalive }
+        FencePassGuard {
+            lost,
+            keepalive,
+            slot: None,
+        }
     }
 
     /// Freeze the set of generation rows on a database while a command runs
@@ -4188,6 +4258,25 @@ mod tests {
 
         FenceRegistry::clear();
         assert!(!FenceRegistry::is_enabled());
+    }
+
+    /// A fenced-out process stops every registered worker, not only the one
+    /// that saw the bump (issue #1823). A late registration stops at once.
+    #[test]
+    fn fenced_out_stops_every_registered_worker() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::register(ShardId::new(0), ShardGeneration(1)).expect("pin");
+        let first = tokio_util::sync::CancellationToken::new();
+        let second = tokio_util::sync::CancellationToken::new();
+        FenceRegistry::register_worker_shutdown(&first);
+        FenceRegistry::register_worker_shutdown(&second);
+        FenceRegistry::mark_fenced_out();
+        assert!(first.is_cancelled() && second.is_cancelled());
+        let late = tokio_util::sync::CancellationToken::new();
+        FenceRegistry::register_worker_shutdown(&late);
+        assert!(late.is_cancelled());
+        FenceRegistry::clear();
     }
 
     /// A process reserves one mode, fenced or unfenced, atomically (issue

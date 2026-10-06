@@ -260,7 +260,8 @@ shard is plain:
 - A worker's startup writes (its fleet row and its rate-limit buckets) and
   each heartbeat run under the fence barrier. A held or fenced shard gets
   none of them, and they retry later.
-- A worker that finds its pin superseded stops. Its heartbeat stops at
+- A worker that finds its pin superseded stops, and so does every other
+  worker in its process: the pins are process-wide. Its heartbeat stops at
   once, and its shutdown skips its database writes: fleet status,
   sticky-pin release, claim release and the lease keeper. Another region
   owns those rows. Its orphan reclaim recovers the claims.
@@ -383,15 +384,17 @@ cannot commit while any of them writes.
 
 Three limits, stated plainly:
 
-- A barrier opens one extra connection per shard. On a DR node every admin
-  write, scheduler pass and partition pass pays that cost. The barrier pings
-  that connection each second. If the session ends, the server frees the
-  lock. The pass then stops: a scheduler pass before it fires, a partition
-  pass or a rebalance at once, with an error. An admin write or a webhook
-  answers `503`. A statement the server already runs is not cancelled. It
-  can still commit after a bump, within one second plus its own run time.
-  History appends are not exposed: each checks the fence in its own
-  transaction.
+- A barrier opens one extra connection per shard. A process holds at most
+  64 of these at once. A barrier past that waits up to 10 seconds for a
+  free slot, then fails closed: an admin write answers `503`. On a DR node
+  every admin write, scheduler pass and partition pass pays that cost. The
+  barrier pings that connection each second. If the session ends, the
+  server frees the lock. The pass then stops: a scheduler pass before it
+  fires, a partition pass or a rebalance at once, with an error. An admin
+  write or a webhook answers `503`. A statement the server already runs is
+  not cancelled. It can still commit after a bump, within one second plus
+  its own run time. History appends are not exposed: each checks the fence
+  in its own transaction.
 - The check reads every shard of the storage pool, and every pinned shard
   colocated with one, on each admin write. If one cannot be read, every
   admin write on the node answers `503`. That fails closed. A node that has
