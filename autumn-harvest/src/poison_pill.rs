@@ -96,18 +96,43 @@ pub struct OrphanClaim {
 
 /// The orphan claims that one reclaimer saw, and when it first saw each one
 /// (issue #1879).
+///
+/// A late heartbeat and a dead worker look the same to one sweep. A
+/// quarantine is terminal, so the reclaimer quarantines only a claim that it
+/// saw as an orphan in every sweep for one stale window.
+///
+/// The watch must have no gap longer than one stale window. A heartbeat in
+/// such a gap can go unseen, so the hold then starts again.
 #[derive(Debug, Default)]
 pub struct OrphanWitness {
     first_seen: std::collections::HashMap<OrphanClaim, std::time::Instant>,
+    last_sweep: Option<std::time::Instant>,
 }
 
 impl OrphanWitness {
     /// Record the orphan claims of one sweep, seen at `now`.
+    ///
+    /// The witness forgets each claim that is not in `claims`. It forgets
+    /// all claims when the last sweep was more than `hold` before `now`.
     pub fn observe<I>(&mut self, claims: I, now: std::time::Instant, hold: std::time::Duration)
     where
         I: IntoIterator<Item = OrphanClaim>,
     {
-        let _ = (claims.into_iter().count(), now, hold);
+        let watched = self
+            .last_sweep
+            .is_some_and(|last| now.saturating_duration_since(last) <= hold);
+        let mut seen = std::mem::take(&mut self.first_seen);
+        if !watched {
+            seen.clear();
+        }
+        self.first_seen = claims
+            .into_iter()
+            .map(|claim| {
+                let first = seen.get(&claim).copied().unwrap_or(now);
+                (claim, first)
+            })
+            .collect();
+        self.last_sweep = Some(now);
     }
 
     /// Tell if this reclaimer saw `claim` as an orphan for at least `hold`.
@@ -118,8 +143,9 @@ impl OrphanWitness {
         now: std::time::Instant,
         hold: std::time::Duration,
     ) -> bool {
-        let _ = (claim, now, hold, &self.first_seen);
-        true
+        self.first_seen
+            .get(claim)
+            .is_some_and(|first| now.saturating_duration_since(*first) >= hold)
     }
 
     /// The number of claims that the witness keeps.
@@ -286,8 +312,8 @@ mod scanner {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ReclaimAction, ReclaimSummary, orphaned_running_tasks_query, quarantine_decision,
-        stuck_running_tasks_query,
+        OrphanClaim, OrphanWitness, ReclaimAction, ReclaimSummary, orphaned_running_tasks_query,
+        quarantine_decision, stuck_running_tasks_query,
     };
     use crate::completion_trigger::DeferredTriggerStart;
     use crate::error::{HarvestError, HarvestResult};
@@ -949,6 +975,10 @@ mod scanner {
     /// touches `crash_strikes` and never quarantines — being stuck this way
     /// says nothing about the task itself.
     ///
+    /// This sweep quarantines an orphan on first sight. A late heartbeat can
+    /// then quarantine a live worker's task (issue #1879). A reclaim loop
+    /// uses [`reclaim_orphaned_tasks_witnessed`] instead.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] on query failure.
@@ -962,10 +992,82 @@ mod scanner {
         // `WorkflowFailed` carries a payload-bearing `details` field.
         codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<ReclaimSummary> {
+        reclaim_sweep(
+            conn,
+            threshold,
+            worker_stale_secs,
+            stuck_running_secs,
+            metrics,
+            codecs,
+            None,
+        )
+        .await
+    }
+
+    /// [`reclaim_orphaned_tasks`], with a quarantine that waits for proof of
+    /// death (issue #1879).
+    ///
+    /// The sweep quarantines an orphan only when `witness` saw the same claim
+    /// in every sweep for one stale window. Until then the row stays
+    /// `RUNNING` and gets no strike. A worker that heartbeats again keeps its
+    /// task. A requeue under the threshold does not wait.
+    ///
+    /// `now` is the time of this sweep. Use one `witness` for all sweeps of
+    /// one reclaim loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] on query failure.
+    // One more parameter than `reclaim_orphaned_tasks`, which is at the limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reclaim_orphaned_tasks_witnessed(
+        conn: &mut AsyncPgConnection,
+        threshold: i32,
+        worker_stale_secs: i64,
+        stuck_running_secs: Option<i64>,
+        metrics: &dyn MetricsRecorder,
+        codecs: &crate::payload_codec::PayloadCodecs,
+        witness: &mut OrphanWitness,
+        now: std::time::Instant,
+    ) -> HarvestResult<ReclaimSummary> {
+        reclaim_sweep(
+            conn,
+            threshold,
+            worker_stale_secs,
+            stuck_running_secs,
+            metrics,
+            codecs,
+            Some((witness, now)),
+        )
+        .await
+    }
+
+    /// The claim that `task` shows, or `None` for a row with no worker.
+    fn orphan_claim(task: &TaskQueueItem) -> Option<OrphanClaim> {
+        task.worker_id.clone().map(|worker_id| OrphanClaim {
+            task_id: task.id,
+            worker_id,
+            crash_strikes: task.crash_strikes,
+        })
+    }
+
+    /// The body of both reclaim sweeps. `watch` is the witness and the sweep
+    /// time. `None` quarantines on first sight.
+    async fn reclaim_sweep(
+        conn: &mut AsyncPgConnection,
+        threshold: i32,
+        worker_stale_secs: i64,
+        stuck_running_secs: Option<i64>,
+        metrics: &dyn MetricsRecorder,
+        codecs: &crate::payload_codec::PayloadCodecs,
+        mut watch: Option<(&mut OrphanWitness, std::time::Instant)>,
+    ) -> HarvestResult<ReclaimSummary> {
         // Clamp once at the entry point. Neither the candidate scan nor
         // the per-row liveness re-check can then overflow the SQL
         // interval arithmetic on an out-of-range caller value.
         let worker_stale_secs = worker_stale_secs.clamp(0, super::MAX_WORKER_STALE_SECS);
+        // The clamp makes the value non-negative, so the conversion holds.
+        let hold = std::time::Duration::from_secs(worker_stale_secs.unsigned_abs());
         // Chaos: inject a transient DB/connection error before the orphan scan
         // (issue #940 AC1(b)). The reclaim is idempotent and the poll loop
         // retries it on the next tick, so a transient error must not strand an
@@ -976,13 +1078,25 @@ mod scanner {
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
+        if let Some((witness, now)) = watch.as_mut() {
+            witness.observe(orphans.iter().filter_map(orphan_claim), *now, hold);
+        }
 
         let mut summary = ReclaimSummary::default();
         for task in orphans {
             let new_strikes = task.crash_strikes.saturating_add(1);
             match quarantine_decision(new_strikes, threshold) {
                 ReclaimAction::Quarantine => {
-                    if quarantine_orphan(
+                    // Issue #1879: the strike is permanent and the quarantine
+                    // is terminal. Hold the row until the witness confirms
+                    // that the worker is dead, not late.
+                    let unconfirmed = watch.as_ref().is_some_and(|(witness, now)| {
+                        orphan_claim(&task)
+                            .is_none_or(|claim| !witness.confirmed(&claim, *now, hold))
+                    });
+                    if unconfirmed {
+                        summary.held += 1;
+                    } else if quarantine_orphan(
                         conn,
                         &task,
                         new_strikes,
@@ -1022,37 +1136,6 @@ mod scanner {
             }
         }
         Ok(summary)
-    }
-
-    /// [`reclaim_orphaned_tasks`], with a quarantine that waits for proof
-    /// (issue #1879).
-    ///
-    /// `now` is the time of this sweep.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Database`] on query failure.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn reclaim_orphaned_tasks_witnessed(
-        conn: &mut AsyncPgConnection,
-        threshold: i32,
-        worker_stale_secs: i64,
-        stuck_running_secs: Option<i64>,
-        metrics: &dyn MetricsRecorder,
-        codecs: &crate::payload_codec::PayloadCodecs,
-        witness: &mut super::OrphanWitness,
-        now: std::time::Instant,
-    ) -> HarvestResult<ReclaimSummary> {
-        let _ = (&witness, now);
-        reclaim_orphaned_tasks(
-            conn,
-            threshold,
-            worker_stale_secs,
-            stuck_running_secs,
-            metrics,
-            codecs,
-        )
-        .await
     }
 
     /// Spawn a background task that periodically reclaims orphaned poison-pill
@@ -1139,6 +1222,8 @@ mod scanner {
         );
         // Keep the worker dispatch binding for hints (issue #1431).
         crate::dispatch::spawn_bound(async move {
+            // Issue #1879: one witness for the life of this loop.
+            let mut witness = OrphanWitness::default();
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
@@ -1157,25 +1242,35 @@ mod scanner {
                 };
                 match get_result {
                     Ok(mut conn) => {
-                        match reclaim_orphaned_tasks(
+                        match reclaim_orphaned_tasks_witnessed(
                             &mut conn,
                             threshold,
                             worker_stale_secs,
                             stuck_running_secs,
                             &*telemetry.metrics,
                             &payload_codecs,
+                            &mut witness,
+                            std::time::Instant::now(),
                         )
                         .await
                         {
-                            Ok(summary) if summary.total() > 0 => {
-                                tracing::warn!(
-                                    requeued = summary.requeued,
-                                    quarantined = summary.quarantined,
-                                    stuck_requeued = summary.stuck_requeued,
-                                    "reclaimed orphaned poison-pill tasks"
-                                );
+                            Ok(summary) => {
+                                if summary.total() > 0 {
+                                    tracing::warn!(
+                                        requeued = summary.requeued,
+                                        quarantined = summary.quarantined,
+                                        stuck_requeued = summary.stuck_requeued,
+                                        "reclaimed orphaned poison-pill tasks"
+                                    );
+                                }
+                                if summary.held > 0 {
+                                    tracing::info!(
+                                        held = summary.held,
+                                        "held orphans at the poison-pill threshold until \
+                                         their workers are confirmed dead"
+                                    );
+                                }
                             }
-                            Ok(_) => {}
                             Err(e) => {
                                 tracing::error!(error = %e, "poison-pill reclaim sweep failed");
                             }

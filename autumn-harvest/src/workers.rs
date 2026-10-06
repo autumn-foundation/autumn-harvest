@@ -1735,20 +1735,32 @@ pub async fn do_heartbeat_tick(
 }
 
 /// The start times of the worker heartbeat ticks (issue #1879).
+///
+/// The schedule has a fixed rate. Tick latency does not add to the period.
+/// A fixed delay made the period the interval plus the latency. A slow
+/// database then made a live worker look dead.
+///
+/// After a tick that takes longer than one interval, the next tick starts
+/// at once. The schedule does not send a burst of ticks to catch up.
 #[derive(Debug)]
 pub(crate) struct HeartbeatSchedule {
-    interval: Duration,
+    ticks: tokio::time::Interval,
 }
 
 impl HeartbeatSchedule {
     /// Make a schedule. The first tick comes one `interval` after this call.
-    pub(crate) const fn new(interval: Duration) -> Self {
-        Self { interval }
+    ///
+    /// A zero `interval` becomes 1 ms, because a zero period panics.
+    pub(crate) fn new(interval: Duration) -> Self {
+        let period = interval.max(Duration::from_millis(1));
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self { ticks }
     }
 
-    /// Wait until the next tick is due.
+    /// Wait until the next tick is due. This is cancel safe.
     pub(crate) async fn wait(&mut self) {
-        tokio::time::sleep(self.interval).await;
+        self.ticks.tick().await;
     }
 }
 
