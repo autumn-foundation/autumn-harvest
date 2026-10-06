@@ -35,6 +35,8 @@ are true:
   for a short time, for example during a registration retry. So the
   reclaimer must see such a claim without a break for the full window. A
   fresh sighting of the worker breaks the watch, so the time starts again.
+  The sweep reads its clock after the orphan scan returns, so a delay
+  before the scan does not count.
 - The final quarantine locks the row and checks the whole claim, `attempt`
   and `started_at` included. A new claim of the row in the meantime is
   left alone.

@@ -875,7 +875,7 @@ async fn witnessed_sweep_at(
         metrics,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
         witness,
-        now,
+        &move || now,
     )
     .await
     .expect("witnessed reclaim")

@@ -1159,8 +1159,9 @@ mod scanner {
     /// gets no strike. A worker that heartbeats again keeps its task. A
     /// requeue under the threshold does not wait.
     ///
-    /// Use one `witness` for all sweeps of one reclaim loop. `now` is the
-    /// time of this sweep.
+    /// Use one `witness` for all sweeps of one reclaim loop. The sweep reads
+    /// `clock` once, after the orphan scan returns. A delay before the scan
+    /// then cannot count toward a hold.
     ///
     /// # Errors
     ///
@@ -1175,7 +1176,7 @@ mod scanner {
         metrics: &dyn MetricsRecorder,
         codecs: &crate::payload_codec::PayloadCodecs,
         witness: &mut OrphanWitness,
-        now: std::time::Instant,
+        clock: &(dyn Fn() -> std::time::Instant + Sync),
     ) -> HarvestResult<ReclaimSummary> {
         reclaim_sweep(
             conn,
@@ -1184,7 +1185,7 @@ mod scanner {
             stuck_running_secs,
             metrics,
             codecs,
-            Some((witness, now)),
+            Some((witness, clock)),
         )
         .await
     }
@@ -1234,8 +1235,8 @@ mod scanner {
         )
     }
 
-    /// The body of both reclaim sweeps. `watch` is the witness and the time
-    /// of this sweep. With no `watch`, the last strike does not wait.
+    /// The body of both reclaim sweeps. `watch` is the witness and its clock.
+    /// With no `watch`, the last strike does not wait.
     async fn reclaim_sweep(
         conn: &mut AsyncPgConnection,
         threshold: i32,
@@ -1243,7 +1244,7 @@ mod scanner {
         stuck_running_secs: Option<i64>,
         metrics: &dyn MetricsRecorder,
         codecs: &crate::payload_codec::PayloadCodecs,
-        mut watch: Option<(&mut OrphanWitness, std::time::Instant)>,
+        mut watch: Option<(&mut OrphanWitness, &(dyn Fn() -> std::time::Instant + Sync))>,
     ) -> HarvestResult<ReclaimSummary> {
         // Clamp once at the entry point. Neither the candidate scan nor
         // the per-row liveness re-check can then overflow the SQL
@@ -1260,8 +1261,11 @@ mod scanner {
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
-        if let Some((witness, now)) = watch.as_mut() {
-            witness.observe(orphans.iter().filter_map(orphan_claim), *now);
+        // Issue #1879: read the clock after the scan returns. A delay before
+        // the scan is not time that the reclaimer saw the orphan.
+        let swept_at = watch.as_ref().map(|(_, clock)| clock());
+        if let (Some((witness, _)), Some(now)) = (watch.as_mut(), swept_at) {
+            witness.observe(orphans.iter().filter_map(orphan_claim), now);
         }
 
         let mut summary = ReclaimSummary::default();
@@ -1275,12 +1279,12 @@ mod scanner {
                     // Issue #1879: the strike is permanent and the quarantine
                     // is terminal. Hold the row until the death of the worker
                     // is confirmed. A late worker is not a dead one.
-                    let (wait, dead_secs) = match watch.as_mut() {
-                        Some((witness, now)) => (
-                            hold_last_strike(conn, &task, witness, *now, confirm_secs).await?,
+                    let (wait, dead_secs) = match (watch.as_mut(), swept_at) {
+                        (Some((witness, _)), Some(now)) => (
+                            hold_last_strike(conn, &task, witness, now, confirm_secs).await?,
                             confirm_secs,
                         ),
-                        None => (false, worker_stale_secs),
+                        _ => (false, worker_stale_secs),
                     };
                     if wait {
                         summary.held += 1;
@@ -1437,7 +1441,7 @@ mod scanner {
                             &*telemetry.metrics,
                             &payload_codecs,
                             &mut witness,
-                            std::time::Instant::now(),
+                            &std::time::Instant::now,
                         )
                         .await
                         {
