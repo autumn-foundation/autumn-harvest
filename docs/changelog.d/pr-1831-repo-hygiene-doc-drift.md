@@ -10,10 +10,13 @@
   leftover. The binary rule is git's: a NUL byte in the first 8000 bytes.
   `echo.wasm` is the one allowed binary.
 - `docs/audits/doc-claim-drift.py` checks each doc claim against the shipped
-  code. A stated `WorkflowEvent` variant count matches `event.rs`. No two
+  code. The `event.rs` row in `docs/architecture.md` states no
+  `WorkflowEvent` variant count, because a hard-coded count drifts. No two
   rows of one table in `docs/architecture.md` share a first cell. The newest
   version in `RELEASE_NOTES.md`, if any, is the workspace version. Each
-  `STALE_CLAIMS` pattern stays absent from its file.
+  `STALE_CLAIMS` pin, the exact wording that a shipped change made false,
+  stays absent from its file. No rule judges free prose: a regex cannot tell
+  a total from a subset, or harvest from a competitor, with certainty.
 
 **Docs reconciled.**
 
