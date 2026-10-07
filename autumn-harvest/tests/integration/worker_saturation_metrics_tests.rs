@@ -1242,6 +1242,115 @@ async fn a_workflow_that_returns_an_error_counts_as_a_failure() {
     );
 }
 
+const HANGING_WORKFLOW: &str = "saturation_hanging_wf";
+const HANGING_ACTIVITY: &str = "saturation_hanging_activity";
+
+fn hangs<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Ok(serde_json::json!({}))
+    })
+}
+
+fn swallows_a_hanging_activity<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        let _ = ctx
+            .execute_activity_raw(HANGING_ACTIVITY, input, &queue)
+            .await;
+        Ok(serde_json::json!({ "swallowed": true }))
+    })
+}
+
+/// An activity that hangs past its start-to-close is timed out by the
+/// scanner, which takes its claim. The attempt is a failure in the outlier
+/// window, although the worker sees a cancelled attempt and a lost lease
+/// (issue #1815). The workflow swallows the error, so its own task is a
+/// success, and the one failure is the timed-out attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scanner_enforced_activity_timeout_counts_as_a_failure() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool: DbPool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("hang-q");
+    let worker_id = unique_id("hang-w");
+    let built = HarvestBuilder::new()
+        .workflows(vec![WorkflowInfo {
+            name: HANGING_WORKFLOW,
+            handler: swallows_a_hanging_activity,
+            ..workflow_info()
+        }])
+        .activities(vec![ActivityInfo {
+            name: HANGING_ACTIVITY,
+            handler: hangs,
+            default_retry_policy: Some(RetryPolicy::fixed(1, Duration::from_millis(10))),
+            default_start_to_close: Some(Duration::from_millis(300)),
+            ..activity_info()
+        }])
+        .worker(WorkerConfig::default().with_queues([queue.as_str()]))
+        .build();
+    let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id.clone_from(&worker_id);
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.worker_heartbeat_interval = Duration::from_millis(100);
+    runtime_config.shutdown_timeout = Duration::from_secs(5);
+    let worker =
+        Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
+
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("hang-wf");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: HANGING_WORKFLOW,
+            ..start_params(exec_id, &workflow_id, &queue)
+        },
+        None,
+    )
+    .await
+    .expect("start workflow");
+    let runner = Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&run_pool).await });
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let row = loop {
+        let row: Option<StatsRow> = diesel::sql_query(
+            "SELECT window_tasks, window_failures FROM harvest_worker_task_stats \
+             WHERE worker_id = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&worker_id)
+        .get_result(&mut conn)
+        .await
+        .ok();
+        if let Some(row) = row
+            && row.window_failures >= 1
+        {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no task-stats row counts the timed-out attempt"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        row.window_failures, 1,
+        "the timed-out attempt is one failure"
+    );
+    worker.shutdown();
+    handle.await.expect("worker joins");
+}
+
 /// One timeout-scanner pass records the `scan` op.
 #[tokio::test]
 async fn timeout_scanner_pass_records_the_scan_op() {

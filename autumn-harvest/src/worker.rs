@@ -18619,7 +18619,8 @@ async fn process_activity_task(
         // work. A rejection whose claim a later owner took is skipped, as for
         // any attempt.
         let write = finalize_write_for_outcome(&finalized);
-        if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write) {
+        if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write, false)
+        {
             record_activity_outcome(
                 task_outcomes,
                 deferred_failure,
@@ -19100,9 +19101,11 @@ async fn process_activity_task(
     // is skipped, as in the circuit breaker.
     // Takes the whole result, so a transient error always reaches the
     // deferral rule.
-    let record_outcome = |finalized: &HarvestResult<queue::ClaimWrite>| {
+    let record_outcome = |finalized: &HarvestResult<queue::ClaimWrite>, lost_to_timeout: bool| {
         let write = finalize_write_for_outcome(finalized);
-        if let Some(failed) = activity_attempt_outcome(status, was_cancelled, write) {
+        if let Some(failed) =
+            activity_attempt_outcome(status, was_cancelled, write, lost_to_timeout)
+        {
             // Through finalization: a slow persist path is part of the attempt.
             record_activity_outcome(
                 task_outcomes,
@@ -19166,7 +19169,7 @@ async fn process_activity_task(
             Ok(policy) => policy,
             Err(error) => {
                 let failed = Err(error);
-                record_outcome(&failed);
+                record_outcome(&failed, false);
                 return failed.map(|_| ());
             }
         }
@@ -19336,7 +19339,7 @@ async fn process_activity_task(
                  observes the committed success"
             );
         }
-        record_outcome(&Ok(queue::ClaimWrite::Applied));
+        record_outcome(&Ok(queue::ClaimWrite::Applied), false);
         report_outcome(Some(true), false);
         return Ok(());
     }
@@ -19411,7 +19414,6 @@ async fn process_activity_task(
         &activity_result,
     )
     .await;
-    record_outcome(&finalized);
     // A failed write still releases an admitted probe, without a trip. A
     // lost claim counts only when a timeout took it (see `on_claim_lost`).
     let mut applied = finalized
@@ -19429,7 +19431,28 @@ async fn process_activity_task(
         applied = settled.applied;
         lost_to_timeout = settled.lost_to_timeout;
         attempt_metrics.counted_by_enforcer = settled.enforcer_counts;
+    } else if !drained
+        && activity_attempt_outcome(
+            status,
+            was_cancelled,
+            finalize_write_for_outcome(&finalized),
+            false,
+        )
+        .is_none()
+    {
+        // Issue #1815: the scanner cancels a hung attempt and takes its
+        // claim, so the worker sees a cancellation and a lost lease. The
+        // timeout record tells the two apart. Only the claim owner reads it,
+        // and only once. A cancelled attempt with a breaker token read it
+        // above, into `counted_by_enforcer`.
+        lost_to_timeout = if was_cancelled && circuit_token.is_some() {
+            attempt_metrics.counted_by_enforcer
+        } else {
+            claim_lost_to_timeout(pool, task).await
+        };
     }
+    // Issue #1815: a timed-out attempt is a failure in the outlier window.
+    record_outcome(&finalized, lost_to_timeout && !drained);
     let lost_to_timeout =
         applied == Some(false) && lost_to_timeout && circuit_breakers.has_policy(activity_name);
     report_outcome(applied, lost_to_timeout);
@@ -19520,12 +19543,17 @@ const fn session_task_outcome(result: &HarvestResult<Option<queue::ClaimWrite>>)
 /// finalize also counts, because the work is lost. A finalization that lost
 /// its claim is skipped, because a later owner decides the outcome. A
 /// cancelled attempt is skipped, because a cancellation says nothing about
-/// the worker.
+/// the worker. An attempt that a timeout took is a failure, although the
+/// scanner both cancels it and takes its claim: the handler hung.
 fn activity_attempt_outcome(
     status: ActivityStatus,
     was_cancelled: bool,
     finalized: Option<queue::ClaimWrite>,
+    lost_to_timeout: bool,
 ) -> Option<bool> {
+    if lost_to_timeout {
+        return Some(true);
+    }
     if was_cancelled || finalized == Some(queue::ClaimWrite::LeaseLost) {
         return None;
     }
@@ -46164,18 +46192,24 @@ mod tests {
         use ActivityStatus::{Completed, Failed};
         use queue::ClaimWrite::{Applied, LeaseLost};
         assert_eq!(
-            activity_attempt_outcome(Completed, false, Some(Applied)),
+            activity_attempt_outcome(Completed, false, Some(Applied), false),
             Some(false)
         );
-        assert_eq!(activity_attempt_outcome(Completed, false, None), Some(true));
         assert_eq!(
-            activity_attempt_outcome(Failed, false, Some(Applied)),
+            activity_attempt_outcome(Completed, false, None, false),
             Some(true)
         );
-        assert_eq!(activity_attempt_outcome(Failed, false, None), Some(true));
+        assert_eq!(
+            activity_attempt_outcome(Failed, false, Some(Applied), false),
+            Some(true)
+        );
+        assert_eq!(
+            activity_attempt_outcome(Failed, false, None, false),
+            Some(true)
+        );
         for status in [Completed, Failed] {
             assert_eq!(
-                activity_attempt_outcome(status, false, Some(LeaseLost)),
+                activity_attempt_outcome(status, false, Some(LeaseLost), false),
                 None,
                 "a lost claim is not this worker's outcome"
             );
@@ -46185,8 +46219,17 @@ mod tests {
             (Failed, Some(Applied)),
             (Failed, None),
         ] {
-            assert_eq!(activity_attempt_outcome(status, true, finalized), None);
+            assert_eq!(
+                activity_attempt_outcome(status, true, finalized, false),
+                None
+            );
         }
+        // A timeout cancels the attempt and takes its claim. It still fails.
+        assert_eq!(
+            activity_attempt_outcome(Completed, true, Some(LeaseLost), true),
+            Some(true),
+            "a timed-out attempt is a failure"
+        );
     }
 
     /// Issue #1815: a session acquire or release counts when it finalizes or
