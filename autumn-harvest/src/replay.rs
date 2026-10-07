@@ -772,12 +772,14 @@ impl HistoryMatcher {
         // retried-then-redriven run's cursor gets stuck on the
         // bookkeeping event itself, before it ever reaches the marker or
         // dispatch behind it.
+        //
+        // A decision boundary (issue #1833) is transparent too. It carries
+        // no command, so replay must read a history the same way with or
+        // without boundaries.
         let mut transparent_events: HashSet<usize> = events
             .iter()
             .enumerate()
-            .filter(|(_, e)| {
-                Self::is_pause_lifecycle_event(e) || Self::is_post_terminal_bookkeeping(e)
-            })
+            .filter(|(_, e)| Self::is_command_free_bookkeeping(e))
             .map(|(i, _)| i)
             .collect();
         // DLQ redrive (issue #510): a `WorkflowRedriven` event reopens a run that
@@ -921,8 +923,10 @@ impl HistoryMatcher {
     /// and are never consumed by the workflow function — operator pause/resume
     /// (#383) and post-terminal bookkeeping appended *after* a terminal event
     /// (`WorkflowRetryScheduled` from a workflow-level retry (#523),
-    /// `ChildWorkflowCascadeApplied` from a parent-close cascade (#347)). If the
-    /// first event it lands on is a `WorkflowFailed`, that index opens the tail.
+    /// `ChildWorkflowCascadeApplied` from a parent-close cascade (#347)). It
+    /// also skips a decision boundary (#1833), which follows the terminal of
+    /// the last decision. If the first event it lands on is a `WorkflowFailed`,
+    /// that index opens the tail.
     ///
     /// A `WorkflowRedriven` (#510) is deliberately **not** skipped: a redriven
     /// run is reopened, not failing, and keeps the narrower redrive-anchored
@@ -936,7 +940,7 @@ impl HistoryMatcher {
         while idx > 0 {
             idx -= 1;
             let event = &events[idx];
-            if Self::is_pause_lifecycle_event(event) || Self::is_post_terminal_bookkeeping(event) {
+            if Self::is_command_free_bookkeeping(event) {
                 continue;
             }
             // `idx > 0` guard: a history whose FIRST event is the terminal
@@ -949,6 +953,15 @@ impl HistoryMatcher {
                 .then_some(idx);
         }
         None
+    }
+
+    /// Events that carry no workflow command and that replay never consumes:
+    /// pause and resume (#383), post-terminal bookkeeping, and decision
+    /// boundaries (#1833).
+    const fn is_command_free_bookkeeping(event: &WorkflowEvent) -> bool {
+        Self::is_pause_lifecycle_event(event)
+            || Self::is_post_terminal_bookkeeping(event)
+            || event.is_decision_boundary()
     }
 
     /// Events appended **after** a run's terminal event as durable bookkeeping.
@@ -13987,5 +14000,158 @@ mod tests {
             HistoryMatch::Matched { .. }
         ));
         assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    // ── Decision-boundary transparency tests (issue #1833) ────────────────
+
+    fn decision_boundary() -> WorkflowEvent {
+        WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("build-a"),
+            worker_id: crate::types::WorkerId::new("worker-a"),
+        }
+    }
+
+    /// Puts a `DecisionCommitted` after every event, as a worst case.
+    fn with_boundaries(events: &[WorkflowEvent]) -> Vec<WorkflowEvent> {
+        events
+            .iter()
+            .flat_map(|event| [event.clone(), decision_boundary()])
+            .collect()
+    }
+
+    fn started_event() -> WorkflowEvent {
+        WorkflowEvent::workflow_started(Value::Null, chrono::Utc::now())
+    }
+
+    /// One history that uses each main command kind once.
+    fn mixed_history(child_id: ExecutionId) -> Vec<WorkflowEvent> {
+        let activity_id = ActivityExecId::new();
+        vec![
+            started_event(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"charged": true}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t-1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("t-1"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approve".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!(7),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some("token".into()),
+                value: serde_json::json!("abc"),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!("done"),
+            },
+        ]
+    }
+
+    /// Runs the commands of `mixed_history` and records each answer.
+    fn drive_mixed(matcher: &mut HistoryMatcher) -> Vec<HistoryMatch> {
+        matcher.advance(); // WorkflowStarted
+        vec![
+            matcher.match_activity("charge"),
+            matcher.match_timer("t-1"),
+            matcher.match_signal("approve"),
+            matcher.match_child_workflow("child", &Value::Null),
+            matcher.match_side_effect("token"),
+        ]
+    }
+
+    #[test]
+    fn decision_boundaries_do_not_change_any_match_result() {
+        let child_id = ExecutionId::new();
+        let plain = mixed_history(child_id);
+        let mut without = HistoryMatcher::new(plain.clone());
+        let mut with = HistoryMatcher::new(with_boundaries(&plain));
+
+        let expected = drive_mixed(&mut without);
+        assert!(
+            expected
+                .iter()
+                .all(|m| matches!(m, HistoryMatch::Matched { .. })),
+            "fixture must match cleanly without boundaries: {expected:?}"
+        );
+        assert_eq!(drive_mixed(&mut with), expected);
+        assert!(!with.has_non_lifecycle_unconsumed());
+        assert_eq!(with.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn decision_boundaries_keep_event_indices() {
+        let events = with_boundaries(&[started_event()]);
+        let matcher = HistoryMatcher::new(events);
+        assert_eq!(matcher.event_count(), 2, "a boundary still counts");
+        assert!(matcher.is_consumed(1), "a boundary is pre-consumed");
+    }
+
+    #[test]
+    fn trailing_boundary_after_completion_is_not_unconsumed() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            decision_boundary(),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance();
+        assert!(!matcher.has_non_lifecycle_unconsumed());
+    }
+
+    #[test]
+    fn trailing_boundary_keeps_the_terminal_failure_tail() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::workflow_failed("boom"),
+            decision_boundary(),
+        ];
+        assert_eq!(
+            HistoryMatcher::terminal_failure_tail_start(&events),
+            Some(1)
+        );
+        let matcher = HistoryMatcher::new(events);
+        assert!(matcher.has_terminal_failure_tail());
+        assert!(matcher.is_consumed(1));
+    }
+
+    #[test]
+    fn boundary_between_failed_and_redrive_keeps_redrive_transparency() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::workflow_failed("boom"),
+            decision_boundary(),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(matcher.is_consumed(1), "superseded WorkflowFailed");
+        assert!(matcher.is_consumed(3), "WorkflowRedriven");
     }
 }
