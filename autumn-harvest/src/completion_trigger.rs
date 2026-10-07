@@ -2469,7 +2469,8 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
     };
     let resolved_queues = if !names_needing_lookup.is_empty()
         && let Some(sp) = sharded_pool.as_ref()
-        && let Ok(mut default_conn) = sp.pool_for(sp.default_shard()).get().await
+        && let Ok(mut default_conn) =
+            crate::replication::fenced_checkout(sp.pool_for(sp.default_shard())).await
     {
         resolve_target_queues_batch(&mut default_conn, &names_needing_lookup).await
     } else {
@@ -2492,7 +2493,9 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             continue;
         };
 
-        let mut target_conn = match target_pool.get().await {
+        // Under a fenced pass the checkout is bounded, and a timeout abandons
+        // the pass (issue #1823). See `replication::fenced_checkout`.
+        let mut target_conn = match crate::replication::fenced_checkout(&target_pool).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(

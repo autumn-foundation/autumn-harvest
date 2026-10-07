@@ -3326,6 +3326,48 @@ async fn a_held_only_process_still_beats_on_a_plain_database() {
     );
 }
 
+/// A multi-database pass that meets a bump on one database drops its guards
+/// on the others (issue #1823). It must not hold a bump off elsewhere.
+#[tokio::test]
+async fn a_pass_waiting_on_one_database_does_not_block_a_bump_on_another() {
+    use diesel_async::SimpleAsyncConnection as _;
+    let _serial = registry_guard().await;
+    let (url_a, _db_a) = require_db!("lockwait_a");
+    let (url_b, _db_b) = require_db!("lockwait_b");
+    let (zero, one) = (ShardId::new(0), ShardId::new(1));
+    let mut conn_a = connect(&url_a).await;
+    let mut conn_b = connect(&url_b).await;
+    let g0 = ensure_generation_row(&mut conn_a, zero).await.unwrap();
+    let g1 = ensure_generation_row(&mut conn_b, one).await.unwrap();
+    FenceRegistry::publish(&[(zero, g0), (one, g1)], zero).expect("pin");
+
+    // A bump on database B holds its exclusive pass lock.
+    let mut bump_b = connect(&url_b).await;
+    bump_b
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock({})",
+            (1823_i64 << 32) | 1
+        ))
+        .await
+        .expect("hold B's pass lock");
+
+    let (pool_a, pool_b) = (dr_pool(&url_a), dr_pool(&url_b));
+    let pass = tokio::spawn(async move {
+        autumn_harvest::replication::begin_fenced_groups(&[(&pool_a, zero), (&pool_b, one)])
+            .await
+            .map(|guards| guards.len())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let bumped = bump_generation(&mut conn_a, zero, "failover", "test").await;
+    bump_b.batch_execute("ROLLBACK").await.expect("release");
+    let _ = pass.await;
+    assert!(
+        bumped.is_ok(),
+        "a pass waiting on database B must not hold a bump off on A: {bumped:?}"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.

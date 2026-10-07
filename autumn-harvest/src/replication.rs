@@ -1675,6 +1675,11 @@ mod db {
     /// The error a pass gets when its fence guard loses its session.
     const FENCE_PASS_LOST: &str = "the DR fence session ended, so the pass stopped. A fence \
                                    bump can commit after that point. Run the pass again.";
+    /// How long a guard waits for its pass locks and its check (issue #1823).
+    /// It stays below the bump's lock timeout. An operation that meets a
+    /// bump then gives up, and its other guards drop before that bump times
+    /// out.
+    const FENCE_LOCK_WAIT_SQL: &str = "SET LOCAL lock_timeout = '2000ms'";
     /// The error a pass gets when [`fenced_checkout`] gives up on a pool.
     const FENCE_PASS_ABANDONED: &str = "a fenced pass could not check out a pooled connection \
                                         in time, so it released its DR fence guards. The next \
@@ -2137,15 +2142,16 @@ mod db {
         let conns =
             futures::future::try_join_all(plan.iter().map(|(pool, _, _)| connect_guard(pool)))
                 .await?;
-        let mut guards = Vec::with_capacity(plan.len());
-        for (conn, (_, fresh, bindings)) in conns.into_iter().zip(plan) {
-            // One guard per database holds the barrier of every shard there,
-            // and checks for rows this process did not pin.
-            guards.push(
-                lock_checked_pass(conn, &fresh, &bindings, std::sync::Arc::clone(&slot)).await?,
-            );
-        }
-        Ok(guards)
+        // The locks are taken on every database together. One that waits holds
+        // the others for at most its own bounded wait. One guard per database
+        // holds the barrier of every shard there, and checks for rows this
+        // process did not pin.
+        futures::future::try_join_all(conns.into_iter().zip(&plan).map(
+            |(conn, (_, fresh, bindings))| {
+                lock_checked_pass(conn, fresh, bindings, std::sync::Arc::clone(&slot))
+            },
+        ))
+        .await
     }
 
     /// The shard of every generation row on this database (issue #1823).
@@ -2325,6 +2331,12 @@ mod db {
     ) -> HarvestResult<FencePassGuard> {
         use diesel_async::SimpleAsyncConnection as _;
         begin_guard_transaction(&mut conn).await?;
+        // The locks and the check below wait at most `FENCE_LOCK_WAIT_SQL`. A
+        // bump in progress on this database then fails the operation fast, and
+        // its other guards drop. They cannot hold a bump off elsewhere.
+        conn.batch_execute(FENCE_LOCK_WAIT_SQL)
+            .await
+            .map_err(database_error)?;
         // Taken in shard order. A bump takes one pass lock only, so no order
         // of these shared locks can deadlock with it.
         let mut ordered = shards.to_vec();
@@ -2355,7 +2367,7 @@ mod db {
         if !allowed.is_empty() {
             assert_no_unpinned_rows(&mut conn, allowed).await?;
         }
-        conn.batch_execute("ROLLBACK TO SAVEPOINT harvest_fence_check")
+        conn.batch_execute("ROLLBACK TO SAVEPOINT harvest_fence_check; SET LOCAL lock_timeout = 0")
             .await
             .map_err(database_error)?;
         let label = <[_]>::first(&ordered).map_or(-1, |(shard, _)| shard.as_i32());
