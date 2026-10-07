@@ -3294,6 +3294,38 @@ async fn a_fenced_timeout_scanner_does_not_release_its_lease_on_shutdown() {
     );
 }
 
+/// A held-only process still writes to a plain database (issue #1823). A
+/// shard held for an unreachable probe pins no generation. A healthy plain
+/// database has no generation row, and that is no lost authority.
+#[tokio::test]
+async fn a_held_only_process_still_beats_on_a_plain_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("heldplain");
+    let mut conn = connect(&url).await;
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, input, state, worker_id, attempt) \
+         VALUES ($1, 'q', 'activity', '{}'::jsonb, 'RUNNING', 'w-1', 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a claimed task");
+    // Another shard is held. This database has no generation row.
+    FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(0)).expect("hold");
+    assert!(!FenceRegistry::has_real_pin(), "precondition: held only");
+
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "w-1", 1);
+    let beat =
+        autumn_harvest::queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"n": 1}))
+            .await;
+    assert!(
+        beat.is_ok(),
+        "a held-only process must still beat on a plain database: {beat:?}"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.

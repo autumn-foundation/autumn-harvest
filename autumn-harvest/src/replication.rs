@@ -2024,9 +2024,14 @@ mod db {
         .map_err(database_error)?;
         // A restored or edited database can lose a row. With no row, nothing
         // proves authority, so the write fails closed. See the per-shard
-        // `assert_generation`, which does the same.
+        // `assert_generation`, which does the same. A held-only process pins
+        // no generation. A plain database then has no row, and that is not
+        // a lost row, so its write goes ahead.
         let present: std::collections::BTreeSet<i32> = rows.iter().map(|r| r.shard_id).collect();
         if present.is_empty() {
+            if !FenceRegistry::has_real_pin() {
+                return Ok(());
+            }
             return Err(match FenceRegistry::binding(ShardId::UNENCODED) {
                 Some((shard, pinned)) => crate::error::HarvestError::ShardFenced {
                     shard_id: shard.as_i32(),
