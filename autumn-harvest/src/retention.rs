@@ -1359,7 +1359,7 @@ async fn run_terminal_task_pass(
         // yet, so returning here abandons nothing.
         let checkout = tokio::select! {
             () = shutdown.cancelled() => return,
-            result = pool.get() => result,
+            result = crate::replication::fenced_checkout(pool) => result,
         };
         let result = match checkout {
             Ok(mut conn) => crate::queue::sweep_terminal_tasks_into(
@@ -1521,7 +1521,7 @@ async fn run_partition_maintenance_pass(
         // here can never abandon one mid-flight.
         let mut conn = tokio::select! {
             () = shutdown.cancelled() => return,
-            result = pool.get() => match result {
+            result = crate::replication::fenced_checkout(pool) => match result {
                 Ok(conn) => conn,
                 Err(error) => {
                     // Never silent: a shard that cannot be reached gets no
@@ -2003,7 +2003,7 @@ impl RetentionRuntime {
                     // Purge old schedule decisions once per tick, best-effort.
                     if config.schedule_decision_retention_days > 0 && !config.dry_run {
                         for (_, pool) in pools.iter_shards() {
-                            if let Ok(mut conn) = pool.get().await
+                            if let Ok(mut conn) = crate::replication::fenced_checkout(pool).await
                                 && let Err(err) =
                                     crate::schedule_decision::purge_old_schedule_decisions(
                                         &mut conn,
@@ -2029,7 +2029,7 @@ impl RetentionRuntime {
                     {
                         let now = Utc::now();
                         for (shard, pool) in pools.iter_shards() {
-                            if let Ok(mut conn) = pool.get().await {
+                            if let Ok(mut conn) = crate::replication::fenced_checkout(pool).await {
                                 match purge_expired_summaries(
                                     &mut conn,
                                     u16::try_from(shard.as_i32()).unwrap_or(0),
@@ -2102,7 +2102,7 @@ impl RetentionRuntime {
                     {
                         let cutoff = Utc::now() - window;
                         for (shard, pool) in pools.iter_shards() {
-                            let mut conn = match pool.get().await {
+                            let mut conn = match crate::replication::fenced_checkout(pool).await {
                                 Ok(conn) => conn,
                                 Err(error) => {
                                     tracing::warn!(
@@ -2384,7 +2384,7 @@ pub async fn release_retention_leases(
         }
     };
     let release = async {
-        if let Ok(mut conn) = pool.get().await {
+        if let Ok(mut conn) = crate::replication::fenced_checkout(&pool).await {
             let _ = diesel::update(
                 harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::id.eq_any(ids))
@@ -2476,7 +2476,7 @@ async fn purge_audit_records_across_shards(pools: &ShardedDbPool, config: &Reten
     for (pool, protect_unexported_audit, colocated_shards, exempted_shards) in
         group_shards_by_pool(pools, config)
     {
-        if let Ok(mut conn) = pool.get().await {
+        if let Ok(mut conn) = crate::replication::fenced_checkout(pool).await {
             let colocated_shard_ids: Vec<i32> =
                 colocated_shards.iter().map(|s| s.as_i32()).collect();
             let exempted_shard_ids: Vec<i32> = exempted_shards.iter().map(|s| s.as_i32()).collect();
@@ -2579,10 +2579,7 @@ async fn run_shard_tick(
     // rows. Runs once per shard tick (not per candidate) since it is a
     // table-wide reclaim, not scoped to this tick's candidate batch.
     {
-        let mut conn = pool
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let mut conn = crate::replication::fenced_checkout(&pool).await?;
         let reclaimed = diesel::sql_query(
             "DELETE FROM harvest_completion_deliveries
              WHERE state = 'DELIVERED'
@@ -2599,10 +2596,7 @@ async fn run_shard_tick(
 
     while remaining > 0 {
         // Check out a short-lived connection just to load and claim this batch of candidates in a single transaction
-        let mut conn = pool
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let mut conn = crate::replication::fenced_checkout(&pool).await?;
 
         let lease_id_inner = lease_id.clone();
         let names_inner = override_cut_names.clone();
@@ -2700,10 +2694,7 @@ async fn run_shard_tick(
             remaining = remaining.saturating_sub(1);
 
             // Checkout a connection to run candidate dependency validations
-            let mut conn = pool
-                .get()
-                .await
-                .map_err(|error| HarvestError::Database(error.to_string()))?;
+            let mut conn = crate::replication::fenced_checkout(&pool).await?;
 
             // --- Per-candidate retention decision (issue #737) ------------
             // This is the single seam where a candidate's fate is decided.
@@ -3003,10 +2994,7 @@ async fn run_shard_tick(
             }
 
             // Check out a short-lived connection exclusively to execute the candidate deletion transaction
-            let mut conn = pool
-                .get()
-                .await
-                .map_err(|error| HarvestError::Database(error.to_string()))?;
+            let mut conn = crate::replication::fenced_checkout(&pool).await?;
 
             // Collect the candidate's offloaded blob references BEFORE deletion
             // (the rows cascade-delete with the execution). Issue #524.

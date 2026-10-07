@@ -3114,6 +3114,51 @@ async fn a_batch_pass_waiting_for_a_connection_does_not_block_a_bump() {
     );
 }
 
+/// A retention tick that cannot check out a connection drops its fence
+/// barriers (issue #1823). An exhausted pool must not block a bump.
+#[tokio::test]
+async fn a_retention_tick_waiting_for_a_connection_does_not_block_a_bump() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("retentionwait");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        );
+    let pool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool build");
+    let runtime = autumn_harvest::retention::RetentionRuntime::spawn(
+        autumn_harvest::shard::ShardedDbPool::single(pool.clone()),
+        autumn_harvest::retention::RetentionConfig::with_max_age(std::time::Duration::from_secs(
+            86_400,
+        )),
+        std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+        None,
+        None,
+    )
+    .expect("retention runs with a max age");
+    // The startup pass needs the connection. Let it finish first.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    // The only connection stays checked out, so the tick waits for it.
+    let busy = pool.get().await.expect("check out the only connection");
+    runtime.run_now();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bumped = bump_generation(&mut conn, shard, "failover", "test").await;
+    drop(busy);
+    runtime.shutdown();
+    assert!(
+        bumped.is_ok(),
+        "a retention tick parked on the pool must not hold the bump off: {bumped:?}"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.

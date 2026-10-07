@@ -1675,6 +1675,51 @@ mod db {
     /// The error a pass gets when its fence guard loses its session.
     const FENCE_PASS_LOST: &str = "the DR fence session ended, so the pass stopped. A fence \
                                    bump can commit after that point. Run the pass again.";
+    /// The error a pass gets when [`fenced_checkout`] gives up on a pool.
+    const FENCE_PASS_ABANDONED: &str = "a fenced pass could not check out a pooled connection \
+                                        in time, so it released its DR fence guards. The next \
+                                        pass tries again.";
+
+    /// The longest a checkout waits inside a pass that holds fence guards
+    /// (issue #1823). It stays below the bump's lock timeout, so a pass
+    /// parked on an exhausted pool cannot hold a bump off.
+    pub const FENCED_CHECKOUT_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+    tokio::task_local! {
+        /// Set while [`run_fenced_pass`] runs a pass under guards. A
+        /// [`fenced_checkout`] that times out cancels it, and the pass is
+        /// abandoned so that its guards drop (issue #1823).
+        static PASS_ABANDON: tokio_util::sync::CancellationToken;
+    }
+
+    /// Check out a pooled connection inside a fenced pass (issue #1823).
+    ///
+    /// The guards of a pass hold a shared pass lock, and a bump needs it
+    /// exclusive. A checkout that waits on an exhausted pool would hold the
+    /// bump off without writing. So inside a pass that [`run_fenced_pass`]
+    /// runs under guards, this waits at most [`FENCED_CHECKOUT_BOUND`]. On
+    /// timeout it abandons the whole pass, so its guards drop. Outside such a
+    /// pass, it waits as `pool.get()` does.
+    ///
+    /// # Errors
+    ///
+    /// The pool's error, or [`crate::error::HarvestError::PoolAcquireTimeout`]
+    /// when the bound runs out.
+    pub async fn fenced_checkout(
+        pool: &crate::worker::DbPool,
+    ) -> HarvestResult<crate::pool::PooledConn> {
+        let Ok(abandon) = PASS_ABANDON.try_with(Clone::clone) else {
+            return pool
+                .get()
+                .await
+                .map_err(|error| crate::error::HarvestError::Database(error.to_string()));
+        };
+        let checkout = crate::pool::acquire(pool, FENCED_CHECKOUT_BOUND).await;
+        if checkout.is_err() {
+            abandon.cancel();
+        }
+        checkout
+    }
     /// How often a fence guard pings its session (issue #1823). The ping
     /// keeps an idle proxy from closing it, and finds a lost session.
     const FENCE_PASS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1799,7 +1844,8 @@ mod db {
     ///
     /// A lost session frees the pass lock, so a bump can commit. This then
     /// drops `pass`, and the pass stops before its next write. With no
-    /// guard, the pass runs to its end.
+    /// guard, the pass runs to its end. A [`fenced_checkout`] inside `pass`
+    /// that times out abandons it the same way.
     ///
     /// A dropped pass can leave a transaction open on a pooled connection.
     /// The pool discards a connection in a transaction state, so the server
@@ -1827,10 +1873,15 @@ mod db {
         if lost.is_empty() {
             return Ok(pass.await);
         }
+        let abandon = tokio_util::sync::CancellationToken::new();
+        let pass = PASS_ABANDON.scope(abandon.clone(), pass);
         tokio::select! {
             biased;
             _ = futures::future::select_all(lost) => Err(
                 crate::error::HarvestError::Database(FENCE_PASS_LOST.to_string()),
+            ),
+            () = abandon.cancelled() => Err(
+                crate::error::HarvestError::Database(FENCE_PASS_ABANDONED.to_string()),
             ),
             output = pass => Ok(output),
         }
@@ -3790,13 +3841,13 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    FENCE_GUARD_LIMIT, FencePassGuard, advance_sequences_after_promotion,
+    FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, advance_sequences_after_promotion,
     assert_admin_write_authority, assert_database_fence, assert_fence, assert_fence_group,
     begin_fenced_group, begin_fenced_groups, begin_fenced_pass, begin_fenced_pass_at,
     begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
-    ensure_generation_row, freeze_generation_rows_on, measure_rpo, pin_process_fence,
-    pin_worker_fence, probe_dr_markers, query_replication_status, record_replication_heartbeat,
-    resolve_held, run_fenced_pass,
+    ensure_generation_row, fenced_checkout, freeze_generation_rows_on, measure_rpo,
+    pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
+    record_replication_heartbeat, resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]

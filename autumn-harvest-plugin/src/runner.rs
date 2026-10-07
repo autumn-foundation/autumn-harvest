@@ -1161,6 +1161,13 @@ impl HarvestRunner {
             } else {
                 shard_id
             };
+            // The connection comes first, so a sync that waits for one holds
+            // no fence barrier and cannot block a bump.
+            let mut conn = shard_pool.get().await.map_err(|e| {
+                AutumnError::service_unavailable_msg(format!(
+                    "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
+                ))
+            })?;
             // The sync rewrites a database-wide table, so it guards every
             // pinned shard colocated on this database too.
             let fence = autumn_harvest::replication::begin_fenced_group(shard_pool, fence_key)
@@ -1170,11 +1177,6 @@ impl HarvestRunner {
                         "refusing to start: shard {shard_id} is fenced: {error}"
                     ))
                 })?;
-            let mut conn = shard_pool.get().await.map_err(|e| {
-                AutumnError::service_unavailable_msg(format!(
-                    "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
-                ))
-            })?;
             // A lost fence session stops the sync. See `run_fenced_pass`.
             autumn_harvest::replication::run_fenced_pass(
                 &fence,

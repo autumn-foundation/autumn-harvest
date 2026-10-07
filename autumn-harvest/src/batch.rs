@@ -752,20 +752,16 @@ mod db {
             })
     }
 
-    /// The longest a checkout before a write waits while the executor pass
-    /// holds its fence (issue #1823). It stays below the bump's lock timeout,
-    /// so a pass parked on an exhausted pool cannot hold a bump off.
-    const FENCED_CHECKOUT_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
-
     /// Check out a connection inside the executor pass (issue #1823).
     ///
     /// The pass holds a fence barrier on every pinned shard. With fencing on,
-    /// this checkout waits at most [`FENCED_CHECKOUT_BOUND`]. A pass that gets
+    /// this checkout waits at most
+    /// [`crate::replication::FENCED_CHECKOUT_BOUND`]. A pass that gets
     /// no connection then fails, its guards drop, and the next tick tries
     /// again. With fencing off, the checkout waits as before.
     async fn executor_conn(pool: &DbPool) -> HarvestResult<crate::pool::PooledConn> {
         if crate::replication::FenceRegistry::is_enabled() {
-            return crate::pool::acquire(pool, FENCED_CHECKOUT_BOUND).await;
+            return crate::pool::acquire(pool, crate::replication::FENCED_CHECKOUT_BOUND).await;
         }
         pool.get()
             .await
