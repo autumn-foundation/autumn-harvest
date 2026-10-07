@@ -604,7 +604,18 @@ pub fn history_fingerprint(events: &[crate::event::WorkflowEvent]) -> String {
         hasher.update([0u8]);
     }
 
-    format!("{:x}", hasher.finalize())
+    lower_hex(&hasher.finalize())
+}
+
+/// Render a digest as lowercase hex, two digits per byte.
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Hash the raw, still-encoded `harvest_events` rows a copy verified
@@ -623,7 +634,7 @@ pub fn raw_history_fingerprint(raw: &serde_json::Value) -> String {
         canonical.extend_from_slice(raw.to_string().as_bytes());
     }
     hasher.update(&canonical);
-    format!("{:x}", hasher.finalize())
+    lower_hex(&hasher.finalize())
 }
 
 #[cfg(feature = "db")]

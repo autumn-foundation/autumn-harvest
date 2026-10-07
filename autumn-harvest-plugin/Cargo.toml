@@ -138,12 +138,12 @@ async-trait = { version = "0.1", optional = true }
 # Collision-resistant digest for the bounded idempotency-key encoding, so a
 # pathological topic/key component can never blow the 512-byte start-key cap
 # (the issue #699 `bound_key_component` precedent).
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 # Kafka client. `cmake-build` builds librdkafka from the vendored source, so
 # the adapter needs no system librdkafka. NOTE: librdkafka's build requires
 # libcurl headers (`libcurl4-openssl-dev` on Debian/Ubuntu) even with
 # `WITH_CURL=0` — see the CI step added alongside this feature.
-rdkafka = { version = "0.38", default-features = false, features = ["cmake-build", "libz", "tokio"], optional = true }
+rdkafka = { version = "0.39", default-features = false, features = ["cmake-build", "libz", "tokio"], optional = true }
 # SQS client. `aws-sdk-sqs` requests `default-https-client` rather than its
 # own `rustls` feature deliberately: `rustls` there maps to
 # `aws-smithy-runtime/tls-rustls`, which pulls the legacy hyper-0.14/h2-0.3.x/

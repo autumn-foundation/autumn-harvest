@@ -43,9 +43,9 @@ sources.
 
 | Dimension | autumn-harvest | Temporal | DBOS | Inngest | Hatchet | Restate |
 |---|---|---|---|---|---|---|
-| **Backing store** | Postgres only ([sharding](sharding.md)) | DB + Visibility store | Postgres only | Postgres + Redis | Postgres (+ opt. RabbitMQ) | Embedded (RocksDB) |
+| **Backing store** | Postgres ([sharding](sharding.md)); embedded single-writer [SQLite](sqlite-backend.md) for edge use | DB + Visibility store | Postgres only | Postgres + Redis | Postgres (+ opt. RabbitMQ) | Embedded (RocksDB) |
 | **Self-host shape** | Embed in app / standalone runner | Server cluster + DB(s) | Library in app | Server binary + PG/Redis | Engine + Postgres | Single binary |
-| **SDK languages** | Rust only ([planned](https://github.com/autumn-foundation/autumn-harvest/issues/955): TS/Py) | 7 SDKs | Py/TS/Go/Java | TS/Py/Go | Py/TS/Go(/Ruby) | TS/Java/Kotlin/Py/Go/Rust |
+| **SDK languages** | Rust only (+ TypeScript management-API client) | 7 SDKs | Py/TS/Go/Java | TS/Py/Go | Py/TS/Go(/Ruby) | TS/Java/Kotlin/Py/Go/Rust |
 | **Model** | Code-first + DAG ([#256](https://github.com/autumn-foundation/autumn-harvest/issues/256)) | Imperative WF+Activity | Decorated WF+steps | Event/step functions | Queue/DAG/durable | Services/Objects/WF |
 | **Determinism tooling** | Guardrails + replayer + [ND-block #603](https://github.com/autumn-foundation/autumn-harvest/issues/603) | Replay + replay tests | Checkpoint/resume | Step memoization | Event-log replay | Journal replay |
 | **Managed cloud** | None (by design) | Temporal Cloud | DBOS Cloud | Inngest Cloud | Hatchet Cloud | Restate Cloud |
@@ -64,7 +64,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Requirement |
 |---|---|
-| **autumn-harvest** | **Postgres only.** No broker, no message queue, no separate server cluster — the task queue is `SELECT … FOR UPDATE SKIP LOCKED` and dispatch wakeups are Postgres LISTEN/NOTIFY (`notify.rs`). Runs as a companion to the [Autumn](https://github.com/autumn-foundation/autumn) web framework or standalone via `HarvestRunner`. Optional [sharding](sharding.md) spreads state across N independent Postgres databases. |
+| **autumn-harvest** | **Postgres only.** No broker, no message queue, no separate server cluster — the task queue is `SELECT … FOR UPDATE SKIP LOCKED` and dispatch wakeups are Postgres LISTEN/NOTIFY (`notify.rs`). Runs as a companion to the [Autumn](https://github.com/autumn-foundation/autumn) web framework or standalone via `HarvestRunner`. Optional [sharding](sharding.md) spreads state across N independent Postgres databases. An optional Redis Streams [dispatch channel](operations/redis-dispatch.md) carries task references only; Postgres stays the source of truth. A separate crate, [`autumn-harvest-sqlite`](sqlite-backend.md), runs the same replay engine on one SQLite file for single-writer edge use. |
 | Temporal | A persistence DB (Cassandra / MySQL / PostgreSQL) **plus** a separate Visibility store (Elasticsearch recommended for production; Cassandra can't back Visibility). ([docs](https://docs.temporal.io/temporal-service/persistence), [Visibility](https://docs.temporal.io/self-hosted-guide/visibility)) |
 | DBOS | PostgreSQL only; durable queues and step checkpoints live in Postgres, no separate broker. ([docs](https://docs.dbos.dev/architecture)) |
 | Inngest | Server needs external **Postgres + Redis** for production (SQLite + in-memory Redis in dev mode). ([docs](https://www.inngest.com/docs/self-hosting)) |
@@ -86,7 +86,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | SDKs |
 |---|---|
-| **autumn-harvest** | **Rust only.** Non-Rust systems participate as _callers_ via the HTTP [management API](management-api.md), the [workflow-result endpoint (#527)](https://github.com/autumn-foundation/autumn-harvest/issues/527), published input/output [JSON Schema (#373)](https://github.com/autumn-foundation/autumn-harvest/issues/373), and [MCP tools (#597)](https://github.com/autumn-foundation/autumn-harvest/issues/597) ([docs](mcp-tools.md)) — but there is no non-Rust worker/author SDK. **Planned:** a TypeScript activity-worker SDK ([#959](https://github.com/autumn-foundation/autumn-harvest/issues/959)) and TypeScript + Python management-API client SDKs ([#955](https://github.com/autumn-foundation/autumn-harvest/issues/955)). |
+| **autumn-harvest** | **Rust only.** Non-Rust systems participate as _callers_ via the HTTP [management API](management-api.md), the [workflow-result endpoint (#527)](https://github.com/autumn-foundation/autumn-harvest/issues/527), published input/output [JSON Schema (#373)](https://github.com/autumn-foundation/autumn-harvest/issues/373), and [MCP tools (#597)](https://github.com/autumn-foundation/autumn-harvest/issues/597) ([docs](mcp-tools.md)) — but there is no non-Rust worker/author SDK. A typed [TypeScript management-API client](../clients/typescript/README.md) generated from the OpenAPI document ships with each GitHub release after 0.6.0 (#1616). Non-Rust worker SDKs are out of scope by [ADR 0002](adr/0002-rust-native-execution-boundary.md); the TypeScript activity-worker SDK ([#959](https://github.com/autumn-foundation/autumn-harvest/issues/959)) and the TypeScript + Python client SDKs ([#955](https://github.com/autumn-foundation/autumn-harvest/issues/955)) were closed as not planned. |
 | Temporal | 7 official SDKs: Go, Java, PHP, Python, TypeScript, .NET, Ruby. ([docs](https://docs.temporal.io/encyclopedia/temporal-sdks)) |
 | DBOS | Python, TypeScript, Go, Java. ([docs](https://docs.dbos.dev/)) |
 | Inngest | TypeScript, Python, Go (official); Elixir and Rust listed as in development. ([blog](https://www.inngest.com/blog/cross-language-support-with-new-sdks)) |
@@ -141,7 +141,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Surface |
 |---|---|
-| **autumn-harvest** | An [OpenTelemetry trace contract (ADR-0001)](adr/0001-otel-trace-contract.md) ([#136](https://github.com/autumn-foundation/autumn-harvest/issues/136)) covering 8 named span kinds; a bounded-cardinality metric catalogue with a `metrics-rs` adapter; a [starter alert pack + runbooks](alerts/); a [Grafana dashboard pack (#754)](https://github.com/autumn-foundation/autumn-harvest/issues/754); a per-execution [timeline API (#739)](https://github.com/autumn-foundation/autumn-harvest/issues/739); a [DAG run graph view (#690)](https://github.com/autumn-foundation/autumn-harvest/issues/690); and a rolled-up [health summary endpoint (#679)](https://github.com/autumn-foundation/autumn-harvest/issues/679). The embedded **Vantage UI is partial** — the [Workers tab (#142)](https://github.com/autumn-foundation/autumn-harvest/issues/142), a DLQ inspection page with a summary view ([#226](https://github.com/autumn-foundation/autumn-harvest/issues/226) / [#385](https://github.com/autumn-foundation/autumn-harvest/issues/385)), a [schedules management page (#333)](https://github.com/autumn-foundation/autumn-harvest/issues/333), and [DAG list + detail pages (#426)](https://github.com/autumn-foundation/autumn-harvest/issues/426) have shipped; a rendered DAG **graph** visualization is still Phase 4 (see [Where harvest is behind](#where-harvest-is-behind)). See [telemetry](telemetry.md). |
+| **autumn-harvest** | An [OpenTelemetry trace contract (ADR-0001)](adr/0001-otel-trace-contract.md) ([#136](https://github.com/autumn-foundation/autumn-harvest/issues/136)) covering 8 named span kinds; a bounded-cardinality metric catalogue with a `metrics-rs` adapter; a [starter alert pack + runbooks](alerts/); a [Grafana dashboard pack (#754)](https://github.com/autumn-foundation/autumn-harvest/issues/754); a per-execution [timeline API (#739)](https://github.com/autumn-foundation/autumn-harvest/issues/739); a [DAG run graph view (#690)](https://github.com/autumn-foundation/autumn-harvest/issues/690); and a rolled-up [health summary endpoint (#679)](https://github.com/autumn-foundation/autumn-harvest/issues/679). The embedded **Vantage UI is partial** — the [Workers tab (#142)](https://github.com/autumn-foundation/autumn-harvest/issues/142), a DLQ inspection page with a summary view ([#226](https://github.com/autumn-foundation/autumn-harvest/issues/226) / [#385](https://github.com/autumn-foundation/autumn-harvest/issues/385)), a [schedules management page (#333)](https://github.com/autumn-foundation/autumn-harvest/issues/333), and [DAG list + detail pages (#426)](https://github.com/autumn-foundation/autumn-harvest/issues/426) have shipped, and the DAG detail page renders each run as an inline SVG node/edge graph. The UI still trails the competitors' (see [Where harvest is behind](#where-harvest-is-behind)). See [telemetry](telemetry.md). |
 | Temporal | Open-source Web UI; SDK metrics (Prometheus); tracing/OTel via SDK interceptors. Temporal Cloud adds a Prometheus-compatible OpenMetrics endpoint. ([docs](https://docs.temporal.io/references/sdk-metrics)) |
 | DBOS | OpenTelemetry traces per workflow/step; Prometheus-compatible metrics endpoint; Conductor dashboards of active/past workflows + queued tasks. ([docs](https://www.dbos.dev/dbos-conductor)) |
 | Inngest | Built-in Dashboard UI with step-level observability (queue delay, step timing, flow control) + event history. Explicit OTel export is **(unverified)** in this pass. ([docs](https://www.inngest.com/docs/self-hosting)) |
@@ -255,10 +255,9 @@ where one exists.
 - **Rust-only — no polyglot SDK.** If your workflows or activity workers aren't in
   Rust, harvest can't author them today. Non-Rust systems can only be _callers_
   (HTTP API, MCP, JSON Schema). This is the single biggest adoption gate versus
-  Temporal (7 SDKs) and Restate (6). Planned:
-  [#959](https://github.com/autumn-foundation/autumn-harvest/issues/959) (TypeScript
-  activity-worker SDK), [#955](https://github.com/autumn-foundation/autumn-harvest/issues/955)
-  (TypeScript + Python management-API clients).
+  Temporal (7 SDKs) and Restate (6). A TypeScript management-API client ships
+  (#1616), but it only calls the API. [ADR 0002](adr/0002-rust-native-execution-boundary.md)
+  keeps workers Rust-only, so this gap stays open by design.
 - **DR is operator-driven, not automatic.** Each shard replicates to a standby
   region, and an operator runs a fenced failover
   ([cross-region DR](cross-region-dr.md),
@@ -280,9 +279,8 @@ where one exists.
   ([#226](https://github.com/autumn-foundation/autumn-harvest/issues/226) /
   [#385](https://github.com/autumn-foundation/autumn-harvest/issues/385)), a
   [schedules management page (#333)](https://github.com/autumn-foundation/autumn-harvest/issues/333),
-  and [DAG list + detail pages (#426)](https://github.com/autumn-foundation/autumn-harvest/issues/426),
-  but a rendered DAG **graph** visualization (a node/edge diagram) is still Phase 4
-  work in progress. Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all
+  [DAG list + detail pages (#426)](https://github.com/autumn-foundation/autumn-harvest/issues/426)
+  and a rendered DAG run graph. Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all
   ship more mature UIs today.
 - **Younger project, smaller ecosystem.** harvest is pre-1.0 (0.x, breaking
   changes in minor versions) with a smaller community, fewer third-party
@@ -312,6 +310,14 @@ where one exists.
   substitute — it carries hardware, configuration and staleness this project
   cannot vouch for, and its unit is usually per-action or per-state-transition
   rather than per-workflow.
+
+  One same-box measurement now exists, and it goes against harvest.
+  [Assay #11](assays/0011-harvest-vs-temporal-single-box.md) ran harvest's
+  Postgres mode and Temporal's Go SDK on one 4-core box, against one Postgres
+  server, at one 3-activity shape. Harvest sustained 5.47 workflows/sec.
+  Temporal sustained 43.29. That is one shape on one box, so the tables above
+  still carry no performance cell. Read the assay for what the result may and
+  may not be read to mean.
 
 ---
 
