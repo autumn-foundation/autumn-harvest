@@ -2815,6 +2815,46 @@ async fn an_unprobeable_shard_reuses_the_process_pin() {
     );
 }
 
+/// A peer row that a pin discovered reuses that pin too (issue #1823). The
+/// pin was taken through this pool, so a later worker that targets the peer
+/// and cannot probe it starts on the existing pin.
+#[tokio::test]
+async fn an_unprobeable_peer_reuses_the_discovered_pin() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("peerreuse");
+    let (own, peer) = (ShardId::new(0), ShardId::new(5));
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, own).await.unwrap();
+    let peer_generation = ensure_generation_row(&mut conn, peer).await.unwrap();
+    drop(conn);
+    let pool = dr_pool(&url);
+    let runner_targets = Some((vec![(own, pool.clone())], own));
+    pin_process_fence(DrFencing::Auto, DR_PREFIX, runner_targets, &pool)
+        .await
+        .expect("the runner pins its shard and discovers the peer");
+    assert_eq!(FenceRegistry::expected(peer), Some(peer_generation));
+    // The outage: the database goes away.
+    let admin = admin_url().await.expect("admin url");
+    let mut admin_conn = connect(&admin).await;
+    diesel::sql_query(format!("DROP DATABASE \"{db}\" WITH (FORCE)"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("drop the database");
+
+    // The process keeps its default shard. Only the target is the peer.
+    let targets = Some((vec![(peer, pool.clone())], own));
+    let started = pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &[]).await;
+
+    let fenced: Vec<ShardId> = started
+        .expect("the peer pin was taken through this pool")
+        .0
+        .expect("the peer stays fenced")
+        .into_iter()
+        .map(|(shard, _)| shard)
+        .collect();
+    assert_eq!(fenced, vec![peer]);
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.

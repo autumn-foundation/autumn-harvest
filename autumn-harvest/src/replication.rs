@@ -2980,6 +2980,13 @@ mod db {
         for (shard, pool) in &fenced {
             record_pin_pool(*shard, pool);
         }
+        // A peer row was pinned through the pool of the target that found it.
+        // A later worker that targets the peer can then reuse the pin there.
+        for (row, target) in &peers {
+            if let Some((_, pool)) = fenced.iter().find(|(shard, _)| shard == target) {
+                record_pin_pool(*row, pool);
+            }
+        }
         reservation.keep();
         Ok((Some(fenced), held))
     }
