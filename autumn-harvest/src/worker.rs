@@ -1264,6 +1264,7 @@ impl HandlerRegistry {
             continue_as_new_threshold: self.history_policy.continue_as_new_threshold(),
             event_hard_cap: self.history_policy.event_hard_cap(),
             byte_hard_cap: self.history_policy.byte_hard_cap(),
+            history_bloat_warn_fraction: self.history_policy.history_bloat_warn_fraction(),
             continue_as_new_deadline_fraction: self
                 .history_policy
                 .continue_as_new_deadline_fraction(),
@@ -16826,6 +16827,32 @@ async fn defer_for_adaptive_limit(
     defer_unstarted_claim(conn, task, delay, "adaptive-limit deferral").await
 }
 
+/// [`defer_for_adaptive_limit`] on a pooled connection (issue #1815). The
+/// acquire and the write give one result, so the caller counts a failure of
+/// either as a failed setup step.
+async fn defer_adaptive_limited_task(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    activity: &ActivityInfo,
+    delay: Duration,
+) -> HarvestResult<bool> {
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+    defer_for_adaptive_limit(&mut conn, task, activity, delay).await
+}
+
+/// Put a task that an open breaker short-circuits back to `PENDING` on a
+/// pooled connection (issues #1809, #1815). The acquire and the write give
+/// one result, so the caller counts a failure of either as a failed setup
+/// step.
+async fn defer_open_circuit_task(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    delay: chrono::Duration,
+) -> HarvestResult<queue::ClaimWrite> {
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+    queue::defer_claimed_task_for_open_circuit(&mut conn, &claim_of_task(task)?, delay).await
+}
+
 /// Put a claimed activity that did not start back to `PENDING`, `delay`
 /// past the database clock. See `queue::defer_claimed_retry_for_budget`.
 ///
@@ -18191,10 +18218,14 @@ async fn process_activity_task(
         && policy.open_mode == crate::policy::CircuitOpenMode::Defer
     {
         let delay = circuit_defer_delay(retry_after, policy.cooldown, task);
-        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-        match queue::defer_claimed_task_for_open_circuit(&mut conn, &claim_of_task(task)?, delay)
-            .await?
-        {
+        // Issue #1815: a deferral that failed to persist is a failed setup
+        // write, as for the retry budget below.
+        match count_setup_failure(
+            task_outcomes,
+            deferred_failure,
+            outlier_clock,
+            defer_open_circuit_task(pool, task, delay).await,
+        )? {
             queue::ClaimWrite::Applied => registry
                 .telemetry()
                 .metrics
@@ -18218,8 +18249,13 @@ async fn process_activity_task(
                 if let Some(token) = circuit_token {
                     circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
                 }
-                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-                if defer_for_adaptive_limit(&mut conn, task, activity, retry_after).await? {
+                // Issue #1815: a failed deferral write is a failed setup step.
+                if count_setup_failure(
+                    task_outcomes,
+                    deferred_failure,
+                    outlier_clock,
+                    defer_adaptive_limited_task(pool, task, activity, retry_after).await,
+                )? {
                     // Count only a deferral that persisted, as the retry
                     // budget does.
                     registry
@@ -40651,6 +40687,29 @@ mod tests {
         );
     }
 
+    /// Issue #1815: near the warning threshold, a workflow task counts its
+    /// history and marks the warning after it persists. That work is part of
+    /// the task latency, so the warning fraction is part of the cohort.
+    #[test]
+    fn payload_policy_holds_the_history_bloat_warning() {
+        use crate::context::WorkflowHistoryPolicy;
+        let policy = |history: WorkflowHistoryPolicy| {
+            HandlerRegistry::new(vec![], vec![])
+                .with_history_policy(history)
+                .payload_policy()
+        };
+        let base = WorkflowHistoryPolicy::default();
+        assert_ne!(
+            policy(base.with_history_bloat_warn_fraction(0.5)),
+            policy(base.with_history_bloat_warn_fraction(0.0)),
+            "the warning on and off"
+        );
+        assert_eq!(
+            policy(base.with_history_bloat_warn_fraction(0.5)),
+            policy(base.with_history_bloat_warn_fraction(0.5))
+        );
+    }
+
     /// Issue #1815: the task context carries the declarative query and update
     /// handlers of its workflow. A worker without a handler fails a request
     /// that a peer runs, so the handlers are part of the cohort.
@@ -45873,6 +45932,33 @@ mod tests {
             })),
             None
         );
+    }
+
+    /// Issue #1815: the open-circuit and adaptive-limit deferrals write
+    /// before the handler, as the retry-budget and rate-limit deferrals do. A
+    /// failed write is a failed setup step, so each deferral result passes
+    /// through `count_setup_failure`. A bare `?` would publish a clean window
+    /// for a worker that keeps losing these writes. The paths need a failing
+    /// database, so this checks the source.
+    #[test]
+    fn the_pre_handler_deferrals_count_a_failed_write() {
+        let src = include_str!("worker.rs").replace("\r\n", "\n");
+        let start = src
+            .find("async fn process_activity_task(")
+            .expect("process_activity_task exists");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("process_activity_task ends")];
+        for helper in ["defer_open_circuit_task(", "defer_adaptive_limited_task("] {
+            let at = body
+                .find(helper)
+                .unwrap_or_else(|| panic!("{helper} is called"));
+            let call = &body[..at];
+            let wrapper = call.rfind("count_setup_failure(").expect("a wrapper");
+            assert!(
+                !call[wrapper..].contains(';'),
+                "{helper} must be an argument of count_setup_failure"
+            );
+        }
     }
 
     /// Issue #1815: a handler success that does not finalize counts as a

@@ -39,7 +39,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - A failed activity attempt counts as a failure. So does an attempt that an
   open circuit breaker rejects, because the breaker belongs to the worker.
   An activity that succeeds but does not finalize also counts as a failure.
-  So does an activity whose setup loses its database write. When that write
+  So does an activity whose setup loses its database write. A failed
+  deferral write counts too, for the retry budget, the rate limit, an open
+  breaker in defer mode and the adaptive limit. When that write
   fails with a transient database error, the dispatch loop releases the
   claim first. The attempt then counts with the release time, and not at all
   when a peer took the claim.
