@@ -320,6 +320,11 @@ The guard fails safe: when it cannot read, it does not abort.
   `ramp_caller_target_id`. One policy fan-out can give one caller id to
   ramps with different targets on different pools. An abort of one target
   then leaves the other alone.
+- On a pool where the guard clears the ramp of a request, it also retires
+  that request's own id. A later ramp can take the place of the aborted
+  one. A late retry of a keyed policy request then cannot drop that newer
+  ramp. An exact retry, whose build and deployment the pool already holds,
+  gets `200` and changes nothing. A changed retry gets `409 Conflict`.
 - A fan-out can miss a pool, so that pool holds no row of the aborted ramp.
   The abort marker keeps the caller id as `caller`. Right after the clear,
   and again on each pass while the marker lives, the guard retires it on

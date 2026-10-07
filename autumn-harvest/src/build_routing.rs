@@ -437,13 +437,16 @@ pub(crate) fn ramp_generation_id_sql(id: &str, queue: &str, base: &str, target: 
 /// report ledger of this database.
 ///
 /// A later writer can supersede this request on the pool. It then retires
-/// the request's `ramp_id`. A late retry of the request is refused, so it
-/// cannot drop or re-id the newer ramp of that writer.
+/// the request's `ramp_id`. The ramp guard does the same when it clears the
+/// ramp that the request wrote. A late retry of the request then changes no
+/// ramp, so it cannot drop or re-id a newer one. A retry whose build and
+/// deployment the row already holds is a no-op. Any other retry is refused.
 ///
 /// # Errors
 ///
 /// Returns `HarvestError::Database` on failure, and `HarvestError::Config`
-/// when a later write superseded this request on the pool.
+/// when a later write superseded this request on the pool and the row holds
+/// another build or deployment.
 #[cfg(feature = "db")]
 pub async fn set_build_policy_with_ramp_id(
     conn: &mut AsyncPgConnection,
@@ -457,7 +460,15 @@ pub async fn set_build_policy_with_ramp_id(
         .run(async |conn| {
             lock_ramp_generations(conn, queue_name).await?;
             if request_retired(conn, queue_name, ramp_id).await? {
-                return Err(superseded_policy_error(queue_name));
+                return match get_build_policy(conn, queue_name).await? {
+                    Some(policy)
+                        if policy.build_id == build_id
+                            && policy.deployment_name.as_deref() == deployment_name =>
+                    {
+                        Ok(policy)
+                    }
+                    _ => Err(superseded_policy_error(queue_name)),
+                };
             }
             let old = current_ramp_id(conn, queue_name).await?;
             let policy = upsert_build_policy_with_ramp_id(
@@ -839,9 +850,10 @@ fn generation_aborted_sql(id: &str, caller_target: &str) -> String {
 /// pool (issue #1814).
 ///
 /// A writer retires the raw request id only when it replaces or clears what
-/// that request wrote. The guard retires another id, the
-/// [`ramp_caller_target_id`]. So a hit means a later write superseded the
-/// request here.
+/// that request wrote. The ramp guard retires it only on a pool where it
+/// cleared the ramp of that request. On every pool it retires another id,
+/// the [`ramp_caller_target_id`]. So a hit means a later write superseded
+/// the request here.
 #[cfg(feature = "db")]
 async fn request_retired(
     conn: &mut AsyncPgConnection,

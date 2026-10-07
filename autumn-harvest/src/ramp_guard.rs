@@ -423,11 +423,16 @@ pub const fn ramp_outcome_stats_query() -> &'static str {
 ///
 /// The same statement retires the row's `ramp_caller_id`. A retry after a
 /// base change derives another stored id, so only the caller id refuses it.
-/// It retires the [`ramp_caller_target_id`] of the caller id and the target,
-/// not the raw caller id. One policy fan-out can give one caller id to two
-/// targets, and an abort of one must not refuse the other. The marker keeps
-/// that id as `caller`. A later pass retires it on every pool, also on a pool
-/// that the fan-out missed. The subquery is the SQL form of that id.
+/// It retires the [`ramp_caller_target_id`] of the caller id and the target.
+/// The marker keeps that id as `caller`. A later pass retires it on every
+/// pool, also on a pool that the fan-out missed. The subquery is the SQL form
+/// of that id.
+///
+/// It also retires the raw caller id, but on this pool only. The clear
+/// removes what that request wrote here. A later ramp can take its place, and
+/// a late retry of the request must not drop it. One policy fan-out can give
+/// one caller id to two targets on two pools. So the raw id is never retired
+/// on every pool, and an abort of one target does not refuse the other.
 ///
 /// [`ramp_caller_target_id`]: crate::build_routing::ramp_caller_target_id
 /// The retire reads the output of the clear, so it retires an id only when
@@ -450,14 +455,17 @@ pub const fn abort_ramp_query() -> &'static str {
                    || '/' || octet_length(convert_to(queue_name, 'UTF8')) || ':' || queue_name \
                    || '/0:' \
                    || '/' || octet_length(convert_to(target_build_id, 'UTF8')) || ':' \
-                   || target_build_id, 'UTF8')) FROM 1 FOR 16), 'hex')::uuid AS caller \
+                   || target_build_id, 'UTF8')) FROM 1 FOR 16), 'hex')::uuid AS caller, \
+                   ramp_caller_id AS raw \
                FROM harvest_build_policies WHERE queue_name = $1) AS old \
          WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
            AND updated_at = $4 \
-         RETURNING queue_name, old.caller, (ramp_aborted -> 0 ->> 'id')::uuid AS marker_id \
+         RETURNING queue_name, old.caller, old.raw, \
+                   (ramp_aborted -> 0 ->> 'id')::uuid AS marker_id \
      ), retired AS ( \
          INSERT INTO harvest_ramp_retired_ids (queue_name, ramp_id) \
          SELECT queue_name, caller FROM cleared WHERE caller IS NOT NULL \
+         UNION SELECT queue_name, raw FROM cleared WHERE raw IS NOT NULL \
          ON CONFLICT (queue_name, ramp_id) DO NOTHING \
      ) \
      SELECT marker_id FROM cleared"
@@ -1357,6 +1365,22 @@ async fn record_abort_tombstones(
             ))
             .bind::<Text, _>(queue)
             .bind::<Array<diesel::sql_types::Uuid>, _>(ramp_ids)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+            // The clear below removes what a request wrote on this pool, so
+            // its raw id is retired here. A late retry of it then cannot drop
+            // a newer ramp.
+            diesel::sql_query(format!(
+                "INSERT INTO harvest_ramp_retired_ids (queue_name, ramp_id) \
+                 SELECT queue_name, ramp_caller_id FROM harvest_build_policies \
+                 WHERE queue_name = $1 AND ramp_caller_id IS NOT NULL \
+                   AND (ramp_id = ANY($2::uuid[]) OR {caller_target} = ANY($3::uuid[])) \
+                 ON CONFLICT (queue_name, ramp_id) DO NOTHING"
+            ))
+            .bind::<Text, _>(queue)
+            .bind::<Array<diesel::sql_types::Uuid>, _>(ramp_ids)
+            .bind::<Array<diesel::sql_types::Uuid>, _>(callers)
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;

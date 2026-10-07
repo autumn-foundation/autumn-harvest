@@ -1938,6 +1938,24 @@ async fn the_tombstone_write_clears_an_aborted_ramp_on_a_missed_pool() {
         !ramp_is_active(&mut conn_2).await,
         "the tombstone write cleared the aborted ramp on pool 2"
     );
+    assert!(
+        id_retired(&mut conn_2, ramp_id).await,
+        "the clear retires the request id of the cleared write"
+    );
+}
+
+/// Whether `ramp_id` is a retired id of the test queue.
+async fn id_retired(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) -> bool {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_ramp_retired_ids \
+         WHERE queue_name = $1 AND ramp_id = $2",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
+    .get_result::<CountRow>(conn)
+    .await
+    .expect("read retired ids")
+    .n > 0
 }
 
 /// The guard gives a ramp with no `ramp_id` the report id on every pool
@@ -2474,6 +2492,55 @@ async fn a_keyed_percent_change_keeps_its_ramp_id() {
     assert_eq!(
         policy_ramp_id(&mut conn).await,
         Some(ramp_generation_id(caller, QUEUE, BUILD_A, BUILD_B))
+    );
+}
+
+/// The guard aborts the ramp that a policy write kept. A newer ramp request
+/// then ramps to the same target. A late retry of the policy write keeps
+/// that newer ramp. An exact retry changes nothing, and a changed one is
+/// refused.
+#[tokio::test]
+async fn a_policy_retry_after_an_abort_keeps_a_newer_ramp() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_ramp_with_id(&mut conn, uuid::Uuid::new_v4()).await;
+    let request = uuid::Uuid::new_v4();
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, request)
+        .await
+        .expect("policy write keeps the ramp");
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_C, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    let newer = uuid::Uuid::new_v4();
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, newer)
+        .await
+        .expect("newer ramp");
+    let newer_id = Some(ramp_generation_id(newer, QUEUE, BUILD_C, BUILD_B));
+
+    let retry = set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, request)
+        .await
+        .expect("the exact retry changes nothing");
+    assert_eq!(retry.target_build_id.as_deref(), Some(BUILD_B));
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        newer_id,
+        "the newer ramp stays"
+    );
+
+    let changed =
+        set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, Some("late"), request).await;
+    assert!(
+        matches!(changed, Err(autumn_harvest::HarvestError::Config(_))),
+        "a changed retry is refused: {changed:?}"
+    );
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        newer_id,
+        "the newer ramp stays"
     );
 }
 
