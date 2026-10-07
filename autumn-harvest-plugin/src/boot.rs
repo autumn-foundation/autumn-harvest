@@ -67,6 +67,8 @@ pub fn mirror_built_config(api_state: &HarvestApiState, built: &mut BuiltHarvest
         .gate_cache()
         .load_shedder()
         .configure(built.load_shed.clone());
+    // Build ramp guard (issue #1814). The default config is disabled.
+    api_state.set_ramp_guard_config(built.ramp_guard);
     // Completion-callback SSRF policy (issue #605). The HTTP start route
     // validates a per-execution target against the allowlist that the scanner
     // uses at delivery time. `PreparedHarvestRuntime::build`, inside
@@ -122,6 +124,7 @@ pub struct GateRefreshRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
     load_shed: Option<JoinHandle<()>>,
+    ramp_guard: Option<JoinHandle<()>>,
 }
 
 impl GateRefreshRuntime {
@@ -131,6 +134,9 @@ impl GateRefreshRuntime {
         let _ = self.handle.await;
         if let Some(load_shed) = self.load_shed {
             let _ = load_shed.await;
+        }
+        if let Some(ramp_guard) = self.ramp_guard {
+            let _ = ramp_guard.await;
         }
     }
 }
@@ -153,6 +159,7 @@ pub fn spawn_gate_refresh(
     let cancel = shutdown.child_token();
     let inputs = LoadShedSamplerInputs::from_registry(runtime.registry());
     let load_shed = spawn_load_shed_sampler(api_state, pools, inputs, shutdown.child_token());
+    let ramp_guard = spawn_ramp_guard(api_state, pools, runtime, shutdown.child_token());
     let pool = pools.clone_inner();
     let cache = api_state.gate_cache();
     let api_state = api_state.clone();
@@ -200,7 +207,40 @@ pub fn spawn_gate_refresh(
         shutdown,
         handle,
         load_shed,
+        ramp_guard,
     }
+}
+
+/// Spawn the build ramp guard of `api_state` (issue #1814).
+///
+/// Returns `None` when the guard is disabled, so a default deployment runs no
+/// guard SQL. The guard reads each physical pool once per pass and writes its
+/// audit rows to the default pool. It takes the metrics recorder from
+/// `runtime`, so a caller can spawn it before `api_state.install(runtime)`.
+fn spawn_ramp_guard(
+    api_state: &HarvestApiState,
+    pools: &HarvestDbPool,
+    runtime: &HarvestApiRuntime,
+    cancel: CancellationToken,
+) -> Option<JoinHandle<()>> {
+    let config = api_state.ramp_guard_config();
+    if !config.is_enabled() {
+        return None;
+    }
+    let shard_pools: Vec<DbPool> = pools
+        .sharded_pool()
+        .pool_groups()
+        .into_iter()
+        .map(|(pool, _)| pool.clone())
+        .collect();
+    let metrics = Arc::clone(&runtime.registry().telemetry().metrics);
+    Some(tokio::spawn(autumn_harvest::ramp_guard::run_ramp_guard(
+        shard_pools,
+        pools.clone_inner(),
+        config,
+        metrics,
+        cancel,
+    )))
 }
 
 /// The registry data that every load-shed sample reads (issue #1794).
@@ -847,5 +887,80 @@ mod load_shed_sampler_tests {
             tripped,
             "the sampler must trip on the old breaker task without an install"
         );
+    }
+}
+
+#[cfg(test)]
+mod ramp_guard_spawn_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use autumn_harvest::ramp_guard::RampGuardConfig;
+    use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
+    use autumn_harvest::shard::ShardRouter;
+    use autumn_harvest::worker::{DbPool, HandlerRegistry};
+    use diesel_async::AsyncPgConnection;
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    use tokio_util::sync::CancellationToken;
+
+    use super::spawn_ramp_guard;
+    use crate::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
+    use crate::state::HarvestDbPool;
+
+    /// A pool that never connects: the pool is lazy, and the tests do not
+    /// need a database.
+    fn lazy_pool() -> HarvestDbPool {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://nobody@127.0.0.1:1/none",
+        );
+        let pool: DbPool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool");
+        HarvestDbPool::from(pool)
+    }
+
+    fn runtime() -> HarvestApiRuntime {
+        HarvestApiRuntime::new(
+            Arc::new(HandlerRegistry::new(vec![], vec![])),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            Some("ramp-guard-boot-test".to_owned()),
+            vec![],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+            ShardRouter::default(),
+        )
+    }
+
+    /// Issue #1814: the default config spawns no guard, so a default
+    /// deployment runs no guard SQL.
+    #[tokio::test]
+    async fn default_config_spawns_no_ramp_guard() {
+        let api_state = HarvestApiState::new();
+        let handle = spawn_ramp_guard(
+            &api_state,
+            &lazy_pool(),
+            &runtime(),
+            CancellationToken::new(),
+        );
+        assert!(handle.is_none());
+    }
+
+    /// Issue #1814: an enabled config spawns the guard loop, and a cancel
+    /// stops it.
+    #[tokio::test]
+    async fn enabled_config_spawns_a_ramp_guard_that_stops_on_cancel() {
+        let api_state = HarvestApiState::new();
+        api_state
+            .set_ramp_guard_config(RampGuardConfig::new().with_interval(Duration::from_secs(3600)));
+        let cancel = CancellationToken::new();
+        let handle = spawn_ramp_guard(&api_state, &lazy_pool(), &runtime(), cancel.clone())
+            .expect("an enabled guard spawns");
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("the guard stops on cancel")
+            .expect("the guard task does not panic");
     }
 }

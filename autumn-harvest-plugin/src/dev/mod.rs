@@ -560,7 +560,7 @@ impl DevRuntime {
     async fn wait_until_ready(&self) -> Result<(), DevError> {
         const READY_TIMEOUT_SECS: u64 = 180;
         let url = format!("{}/health", self.api_url);
-        let client = reqwest::Client::new();
+        let client = health_probe_client();
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(READY_TIMEOUT_SECS);
         while std::time::Instant::now() < deadline {
@@ -1205,6 +1205,70 @@ mod server_panic_tests {
         let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
 
         assert_eq!(panic_payload_message(&*payload), "boom");
+    }
+}
+
+/// Limit on one readiness probe, connect phase included (issue #1832).
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Limit on the connect phase of one readiness probe (issue #1832).
+const HEALTH_PROBE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The client for the readiness probe in `wait_until_ready`.
+///
+/// Each probe ends within [`HEALTH_PROBE_TIMEOUT`]. Without it, a server
+/// that accepts but never answers holds the loop past its deadline.
+#[expect(
+    clippy::expect_used,
+    reason = "only a TLS backend that cannot start fails here, and `Client::new` panics on that too"
+)]
+fn health_probe_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(HEALTH_PROBE_TIMEOUT)
+        .connect_timeout(HEALTH_PROBE_CONNECT_TIMEOUT)
+        .build()
+        .expect("a reqwest client with two timeouts must build")
+}
+
+#[cfg(test)]
+mod health_probe_client_tests {
+    //! Issue #1832. A probe with no timeout can hang on a server that accepts
+    //! but never answers. The readiness deadline then never fires.
+
+    use super::health_probe_client;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn a_probe_to_a_black_hole_fails_within_the_probe_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Keep each accepted socket open, and never answer.
+        let black_hole = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _open = socket;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            health_probe_client()
+                .get(format!("http://{addr}/health"))
+                .send(),
+        )
+        .await
+        .expect("the probe must give up on its own, not hang");
+        black_hole.abort();
+
+        assert!(
+            outcome.as_ref().is_err_and(reqwest::Error::is_timeout),
+            "expected a timeout, got {outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
 

@@ -261,6 +261,13 @@ pub struct WorkerConfigView {
     /// Most rows per timeout reason that one timeout pass enforces, as
     /// configured. The checker raises 0 to 1.
     pub timeout_scan_batch_size: u32,
+    /// Whether the worker runs the rebalance-resume scanner (issue #1839).
+    pub rebalance_resume_enabled: bool,
+    /// Time between rebalance-resume passes, in milliseconds (issue #1839).
+    pub rebalance_resume_interval_ms: u64,
+    /// Age of a `COMMITTED` shard migration before the rebalance-resume
+    /// scanner settles it, in milliseconds, after the floor (issue #1839).
+    pub rebalance_stall_after_ms: u64,
     /// Retry budget policy for activity types without an override
     /// (issue #1793). `null` = no default budget.
     pub retry_budget_default: Option<crate::policy::RetryBudgetPolicy>,
@@ -268,6 +275,13 @@ pub struct WorkerConfigView {
     /// policy turns the budget off for that type.
     pub retry_budget_overrides:
         std::collections::BTreeMap<String, Option<crate::policy::RetryBudgetPolicy>>,
+    /// Adaptive limit policy for activity types without an override
+    /// (issue #1836). `null` = no default limit.
+    pub adaptive_limit_default: Option<crate::policy::AdaptiveLimitPolicy>,
+    /// Per-activity-type adaptive limit overrides (issue #1836). A `null`
+    /// policy turns the limit off for that type.
+    pub adaptive_limit_overrides:
+        std::collections::BTreeMap<String, Option<crate::policy::AdaptiveLimitPolicy>>,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -429,6 +443,7 @@ impl WorkerConfigView {
             codec_rotation_batch_size,
             scanner,
             retry_budget,
+            adaptive_limit,
             // REDACTED — the registry holds live codec handles that may close
             // over key material. Only the operator-chosen key IDENTIFIERS are
             // safe to report, and those are served by
@@ -497,8 +512,17 @@ impl WorkerConfigView {
             scanner_jitter: crate::scanner_lease::clamp_jitter(scanner.jitter),
             timeout_scan_interval_ms: scanner.timeout_interval.map(dur_ms),
             timeout_scan_batch_size: scanner.timeout_batch_size,
+            rebalance_resume_interval_ms: dur_ms(crate::scanner_lease::scanner_interval(
+                scanner.rebalance_resume_interval,
+            )),
+            rebalance_resume_enabled: scanner.rebalance_resume_enabled,
+            rebalance_stall_after_ms: dur_ms(crate::scanner_lease::rebalance_stall_after(
+                scanner.rebalance_stall_after,
+            )),
             retry_budget_default: retry_budget.default_policy(),
             retry_budget_overrides: retry_budget.overrides(),
+            adaptive_limit_default: adaptive_limit.default_policy(),
+            adaptive_limit_overrides: adaptive_limit.overrides(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),
@@ -617,6 +641,12 @@ pub struct ShardTopologyView {
     /// reporting identical `readable`/`writable`/`default` sets. Diff this field
     /// across replicas as the last step of a shard decommission.
     pub shard_forwards: BTreeMap<i32, i32>,
+    /// The shards reserved for pinned work, one per tenant cell (issue #1837).
+    ///
+    /// Empty unless the deployment reserves a shard. Unpinned starts never
+    /// land on these shards. Diff this field across replicas. A replica that
+    /// does not reserve a cell shard hashes shared tenants into that cell.
+    pub reserved_shards: Vec<i32>,
 }
 
 impl ShardTopologyView {
@@ -635,6 +665,7 @@ impl ShardTopologyView {
             default_shard,
             residency_map,
             shard_forwards,
+            reserved_shards,
         } = router.parts();
         Self {
             readable_shards: readable_shards.iter().map(|s| s.as_i32()).collect(),
@@ -648,6 +679,7 @@ impl ShardTopologyView {
                 .iter()
                 .map(|(from, to)| (from.as_i32(), to.as_i32()))
                 .collect(),
+            reserved_shards: reserved_shards.iter().map(|s| s.as_i32()).collect(),
         }
     }
 }
@@ -831,6 +863,28 @@ mod tests {
 
         assert!(view.notification_channel_configured);
         assert_eq!(view.shard_notification_channels_configured, 1);
+    }
+
+    /// The view reports the adaptive limit config (issue #1836).
+    #[test]
+    fn view_reports_the_adaptive_limit() {
+        let worker = WorkerConfig::default().with_adaptive_limit(
+            crate::adaptive_limit::AdaptiveLimitConfig::disabled().with_activity(
+                "charge_card",
+                Some(crate::policy::AdaptiveLimitPolicy::new(2, 32)),
+            ),
+        );
+        let view = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(json["adaptive_limit_default"], serde_json::Value::Null);
+        assert_eq!(
+            json["adaptive_limit_overrides"]["charge_card"]["min_limit"],
+            2
+        );
+        assert_eq!(
+            json["adaptive_limit_overrides"]["charge_card"]["max_limit"],
+            32
+        );
     }
 
     #[test]

@@ -1,0 +1,3515 @@
+//! Metric-gated automatic build-ramp abort (issue #1814).
+//!
+//! Each test runs two real workers against Postgres. Worker A runs the base
+//! build and completes every run. Worker B runs the ramp target. The tests
+//! pick execution ids by ramp bucket, so the split between the builds is
+//! exact and the tests are deterministic.
+//!
+//! A test uses `HARVEST_TEST_DATABASE_URL` when it is set and makes its own
+//! database from it. Otherwise it starts a Postgres container.
+
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use autumn_harvest::build_routing::{
+    clear_build_ramp, get_build_policy, lock_ramp_generations, ramp_bucket,
+    ramp_generation_aborted, ramp_generation_id, set_build_policy, set_build_policy_with_ramp_id,
+    set_build_ramp, set_build_ramp_with_id,
+};
+use autumn_harvest::context::empty_shared_state;
+use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::ramp_guard::{
+    MIN_MARKER_RETENTION, RampAbortReason, RampGuard, RampGuardConfig, abort_ramp,
+    claim_unreported_abort, guard_once, mark_abort_reported, ramp_aborted_by_guard,
+    record_abort_report, run_ramp_guard,
+};
+use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::telemetry::{
+    BUILD_ID_LABEL_OTHER, MetricsRecorder, TelemetryConfig, WorkflowStatus,
+};
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
+use autumn_harvest::{
+    ExecutionId, Priority, ShardId, StartWorkflowParams, WorkflowContext,
+    start_or_load_workflow_execution,
+};
+use diesel::prelude::*;
+use diesel::sql_types::{BigInt, Text};
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use serde_json::Value;
+use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tokio_util::sync::CancellationToken;
+
+const WF: &str = "ramp_guard_wf";
+const QUEUE: &str = "default";
+const BUILD_A: &str = "ramp-a";
+const BUILD_B: &str = "ramp-b";
+const BUILD_C: &str = "ramp-c";
+const RAMP_PERCENT: i32 = 10;
+const RUNS_A: usize = 30;
+const RUNS_B: usize = 10;
+const CLEAR_BOUND: Duration = Duration::from_secs(5);
+
+// ── Handlers ────────────────────────────────────────────────────────────────
+
+type HandlerFuture<'a> =
+    Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
+
+fn ok_handler(_ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move { Ok(serde_json::json!("done")) })
+}
+
+fn failing_handler(_ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move { Err("build B is broken".to_owned()) })
+}
+
+fn wf_info(handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
+    WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        name: WF,
+        module: "ramp_guard_tests",
+        handler,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+        mcp: false,
+    }
+}
+
+// ── Metrics capture ─────────────────────────────────────────────────────────
+
+/// Records the build-labelled terminal counter and the ramp-abort counter.
+#[derive(Default)]
+struct RecordingMetrics {
+    terminal: Mutex<Vec<(String, WorkflowStatus)>>,
+    aborted: Mutex<Vec<(String, String)>>,
+}
+
+impl MetricsRecorder for RecordingMetrics {
+    fn record_workflow_terminal_for_build(
+        &self,
+        _workflow_name: &str,
+        _queue: &str,
+        build_id: &str,
+        outcome: WorkflowStatus,
+    ) {
+        self.terminal
+            .lock()
+            .unwrap()
+            .push((build_id.to_owned(), outcome));
+    }
+
+    fn record_build_ramp_aborted(&self, queue: &str, reason: &str) {
+        self.aborted
+            .lock()
+            .unwrap()
+            .push((queue.to_owned(), reason.to_owned()));
+    }
+}
+
+// ── Database helpers ────────────────────────────────────────────────────────
+
+async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (provision_ephemeral_db(&base_url).await, None);
+    }
+    let container = Postgres::default()
+        .with_init_sql(autumn_harvest::test_init_sql().as_bytes().to_vec())
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    (url, Some(container))
+}
+
+/// Make a new, migrated database for one test, so that tests do not share
+/// build policies or executions.
+async fn provision_ephemeral_db(base_url: &str) -> String {
+    use diesel_async::SimpleAsyncConnection;
+
+    let db_name = format!("harvest_ramp_guard_{}", uuid::Uuid::new_v4().simple());
+    let mut admin = AsyncPgConnection::establish(base_url)
+        .await
+        .expect("connect to base database");
+    diesel::sql_query(format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&mut admin)
+        .await
+        .expect("create ephemeral database");
+    let (prefix, _) = base_url
+        .rsplit_once('/')
+        .expect("base url must end with /<database>");
+    let url = format!("{prefix}/{db_name}");
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect to ephemeral database");
+    conn.batch_execute(&autumn_harvest::test_init_sql())
+        .await
+        .expect("apply migrations");
+    url
+}
+
+fn build_pool(url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(8)
+        .build()
+        .expect("pool build failed")
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+async fn auto_abort_audit_rows(conn: &mut AsyncPgConnection) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_audit_log \
+         WHERE operation = 'build_routing.ramp.auto_abort' \
+           AND target_type = 'build_routing' AND target_id = $1 \
+           AND actor = 'system' AND route_or_command = 'background.ramp_guard'",
+    )
+    .bind::<Text, _>(QUEUE)
+    .get_result::<CountRow>(conn)
+    .await
+    .expect("count audit rows")
+    .n
+}
+
+async fn terminal_count(conn: &mut AsyncPgConnection) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 AND state IN ('COMPLETED', 'FAILED')",
+    )
+    .bind::<Text, _>(WF)
+    .get_result::<CountRow>(conn)
+    .await
+    .expect("count terminal runs")
+    .n
+}
+
+async fn wait_for_terminal(conn: &mut AsyncPgConnection, want: usize) {
+    let want = i64::try_from(want).expect("small count");
+    for _ in 0..1200 {
+        if terminal_count(conn).await >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+    panic!("only {} of {want} runs ended", terminal_count(conn).await);
+}
+
+// ── Worker helpers ──────────────────────────────────────────────────────────
+
+fn make_worker(build_id: &str, info: WorkflowInfo, metrics: Arc<RecordingMetrics>) -> Worker {
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(metrics as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![info],
+        vec![],
+        empty_shared_state(),
+        telemetry,
+    ));
+    Worker::new(
+        WorkerRuntimeConfig {
+            codec_rotation_batch_size: 0,
+            dr: autumn_harvest::replication::DrConfig::default(),
+            worker_id: uuid::Uuid::new_v4().to_string(),
+            queues: vec![QUEUE.to_string()],
+            queue_weights: std::collections::HashMap::new(),
+            notification_database_url: None,
+            shard_notification_database_urls: Vec::new(),
+            max_concurrent_workflows: 10,
+            max_concurrent_activities: 10,
+            poll_interval: Duration::from_millis(50),
+            shutdown_timeout: Duration::from_secs(2),
+            cancellation_grace_period: Duration::from_secs(2),
+            sticky_timeout: Duration::ZERO,
+            max_local_activity_start_to_close: Duration::from_secs(60),
+            shard_assignments: vec![ShardId::new(0)],
+            worker_heartbeat_interval: Duration::from_secs(5),
+            build_id: build_id.to_string(),
+            deployment_name: None,
+            workflow_cache_size: 100,
+            resident_workflows: true,
+            priority_aging_secs: None,
+            unknown_target_grace_window: Duration::from_secs(5),
+            scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+            poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
+            workflow_task_timeout: Duration::from_secs(30),
+            workflow_panic_max_attempts: 3,
+            max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            labels: std::collections::HashMap::new(),
+            sharded_pool: None,
+            max_workflow_history_events: None,
+            slot_tuner: None,
+            max_concurrent_sessions: 0,
+        },
+        registry,
+    )
+    .expect("worker should build")
+}
+
+struct RunningWorkers {
+    workers: Vec<Arc<Worker>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl RunningWorkers {
+    fn spawn(workers: Vec<Worker>, pool: &DbPool) -> Self {
+        let mut running = Self {
+            workers: Vec::new(),
+            handles: Vec::new(),
+        };
+        for worker in workers {
+            let worker = Arc::new(worker);
+            let worker_ref = Arc::clone(&worker);
+            let pool = pool.clone();
+            running.handles.push(tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(120), worker_ref.run(&pool)).await;
+            }));
+            running.workers.push(worker);
+        }
+        running
+    }
+
+    async fn stop(self) {
+        for worker in &self.workers {
+            worker.shutdown();
+        }
+        for handle in self.handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Return an execution id whose ramp bucket sends it to the target build
+/// when `to_target` is true, and to the base build otherwise.
+fn exec_id_for(to_target: bool) -> ExecutionId {
+    let percent = u8::try_from(RAMP_PERCENT).expect("small percent");
+    loop {
+        let id = ExecutionId::new_for_shard(ShardId::new(0));
+        if (ramp_bucket(id) < percent) == to_target {
+            return id;
+        }
+    }
+}
+
+async fn start_run(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    let workflow_id = format!("ramp-guard-{}", exec_id.as_uuid());
+    start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name: WF,
+            workflow_id: &workflow_id,
+            exec_id,
+            input: Value::Null.into(),
+            parent_id: None,
+            queue_name: QUEUE,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .expect("workflow start should succeed");
+}
+
+/// Set the base policy, ramp the target to 10 %, then start the runs.
+async fn ramp_and_start(conn: &mut AsyncPgConnection) {
+    set_build_policy(conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp(conn, QUEUE, BUILD_B, RAMP_PERCENT)
+        .await
+        .expect("set ramp");
+    for _ in 0..RUNS_A {
+        start_run(conn, exec_id_for(false)).await;
+    }
+    for _ in 0..RUNS_B {
+        start_run(conn, exec_id_for(true)).await;
+    }
+}
+
+async fn assigned_builds(conn: &mut AsyncPgConnection) -> (i64, i64) {
+    let rows: Vec<Option<String>> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(WF))
+        .select(harvest_workflow_executions::assigned_build_id)
+        .load(conn)
+        .await
+        .expect("load assigned builds");
+    let a = rows
+        .iter()
+        .filter(|b| b.as_deref() == Some(BUILD_A))
+        .count();
+    let b = rows
+        .iter()
+        .filter(|b| b.as_deref() == Some(BUILD_B))
+        .count();
+    (
+        i64::try_from(a).expect("small"),
+        i64::try_from(b).expect("small"),
+    )
+}
+
+fn guard_config() -> RampGuardConfig {
+    RampGuardConfig::new()
+        .with_interval(Duration::from_secs(1))
+        .with_min_samples(5)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+/// RED test of issue #1814. Build B takes 10 % of new starts and fails every
+/// run. The guard loop must abort the ramp with no operator action, write one
+/// audit row, and count the abort.
+#[tokio::test]
+async fn ramp_aborts_automatically_when_target_build_fails_every_run() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    ramp_and_start(&mut conn).await;
+    assert_eq!(
+        assigned_builds(&mut conn).await,
+        (30, 10),
+        "the ramp must send exactly the chosen runs to build B"
+    );
+
+    let workers = RunningWorkers::spawn(
+        vec![
+            make_worker(BUILD_A, wf_info(ok_handler), Arc::clone(&metrics)),
+            make_worker(BUILD_B, wf_info(failing_handler), Arc::clone(&metrics)),
+        ],
+        &pool,
+    );
+    wait_for_terminal(&mut conn, RUNS_A + RUNS_B).await;
+    workers.stop().await;
+
+    // The guard runs as a background loop, as it does in a deployment.
+    let cancel = CancellationToken::new();
+    let guard = tokio::spawn(run_ramp_guard(
+        vec![pool.clone()],
+        pool.clone(),
+        guard_config(),
+        Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+        cancel.child_token(),
+    ));
+    let mut aborted = false;
+    for _ in 0..100 {
+        let policy = get_build_policy(&mut conn, QUEUE)
+            .await
+            .expect("read policy")
+            .expect("policy exists");
+        if policy.target_build_id.is_none() {
+            aborted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    cancel.cancel();
+    let _ = guard.await;
+    assert!(aborted, "the guard must abort the ramp automatically");
+
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read policy")
+        .expect("policy exists");
+    assert_eq!(policy.build_id, BUILD_A, "the base build stays");
+    assert_eq!(policy.target_build_id, None);
+    assert_eq!(policy.ramp_percent, None);
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
+    assert_eq!(
+        metrics.aborted.lock().unwrap().as_slice(),
+        &[(
+            QUEUE.to_owned(),
+            RampAbortReason::FailureRate.as_str().to_owned()
+        )]
+    );
+
+    // The worker metrics carry the build of the worker that ran the task.
+    // The worker metrics carry the build of the worker that ran the task.
+    // The label cap is process-wide. A full local run of every suite in one
+    // process can fill it first, so `__other__` is also accepted.
+    let terminal = metrics.terminal.lock().unwrap().clone();
+    let is = |label: &str, build: &str| label == build || label == BUILD_ID_LABEL_OTHER;
+    let failed_b = terminal
+        .iter()
+        .filter(|(b, s)| is(b, BUILD_B) && *s == WorkflowStatus::Failed)
+        .count();
+    let completed_a = terminal
+        .iter()
+        .filter(|(b, s)| is(b, BUILD_A) && *s == WorkflowStatus::Completed)
+        .count();
+    assert_eq!((completed_a, failed_b), (RUNS_A, RUNS_B));
+
+    // After the abort, a run that the ramp sent to B now goes to A.
+    let before = assigned_builds(&mut conn).await;
+    for _ in 0..3 {
+        start_run(&mut conn, exec_id_for(true)).await;
+    }
+    assert_eq!(
+        assigned_builds(&mut conn).await,
+        (before.0 + 3, before.1),
+        "the base build takes every new start"
+    );
+
+    // A second pass finds no ramp and writes nothing.
+    let again = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
+    assert!(again.is_empty(), "no ramp is left to abort: {again:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
+}
+
+/// A healthy target build keeps its ramp.
+#[tokio::test]
+async fn healthy_ramp_is_not_aborted() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    ramp_and_start(&mut conn).await;
+    let workers = RunningWorkers::spawn(
+        vec![
+            make_worker(BUILD_A, wf_info(ok_handler), Arc::clone(&metrics)),
+            make_worker(BUILD_B, wf_info(ok_handler), Arc::clone(&metrics)),
+        ],
+        &pool,
+    );
+    wait_for_terminal(&mut conn, RUNS_A + RUNS_B).await;
+    workers.stop().await;
+
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "a healthy ramp must stay: {aborts:?}");
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read policy")
+        .expect("policy exists");
+    assert_eq!(policy.target_build_id.as_deref(), Some(BUILD_B));
+    assert_eq!(policy.ramp_percent, Some(RAMP_PERCENT));
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+}
+
+/// Too few target runs gives no verdict, so the ramp stays.
+#[tokio::test]
+async fn ramp_with_too_few_target_samples_is_not_aborted() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    ramp_and_start(&mut conn).await;
+    let workers = RunningWorkers::spawn(
+        vec![
+            make_worker(BUILD_A, wf_info(ok_handler), Arc::clone(&metrics)),
+            make_worker(BUILD_B, wf_info(failing_handler), Arc::clone(&metrics)),
+        ],
+        &pool,
+    );
+    wait_for_terminal(&mut conn, RUNS_A + RUNS_B).await;
+    workers.stop().await;
+
+    let strict = guard_config().with_min_samples(1_000);
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &strict, None).await;
+    assert!(
+        aborts.is_empty(),
+        "no verdict below min_samples: {aborts:?}"
+    );
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+}
+
+/// The abort is a compare-and-swap. When an operator moves the ramp to a new
+/// target, a verdict about the old target does not clear it.
+#[tokio::test]
+async fn abort_does_not_clear_a_ramp_that_moved_to_another_target() {
+    let (url, _container) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    let ramp = set_build_ramp(&mut conn, QUEUE, "ramp-c", 5)
+        .await
+        .expect("set ramp");
+
+    let cleared = abort_ramp(
+        &mut conn,
+        QUEUE,
+        BUILD_A,
+        BUILD_B,
+        ramp.updated_at,
+        CLEAR_BOUND,
+    )
+    .await
+    .expect("abort_ramp");
+    assert!(cleared.is_none(), "a ramp to another target must stay");
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read policy")
+        .expect("policy exists");
+    assert_eq!(policy.target_build_id.as_deref(), Some("ramp-c"));
+}
+
+/// A verdict about an old step does not clear a new step of the same ramp.
+#[tokio::test]
+async fn abort_does_not_clear_a_new_step_of_the_same_ramp() {
+    let (url, _container) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    let old_step = set_build_ramp(&mut conn, QUEUE, BUILD_B, 10)
+        .await
+        .expect("set ramp")
+        .updated_at;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let new_step = set_build_ramp(&mut conn, QUEUE, BUILD_B, 1)
+        .await
+        .expect("re-ramp")
+        .updated_at;
+    assert_ne!(old_step, new_step);
+
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, old_step, CLEAR_BOUND)
+            .await
+            .expect("abort_ramp")
+            .is_none(),
+        "the old step must not clear the new one"
+    );
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, new_step, CLEAR_BOUND)
+            .await
+            .expect("abort_ramp")
+            .is_some(),
+        "the current step clears"
+    );
+}
+
+// ── Seeded tests: query semantics without workers ───────────────────────────
+
+/// Start one run on the ramp and set its outcome columns directly.
+async fn seed(
+    conn: &mut AsyncPgConnection,
+    to_target: bool,
+    state: &str,
+    nd_blocked: bool,
+) -> ExecutionId {
+    let exec_id = exec_id_for(to_target);
+    start_run(conn, exec_id).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+         SET state = $2, \
+             nd_blocked_at = CASE WHEN $3 THEN NOW() ELSE NULL END \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<Text, _>(state)
+    .bind::<diesel::sql_types::Bool, _>(nd_blocked)
+    .execute(conn)
+    .await
+    .expect("seed outcome");
+    exec_id
+}
+
+async fn set_ramp(conn: &mut AsyncPgConnection) {
+    set_build_policy(conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp(conn, QUEUE, BUILD_B, RAMP_PERCENT)
+        .await
+        .expect("set ramp");
+}
+
+async fn seed_healthy_base(conn: &mut AsyncPgConnection, n: usize) {
+    for _ in 0..n {
+        seed(conn, false, "COMPLETED", false).await;
+    }
+}
+
+async fn ramp_is_active(conn: &mut AsyncPgConnection) -> bool {
+    get_build_policy(conn, QUEUE)
+        .await
+        .expect("read policy")
+        .expect("policy exists")
+        .target_build_id
+        .is_some()
+}
+
+/// Blocked runs abort the ramp on the ND-block rate. A blocked run that an
+/// operator paused still counts.
+#[tokio::test]
+async fn nd_blocked_target_runs_abort_on_nd_block_rate() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_ramp(&mut conn).await;
+    seed_healthy_base(&mut conn, 10).await;
+    for _ in 0..3 {
+        seed(&mut conn, true, "RUNNING", true).await;
+        seed(&mut conn, true, "PAUSED", true).await;
+    }
+
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0].reason, RampAbortReason::NdBlockRate);
+    assert_eq!(
+        aborts[0].target.nd_blocked, 6,
+        "RUNNING and PAUSED blocks count"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+
+    let summary: Vec<Option<String>> = autumn_harvest::schema::harvest_audit_log::table
+        .filter(
+            autumn_harvest::schema::harvest_audit_log::operation
+                .eq("build_routing.ramp.auto_abort"),
+        )
+        .select(autumn_harvest::schema::harvest_audit_log::error_summary)
+        .load(&mut conn)
+        .await
+        .expect("load audit summary");
+    let summary = summary[0].clone().expect("summary set");
+    assert!(summary.contains("reason=nd_block_rate"), "{summary}");
+    assert!(summary.contains("target_build=ramp-b"), "{summary}");
+    assert!(summary.contains("target_started=6"), "{summary}");
+}
+
+/// Only runs of the current step count. Canary probes never count. A timed
+/// out run is a failure.
+#[tokio::test]
+async fn only_current_step_non_canary_runs_count_and_timeouts_fail() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_ramp(&mut conn).await;
+    seed_healthy_base(&mut conn, 10).await;
+
+    // Five failed target runs from before the step.
+    let mut old = Vec::new();
+    for _ in 0..5 {
+        old.push(seed(&mut conn, true, "FAILED", false).await);
+    }
+    for id in old {
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions \
+             SET created_at = created_at - INTERVAL '1 day' WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("backdate");
+    }
+    // Five failed canary probes on the target build.
+    for _ in 0..5 {
+        let id = seed(&mut conn, true, "FAILED", false).await;
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions \
+             SET workflow_name = '__harvest_canary_probe__default' WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("rename to canary");
+    }
+    assert!(
+        guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None)
+            .await
+            .is_empty(),
+        "old-step and canary runs give no samples"
+    );
+    assert!(ramp_is_active(&mut conn).await);
+
+    // Five timed-out runs in the step are failures.
+    for _ in 0..5 {
+        seed(&mut conn, true, "TIMED_OUT", false).await;
+    }
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0].reason, RampAbortReason::FailureRate);
+    assert_eq!(
+        aborts[0].target.failed, 5,
+        "only the step's timed-out runs count"
+    );
+}
+
+/// Two pools that both hold the ramp: the guard merges their counts, clears
+/// both and audits once.
+#[tokio::test]
+async fn guard_merges_pools_clears_each_and_audits_once() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    // The API fan-out writes one `ramp_id` to every pool.
+    let ramp_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_ramp_with_id(conn, ramp_id).await;
+        seed_healthy_base(conn, 5).await;
+        // Three failed target runs per pool: below min_samples on each pool
+        // alone, above it once merged.
+        for _ in 0..3 {
+            seed(conn, true, "FAILED", false).await;
+        }
+    }
+    let config = guard_config().with_min_samples(6);
+    let pools = [pool_1.clone(), pool_2.clone()];
+
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0].target.failed, 6, "the counts merge over pools");
+    assert!(!aborts[0].incomplete);
+    assert!(!ramp_is_active(&mut conn_1).await);
+    assert!(!ramp_is_active(&mut conn_2).await);
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+    assert_eq!(auto_abort_audit_rows(&mut conn_2).await, 0);
+}
+
+/// Two pools hold ramps with the same builds but different `ramp_id`s. The
+/// guard judges each ramp on its own counts, so failures of one ramp cannot
+/// abort the other.
+#[tokio::test]
+async fn ramps_with_different_ids_are_judged_apart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_ramp_with_id(conn, uuid::Uuid::new_v4()).await;
+        seed_healthy_base(conn, 5).await;
+        // Three failed target runs per ramp: below min_samples for each one.
+        for _ in 0..3 {
+            seed(conn, true, "FAILED", false).await;
+        }
+    }
+    let config = guard_config().with_min_samples(6);
+    let pools = [pool_1.clone(), pool_2.clone()];
+
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "the counts do not merge: {aborts:?}");
+    assert!(ramp_is_active(&mut conn_1).await);
+    assert!(ramp_is_active(&mut conn_2).await);
+}
+
+/// A pending clear of an old generation does not block a newer generation
+/// with the same builds. Pool 1 stays readable, but a row lock makes its
+/// clear fail on every pass. A new ramp on pool 2 still gets judged and
+/// cleared.
+#[tokio::test]
+async fn a_pending_clear_blocks_only_its_own_generation() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut locker = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect locker");
+    set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock pool 1 policy row");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let mut guard = RampGuard::new(guard_config());
+    let aborts = guard.pass(&pools, &pool_2, None, &never).await;
+    assert!(aborts.is_empty(), "the clear failed: {aborts:?}");
+    assert_eq!(guard.pending_clears(), 1, "the old clear is pending");
+
+    // A new generation with the same builds goes live on pool 2.
+    set_ramp_with_id(&mut conn_2, uuid::Uuid::new_v4()).await;
+    seed_healthy_base(&mut conn_2, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_2, true, "FAILED", false).await;
+    }
+    let aborts = guard.pass(&pools, &pool_2, None, &never).await;
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert_eq!(aborts.len(), 1, "the new generation is judged: {aborts:?}");
+    assert!(!ramp_is_active(&mut conn_2).await, "and cleared");
+}
+
+/// A guard that cleared one pool owes the report, even while another pool
+/// stays pending. A failed audit write is retried on the next pass, so a
+/// pool that keeps rejecting the clear does not leave the abort unaudited.
+#[tokio::test]
+async fn a_failed_report_of_a_partial_abort_is_retried() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut locker = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect locker");
+    let ramp_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_ramp_with_id(conn, ramp_id).await;
+    }
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock pool 2 policy row");
+    // No server listens on port 1, so the first audit write fails.
+    let dead_audit = build_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let mut guard = RampGuard::new(guard_config());
+    let aborts = guard.pass(&pools, &dead_audit, None, &never).await;
+    assert!(aborts.is_empty(), "the report failed: {aborts:?}");
+    assert!(!ramp_is_active(&mut conn_1).await, "pool 1 cleared");
+    assert_eq!(guard.pending_clears(), 1, "pool 2 is pending");
+
+    // Pool 2 still rejects the clear. The audit database is back.
+    let aborts = guard.pass(&pools, &pool_1, None, &never).await;
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert_eq!(aborts.len(), 1, "the report is retried: {aborts:?}");
+    assert!(aborts[0].incomplete, "pool 2 has not cleared");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+}
+
+/// A guard clears pool 1, cannot clear pool 2, and fails its report. It then
+/// restarts with its pending report lost. Pool 2 still holds the ramp. The
+/// unreported marker on pool 1 is still recovered once the audit pool works.
+/// The recovered report names pool 2 as pending, as a fresh report does.
+#[tokio::test]
+async fn an_unaudited_partial_abort_is_reported_after_a_restart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut locker = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect locker");
+    let ramp_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_ramp_with_id(conn, ramp_id).await;
+    }
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock pool 2 policy row");
+    // No server listens on port 1, so the first audit write fails.
+    let dead_audit = build_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = RampGuard::new(config)
+        .pass(&pools, &dead_audit, None, &never)
+        .await;
+    assert!(aborts.is_empty(), "the report failed: {aborts:?}");
+    assert!(!ramp_is_active(&mut conn_1).await, "pool 1 cleared");
+
+    // A restart drops the pending report. Pool 2 still rejects the clear.
+    let mut restarted = RampGuard::new(config);
+    let mut reported = Vec::new();
+    for _ in 0..2 {
+        reported.extend(restarted.pass(&pools, &pool_1, None, &never).await);
+    }
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert_eq!(reported.len(), 1, "the abort is reported: {reported:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+    // Pool 2 still holds the ramp, so the recovered report is incomplete.
+    assert!(reported[0].incomplete, "pool 2 is pending: {reported:?}");
+    let rows: Vec<(String, Option<String>)> = autumn_harvest::schema::harvest_audit_log::table
+        .filter(
+            autumn_harvest::schema::harvest_audit_log::operation
+                .eq("build_routing.ramp.auto_abort"),
+        )
+        .select((
+            autumn_harvest::schema::harvest_audit_log::status,
+            autumn_harvest::schema::harvest_audit_log::error_summary,
+        ))
+        .load(&mut conn_1)
+        .await
+        .expect("load audit row");
+    let (status, summary) = rows[0].clone();
+    assert_eq!(status, autumn_harvest::audit::STATUS_FAILED);
+    let summary = summary.expect("summary set");
+    assert!(
+        summary.contains("clear pending on pools 1"),
+        "pool 2 is named by its index: {summary}"
+    );
+}
+
+/// A fan-out reaches pool 1 only, and the guard aborts it there. Pool 2 has
+/// another base, so a late retry there derives another stored id. The abort
+/// retires the caller id on pool 2 too, so the retry is refused.
+#[tokio::test]
+async fn an_abort_retires_the_caller_id_on_a_pool_the_fan_out_missed() {
+    #[derive(diesel::QueryableByName)]
+    struct Caller {
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        caller: Option<String>,
+    }
+
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let caller = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, caller).await;
+    set_build_policy(&mut conn_2, QUEUE, BUILD_C, None)
+        .await
+        .expect("pool 2 base policy");
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let aborts = RampGuard::new(guard_config())
+        .pass(&pools, &pool_1, None, &never)
+        .await;
+    assert_eq!(aborts.len(), 1, "pool 1 is aborted: {aborts:?}");
+    // The marker holds the caller id as the Rust derivation gives it.
+    let marker: Caller = diesel::sql_query(
+        "SELECT ramp_aborted -> 0 ->> 'caller' AS caller FROM harvest_build_policies \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .get_result(&mut conn_1)
+    .await
+    .expect("read marker");
+    let want = autumn_harvest::build_routing::ramp_caller_target_id(caller, QUEUE, BUILD_B);
+    assert_eq!(marker.caller, Some(want.to_string()));
+
+    let retry = set_build_ramp_with_id(&mut conn_2, QUEUE, BUILD_B, RAMP_PERCENT, caller).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "the late retry on pool 2 is refused: {retry:?}"
+    );
+    assert!(!ramp_is_active(&mut conn_2).await);
+}
+
+/// A ramp write with the `ramp_id` of an aborted generation changes
+/// nothing. The abort marker refuses it, and after the markers are pruned
+/// the report ledger refuses it.
+#[tokio::test]
+async fn a_ramp_write_does_not_restore_an_aborted_generation() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    let stored = abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+        .await
+        .expect("clear")
+        .expect("cleared");
+
+    let refused = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id).await;
+    assert!(
+        matches!(refused, Err(autumn_harvest::HarvestError::Config(_))),
+        "the marker refuses it: {refused:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+
+    diesel::sql_query(
+        "INSERT INTO harvest_ramp_abort_reports (ramp_id, queue_name) VALUES ($1, $2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(stored)
+    .bind::<Text, _>(QUEUE)
+    .execute(&mut conn)
+    .await
+    .expect("ledger row");
+    diesel::sql_query("UPDATE harvest_build_policies SET ramp_aborted = '[]'::jsonb")
+        .execute(&mut conn)
+        .await
+        .expect("prune markers");
+    let refused = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id).await;
+    assert!(
+        matches!(refused, Err(autumn_harvest::HarvestError::Config(_))),
+        "the ledger refuses it: {refused:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+
+    // Another id is another generation.
+    set_build_ramp_with_id(
+        &mut conn,
+        QUEUE,
+        BUILD_B,
+        RAMP_PERCENT,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .expect("a new ramp");
+    assert!(ramp_is_active(&mut conn).await);
+}
+
+/// With the base build promoted to the target, the ramp is not a ramp.
+#[tokio::test]
+async fn a_ramp_to_its_own_base_build_is_skipped() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_build_policy(&mut conn, QUEUE, BUILD_B, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp(&mut conn, QUEUE, BUILD_B, 100)
+        .await
+        .expect("set ramp");
+    for _ in 0..10 {
+        seed(&mut conn, true, "FAILED", false).await;
+    }
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "a promotion is not judged: {aborts:?}");
+    assert!(ramp_is_active(&mut conn).await);
+}
+
+/// The server bounds a clear. A clear that waits on a row lock fails on the
+/// server and rolls back, so it cannot commit after the guard gave up.
+#[tokio::test]
+async fn a_blocked_clear_fails_on_the_server_and_changes_nothing() {
+    use diesel_async::AsyncConnection as _;
+
+    let (url, _container) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut locker = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect locker");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    let step = set_build_ramp(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT)
+        .await
+        .expect("set ramp")
+        .updated_at;
+
+    // Hold the policy row lock for longer than the clear bound.
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock policy row");
+
+    let started = std::time::Instant::now();
+    let result = abort_ramp(
+        &mut conn,
+        QUEUE,
+        BUILD_A,
+        BUILD_B,
+        step,
+        Duration::from_millis(300),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "the server stops a blocked clear: {result:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the server bound applies, not a client wait"
+    );
+
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert!(
+        ramp_is_active(&mut conn).await,
+        "the failed clear rolled back"
+    );
+}
+
+/// Set the test ramp on one pool with a given `ramp_id`, as the API fan-out
+/// does on every shard.
+/// The `ramp_id` that [`set_ramp_with_id`] stores for a caller id.
+fn stored(ramp_id: uuid::Uuid) -> uuid::Uuid {
+    ramp_generation_id(ramp_id, QUEUE, BUILD_A, BUILD_B)
+}
+
+async fn set_ramp_with_id(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) {
+    set_build_policy(conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp_with_id(conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id)
+        .await
+        .expect("set ramp");
+}
+
+async fn policy_step(conn: &mut AsyncPgConnection) -> chrono::DateTime<chrono::Utc> {
+    get_build_policy(conn, QUEUE)
+        .await
+        .expect("read policy")
+        .expect("policy exists")
+        .updated_at
+}
+
+/// After a restart, a ramp that one pool still holds is cleared when another
+/// pool holds the abort marker for the same `ramp_id`. The marker commits
+/// with the clear, so this works with no audit row at all.
+#[tokio::test]
+async fn a_restarted_guard_finishes_a_marked_partial_abort() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    set_ramp_with_id(&mut conn_2, ramp_id).await;
+
+    // The old guard cleared pool 1, then stopped before its audit write.
+    let step_1 = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+            .is_some()
+    );
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no audit row");
+
+    // Pool 2 alone has no runs, so a verdict is impossible. A new guard
+    // still finishes the clear from the marker.
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(
+        aborts.is_empty(),
+        "a finished clear reports nothing: {aborts:?}"
+    );
+    assert!(!ramp_is_active(&mut conn_2).await, "pool 2 is cleared");
+    assert_eq!(
+        auto_abort_audit_rows(&mut conn_1).await,
+        0,
+        "no new audit row"
+    );
+}
+
+/// An operator ramp set after a guard abort has a new `ramp_id`, so the old
+/// marker does not clear it. The match uses ids, so no clock is involved.
+#[tokio::test]
+async fn an_abort_marker_for_another_ramp_id_does_not_clear_a_ramp() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+    let step_1 = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+            .is_some()
+    );
+    // The operator ramps the same target again, but only pool 2 takes it.
+    set_ramp_with_id(&mut conn_2, uuid::Uuid::new_v4()).await;
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "the newer operator ramp stays"
+    );
+}
+
+/// A pool can hold the marker of an old ramp and a newer operator ramp with
+/// the same builds. The guard finishes the old ramp on the other pool. It
+/// keeps the newer ramp, because its `ramp_id` matches no marker.
+#[tokio::test]
+async fn a_marker_beside_a_newer_ramp_finishes_only_the_marked_ramp() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+
+    // The old guard cleared pool 1 only. Pool 1 now holds the marker.
+    let step_1 = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+            .is_some()
+    );
+    // A new operator ramp with the same builds reaches pool 1 only.
+    let new_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, new_id).await;
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the marked old ramp on pool 2 is cleared"
+    );
+    assert!(
+        ramp_is_active(&mut conn_1).await,
+        "the newer ramp on pool 1 stays"
+    );
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no audit row");
+}
+
+/// A base-build change keeps the `ramp_id`, but it starts a new step. An old
+/// marker for the old base therefore does not finish the ramp.
+#[tokio::test]
+async fn a_marker_does_not_finish_a_ramp_whose_base_changed() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    set_ramp_with_id(&mut conn_2, ramp_id).await;
+    let step_1 = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+            .is_some()
+    );
+    // The operator moves pool 2 to a new base build. The ramp stays.
+    set_build_policy(&mut conn_2, QUEUE, BUILD_C, None)
+        .await
+        .expect("set new base");
+    assert!(ramp_is_active(&mut conn_2).await);
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "the ramp from the new base stays"
+    );
+}
+
+/// A lost clear tells a guard clear from an operator change by the abort
+/// marker. Only a guard clear sets the marker of the ramp's `ramp_id`.
+#[tokio::test]
+async fn the_marker_tells_a_guard_clear_from_an_operator_clear() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    // An operator clears the ramp: no guard marker.
+    let operator_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, operator_id).await;
+    clear_build_ramp(&mut conn, QUEUE).await.expect("clear");
+    assert!(
+        !ramp_aborted_by_guard(&mut conn, QUEUE, stored(operator_id))
+            .await
+            .expect("read marker")
+    );
+
+    // A guard clears the next ramp: the marker holds its id.
+    let guard_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, guard_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("guard clear")
+            .is_some()
+    );
+    assert!(
+        ramp_aborted_by_guard(&mut conn, QUEUE, stored(guard_id))
+            .await
+            .expect("read marker")
+    );
+    assert!(
+        !ramp_aborted_by_guard(&mut conn, QUEUE, stored(operator_id))
+            .await
+            .expect("read marker")
+    );
+}
+
+/// A guard abort on a pool keeps the older markers of that pool. An old
+/// partial abort can therefore still finish after a newer abort there.
+#[tokio::test]
+async fn a_newer_abort_keeps_an_older_marker() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+    // The old ramp clears on pool 1 only.
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear old ramp")
+            .is_some()
+    );
+    // A newer ramp on pool 1 is aborted there too.
+    set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear new ramp")
+            .is_some()
+    );
+    assert!(
+        ramp_aborted_by_guard(&mut conn_1, QUEUE, stored(old_id))
+            .await
+            .expect("read marker"),
+        "the old marker stays"
+    );
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the old ramp on pool 2 is finished"
+    );
+}
+
+/// The number of abort markers that one pool holds for the test queue.
+async fn abort_marker_count(conn: &mut AsyncPgConnection) -> i64 {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query(
+        "SELECT jsonb_array_length(ramp_aborted)::bigint AS n \
+         FROM harvest_build_policies WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .get_result::<Row>(conn)
+    .await
+    .expect("count markers")
+    .n
+}
+
+/// A marker stays while any pool holds its ramp, however many newer aborts
+/// the pool takes. Once no pool holds the ramp, a pass removes the marker.
+#[tokio::test]
+async fn a_marker_stays_until_its_abort_finishes_and_is_then_pruned() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear old ramp")
+            .is_some()
+    );
+    // The guard that cleared each ramp also reported it.
+    mark_abort_reported(&mut conn_1, QUEUE, stored(old_id), CLEAR_BOUND)
+        .await
+        .expect("mark old ramp");
+    // Many newer ramps on pool 1 are aborted there too.
+    for _ in 0..12 {
+        let new_id = uuid::Uuid::new_v4();
+        set_ramp_with_id(&mut conn_1, new_id).await;
+        let step = policy_step(&mut conn_1).await;
+        assert!(
+            abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+                .await
+                .expect("clear newer ramp")
+                .is_some()
+        );
+        mark_abort_reported(&mut conn_1, QUEUE, stored(new_id), CLEAR_BOUND)
+            .await
+            .expect("mark newer ramp");
+    }
+    assert_eq!(
+        abort_marker_count(&mut conn_1).await,
+        13,
+        "no marker is evicted"
+    );
+
+    // The pass finishes the old ramp on pool 2.
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the old ramp on pool 2 is finished"
+    );
+
+    // The finishing clear wrote an unreported marker on pool 2. The abort was
+    // reported on pool 1, so the next pass only marks pool 2.
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(
+        marker_reported(&mut conn_2, stored(old_id)).await,
+        Some(true)
+    );
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0, "no new report");
+
+    // Every marker is reported and no pool holds a marked ramp. A zero
+    // report grace still keeps them for the marker retention, so a late
+    // fan-out write can still meet a marker.
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn_1).await, 13, "retained");
+
+    // After the retention, the next pass prunes every marker.
+    let past = MIN_MARKER_RETENTION + Duration::from_secs(60);
+    age_markers(&mut conn_1, past).await;
+    age_markers(&mut conn_2, past).await;
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(
+        abort_marker_count(&mut conn_1).await,
+        0,
+        "finished markers go"
+    );
+    assert_eq!(abort_marker_count(&mut conn_2).await, 0);
+}
+
+/// Before the guard prunes the markers of a reported abort, it leaves a
+/// tombstone in the report ledger of every pool. A direct ramp write with
+/// the aborted id is then refused on each pool, also on a pool that never
+/// held the ramp (issue #1814).
+#[tokio::test]
+async fn pruned_markers_leave_a_tombstone_on_every_pool() {
+    let urls = [setup().await, setup().await, setup().await];
+    let pools: Vec<DbPool> = urls.iter().map(|(url, _)| build_pool(url)).collect();
+    let mut conns = Vec::new();
+    for (url, _) in &urls {
+        conns.push(AsyncPgConnection::establish(url).await.expect("connect"));
+    }
+    let ramp_id = uuid::Uuid::new_v4();
+    // Pools 1 and 2 hold the ramp. Pool 3 never got it.
+    for conn in &mut conns[..2] {
+        set_ramp_with_id(conn, ramp_id).await;
+        let step = policy_step(conn).await;
+        assert!(
+            abort_ramp(conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+                .await
+                .expect("clear")
+                .is_some()
+        );
+        mark_abort_reported(conn, QUEUE, stored(ramp_id), CLEAR_BOUND)
+            .await
+            .expect("mark");
+    }
+    set_build_policy(&mut conns[2], QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // The audit pool is pool 1. Its ledger holds the report.
+    assert!(
+        record_abort_report(&mut conns[0], QUEUE, stored(ramp_id))
+            .await
+            .expect("ledger row")
+    );
+    let past = MIN_MARKER_RETENTION + Duration::from_secs(60);
+    for conn in &mut conns[..2] {
+        age_markers(conn, past).await;
+    }
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pools[0], &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    for conn in &mut conns[..2] {
+        assert_eq!(abort_marker_count(conn).await, 0, "the markers are pruned");
+    }
+
+    for (index, conn) in conns.iter_mut().enumerate() {
+        let refused = set_build_ramp_with_id(conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id).await;
+        assert!(
+            matches!(refused, Err(autumn_harvest::HarvestError::Config(_))),
+            "pool {} refuses the aborted ramp: {refused:?}",
+            index + 1
+        );
+        assert!(!ramp_is_active(conn).await);
+    }
+}
+
+/// A policy update re-ids a retained ramp (issue #1814). The guard can
+/// abort that new generation on another pool. The update then applies the
+/// new base and drops the ramp, so it never installs the aborted generation.
+#[tokio::test]
+async fn a_policy_update_drops_a_retained_ramp_whose_new_generation_was_aborted() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    // This pool missed the first policy fan-out, so it still ramps from A.
+    set_ramp_with_id(&mut conn, uuid::Uuid::new_v4()).await;
+    // The fan-out moved the base to C on another pool. The guard aborted the
+    // new generation there, pruned its markers and left a tombstone here.
+    let fan_out = uuid::Uuid::new_v4();
+    let aborted = ramp_generation_id(fan_out, QUEUE, BUILD_C, BUILD_B);
+    assert!(
+        record_abort_report(&mut conn, QUEUE, aborted)
+            .await
+            .expect("tombstone")
+    );
+
+    // The retried fan-out reaches this pool.
+    let policy = set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, fan_out)
+        .await
+        .expect("policy update");
+    assert_eq!(policy.build_id, BUILD_C, "the new base applies");
+    assert_eq!(policy.target_build_id, None, "the aborted ramp is dropped");
+    assert_eq!(policy.ramp_percent, None);
+    assert_eq!(policy_ramp_id(&mut conn).await, None);
+}
+
+/// The tombstone write and the ramp writers of a queue take one advisory
+/// lock (issue #1814). A ramp write waits while the lock is held. So its
+/// statement cannot read the ledger before a tombstone and the row after
+/// the prune.
+#[tokio::test]
+async fn ramp_writers_wait_for_the_ramp_generation_lock() {
+    use diesel_async::AsyncConnection as _;
+
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut holder = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect holder");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    lock_ramp_generations(&mut holder, QUEUE)
+        .await
+        .expect("hold the lock");
+
+    let ramp = tokio::time::timeout(
+        Duration::from_millis(500),
+        set_build_ramp_with_id(
+            &mut conn,
+            QUEUE,
+            BUILD_B,
+            RAMP_PERCENT,
+            uuid::Uuid::new_v4(),
+        ),
+    )
+    .await;
+    assert!(ramp.is_err(), "the ramp write waits: {ramp:?}");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("reconnect");
+    let policy = tokio::time::timeout(
+        Duration::from_millis(500),
+        set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, None, uuid::Uuid::new_v4()),
+    )
+    .await;
+    assert!(policy.is_err(), "the policy write waits: {policy:?}");
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("rollback");
+}
+
+/// A ramp writer sees the commit of the lock holder before it, also when the
+/// database defaults to `repeatable read`. Its snapshot must start after the
+/// lock wait, so it sees a caller id that the holder retired.
+#[tokio::test]
+async fn a_ramp_writer_sees_the_lock_holders_commit_under_repeatable_read() {
+    let (url, _c) = setup().await;
+    let mut admin = AsyncPgConnection::establish(&url).await.expect("connect");
+    diesel::sql_query(
+        "DO $$ BEGIN EXECUTE format( \
+             'ALTER DATABASE %I SET default_transaction_isolation = ''repeatable read''', \
+             current_database()); END $$",
+    )
+    .execute(&mut admin)
+    .await
+    .expect("default to repeatable read");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut holder = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect holder");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    let caller = uuid::Uuid::new_v4();
+    diesel::sql_query("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    lock_ramp_generations(&mut holder, QUEUE)
+        .await
+        .expect("hold the lock");
+    diesel::sql_query("INSERT INTO harvest_ramp_retired_ids (queue_name, ramp_id) VALUES ($1, $2)")
+        .bind::<Text, _>(QUEUE)
+        .bind::<diesel::sql_types::Uuid, _>(caller)
+        .execute(&mut holder)
+        .await
+        .expect("retire the caller id");
+
+    let writer = tokio::spawn(async move {
+        let result = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, caller).await;
+        (result, conn)
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!writer.is_finished(), "the writer waits for the lock");
+    diesel::sql_query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("commit");
+
+    let (result, mut conn) = writer.await.expect("writer task");
+    assert!(
+        matches!(result, Err(autumn_harvest::HarvestError::Config(_))),
+        "the retired caller id is refused: {result:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+}
+
+/// The guard writes no tombstone, and so prunes no marker, while a ramp
+/// writer of the queue holds the advisory lock (issue #1814).
+#[tokio::test]
+async fn markers_stay_while_a_ramp_writer_holds_the_lock() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut holder = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect holder");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    mark_abort_reported(&mut conn, QUEUE, stored(ramp_id), CLEAR_BOUND)
+        .await
+        .expect("mark");
+    age_markers(&mut conn, MIN_MARKER_RETENTION + Duration::from_secs(60)).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    lock_ramp_generations(&mut holder, QUEUE)
+        .await
+        .expect("hold the lock");
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn).await, 1, "the marker stays");
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("rollback");
+
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn).await, 0, "then it goes");
+}
+
+/// A ramp write can reach a pool that the fan-out missed, after the fleet
+/// read and before the tombstone (issue #1814). That pool never held the
+/// marker. The tombstone write, under the lock, clears the ramp, so it does
+/// not outlive the pruned markers.
+#[tokio::test]
+async fn the_tombstone_write_clears_an_aborted_ramp_on_a_missed_pool() {
+    use diesel_async::AsyncConnection as _;
+
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut writer = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect writer");
+    let ramp_id = uuid::Uuid::new_v4();
+    // The fan-out reached pool 1 only. The guard aborted it there and
+    // reported it.
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    mark_abort_reported(&mut conn_1, QUEUE, stored(ramp_id), CLEAR_BOUND)
+        .await
+        .expect("mark");
+    assert!(
+        record_abort_report(&mut conn_1, QUEUE, stored(ramp_id))
+            .await
+            .expect("ledger row")
+    );
+    age_markers(&mut conn_1, MIN_MARKER_RETENTION + Duration::from_secs(60)).await;
+    set_build_policy(&mut conn_2, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+
+    // A retry of the fan-out holds the lock on pool 2 while the pass runs.
+    diesel::sql_query("BEGIN")
+        .execute(&mut writer)
+        .await
+        .expect("begin");
+    lock_ramp_generations(&mut writer, QUEUE)
+        .await
+        .expect("take the lock");
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config()
+        .with_interval(Duration::from_secs(5))
+        .with_report_grace(Duration::ZERO);
+    let pass = tokio::spawn({
+        let pools = pools.clone();
+        async move { guard_once(&pools, &pools[0], &config, None).await }
+    });
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    // The retry installs the ramp on pool 2 and commits before the
+    // tombstone.
+    set_build_ramp_with_id(&mut writer, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id)
+        .await
+        .expect("the retry ramps pool 2");
+    diesel::sql_query("COMMIT")
+        .execute(&mut writer)
+        .await
+        .expect("commit");
+    let aborts = pass.await.expect("pass");
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(
+        abort_marker_count(&mut conn_1).await,
+        0,
+        "the marker is pruned"
+    );
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the tombstone write cleared the aborted ramp on pool 2"
+    );
+    assert!(
+        id_retired(&mut conn_2, ramp_id).await,
+        "the clear retires the request id of the cleared write"
+    );
+}
+
+/// Whether `ramp_id` is a retired id of the test queue.
+async fn id_retired(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) -> bool {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_ramp_retired_ids \
+         WHERE queue_name = $1 AND ramp_id = $2",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
+    .get_result::<CountRow>(conn)
+    .await
+    .expect("read retired ids")
+    .n > 0
+}
+
+/// The guard gives a ramp with no `ramp_id` the report id on every pool
+/// before it clears (issue #1814). A guard can then stop after a partial
+/// clear. A later guard still finishes the pool that did not clear.
+#[tokio::test]
+async fn a_partial_abort_of_an_id_less_ramp_is_finished_after_a_restart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_policy(conn, QUEUE, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        // An old writer sets the ramp with no id.
+        diesel::sql_query(
+            "UPDATE harvest_build_policies \
+             SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+             WHERE queue_name = $1",
+        )
+        .bind::<Text, _>(QUEUE)
+        .bind::<Text, _>(BUILD_B)
+        .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+        .execute(conn)
+        .await
+        .expect("old writer ramp");
+    }
+    assert_eq!(policy_ramp_id(&mut conn_2).await, None);
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    // Pool 2 accepts other writes but fails the clear.
+    diesel::sql_query(
+        "CREATE FUNCTION fail_ramp_clear() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             IF OLD.target_build_id IS NOT NULL AND NEW.target_build_id IS NULL THEN \
+                 RAISE EXCEPTION 'injected clear failure'; \
+             END IF; \
+             RETURN NEW; \
+         END $$",
+    )
+    .execute(&mut conn_2)
+    .await
+    .expect("create function");
+    diesel::sql_query(
+        "CREATE TRIGGER fail_ramp_clear BEFORE UPDATE ON harvest_build_policies \
+         FOR EACH ROW EXECUTE FUNCTION fail_ramp_clear()",
+    )
+    .execute(&mut conn_2)
+    .await
+    .expect("create trigger");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let mut guard = RampGuard::new(guard_config());
+    let aborts = guard.pass(&pools, &pool_1, None, &never).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert!(aborts[0].incomplete, "pool 2 did not clear");
+    // The guard stops before it retries.
+    drop(guard);
+    diesel::sql_query("DROP TRIGGER fail_ramp_clear ON harvest_build_policies")
+        .execute(&mut conn_2)
+        .await
+        .expect("drop trigger");
+
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "no second report: {aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "a later guard finishes pool 2"
+    );
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+}
+
+/// A pool can reject the report-id stamp of an id-less ramp. The guard then
+/// clears no pool in that pass (issue #1814). A clear of the other pools would
+/// leave an unstamped ramp that no marker matches after a restart.
+#[tokio::test]
+async fn a_failed_stamp_defers_the_abort_of_an_id_less_ramp() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_policy(conn, QUEUE, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        // An old writer sets the ramp with no id.
+        diesel::sql_query(
+            "UPDATE harvest_build_policies \
+             SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+             WHERE queue_name = $1",
+        )
+        .bind::<Text, _>(QUEUE)
+        .bind::<Text, _>(BUILD_B)
+        .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+        .execute(conn)
+        .await
+        .expect("old writer ramp");
+    }
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    // Pool 2 rejects the stamp and the clear.
+    diesel::sql_query(
+        "CREATE FUNCTION fail_ramp_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             IF OLD.target_build_id IS NOT NULL THEN \
+                 RAISE EXCEPTION 'injected write failure'; \
+             END IF; \
+             RETURN NEW; \
+         END $$",
+    )
+    .execute(&mut conn_2)
+    .await
+    .expect("create function");
+    diesel::sql_query(
+        "CREATE TRIGGER fail_ramp_write BEFORE UPDATE ON harvest_build_policies \
+         FOR EACH ROW EXECUTE FUNCTION fail_ramp_write()",
+    )
+    .execute(&mut conn_2)
+    .await
+    .expect("create trigger");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "the abort waits: {aborts:?}");
+    assert!(ramp_is_active(&mut conn_1).await, "no pool clears alone");
+
+    diesel::sql_query("DROP TRIGGER fail_ramp_write ON harvest_build_policies")
+        .execute(&mut conn_2)
+        .await
+        .expect("drop trigger");
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert_eq!(aborts.len(), 1, "a later pass aborts: {aborts:?}");
+    assert!(!ramp_is_active(&mut conn_1).await);
+    assert!(!ramp_is_active(&mut conn_2).await);
+}
+
+/// Two guards can race to give an id-less ramp its report id (issue #1814).
+/// The guard that loses adopts the id on the row. Its clear, report and
+/// mark then all use that id, so the marker is reported once.
+#[tokio::test]
+async fn a_guard_adopts_the_report_id_another_guard_stamped() {
+    use diesel_async::AsyncConnection as _;
+
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut other = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect other guard");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // An old writer sets the ramp with no id.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+    .execute(&mut conn)
+    .await
+    .expect("old writer ramp");
+    seed_healthy_base(&mut conn, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn, true, "FAILED", false).await;
+    }
+
+    // The other guard holds the row while this pass reads and judges.
+    diesel::sql_query("BEGIN")
+        .execute(&mut other)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut other)
+        .await
+        .expect("lock the row");
+    let config = guard_config().with_interval(Duration::from_secs(5));
+    let pass = tokio::spawn({
+        let pool = pool.clone();
+        async move { guard_once(std::slice::from_ref(&pool), &pool, &config, None).await }
+    });
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    // The other guard stamps its report id first.
+    let won = uuid::Uuid::new_v4();
+    diesel::sql_query("UPDATE harvest_build_policies SET ramp_id = $2 WHERE queue_name = $1")
+        .bind::<Text, _>(QUEUE)
+        .bind::<diesel::sql_types::Uuid, _>(won)
+        .execute(&mut other)
+        .await
+        .expect("stamp");
+    diesel::sql_query("COMMIT")
+        .execute(&mut other)
+        .await
+        .expect("commit");
+
+    let aborts = pass.await.expect("pass");
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert!(!ramp_is_active(&mut conn).await);
+    assert_eq!(
+        marker_reported(&mut conn, won).await,
+        Some(true),
+        "the marker of the adopted id is reported"
+    );
+}
+
+/// Two guards derive the same report id for one id-less ramp, with no
+/// coordination (issue #1814). The id comes from the queue, the builds and
+/// the step of each pool. So replicas cannot split the pools between two
+/// ids, whatever order their stamps land in.
+#[tokio::test]
+async fn guards_derive_one_report_id_for_an_id_less_ramp() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conns = [
+        AsyncPgConnection::establish(&url_1)
+            .await
+            .expect("connect 1"),
+        AsyncPgConnection::establish(&url_2)
+            .await
+            .expect("connect 2"),
+    ];
+    for conn in &mut conns {
+        set_build_policy(conn, QUEUE, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        // An old writer sets the ramp with no id.
+        diesel::sql_query(
+            "UPDATE harvest_build_policies \
+             SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+             WHERE queue_name = $1",
+        )
+        .bind::<Text, _>(QUEUE)
+        .bind::<Text, _>(BUILD_B)
+        .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+        .execute(conn)
+        .await
+        .expect("old writer ramp");
+        // Every clear fails, so the stamps stay visible.
+        diesel::sql_query(
+            "CREATE FUNCTION fail_ramp_clear() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+                 IF OLD.target_build_id IS NOT NULL AND NEW.target_build_id IS NULL THEN \
+                     RAISE EXCEPTION 'injected clear failure'; \
+                 END IF; \
+                 RETURN NEW; \
+             END $$",
+        )
+        .execute(conn)
+        .await
+        .expect("create function");
+        diesel::sql_query(
+            "CREATE TRIGGER fail_ramp_clear BEFORE UPDATE ON harvest_build_policies \
+             FOR EACH ROW EXECUTE FUNCTION fail_ramp_clear()",
+        )
+        .execute(conn)
+        .await
+        .expect("create trigger");
+    }
+    seed_healthy_base(&mut conns[0], 5).await;
+    for _ in 0..6 {
+        seed(&mut conns[0], true, "FAILED", false).await;
+    }
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+
+    let mut stamped = Vec::new();
+    for _ in 0..2 {
+        // A fresh guard, as another replica would be.
+        let mut guard = RampGuard::new(guard_config());
+        let _ = guard.pass(&pools, &pool_1, None, &never).await;
+        let ids = [
+            policy_ramp_id(&mut conns[0]).await,
+            policy_ramp_id(&mut conns[1]).await,
+        ];
+        assert!(ids[0].is_some(), "the guard stamped the ramp: {ids:?}");
+        assert_eq!(ids[0], ids[1], "one id on both pools");
+        stamped.push(ids[0]);
+        // Forget the stamp, so the next guard sees the ramp with no id. The
+        // step stays.
+        for conn in &mut conns {
+            diesel::sql_query("UPDATE harvest_build_policies SET ramp_id = NULL")
+                .execute(conn)
+                .await
+                .expect("forget the stamp");
+        }
+    }
+    assert_eq!(stamped[0], stamped[1], "both guards derive one report id");
+}
+
+/// A guard can stamp the report id of an id-less ramp on some pools only
+/// (issue #1814). A later guard then reads one stamped generation and one
+/// id-less one. It sees that both are the same ramp and stamps the id that
+/// is already there, so the pools never hold two ids.
+#[tokio::test]
+async fn a_later_guard_converges_on_a_partial_stamp() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conns = [
+        AsyncPgConnection::establish(&url_1)
+            .await
+            .expect("connect 1"),
+        AsyncPgConnection::establish(&url_2)
+            .await
+            .expect("connect 2"),
+    ];
+    for conn in &mut conns {
+        set_build_policy(conn, QUEUE, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        // An old writer sets the ramp with no id.
+        diesel::sql_query(
+            "UPDATE harvest_build_policies \
+             SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+             WHERE queue_name = $1",
+        )
+        .bind::<Text, _>(QUEUE)
+        .bind::<Text, _>(BUILD_B)
+        .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+        .execute(conn)
+        .await
+        .expect("old writer ramp");
+        // Every clear fails, so the stamps stay visible.
+        diesel::sql_query(
+            "CREATE FUNCTION fail_ramp_clear() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+                 IF OLD.target_build_id IS NOT NULL AND NEW.target_build_id IS NULL THEN \
+                     RAISE EXCEPTION 'injected clear failure'; \
+                 END IF; \
+                 RETURN NEW; \
+             END $$",
+        )
+        .execute(conn)
+        .await
+        .expect("create function");
+        diesel::sql_query(
+            "CREATE TRIGGER fail_ramp_clear BEFORE UPDATE ON harvest_build_policies \
+             FOR EACH ROW EXECUTE FUNCTION fail_ramp_clear()",
+        )
+        .execute(conn)
+        .await
+        .expect("create trigger");
+        seed_healthy_base(conn, 5).await;
+        for _ in 0..6 {
+            seed(conn, true, "FAILED", false).await;
+        }
+    }
+    // The first guard's stamp fails on pool 2.
+    diesel::sql_query(
+        "CREATE FUNCTION fail_ramp_stamp() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             IF OLD.ramp_id IS NULL AND NEW.ramp_id IS NOT NULL THEN \
+                 RAISE EXCEPTION 'injected stamp failure'; \
+             END IF; \
+             RETURN NEW; \
+         END $$",
+    )
+    .execute(&mut conns[1])
+    .await
+    .expect("create stamp function");
+    diesel::sql_query(
+        "CREATE TRIGGER fail_ramp_stamp BEFORE UPDATE ON harvest_build_policies \
+         FOR EACH ROW EXECUTE FUNCTION fail_ramp_stamp()",
+    )
+    .execute(&mut conns[1])
+    .await
+    .expect("create stamp trigger");
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let never = CancellationToken::new();
+    let _ = RampGuard::new(guard_config())
+        .pass(&pools, &pool_1, None, &never)
+        .await;
+    let stamped = policy_ramp_id(&mut conns[0]).await;
+    assert!(stamped.is_some(), "pool 1 holds the stamp");
+    assert_eq!(policy_ramp_id(&mut conns[1]).await, None, "pool 2 does not");
+
+    // A fresh guard reads one stamped and one id-less generation.
+    diesel::sql_query("DROP TRIGGER fail_ramp_stamp ON harvest_build_policies")
+        .execute(&mut conns[1])
+        .await
+        .expect("drop stamp trigger");
+    let _ = RampGuard::new(guard_config())
+        .pass(&pools, &pool_1, None, &never)
+        .await;
+    let second = policy_ramp_id(&mut conns[1]).await;
+    assert!(
+        second.is_none() || second == stamped,
+        "pool 2 holds no other id: {second:?} vs {stamped:?}"
+    );
+    assert_eq!(policy_ramp_id(&mut conns[0]).await, stamped);
+}
+
+/// A ramp write with the `ramp_id` of a ramp that an operator cleared or
+/// replaced changes nothing (issue #1814). A late retry of the first
+/// request therefore cannot undo the operator's change.
+#[tokio::test]
+async fn a_ramp_write_does_not_restore_a_superseded_ramp() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    // An operator clears the ramp.
+    let cleared = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, cleared).await;
+    clear_build_ramp(&mut conn, QUEUE).await.expect("clear");
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, cleared).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "a retry after a clear is refused: {retry:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+
+    // An operator replaces the ramp with another one.
+    let replaced = uuid::Uuid::new_v4();
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, replaced)
+        .await
+        .expect("first ramp");
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, 50, uuid::Uuid::new_v4())
+        .await
+        .expect("operator ramp");
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, replaced).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "a retry after a replace is refused: {retry:?}"
+    );
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert_eq!(policy.ramp_percent, Some(50), "the operator ramp stays");
+}
+
+/// A base change re-ids a kept ramp (issue #1814). A late retry of the
+/// first ramp request then derives another stored id from the new base.
+/// The writer retires the request's own id too, so the retry is still
+/// refused and cannot overwrite a newer ramp.
+#[tokio::test]
+async fn a_ramp_retry_after_a_base_change_is_refused() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let first = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, first).await;
+    // A policy fan-out moves the base and keeps the ramp.
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, uuid::Uuid::new_v4())
+        .await
+        .expect("base change");
+    // The operator then sets a newer ramp.
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, 50, uuid::Uuid::new_v4())
+        .await
+        .expect("operator ramp");
+
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, first).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "a retry after a base change is refused: {retry:?}"
+    );
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert_eq!(policy.ramp_percent, Some(50), "the operator ramp stays");
+}
+
+/// An abort retires the request's own id too. A retry after a base change
+/// derives another stored id, but it is still refused.
+#[tokio::test]
+async fn a_retry_of_an_aborted_ramp_after_a_base_change_is_refused() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let first = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, first).await;
+    let step = policy_step(&mut conn).await;
+    abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+        .await
+        .expect("clear")
+        .expect("cleared");
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, uuid::Uuid::new_v4())
+        .await
+        .expect("base change");
+
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, first).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "a retry of an aborted ramp is refused on a new base: {retry:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await);
+}
+
+/// An id-aware writer can change only the percentage under the same caller
+/// id. The reset trigger keeps the id, so an exact retry stays a no-op.
+#[tokio::test]
+async fn a_keyed_percent_change_keeps_its_ramp_id() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let caller = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, caller).await;
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT + 10, caller)
+        .await
+        .expect("percent change");
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(caller, QUEUE, BUILD_A, BUILD_B)),
+        "the id stays"
+    );
+
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT + 10, caller).await;
+    assert!(retry.is_ok(), "an exact retry is a no-op: {retry:?}");
+    // A deployment change under the same caller id keeps the id too.
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("one"), caller)
+        .await
+        .expect("policy write");
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("two"), caller)
+        .await
+        .expect("deployment change");
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(caller, QUEUE, BUILD_A, BUILD_B))
+    );
+}
+
+/// The guard aborts the ramp that a policy write kept. A newer ramp request
+/// then ramps to the same target. A late retry of the policy write keeps
+/// that newer ramp. An exact retry changes nothing, and a changed one is
+/// refused.
+#[tokio::test]
+async fn a_policy_retry_after_an_abort_keeps_a_newer_ramp() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_ramp_with_id(&mut conn, uuid::Uuid::new_v4()).await;
+    let request = uuid::Uuid::new_v4();
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, request)
+        .await
+        .expect("policy write keeps the ramp");
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_C, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    let newer = uuid::Uuid::new_v4();
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, newer)
+        .await
+        .expect("newer ramp");
+    let newer_id = Some(ramp_generation_id(newer, QUEUE, BUILD_C, BUILD_B));
+
+    let retry = set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, request)
+        .await
+        .expect("the exact retry changes nothing");
+    assert_eq!(retry.target_build_id.as_deref(), Some(BUILD_B));
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        newer_id,
+        "the newer ramp stays"
+    );
+
+    let changed =
+        set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, Some("late"), request).await;
+    assert!(
+        matches!(changed, Err(autumn_harvest::HarvestError::Config(_))),
+        "a changed retry is refused: {changed:?}"
+    );
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        newer_id,
+        "the newer ramp stays"
+    );
+}
+
+/// A later policy write that keeps the ramp supersedes an earlier one. A
+/// late retry of the earlier write is refused and leaves the newer ramp.
+#[tokio::test]
+async fn a_stale_policy_retry_does_not_drop_a_newer_ramp() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_ramp_with_id(&mut conn, uuid::Uuid::new_v4()).await;
+    let first = uuid::Uuid::new_v4();
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("one"), first)
+        .await
+        .expect("first policy write");
+    let second = uuid::Uuid::new_v4();
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("two"), second)
+        .await
+        .expect("second policy write");
+
+    let retry = set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("one"), first).await;
+    assert!(
+        matches!(retry, Err(autumn_harvest::HarvestError::Config(_))),
+        "the stale retry is refused: {retry:?}"
+    );
+    let policy = get_build_policy(&mut conn, QUEUE)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert_eq!(policy.deployment_name.as_deref(), Some("two"));
+    assert_eq!(
+        policy.target_build_id.as_deref(),
+        Some(BUILD_B),
+        "the newer ramp stays"
+    );
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(second, QUEUE, BUILD_A, BUILD_B))
+    );
+}
+
+/// A guard can stop after its clear commits and before its report. A later
+/// pass reports that abort once, from the marker, after the report grace.
+#[tokio::test]
+async fn an_unreported_abort_is_reported_once_from_its_marker() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_ramp_with_id(&mut conn, uuid::Uuid::new_v4()).await;
+    // The old guard cleared the ramp, then stopped before its report.
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+
+    // Within the default grace, a pass reports nothing and keeps the marker.
+    let pools = [pool.clone()];
+    let aborts = guard_once(&pools, &pool, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn).await, 1);
+
+    // After the grace, a pass reports the abort from the marker.
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0].reason, RampAbortReason::Unreported);
+    assert_eq!(aborts[0].target_build_id, BUILD_B);
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
+
+    // The next pass reports nothing more. A zero grace still keeps the
+    // reported marker for the marker retention.
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1, "reported once");
+    assert_eq!(abort_marker_count(&mut conn).await, 1, "retained");
+
+    // After the retention, a pass prunes the marker.
+    age_markers(&mut conn, MIN_MARKER_RETENTION + Duration::from_secs(60)).await;
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn).await, 0);
+}
+
+/// Move every abort marker of the test queue back by `by`, as if that much
+/// time had passed.
+async fn age_markers(conn: &mut AsyncPgConnection, by: Duration) {
+    let ms = i64::try_from(by.as_millis()).expect("age in ms");
+    diesel::sql_query(
+        "UPDATE harvest_build_policies SET ramp_aborted = COALESCE(( \
+           SELECT jsonb_agg(jsonb_set(m, '{at}', to_jsonb((m ->> 'at')::bigint - $2)) \
+                            ORDER BY ord) \
+           FROM jsonb_array_elements(ramp_aborted) WITH ORDINALITY AS e(m, ord)), '[]'::jsonb) \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<BigInt, _>(ms)
+    .execute(conn)
+    .await
+    .expect("age markers");
+}
+
+/// The `reported` flag of the abort marker of `ramp_id` on one pool.
+async fn marker_reported(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) -> Option<bool> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        reported: bool,
+    }
+    diesel::sql_query(
+        "SELECT (entry->>'reported')::boolean AS reported \
+         FROM harvest_build_policies, jsonb_array_elements(ramp_aborted) AS m(entry) \
+         WHERE queue_name = $1 AND entry->>'id' = $2",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(ramp_id.to_string())
+    .get_result::<Row>(conn)
+    .await
+    .optional()
+    .expect("read marker")
+    .map(|row| row.reported)
+}
+
+/// The `ramp_id` of the test queue on one pool.
+async fn policy_ramp_id(conn: &mut AsyncPgConnection) -> Option<uuid::Uuid> {
+    queue_ramp_id(conn, QUEUE).await
+}
+
+/// The `ramp_id` of `queue` on one pool.
+async fn queue_ramp_id(conn: &mut AsyncPgConnection, queue: &str) -> Option<uuid::Uuid> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        ramp_id: Option<uuid::Uuid>,
+    }
+    diesel::sql_query("SELECT ramp_id FROM harvest_build_policies WHERE queue_name = $1")
+        .bind::<Text, _>(queue)
+        .get_result::<Row>(conn)
+        .await
+        .expect("read ramp_id")
+        .ramp_id
+}
+
+/// One caller id on two queues gives two ramp ids. The report ledger keys
+/// on `ramp_id`, so a shared id would drop the report of the second abort.
+#[tokio::test]
+async fn one_caller_id_on_two_queues_gives_two_ramp_ids() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    let mut stored_ids = Vec::new();
+    for queue in [QUEUE, "other-queue"] {
+        set_build_policy(&mut conn, queue, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        set_build_ramp_with_id(&mut conn, queue, BUILD_B, RAMP_PERCENT, ramp_id)
+            .await
+            .expect("set ramp");
+        stored_ids.push(queue_ramp_id(&mut conn, queue).await);
+    }
+    assert!(stored_ids[0].is_some(), "{stored_ids:?}");
+    assert_ne!(stored_ids[0], stored_ids[1], "each queue has its own id");
+}
+
+/// A clear on one queue retires the caller id for that queue only. A retry
+/// of the same caller id on another queue stays idempotent.
+#[tokio::test]
+async fn a_clear_on_one_queue_does_not_refuse_the_caller_id_on_another() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    for queue in [QUEUE, "other-queue"] {
+        set_build_policy(&mut conn, queue, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        set_build_ramp_with_id(&mut conn, queue, BUILD_B, RAMP_PERCENT, ramp_id)
+            .await
+            .expect("set ramp");
+    }
+    clear_build_ramp(&mut conn, QUEUE).await.expect("clear");
+
+    let retry =
+        set_build_ramp_with_id(&mut conn, "other-queue", BUILD_B, RAMP_PERCENT, ramp_id).await;
+    assert!(retry.is_ok(), "the other queue keeps its ramp: {retry:?}");
+    let aborted = ramp_generation_aborted(&mut conn, "other-queue", &[ramp_id])
+        .await
+        .expect("check");
+    assert!(!aborted, "the retired id belongs to the cleared queue only");
+}
+
+/// Build ids are free text, so a `/` in one cannot shift the split between
+/// base and target. Two pairs with the same joined text get different ids.
+#[test]
+fn a_slash_in_a_build_id_cannot_collide_two_generations() {
+    let id = uuid::Uuid::new_v4();
+    assert_ne!(
+        ramp_generation_id(id, QUEUE, "a/b", "c"),
+        ramp_generation_id(id, QUEUE, "a", "b/c")
+    );
+}
+
+/// The SQL writers store the same id as [`ramp_generation_id`], also for
+/// build ids with a `/` or multi-byte text.
+#[tokio::test]
+async fn the_stored_ramp_id_matches_the_rust_derivation() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let (base, target) = ("base/ü", "target/ç");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_build_policy(&mut conn, QUEUE, base, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp_with_id(&mut conn, QUEUE, target, RAMP_PERCENT, ramp_id)
+        .await
+        .expect("set ramp");
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(ramp_id, QUEUE, base, target)),
+        "ramp write"
+    );
+
+    let new_base = "base/ä";
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, new_base, None, ramp_id)
+        .await
+        .expect("set policy");
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(ramp_id, QUEUE, new_base, target)),
+        "policy write"
+    );
+}
+
+/// A writer from before the `ramp_id` column changes a ramp but keeps the
+/// old `ramp_id`. The database clears that id, so an old abort marker cannot
+/// match the new ramp.
+#[tokio::test]
+async fn a_ramp_change_without_a_new_ramp_id_drops_the_id() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+            .is_some()
+    );
+    // An old API replica sets a new ramp on pool 2 with its old UPDATE.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT + 10)
+    .execute(&mut conn_2)
+    .await
+    .expect("old writer ramp");
+    assert_eq!(policy_ramp_id(&mut conn_2).await, None, "the old id goes");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "the old marker does not clear the new ramp"
+    );
+}
+
+/// The guard marks an abort as reported only after its audit row commits.
+/// A failed audit write keeps the marker unreported, so a later pass can
+/// report the abort.
+#[tokio::test]
+async fn a_failed_audit_write_keeps_the_marker_unreported() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    seed_healthy_base(&mut conn, 5).await;
+    for _ in 0..5 {
+        seed(&mut conn, true, "FAILED", false).await;
+    }
+    // No server listens on port 1, so every audit write fails.
+    let audit_pool = build_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+
+    let aborts = guard_once(
+        std::slice::from_ref(&pool),
+        &audit_pool,
+        &guard_config(),
+        None,
+    )
+    .await;
+    assert!(
+        aborts.is_empty(),
+        "a failed report is not returned: {aborts:?}"
+    );
+    assert!(!ramp_is_active(&mut conn).await, "the clear still happens");
+    assert_eq!(
+        marker_reported(&mut conn, stored(ramp_id)).await,
+        Some(false),
+        "no audit row, so the marker stays unreported"
+    );
+}
+
+/// A recovery claim is a lease. A guard can claim an unreported abort and
+/// then stop. After the lease, another pass claims it again and reports it
+/// once.
+#[tokio::test]
+async fn a_recovery_claim_that_did_not_report_is_retried_after_its_lease() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    let grace = Duration::from_secs(1);
+    tokio::time::sleep(grace + Duration::from_millis(200)).await;
+    // A guard claims the recovery, then stops before its report.
+    assert!(
+        claim_unreported_abort(&mut conn, QUEUE, stored(ramp_id), grace, CLEAR_BOUND)
+            .await
+            .expect("claim")
+    );
+    assert_eq!(
+        marker_reported(&mut conn, stored(ramp_id)).await,
+        Some(false)
+    );
+
+    // The lease is fresh, so a pass does not report.
+    let config = guard_config().with_report_grace(grace);
+    let pools = [pool.clone()];
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+
+    // After the lease, a pass claims it again and reports it once. With one
+    // pool and a bound of 1 s, the lease is 5 s.
+    tokio::time::sleep(Duration::from_secs(5) + Duration::from_millis(300)).await;
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
+    assert_eq!(
+        marker_reported(&mut conn, stored(ramp_id)).await,
+        Some(true)
+    );
+}
+
+/// A base-build change keeps an active ramp. The fan-out gives the ramp one
+/// new `ramp_id` on every pool. A repeated write on one pool, from a retry
+/// or from two shards on one pool, keeps that id. So the ramp keeps one
+/// identity across pools, and no old marker matches it.
+#[tokio::test]
+async fn a_base_change_fan_out_gives_the_ramp_one_new_id() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let old_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, old_id).await;
+    set_ramp_with_id(&mut conn_2, old_id).await;
+    let new_id = uuid::Uuid::new_v4();
+    // Pool 1 takes the write twice, as from two shards on one pool.
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_policy_with_ramp_id(conn, QUEUE, BUILD_C, None, new_id)
+            .await
+            .expect("set new base");
+        assert!(ramp_is_active(conn).await, "the ramp stays");
+    }
+    set_build_policy_with_ramp_id(&mut conn_1, QUEUE, BUILD_C, None, new_id)
+        .await
+        .expect("repeat on pool 1");
+    let want = ramp_generation_id(new_id, QUEUE, BUILD_C, BUILD_B);
+    assert_eq!(policy_ramp_id(&mut conn_1).await, Some(want));
+    assert_eq!(policy_ramp_id(&mut conn_2).await, Some(want));
+    assert_ne!(want, old_id);
+}
+
+/// A partial fan-out can leave two pools with different targets. A later
+/// policy update keeps both ramps. Each target must keep its own `ramp_id`,
+/// so an abort of one target cannot finish the other.
+#[tokio::test]
+async fn a_policy_update_keeps_diverged_targets_apart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    // Pool 1 ramps to build B. Pool 2 ramps to build C.
+    set_ramp_with_id(&mut conn_1, uuid::Uuid::new_v4()).await;
+    set_build_policy(&mut conn_2, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    set_build_ramp_with_id(
+        &mut conn_2,
+        QUEUE,
+        BUILD_C,
+        RAMP_PERCENT,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .expect("set ramp");
+
+    // One policy update reaches both pools with one caller id.
+    let new_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_policy_with_ramp_id(conn, QUEUE, BUILD_A, Some("deploy"), new_id)
+            .await
+            .expect("policy update");
+    }
+    let id_1 = policy_ramp_id(&mut conn_1).await;
+    let id_2 = policy_ramp_id(&mut conn_2).await;
+    assert_eq!(
+        id_1,
+        Some(ramp_generation_id(new_id, QUEUE, BUILD_A, BUILD_B))
+    );
+    assert_eq!(
+        id_2,
+        Some(ramp_generation_id(new_id, QUEUE, BUILD_A, BUILD_C))
+    );
+    assert_ne!(id_1, id_2, "each target keeps its own id");
+
+    // The guard aborts the ramp to B on pool 1. The ramp to C stays.
+    let step_1 = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+            .is_some()
+    );
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "the ramp to C is not finished by the marker of B"
+    );
+}
+
+/// A partial policy fan-out can leave pools with different base builds. A
+/// later ramp fan-out then reaches both pools with one caller id. The guard
+/// judges the two ramps as two generations, so each abort must report on
+/// its own.
+#[tokio::test]
+async fn a_ramp_fan_out_keeps_diverged_bases_apart() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    // Pool 1 has base build A. Pool 2 has base build C.
+    set_build_policy(&mut conn_1, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base A");
+    set_build_policy(&mut conn_2, QUEUE, BUILD_C, None)
+        .await
+        .expect("set base C");
+    let caller_id = uuid::Uuid::new_v4();
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_ramp_with_id(conn, QUEUE, BUILD_B, RAMP_PERCENT, caller_id)
+            .await
+            .expect("ramp fan-out");
+    }
+    assert_ne!(
+        policy_ramp_id(&mut conn_1).await,
+        policy_ramp_id(&mut conn_2).await,
+        "each base keeps its own id"
+    );
+
+    // Both ramps are cleared with no report, as by a guard that stopped.
+    for (conn, base) in [(&mut conn_1, BUILD_A), (&mut conn_2, BUILD_C)] {
+        let step = policy_step(conn).await;
+        assert!(
+            abort_ramp(conn, QUEUE, base, BUILD_B, step, CLEAR_BOUND)
+                .await
+                .expect("clear")
+                .is_some()
+        );
+    }
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert_eq!(aborts.len(), 2, "each abort reports on its own: {aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 2);
+}
+
+/// `abort_ramp` returns the marker id of its clear. A ramp with no
+/// `ramp_id` gets a fresh report id, so the caller can only report and mark
+/// that abort with the returned id.
+#[tokio::test]
+async fn abort_ramp_returns_the_marker_id_of_an_id_less_ramp() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // An old writer sets the ramp with no id.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+    .execute(&mut conn)
+    .await
+    .expect("old writer ramp");
+    assert_eq!(policy_ramp_id(&mut conn).await, None);
+
+    let step = policy_step(&mut conn).await;
+    let id = abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+        .await
+        .expect("clear")
+        .expect("the clear returns its marker id");
+    assert_eq!(marker_reported(&mut conn, id).await, Some(false));
+    assert!(
+        mark_abort_reported(&mut conn, QUEUE, id, CLEAR_BOUND)
+            .await
+            .expect("mark")
+    );
+    assert_eq!(marker_reported(&mut conn, id).await, Some(true));
+}
+
+/// A recovery claim stays leased while its guard reports, even with a zero
+/// report grace. Another pass therefore does not report the abort again.
+#[tokio::test]
+async fn a_zero_grace_still_leases_a_recovery_claim() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    // Another guard has just claimed the recovery and is still reporting.
+    assert!(
+        claim_unreported_abort(
+            &mut conn,
+            QUEUE,
+            stored(ramp_id),
+            Duration::ZERO,
+            CLEAR_BOUND
+        )
+        .await
+        .expect("claim")
+    );
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
+    assert!(aborts.is_empty(), "the fresh claim holds: {aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+}
+
+/// A repeated ramp write with the same `ramp_id`, from a retry or from two
+/// shards on one pool, keeps the id. It does not start a new step either.
+#[tokio::test]
+async fn a_repeated_ramp_write_keeps_its_ramp_id() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id)
+        .await
+        .expect("repeat the ramp write");
+    assert_eq!(policy_ramp_id(&mut conn).await, Some(stored(ramp_id)));
+    assert_eq!(policy_step(&mut conn).await, step, "the step stays");
+}
+
+/// A policy update gives an id-less ramp the caller's `ramp_id`. Such a ramp
+/// comes from a writer from before the migration. With an id, a later guard
+/// can finish a partial abort of it after a restart.
+#[tokio::test]
+async fn a_policy_update_gives_an_id_less_ramp_an_id() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // An old writer sets the ramp with no id.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+    .execute(&mut conn)
+    .await
+    .expect("old writer ramp");
+    assert_eq!(policy_ramp_id(&mut conn).await, None);
+
+    let ramp_id = uuid::Uuid::new_v4();
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_C, None, ramp_id)
+        .await
+        .expect("set new base");
+    assert!(ramp_is_active(&mut conn).await);
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(ramp_id, QUEUE, BUILD_C, BUILD_B))
+    );
+}
+
+/// Clear the test ramp on both pools with unreported markers for one id, as
+/// a guard does that stopped before its report.
+async fn clear_on_both_pools_unreported(
+    conn_1: &mut AsyncPgConnection,
+    conn_2: &mut AsyncPgConnection,
+) -> uuid::Uuid {
+    let ramp_id = uuid::Uuid::new_v4();
+    for conn in [conn_1, conn_2] {
+        set_ramp_with_id(conn, ramp_id).await;
+        let step = policy_step(conn).await;
+        assert!(
+            abort_ramp(conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+                .await
+                .expect("clear")
+                .is_some()
+        );
+    }
+    stored(ramp_id)
+}
+
+/// A fresh recovery claim on one pool stops recovery of that abort on every
+/// pool. Another guard therefore cannot report it through the second pool.
+#[tokio::test]
+async fn a_fresh_claim_on_one_pool_stops_recovery_on_every_pool() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = clear_on_both_pools_unreported(&mut conn_1, &mut conn_2).await;
+    // Another guard has claimed the recovery on pool 1 and still reports.
+    assert!(
+        claim_unreported_abort(&mut conn_1, QUEUE, ramp_id, Duration::ZERO, CLEAR_BOUND)
+            .await
+            .expect("claim")
+    );
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "the claim holds fleet-wide: {aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0);
+    assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(false));
+}
+
+/// A recovery claim that fails on one pool moves to the next marker pool.
+/// Pool 1 stays readable, but a row lock blocks the claim there. The abort is
+/// still reported once, through pool 2.
+#[tokio::test]
+async fn a_failed_recovery_claim_tries_the_next_marker_pool() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let mut locker = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect locker");
+    let ramp_id = clear_on_both_pools_unreported(&mut conn_1, &mut conn_2).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock pool 1 policy row");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_2, &config, None).await;
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert_eq!(aborts.len(), 1, "pool 2 takes the claim: {aborts:?}");
+    assert_eq!(aborts[0].reason, RampAbortReason::Unreported);
+    assert_eq!(auto_abort_audit_rows(&mut conn_2).await, 1);
+    assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(true));
+}
+
+/// A reported marker on one pool means that the abort was reported. A pass
+/// marks the rest as reported and does not report the abort again.
+#[tokio::test]
+async fn a_partly_marked_abort_is_not_reported_again() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = clear_on_both_pools_unreported(&mut conn_1, &mut conn_2).await;
+    // The reporting guard marked pool 1, then stopped before pool 2.
+    assert!(
+        mark_abort_reported(&mut conn_1, QUEUE, ramp_id, CLEAR_BOUND)
+            .await
+            .expect("mark pool 1")
+    );
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 0);
+    assert_eq!(marker_reported(&mut conn_2, ramp_id).await, Some(true));
+}
+
+/// The report ledger records each abort once. A second record of the same
+/// `ramp_id` changes nothing.
+#[tokio::test]
+async fn the_report_ledger_records_an_abort_once() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    assert!(
+        record_abort_report(&mut conn, QUEUE, ramp_id)
+            .await
+            .expect("first record")
+    );
+    assert!(
+        !record_abort_report(&mut conn, QUEUE, ramp_id)
+            .await
+            .expect("second record")
+    );
+}
+
+/// A guard that wants to report an abort that the ledger already holds
+/// writes no audit row. It only marks the markers as reported. So two
+/// replicas that both think they won an abort report it once.
+#[tokio::test]
+async fn an_abort_in_the_report_ledger_is_not_reported_again() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, ramp_id).await;
+    let step = policy_step(&mut conn).await;
+    assert!(
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear")
+            .is_some()
+    );
+    // Another replica reported the abort, then stopped before its mark.
+    assert!(
+        record_abort_report(&mut conn, QUEUE, stored(ramp_id))
+            .await
+            .expect("record")
+    );
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &config, None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 0);
+    assert_eq!(
+        marker_reported(&mut conn, stored(ramp_id)).await,
+        Some(true)
+    );
+}
+
+/// A guard that finishes a partial abort keeps the abort unreported, so a
+/// later pass still reports an abort whose first guard stopped early.
+#[tokio::test]
+async fn finishing_an_unreported_abort_keeps_it_unreported() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    set_ramp_with_id(&mut conn_2, ramp_id).await;
+    // The first guard cleared pool 1 and stopped before its report.
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+            .is_some()
+    );
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(!ramp_is_active(&mut conn_2).await, "pool 2 is finished");
+    assert_eq!(
+        marker_reported(&mut conn_2, stored(ramp_id)).await,
+        Some(false)
+    );
+
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool_1, &config, None).await;
+    assert_eq!(aborts.len(), 1, "the abort is still reported: {aborts:?}");
+    assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+}
+
+/// A reported marker stays for the report grace before a pass prunes it. In
+/// that window, a fan-out still in flight can write the same `ramp_id` to a
+/// later pool. The marker's caller id refuses that write there.
+#[tokio::test]
+async fn a_reported_marker_outlives_a_late_fan_out_write() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    set_build_policy(&mut conn_2, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy 2");
+    // The fan-out reached pool 1, and the guard aborted and reported it.
+    let ramp_id = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn_1, ramp_id).await;
+    let step = policy_step(&mut conn_1).await;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+            .is_some()
+    );
+    mark_abort_reported(&mut conn_1, QUEUE, stored(ramp_id), CLEAR_BOUND)
+        .await
+        .expect("mark pool 1");
+
+    // Within the grace, a pass keeps the reported marker.
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert_eq!(abort_marker_count(&mut conn_1).await, 1, "the marker stays");
+
+    // The late fan-out write reaches pool 2. The pass retired the caller id
+    // on pool 2 from the marker, so the write is refused.
+    let late = set_build_ramp_with_id(&mut conn_2, QUEUE, BUILD_B, RAMP_PERCENT, ramp_id).await;
+    assert!(
+        matches!(late, Err(autumn_harvest::HarvestError::Config(_))),
+        "the late write is refused: {late:?}"
+    );
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        !ramp_is_active(&mut conn_2).await,
+        "the late ramp is cleared"
+    );
+}
+
+/// The guard keeps a failed report of a ramp with no `ramp_id` recoverable.
+/// The clear writes a marker under a report id of its own, so a later pass
+/// still reports the abort.
+#[tokio::test]
+async fn a_failed_report_of_an_id_less_ramp_is_recovered() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    // An old writer sets the ramp with no id.
+    diesel::sql_query(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1",
+    )
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(BUILD_B)
+    .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+    .execute(&mut conn)
+    .await
+    .expect("old writer ramp");
+    seed_healthy_base(&mut conn, 5).await;
+    for _ in 0..5 {
+        seed(&mut conn, true, "FAILED", false).await;
+    }
+    // The first report fails: no server listens on port 1.
+    let audit_down = build_pool("postgres://postgres:postgres@127.0.0.1:1/none");
+    let pools = [pool.clone()];
+    let aborts = guard_once(&pools, &audit_down, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(!ramp_is_active(&mut conn).await, "the clear happens");
+    assert_eq!(abort_marker_count(&mut conn).await, 1, "a marker remains");
+
+    // A later pass reports the abort from that marker.
+    let config = guard_config().with_report_grace(Duration::ZERO);
+    let aborts = guard_once(&pools, &pool, &config, None).await;
+    assert_eq!(aborts.len(), 1, "{aborts:?}");
+    assert_eq!(aborts[0].reason, RampAbortReason::Unreported);
+    assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
+}
+
+/// A split ramp with no abort marker is not cleared.
+#[tokio::test]
+async fn a_split_ramp_without_an_abort_marker_stays() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    set_build_policy(&mut conn_1, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy 1");
+    set_ramp(&mut conn_2).await;
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "no marker, so the ramp stays"
+    );
+}

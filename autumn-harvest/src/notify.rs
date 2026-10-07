@@ -289,6 +289,31 @@ pub async fn notify_workflow_events_appended(
     .await
 }
 
+/// Add trailing events to the next wake of [`workflow_events_channel`].
+///
+/// A decision boundary (issue #1833) uses it. The count of the wake includes
+/// the boundary, and the last event type stays the decision's outcome.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_trailing_events_appended(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    event_count: usize,
+    event_type: &str,
+) -> HarvestResult<()> {
+    stage(
+        conn,
+        vec![Note::Trailing {
+            exec_id: workflow_exec_id,
+            count: event_count,
+            event_type: event_type.to_string(),
+        }],
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Post-commit delivery (issue #1796)
 // ---------------------------------------------------------------------------
@@ -360,6 +385,18 @@ pub(crate) enum Note {
         /// Type name of the last appended event.
         last_event_type: String,
     },
+    /// Events that trail the decision's own events, such as a decision
+    /// boundary (issue #1833). They add to the count of the execution. The
+    /// last type of a note before them stays, so a listener still sees the
+    /// outcome event.
+    Trailing {
+        /// The execution.
+        exec_id: Uuid,
+        /// Number of events appended.
+        count: usize,
+        /// Type name to report when no note before them names one.
+        event_type: String,
+    },
 }
 
 impl Note {
@@ -367,7 +404,7 @@ impl Note {
     fn channel(&self) -> &str {
         match self {
             Self::Task { channel, .. } => channel,
-            Self::Events { .. } => workflow_events_channel(),
+            Self::Events { .. } | Self::Trailing { .. } => workflow_events_channel(),
         }
     }
 }
@@ -420,6 +457,21 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                 } else {
                     index.insert(key, merged.len());
                     merged.push(Merged::Events(exec_id, count, last_event_type));
+                }
+            }
+            Note::Trailing {
+                exec_id,
+                count,
+                event_type,
+            } => {
+                let key = format!("events:{exec_id}");
+                if let Some(&i) = index.get(&key) {
+                    if let Merged::Events(_, total, _) = &mut merged[i] {
+                        *total += count;
+                    }
+                } else {
+                    index.insert(key, merged.len());
+                    merged.push(Merged::Events(exec_id, count, event_type));
                 }
             }
         }
@@ -880,6 +932,81 @@ struct StageRow {
     started_at: DateTime<Utc>,
 }
 
+/// Notes that [`coalesced`] holds for one write connection (issue #1833).
+struct HeldNotes {
+    /// The address of the connection the notes belong to.
+    conn: usize,
+    /// The notes staged on that connection so far.
+    notes: Vec<Note>,
+}
+
+tokio::task_local! {
+    /// The notes of the [`coalesced`] scope that runs on this task.
+    static HELD: std::cell::RefCell<HeldNotes>;
+}
+
+/// The key that tells one connection from another in a [`coalesced`] scope.
+fn conn_key(conn: &AsyncPgConnection) -> usize {
+    std::ptr::from_ref(conn).addr()
+}
+
+/// Run `body` on `conn`, then stage its notes once, merged (issue #1833).
+///
+/// Call it inside a transaction. Each note that `body` stages on `conn` is
+/// held. The notes go out in one stage call before `body`'s transaction
+/// commits. So the fallback path also merges the notes of one execution
+/// into one wake, as the post-commit sender does. A decision boundary
+/// needs that: its count must reach the wake of the outcome event.
+///
+/// A note staged on another connection is not held. It can belong to
+/// another database or another transaction.
+///
+/// # Errors
+///
+/// Returns the error of `body`, or the error of the stage call.
+#[doc(hidden)]
+pub async fn coalesced<T>(
+    conn: &mut AsyncPgConnection,
+    body: impl AsyncFnOnce(&mut AsyncPgConnection) -> HarvestResult<T>,
+) -> HarvestResult<T> {
+    let held = HeldNotes {
+        conn: conn_key(conn),
+        notes: Vec::new(),
+    };
+    HELD.scope(std::cell::RefCell::new(held), async move {
+        let out = body(conn).await?;
+        let notes = HELD.with(|held| std::mem::take(&mut held.borrow_mut().notes));
+        if !notes.is_empty() {
+            stage_now(conn, notes).await?;
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Stage `notes` for the write on `conn`, or hold them in a [`coalesced`]
+/// scope for `conn`.
+///
+/// # Errors
+///
+/// Same as [`stage_now`].
+async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+    let key = conn_key(conn);
+    let mut notes = Some(notes);
+    let _ = HELD.try_with(|held| {
+        let mut held = held.borrow_mut();
+        if held.conn == key
+            && let Some(notes) = notes.take()
+        {
+            held.notes.extend(notes);
+        }
+    });
+    match notes {
+        Some(notes) => stage_now(conn, notes).await,
+        None => Ok(()),
+    }
+}
+
 /// Stage `notes` for the write on `conn`.
 ///
 /// # Errors
@@ -887,7 +1014,7 @@ struct StageRow {
 /// Returns an error only when the write transaction has already failed.
 /// Postgres answers `COMMIT` on a failed transaction with a silent rollback.
 /// The error therefore tells the caller that its write did not commit.
-async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+async fn stage_now(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
     let has_sink = any_sink();
     if AtomicBool::load(&ANY_DEFERRED, Ordering::Relaxed)
         && let Ok(runtime) = tokio::runtime::Handle::try_current()
@@ -1993,6 +2120,47 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_trailing_note_adds_its_count_and_keeps_the_last_type() {
+        // A decision boundary follows the outcome events (issue #1833). The
+        // count must include it, and the outcome stays the last type.
+        let a = Uuid::new_v4();
+        let sent = coalesce(vec![
+            events_note(a, 2, "WorkflowCompleted"),
+            Note::Trailing {
+                exec_id: a,
+                count: 1,
+                event_type: "DecisionCommitted".to_string(),
+            },
+        ]);
+        let payload: WorkflowEventNotifyPayload =
+            serde_json::from_str(&sent[0].1).expect("payload parses");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            payload,
+            WorkflowEventNotifyPayload {
+                workflow_exec_id: a,
+                event_count: 3,
+                last_event_type: "WorkflowCompleted".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_trailing_note_alone_reports_its_own_type() {
+        // A decision whose only write is inline staged no event note here.
+        let a = Uuid::new_v4();
+        let sent = coalesce(vec![Note::Trailing {
+            exec_id: a,
+            count: 1,
+            event_type: "DecisionCommitted".to_string(),
+        }]);
+        let payload: WorkflowEventNotifyPayload =
+            serde_json::from_str(&sent[0].1).expect("payload parses");
+        assert_eq!(payload.event_count, 1);
+        assert_eq!(payload.last_event_type, "DecisionCommitted");
     }
 
     #[test]

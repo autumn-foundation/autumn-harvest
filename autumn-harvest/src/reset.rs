@@ -233,6 +233,8 @@ pub fn resolve_reset_point(
                         // * ChildWorkflowCascadeApplied — post-terminal operational
                         //   tail emitted when the parent close cascade fires; including
                         //   it would re-trigger the cascade on replay.
+                        // * DecisionCommitted — the boundary after the terminal of
+                        //   the last decision (issue #1833). It is never a reset point.
                         if matches!(
                             event,
                             WorkflowEvent::WorkflowCompleted { .. }
@@ -241,6 +243,7 @@ pub fn resolve_reset_point(
                                 | WorkflowEvent::WorkflowExecutionTimedOut { .. }
                                 | WorkflowEvent::WorkflowRetryScheduled { .. }
                                 | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+                                | WorkflowEvent::DecisionCommitted { .. }
                         ) {
                             return None;
                         }
@@ -2420,6 +2423,37 @@ mod tests {
             resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
             Ok(0),
             "LastWorkflowTask must skip ChildWorkflowCascadeApplied and return WorkflowStarted"
+        );
+    }
+
+    #[test]
+    fn last_workflow_task_skips_a_decision_boundary_after_the_terminal() {
+        // started(0), scheduled(1), completed(2), boundary(3),
+        // workflow completed(4), boundary(5). A boundary is never a reset
+        // point, so the result is index 2 (issue #1833).
+        let act_id = crate::types::ActivityExecId::new();
+        let boundary = || WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("b"),
+            worker_id: crate::types::WorkerId::new("w"),
+        };
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: act_id,
+                name: "a".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            activity_completed(act_id),
+            boundary(),
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            boundary(),
+        ];
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Ok(2),
         );
     }
 
