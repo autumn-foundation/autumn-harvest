@@ -1686,27 +1686,30 @@ fn external_task_timeout_still_due(
     state == "PENDING" && schedule_to_close_at < now
 }
 
-/// What a workflow task timeout may do to its owning execution.
+/// What a task timeout may do to its owning execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkflowTaskTimeoutDisposition {
-    /// The run is open. Seal it `TIMED_OUT`.
-    Seal,
+enum TaskTimeoutDisposition {
+    /// The run is open. Enforce the timeout: a workflow task seals the run
+    /// `TIMED_OUT`, and an activity task retries or records the timeout.
+    Enforce,
     /// The run is already sealed. Fail the orphan task and nothing else.
     FailTaskOnly,
     /// The row is a staged shard copy. Do not touch it.
     Skip,
 }
 
-/// Classify the locked execution state for a workflow task timeout.
+/// Classify the locked execution state for a task timeout.
 ///
-/// `PAUSED` seals, as the quarantine and poison-pill paths do (issue #383).
-/// A terminal state never changes, so a late timeout cannot rewrite the
-/// recorded outcome of a run.
-fn workflow_task_timeout_disposition(state: &str) -> WorkflowTaskTimeoutDisposition {
+/// `PAUSED` is open, as on the quarantine and poison-pill paths (issue
+/// #383). A terminal state never changes, so a late timeout cannot rewrite
+/// the recorded outcome of a run. That holds for an activity task too: its
+/// timeout appends no event to a sealed history and starts no new attempt
+/// (issue #1870).
+fn task_timeout_disposition(state: &str) -> TaskTimeoutDisposition {
     match state {
-        "RUNNING" | "PAUSED" => WorkflowTaskTimeoutDisposition::Seal,
-        s if crate::erase::is_terminal_state(s) => WorkflowTaskTimeoutDisposition::FailTaskOnly,
-        _ => WorkflowTaskTimeoutDisposition::Skip,
+        "RUNNING" | "PAUSED" => TaskTimeoutDisposition::Enforce,
+        s if crate::erase::is_terminal_state(s) => TaskTimeoutDisposition::FailTaskOnly,
+        _ => TaskTimeoutDisposition::Skip,
     }
 }
 
@@ -2177,6 +2180,18 @@ async fn enforce_activity_timeout(
                 Utc::now(),
             ) {
                 return Ok(None);
+            }
+            // A late timeout must not change a sealed run (issue #1870). A
+            // workflow can end while its activity still runs. The timeout then
+            // fails the orphan task only. It appends no event and wakes nothing,
+            // as for a workflow task. A retry would run the handler again.
+            match task_timeout_disposition(&execution.state) {
+                TaskTimeoutDisposition::Enforce => {}
+                TaskTimeoutDisposition::FailTaskOnly => {
+                    queue::fail_task(conn, task.id, &error).await?;
+                    return Ok(None);
+                }
+                TaskTimeoutDisposition::Skip => return Ok(None),
             }
             // (The queue-pause re-check runs at the TOP of this transaction, before
             // the row locks above — see the lock-ordering note there.)
@@ -2922,15 +2937,15 @@ async fn enforce_workflow_timeout(
             // The task scan filters on task state only. So the owning execution
             // can already be sealed, or can be a staged shard copy. A workflow
             // task timeout seals only an open run: `RUNNING` or `PAUSED`.
-            match workflow_task_timeout_disposition(&execution.state) {
-                WorkflowTaskTimeoutDisposition::Seal => {}
-                WorkflowTaskTimeoutDisposition::FailTaskOnly => {
+            match task_timeout_disposition(&execution.state) {
+                TaskTimeoutDisposition::Enforce => {}
+                TaskTimeoutDisposition::FailTaskOnly => {
                     // The run is already sealed. Close the orphan task so the
                     // scan stops finding it, and keep the recorded outcome.
                     queue::fail_task(conn, task.id, &error).await?;
                     return Ok(None);
                 }
-                WorkflowTaskTimeoutDisposition::Skip => return Ok(None),
+                TaskTimeoutDisposition::Skip => return Ok(None),
             }
             // The engine-reserved type keeps the timeout readable after a
             // start-replace seals this row `CONTINUED_AS_NEW`.
@@ -6960,35 +6975,35 @@ mod tests {
         assert!(!TimeoutReason::ScheduleToClose.retries_per_policy());
     }
 
-    // ── workflow task timeout against the locked execution state ─────────
+    // ── task timeout against the locked execution state ─────────────────
 
     #[test]
-    fn a_workflow_task_timeout_seals_only_an_open_run() {
+    fn a_task_timeout_is_enforced_only_in_an_open_run() {
         for state in ["RUNNING", "PAUSED"] {
             assert_eq!(
-                workflow_task_timeout_disposition(state),
-                WorkflowTaskTimeoutDisposition::Seal,
+                task_timeout_disposition(state),
+                TaskTimeoutDisposition::Enforce,
                 "{state}"
             );
         }
     }
 
     #[test]
-    fn a_workflow_task_timeout_never_rewrites_a_sealed_run() {
+    fn a_task_timeout_never_rewrites_a_sealed_run() {
         for state in crate::erase::TERMINAL_STATES {
             assert_eq!(
-                workflow_task_timeout_disposition(state),
-                WorkflowTaskTimeoutDisposition::FailTaskOnly,
+                task_timeout_disposition(state),
+                TaskTimeoutDisposition::FailTaskOnly,
                 "{state}"
             );
         }
     }
 
     #[test]
-    fn a_workflow_task_timeout_leaves_a_staged_copy_alone() {
+    fn a_task_timeout_leaves_a_staged_copy_alone() {
         assert_eq!(
-            workflow_task_timeout_disposition("MIGRATING"),
-            WorkflowTaskTimeoutDisposition::Skip
+            task_timeout_disposition("MIGRATING"),
+            TaskTimeoutDisposition::Skip
         );
     }
 

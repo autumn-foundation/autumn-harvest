@@ -9430,6 +9430,10 @@
           "description": "Unauthenticated request."
         },
         {
+          "status": 409,
+          "description": "Every shard refused the write: the policy carries a ramp that the build-ramp guard aborted, or a later write superseded this request."
+        },
+        {
           "status": 503,
           "description": "Database unavailable."
         }

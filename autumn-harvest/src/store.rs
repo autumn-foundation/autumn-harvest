@@ -197,42 +197,7 @@ pub async fn append_events_with_codecs(
     }
 
     let rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
-
-    // Cross-region DR write-authority fence (issue #954).
-    //
-    // Below the empty-append early return — an empty append writes nothing, so
-    // there is nothing to fence — and, when fencing is on, in the **same
-    // transaction** as the INSERT. That pairing is the whole guarantee: the
-    // fence read's `ACCESS SHARE` is what blocks `bump_generation`'s
-    // `ACCESS EXCLUSIVE`, and a lock taken by an autocommit statement is
-    // released at statement end. Checked-then-inserted across two autocommit
-    // statements, a concurrent `harvest dr fence` could commit in between and
-    // the stale worker would still append history the operator had been told
-    // was fenced off.
-    //
-    // Most callers already hold a transaction, in which case `transaction()`
-    // opens a savepoint and the outer lock already covers this. The wrapper is
-    // skipped entirely when fencing is off, so the pre-#954 path is unchanged:
-    // no fence read, no savepoint, one INSERT.
-    let inserted = if crate::replication::FenceRegistry::is_enabled() {
-        Box::pin(
-            conn.transaction::<usize, crate::error::HarvestError, _>(async |conn| {
-                crate::replication::assert_fence(conn, exec_id.shard()).await?;
-                diesel::insert_into(harvest_events::table)
-                    .values(&rows)
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)
-            }),
-        )
-        .await?
-    } else {
-        diesel::insert_into(harvest_events::table)
-            .values(&rows)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?
-    };
+    let inserted = insert_event_rows(conn, exec_id, &rows).await?;
 
     if let Some(last_event) = events.last() {
         crate::notify::notify_workflow_events_appended(
@@ -245,6 +210,109 @@ pub async fn append_events_with_codecs(
     }
 
     Ok(inserted)
+}
+
+/// Insert prepared event rows behind the DR write fence. Stages no NOTIFY.
+async fn insert_event_rows(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    rows: &[NewHarvestEvent<'_>],
+) -> HarvestResult<usize> {
+    // Cross-region DR write-authority fence (issue #954).
+    //
+    // Callers skip an empty append — it writes nothing, so there is nothing to
+    // fence. When fencing is on, the fence runs in the **same
+    // transaction** as the INSERT. That pairing is the whole guarantee: the
+    // fence read's `ACCESS SHARE` is what blocks `bump_generation`'s
+    // `ACCESS EXCLUSIVE`, and a lock taken by an autocommit statement is
+    // released at statement end. Checked-then-inserted across two autocommit
+    // statements, a concurrent `harvest dr fence` could commit in between and
+    // the stale worker would still append history the operator had been told
+    // was fenced off.
+    //
+    // Most callers already hold a transaction, in which case `transaction()`
+    // opens a savepoint and the outer lock already covers this. The wrapper is
+    // skipped entirely when fencing is off, so the pre-#954 path is unchanged:
+    // no fence read, no savepoint, one INSERT.
+    if crate::replication::FenceRegistry::is_enabled() {
+        Box::pin(
+            conn.transaction::<usize, crate::error::HarvestError, _>(async |conn| {
+                crate::replication::assert_fence(conn, exec_id.shard()).await?;
+                diesel::insert_into(harvest_events::table)
+                    .values(rows)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)
+            }),
+        )
+        .await
+    } else {
+        diesel::insert_into(harvest_events::table)
+            .values(rows)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)
+    }
+}
+
+/// Append a decision boundary when the decision grew the history (issue #1833).
+///
+/// Call it only for a decision that writes events of its own. As a second
+/// guard, the boundary goes in only when the history grew since
+/// `decision_start`, the next event id when the decision loaded its history.
+///
+/// Call it inside the transaction that persists the decision outcome. The
+/// `FOR UPDATE` lock in [`next_event_id_for`] keeps the id valid.
+///
+/// The insert adds a trailing note to the staged NOTIFY. The `event_count`
+/// of the wake counts the boundary. Its `last_event_type` stays the
+/// decision's outcome, so a listener still sees, say, `WorkflowCompleted`.
+///
+/// `running_cap` is the event hard cap when the run stays running. The
+/// boundary is skipped when it would bring the history to that cap.
+///
+/// Returns `true` when it appended the boundary.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if a query fails, or a
+/// codec error if encoding fails.
+pub(crate) async fn append_decision_boundary(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    decision_start: i32,
+    running_cap: Option<u64>,
+    boundary: &WorkflowEvent,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<bool> {
+    let next_id = next_event_id_for(conn, exec_id).await?;
+    if next_id <= decision_start {
+        return Ok(false);
+    }
+    // A boundary never brings a running history to its hard cap. The cap
+    // check counts rows before persistence, so it cannot foresee every row.
+    // A grant after a busy mutex frees is one example. Such a row can leave
+    // room for the decision but not for its boundary. That decision then
+    // has no boundary.
+    let after = u64::try_from(next_id).unwrap_or(0).saturating_add(1);
+    if running_cap.is_some_and(|cap| after >= cap) {
+        return Ok(false);
+    }
+    let rows = events_to_insert_rows_from_with_codecs(
+        exec_id,
+        std::slice::from_ref(boundary),
+        next_id,
+        codecs,
+    )?;
+    insert_event_rows(conn, exec_id, &rows).await?;
+    crate::notify::notify_trailing_events_appended(
+        conn,
+        exec_id.as_uuid(),
+        rows.len(),
+        boundary.type_name(),
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Append events, offloading any over-threshold payload fields (issue #524).
@@ -922,15 +990,17 @@ pub(crate) async fn next_event_id_for(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<i32> {
-    use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
 
+    // The row is read only to lock it and to prove it exists. Selecting the
+    // id alone skips the JSONB columns. Each decision runs this for its
+    // boundary (issue #1833).
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .for_update()
-        .select(WorkflowExecution::as_select())
-        .first(conn)
+        .select(harvest_workflow_executions::id)
+        .first::<uuid::Uuid>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?

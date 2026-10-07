@@ -2484,7 +2484,8 @@ fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
         | WorkflowEvent::WorkflowRedriven { .. }
         | WorkflowEvent::WorkflowRetryScheduled { .. }
         | WorkflowEvent::ExternalAwaitResolved { .. }
-        | WorkflowEvent::ExternalAwaitFailed { .. } => None,
+        | WorkflowEvent::ExternalAwaitFailed { .. }
+        | WorkflowEvent::DecisionCommitted { .. } => None,
     }
 }
 

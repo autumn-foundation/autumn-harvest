@@ -852,6 +852,51 @@ async fn paused_execution_retries_past_the_deadline() {
     );
 }
 
+/// A timeout after the run has ended starts no new attempt (issue #1870).
+///
+/// A workflow can fail while one of its activities still runs. A retry would
+/// then run the handler again for a sealed run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_after_the_run_ends_starts_no_new_attempt() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1870-sealed");
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, "t1870_sealed", 3, timeouts).await;
+
+    claim(&mut conn, &queue, "w-sealed").await;
+    age_claim(&mut conn, task_id).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("FAILED"))
+        .execute(&mut conn)
+        .await
+        .expect("end the run");
+    let sealed = history(&mut conn, exec_id).await.len();
+    enforce(&mut conn, None).await;
+
+    let row = task_row(&mut conn, task_id).await;
+    assert_eq!(
+        (row.state.as_str(), row.attempt),
+        ("FAILED", 1),
+        "a sealed run gets no new attempt"
+    );
+    // The recorded outcome stays the last word, as for a workflow task.
+    let events = history(&mut conn, exec_id).await;
+    assert_eq!(
+        (events.len(), timed_out(&events)),
+        (sealed, Vec::new()),
+        "a late timeout appends nothing to a sealed history"
+    );
+    assert_eq!(
+        workflow_task_count(&mut conn, exec_id).await,
+        0,
+        "a late timeout does not wake a sealed run"
+    );
+}
+
 /// ADR 0005 §1: schedule-to-start is not retried, and a task that never left
 /// the queue never feeds the breaker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

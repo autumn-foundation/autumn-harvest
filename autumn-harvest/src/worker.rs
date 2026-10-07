@@ -8994,9 +8994,10 @@ async fn block_workflow_for_non_determinism(
     // fires speculatively before its pause-guarded transaction even opens
     // (an accepted "best-effort, may over-count in a rare pause race"
     // pattern already established in this codebase).
-    telemetry
-        .metrics
-        .record_workflow_non_determinism(&execution.workflow_name, build_id);
+    telemetry.metrics.record_workflow_non_determinism(
+        &execution.workflow_name,
+        &crate::telemetry::build_id_label(build_id),
+    );
 
     if parked_paused {
         // The nd_blocked_at/reason/count columns were never actually
@@ -9016,7 +9017,11 @@ async fn block_workflow_for_non_determinism(
 
     telemetry
         .metrics
-        .record_workflow_nondeterministic_block(&execution.workflow_name, &task.queue_name);
+        .record_workflow_nondeterministic_block_for_build(
+            &execution.workflow_name,
+            &task.queue_name,
+            &crate::telemetry::build_id_label(build_id),
+        );
     tracing::warn!(
         execution_id = %exec_id,
         workflow = %execution.workflow_name,
@@ -16911,6 +16916,8 @@ struct AttemptMetrics<'a> {
     metrics: &'a dyn crate::telemetry::MetricsRecorder,
     activity_name: &'a str,
     queue: &'a str,
+    /// The `build_id` label of the worker that ran the attempt (issue #1814).
+    build: &'a str,
     duration_secs: f64,
     status: ActivityStatus,
     /// The error type and the non-retryable flag of a failed attempt.
@@ -16923,9 +16930,10 @@ impl Drop for AttemptMetrics<'_> {
         if self.counted_by_enforcer {
             return;
         }
-        self.metrics.record_activity_completed_with_error_type(
+        self.metrics.record_activity_completed_for_build(
             self.activity_name,
             self.queue,
+            self.build,
             self.duration_secs,
             self.status,
             self.failure
@@ -16936,8 +16944,12 @@ impl Drop for AttemptMetrics<'_> {
         // SLOs. Fires for both outcomes so `completed / (completed + failed)`
         // is one metric family, the activity-level mirror of
         // harvest.workflow.terminal.
-        self.metrics
-            .record_activity_attempt(self.activity_name, self.queue, self.status);
+        self.metrics.record_activity_attempt_for_build(
+            self.activity_name,
+            self.queue,
+            self.build,
+            self.status,
+        );
         if let Some((error_type, non_retryable)) = self.failure.as_ref() {
             // `workflow.type` is empty here: looking it up costs an extra
             // `harvest_workflow_executions` query per failure. The
@@ -17857,6 +17869,7 @@ async fn process_activity_task(
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
+    build_id: &str,
     cancellation_grace_period: Duration,
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
@@ -18256,9 +18269,12 @@ async fn process_activity_task(
             crate::failure::ActivityFailure::circuit_open(activity_name, opened_at, retry_after)
                 .into_error_payload();
         let telemetry = registry.telemetry().clone();
-        telemetry.metrics.record_activity_completed_with_error_type(
+        let build_label = crate::telemetry::build_id_label(build_id);
+        let build_label = build_label.as_ref();
+        telemetry.metrics.record_activity_completed_for_build(
             activity_name,
             &task.queue_name,
+            build_label,
             0.0,
             ActivityStatus::Failed,
             Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN),
@@ -18269,9 +18285,10 @@ async fn process_activity_task(
             crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
             true,
         );
-        telemetry.metrics.record_activity_attempt(
+        telemetry.metrics.record_activity_attempt_for_build(
             activity_name,
             &task.queue_name,
+            build_label,
             ActivityStatus::Failed,
         );
         // `ActivityStarted` is already committed, and a start is not
@@ -18775,10 +18792,13 @@ async fn process_activity_task(
     // The attempt metrics record when this guard drops, after the outcome is
     // known (issue #1809). A claim lost to a timeout skips them: the timeout
     // enforcer counted that attempt as failed.
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
     let mut attempt_metrics = AttemptMetrics {
         metrics: telemetry.metrics.as_ref(),
         activity_name,
         queue: &task.queue_name,
+        build: build_label.as_ref(),
         duration_secs,
         status,
         failure: failure_info
@@ -20440,6 +20460,58 @@ async fn handle_suspended_workflow(
         registry.payload_codecs(),
     )
     .await
+}
+
+/// Returns 1 when the decision writes a boundary, else 0 (issue #1833).
+///
+/// The history-size gauge of a terminal decision adds this value. A
+/// terminal decision always writes its boundary when boundaries are on.
+/// The history-cap checks add nothing for a boundary: the boundary write
+/// never brings a running history to its cap.
+fn decision_boundary_reserve(registry: &HandlerRegistry, appends: bool) -> u64 {
+    u64::from(appends && registry.history_policy().decision_boundaries())
+}
+
+/// Appends the boundary of this decision when the policy allows it
+/// (issue #1833).
+///
+/// It runs in the transaction that persists the decision outcome. `appends`
+/// tells whether this decision may write events of its own. The boundary
+/// follows only when a row exists at or past `decision_start`. A decision
+/// that writes none gets no boundary, even when another writer appended
+/// meanwhile.
+#[allow(clippy::too_many_arguments)]
+async fn record_decision_boundary(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    exec_id: ExecutionId,
+    decision_start: i32,
+    appends: bool,
+    stays_running: bool,
+    worker_id: &str,
+    build_id: &str,
+) -> HarvestResult<()> {
+    if !appends || !registry.history_policy().decision_boundaries() {
+        return Ok(());
+    }
+    let boundary = WorkflowEvent::DecisionCommitted {
+        build_id: crate::types::BuildId::new(build_id),
+        worker_id: crate::types::WorkerId::new(worker_id),
+    };
+    let running_cap = registry
+        .history_policy()
+        .event_hard_cap()
+        .filter(|_| stays_running);
+    store::append_decision_boundary(
+        conn,
+        exec_id,
+        decision_start,
+        running_cap,
+        &boundary,
+        registry.payload_codecs(),
+    )
+    .await?;
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -22861,10 +22933,14 @@ fn emit_pending_workflow_metrics(
     build_id: &str,
     pending: &PendingWorkflowMetrics,
 ) {
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
     if !pending.is_canary {
-        telemetry.metrics.record_workflow_completed(
+        telemetry.metrics.record_workflow_completed_for_build(
             &execution.workflow_name,
             queue_name,
+            build_label,
             pending.duration_secs,
             pending.status,
         );
@@ -22900,10 +22976,11 @@ fn emit_pending_workflow_metrics(
                     pending.canary_roundtrip_secs.unwrap_or(0.0),
                 );
             } else {
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     &*telemetry.metrics,
                     &execution.workflow_name,
                     queue_name,
+                    build_label,
                     WorkflowStatus::Completed,
                 );
             }
@@ -22921,19 +22998,21 @@ fn emit_pending_workflow_metrics(
                  process_workflow_task, before terminal metrics are recorded"
             );
             if *had_nd_details {
-                telemetry
-                    .metrics
-                    .record_workflow_non_determinism(&execution.workflow_name, build_id);
+                telemetry.metrics.record_workflow_non_determinism(
+                    &execution.workflow_name,
+                    &crate::telemetry::build_id_label(build_id),
+                );
             }
             if pending.is_canary {
                 telemetry
                     .metrics
                     .record_canary_failure(queue_name, pending.canary_shard);
             } else {
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     &*telemetry.metrics,
                     &execution.workflow_name,
                     queue_name,
+                    build_label,
                     WorkflowStatus::Failed,
                 );
             }
@@ -22941,10 +23020,11 @@ fn emit_pending_workflow_metrics(
         TerminalMetricsKind::ContinuedAsNew => {
             // A canary never continues-as-new; the choke point skips it anyway
             // (AC8), so this is effectively unreachable for a canary.
-            crate::telemetry::emit_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal_for_build(
                 &*telemetry.metrics,
                 &execution.workflow_name,
                 queue_name,
+                build_label,
                 WorkflowStatus::ContinuedAsNew,
             );
         }
@@ -23586,77 +23666,116 @@ pub async fn move_workflow_to_dlq_for_history_cap(
     Vec<(ExecutionId, String)>,
     Vec<crate::execution::StartCancelledRun>,
 )> {
+    dead_letter_for_history_cap(
+        conn,
+        task,
+        exec_id,
+        next_event_id,
+        worker_id,
+        parent_exec_id,
+        reason,
+        metrics,
+        codecs,
+        None,
+    )
+    .await
+}
+
+/// [`move_workflow_to_dlq_for_history_cap`] that also appends `boundary`
+/// after the failure (issue #1833).
+///
+/// The cap failure is the terminal decision of the run, so it ends with a
+/// boundary like any other terminal decision. The notes of the transaction
+/// go out merged, so the wake counts the boundary.
+#[allow(clippy::too_many_arguments)]
+async fn dead_letter_for_history_cap(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    parent_exec_id: Option<ExecutionId>,
+    reason: DeadLetterReason,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    boundary: Option<&WorkflowEvent>,
+) -> HarvestResult<(
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<crate::execution::StartCancelledRun>,
+)> {
     let reason = reason.to_string();
 
     let (deferred, closed_children, pending_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-            use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-            let reason = reason.clone();
-            // Issue #1184 (Codex review round 3, P1): this transaction had no
-            // ownership recheck at all -- a stale dispatcher whose claim had
-            // already moved could still DLQ and terminally fail a run its new
-            // owner was actively driving. Lock the execution row FIRST (the
-            // documented `harvest_task_queue` convention -- see
-            // `lock_workflow_execution_row_only`'s doc comment -- and this
-            // function's own subsequent `update_workflow_execution_failed`
-            // write to that same row), before the task-row claim check, so
-            // this can never invert against `timeout::enforce_workflow_timeout`
-            // /`force_fail_activity`'s execution-then-task lock order.
-            lock_workflow_execution_row_only(conn, exec_id).await?;
-            if !queue::claim_still_held_for_update(
-                conn,
-                task.id,
-                worker_id,
-                task.crash_strikes,
-                task.attempt,
-            )
-            .await?
-            {
-                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id: task.id });
-            }
-            let (owner, severity) = exec_dsl::harvest_workflow_executions
-                .find(exec_id.as_uuid())
-                .select((exec_dsl::owner, exec_dsl::severity))
-                .first::<(Option<String>, Option<String>)>(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .unwrap_or((None, None));
-            dlq::dead_letter(
-                conn,
-                &NewDeadLetterEntry {
-                    original_task_id: task.id,
-                    queue_name: task.queue_name.clone(),
-                    task_type: task.task_type.clone(),
-                    workflow_exec_id: task.workflow_exec_id,
-                    activity_name: task.activity_name.clone(),
-                    input: task.input.clone(),
-                    error: reason.clone(),
-                    attempts: task.attempt,
-                    owner,
-                    severity,
-                },
-            )
-            .await?;
-            store::append_events_with_codecs(
-                conn,
-                exec_id,
-                &[WorkflowEvent::workflow_failed(reason.clone())],
-                next_event_id,
-                codecs,
-            )
-            .await?;
-            update_workflow_execution_failed(conn, exec_id, worker_id, &reason, None).await?;
-            queue::fail_task(conn, task.id, &reason).await?;
-            // Drain any remaining sibling PENDING/RUNNING task rows so
-            // they are not claimed after a future redrive reactivates the
-            // execution to RUNNING. Mirrors the poison-pill quarantine and
-            // workflow-task-timeout seal paths.
-            queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
-            let (mut deferred, closed_children) =
-                apply_parent_close_cascade(conn, exec_id, codecs).await?;
-            let mut pending_cancel_metrics = Vec::new();
-            let failed_triggers =
+            crate::notify::coalesced(conn, async |conn| {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let reason = reason.clone();
+                // Issue #1184 (Codex review round 3, P1): this transaction had no
+                // ownership recheck at all -- a stale dispatcher whose claim had
+                // already moved could still DLQ and terminally fail a run its new
+                // owner was actively driving. Lock the execution row FIRST (the
+                // documented `harvest_task_queue` convention -- see
+                // `lock_workflow_execution_row_only`'s doc comment -- and this
+                // function's own subsequent `update_workflow_execution_failed`
+                // write to that same row), before the task-row claim check, so
+                // this can never invert against `timeout::enforce_workflow_timeout`
+                // /`force_fail_activity`'s execution-then-task lock order.
+                lock_workflow_execution_row_only(conn, exec_id).await?;
+                if !queue::claim_still_held_for_update(
+                    conn,
+                    task.id,
+                    worker_id,
+                    task.crash_strikes,
+                    task.attempt,
+                )
+                .await?
+                {
+                    return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id: task.id });
+                }
+                let (owner, severity) = exec_dsl::harvest_workflow_executions
+                    .find(exec_id.as_uuid())
+                    .select((exec_dsl::owner, exec_dsl::severity))
+                    .first::<(Option<String>, Option<String>)>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?
+                    .unwrap_or((None, None));
+                dlq::dead_letter(
+                    conn,
+                    &NewDeadLetterEntry {
+                        original_task_id: task.id,
+                        queue_name: task.queue_name.clone(),
+                        task_type: task.task_type.clone(),
+                        workflow_exec_id: task.workflow_exec_id,
+                        activity_name: task.activity_name.clone(),
+                        input: task.input.clone(),
+                        error: reason.clone(),
+                        attempts: task.attempt,
+                        owner,
+                        severity,
+                    },
+                )
+                .await?;
+                store::append_events_with_codecs(
+                    conn,
+                    exec_id,
+                    &[WorkflowEvent::workflow_failed(reason.clone())],
+                    next_event_id,
+                    codecs,
+                )
+                .await?;
+                update_workflow_execution_failed(conn, exec_id, worker_id, &reason, None).await?;
+                queue::fail_task(conn, task.id, &reason).await?;
+                // Drain any remaining sibling PENDING/RUNNING task rows so
+                // they are not claimed after a future redrive reactivates the
+                // execution to RUNNING. Mirrors the poison-pill quarantine and
+                // workflow-task-timeout seal paths.
+                queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
+                let (mut deferred, closed_children) =
+                    apply_parent_close_cascade(conn, exec_id, codecs).await?;
+                let mut pending_cancel_metrics = Vec::new();
+                let failed_triggers =
                 crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                     conn,
                     exec_id,
@@ -23666,12 +23785,25 @@ pub async fn move_workflow_to_dlq_for_history_cap(
                     codecs,
                 )
                 .await?;
-            deferred.extend(failed_triggers);
-            if let Some(parent_exec_id) = parent_exec_id {
-                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason, codecs)
+                deferred.extend(failed_triggers);
+                if let Some(parent_exec_id) = parent_exec_id {
+                    wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason, codecs)
+                        .await?;
+                }
+                if let Some(boundary) = boundary {
+                    store::append_decision_boundary(
+                        conn,
+                        exec_id,
+                        next_event_id,
+                        None,
+                        boundary,
+                        codecs,
+                    )
                     .await?;
-            }
-            Ok((deferred, closed_children, pending_cancel_metrics))
+                }
+                Ok((deferred, closed_children, pending_cancel_metrics))
+            })
+            .await
         }))
         .await?;
 
@@ -23896,10 +24028,24 @@ async fn fail_workflow_for_history_cap(
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    build_id: &str,
     started_at: std::time::Instant,
     breach: HistoryCapBreach,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
-    let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
+    // Issue #1833: the cap failure is a terminal decision, so it ends with a
+    // boundary when boundaries are on.
+    let boundary =
+        registry
+            .history_policy()
+            .decision_boundaries()
+            .then(|| WorkflowEvent::DecisionCommitted {
+                build_id: crate::types::BuildId::new(build_id),
+                worker_id: crate::types::WorkerId::new(worker_id),
+            });
+    let terminal_count = u64::try_from(next_event_id)
+        .unwrap_or(0)
+        .saturating_add(1)
+        .saturating_add(u64::from(boundary.is_some()));
 
     // Issue #704: decide the crossing from `terminal_count`, never from the
     // `breach` count. `terminal_count` is the durable post-failure event
@@ -23955,7 +24101,7 @@ async fn fail_workflow_for_history_cap(
         "workflow history reached a hard cap; failing the run and moving it to the DLQ"
     );
     let reason = breach.dead_letter_reason(execution.workflow_name.clone());
-    let (deferred, closed_children, pending_cancel_metrics) = move_workflow_to_dlq_for_history_cap(
+    let (deferred, closed_children, pending_cancel_metrics) = dead_letter_for_history_cap(
         conn,
         task,
         exec_id,
@@ -23965,6 +24111,7 @@ async fn fail_workflow_for_history_cap(
         reason,
         Some(telemetry.metrics.as_ref()),
         registry.payload_codecs(),
+        boundary.as_ref(),
     )
     .await?;
 
@@ -23984,19 +24131,24 @@ async fn fail_workflow_for_history_cap(
     // completion-trigger latest-wins supersede counters this call's inline
     // same-shard trigger start may have collected.
     crate::execution::emit_start_cancel_metrics(&*telemetry.metrics, &pending_cancel_metrics);
-    telemetry.metrics.record_workflow_completed(
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
+    telemetry.metrics.record_workflow_completed_for_build(
         &execution.workflow_name,
         &task.queue_name,
+        build_label,
         duration_secs,
         WorkflowStatus::Failed,
     );
     telemetry
         .metrics
         .record_workflow_history_size(&execution.workflow_name, terminal_count);
-    crate::telemetry::emit_workflow_terminal(
+    crate::telemetry::emit_workflow_terminal_for_build(
         &*telemetry.metrics,
         &execution.workflow_name,
         &task.queue_name,
+        build_label,
         WorkflowStatus::Failed,
     );
 
@@ -24400,6 +24552,8 @@ async fn process_workflow_task(
     // activity, timer, signal wait, …) breaks out of the loop.
     let mut history_events = prepared.history_events;
     let mut next_event_id = prepared.next_event_id;
+    // Issue #1833: the boundary covers every event this decision appends.
+    let decision_start_event_id = prepared.next_event_id;
     // Issue #1798: the resident workflow of a warm hit. The first iteration
     // tries to resume it. A decline replays cold, as on a miss.
     let mut warm_resident = prepared.resident.take();
@@ -24802,6 +24956,7 @@ async fn process_workflow_task(
                                 prepared.exec_id,
                                 next_event_id,
                                 worker_id,
+                                build_id,
                                 started_at,
                                 HistoryCapBreach::Events {
                                     count: current_history_event_count,
@@ -24934,6 +25089,7 @@ async fn process_workflow_task(
                             prepared.exec_id,
                             next_event_id,
                             worker_id,
+                            build_id,
                             started_at,
                             breach,
                         )
@@ -24979,6 +25135,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         HistoryCapBreach::Events {
                             count: current_history_event_count,
@@ -25146,6 +25303,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         HistoryCapBreach::Events {
                             count: current_history_event_count,
@@ -25431,6 +25589,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         HistoryCapBreach::Events {
                             count: current_history_event_count,
@@ -25516,7 +25675,7 @@ async fn process_workflow_task(
             // `resume_workflow_execution`'s own lock. A concurrent resume
             // therefore always commits its own wake after this park commits.
             let still_paused = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
-                check_paused_and_park(
+                let parked = check_paused_and_park(
                     conn,
                     prepared.exec_id.as_uuid(),
                     task.id,
@@ -25525,7 +25684,24 @@ async fn process_workflow_task(
                     task.attempt,
                     sticky_timeout,
                 )
-                .await
+                .await?;
+                // Issue #1833: inline steps can have appended events
+                // already. They keep their boundary, as on the park at
+                // persist time.
+                if parked {
+                    record_decision_boundary(
+                        conn,
+                        registry,
+                        prepared.exec_id,
+                        decision_start_event_id,
+                        next_event_id > decision_start_event_id,
+                        true,
+                        worker_id,
+                        build_id,
+                    )
+                    .await?;
+                }
+                Ok(parked)
             }))
             .await?;
             if still_paused {
@@ -25874,6 +26050,17 @@ async fn process_workflow_task(
         // Issue #1797: returned at the gate above; it appends no event.
         WorkflowOutcome::TaskFailed { .. } => 0,
     };
+    // Whether this decision writes events of its own (issue #1833). Inline
+    // steps already advanced `next_event_id`. A terminal outcome always
+    // writes its terminal event.
+    let inline_appends = next_event_id > decision_start_event_id;
+    let stays_running = matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    let decision_appends = inline_appends || pending_durable_event_count > 0 || !stays_running;
+    // The preflight reserves no slot for the boundary. Several estimates
+    // above are upper bounds. Examples are a mutex acquire and the losers of
+    // a race. A reserved slot could then fail a decision that writes
+    // nothing. Instead the boundary write never brings a running history to
+    // its cap.
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
         .saturating_add(pending_durable_event_count);
@@ -25894,6 +26081,7 @@ async fn process_workflow_task(
             prepared.exec_id,
             next_event_id,
             worker_id,
+            build_id,
             started_at,
             HistoryCapBreach::Events {
                 count: current_history_event_count,
@@ -25924,6 +26112,7 @@ async fn process_workflow_task(
             prepared.exec_id,
             next_event_id,
             worker_id,
+            build_id,
             started_at,
             breach,
         )
@@ -25974,7 +26163,8 @@ async fn process_workflow_task(
                 &pending_cmds,
                 resolved_abandoned_dispatch_event_count,
             )
-            .saturating_add(terminal_parent_close_cascade_events),
+            .saturating_add(terminal_parent_close_cascade_events)
+            .saturating_add(decision_boundary_reserve(registry, true)),
         )
     } else {
         None
@@ -26192,94 +26382,134 @@ async fn process_workflow_task(
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
 
+    // Issue #1833: one merged wake per execution, also on the fallback path.
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
-            if check_paused_and_park(
-                conn,
-                exec_uuid,
-                task.id,
-                worker_id,
-                task.crash_strikes,
-                task.attempt,
-                sticky_timeout,
-            )
-            .await?
-            {
-                return Ok(WorkflowPersistFlow::ParkedPaused);
-            }
-
-            // Issue #603: this cycle replayed cleanly (the ND gate above
-            // did not fire), so if the execution was previously blocked on
-            // replay non-determinism the offending build has been rolled
-            // back or fixed — clear the block marker atomically with the
-            // recovered cycle's persisted outcome. Guarded on
-            // `was_nd_blocked` (captured *before* the in-memory mutation
-            // above) rather than re-reading `execution_ref.nd_blocked_at`,
-            // which is already `None` here by the time this runs — so
-            // never-blocked executions still pay nothing, and a
-            // previously-blocked one still gets its DB row cleared.
-            if was_nd_blocked {
-                clear_nd_block(conn, persistence.exec_id).await?;
-            }
-
-            let mut pending_cancel_metrics = Vec::new();
-            // Issue #1161: `false` unless the ContinuedAsNew outcome below
-            // (reached via either branch) redirects to a terminal failure —
-            // see `persist_workflow_outcome`'s parameter doc.
-            let mut continue_as_new_redirected_to_failure = false;
-            let (retry_scheduled, deferred_checks, race_deferred_triggers) =
-                if is_terminal_with_commands {
-                    persist_terminal_outcome_commands(
+            crate::notify::coalesced(conn, async |conn| {
+                if check_paused_and_park(
+                    conn,
+                    exec_uuid,
+                    task.id,
+                    worker_id,
+                    task.crash_strikes,
+                    task.attempt,
+                    sticky_timeout,
+                )
+                .await?
+                {
+                    // Inline local activities can have appended events already.
+                    record_decision_boundary(
                         conn,
                         registry,
-                        execution_ref,
-                        persistence,
-                        outcome,
-                        &pending_cmds,
-                        &recorded_dispatches,
-                        &execute_span,
-                        &mut pending_cancel_metrics,
-                        &mut continue_as_new_redirected_to_failure,
-                        resolved_router.as_ref(),
-                    )
-                    .await?
-                } else {
-                    let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
-                        conn,
-                        registry,
-                        execution_ref,
-                        persistence,
-                        outcome,
-                        &execute_span,
-                        false,
-                        // Issue #678: carries any external-op terminal
-                        // resolved inline this cycle into the Suspended arm
-                        // so a mixed timer + external op self-wakes.
-                        resolved_inline_external,
-                        &mut pending_cancel_metrics,
-                        &mut continue_as_new_redirected_to_failure,
-                        resolved_router.as_ref(),
-                        // This path never computes an abandoned-dispatch
-                        // decision ahead of time (`is_terminal_with_commands`
-                        // is false here), so the arm resolves its own verdict.
-                        None,
+                        prepared.exec_id,
+                        decision_start_event_id,
+                        inline_appends,
+                        true,
+                        worker_id,
+                        build_id,
                     )
                     .await?;
-                    (retry_scheduled, deferred_checks, Vec::new())
-                };
-            // Chaos: kill/delay inside the persist transaction, after the
-            // outcome is written but before the outer commit — the #367 window
-            // (worker dies after claim, before the terminal is durable). A kill
-            // (owned conn in the reproducer's spawned task) rolls the persist
-            // back, leaving the task RUNNING with a dead worker (AC4).
-            crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
-            Ok(WorkflowPersistFlow::Persisted {
-                retry_scheduled,
-                deferred_checks,
-                race_deferred_triggers,
-                pending_cancel_metrics,
-                continue_as_new_redirected_to_failure,
+                    return Ok(WorkflowPersistFlow::ParkedPaused);
+                }
+
+                // Issue #1833: the boundary follows only rows this decision
+                // writes. The execution row is locked now, and every history
+                // writer takes that lock. So a row past this id is this
+                // transaction's own. A row another writer committed after the
+                // decision start does not count. Inline steps wrote before
+                // the lock, so they keep the decision start.
+                let boundary_floor =
+                    if inline_appends || !registry.history_policy().decision_boundaries() {
+                        decision_start_event_id
+                    } else {
+                        store::next_event_id_for(conn, prepared.exec_id).await?
+                    };
+
+                // Issue #603: this cycle replayed cleanly (the ND gate above
+                // did not fire), so if the execution was previously blocked on
+                // replay non-determinism the offending build has been rolled
+                // back or fixed — clear the block marker atomically with the
+                // recovered cycle's persisted outcome. Guarded on
+                // `was_nd_blocked` (captured *before* the in-memory mutation
+                // above) rather than re-reading `execution_ref.nd_blocked_at`,
+                // which is already `None` here by the time this runs — so
+                // never-blocked executions still pay nothing, and a
+                // previously-blocked one still gets its DB row cleared.
+                if was_nd_blocked {
+                    clear_nd_block(conn, persistence.exec_id).await?;
+                }
+
+                let mut pending_cancel_metrics = Vec::new();
+                // Issue #1161: `false` unless the ContinuedAsNew outcome below
+                // (reached via either branch) redirects to a terminal failure —
+                // see `persist_workflow_outcome`'s parameter doc.
+                let mut continue_as_new_redirected_to_failure = false;
+                let (retry_scheduled, deferred_checks, race_deferred_triggers) =
+                    if is_terminal_with_commands {
+                        persist_terminal_outcome_commands(
+                            conn,
+                            registry,
+                            execution_ref,
+                            persistence,
+                            outcome,
+                            &pending_cmds,
+                            &recorded_dispatches,
+                            &execute_span,
+                            &mut pending_cancel_metrics,
+                            &mut continue_as_new_redirected_to_failure,
+                            resolved_router.as_ref(),
+                        )
+                        .await?
+                    } else {
+                        let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
+                            conn,
+                            registry,
+                            execution_ref,
+                            persistence,
+                            outcome,
+                            &execute_span,
+                            false,
+                            // Issue #678: carries any external-op terminal
+                            // resolved inline this cycle into the Suspended arm
+                            // so a mixed timer + external op self-wakes.
+                            resolved_inline_external,
+                            &mut pending_cancel_metrics,
+                            &mut continue_as_new_redirected_to_failure,
+                            resolved_router.as_ref(),
+                            // This path never computes an abandoned-dispatch
+                            // decision ahead of time (`is_terminal_with_commands`
+                            // is false here), so the arm resolves its own verdict.
+                            None,
+                        )
+                        .await?;
+                        (retry_scheduled, deferred_checks, Vec::new())
+                    };
+                record_decision_boundary(
+                    conn,
+                    registry,
+                    prepared.exec_id,
+                    boundary_floor,
+                    decision_appends,
+                    stays_running,
+                    worker_id,
+                    build_id,
+                )
+                .await?;
+                // Chaos: kill/delay inside the persist transaction, after the
+                // outcome is written but before the outer commit — the #367 window
+                // (worker dies after claim, before the terminal is durable). A kill
+                // (owned conn in the reproducer's spawned task) rolls the persist
+                // back, leaving the task RUNNING with a dead worker (AC4).
+                crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
+                Ok(WorkflowPersistFlow::Persisted {
+                    retry_scheduled,
+                    deferred_checks,
+                    race_deferred_triggers,
+                    pending_cancel_metrics,
+                    continue_as_new_redirected_to_failure,
+                })
             })
+            .await
         },
     ))
     .await;
@@ -26866,6 +27096,7 @@ async fn process_task(
                 registry.as_ref(),
                 &task,
                 worker_id,
+                build_id,
                 cancellation_grace_period,
                 dispatched_at,
                 max_concurrent_sessions,
@@ -35723,12 +35954,13 @@ impl Worker {
                                         exec_id,
                                     );
                                 }
-                                let quarantined = quarantine_workflow_task_timeout(
+                                let quarantined = quarantine_workflow_task_timeout_for_build(
                                     &pool,
                                     task_id,
                                     exec_id_for_timeout,
                                     &worker_id,
                                     claim_attempt,
+                                    &build_id,
                                     new_strikes,
                                     timeout_secs,
                                     &workflow_name_str,
@@ -36389,7 +36621,10 @@ async fn workflow_task_timeout_metric_names(
 /// The write is fenced on the claim `(worker_id, attempt)`. The acquire can
 /// retry for longer than the stuck-running backstop. A peer can then hold a
 /// new claim, and its run must not fail. A lost claim also returns `false`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+///
+/// The terminal metric reports `build_id="none"`. The worker calls the
+/// crate-private variant that reports its own build (issue #1814).
+#[allow(clippy::too_many_arguments)]
 pub async fn quarantine_workflow_task_timeout(
     pool: &DbPool,
     task_id: uuid::Uuid,
@@ -36403,6 +36638,40 @@ pub async fn quarantine_workflow_task_timeout(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> bool {
+    quarantine_workflow_task_timeout_for_build(
+        pool,
+        task_id,
+        exec_id_opt,
+        worker_id,
+        attempt,
+        "",
+        new_strikes,
+        timeout_secs,
+        workflow_name,
+        queue_name,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`quarantine_workflow_task_timeout`] with the build of the worker that ran
+/// the task, for the `build_id` label of the terminal metric (issue #1814).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn quarantine_workflow_task_timeout_for_build(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    exec_id_opt: Option<uuid::Uuid>,
+    worker_id: &str,
+    attempt: i32,
+    build_id: &str,
+    new_strikes: i32,
+    timeout_secs: u64,
+    workflow_name: &str,
+    queue_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> bool {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
@@ -36732,10 +37001,11 @@ pub async fn quarantine_workflow_task_timeout(
                     .map_or((workflow_name, q.as_str()), |(name, queue)| {
                         (name.as_str(), queue.as_str())
                     });
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     metrics,
                     workflow_name,
                     q,
+                    &crate::telemetry::build_id_label(build_id),
                     crate::telemetry::WorkflowStatus::Failed,
                 );
                 // The terminal above skips a canary probe. A quarantined probe

@@ -917,7 +917,9 @@ the codec encrypts. Set it with `WorkflowFailure::with_details` or
 `ActivityFailure::with_details`. A plain `Err(String)` sets no `details`. The
 other variants have no encrypted field for failure data.
 
-Event types, ids, timestamps and workflow names also stay in clear. Do not put
+Event types, ids, timestamps and workflow names also stay in clear. So do the
+build id and the worker id in `DecisionCommitted` (issue #1833). A worker id
+often holds a host name or a pod name. The redacted export keeps both. Do not put
 PII in a memo, a search attribute, a workflow id or a workflow name. If these
 columns must not hold PII, encrypt the value in workflow code before Harvest
 sees it. Also use Postgres disk encryption.

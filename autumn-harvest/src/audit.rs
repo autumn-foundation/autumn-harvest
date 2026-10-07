@@ -195,6 +195,10 @@ pub const OP_BATCH_RESET: &str = "batch.reset";
 pub const OP_BUILD_RAMP_SET: &str = "build_routing.ramp.set";
 /// Audit operation: Cleared a queue's percentage build ramp (issue #604).
 pub const OP_BUILD_RAMP_CLEAR: &str = "build_routing.ramp.clear";
+/// Audit operation: The ramp guard aborted a queue's build ramp (issue #1814).
+///
+/// The actor is `system`. The row's summary holds the reason and both rates.
+pub const OP_BUILD_RAMP_AUTO_ABORT: &str = "build_routing.ramp.auto_abort";
 /// Audit operation: Manually redrove a dead-lettered completion-callback
 /// delivery (issue #605).
 pub const OP_CALLBACK_REDRIVE: &str = "completion_callback.redrive";
@@ -970,6 +974,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // writes these rows.
     OP_LOAD_SHED_TRIP,
     OP_LOAD_SHED_CLEAR,
+    // Build ramp guard (issue #1814). No route entry: the guard writes these
+    // rows.
+    OP_BUILD_RAMP_AUTO_ABORT,
     // Shard rebalancing (issues #964 and #1839). No route entry: the CLI and
     // the rebalance-resume scanner write these rows.
     OP_SHARD_REBALANCE_MIGRATE,
