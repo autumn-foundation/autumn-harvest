@@ -3073,6 +3073,47 @@ async fn a_superseded_pin_writes_no_activity_heartbeat() {
     );
 }
 
+/// A batch pass that cannot check out a connection drops its fence barriers
+/// (issue #1823). An exhausted pool must not block a bump.
+#[tokio::test]
+async fn a_batch_pass_waiting_for_a_connection_does_not_block_a_bump() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("batchwait");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        );
+    let pool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool build");
+    // The only connection stays checked out, so the pass waits for it.
+    let busy = pool.get().await.expect("check out the only connection");
+    let pools = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+    let pass = tokio::spawn(async move {
+        autumn_harvest::batch::run_executor_once(
+            &pools,
+            &autumn_harvest::batch::BatchExecutorConfig::default(),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bumped = bump_generation(&mut conn, shard, "failover", "test").await;
+    drop(busy);
+    pass.abort();
+    let _ = pass.await;
+    assert!(
+        bumped.is_ok(),
+        "a batch pass parked on the pool must not hold the bump off: {bumped:?}"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.
