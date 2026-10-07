@@ -21077,7 +21077,9 @@ mod tests {
     async fn freeze_completes_well_under_a_decision_budget_at_max_n() {
         // R10: a decision cycle must stay cheap. The scan is bounded and uses
         // BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
+        // Every tenth day stays open, so no run is longer than 30 days (issue #1968).
         let holidays: Vec<chrono::NaiveDate> = (0..400)
+            .filter(|i| i % 10 != 0)
             .filter_map(|i| {
                 chrono::NaiveDate::from_ymd_opt(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
             })
@@ -21090,7 +21092,7 @@ mod tests {
         // Assert the outcome, not just the timing: discarding the Result would
         // let the scan bail out immediately with an error and still "pass".
         // With no declared coverage horizon the resolution must SUCCEED, and it
-        // must land past the 400 blocked days.
+        // must land past the 400-day holiday span.
         let deadline = out.expect("MAX_BUSINESS_DAYS must resolve, not reject");
         assert!(
             deadline > bd_utc("2027-02-05T00:00:00Z"),

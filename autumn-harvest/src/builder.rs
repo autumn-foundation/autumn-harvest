@@ -3222,29 +3222,20 @@ fn validate_workflow_schedules(
                 workflow_name: schedule.workflow_name.clone(),
             });
         }
-        // Reject zero-length intervals (would cause infinite loops in due_run_plan
-        // with catchup=true) and invalid cron expressions (would silently never fire).
-        if let crate::policy::Schedule::Interval(dur) = &schedule.schedule {
-            if dur.is_zero() {
-                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
-                    workflow_name: schedule.workflow_name.clone(),
-                    reason: "interval must be at least 1 second".to_string(),
-                });
-            }
-        } else {
-            // Validate timezone names early so operators get a typed error rather
-            // than a silent bad-timezone panic at first scheduler tick.
-            if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
-                && tz.parse::<chrono_tz::Tz>().is_err()
-            {
-                return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
-            }
-            if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
-                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
-                    workflow_name: schedule.workflow_name.clone(),
-                    reason,
-                });
-            }
+        // Validate timezone names early so operators get a typed error rather
+        // than a silent bad-timezone panic at first scheduler tick.
+        if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
+            && tz.parse::<chrono_tz::Tz>().is_err()
+        {
+            return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
+        }
+        // Reject a bad cron expression, a zero interval and a fractional interval
+        // (issue #1967).
+        if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason,
+            });
         }
         if let Err(reason) = crate::policy::validate_jitter(&schedule.schedule, schedule.jitter) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
@@ -5682,6 +5673,27 @@ mod tests {
         assert!(
             err.to_string().contains("auto-registered DAG"),
             "error should explain the DAG/workflow schedule collision: {err}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_subsecond_workflow_schedule() {
+        // Issue #1967: the stored form would drop the fraction.
+        let err = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::Interval(Duration::from_millis(500)),
+            ))
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "test" && reason.contains("whole number of seconds")
+            ),
+            "got: {err:?}"
         );
     }
 
