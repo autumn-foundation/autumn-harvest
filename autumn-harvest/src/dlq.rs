@@ -25,6 +25,13 @@ pub const DEFAULT_BULK_LIMIT: u32 = 100;
 /// Maximum number of DLQ rows a single bulk operation can act on.
 pub const MAX_BULK_LIMIT: u32 = 1000;
 
+/// Default spread window for a full [`MAX_BULK_LIMIT`] redrive (issue #1832).
+///
+/// A smaller batch gets a smaller window. See [`redrive_spread_window`].
+pub const DEFAULT_REDRIVE_SPREAD: std::time::Duration = std::time::Duration::from_secs(60);
+/// Upper bound on an operator-set redrive spread, in seconds.
+pub const MAX_REDRIVE_SPREAD_SECS: u64 = 3600;
+
 /// Filter for bulk DLQ operations.
 ///
 /// At least one substantive criterion (any of `activity_name`, `workflow_name`,
@@ -69,6 +76,10 @@ pub struct BulkDlqFilter {
     /// When `true`, return matching rows and count without writing.
     #[serde(default)]
     pub dry_run: bool,
+    /// Replay only: the window, in seconds, over which replayed tasks
+    /// become due (issue #1832). See [`redrive_spread_window`].
+    #[serde(default)]
+    pub spread_secs: Option<u64>,
 }
 
 impl BulkDlqFilter {
@@ -183,6 +194,10 @@ pub struct RedriveFilter {
     /// When `true`, return matching rows and count without writing.
     #[serde(default)]
     pub dry_run: bool,
+    /// The window, in seconds, over which redriven tasks become due
+    /// (issue #1832). See [`redrive_spread_window`].
+    #[serde(default)]
+    pub spread_secs: Option<u64>,
 }
 
 impl RedriveFilter {
@@ -234,6 +249,81 @@ pub struct RedriveResult {
     pub dry_run: bool,
     /// Per-row rejections that did not roll back other rows.
     pub failures: Vec<BulkDlqFailure>,
+}
+
+/// The window over which a bulk redrive of `rows` rows spreads its tasks
+/// (issue #1832).
+///
+/// `Some(secs)` sets the window, capped at [`MAX_REDRIVE_SPREAD_SECS`].
+/// `Some(0)` makes every task due at once. `None` scales
+/// [`DEFAULT_REDRIVE_SPREAD`] by `rows / MAX_BULK_LIMIT`. So a full batch
+/// spreads over 60 s, and one row waits at most 60 ms.
+#[must_use]
+pub fn redrive_spread_window(spread_secs: Option<u64>, rows: usize) -> std::time::Duration {
+    spread_secs.map_or_else(
+        || {
+            let rows = u32::try_from(rows)
+                .unwrap_or(MAX_BULK_LIMIT)
+                .min(MAX_BULK_LIMIT);
+            DEFAULT_REDRIVE_SPREAD * rows / MAX_BULK_LIMIT
+        },
+        |secs| std::time::Duration::from_secs(secs.min(MAX_REDRIVE_SPREAD_SECS)),
+    )
+}
+
+/// The offset of row `index` of `count` inside `window` (issue #1832).
+///
+/// The window has `count` equal slots. Row `index` lands in slot `index`,
+/// and `seed` sets its place inside that slot. So the rows cover the window
+/// evenly, and no two rows become due in lockstep.
+#[must_use]
+pub fn redrive_spread_offset(
+    index: usize,
+    count: usize,
+    window: std::time::Duration,
+    seed: u64,
+) -> std::time::Duration {
+    let count = u128::try_from(count.max(1)).unwrap_or(u128::MAX);
+    let index = u128::try_from(index).unwrap_or(u128::MAX);
+    let slot = window.as_nanos() / count;
+    // `mix64` is below 2^64, so the jitter is below one slot.
+    let jitter = (slot * u128::from(mix64(seed))) >> 64;
+    let nanos = slot.saturating_mul(index).saturating_add(jitter);
+    std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// The `scheduled_at` for each row of a bulk redrive (issue #1832).
+///
+/// Row `index` becomes due at `now` plus its [`redrive_spread_offset`]. The
+/// row id seeds the jitter. A zero window gives `None` for every row, so
+/// each task keeps the default, immediate `scheduled_at`.
+#[must_use]
+pub fn redrive_schedule(
+    now: DateTime<Utc>,
+    window: std::time::Duration,
+    ids: &[Uuid],
+) -> Vec<Option<DateTime<Utc>>> {
+    if window.is_zero() {
+        return vec![None; ids.len()];
+    }
+    ids.iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let (high, low) = id.as_u64_pair();
+            let offset = redrive_spread_offset(index, ids.len(), window, high ^ low);
+            chrono::Duration::from_std(offset)
+                .ok()
+                .and_then(|offset| now.checked_add_signed(offset))
+        })
+        .collect()
+}
+
+/// The `SplitMix64` finalizer. It spreads close seeds over all of `u64`.
+const fn mix64(seed: u64) -> u64 {
+    let mut z = seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// Outcome of redriving a single dead-letter entry.
@@ -369,6 +459,7 @@ async fn redrive_callback_dead_letter(
     dead_letter_id: Uuid,
     workflow_exec_id: Option<Uuid>,
     original_task_id: Uuid,
+    not_before: Option<DateTime<Utc>>,
 ) -> HarvestResult<Uuid> {
     let exec_id = workflow_exec_id
         .map(crate::types::ExecutionId::from_uuid)
@@ -378,7 +469,17 @@ async fn redrive_callback_dead_letter(
             ))
         })?;
 
-    match crate::completion_callback::redrive_delivery(conn, exec_id, original_task_id).await? {
+    // The callback scanner reads `next_attempt_at` on the host clock.
+    let not_before = slot_on_host_clock(conn, not_before).await?;
+
+    match crate::completion_callback::redrive_delivery_at(
+        conn,
+        exec_id,
+        original_task_id,
+        not_before,
+    )
+    .await?
+    {
         crate::completion_callback::DeliveryRedriveOutcome::Redriven => Ok(original_task_id),
         crate::completion_callback::DeliveryRedriveOutcome::NotFound => Err(
             HarvestError::NotFound(format!("dead-letter {dead_letter_id}")),
@@ -390,6 +491,80 @@ async fn redrive_callback_dead_letter(
             )))
         }
     }
+}
+
+/// Move a database-clock spread slot onto the host clock (issue #1832).
+///
+/// [`spread_schedule`] reads the database clock. The callback scanner
+/// compares `next_attempt_at` with the host clock.
+async fn slot_on_host_clock(
+    conn: &mut AsyncPgConnection,
+    not_before: Option<DateTime<Utc>>,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let Some(at) = not_before else {
+        return Ok(None);
+    };
+    let db_now = crate::queue::db_now(conn).await?;
+    Ok(Some(to_host_clock(at, db_now, Utc::now())))
+}
+
+/// Where a redriven run's timeout window starts (issue #1832).
+///
+/// `slot` is on the database clock. Two checks read `deadline_at` on
+/// different clocks. The claim gate uses the database clock, and the timeout
+/// scanner uses the host clock. The later of the two slot readings is due on
+/// both clocks, so a window that starts there never expires before the task
+/// becomes due. Clock skew can only add time to the window.
+#[must_use]
+fn deadline_window_start(
+    slot: DateTime<Utc>,
+    db_now: DateTime<Utc>,
+    host_now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    slot.max(to_host_clock(slot, db_now, host_now))
+}
+
+/// [`deadline_window_start`] for an optional slot, with the clocks read now.
+async fn deadline_slot(
+    conn: &mut AsyncPgConnection,
+    not_before: Option<DateTime<Utc>>,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let Some(slot) = not_before else {
+        return Ok(None);
+    };
+    let db_now = crate::queue::db_now(conn).await?;
+    Ok(Some(deadline_window_start(slot, db_now, Utc::now())))
+}
+
+/// Move a database-clock instant onto the host clock (issue #1832).
+///
+/// The result is as far after `host_now` as `at` is after `db_now`.
+#[must_use]
+fn to_host_clock(
+    at: DateTime<Utc>,
+    db_now: DateTime<Utc>,
+    host_now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    host_now + (at - db_now)
+}
+
+/// The enqueue parameters that put `entry` back on its queue.
+///
+/// Set `max_attempts` to the recorded attempt count, with a minimum of one.
+/// `not_before` sets `scheduled_at`. `None` keeps the immediate default.
+fn requeue_params(
+    entry: DeadLetter,
+    task_type: TaskType,
+    not_before: Option<DateTime<Utc>>,
+) -> EnqueueParams {
+    let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
+    params.workflow_exec_id = entry.workflow_exec_id;
+    params.activity_name = entry.activity_name;
+    params.max_attempts = entry.attempts.max(1);
+    if let Some(at) = not_before {
+        params.scheduled_at = at;
+    }
+    params
 }
 
 fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult<TaskType> {
@@ -569,6 +744,23 @@ pub async fn replay_dead_letter(
     dead_letter_id: Uuid,
     registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<Uuid> {
+    replay_dead_letter_at(conn, dead_letter_id, registry, None).await
+}
+
+/// [`replay_dead_letter`] with a `scheduled_at` for the new task (issue #1832).
+///
+/// `None` makes the task due at once. For a completion-callback entry,
+/// `not_before` sets the next delivery attempt instead.
+///
+/// # Errors
+///
+/// The same as [`replay_dead_letter`].
+pub async fn replay_dead_letter_at(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    registry: Option<&HandlerRegistry>,
+    not_before: Option<DateTime<Utc>>,
+) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
     // The re-enqueue below writes a `PENDING` task row, so it raises a dispatch
@@ -601,16 +793,14 @@ pub async fn replay_dead_letter(
                     dead_letter_id,
                     entry.workflow_exec_id,
                     entry.original_task_id,
+                    not_before,
                 )
                 .await;
             }
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
-            params.workflow_exec_id = entry.workflow_exec_id;
-            params.activity_name = entry.activity_name;
-            params.max_attempts = entry.attempts.max(1);
+            let mut params = requeue_params(entry, task_type, not_before);
 
             // Restore required_build_id and concurrency policy from the owning
             // execution so the replayed task is subject to the same constraints.
@@ -851,37 +1041,72 @@ pub async fn bulk_replay_dead_letters(
         });
     }
 
-    let mut acted_on = 0usize;
-    let mut skipped = 0usize;
-    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
-    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let mut result = replay_dead_letter_batch(conn, &ids, filter.spread_secs, registry).await?;
+    result.matched = matched;
+    Ok(result)
+}
 
-    for row in &rows {
-        match replay_dead_letter(conn, row.id, registry).await {
+/// Replay the dead letters `ids`, spread over a window (issue #1832).
+///
+/// [`redrive_spread_window`] sets the window from `spread_secs`. Each row
+/// goes through [`replay_dead_letter_at`] on its own, so a per-row failure
+/// does not roll back other rows. A missing row counts as skipped. The
+/// result has `matched` at zero. The caller sets it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the database clock read fails.
+/// Per-row errors go into [`BulkDlqResult::failures`].
+pub async fn replay_dead_letter_batch(
+    conn: &mut AsyncPgConnection,
+    ids: &[Uuid],
+    spread_secs: Option<u64>,
+    registry: Option<&HandlerRegistry>,
+) -> HarvestResult<BulkDlqResult> {
+    let mut result = BulkDlqResult {
+        matched: 0,
+        acted_on: 0,
+        skipped: 0,
+        ids: Vec::with_capacity(ids.len()),
+        dry_run: false,
+        failures: Vec::new(),
+    };
+    let schedule = spread_schedule(conn, spread_secs, ids).await?;
+
+    for (&id, not_before) in ids.iter().zip(schedule) {
+        match replay_dead_letter_at(conn, id, registry, not_before).await {
             Ok(_task_id) => {
-                acted_on += 1;
-                acted_ids.push(row.id.to_string());
+                result.acted_on += 1;
+                result.ids.push(id.to_string());
             }
-            Err(HarvestError::NotFound(_)) => {
-                skipped += 1;
-            }
-            Err(e) => {
-                failures.push(BulkDlqFailure {
-                    id: row.id.to_string(),
-                    reason: e.to_string(),
-                });
-            }
+            Err(HarvestError::NotFound(_)) => result.skipped += 1,
+            Err(e) => result.failures.push(BulkDlqFailure {
+                id: id.to_string(),
+                reason: e.to_string(),
+            }),
         }
     }
 
-    Ok(BulkDlqResult {
-        matched,
-        acted_on,
-        skipped,
-        ids: acted_ids,
-        dry_run: false,
-        failures,
-    })
+    Ok(result)
+}
+
+/// The per-row `scheduled_at` for a bulk redrive of `ids` (issue #1832).
+///
+/// The base instant is the database clock, not the host clock. Workers
+/// compare `scheduled_at` with the database `NOW()` (issue #1807). A zero
+/// window reads no clock.
+async fn spread_schedule(
+    conn: &mut AsyncPgConnection,
+    spread_secs: Option<u64>,
+    ids: &[Uuid],
+) -> HarvestResult<Vec<Option<DateTime<Utc>>>> {
+    let window = redrive_spread_window(spread_secs, ids.len());
+    if window.is_zero() {
+        return Ok(vec![None; ids.len()]);
+    }
+    let now = crate::queue::db_now(conn).await?;
+    Ok(redrive_schedule(now, window, ids))
 }
 
 /// Delete several dead-letter rows by id in one statement.
@@ -1116,6 +1341,24 @@ pub async fn redrive_dead_letter(
     registry: Option<&HandlerRegistry>,
     reason: Option<&str>,
 ) -> HarvestResult<RedriveOutcome> {
+    redrive_dead_letter_at(conn, dead_letter_id, registry, reason, None).await
+}
+
+/// [`redrive_dead_letter`] with a `scheduled_at` for the new task (issue #1832).
+///
+/// `None` makes the task due at once. For a completion-callback entry,
+/// `not_before` sets the next delivery attempt instead.
+///
+/// # Errors
+///
+/// The same as [`redrive_dead_letter`].
+pub async fn redrive_dead_letter_at(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    registry: Option<&HandlerRegistry>,
+    reason: Option<&str>,
+    not_before: Option<DateTime<Utc>>,
+) -> HarvestResult<RedriveOutcome> {
     use crate::schema::harvest_dead_letters::dsl;
 
     // Same buffering scope as `replay_dead_letter`: the re-enqueue raises a
@@ -1145,6 +1388,7 @@ pub async fn redrive_dead_letter(
                     dead_letter_id,
                     entry.workflow_exec_id,
                     entry.original_task_id,
+                    not_before,
                 )
                 .await
                 {
@@ -1156,13 +1400,9 @@ pub async fn redrive_dead_letter(
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            let mut params =
-                EnqueueParams::new(entry.queue_name.clone(), task_type, entry.input.clone());
-            params.workflow_exec_id = entry.workflow_exec_id;
-            params.activity_name = entry.activity_name.clone();
-            params.max_attempts = entry.attempts.max(1);
+            let mut params = requeue_params(entry, task_type, not_before);
 
-            if let Some(exec_uuid) = entry.workflow_exec_id {
+            if let Some(exec_uuid) = params.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
                 let row: Option<(Option<String>, String, String)> =
                     exec_dsl::harvest_workflow_executions
@@ -1197,11 +1437,14 @@ pub async fn redrive_dead_letter(
                     // sealed FAILED at quarantine time so it can resume.
                     "FAILED" => {
                         let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
-                        crate::execution::reactivate_failed_execution(
+                        // The window must start after the slot on both clocks.
+                        let slot = deadline_slot(conn, not_before).await?;
+                        crate::execution::reactivate_failed_execution_at(
                             conn,
                             exec_id,
                             dead_letter_id,
                             reason,
+                            slot,
                         )
                         .await?;
                     }
@@ -1276,9 +1519,11 @@ pub async fn redrive_dead_letters(
     let mut skipped = 0usize;
     let mut ids: Vec<String> = Vec::with_capacity(rows.len());
     let mut failures: Vec<BulkDlqFailure> = Vec::new();
+    let row_ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let schedule = spread_schedule(conn, filter.spread_secs, &row_ids).await?;
 
-    for row in &rows {
-        match redrive_dead_letter(conn, row.id, registry, reason).await {
+    for (row, not_before) in rows.iter().zip(schedule) {
+        match redrive_dead_letter_at(conn, row.id, registry, reason, not_before).await {
             Ok(RedriveOutcome::Redriven(_task_id)) => {
                 redriven += 1;
                 ids.push(row.id.to_string());
@@ -2526,6 +2771,142 @@ mod tests {
         assert_eq!(filter.effective_limit(), 1);
     }
 
+    // ── Redrive spread (issue #1832) ─────────────────────────────────────
+
+    use std::time::Duration as StdDuration;
+
+    #[test]
+    fn spread_window_honours_an_explicit_value() {
+        assert_eq!(
+            redrive_spread_window(Some(60), 1000),
+            StdDuration::from_secs(60)
+        );
+        assert_eq!(
+            redrive_spread_window(Some(60), 1),
+            StdDuration::from_secs(60)
+        );
+        assert_eq!(redrive_spread_window(Some(0), 1000), StdDuration::ZERO);
+    }
+
+    #[test]
+    fn spread_window_caps_an_explicit_value() {
+        assert_eq!(
+            redrive_spread_window(Some(u64::MAX), 10),
+            StdDuration::from_secs(MAX_REDRIVE_SPREAD_SECS)
+        );
+    }
+
+    #[test]
+    fn spread_window_default_is_pro_rated_by_batch_size() {
+        assert_eq!(redrive_spread_window(None, 1000), DEFAULT_REDRIVE_SPREAD);
+        assert_eq!(redrive_spread_window(None, 100), StdDuration::from_secs(6));
+        assert_eq!(redrive_spread_window(None, 1), StdDuration::from_millis(60));
+        assert_eq!(redrive_spread_window(None, 0), StdDuration::ZERO);
+        // More rows than the bulk cap never exceed the default window.
+        assert_eq!(redrive_spread_window(None, 5000), DEFAULT_REDRIVE_SPREAD);
+    }
+
+    #[test]
+    fn spread_offset_stays_inside_its_slot() {
+        let window = StdDuration::from_secs(60);
+        let count = 1000;
+        let slot = window / 1000;
+        for index in 0..count {
+            for seed in [0, 1, u64::MAX / 2, u64::MAX] {
+                let offset = redrive_spread_offset(index, count, window, seed);
+                let start = slot * u32::try_from(index).unwrap();
+                assert!(
+                    offset >= start && offset < start + slot,
+                    "row {index} seed {seed}: {offset:?} outside slot {start:?}+{slot:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spread_offset_jitters_by_seed() {
+        let window = StdDuration::from_secs(60);
+        let offsets: std::collections::HashSet<_> = (0..20_u64)
+            .map(|seed| redrive_spread_offset(3, 10, window, seed.wrapping_mul(0x9e37_79b9)))
+            .collect();
+        assert!(offsets.len() > 1, "seeds must move a row inside its slot");
+        assert_eq!(
+            redrive_spread_offset(3, 10, window, 42),
+            redrive_spread_offset(3, 10, window, 42),
+            "the offset is deterministic"
+        );
+    }
+
+    #[test]
+    fn spread_offset_is_zero_for_an_empty_window() {
+        assert_eq!(
+            redrive_spread_offset(5, 10, StdDuration::ZERO, 7),
+            StdDuration::ZERO
+        );
+    }
+
+    #[test]
+    fn deadline_window_starts_after_the_slot_on_both_clocks() {
+        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let slot = db_now + chrono::Duration::seconds(45);
+        // Host 30 s behind the database: the database-clock slot is later.
+        let behind = db_now - chrono::Duration::seconds(30);
+        assert_eq!(deadline_window_start(slot, db_now, behind), slot);
+        // Host 30 s ahead: the host-clock slot is later.
+        let ahead = db_now + chrono::Duration::seconds(30);
+        assert_eq!(
+            deadline_window_start(slot, db_now, ahead),
+            ahead + chrono::Duration::seconds(45)
+        );
+    }
+
+    #[test]
+    fn to_host_clock_keeps_the_offset_across_clock_skew() {
+        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // The host runs 30 s ahead of the database.
+        let host_now = db_now + chrono::Duration::seconds(30);
+        let at = db_now + chrono::Duration::seconds(45);
+        assert_eq!(
+            to_host_clock(at, db_now, host_now),
+            host_now + chrono::Duration::seconds(45)
+        );
+    }
+
+    #[test]
+    fn schedule_with_no_window_is_immediate() {
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        assert_eq!(
+            redrive_schedule(Utc::now(), StdDuration::ZERO, &ids),
+            vec![None; 5]
+        );
+    }
+
+    #[test]
+    fn schedule_of_1000_rows_spreads_across_the_window() {
+        // Issue #1832 AC: 1000 redriven tasks spread across the window.
+        let now = Utc::now();
+        let window = StdDuration::from_secs(60);
+        let ids: Vec<Uuid> = (0..1000).map(|_| Uuid::new_v4()).collect();
+        let schedule = redrive_schedule(now, window, &ids);
+        assert_eq!(schedule.len(), 1000);
+
+        let mut buckets = [0_u32; 10];
+        let mut distinct = std::collections::HashSet::new();
+        for at in &schedule {
+            let at = at.expect("a non-zero window schedules every row");
+            let offset = (at - now).to_std().expect("never before now");
+            assert!(offset < window, "{offset:?} is past the window");
+            buckets[usize::try_from(offset.as_secs() / 6).unwrap()] += 1;
+            distinct.insert(at);
+        }
+        assert_eq!(distinct.len(), 1000, "no two rows share an instant");
+        assert_eq!(buckets, [100; 10], "each 6 s bucket gets 100 rows");
+    }
+
     #[test]
     fn bulk_filter_effective_limit_clamps_at_1000() {
         let filter = BulkDlqFilter {
@@ -2555,6 +2936,7 @@ mod tests {
             failure_signature: None,
             limit: Some(200),
             dry_run: true,
+            spread_secs: Some(30),
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: BulkDlqFilter = serde_json::from_str(&json).unwrap();

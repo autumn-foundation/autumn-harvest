@@ -278,6 +278,7 @@ pub struct WasmModuleStore {
     modules: RwLock<LruCache<String, Arc<Module>>>,
     ticker_stop: Arc<AtomicBool>,
     ticker: Option<JoinHandle<()>>,
+    trust: RwLock<Option<Arc<crate::wasm_signing::WasmTrustPolicy>>>,
 }
 
 impl WasmModuleStore {
@@ -393,7 +394,25 @@ impl WasmModuleStore {
             modules: RwLock::new(LruCache::new(cap)),
             ticker_stop,
             ticker: Some(ticker),
+            trust: RwLock::new(None),
         }
+    }
+
+    /// Install the publisher trust policy (issue #1838).
+    ///
+    /// With a policy, dispatch runs a module only if a trusted key signed it.
+    /// `None` removes the check. See [`crate::wasm_signing`].
+    pub fn set_trust_policy(&self, policy: Option<crate::wasm_signing::WasmTrustPolicy>) {
+        *self.trust.write().unwrap_or_else(PoisonError::into_inner) = policy.map(Arc::new);
+    }
+
+    /// The installed publisher trust policy, if any.
+    #[must_use]
+    pub fn trust_policy(&self) -> Option<Arc<crate::wasm_signing::WasmTrustPolicy>> {
+        self.trust
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Borrow the underlying wasmtime engine.
