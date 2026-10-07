@@ -69,7 +69,7 @@ fn apply_skip_policy_with(
     if !is_excluded(date) {
         return Some(date);
     }
-    // Checked steps: a scan past the `NaiveDate` range returns `None` (issue #1968).
+    // Each step is checked. A scan past the `NaiveDate` range returns `None` (issue #1968).
     let step: fn(NaiveDate) -> Option<NaiveDate> = match skip_policy {
         SkipPolicy::Skip => return None,
         SkipPolicy::RunNextBusinessDay => |d| d.checked_add_days(chrono::Days::new(1)),
@@ -213,12 +213,13 @@ pub struct BusinessDayResolution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum BusinessDayRejection {
-    /// The scan found more than 30 consecutive non-business days.
+    /// The scan finds more than 30 consecutive non-business days.
     ///
     /// Only a degenerate calendar causes this rejection. See
     /// [`add_business_days`] for the bound.
     ScanExhausted {
-        /// The length of the run with no business day, in calendar days.
+        /// The consecutive non-business days the scan examined before it stopped.
+        /// The value is always 31.
         scanned_days: u32,
     },
     /// The scan needed a date past the last date the calendar knows about.
@@ -472,11 +473,11 @@ fn parse_builtin_dates(raw: &[&str]) -> Vec<NaiveDate> {
 /// A longer run is a degenerate calendar, and the scan rejects it.
 ///
 /// The bound is on one run, not on the full scan (issue #1968). The scan for a
-/// smaller `n` is a prefix of the scan for a larger `n`. Thus a smaller `n`
-/// never rejects where a larger `n` resolves. A total bound that grows with `n`
-/// does not give this property.
+/// smaller `n` is a prefix of the scan for a larger `n`. So a smaller `n` never
+/// rejects where a larger `n` resolves. A total bound that grows with `n` does
+/// not give this property.
 ///
-/// Each business day is at most 31 days after the previous one. The scan thus
+/// Each business day is at most 31 days after the previous one. So the scan
 /// examines at most `(n + 1) * 31` dates.
 const MAX_NON_BUSINESS_RUN_DAYS: u32 = 30;
 
@@ -1353,7 +1354,7 @@ mod tests {
 
     #[test]
     fn add_business_days_scan_exhaustion_rejects() {
-        // 60 consecutive exclusions. The scan stops after 31 of them.
+        // The calendar excludes 60 consecutive days. The scan stops after 31 of them.
         let all = closure("2026-07-02", 60);
         assert_eq!(
             add_business_days(utc("2026-07-02T09:00:00Z"), 1, &all),
@@ -1361,7 +1362,7 @@ mod tests {
         );
     }
 
-    /// `days` consecutive holiday dates, from `start`.
+    /// Returns `days` consecutive holiday dates from `start`.
     fn closure(start: &str, days: u64) -> std::collections::BTreeSet<NaiveDate> {
         let start = date(start);
         (0..days)
@@ -1375,8 +1376,8 @@ mod tests {
 
     #[test]
     fn smaller_n_is_never_rejected_where_larger_n_succeeds() {
-        // Issue #1968. The old bound `n * 7 + 30` grew with `n`.
-        // A long closure then rejected a small `n` and accepted a larger `n`.
+        // The old bound `n * 7 + 30` grows with `n` (issue #1968).
+        // A long closure then rejects a small `n` and accepts a larger `n`.
         // Wed 2026-07-01 starts each closure.
         let anchor = utc("2026-07-01T09:00:00Z");
         for days in 25..=45 {

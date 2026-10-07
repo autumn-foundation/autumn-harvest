@@ -15,7 +15,7 @@ use proptest::prelude::*;
 use super::prop_config::config;
 
 /// The first date of the generated calendars.
-fn origin() -> NaiveDate {
+const fn origin() -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
 }
 
@@ -50,19 +50,19 @@ proptest! {
         closures in closures(),
         anchor_offset in 0u64..120,
         n in 1u32..20,
-        m_back in 1u32..20,
     ) {
         let cal = calendar(&closures);
         let anchor = (origin() + Days::new(anchor_offset))
             .and_hms_opt(9, 0, 0)
             .unwrap()
             .and_utc();
-        let m = n.saturating_sub(m_back);
         if add_business_days(anchor, n, &cal).is_ok() {
-            prop_assert!(
-                add_business_days(anchor, m, &cal).is_ok(),
-                "n = {n} resolves, m = {m} rejects"
-            );
+            for m in 0..n {
+                prop_assert!(
+                    add_business_days(anchor, m, &cal).is_ok(),
+                    "n = {n} resolves, m = {m} rejects"
+                );
+            }
         }
     }
 
