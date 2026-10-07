@@ -234,7 +234,10 @@ async fn a_due_hint_is_promoted_after_the_server_forgets_the_script() {
         )])
         .await
         .expect("publish");
-    assert!(read(&fixture, &queues, 10).await.is_empty());
+    assert!(
+        read(&fixture, &queues, 10).await.is_empty(),
+        "a hint that is not due must not be delivered"
+    );
 
     // A restart or `SCRIPT FLUSH` drops the promote script. The pipeline then
     // gets NOSCRIPT, and the dispatch must load the script and run it again.
