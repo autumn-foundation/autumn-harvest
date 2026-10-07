@@ -214,6 +214,8 @@ pub mod append_only;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
+/// Keyed hash chain over exported audit rows (issue #1838).
+pub mod audit_chain;
 /// Audit-record export to an external sink for SIEM compliance (issue #953).
 pub mod audit_export;
 /// Open-awaitables diagnostic projection (issue #615).
@@ -556,6 +558,9 @@ pub mod store;
 pub mod timeout;
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_activities;
+/// Ed25519 publisher signatures for WASM modules (issue #1838).
+#[cfg(feature = "wasm-activities")]
+pub mod wasm_signing;
 /// Postgres storage and dispatch resolution for WASM activities (issue #965).
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_store;
@@ -830,9 +835,10 @@ pub use wasm_activities::{
 #[cfg(feature = "wasm-activities")]
 pub use wasm_store::{
     MAX_WASM_MODULE_BYTES, PreparedWasmActivity, WasmActivityRegistration, WasmBinding,
-    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules, publish_wasm_module,
-    resolve_active_wasm_hash, resolve_active_wasm_module, resolve_wasm_dispatch,
-    seed_registered_wasm_modules, seed_wasm_module,
+    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules,
+    publish_signed_wasm_module, publish_wasm_module, resolve_active_wasm_hash,
+    resolve_active_wasm_module, resolve_active_wasm_version, resolve_wasm_dispatch,
+    seed_registered_wasm_modules, seed_signed_wasm_module, seed_wasm_module,
 };
 
 #[cfg(feature = "db")]

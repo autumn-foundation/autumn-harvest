@@ -196,6 +196,11 @@ Replace step 1 with your OTel SDK setup and a `metrics-exporter-otlp` or
 backend-agnostic — it writes to whichever exporter the `metrics` crate's
 global recorder is pointing at.
 
+To keep the Prometheus exporter and send OTLP from an OpenTelemetry Collector,
+use the [Collector recipe](operations/otel-collector.md) (issue #1838). It also
+copies the metrics that match an OTel messaging semantic convention under the
+semconv name.
+
 ## Custom recorder
 
 If you already have a metrics backend that does not use the `metrics` crate

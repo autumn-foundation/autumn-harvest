@@ -674,7 +674,7 @@ pub struct HandlerRegistry {
     /// `HarvestBuilder::wasm_activity(...)` gets a working WASM activity with no
     /// manual publish step.
     #[cfg(feature = "wasm-activities")]
-    wasm_module_registrations: Vec<(String, Vec<u8>)>,
+    wasm_module_registrations: Vec<(String, Vec<u8>, Option<String>)>,
     /// Builder-level default activity retry policy (issue #620). `None` = no
     /// floor configured; the schedule-time resolution is a pure no-op preserving
     /// today's behaviour byte-for-byte.
@@ -1061,7 +1061,7 @@ impl HandlerRegistry {
         mut self,
         store: Arc<crate::wasm_activities::WasmModuleStore>,
         bindings: HashMap<String, crate::wasm_store::WasmBinding>,
-        registrations: Vec<(String, Vec<u8>)>,
+        registrations: Vec<(String, Vec<u8>, Option<String>)>,
     ) -> Self {
         self.wasm_store = Some(store);
         self.wasm_activities = bindings;
@@ -1137,7 +1137,7 @@ impl HandlerRegistry {
     /// startup (issue #965).
     #[cfg(feature = "wasm-activities")]
     #[must_use]
-    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>)] {
+    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>, Option<String>)] {
         &self.wasm_module_registrations
     }
 
@@ -32592,9 +32592,14 @@ impl Worker {
                 for (shard, shard_pool) in seed_targets {
                     match acquire_shard_conn(shard_pool, seed_acquire_bound).await {
                         Ok(mut conn) => {
+                            let policy = self
+                                .registry
+                                .wasm_store()
+                                .and_then(|store| store.trust_policy());
                             if let Err(e) = crate::wasm_store::seed_registered_wasm_modules(
                                 &mut conn,
                                 registrations,
+                                policy.as_deref(),
                             )
                             .await
                             {
