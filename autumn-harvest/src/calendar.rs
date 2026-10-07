@@ -213,12 +213,12 @@ pub struct BusinessDayResolution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum BusinessDayRejection {
-    /// The scan window elapsed without finding enough business days.
+    /// The scan found more than 30 consecutive non-business days.
     ///
-    /// Only reachable with a degenerate calendar that excludes every day in the
-    /// derived window (`n * 7 + 14` calendar days).
+    /// Only a degenerate calendar causes this rejection. See
+    /// [`add_business_days`] for the bound.
     ScanExhausted {
-        /// The derived scan bound, in calendar days.
+        /// The length of the run with no business day, in calendar days.
         scanned_days: u32,
     },
     /// The scan needed a date past the last date the calendar knows about.
@@ -495,8 +495,9 @@ const MAX_NON_BUSINESS_RUN_DAYS: u32 = 30;
 ///
 /// # Errors
 ///
-/// - [`BusinessDayRejection::ScanExhausted`] when the calendar excludes every
-///   day in the derived `n * 7 + 14` calendar-day window.
+/// - [`BusinessDayRejection::ScanExhausted`] when the scan finds more than 30
+///   consecutive non-business days before it resolves. The bound applies to
+///   each run, so a smaller `n` never rejects where a larger `n` resolves.
 /// - [`BusinessDayRejection::DateOverflow`] when advancing the cursor would
 ///   leave [`NaiveDate`]'s representable range.
 ///
