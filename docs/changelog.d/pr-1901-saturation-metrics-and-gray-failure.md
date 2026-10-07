@@ -85,7 +85,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   that keeps its id always writes above the rows of its previous process.
 - The snapshot and its cohort key are read in one serialized step. A codec
   change can still land between the two reads, so the step reads the key
-  again after the snapshot and captures again until the key holds.
+  again after the snapshot and captures again until the key holds. When the
+  key changes after each of five snapshots, the tick publishes nothing and
+  clears its view. The next tick captures again.
 - Startup registration drops the worker's stats row in its transaction. A
   restarted process therefore does not show its previous process's
   failures before its first heartbeat.

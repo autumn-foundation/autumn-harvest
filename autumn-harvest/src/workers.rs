@@ -1604,28 +1604,31 @@ pub enum SnapshotWrite {
 /// between the key read and the snapshot. A task dispatched under the new key
 /// would then be published under the old one. The step therefore reads the
 /// key again after each snapshot, and captures again until the key holds.
+///
+/// Returns `None` when the key changes after every snapshot. Each snapshot
+/// that the step returns is confirmed by a later key read. A snapshot with no
+/// such read could hold tasks of a newer cohort, so it is not published.
 pub fn capture_task_stats(
     window: &TaskOutcomeWindow,
     cohort_key: impl Fn() -> (String, crate::worker_outlier::CohortEpoch),
-) -> (String, WorkerTaskStats, i64) {
+) -> Option<(String, WorkerTaskStats, i64)> {
     // Codec changes are operator actions, so a few reads always settle. The
     // bound only stops a pathological writer from holding the heartbeat.
-    const MAX_RECAPTURES: usize = 4;
+    const MAX_CAPTURES: usize = 5;
     static CAPTURE: Mutex<()> = Mutex::new(());
     let _capture = CAPTURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut cohort, mut epoch) = cohort_key();
-    let mut stats = window.snapshot_in_cohort_at(&cohort, epoch);
-    for _ in 0..MAX_RECAPTURES {
+    for _ in 0..MAX_CAPTURES {
+        let stats = window.snapshot_in_cohort_at(&cohort, epoch);
         let (now, now_epoch) = cohort_key();
         if now == cohort && now_epoch == epoch {
-            break;
+            return Some((cohort, stats, next_snapshot_seq()));
         }
         (cohort, epoch) = (now, now_epoch);
-        stats = window.snapshot_in_cohort_at(&cohort, epoch);
     }
-    (cohort, stats, next_snapshot_seq())
+    None
 }
 
 /// Write one worker's task stats snapshot with sequence `seq` (issue #1815).
@@ -1911,18 +1914,28 @@ pub async fn run_outlier_tick(
 ) -> HarvestResult<Vec<OutlierDimension>> {
     // A row of the worker's previous process can hold a higher sequence. The
     // first write then moves the counter above it, and a fresh capture follows.
-    let mut cohort = String::new();
+    let mut cohort = None;
     for _ in 0..2 {
-        let (key, own, seq) = capture_task_stats(&probe.window, || probe.cohort_and_epoch());
-        cohort = key;
-        if write_task_stats_snapshot(conn, worker_id, &cohort, &own, seq).await?
-            != SnapshotWrite::Foreign
-        {
+        let Some((key, own, seq)) = capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+        else {
+            cohort = None;
+            break;
+        };
+        let write = write_task_stats_snapshot(conn, worker_id, &key, &own, seq).await?;
+        cohort = Some(key);
+        if write != SnapshotWrite::Foreign {
             break;
         }
     }
     // Every shard heartbeat prunes its own database, whether it compares or not.
     prune_worker_task_stats(conn, probe.fleet_stale_secs).await?;
+    // The codec keys did not hold during the capture, so this tick has no
+    // cohort to compare in. It clears its view like a failed tick. The next
+    // tick captures again.
+    let Some(cohort) = cohort else {
+        probe.clear_gauge(worker_id);
+        return Ok(Vec::new());
+    };
     if !probe.metrics.is_enabled() {
         return Ok(Vec::new());
     }
@@ -4477,7 +4490,8 @@ mod tests {
         codecs
             .register_key("k1", std::sync::Arc::new(IdentityCodec))
             .expect("register a key");
-        let (_, first, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch());
+        let (_, first, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+            .expect("the key holds");
         assert_eq!(first, crate::worker_outlier::WorkerTaskStats::default());
     }
 
@@ -4497,13 +4511,15 @@ mod tests {
                 .window
                 .record(true, std::time::Duration::from_millis(40));
         }
-        let (_, old, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch());
+        let (_, old, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+            .expect("the key holds");
         assert_eq!(old.failures, 30);
 
         codecs
             .register_key("k1", std::sync::Arc::new(IdentityCodec))
             .expect("register a key");
-        let (_, new, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch());
+        let (_, new, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+            .expect("the key holds");
         assert_eq!(new, crate::worker_outlier::WorkerTaskStats::default());
     }
 
@@ -4535,7 +4551,8 @@ mod tests {
         codecs.set_active_key("k2").expect("activate k2");
         codecs.set_active_key("k1").expect("activate k1 again");
         assert_eq!(probe.cohort_key(), before, "the same key string");
-        let (_, stats, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch());
+        let (_, stats, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+            .expect("the key holds");
         assert_eq!(stats, crate::worker_outlier::WorkerTaskStats::default());
     }
 
@@ -4584,8 +4601,8 @@ mod tests {
             "a capture waits while another heartbeat reads its key"
         );
         release.send(()).expect("release the old heartbeat");
-        let (old_key, _, old_seq) = old.join().expect("old joins");
-        let (new_key, _, new_seq) = new.join().expect("new joins");
+        let (old_key, _, old_seq) = old.join().expect("old joins").expect("old key holds");
+        let (new_key, _, new_seq) = new.join().expect("new joins").expect("new key holds");
         assert_eq!((old_key.as_str(), new_key.as_str()), ("old", "new"));
         assert!(new_seq > old_seq, "the later key has the higher sequence");
     }
@@ -4617,12 +4634,33 @@ mod tests {
                     changed_at: changed_at.get(),
                 },
             )
-        });
+        })
+        .expect("the new key holds");
         assert_eq!(key, "new", "the snapshot carries the key it was taken in");
         assert_eq!(
             (stats.tasks, stats.failures),
             (1, 1),
             "the task dispatched under the new key stays"
+        );
+    }
+
+    /// Issue #1815: a codec writer can change the key on every read. The
+    /// capture then never publishes a snapshot that no later read confirms.
+    #[test]
+    fn a_key_that_never_holds_publishes_no_snapshot() {
+        use crate::worker_outlier::{CohortEpoch, TaskOutcomeWindow};
+        let window = TaskOutcomeWindow::default();
+        let reads = std::cell::RefCell::new(Vec::new());
+        let captured = super::capture_task_stats(&window, || {
+            let mut reads = reads.borrow_mut();
+            let key = format!("k{}", reads.len());
+            reads.push(key.clone());
+            (key, CohortEpoch::default())
+        });
+        let reads = reads.into_inner();
+        assert!(
+            captured.is_none(),
+            "no key held, so nothing is published: {captured:?} after {reads:?}"
         );
     }
 

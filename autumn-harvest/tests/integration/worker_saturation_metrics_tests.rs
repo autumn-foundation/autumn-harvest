@@ -558,8 +558,10 @@ async fn a_late_write_of_an_older_snapshot_is_dropped() {
     let id = unique_id("w-late");
     register(&mut conn, &id, &queue).await;
     let key = || ("c".to_owned(), CohortEpoch::default());
-    let (_, older, older_seq) = workers::capture_task_stats(&window(40, None), key);
-    let (_, newer, newer_seq) = workers::capture_task_stats(&window(60, Some(2)), key);
+    let (_, older, older_seq) =
+        workers::capture_task_stats(&window(40, None), key).expect("the key holds");
+    let (_, newer, newer_seq) =
+        workers::capture_task_stats(&window(60, Some(2)), key).expect("the key holds");
     assert!(
         newer_seq > older_seq,
         "a later capture has a higher sequence"
