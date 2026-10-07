@@ -1881,6 +1881,9 @@ impl RetentionRuntime {
                         // inside `run_shard_tick` (PR #990 review) — there is no
                         // single "loose cutoff" SQL bind any more.
                         let now = Utc::now();
+                        // A single pool names its shard through the default pin,
+                        // as `begin_fenced_tick` does (issue #1823).
+                        let single_pool = pools.len() == 1;
                         let tick_futures = pools.iter_shards().map(|(shard, pool)| {
                             let pool = pool.clone();
                             let config = config.clone();
@@ -1890,9 +1893,15 @@ impl RetentionRuntime {
                             let cursor = scan_cursors.get(&shard).copied().flatten();
                             async move {
                                 let started = Instant::now();
+                                let fence_key = if single_pool {
+                                    ShardId::UNENCODED
+                                } else {
+                                    shard
+                                };
                                 let tick = run_shard_tick(
                                     pool,
                                     shard,
+                                    fence_key,
                                     now,
                                     &config,
                                     archiver,
@@ -2313,6 +2322,8 @@ struct RetentionScanCursor {
 #[cfg(feature = "db")]
 struct RetentionLeaseGuard {
     pool: crate::worker::DbPool,
+    /// The shard the tick fenced. The release fences it again (issue #1823).
+    fence_key: ShardId,
     lease_id: String,
     active_ids: Arc<Mutex<Vec<uuid::Uuid>>>,
     active: bool,
@@ -2337,27 +2348,54 @@ impl Drop for RetentionLeaseGuard {
                 return;
             };
             if !ids.is_empty() {
-                runtime.spawn(async move {
-                    if let Ok(mut conn) = pool.get().await {
-                        let _ = diesel::update(
-                            harvest_workflow_executions::table
-                                .filter(harvest_workflow_executions::id.eq_any(ids))
-                                .filter(
-                                    harvest_workflow_executions::sticky_worker_id
-                                        .eq(Some(lease_id)),
-                                ),
-                        )
-                        .set(
-                            harvest_workflow_executions::sticky_worker_id
-                                .eq::<Option<String>>(None),
-                        )
-                        .execute(&mut conn)
-                        .await;
-                    }
-                });
+                let fence_key = self.fence_key;
+                runtime.spawn(release_retention_leases(pool, fence_key, lease_id, ids));
             }
         }
     }
+}
+
+/// Clear the retention lease `lease_id` from the executions `ids`.
+///
+/// A dropped retention tick calls it from a detached task. Best effort: a
+/// row that keeps its lease is recovered as after a process crash.
+///
+/// The tick's own fence is gone by then, so the release takes a new one on
+/// `fence_key` (issue #1823). A fenced or held shard keeps its leases, and
+/// a lost guard stops the write.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn release_retention_leases(
+    pool: crate::worker::DbPool,
+    fence_key: ShardId,
+    lease_id: String,
+    ids: Vec<uuid::Uuid>,
+) {
+    let fence = match crate::replication::begin_fenced_group(&pool, fence_key).await {
+        Ok(fence) => fence,
+        Err(error) => {
+            tracing::warn!(
+                shard_id = fence_key.as_i32(),
+                %error,
+                "retention lease release skipped: this process is fenced; the leases are \
+                 recovered as after a crash"
+            );
+            return;
+        }
+    };
+    let release = async {
+        if let Ok(mut conn) = pool.get().await {
+            let _ = diesel::update(
+                harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::id.eq_any(ids))
+                    .filter(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id))),
+            )
+            .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+            .execute(&mut conn)
+            .await;
+        }
+    };
+    let _ = crate::replication::run_fenced_pass(&fence, Box::pin(release)).await;
 }
 
 /// Compute each pool group's combined `protect_unexported_audit` decision
@@ -2463,6 +2501,7 @@ async fn purge_audit_records_across_shards(pools: &ShardedDbPool, config: &Reten
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
+    fence_key: ShardId,
     now: DateTime<Utc>,
     config: &RetentionConfig,
     archiver: Option<Arc<dyn HistoryArchiver>>,
@@ -2520,6 +2559,7 @@ async fn run_shard_tick(
     let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
     let guard = RetentionLeaseGuard {
         pool: pool.clone(),
+        fence_key,
         lease_id: lease_id.clone(),
         active_ids: Arc::new(Mutex::new(Vec::new())),
         active: true,
@@ -5422,6 +5462,7 @@ mod tests {
     fn active_guard(active_ids: Arc<Mutex<Vec<uuid::Uuid>>>) -> RetentionLeaseGuard {
         RetentionLeaseGuard {
             pool: unconnected_pool(),
+            fence_key: ShardId::UNENCODED,
             lease_id: "retention-lease-test".to_owned(),
             active_ids,
             active: true,

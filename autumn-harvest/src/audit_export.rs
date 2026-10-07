@@ -1855,6 +1855,32 @@ async fn operator_ddl(conn: &mut diesel_async::AsyncPgConnection) -> (String, St
     )
 }
 
+/// [`build_unexported_index_on_dedicated_connection`] under its own DR fence
+/// (issue #1823).
+///
+/// The build outlives the export tick and its fence. So it takes a fence of
+/// its own, and a bump waits for the DDL. A fenced or held shard, or a lost
+/// guard, returns an error, and the caller then waits to retry.
+#[cfg(feature = "db")]
+async fn build_unexported_index_fenced(
+    pool: &crate::worker::DbPool,
+    fence_key: crate::types::ShardId,
+    dsn: &str,
+    schema: &str,
+) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
+    let fence = crate::replication::begin_fenced_group(pool, fence_key).await?;
+    crate::replication::run_fenced_pass(
+        &fence,
+        Box::pin(build_unexported_index_on_dedicated_connection(
+            dsn,
+            schema,
+            INDEX_BUILD_CONNECT_TIMEOUT,
+        )),
+    )
+    .await
+    .and_then(|built| built)
+}
+
 /// Start the index build in a detached task, off the export tick (issue #1667).
 ///
 /// The build can take minutes on a large table. It must not delay a claim,
@@ -1884,10 +1910,12 @@ async fn operator_ddl(conn: &mut diesel_async::AsyncPgConnection) -> (String, St
 async fn spawn_unexported_index_build_if_due(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-    pool_id: usize,
+    pool: &crate::worker::DbPool,
+    fence_key: crate::types::ShardId,
     build_dsn: Option<&str>,
     cancel: &tokio_util::sync::CancellationToken,
 ) {
+    let pool_id = std::ptr::from_ref(pool.manager()) as usize;
     // One probe per interval. Without it, every tick of a healthy exporter
     // would read the catalogs.
     if !index_probe_due(&(shard_id, build_dsn.map_or(0, dsn_fingerprint), pool_id)) {
@@ -1939,16 +1967,13 @@ async fn spawn_unexported_index_build_if_due(
     }
     let dsn = dsn.to_owned();
     let cancel = cancel.clone();
+    let pool = pool.clone();
     tokio::spawn(async move {
         // The task owns the in-flight mark now. A panic or an abort that drops
         // the task leaves a retry wait too.
         let guard = guard;
         let end = tokio::select! {
-            result = build_unexported_index_on_dedicated_connection(
-                &dsn,
-                &schema,
-                INDEX_BUILD_CONNECT_TIMEOUT,
-            ) => match result {
+            result = build_unexported_index_fenced(&pool, fence_key, &dsn, &schema) => match result {
                 Ok(UnexportedIndexOutcome::Ready) => BuildEnd::Ready,
                 Ok(UnexportedIndexOutcome::LockBusy) => {
                     tracing::debug!(
@@ -3778,6 +3803,7 @@ async fn acquire_shard_conn_for_export(
 async fn export_once_via_pool(
     pool: &crate::worker::DbPool,
     shard_id: i32,
+    fence_key: crate::types::ShardId,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     cancel: &tokio_util::sync::CancellationToken,
     config_arc: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
@@ -3804,7 +3830,8 @@ async fn export_once_via_pool(
         spawn_unexported_index_build_if_due(
             &mut conn,
             shard_id,
-            std::ptr::from_ref(pool.manager()) as usize,
+            pool,
+            fence_key,
             index_build_dsn,
             cancel,
         ),
@@ -4272,6 +4299,7 @@ pub fn spawn_audit_export_checker_for_shard(
                 Box::pin(export_once_via_pool(
                     &pool,
                     shard_id,
+                    fence_key,
                     &*telemetry.metrics,
                     &cancel,
                     config_snapshot,

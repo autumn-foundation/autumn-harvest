@@ -2919,6 +2919,57 @@ async fn a_held_shard_keeps_its_scanners_live() {
     }
 }
 
+/// A retention lease release checks the fence (issue #1823). A dropped tick
+/// releases its leases from a detached task, after the tick's own fence is
+/// gone. A process whose pin is superseded must leave the leases alone.
+#[tokio::test]
+async fn a_superseded_pin_releases_no_retention_lease() {
+    #[derive(diesel::QueryableByName)]
+    struct Lease {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        sticky_worker_id: Option<String>,
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("leasefence");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let exec_id = ExecutionId::new_for_shard(shard).as_uuid();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+            (id, workflow_name, workflow_id, shard_id, state, input, sticky_worker_id) \
+         VALUES ($1, 'wf', 'lease-fence', 0, 'COMPLETED', '{}'::jsonb, 'retention-lease-x')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a leased execution");
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+    bump_generation(&mut conn, shard, "failover", "test")
+        .await
+        .expect("bump");
+
+    autumn_harvest::retention::release_retention_leases(
+        dr_pool(&url),
+        shard,
+        "retention-lease-x".to_string(),
+        vec![exec_id],
+    )
+    .await;
+
+    let rows: Vec<Lease> =
+        diesel::sql_query("SELECT sticky_worker_id FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id)
+            .load(&mut conn)
+            .await
+            .expect("read the lease");
+    assert_eq!(
+        <[Lease]>::first(&rows).and_then(|row| row.sticky_worker_id.clone()),
+        Some("retention-lease-x".to_string()),
+        "a process that lost write authority must not release a lease"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.
