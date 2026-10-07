@@ -736,6 +736,8 @@ pub enum Schedule {
     /// UTC on upgrade.
     Cron(String),
     /// Fixed interval from the end of the previous run.
+    ///
+    /// The period must be a whole number of seconds greater than zero.
     Interval(Duration),
     /// Only runs when triggered manually via API.
     Manual,
@@ -1566,13 +1568,14 @@ impl WorkflowSchedule {
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
 ///
 /// For [`Schedule::Cron`] expressions this parses the expression using
-/// `croner` (5-field or 6-field with seconds). For other variants the schedule
-/// is always valid.
+/// `croner` (5-field or 6-field with seconds). A [`Schedule::Interval`] period
+/// must be a whole number of seconds greater than zero.
 ///
 /// # Errors
 ///
 /// Returns a human-readable error string if the cron expression is
-/// syntactically invalid.
+/// syntactically invalid. Also returns one if the interval is zero or has a
+/// fractional second.
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
         Schedule::Cron(expr) => Cron::new(expr)
@@ -1600,6 +1603,12 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::Interval(period) if period.is_zero() => {
             Err("interval schedule period must be greater than zero".to_string())
         }
+        // `schedule_expr` drops a fraction on write. A sub-second period reads
+        // back as zero (issue #1967). The scheduler ticks once a second, so it
+        // cannot keep a shorter cadence.
+        Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
+            "interval schedule period must be a whole number of seconds, got {period:?}"
+        )),
         Schedule::Interval(_) | Schedule::Manual => Ok(()),
     }
 }
@@ -2584,6 +2593,23 @@ mod tests {
         );
         // A positive interval remains valid.
         assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(1))).is_ok());
+    }
+
+    #[test]
+    fn subsecond_interval_schedule_rejected() {
+        // The stored form holds whole seconds only (issue #1967).
+        for interval in [
+            Duration::from_nanos(1),
+            Duration::from_millis(500),
+            Duration::from_millis(1_500),
+        ] {
+            let err = validate_schedule(&Schedule::Interval(interval)).unwrap_err();
+            assert!(
+                err.contains("whole number of seconds"),
+                "{interval:?} must be rejected: {err}"
+            );
+        }
+        assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(u64::MAX))).is_ok());
     }
 
     #[test]
