@@ -874,6 +874,7 @@ async fn timeout_after_the_run_ends_starts_no_new_attempt() {
         .execute(&mut conn)
         .await
         .expect("end the run");
+    let sealed = history(&mut conn, exec_id).await.len();
     enforce(&mut conn, None).await;
 
     let row = task_row(&mut conn, task_id).await;
@@ -881,6 +882,18 @@ async fn timeout_after_the_run_ends_starts_no_new_attempt() {
         (row.state.as_str(), row.attempt),
         ("FAILED", 1),
         "a sealed run gets no new attempt"
+    );
+    // The recorded outcome stays the last word, as for a workflow task.
+    let events = history(&mut conn, exec_id).await;
+    assert_eq!(
+        (events.len(), timed_out(&events)),
+        (sealed, Vec::new()),
+        "a late timeout appends nothing to a sealed history"
+    );
+    assert_eq!(
+        workflow_task_count(&mut conn, exec_id).await,
+        0,
+        "a late timeout does not wake a sealed run"
     );
 }
 
