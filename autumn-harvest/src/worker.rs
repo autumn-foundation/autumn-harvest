@@ -19102,19 +19102,18 @@ async fn process_activity_task(
     // Takes the whole result, so a transient error always reaches the
     // deferral rule.
     let record_outcome = |finalized: &HarvestResult<queue::ClaimWrite>, lost_to_timeout: bool| {
-        let write = finalize_write_for_outcome(finalized);
-        if let Some(failed) =
-            activity_attempt_outcome(status, was_cancelled, write, lost_to_timeout)
-        {
-            // Through finalization: a slow persist path is part of the attempt.
-            record_activity_outcome(
-                task_outcomes,
-                deferred_failure,
-                outlier_clock,
-                failed,
-                finalized.as_ref().err(),
-            );
-        }
+        // Through finalization: a slow persist path is part of the attempt.
+        record_attempt_outcome(
+            task_outcomes,
+            deferred_failure,
+            outlier_clock,
+            FinishedAttempt {
+                status,
+                was_cancelled,
+                finalized,
+                lost_to_timeout,
+            },
+        );
     };
     // Parse the structured payload once and reuse for both the histogram
     // and the per-failure counter (so the `error.type` attribute is
@@ -19495,6 +19494,39 @@ fn record_activity_outcome(
         deferred.defer();
     } else {
         window.record(failed, started.elapsed());
+    }
+}
+
+/// How one activity attempt ended, for [`record_attempt_outcome`].
+#[derive(Clone, Copy)]
+struct FinishedAttempt<'a> {
+    status: ActivityStatus,
+    was_cancelled: bool,
+    finalized: &'a HarvestResult<queue::ClaimWrite>,
+    lost_to_timeout: bool,
+}
+
+/// Record one finished activity attempt in the outlier window (issue #1815).
+/// See [`activity_attempt_outcome`] for which attempts count.
+fn record_attempt_outcome(
+    window: &crate::worker_outlier::TaskOutcomeWindow,
+    deferred: &DeferredActivityFailure,
+    started: std::time::Instant,
+    end: FinishedAttempt<'_>,
+) {
+    let write = finalize_write_for_outcome(end.finalized);
+    if let Some(failed) =
+        activity_attempt_outcome(end.status, end.was_cancelled, write, end.lost_to_timeout)
+    {
+        // A timeout took the claim, so the release after a failed finalize
+        // reports a lost claim and would drop a deferred sample. A confirmed
+        // timeout is therefore recorded now, whatever error came with it.
+        let error = if end.lost_to_timeout {
+            None
+        } else {
+            end.finalized.as_ref().err()
+        };
+        record_activity_outcome(window, deferred, started, failed, error);
     }
 }
 
@@ -46104,6 +46136,36 @@ mod tests {
             1,
             "an ambiguous claim is released, so it is skipped"
         );
+    }
+
+    /// Issue #1815: a timeout took the claim, so the release after a failed
+    /// finalization reports a lost claim and would drop a deferred sample.
+    /// A confirmed timeout is therefore recorded at once, whatever error the
+    /// finalization returned.
+    #[test]
+    fn a_confirmed_timeout_is_recorded_at_once() {
+        let window = crate::worker_outlier::TaskOutcomeWindow::default();
+        let deferred = DeferredActivityFailure::default();
+        for error in [
+            crate::error::database_error("connection closed"),
+            crate::error::database_error("deadlock detected"),
+        ] {
+            let finalized: HarvestResult<queue::ClaimWrite> = Err(error);
+            record_attempt_outcome(
+                &window,
+                &deferred,
+                std::time::Instant::now(),
+                FinishedAttempt {
+                    status: ActivityStatus::Completed,
+                    was_cancelled: true,
+                    finalized: &finalized,
+                    lost_to_timeout: true,
+                },
+            );
+        }
+        assert!(!deferred.take(), "nothing waits for a release");
+        let snap = window.snapshot();
+        assert_eq!((snap.tasks, snap.failures), (2, 2));
     }
 
     /// Issue #1815: the dispatch loop releases the claim of an activity
