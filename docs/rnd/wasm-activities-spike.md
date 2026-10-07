@@ -330,6 +330,11 @@ Follow-up (out of scope per the issue): cryptographic module **signing/provenanc
 corrupted, not who authored them). A signature/attestation layer over the module
 table is the natural next step.
 
+**Update (issue #1838).** Optional Ed25519 publisher signatures now exist. A
+worker with a trusted publisher key runs a module only if a trusted key signed
+its activity name and hash. See `crate::wasm_signing` and
+[ADR 0004](../adr/0004-security-extras.md).
+
 ---
 
 ## 7. Storage & distribution — Postgres content-hash table

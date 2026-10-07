@@ -619,6 +619,14 @@ diesel::table! {
         /// (issue #953). `NULL` until assigned; stays `NULL` forever when no
         /// audit sink is configured.
         export_seq -> Nullable<Int8>,
+        /// Audit-chain link of the previous `export_seq` (issue #1838).
+        chain_prev -> Nullable<Bytea>,
+        /// Newest `occurred_at` chained before this row (issue #1838).
+        chain_newest_before -> Nullable<Timestamptz>,
+        /// Audit-chain link of this row (issue #1838).
+        chain_hash -> Nullable<Bytea>,
+        /// The shard whose exporter made the links (issue #1838).
+        chain_shard -> Nullable<Int4>,
     }
 }
 
@@ -642,6 +650,16 @@ diesel::table! {
         last_delivered_at -> Nullable<Timestamptz>,
         updated_at -> Timestamptz,
         retired_at -> Nullable<Timestamptz>,
+        /// Newest audit-chain link on this shard (issue #1838).
+        chain_head -> Nullable<Bytea>,
+        /// First chained `export_seq` on this shard (issue #1838).
+        chain_start_seq -> Nullable<Int8>,
+        /// `export_seq` of the newest chained row (issue #1838).
+        chain_head_seq -> Nullable<Int8>,
+        /// Newest `occurred_at` of the chain, through the head (issue #1838).
+        chain_newest_at -> Nullable<Timestamptz>,
+        /// Keyed MAC over the checkpoint columns (issue #1838).
+        chain_mac -> Nullable<Bytea>,
     }
 }
 
@@ -1109,6 +1127,8 @@ diesel::table! {
         wasm_bytes    -> Bytea,
         active        -> Bool,
         published_at  -> Timestamptz,
+        /// Hex Ed25519 publisher signature (issue #1838). `NULL` = unsigned.
+        signature     -> Nullable<Text>,
     }
 }
 
