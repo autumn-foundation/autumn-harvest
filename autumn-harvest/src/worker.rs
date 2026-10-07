@@ -26797,6 +26797,12 @@ async fn process_workflow_task(
                     had_nd_details: false,
                 };
             }
+            // Issue #1815: a run that this cycle failed is a failed task, as
+            // a failed activity attempt is. The persist has committed, so a
+            // lost claim never reaches this arm.
+            if pending_workflow_metrics.status == WorkflowStatus::Failed {
+                cycle_failure.failed_terminally();
+            }
 
             // Issue #1348: call this first in the arm. No `.await` sits
             // between it and the persist commit above. Every later step in

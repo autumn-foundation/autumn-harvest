@@ -1040,7 +1040,7 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
     );
 
     // The heartbeat publishes on its own cadence. Wait for a snapshot that
-    // holds both failed attempts.
+    // holds both failed attempts and the workflow task that failed the run.
     let deadline = Instant::now() + Duration::from_secs(15);
     let row = loop {
         let row: Option<StatsRow> = diesel::sql_query(
@@ -1052,17 +1052,20 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
         .await
         .ok();
         if let Some(row) = row
-            && row.window_failures >= 2
+            && row.window_failures >= 3
         {
             break row;
         }
         assert!(
             Instant::now() < deadline,
-            "no task-stats row with 2 failures"
+            "no task-stats row with 3 failures"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(row.window_failures, 2, "each failed attempt counts once");
+    assert_eq!(
+        row.window_failures, 3,
+        "each failed attempt and the failed run count once"
+    );
     assert!(
         row.window_tasks > row.window_failures,
         "workflow tasks count as successes too"
@@ -1131,20 +1134,30 @@ fn panics<'a>(
     Box::pin(async move { panic!("handler boom") })
 }
 
-/// With panic retries off, the first handler panic fails the run terminally.
-/// That workflow task is a failure in the outlier window, as a re-pended panic
-/// is (issue #1815).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_terminal_handler_panic_counts_as_a_failure() {
+const FAILING_WORKFLOW: &str = "saturation_failing_wf";
+
+fn fails<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("order rejected".to_owned()) })
+}
+
+/// Run one execution of `workflow` to `FAILED` on a fresh worker, and return
+/// the worker's first stats row that counts a task.
+async fn stats_after_one_failed_run(
+    workflow: &'static str,
+    handler: autumn_harvest::info::WorkflowHandlerFn,
+) -> StatsRow {
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool: DbPool = build_test_pool(&url);
     let mut conn = connect(&url).await;
-    let queue = unique_id("panic-q");
-    let worker_id = unique_id("panic-w");
+    let queue = unique_id("failed-run-q");
+    let worker_id = unique_id("failed-run-w");
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
-            name: PANIC_WORKFLOW,
-            handler: panics,
+            name: workflow,
+            handler,
             ..workflow_info()
         }])
         .worker(
@@ -1163,11 +1176,11 @@ async fn a_terminal_handler_panic_counts_as_a_failure() {
         Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
 
     let exec_id = ExecutionId::new();
-    let workflow_id = unique_id("panic-wf");
+    let workflow_id = unique_id("failed-run-wf");
     start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
-            workflow_name: PANIC_WORKFLOW,
+            workflow_name: workflow,
             ..start_params(exec_id, &workflow_id, &queue)
         },
         None,
@@ -1197,13 +1210,35 @@ async fn a_terminal_handler_panic_counts_as_a_failure() {
         assert!(Instant::now() < deadline, "no task-stats row with a task");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
+    worker.shutdown();
+    handle.await.expect("worker joins");
+    row
+}
+
+/// With panic retries off, the first handler panic fails the run terminally.
+/// That workflow task is a failure in the outlier window, as a re-pended panic
+/// is (issue #1815).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_handler_panic_counts_as_a_failure() {
+    let row = stats_after_one_failed_run(PANIC_WORKFLOW, panics).await;
     assert_eq!(
         (row.window_tasks, row.window_failures),
         (1, 1),
         "the panicked workflow task is one failure"
     );
-    worker.shutdown();
-    handle.await.expect("worker joins");
+}
+
+/// A workflow body that returns `Err` fails the run. That workflow task is a
+/// failure in the outlier window, as a failed activity attempt is (issue
+/// #1815).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workflow_that_returns_an_error_counts_as_a_failure() {
+    let row = stats_after_one_failed_run(FAILING_WORKFLOW, fails).await;
+    assert_eq!(
+        (row.window_tasks, row.window_failures),
+        (1, 1),
+        "the failed workflow task is one failure"
+    );
 }
 
 /// One timeout-scanner pass records the `scan` op.

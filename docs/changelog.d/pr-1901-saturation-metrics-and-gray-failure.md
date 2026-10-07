@@ -48,7 +48,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   A cancelled activity attempt is not counted, and neither is one whose
   claim a later owner took before it finalized. A session acquire or release
   counts when it finalizes or fails, but not when it defers for capacity.
-  A workflow task counts as a failure when it returns an error or times out.
+  A workflow task counts as a failure when it returns an error or times out,
+  and when its cycle fails the run, as a workflow body that returns `Err` does.
   So does a cycle that deadlocks, or panics within its retry budget, and so
   re-pends the task while the run stays `RUNNING`. So does a panic past that
   budget, which fails the run terminally.
