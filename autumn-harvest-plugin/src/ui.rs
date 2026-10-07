@@ -5682,6 +5682,13 @@ fn event_human_label(event_type: &str, event_data: &Value, execution_state: &str
         "ActivityCompletedExternally" => "Activity completed externally".to_string(),
         "ActivityFailedExternally" => "Activity failed externally".to_string(),
         "ActivityExternalDeadlineExtended" => "External activity deadline extended".to_string(),
+        "DecisionCommitted" => {
+            let build = event_data_field(event_data, "build_id")
+                .filter(|build| !build.is_empty())
+                .unwrap_or("<none>");
+            let worker = event_data_field(event_data, "worker_id").unwrap_or("?");
+            format!("Decision committed: build {build}, worker {worker}")
+        }
         "TimerStarted" => "Timer started".to_string(),
         "TimerFired" => "Timer fired".to_string(),
         "TimerCancelled" => "Timer cancelled".to_string(),
@@ -13480,6 +13487,26 @@ mod tests {
         assert_eq!(
             event_human_label("WorkflowCancelled", &data, "CANCELLED"),
             "Workflow cancelled"
+        );
+    }
+
+    #[test]
+    fn event_label_shows_build_and_worker_per_decision() {
+        let data = serde_json::json!({
+            "type": "DecisionCommitted",
+            "data": {"build_id": "build-7", "worker_id": "worker-eu-1"},
+        });
+        assert_eq!(
+            event_human_label("DecisionCommitted", &data, "RUNNING"),
+            "Decision committed: build build-7, worker worker-eu-1"
+        );
+        let legacy = serde_json::json!({
+            "type": "DecisionCommitted",
+            "data": {"build_id": "", "worker_id": "w"},
+        });
+        assert_eq!(
+            event_human_label("DecisionCommitted", &legacy, "RUNNING"),
+            "Decision committed: build <none>, worker w"
         );
     }
 

@@ -537,6 +537,11 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
     Ok(exporter.out)
 }
 
+/// Makes operator text safe inside one Mermaid note line.
+fn mermaid_text(text: &str) -> String {
+    text.replace('\n', " ").replace('"', "'")
+}
+
 struct MermaidExporter {
     out: String,
     participants: std::collections::HashSet<String>,
@@ -597,7 +602,8 @@ impl MermaidExporter {
                 WorkflowEvent::SignalReceived { .. }
                 | WorkflowEvent::MarkerRecorded { .. }
                 | WorkflowEvent::SideEffectRecorded { .. }
-                | WorkflowEvent::MutexGranted { .. } => {
+                | WorkflowEvent::MutexGranted { .. }
+                | WorkflowEvent::DecisionCommitted { .. } => {
                     self.handle_misc_event(event)?;
                 }
                 WorkflowEvent::ActivityAwaitingExternal { .. }
@@ -921,6 +927,22 @@ impl MermaidExporter {
             WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
                 let label = name.as_deref().unwrap_or(kind.as_str());
                 writeln!(self.out, "    Note over WF: Side Effect: {label}")?;
+            }
+            WorkflowEvent::DecisionCommitted {
+                build_id,
+                worker_id,
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Decision committed (build {}, worker {})",
+                    // Plain text: Mermaid can read `<none>` as an HTML tag.
+                    if build_id.is_legacy() {
+                        "none".to_string()
+                    } else {
+                        mermaid_text(build_id.as_str())
+                    },
+                    mermaid_text(worker_id.as_str()),
+                )?;
             }
             WorkflowEvent::MutexGranted { key, .. } => {
                 writeln!(self.out, "    Note over WF: Mutex Acquired: {key}")?;
@@ -1993,5 +2015,43 @@ mod tests {
             "Redacted export must contain neither plaintext nor the envelope: {json}"
         );
         assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
+    }
+
+    // ── DecisionCommitted (issue #1833) ──────────────────────────────────────
+
+    fn decision_committed() -> WorkflowEvent {
+        WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("build-9"),
+            worker_id: crate::types::WorkerId::new("node-a"),
+        }
+    }
+
+    #[test]
+    fn mermaid_shows_build_and_worker_per_decision() {
+        let diagram = export_mermaid_sequence(&[decision_committed()]).expect("export");
+        assert!(
+            diagram.contains("Note over WF: Decision committed (build build-9, worker node-a)"),
+            "{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_names_a_missing_build_and_escapes_operator_text() {
+        let event = WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::legacy(),
+            worker_id: crate::types::WorkerId::new("node \"a\"\nx"),
+        };
+        let diagram = export_mermaid_sequence(&[event]).expect("export");
+        assert!(
+            diagram.contains("Note over WF: Decision committed (build none, worker node 'a' x)"),
+            "{diagram}"
+        );
+    }
+
+    #[test]
+    fn redacted_export_keeps_build_and_worker() {
+        let value = redacted_event_value(&decision_committed()).expect("redact");
+        assert_eq!(value["data"]["build_id"], "build-9");
+        assert_eq!(value["data"]["worker_id"], "node-a");
     }
 }
