@@ -1379,6 +1379,11 @@ jobs:
       # the latency win while still paying the extra fixed cost. See the
       # report's "🔍 Seventh correction" for the full derivation.
       #
+      # Issue #1799 added 49 rows, so every later row ordinal moved. The
+      # isolation claim above no longer holds: at N=21,
+      # `quota_enforcement_tests` shares shard 9 with `integration_e2e`.
+      # Isolation did not fix the hang (see below), so N stays 21.
+      #
       # Whether shard load explains `quota_enforcement_tests`'s recurring,
       # exactly-at-the-configured-timeout hang at all -- named by the "🚦
       # Semaphore" CI-health report series
