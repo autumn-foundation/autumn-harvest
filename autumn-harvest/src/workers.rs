@@ -1110,8 +1110,8 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 /// - `outcome_window_ms` and `peer_stale_secs`: both follow the heartbeat
 ///   interval. Workers with two windows compare two time ranges, and workers
 ///   with two freshness limits can disagree on the live peer set.
-/// - `execution`: the workflow cache, the task budgets and the panic limit.
-///   See [`ExecutionPolicy`].
+/// - `execution`: the workflow cache, the task budgets, the panic limit and
+///   the cancellation grace period. See [`ExecutionPolicy`].
 /// - `payload`: the payload caps, the history policy, the offloader, the codec
 ///   keys and the interceptors. See [`PayloadPolicy`].
 ///
@@ -1422,7 +1422,8 @@ impl PayloadPolicy {
 /// workflow cache decides whether a task replays its full history. The two
 /// budgets decide whether a task times out, and a timeout is a failure. The
 /// panic limit and the poison-pill threshold decide how many failing attempts
-/// run before quarantine.
+/// run before quarantine. The cancellation grace period bounds how long a
+/// cancelled activity unwinds before its outcome is recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionPolicy {
     /// `sticky_timeout`. Zero turns the workflow cache off.
@@ -1440,6 +1441,10 @@ pub struct ExecutionPolicy {
     /// `poison_pill_threshold`. The worker's timeout path quarantines a
     /// workflow task that times out this many times in a row.
     pub poison_pill_threshold: i32,
+    /// `cancellation_grace_period`. A timed-out activity that ignores its
+    /// cancellation runs this long before the timeout is recorded. So the
+    /// period adds to the latency that the window records.
+    pub cancellation_grace_period: std::time::Duration,
 }
 
 impl Default for ExecutionPolicy {
@@ -1453,6 +1458,7 @@ impl Default for ExecutionPolicy {
             max_local_activity_start_to_close: std::time::Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             poison_pill_threshold: 3,
+            cancellation_grace_period: std::time::Duration::from_secs(5),
         }
     }
 }
@@ -1469,6 +1475,7 @@ impl ExecutionPolicy {
             // Every threshold at or below 0 turns quarantine off, so they are
             // one setting.
             "poison_pill_threshold": self.poison_pill_threshold.max(0),
+            "cancellation_grace_period": duration_key(self.cancellation_grace_period),
         })
     }
 }
@@ -4081,6 +4088,16 @@ mod tests {
                     ..base
                 },
             ),
+            (
+                ExecutionPolicy {
+                    cancellation_grace_period: short,
+                    ..base
+                },
+                ExecutionPolicy {
+                    cancellation_grace_period: long,
+                    ..base
+                },
+            ),
         ] {
             assert_ne!(cohort(a, window), cohort(b, window), "{a:?}");
         }
@@ -4091,8 +4108,9 @@ mod tests {
         );
     }
 
-    /// Issue #1815: the workflow cache, the task budgets and the panic limit
-    /// change what the window records for the same task. Workers that differ
+    /// Issue #1815: the workflow cache, the task budgets, the panic limit
+    /// and the cancellation grace period change what the window records for
+    /// the same task. Workers that differ
     /// in any of them are in different cohorts.
     #[test]
     fn the_cohort_key_includes_the_execution_policy() {
@@ -4158,6 +4176,10 @@ mod tests {
             },
             ExecutionPolicy {
                 poison_pill_threshold: 0,
+                ..base
+            },
+            ExecutionPolicy {
+                cancellation_grace_period: Duration::from_secs(1),
                 ..base
             },
         ];

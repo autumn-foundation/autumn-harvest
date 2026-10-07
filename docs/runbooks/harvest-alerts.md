@@ -3435,7 +3435,9 @@ two intervals would compare two time ranges. So do the workflow cache
 settings (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`), the
 task budgets (`workflow_task_timeout`, `max_local_activity_start_to_close`)
 and the quarantine limits (`workflow_panic_max_attempts`,
-`poison_pill_threshold`). So do the payload caps, the history policy, the
+`poison_pill_threshold`). So does `cancellation_grace_period`: a timed-out
+activity that ignores its cancellation runs that long before the timeout is
+recorded. So do the payload caps, the history policy, the
 payload offloader, the registered payload codecs and default codec, the
 registered and active codec keys, the activity interceptor chain
 and each activity's own caps, rate and concurrency limits and WASM binding.

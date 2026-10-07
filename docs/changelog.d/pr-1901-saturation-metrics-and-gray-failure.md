@@ -93,7 +93,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   freshness limit (both follow the heartbeat interval), and execution policy
   (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`,
   `workflow_task_timeout`, `max_local_activity_start_to_close`,
-  `workflow_panic_max_attempts`, `poison_pill_threshold`), and payload policy
+  `workflow_panic_max_attempts`, `poison_pill_threshold`,
+  `cancellation_grace_period`), and payload policy
   (`max_activity_input_bytes`, `max_workflow_input_bytes`,
   `max_activity_result_bytes`, `max_signal_payload_bytes`,
   `max_current_details_bytes`, the history policy, the workflow execution

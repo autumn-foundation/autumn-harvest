@@ -34542,6 +34542,7 @@ impl Worker {
                             .max_local_activity_start_to_close,
                         workflow_panic_max_attempts: self.config.workflow_panic_max_attempts,
                         poison_pill_threshold: self.config.poison_pill_threshold,
+                        cancellation_grace_period: self.config.cancellation_grace_period,
                     },
                     payload: self.registry.payload_policy(),
                 }),
