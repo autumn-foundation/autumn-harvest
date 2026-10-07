@@ -66,7 +66,7 @@ autumn-web = { version = "0.8", features = ["ws"] }
 # ... plus standard deps (serde_json, chrono, uuid, tokio, tracing, etc.)
 ```
 
-The `db` feature (default) pulls Diesel + diesel-async. Requirements: Postgres 12+ (CI tests Postgres 16 only).
+The `db` feature (default) pulls Diesel + diesel-async. Requirements: Postgres 12+. CI runs Harvest's own DB suites on Postgres 16 and does not test 12 to 15.
 
 ## Defining Workflows
 
