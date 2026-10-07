@@ -1364,6 +1364,39 @@ async fn a_workflow_that_returns_an_error_counts_as_a_failure() {
     );
 }
 
+const BATCH_CONFLICT_WORKFLOW: &str = "saturation_batch_conflict_wf";
+
+/// Joins a local activity with a durable timer in one decision cycle. The
+/// worker rejects that batch and fails the run before the persist.
+fn conflicting_batch<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (local, timer) = futures::join!(
+            ctx.execute_local_activity_raw("saturation_local", serde_json::json!({}), None, None),
+            ctx.timer("deadline", 30),
+        );
+        local.map_err(|e| e.to_string())?;
+        timer.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({}))
+    })
+}
+
+/// A workflow-task error path can fail the run itself before it returns the
+/// error. The dispatcher's reset then finds no running row. That is this
+/// claim's own failure, not a lost claim, so the window counts it (issue
+/// #1815).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_the_error_path_commits_counts_as_a_failure() {
+    let row = stats_after_one_failed_run(BATCH_CONFLICT_WORKFLOW, conflicting_batch).await;
+    assert_eq!(
+        (row.window_tasks, row.window_failures),
+        (1, 1),
+        "the rejected batch is one failure"
+    );
+}
+
 const HANGING_WORKFLOW: &str = "saturation_hanging_wf";
 const HANGING_ACTIVITY: &str = "saturation_hanging_activity";
 

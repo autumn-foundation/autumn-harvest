@@ -36984,14 +36984,31 @@ impl Worker {
                         #[cfg(feature = "db")]
                         let recovery = if task_type == "workflow" {
                             drop(permit);
-                            reset_timed_out_workflow_task(
+                            let reset = reset_timed_out_workflow_task(
                                 &pool,
                                 task_id,
                                 &worker_id,
                                 claim_crash_strikes,
                                 claim_attempt,
                             )
-                            .await
+                            .await;
+                            // Issue #1815: an error path that failed the run
+                            // itself leaves no running row. That failure is
+                            // this claim's own, so the window counts it.
+                            if reset == ClaimRecovery::ClaimLost
+                                && claim_failed_its_task(
+                                    &pool,
+                                    task_id,
+                                    &worker_id,
+                                    claim_crash_strikes,
+                                    claim_attempt,
+                                )
+                                .await
+                            {
+                                ClaimRecovery::Applied
+                            } else {
+                                reset
+                            }
                         } else {
                             ClaimRecovery::Applied
                         };
@@ -38169,6 +38186,39 @@ fn releases_activity_claim(error: &HarvestError) -> bool {
 /// dispatched.
 const RESET_POOL_RETRY_BACKOFF_MS: &[u64] =
     &[0, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 8_000, 8_000];
+
+/// Whether this claim's own write failed its workflow task (issue #1815).
+///
+/// An early error path can fail the task and its run before it returns the
+/// error. The dispatcher's reset then finds no running row and reports a lost
+/// claim. A terminal write keeps the row's `worker_id`, `attempt` and
+/// `crash_strikes`, so a failed row under this claim's fence is this claim's
+/// failure. A peer's claim carries another fence. A failed read answers
+/// `false`, so the window never counts a failure it cannot confirm.
+#[cfg(feature = "db")]
+async fn claim_failed_its_task(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    claim_crash_strikes: i32,
+    claim_attempt: i32,
+) -> bool {
+    use crate::schema::harvest_task_queue::dsl;
+    let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
+        return false;
+    };
+    dsl::harvest_task_queue
+        .find(task_id)
+        .filter(dsl::state.eq("FAILED"))
+        .filter(dsl::worker_id.eq(worker_id))
+        .filter(dsl::crash_strikes.eq(claim_crash_strikes))
+        .filter(dsl::attempt.eq(claim_attempt))
+        .select(dsl::id)
+        .first::<uuid::Uuid>(&mut conn)
+        .await
+        .optional()
+        .is_ok_and(|row| row.is_some())
+}
 
 /// Reset a timed-out RUNNING workflow task back to PENDING so any worker can
 /// re-claim it on the next poll cycle without waiting for the orphan-reclaim

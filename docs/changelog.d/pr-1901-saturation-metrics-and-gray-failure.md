@@ -63,7 +63,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   budget, which fails the run terminally.
   The failure counts after its claim-fenced reset or quarantine, with its
   latency taken then. It is left out when that write finds a peer owns the
-  claim. A release is not counted.
+  claim. An early error path can fail the run itself before the reset. The
+  row then stays failed under this claim's fence, so that failure counts.
+  A release is not counted.
   `worker::reset_timed_out_workflow_task` now returns a `ClaimRecovery`.
   The panic re-pend is now fenced by the claim, like the deadlock re-pend,
   through the new `queue::requeue_claimed_workflow_task_after_panic`. A stale
@@ -78,6 +80,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   shards hold a row for one worker, the higher sequence wins. Shard clocks
   can differ, so `updated_at` is not used to order them. A restarted worker
   that keeps its id always writes above the rows of its previous process.
+- The snapshot and its cohort key are read in one serialized step. A codec
+  change can still land between the two reads, so the step reads the key
+  again after the snapshot and captures again until the key holds.
 - Startup registration drops the worker's stats row in its transaction. A
   restarted process therefore does not show its previous process's
   failures before its first heartbeat.
