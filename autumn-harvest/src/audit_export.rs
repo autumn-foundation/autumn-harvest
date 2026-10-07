@@ -1776,6 +1776,22 @@ async fn build_unexported_index_on_dedicated_connection(
     schema: &str,
     connect_timeout: std::time::Duration,
 ) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
+    let mut conn = connect_index_builder(dsn, schema, connect_timeout).await?;
+    let outcome = ensure_unexported_index(&mut conn).await;
+    // On `Err` the session may still hold the advisory lock. Closing the
+    // connection releases it either way.
+    drop(conn);
+    outcome
+}
+
+/// Open the dedicated connection of an index build, with its `search_path`
+/// set. See [`build_unexported_index_on_dedicated_connection`].
+#[cfg(feature = "db")]
+async fn connect_index_builder(
+    dsn: &str,
+    schema: &str,
+    connect_timeout: std::time::Duration,
+) -> crate::error::HarvestResult<diesel_async::AsyncPgConnection> {
     use diesel_async::RunQueryDsl;
 
     // A host can accept the socket and never finish the handshake. Without a
@@ -1797,11 +1813,7 @@ async fn build_unexported_index_on_dedicated_connection(
         .execute(&mut conn)
         .await
         .map_err(crate::error::database_error)?;
-    let outcome = ensure_unexported_index(&mut conn).await;
-    // On `Err` the session may still hold the advisory lock. Closing the
-    // connection releases it either way.
-    drop(conn);
-    outcome
+    Ok(conn)
 }
 
 /// The quoted name of the schema that holds `harvest_audit_log` for the
@@ -1868,17 +1880,18 @@ async fn build_unexported_index_fenced(
     dsn: &str,
     schema: &str,
 ) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
+    // The connection opens before the fence. A slow or unreachable build URL
+    // then holds no barrier.
+    let mut conn = connect_index_builder(dsn, schema, INDEX_BUILD_CONNECT_TIMEOUT).await?;
     let fence = crate::replication::begin_fenced_group(pool, fence_key).await?;
-    crate::replication::run_fenced_pass(
-        &fence,
-        Box::pin(build_unexported_index_on_dedicated_connection(
-            dsn,
-            schema,
-            INDEX_BUILD_CONNECT_TIMEOUT,
-        )),
-    )
-    .await
-    .and_then(|built| built)
+    let outcome =
+        crate::replication::run_fenced_pass(&fence, Box::pin(ensure_unexported_index(&mut conn)))
+            .await
+            .and_then(|built| built);
+    // On `Err` the session may still hold the advisory lock. Closing the
+    // connection releases it either way.
+    drop(conn);
+    outcome
 }
 
 /// Start the index build in a detached task, off the export tick (issue #1667).

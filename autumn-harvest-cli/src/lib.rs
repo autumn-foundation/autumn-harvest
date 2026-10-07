@@ -6260,6 +6260,30 @@ async fn database_fence(
     shard_id: i32,
     expect_generation: &[ExpectGeneration],
 ) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, String> {
+    lock_database_fence(plan_database_fence(dsn, shard_id, expect_generation).await?).await
+}
+
+/// The connections of a [`database_fence`], open but holding no lock yet.
+struct PlannedFence {
+    /// One connection per guarded shard, with the epoch it must hold.
+    passes: Vec<(
+        autumn_harvest::types::ShardId,
+        i64,
+        autumn_harvest::diesel_async::AsyncPgConnection,
+    )>,
+    /// The connection of the row freeze.
+    freeze: autumn_harvest::diesel_async::AsyncPgConnection,
+}
+
+/// The first half of [`database_fence`]: probe the database and open every
+/// connection, with no lock taken (issue #1823). A command over several
+/// databases plans them all before it locks any. A slow connection then
+/// holds no barrier.
+async fn plan_database_fence(
+    dsn: &str,
+    shard_id: i32,
+    expect_generation: &[ExpectGeneration],
+) -> Result<PlannedFence, String> {
     use autumn_harvest::types::ShardId;
     let rows = {
         let mut probe = dr_connect(dsn).await.map_err(|e| e.to_string())?;
@@ -6293,31 +6317,44 @@ async fn database_fence(
         };
         plan.push((ShardId::new(shard), expected));
     }
-    // Issue #1823: every connection opens first, then every pass lock is
-    // taken together. Each lock waits a bounded time. A bump that holds one
-    // lock then fails the command fast. Its other guards drop before a bump
-    // on another shard times out.
+    // Issue #1823: every connection opens here, before any lock.
     let conns = futures::future::try_join_all(plan.iter().map(|_| dr_connect(dsn)))
         .await
         .map_err(|e| e.to_string())?;
-    let mut guards = futures::future::try_join_all(conns.into_iter().zip(&plan).map(
-        |(conn, (shard, expected))| {
+    let freeze = dr_connect(dsn).await.map_err(|e| e.to_string())?;
+    Ok(PlannedFence {
+        passes: plan
+            .into_iter()
+            .zip(conns)
+            .map(|((shard, expected), conn)| (shard, expected, conn))
+            .collect(),
+        freeze,
+    })
+}
+
+/// The second half of [`database_fence`]: take every pass lock together,
+/// then freeze the rows (issue #1823). Each lock waits a bounded time. A
+/// bump that holds one lock then fails the command fast. Its other guards
+/// drop before a bump on another shard times out.
+async fn lock_database_fence(
+    planned: PlannedFence,
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, String> {
+    let guarded: Vec<autumn_harvest::types::ShardId> =
+        planned.passes.iter().map(|(shard, ..)| *shard).collect();
+    let mut guards =
+        futures::future::try_join_all(planned.passes.into_iter().map(|(shard, expected, conn)| {
             autumn_harvest::replication::begin_fenced_pass_on(
                 conn,
-                *shard,
-                autumn_harvest::replication::ShardGeneration::new(*expected),
+                shard,
+                autumn_harvest::replication::ShardGeneration::new(expected),
             )
-        },
-    ))
-    .await
-    .map_err(|e| e.to_string())?;
-    guards.reserve(1);
-    let guarded: Vec<ShardId> = plan.iter().map(|(shard, _)| *shard).collect();
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
     // Frozen even when the table is empty: the first row must not appear
     // mid-command either.
-    let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;
     guards.push(
-        autumn_harvest::replication::freeze_generation_rows_on(conn, &guarded)
+        autumn_harvest::replication::freeze_generation_rows_on(planned.freeze, &guarded)
             .await
             .map_err(|e| e.to_string())?,
     );
@@ -6353,19 +6390,31 @@ async fn shard_pool_write_authority(
         .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
     }
     // Hold the barriers for the whole command, so a bump cannot commit while
-    // the rebalance writes (issue #1823). One set for each database.
-    let mut fenced: Vec<&str> = Vec::new();
+    // the rebalance writes (issue #1823). One set for each database. Every
+    // database's connections open first. Then the locks on all of them are
+    // taken together, so a slow database holds no other's barrier.
+    let mut fenced: Vec<&autumn_harvest::backup_verify::ShardTarget> = Vec::new();
     for target in targets {
-        if fenced.contains(&target.dsn.as_str()) {
+        if fenced.iter().any(|seen| seen.dsn == target.dsn) {
             continue;
         }
-        fenced.push(&target.dsn);
-        guards.extend(
-            database_fence(&target.dsn, target.shard_id, expect_generation)
-                .await
-                .map_err(|e| CliError::InvalidInput(format!("shard {}: {e}", target.shard_id)))?,
-        );
+        fenced.push(target);
     }
+    let planned = futures::future::try_join_all(fenced.iter().map(|target| async move {
+        plan_database_fence(&target.dsn, target.shard_id, expect_generation)
+            .await
+            .map_err(|e| CliError::InvalidInput(format!("shard {}: {e}", target.shard_id)))
+    }))
+    .await?;
+    let locked = futures::future::try_join_all(planned.into_iter().zip(&fenced).map(
+        |(plan, target)| async move {
+            lock_database_fence(plan)
+                .await
+                .map_err(|e| CliError::InvalidInput(format!("shard {}: {e}", target.shard_id)))
+        },
+    ))
+    .await?;
+    guards.extend(locked.into_iter().flatten());
     Ok(guards)
 }
 
