@@ -1593,8 +1593,9 @@
           },
           {
             "kind": "promql",
-            "expr": "(harvest_db_pool_idle == 0) and on (instance, shard) (harvest_db_pool_in_use > 0)",
-            "note": "Companion, per replica: this replica's pool for the shard has no idle connection. When several runtimes in one process share a sink with separate pools for the shard, the gauge reads 0 while any of those pools is exhausted. Pools are per replica, so a sum across replicas would hide one starved replica. deadpool opens connections only when it needs them, so read this with the wait p99: a busy but healthy pool also has few idle connections."
+            "expr": "(harvest_db_pool_idle == 0) and on (instance, shard) (sum by (instance, shard) (rate(harvest_db_pool_wait_duration_sum[5m])) / sum by (instance, shard) (rate(harvest_db_pool_wait_duration_count[5m])) > 0.05)",
+            "for": "10m",
+            "note": "Companion, per replica: this replica's pool for the shard has no idle connection and callers wait for one. deadpool opens connections only when it needs them, so a busy but healthy pool also reads idle 0; the measured wait keeps that case quiet. When several runtimes in one process share a sink with separate pools for the shard, the gauge reads 0 while any of those pools is exhausted. Pools are per replica, so a sum across replicas would hide one starved replica."
           }
         ]
       },

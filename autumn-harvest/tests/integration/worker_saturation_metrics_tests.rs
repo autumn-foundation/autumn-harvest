@@ -1464,6 +1464,46 @@ async fn a_history_cap_failure_counts_as_a_failure() {
     );
 }
 
+/// A run that fails on an early error path, or at the history cap, writes its
+/// failure in a terminal transaction. That write is an outcome persist, so it
+/// records a `persist` sample too (issue #1815).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_failure_write_records_a_persist_sample() {
+    let cases: [(
+        &'static str,
+        autumn_harvest::info::WorkflowHandlerFn,
+        Option<u64>,
+    ); 2] = [
+        (CAPPED_WORKFLOW, waits_on_a_timer, Some(2)),
+        (BATCH_CONFLICT_WORKFLOW, conflicting_batch, None),
+    ];
+    for (workflow, handler, cap) in cases {
+        let recorder = Arc::new(PoolLabels::default());
+        let metrics = Arc::clone(&recorder) as Arc<dyn MetricsRecorder>;
+        stats_after_one_failed_run_with(
+            workflow,
+            handler,
+            move |builder| {
+                let builder = builder.telemetry(TelemetryConfig {
+                    service_name: Arc::from("worker_saturation_metrics_tests"),
+                    propagator: Arc::new(NoOpPropagator),
+                    metrics,
+                });
+                match cap {
+                    Some(cap) => builder.history_event_hard_cap(cap),
+                    None => builder,
+                }
+            },
+            |_| {},
+        )
+        .await;
+        assert!(
+            !recorder.of(DbOp::Persist.as_str()).is_empty(),
+            "{workflow}: the terminal write is a persist sample"
+        );
+    }
+}
+
 const HANGING_WORKFLOW: &str = "saturation_hanging_wf";
 const HANGING_ACTIVITY: &str = "saturation_hanging_activity";
 

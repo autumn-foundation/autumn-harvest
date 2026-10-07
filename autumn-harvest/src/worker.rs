@@ -14331,6 +14331,8 @@ pub async fn fail_task_and_execution_with_history(
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
+    // Issue #1815: a terminal failure write is an outcome persist.
+    let _persist = PersistTimer::start();
     let task_id = task.id;
     let crash_strikes = task.crash_strikes;
     let attempt = task.attempt;
@@ -24246,6 +24248,8 @@ async fn dead_letter_for_history_cap(
     Vec<(ExecutionId, String)>,
     Vec<crate::execution::StartCancelledRun>,
 )> {
+    // Issue #1815: the cap failure's write is an outcome persist.
+    let _persist = PersistTimer::start();
     let reason = reason.to_string();
 
     let (deferred, closed_children, pending_cancel_metrics) =
@@ -24862,8 +24866,6 @@ async fn process_workflow_task(
     // deadlock or a contained panic. The run stays RUNNING, but the task
     // failed, so the worker's outcome window counts it unless the claim is lost.
     cycle_failure: &CycleFailure,
-    // Issue #1815: the `shard` labels of the pool that `conn` came from.
-    pool_labels: &[u16],
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -26967,7 +26969,7 @@ async fn process_workflow_task(
 
     // Issue #1815: the `persist` op spans the whole transaction, COMMIT
     // included. The guard also records a transaction that a timeout cancels.
-    let persist_timer = DbOpTimer::start(&registry.telemetry().metrics, DbOp::Persist, pool_labels);
+    let persist_timer = PersistTimer::start();
     // Issue #1833: one merged wake per execution, also on the fallback path.
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
@@ -27739,23 +27741,28 @@ async fn process_task(
                 // (clippy::large_futures): `process_workflow_task`'s state is
                 // large enough on its own that inlining it here grows every
                 // future that awaits this one.
-                let outcome = Box::pin(process_workflow_task(
-                    &mut conn,
-                    registry.as_ref(),
-                    &task,
-                    worker_id,
-                    build_id,
-                    sticky_timeout,
-                    max_local_activity_start_to_close,
-                    workflow_cache,
-                    dispatched_at,
-                    &workflow_panic_strikes,
-                    workflow_panic_max_attempts,
-                    &workflow_deadlock_strikes,
-                    workflow_task_deadline,
-                    &frontier_reset_committed,
-                    &cycle_failure,
-                    pool_labels,
+                // Issue #1815: every outcome persist of the cycle is timed
+                // under the pool's labels. See `PersistTiming`.
+                let timing = PersistTiming::new(&registry.telemetry().metrics, pool_labels);
+                let outcome = Box::pin(PERSIST_TIMING.scope(
+                    timing,
+                    process_workflow_task(
+                        &mut conn,
+                        registry.as_ref(),
+                        &task,
+                        worker_id,
+                        build_id,
+                        sticky_timeout,
+                        max_local_activity_start_to_close,
+                        workflow_cache,
+                        dispatched_at,
+                        &workflow_panic_strikes,
+                        workflow_panic_max_attempts,
+                        &workflow_deadlock_strikes,
+                        workflow_task_deadline,
+                        &frontier_reset_committed,
+                        &cycle_failure,
+                    ),
                 ))
                 .await;
                 Ok::<_, HarvestError>((conn, outcome))
@@ -30116,40 +30123,72 @@ impl Drop for PollerGuard {
     }
 }
 
-/// Records one [`DbOp`]'s duration when it drops (issue #1815).
+/// How one workflow-task cycle times its outcome persists (issue #1815).
 ///
-/// A guard records an op that a timeout cancels, too. A timeout cancels the
-/// slowest ops first. A plain timer after the `await` would then drop exactly
-/// the samples that show saturation.
-struct DbOpTimer<'a> {
+/// The dispatcher sets it around the cycle. The main persist transaction
+/// starts a `persist` timer from it, and so does each terminal failure write.
+/// An early error path or a history-cap breach commits its failure outside
+/// the main transaction, and that write is an outcome persist too. An
+/// activity task runs outside this scope, so its writes record no sample.
+struct PersistTiming {
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
-    op: DbOp,
-    shards: &'a [u16],
-    started: std::time::Instant,
+    labels: Arc<[u16]>,
+    /// Set while a timer of the cycle runs. A write nested in a timed
+    /// transaction is part of that sample, so it does not start another.
+    running: std::cell::Cell<bool>,
 }
 
-impl<'a> DbOpTimer<'a> {
-    fn start(
-        metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-        op: DbOp,
-        shards: &'a [u16],
-    ) -> Self {
+impl PersistTiming {
+    fn new(metrics: &Arc<dyn crate::telemetry::MetricsRecorder>, labels: &Arc<[u16]>) -> Self {
         Self {
             metrics: Arc::clone(metrics),
-            op,
-            shards,
-            started: std::time::Instant::now(),
+            labels: Arc::clone(labels),
+            running: std::cell::Cell::new(false),
         }
     }
 }
 
-impl Drop for DbOpTimer<'_> {
+tokio::task_local! {
+    static PERSIST_TIMING: PersistTiming;
+}
+
+/// Records one `persist` duration when it drops (issue #1815).
+///
+/// A guard records an op that a timeout cancels, too. A timeout cancels the
+/// slowest ops first. A plain timer after the `await` would then drop exactly
+/// the samples that show saturation.
+struct PersistTimer {
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+    labels: Arc<[u16]>,
+    started: std::time::Instant,
+}
+
+impl PersistTimer {
+    /// Start a timer for this cycle. It is `None` outside a workflow-task
+    /// cycle, and while another timer of the cycle runs.
+    fn start() -> Option<Self> {
+        PERSIST_TIMING
+            .try_with(|timing| {
+                (!timing.running.replace(true)).then(|| Self {
+                    metrics: Arc::clone(&timing.metrics),
+                    labels: Arc::clone(&timing.labels),
+                    started: std::time::Instant::now(),
+                })
+            })
+            .ok()
+            .flatten()
+    }
+}
+
+impl Drop for PersistTimer {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed().as_secs_f64();
-        for shard in self.shards {
+        for label in self.labels.iter() {
             self.metrics
-                .record_db_query_duration(self.op, *shard, elapsed);
+                .record_db_query_duration(DbOp::Persist, *label, elapsed);
         }
+        // Outside the scope there is nothing to reset.
+        let _ = PERSIST_TIMING.try_with(|timing| timing.running.set(false));
     }
 }
 
@@ -38494,7 +38533,6 @@ pub async fn chaos_drive_one_workflow_task(
             None,
             &frontier_reset_committed,
             &cycle_failure,
-            &[0],
         ))
         .await
     })
@@ -38563,7 +38601,6 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             None,
             &frontier_reset_committed,
             &cycle_failure,
-            &[0],
         ));
         let cancelled_at_hold = tokio::select! {
             () = hold.reached() => true,

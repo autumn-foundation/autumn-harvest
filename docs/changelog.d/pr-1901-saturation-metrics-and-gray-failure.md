@@ -22,7 +22,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   slow shard of a multi-shard worker stays visible.
   - `claim` times one claim query.
   - `persist` times the workflow-task persist transaction, COMMIT included.
-    A drop guard records a transaction that a timeout cancels.
+    A drop guard records a transaction that a timeout cancels. A failure
+    that an early error path or a history-cap breach commits instead is
+    timed as a `persist` too.
   - `scan` times one timeout-scanner pass.
   - `heartbeat` times one activity heartbeat write.
 - `harvest.worker.pollers{queue}`: gauge set when a poll loop starts and
