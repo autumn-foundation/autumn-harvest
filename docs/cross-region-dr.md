@@ -407,11 +407,12 @@ Three limits, stated plainly:
   barrier pings that connection each second. If the session ends, the
   server frees the lock. The pass then stops: a scheduler pass before it
   fires, a partition pass or a rebalance at once, with an error. An admin
-  write or a webhook answers `503`. A statement the server already runs is
-  not cancelled. The bump's 2-second wait covers a short statement. A
-  statement that runs longer than about one second can still commit after
-  a bump. History appends are not exposed: each checks the fence in its own
-  transaction.
+  write or a webhook answers `503`. Before it stops, the pass ends the
+  backend of each pooled connection it holds, so the server rolls back a
+  statement it already runs. That happens inside the bump's 2-second wait.
+  If the process cannot end a backend in time, it logs a warning, and that
+  statement can still commit after a bump. History appends are not
+  exposed: each checks the fence in its own transaction.
 - The check reads every shard of the storage pool, and every pinned shard
   colocated with one, on each admin write. If one cannot be read, every
   admin write on the node answers `503`. That fails closed. A node that has

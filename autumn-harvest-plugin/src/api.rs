@@ -41172,9 +41172,9 @@ pub(crate) async fn load_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
-pub(crate) type PoolConn = deadpool::managed::Object<
-    diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
->;
+/// A handler's connection (issue #1823). Under [`run_dr_fenced`], a lost
+/// guard ends its backend, so a statement it sent cannot commit after a bump.
+pub(crate) type PoolConn = autumn_harvest::replication::FencedConn;
 
 fn map_pool_error(error: &impl ToString) -> AutumnError {
     AutumnError::service_unavailable_msg(error.to_string())

@@ -1691,10 +1691,190 @@ mod db {
     pub const FENCED_CHECKOUT_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
     tokio::task_local! {
-        /// Set while [`run_fenced_pass`] runs a pass under guards. A
-        /// [`fenced_checkout`] that times out cancels it, and the pass is
-        /// abandoned so that its guards drop (issue #1823).
-        static PASS_ABANDON: tokio_util::sync::CancellationToken;
+        /// Set while [`run_fenced_pass`] runs a pass under guards (issue
+        /// #1823). A [`fenced_checkout`] that times out cancels its token,
+        /// and the pass is abandoned so that its guards drop. Each checkout
+        /// records its backend here, so a stopped pass can end it.
+        static PASS_SCOPE: PassScope;
+    }
+
+    /// What [`run_fenced_pass`] shares with the pass it runs (issue #1823).
+    #[derive(Clone)]
+    struct PassScope {
+        abandon: tokio_util::sync::CancellationToken,
+        backends: std::sync::Arc<PassBackends>,
+    }
+
+    /// How long a stopped pass waits for the backends it ends (issue #1823).
+    /// A guard sees its loss within one keepalive interval, and a bump waits
+    /// two. So the wait ends before such a bump commits.
+    const PASS_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// The backends of the pooled connections that a fenced pass holds
+    /// (issue #1823).
+    #[derive(Default)]
+    struct PassBackends {
+        next: std::sync::atomic::AtomicU64,
+        held: std::sync::Mutex<std::collections::HashMap<u64, (crate::worker::DbPool, i32)>>,
+    }
+
+    impl PassBackends {
+        /// Record that the pass holds backend `pid` of `pool`.
+        fn hold(
+            self: &std::sync::Arc<Self>,
+            pool: &crate::worker::DbPool,
+            pid: i32,
+        ) -> HeldBackend {
+            let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id, (pool.clone(), pid));
+            HeldBackend {
+                backends: std::sync::Arc::clone(self),
+                id,
+            }
+        }
+
+        /// End every backend the pass still holds, and wait until each exits.
+        ///
+        /// The server rolls back the statement and the transaction of an
+        /// ended backend. So a write the pass already sent cannot commit
+        /// after a bump. Each wait is at most [`PASS_STOP_BOUND`].
+        async fn stop(&self) {
+            // The pass drops next, so the records are no longer needed. Taking
+            // them frees the lock before the waits below.
+            let held = std::mem::take(
+                &mut *self
+                    .held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            let stops = held.into_values().map(|(pool, pid)| async move {
+                let outcome = tokio::time::timeout(PASS_STOP_BOUND, end_backend(&pool, pid)).await;
+                (pid, outcome)
+            });
+            for (pid, outcome) in futures::future::join_all(stops).await {
+                let error = match outcome {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "the backend did not exit in time".to_string(),
+                };
+                tracing::warn!(
+                    pid,
+                    error = %error,
+                    "a stopped DR fence pass could not end a backend it held"
+                );
+            }
+        }
+    }
+
+    /// End backend `pid` through a connection of `pool`, and wait until it
+    /// exits (issue #1823).
+    async fn end_backend(pool: &crate::worker::DbPool, pid: i32) -> HarvestResult<()> {
+        #[derive(diesel::QueryableByName)]
+        struct Alive {
+            #[diesel(sql_type = BigInt)]
+            alive: i64,
+        }
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+        diesel::sql_query("SELECT pg_terminate_backend($1)")
+            .bind::<Integer, _>(pid)
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)?;
+        loop {
+            let rows: Vec<Alive> =
+                diesel::sql_query("SELECT count(*) AS alive FROM pg_stat_activity WHERE pid = $1")
+                    .bind::<Integer, _>(pid)
+                    .load(&mut conn)
+                    .await
+                    .map_err(database_error)?;
+            if <[Alive]>::first(&rows).is_none_or(|row| row.alive == 0) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A record that a fenced pass holds a backend. Dropping it ends the
+    /// record.
+    struct HeldBackend {
+        backends: std::sync::Arc<PassBackends>,
+        id: u64,
+    }
+
+    impl Drop for HeldBackend {
+        fn drop(&mut self) {
+            self.backends
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.id);
+        }
+    }
+
+    /// A pooled connection from [`fenced_checkout`] or [`fenced_acquire`]
+    /// (issue #1823). It dereferences to the connection.
+    ///
+    /// Inside a pass that [`run_fenced_pass`] runs under guards, the pass
+    /// records the connection's backend while it holds the connection. A
+    /// dropped future does not cancel a statement the server already runs.
+    /// So a pass that stops ends each backend it still holds, before it
+    /// drops. A statement it sent then cannot commit after a bump.
+    pub struct FencedConn {
+        // The record drops first, so the backend is out of the record
+        // before the pool can lend it again. Only its drop is read.
+        #[allow(dead_code)]
+        held: Option<HeldBackend>,
+        conn: crate::pool::PooledConn,
+    }
+
+    impl FencedConn {
+        /// The pooled connection. The pass then no longer records it, so a
+        /// stopped pass does not end its backend.
+        pub fn into_pooled(self) -> crate::pool::PooledConn {
+            self.conn
+        }
+
+        /// Record `conn` in the pass this task runs, if any.
+        async fn in_pass(
+            pool: &crate::worker::DbPool,
+            mut conn: crate::pool::PooledConn,
+        ) -> HarvestResult<Self> {
+            #[derive(diesel::QueryableByName)]
+            struct Backend {
+                #[diesel(sql_type = Integer)]
+                pid: i32,
+            }
+            let Ok(backends) = PASS_SCOPE.try_with(|scope| std::sync::Arc::clone(&scope.backends))
+            else {
+                return Ok(Self { held: None, conn });
+            };
+            let rows: Vec<Backend> = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+                .load(&mut conn)
+                .await
+                .map_err(database_error)?;
+            let held = <[Backend]>::first(&rows).map(|row| backends.hold(pool, row.pid));
+            Ok(Self { held, conn })
+        }
+    }
+
+    impl std::ops::Deref for FencedConn {
+        type Target = AsyncPgConnection;
+
+        fn deref(&self) -> &AsyncPgConnection {
+            &self.conn
+        }
+    }
+
+    impl std::ops::DerefMut for FencedConn {
+        fn deref_mut(&mut self) -> &mut AsyncPgConnection {
+            &mut self.conn
+        }
     }
 
     /// Check out a pooled connection inside a fenced pass (issue #1823).
@@ -1710,14 +1890,13 @@ mod db {
     ///
     /// The pool's error, or [`crate::error::HarvestError::PoolAcquireTimeout`]
     /// when the bound runs out.
-    pub async fn fenced_checkout(
-        pool: &crate::worker::DbPool,
-    ) -> HarvestResult<crate::pool::PooledConn> {
-        if PASS_ABANDON.try_with(|_| ()).is_err() {
-            return pool
+    pub async fn fenced_checkout(pool: &crate::worker::DbPool) -> HarvestResult<FencedConn> {
+        if PASS_SCOPE.try_with(|_| ()).is_err() {
+            let conn = pool
                 .get()
                 .await
-                .map_err(|error| crate::error::HarvestError::Database(error.to_string()));
+                .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+            return Ok(FencedConn { held: None, conn });
         }
         fenced_acquire(pool, FENCED_CHECKOUT_BOUND).await
     }
@@ -1727,7 +1906,7 @@ mod db {
     /// [`FENCED_CHECKOUT_BOUND`]. Elsewhere it is `bound`.
     #[must_use]
     pub fn fenced_wait(bound: std::time::Duration) -> std::time::Duration {
-        if PASS_ABANDON.try_with(|_| ()).is_ok() {
+        if PASS_SCOPE.try_with(|_| ()).is_ok() {
             bound.min(FENCED_CHECKOUT_BOUND)
         } else {
             bound
@@ -1738,7 +1917,7 @@ mod db {
     /// checkout that gave up calls it, so the pass's guards drop. See
     /// [`fenced_checkout`].
     pub fn abandon_fenced_pass() {
-        let _ = PASS_ABANDON.try_with(tokio_util::sync::CancellationToken::cancel);
+        let _ = PASS_SCOPE.try_with(|scope| scope.abandon.cancel());
     }
 
     /// A fence-aware [`crate::pool::acquire`] (issue #1823).
@@ -1753,12 +1932,14 @@ mod db {
     pub async fn fenced_acquire(
         pool: &crate::worker::DbPool,
         bound: std::time::Duration,
-    ) -> HarvestResult<crate::pool::PooledConn> {
-        let checkout = crate::pool::acquire(pool, fenced_wait(bound)).await;
-        if checkout.is_err() {
-            abandon_fenced_pass();
+    ) -> HarvestResult<FencedConn> {
+        match crate::pool::acquire(pool, fenced_wait(bound)).await {
+            Ok(conn) => FencedConn::in_pass(pool, conn).await,
+            Err(error) => {
+                abandon_fenced_pass();
+                Err(error)
+            }
         }
-        checkout
     }
     /// How often a fence guard pings its session (issue #1823). The ping
     /// keeps an idle proxy from closing it, and finds a lost session.
@@ -1892,14 +2073,18 @@ mod db {
     /// rolls that transaction back.
     ///
     /// Dropping `pass` does not cancel a statement the server already runs.
-    /// The loss is seen within one keepalive interval. A bump waits two
-    /// intervals after it takes the lock, so a short statement commits
-    /// first. Known limit: a statement that runs longer than about one
-    /// interval can still commit after a bump. So a write that can run long
-    /// asserts the fence in its own transaction. That ties the barrier to the
-    /// writing session. History appends and the retention deletes do this. A
-    /// bump then waits for that transaction, and a writer whose session ends
-    /// rolls back.
+    /// So before it drops `pass`, this ends the backend of each connection
+    /// that `pass` holds from [`fenced_checkout`] or [`fenced_acquire`]. The
+    /// server then rolls back that statement and its transaction. The loss
+    /// is seen within one keepalive interval, and a bump waits two intervals
+    /// after it takes the lock. So the backends end before the bump commits.
+    ///
+    /// Known limit: a backend that this cannot end in time keeps running.
+    /// Examples are a pool with no free connection, or a server this process
+    /// cannot reach. A warning names the backend. So a write that can run
+    /// long also asserts the fence in its own transaction. That ties the
+    /// barrier to the writing session. History appends and the retention
+    /// deletes do this.
     ///
     /// # Errors
     ///
@@ -1916,18 +2101,24 @@ mod db {
         if lost.is_empty() {
             return Ok(pass.await);
         }
-        let abandon = tokio_util::sync::CancellationToken::new();
-        let pass = PASS_ABANDON.scope(abandon.clone(), pass);
-        tokio::select! {
+        let scope = PassScope {
+            abandon: tokio_util::sync::CancellationToken::new(),
+            backends: std::sync::Arc::default(),
+        };
+        let abandon = scope.abandon.clone();
+        let backends = std::sync::Arc::clone(&scope.backends);
+        let pass = PASS_SCOPE.scope(scope, pass);
+        tokio::pin!(pass);
+        let stopped = tokio::select! {
             biased;
-            _ = futures::future::select_all(lost) => Err(
-                crate::error::HarvestError::Database(FENCE_PASS_LOST.to_string()),
-            ),
-            () = abandon.cancelled() => Err(
-                crate::error::HarvestError::Database(FENCE_PASS_ABANDONED.to_string()),
-            ),
-            output = pass => Ok(output),
-        }
+            _ = futures::future::select_all(lost) => FENCE_PASS_LOST,
+            () = abandon.cancelled() => FENCE_PASS_ABANDONED,
+            output = &mut pass => return Ok(output),
+        };
+        // The pass is no longer polled, but it still holds its connections.
+        // So their backends are still its own when this ends them.
+        backends.stop().await;
+        Err(crate::error::HarvestError::Database(stopped.to_string()))
     }
 
     /// Open a [`FencePassGuard`] for `shard`, or `None` when this process
@@ -3978,7 +4169,7 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, abandon_fenced_pass,
+    FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, FencedConn, abandon_fenced_pass,
     advance_sequences_after_promotion, assert_admin_write_authority, assert_database_fence,
     assert_fence, assert_fence_group, begin_fenced_group, begin_fenced_groups, begin_fenced_pass,
     begin_fenced_pass_at, begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick,

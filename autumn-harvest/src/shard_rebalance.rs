@@ -4647,7 +4647,7 @@ mod db {
     pub async fn conn_for_shard(
         pool: &ShardedDbPool,
         shard: ShardId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         checkout(pool, shard).await
     }
 
@@ -4665,7 +4665,7 @@ mod db {
     /// that the two can differ.
     pub enum ResidentConn<'a> {
         Held(&'a mut AsyncPgConnection),
-        Fresh(Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>),
+        Fresh(Box<crate::replication::FencedConn>),
     }
 
     impl AsMut<AsyncPgConnection> for ResidentConn<'_> {
@@ -4729,7 +4729,7 @@ mod db {
     pub async fn conn_for_live_shard(
         pool: &ShardedDbPool,
         shard: ShardId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         checkout_entry(pool, shard).await
     }
 
@@ -4780,7 +4780,7 @@ mod db {
     pub async fn conn_for_execution_forwarded(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         conn_for_execution_forwarded_with_shard(pool, exec_id)
             .await
             .map(|(conn, _)| conn)
@@ -4803,10 +4803,7 @@ mod db {
     pub async fn conn_for_execution_forwarded_with_shard(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
-    ) -> HarvestResult<(
-        diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>,
-        ShardId,
-    )> {
+    ) -> HarvestResult<(crate::replication::FencedConn, ShardId)> {
         // The first hop keeps `pool_for_execution`'s default-shard fallback, so
         // every pre-#964 routing behaviour (including the mid-rollout cases
         // where the pool map and the router legitimately disagree) is
@@ -5141,7 +5138,7 @@ mod db {
     async fn checkout_entry(
         pool: &ShardedDbPool,
         shard: ShardId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         crate::shard_fence::check(shard)?;
         crate::replication::fenced_checkout(pool.pool_for(shard))
             .await
@@ -5158,7 +5155,7 @@ mod db {
     async fn checkout(
         pool: &ShardedDbPool,
         shard: ShardId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         crate::shard_fence::check(shard)?;
         let shard_pool =
             pool.exact_pool_for(shard)

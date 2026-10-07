@@ -6643,7 +6643,7 @@ pub(crate) const fn shard_acquire_bound(
 async fn acquire_shard_conn(
     pool: &DbPool,
     acquire_bound: Option<Duration>,
-) -> HarvestResult<crate::pool::PooledConn> {
+) -> HarvestResult<crate::replication::FencedConn> {
     let bound = acquire_bound.unwrap_or_else(|| crate::pool::acquire_bound(pool));
     // A startup write runs under a fence (issue #1823). There the wait stays
     // below a bump's lock timeout, and a failed checkout drops the guards.

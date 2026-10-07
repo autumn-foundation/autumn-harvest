@@ -1615,7 +1615,7 @@ async fn run_partition_maintenance_pass(
         // A stopped pass can leave a transaction open. Closing the
         // connection makes the server roll it back.
         let maintained = maintained.unwrap_or_else(|lost| {
-            drop(deadpool::managed::Object::take(conn));
+            drop(deadpool::managed::Object::take(conn.into_pooled()));
             Err(lost)
         });
         match maintained {

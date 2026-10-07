@@ -3932,6 +3932,86 @@ async fn a_bump_waits_out_a_write_a_lost_pass_already_sent() {
     );
 }
 
+/// A lost pass ends the statement it still runs (issue #1823). A dropped
+/// future does not cancel a statement on the server. A write that waits on
+/// a row lock would otherwise commit after the bump, once the lock clears.
+#[tokio::test]
+async fn a_lost_pass_ends_a_write_that_waits_on_a_row_lock() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (url, db) = require_db!("passblocked");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    diesel::sql_query("CREATE TABLE dr_blocked (id int PRIMARY KEY)")
+        .execute(&mut conn)
+        .await
+        .expect("create the probe table");
+    diesel::sql_query("INSERT INTO dr_blocked VALUES (1)")
+        .execute(&mut conn)
+        .await
+        .expect("seed the probe row");
+    // Another session holds the row, so the pass's DELETE waits on it.
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; SELECT id FROM dr_blocked WHERE id = 1 FOR UPDATE")
+        .await
+        .expect("lock the probe row");
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(Some(&guard), async {
+        let mut writer = autumn_harvest::replication::fenced_checkout(&pool)
+            .await
+            .expect("check out");
+        diesel::sql_query("DELETE FROM dr_blocked WHERE id = 1")
+            .execute(&mut *writer)
+            .await
+    });
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+    assert!(
+        stopped.is_ok_and(|outcome| outcome.is_err()),
+        "the pass must stop when its guard is lost"
+    );
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    blocker.batch_execute("COMMIT").await.expect("free the row");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Rows> = diesel::sql_query("SELECT count(*) AS n FROM dr_blocked")
+        .load(&mut conn)
+        .await
+        .expect("count the probe rows");
+    drop(guard);
+
+    assert_eq!(
+        <[Rows]>::first(&rows).map(|row| row.n),
+        Some(1),
+        "a write the lost pass sent must not commit after the bump"
+    );
+}
+
 /// A fence stops an activity heartbeat flusher (issue #1823). The flusher
 /// outlives a drain, so the worker token does not reach it. Without this,
 /// it keeps writing `last_heartbeat_at` after another region owns the row.
