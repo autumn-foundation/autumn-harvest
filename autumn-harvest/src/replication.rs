@@ -2128,15 +2128,39 @@ mod db {
             return Ok(Vec::new());
         }
         let slot = guard_slots(plan.len()).await?;
+        // Every connection opens first, together. A slow or unreachable
+        // database then fails the operation before any pass lock is held, so
+        // it cannot hold a bump off on another database.
+        let conns =
+            futures::future::try_join_all(plan.iter().map(|(pool, _, _)| connect_guard(pool)))
+                .await?;
         let mut guards = Vec::with_capacity(plan.len());
-        for (pool, fresh, bindings) in plan {
+        for (conn, (_, fresh, bindings)) in conns.into_iter().zip(plan) {
             // One guard per database holds the barrier of every shard there,
             // and checks for rows this process did not pin.
             guards.push(
-                open_checked_pass(pool, &fresh, &bindings, std::sync::Arc::clone(&slot)).await?,
+                lock_checked_pass(conn, &fresh, &bindings, std::sync::Arc::clone(&slot)).await?,
             );
         }
         Ok(guards)
+    }
+
+    /// The shard of every generation row on this database (issue #1823).
+    async fn generation_shard_ids(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<ShardId>> {
+        #[derive(diesel::QueryableByName)]
+        struct ShardRow {
+            #[diesel(sql_type = Integer)]
+            shard_id: i32,
+        }
+        let rows: Vec<ShardRow> =
+            diesel::sql_query("SELECT shard_id FROM harvest_shard_generation ORDER BY shard_id")
+                .load(conn)
+                .await
+                .map_err(database_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ShardId::new(row.shard_id))
+            .collect())
     }
 
     /// Fail when the database holds a generation row that this process did
@@ -2243,15 +2267,32 @@ mod db {
         allowed: &[(ShardId, ShardGeneration)],
         slot: GuardSlot,
     ) -> HarvestResult<FencePassGuard> {
+        let conn = connect_guard(pool).await?;
+        lock_checked_pass(conn, shards, allowed, slot).await
+    }
+
+    /// Open the connection a fence guard owns (issue #1823). It takes no
+    /// lock. It waits at most [`FENCE_PASS_CONNECT_TIMEOUT`].
+    async fn connect_guard(pool: &crate::worker::DbPool) -> HarvestResult<AsyncPgConnection> {
         use deadpool::managed::Manager as _;
-        let conn = tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
+        tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
             .await
             .map_err(|_| {
                 crate::error::HarvestError::Database(
                     "timed out opening the DR fence connection".to_string(),
                 )
             })?
-            .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+            .map_err(|error| crate::error::HarvestError::Database(error.to_string()))
+    }
+
+    /// Take the pass locks on a connection from [`connect_guard`], under
+    /// `slot`. See [`begin_checked_pass`] for `allowed`.
+    async fn lock_checked_pass(
+        conn: AsyncPgConnection,
+        shards: &[(ShardId, ShardGeneration)],
+        allowed: &[(ShardId, ShardGeneration)],
+        slot: GuardSlot,
+    ) -> HarvestResult<FencePassGuard> {
         let mut guard = begin_pass_on(conn, shards, allowed).await?;
         guard.slot = Some(Box::new(slot));
         Ok(guard)
@@ -3054,18 +3095,27 @@ mod db {
         // their rows too. A claim scan there is not filtered by shard, so
         // this process pins those rows as it finds them. A bump of any of
         // them then stops this process too. Each peer is (row, target).
+        //
+        // The probe ran before this process provisioned its own rows. A peer
+        // that started at the same moment may have provisioned since, so the
+        // rows are read again. Of two processes that start together, the
+        // later one then pins the earlier one's row, as in a sequential
+        // start. A held or unprobed target is skipped.
         let mut peers: Vec<(ShardId, ShardId)> = Vec::new();
         for ((shard, pool), markers) in targets.iter().zip(&probed) {
-            for row in markers.iter().flat_map(|m| m.generation_shards.iter()) {
-                if pins.iter().any(|(pinned, _)| pinned == row)
-                    || targets.iter().any(|(target, _)| target == row)
+            if markers.is_none() || held_shards.contains(shard) {
+                continue;
+            }
+            let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+            for row in generation_shard_ids(&mut conn).await? {
+                if pins.iter().any(|(pinned, _)| *pinned == row)
+                    || targets.iter().any(|(target, _)| *target == row)
                 {
                     continue;
                 }
-                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-                if let Some(generation) = current_generation(&mut conn, *row).await? {
-                    pins.push((*row, generation));
-                    peers.push((*row, *shard));
+                if let Some(generation) = current_generation(&mut conn, row).await? {
+                    pins.push((row, generation));
+                    peers.push((row, *shard));
                 }
             }
         }

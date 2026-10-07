@@ -261,6 +261,47 @@ async fn an_admin_write_waiting_for_a_connection_does_not_block_a_bump() {
     );
 }
 
+/// An admin write whose body is still arriving holds no fence guard (issue
+/// #1823). A slow or stalled upload must not block a bump.
+#[tokio::test]
+async fn an_admin_write_with_a_stalled_body_does_not_block_a_bump() {
+    let _serial = REGISTRY_SERIAL.lock().await;
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut direct = AsyncPgConnection::establish(&url).await.expect("connect");
+    ensure_generation_row(&mut direct, ShardId::new(0))
+        .await
+        .expect("provision generation 0");
+    FenceRegistry::clear();
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::INITIAL)],
+        ShardId::new(0),
+    )
+    .expect("no conflicting pin in this test");
+
+    // The body never finishes arriving.
+    let stalled = futures::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/admin/queues/stalled-body/pause")
+        .header("content-type", "application/json")
+        .header("x-harvest-admin", "true")
+        .header("x-harvest-actor", "oncall")
+        .body(Body::from_stream(stalled))
+        .unwrap();
+    let pending = tokio::spawn(app.clone().oneshot(request));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bumped = bump_generation(&mut direct, ShardId::new(0), "failover", "oncall").await;
+    pending.abort();
+    FenceRegistry::clear();
+    assert!(
+        bumped.is_ok(),
+        "an admin write waiting for its body must not hold the bump off: {bumped:?}"
+    );
+}
+
 /// A lost fence session stops an admin write in flight (issue #1823). The
 /// server then frees the pass lock, so the handler must not write after it.
 #[tokio::test]

@@ -5760,6 +5760,24 @@ async fn admit_mutation(
     if !mutation_admitted(api_state, has_token, session).await {
         return AutumnError::unauthorized_msg("authentication required").into_response();
     }
+    // Issue #1823: a handler reads its body after the guards below are
+    // taken. A slow upload would then hold them while nothing writes. So the
+    // body is read first, up to the largest limit any route allows. The
+    // route's own limit still applies when its handler extracts the body.
+    let request = if autumn_harvest::replication::FenceRegistry::is_enabled() {
+        let (parts, body) = request.into_parts();
+        let limit = usize::try_from(BATCH_START_BODY_HARD_LIMIT).unwrap_or(usize::MAX);
+        match axum::body::to_bytes(body, limit).await {
+            Ok(bytes) => axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes)),
+            Err(error) => {
+                return AutumnError::bad_request_msg(error.to_string())
+                    .with_status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .into_response();
+            }
+        }
+    } else {
+        request
+    };
     // Held until the handler returns, so a bump cannot commit while the
     // handler writes. See `FencePassGuard`.
     let fence = match enforce_dr_fence(api_state).await {
