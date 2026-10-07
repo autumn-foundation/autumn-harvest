@@ -1295,6 +1295,8 @@ pub struct PayloadPolicy {
     pub continue_as_new_threshold: u64,
     /// The history policy's event hard cap.
     pub event_hard_cap: Option<u64>,
+    /// The history policy's byte hard cap.
+    pub byte_hard_cap: Option<u64>,
     /// The history policy's continue-as-new deadline fraction.
     pub continue_as_new_deadline_fraction: f64,
     /// The payload offloader's threshold. `None` without an offloader.
@@ -1341,6 +1343,7 @@ impl PayloadPolicy {
             "max_current_details_bytes": self.max_current_details_bytes,
             "continue_as_new_threshold": self.continue_as_new_threshold,
             "event_hard_cap": self.event_hard_cap,
+            "byte_hard_cap": self.byte_hard_cap,
             "continue_as_new_deadline_fraction": self.continue_as_new_deadline_fraction,
             "offload_threshold": self.offload_threshold,
             "offload_store_id": self.offload_store_id,
@@ -4137,6 +4140,10 @@ mod tests {
             },
             PayloadPolicy {
                 event_hard_cap: Some(1),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                byte_hard_cap: Some(1),
                 ..base.clone()
             },
             PayloadPolicy {

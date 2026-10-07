@@ -1263,6 +1263,7 @@ impl HandlerRegistry {
             max_current_details_bytes: self.max_current_details_bytes,
             continue_as_new_threshold: self.history_policy.continue_as_new_threshold(),
             event_hard_cap: self.history_policy.event_hard_cap(),
+            byte_hard_cap: self.history_policy.byte_hard_cap(),
             continue_as_new_deadline_fraction: self
                 .history_policy
                 .continue_as_new_deadline_fraction(),
@@ -40615,6 +40616,34 @@ mod tests {
             "a smaller line size"
         );
         assert_eq!(on, policy(Some(WorkflowLogPolicy::new())));
+    }
+
+    /// Issue #1815: a workflow task whose history passes the byte hard cap
+    /// fails, so two workers with different caps fail different workflows.
+    /// The byte cap is part of the cohort, as the event cap is.
+    #[test]
+    fn payload_policy_holds_the_history_byte_cap() {
+        use crate::context::WorkflowHistoryPolicy;
+        let policy = |history: WorkflowHistoryPolicy| {
+            HandlerRegistry::new(vec![], vec![])
+                .with_history_policy(history)
+                .payload_policy()
+        };
+        let base = WorkflowHistoryPolicy::default();
+        assert_ne!(
+            policy(base.with_byte_hard_cap(1 << 20)),
+            policy(base.with_byte_hard_cap(1 << 30)),
+            "a different byte cap"
+        );
+        assert_ne!(
+            policy(base.with_byte_hard_cap(1 << 20)),
+            policy(base.without_byte_hard_cap()),
+            "no byte cap"
+        );
+        assert_eq!(
+            policy(base.with_byte_hard_cap(1 << 20)),
+            policy(base.with_byte_hard_cap(1 << 20))
+        );
     }
 
     /// Issue #1815: the task context carries the declarative query and update
