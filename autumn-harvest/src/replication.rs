@@ -1890,8 +1890,11 @@ mod db {
     /// The loss is seen within one keepalive interval. A bump waits two
     /// intervals after it takes the lock, so a short statement commits
     /// first. Known limit: a statement that runs longer than about one
-    /// interval can still commit after a bump. History appends do not
-    /// depend on this guard: each asserts the fence in its own transaction.
+    /// interval can still commit after a bump. So a write that can run long
+    /// asserts the fence in its own transaction. That ties the barrier to the
+    /// writing session. History appends and the retention deletes do this. A
+    /// bump then waits for that transaction, and a writer whose session ends
+    /// rolls back.
     ///
     /// # Errors
     ///

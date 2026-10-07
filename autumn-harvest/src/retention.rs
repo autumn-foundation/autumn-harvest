@@ -2578,19 +2578,27 @@ async fn run_shard_tick(
     // delete's existing "not finished yet" rule for PENDING/INFLIGHT/FAILED
     // rows. Runs once per shard tick (not per candidate) since it is a
     // table-wide reclaim, not scoped to this tick's candidate batch.
+    //
+    // Issue #1823: a table-wide delete can run long. It asserts the fence in
+    // its own transaction, so a bump waits for it even when the tick's guard
+    // session ends first. See `replication::assert_fence_group`.
     {
         let mut conn = crate::replication::fenced_checkout(&pool).await?;
-        let reclaimed = diesel::sql_query(
-            "DELETE FROM harvest_completion_deliveries
-             WHERE state = 'DELIVERED'
-               AND NOT EXISTS (
-                   SELECT 1 FROM harvest_workflow_executions
-                   WHERE harvest_workflow_executions.id = harvest_completion_deliveries.workflow_exec_id
-               )",
-        )
-        .execute(&mut conn)
-        .await
-        .map_err(database_error)?;
+        let reclaimed = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            crate::replication::assert_fence_group(conn, fence_key).await?;
+            diesel::sql_query(
+                "DELETE FROM harvest_completion_deliveries
+                 WHERE state = 'DELIVERED'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM harvest_workflow_executions
+                       WHERE harvest_workflow_executions.id = harvest_completion_deliveries.workflow_exec_id
+                   )",
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)
+        }))
+        .await?;
         outcome.deleted_count += reclaimed;
     }
 
@@ -2603,6 +2611,9 @@ async fn run_shard_tick(
         let cuts_inner = override_cuts.clone();
         let candidates = Box::pin(
             conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
+                // The claim asserts the fence in its own transaction (issue
+                // #1823). See the reclaim above.
+                crate::replication::assert_fence_group(conn, fence_key).await?;
                 // Push each row's exact per-type effective cutoff into the
                 // predicate (issue #737, PR #990 review): the correlated
                 // `unnest` subquery resolves the override cutoff for this row's
@@ -3013,8 +3024,14 @@ async fn run_shard_tick(
                 Vec::new()
             };
 
-            match delete_candidate_execution(&mut conn, candidate.id, now, config.summary.as_ref())
-                .await
+            match delete_candidate_execution(
+                &mut conn,
+                candidate.id,
+                now,
+                config.summary.as_ref(),
+                fence_key,
+            )
+            .await
             {
                 Err(err) => {
                     has_failed = true;
@@ -3294,10 +3311,15 @@ async fn delete_candidate_execution(
     candidate_id: uuid::Uuid,
     now: DateTime<Utc>,
     summary: Option<&SummaryPolicy>,
+    fence_key: ShardId,
 ) -> HarvestResult<CandidateDeleteOutcome> {
     // Copy the policy into the transaction closure (it is `Copy`).
     let summary = summary.copied();
     Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Issue #1823: the delete asserts the fence in its own transaction.
+        // A bump then waits for it, even when the tick's guard session ends
+        // first. The legal-hold read below is still in this transaction.
+        crate::replication::assert_fence_group(conn, fence_key).await?;
         let mut summarized = false;
         // Set alongside `summarized` when this candidate hits the forced
         // migration-target tombstone below. It is set even on the `ON
