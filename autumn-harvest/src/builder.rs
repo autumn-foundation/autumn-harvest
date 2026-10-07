@@ -3229,7 +3229,8 @@ fn validate_workflow_schedules(
         {
             return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
         }
-        // Reject a bad cron expression and a zero or sub-second interval (issue #1967).
+        // Reject a bad cron expression, a zero interval and a fractional interval
+        // (issue #1967).
         if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),

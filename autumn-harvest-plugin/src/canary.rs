@@ -113,8 +113,16 @@ impl CanaryConfig {
     /// warning) rather than accepted — a too-small interval would derive a
     /// `per_probe_timeout` at or below the probe's own minimum runtime and
     /// false-fail a healthy pipeline (issue #796, AC6). **30s is recommended.**
+    /// A fractional `interval` rounds up to the next whole second (issue #1967).
     #[must_use]
     pub fn new(interval: Duration) -> Self {
+        // An interval schedule takes whole seconds only (issue #1967). Round a
+        // fraction up, so the probe keeps its timeout band.
+        let interval = if interval.subsec_nanos() == 0 {
+            interval
+        } else {
+            Duration::from_secs(interval.as_secs().saturating_add(1))
+        };
         let interval = if interval < MIN_CANARY_INTERVAL {
             tracing::warn!(
                 requested_secs = interval.as_secs(),
@@ -1005,6 +1013,15 @@ mod tests {
             .iter()
             .find(|s| s.workflow_name == wf_name)
             .unwrap_or_else(|| panic!("expected a schedule for {wf_name}"))
+    }
+
+    #[test]
+    fn a_fractional_canary_interval_still_builds() {
+        // Issue #1967: an interval schedule takes whole seconds only.
+        let cfg = CanaryConfig::new(Duration::from_millis(90_500));
+        assert_eq!(cfg.interval(), Duration::from_secs(91));
+        let built = register_canary(HarvestBuilder::default(), &cfg).try_build();
+        assert!(built.is_ok(), "got: {:?}", built.err());
     }
 
     #[test]

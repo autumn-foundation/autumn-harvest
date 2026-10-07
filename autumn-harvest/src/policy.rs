@@ -1574,7 +1574,8 @@ impl WorkflowSchedule {
 /// # Errors
 ///
 /// Returns a human-readable error string if the cron expression is
-/// syntactically invalid, or if the interval period is not valid.
+/// syntactically invalid. Also returns one if the interval is zero or has a
+/// fractional second.
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
         Schedule::Cron(expr) => Cron::new(expr)
@@ -1602,9 +1603,9 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::Interval(period) if period.is_zero() => {
             Err("interval schedule period must be greater than zero".to_string())
         }
-        // The stored `interval:<secs>` form holds whole seconds. A fraction is
-        // lost on write, and a sub-second period reads back as zero (issue #1967).
-        // The scheduler ticks once a second, so it cannot keep a shorter cadence.
+        // `schedule_expr` drops a fraction on write. A sub-second period reads
+        // back as zero (issue #1967). The scheduler ticks once a second, so it
+        // cannot keep a shorter cadence.
         Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
             "interval schedule period must be a whole number of seconds, got {period:?}"
         )),

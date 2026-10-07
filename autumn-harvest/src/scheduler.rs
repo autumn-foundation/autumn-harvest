@@ -4970,10 +4970,10 @@ async fn tick_one_workflow_schedule(
 // is where it lived before being moved to `policy` for feature-gate reasons.
 pub use crate::policy::validate_schedule;
 
-/// Write the stored form of `schedule`.
+/// Return the stored form of `schedule`.
 ///
-/// `interval:<secs>` holds whole seconds. `validate_schedule` rejects any other
-/// period, so `as_secs` loses nothing (issue #1967).
+/// `validate_schedule` rejects a fractional period, so `as_secs` loses nothing
+/// (issue #1967).
 fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
     match schedule {
         Some(Schedule::Cron(expr)) => Some(format!("cron:{expr}")),
@@ -8354,6 +8354,7 @@ mod tests {
     #[test]
     fn schedule_expr_round_trips_every_valid_interval() {
         // Oracle (issue #1967): parse(write(x)) == x for each valid interval.
+        let mut checked = 0;
         for interval in [
             Duration::from_secs(1),
             Duration::from_secs(60),
@@ -8372,7 +8373,9 @@ mod tests {
                 matches!(parsed, Some(Schedule::Interval(d)) if d == interval),
                 "{interval:?} is valid but {expr} reads back as {parsed:?}"
             );
+            checked += 1;
         }
+        assert_eq!(checked, 3, "the whole-second samples must be valid");
     }
 
     // ── Overdue-schedule detection (issue #696) ──────────────────────────────
