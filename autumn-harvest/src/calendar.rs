@@ -69,30 +69,20 @@ fn apply_skip_policy_with(
     if !is_excluded(date) {
         return Some(date);
     }
-    let is_target = |d: NaiveDate| !is_weekend(d) && !is_excluded(d);
-    match skip_policy {
-        SkipPolicy::Skip => None,
-        SkipPolicy::RunNextBusinessDay => {
-            let mut candidate = date + chrono::Duration::days(1);
-            for _ in 0..365 {
-                if is_target(candidate) {
-                    return Some(candidate);
-                }
-                candidate += chrono::Duration::days(1);
-            }
-            None
-        }
-        SkipPolicy::RunPrevBusinessDay => {
-            let mut candidate = date - chrono::Duration::days(1);
-            for _ in 0..365 {
-                if is_target(candidate) {
-                    return Some(candidate);
-                }
-                candidate -= chrono::Duration::days(1);
-            }
-            None
+    // Checked steps: a scan past the `NaiveDate` range returns `None` (issue #1968).
+    let step: fn(NaiveDate) -> Option<NaiveDate> = match skip_policy {
+        SkipPolicy::Skip => return None,
+        SkipPolicy::RunNextBusinessDay => |d| d.checked_add_days(chrono::Days::new(1)),
+        SkipPolicy::RunPrevBusinessDay => |d| d.checked_sub_days(chrono::Days::new(1)),
+    };
+    let mut candidate = date;
+    for _ in 0..365 {
+        candidate = step(candidate)?;
+        if !is_weekend(candidate) && !is_excluded(candidate) {
+            return Some(candidate);
         }
     }
+    None
 }
 
 /// Adjust a scheduled fire date according to a calendar and skip policy.
@@ -111,7 +101,8 @@ fn apply_skip_policy_with(
 /// `excluded_dates` is returned unchanged.
 ///
 /// Scans up to 365 calendar days in either direction. Returns `None` if no
-/// non-excluded weekday exists within that window.
+/// non-excluded weekday exists within that window, or if the scan gets to the
+/// limit of the `NaiveDate` range.
 ///
 /// Checks `excluded_dates` with an O(n) linear scan per date. A caller that
 /// invokes this once per date in a loop over the *same* `excluded_dates`
@@ -475,25 +466,19 @@ fn parse_builtin_dates(raw: &[&str]) -> Vec<NaiveDate> {
     out
 }
 
-/// Slack added to the derived scan bound, in calendar days.
+/// The longest run of consecutive non-business days the scan crosses.
 ///
-/// Sized to absorb a real corporate shutdown (a fortnight of consecutive
-/// closures plus the weekends bracketing it) rather than a fortnight alone.
-/// It is a **floor, independent of `n`**: `n = 0` is the roll-forward case, so
-/// it must traverse the LONGEST unbroken non-business run before finding its
-/// first business day — a bound that shrinks with `n` scales backwards from the
-/// requirement and would reject `n = 0` on a calendar where `n = 1` succeeds.
-const SCAN_BOUND_SLACK_DAYS: u32 = 30;
-
-/// Derived scan bound in calendar days: `n * 7 + 30`.
+/// Thirty days holds a real corporate shutdown and the weekends on each side.
+/// A longer run is a degenerate calendar, and the scan rejects it.
 ///
-/// Provably sufficient — every 7-day window contains at least one weekday, and
-/// the fixed [`SCAN_BOUND_SLACK_DAYS`] floor absorbs a month of consecutive
-/// closures at either end regardless of `n`. Scales with `n` rather than
-/// silently capping at a fixed horizon.
-const fn derived_scan_bound(n: u32) -> u32 {
-    n.saturating_mul(7).saturating_add(SCAN_BOUND_SLACK_DAYS)
-}
+/// The bound is on one run, not on the full scan (issue #1968). The scan for a
+/// smaller `n` is a prefix of the scan for a larger `n`. Thus a smaller `n`
+/// never rejects where a larger `n` resolves. A total bound that grows with `n`
+/// does not give this property.
+///
+/// Each business day is at most 31 days after the previous one. The scan thus
+/// examines at most `(n + 1) * 31` dates.
+const MAX_NON_BUSINESS_RUN_DAYS: u32 = 30;
 
 /// Resolve the instant `n` business days after `anchor`.
 ///
@@ -560,12 +545,11 @@ pub fn add_business_days_bounded(
         });
     }
 
-    let bound = derived_scan_bound(n);
     let time_of_day = anchor.time();
     let mut cursor = anchor.date_naive();
     let mut skipped = Vec::new();
     let mut remaining = n;
-    let mut advanced = 0_u32;
+    let mut run = 0_u32;
 
     loop {
         // Checked at the TOP of the body so it also covers the ZERO-ADVANCE
@@ -586,19 +570,18 @@ pub fn add_business_days_bounded(
                 return Ok(BusinessDayResolution { deadline, skipped });
             }
             remaining -= 1;
+            run = 0;
         } else {
             skipped.push(cursor);
+            run += 1;
+            if run > MAX_NON_BUSINESS_RUN_DAYS {
+                return Err(BusinessDayRejection::ScanExhausted { scanned_days: run });
+            }
         }
 
-        if advanced == bound {
-            return Err(BusinessDayRejection::ScanExhausted {
-                scanned_days: bound,
-            });
-        }
         cursor = cursor
             .checked_add_days(chrono::Days::new(1))
             .ok_or(BusinessDayRejection::DateOverflow)?;
-        advanced += 1;
     }
 }
 
