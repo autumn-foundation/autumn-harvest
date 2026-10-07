@@ -1272,6 +1272,16 @@ async fn stats_after_one_failed_run(
     workflow: &'static str,
     handler: autumn_harvest::info::WorkflowHandlerFn,
 ) -> StatsRow {
+    stats_after_one_failed_run_with(workflow, handler, |_| {}).await
+}
+
+/// [`stats_after_one_failed_run`] with `tune` applied to the worker's
+/// runtime config.
+async fn stats_after_one_failed_run_with(
+    workflow: &'static str,
+    handler: autumn_harvest::info::WorkflowHandlerFn,
+    tune: impl FnOnce(&mut WorkerRuntimeConfig),
+) -> StatsRow {
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool: DbPool = build_test_pool(&url);
     let mut conn = connect(&url).await;
@@ -1295,6 +1305,7 @@ async fn stats_after_one_failed_run(
     runtime_config.poll_interval = Duration::from_millis(50);
     runtime_config.worker_heartbeat_interval = Duration::from_millis(100);
     runtime_config.shutdown_timeout = Duration::from_secs(5);
+    tune(&mut runtime_config);
     let worker =
         Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
 
@@ -1390,6 +1401,22 @@ fn conflicting_batch<'a>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failure_the_error_path_commits_counts_as_a_failure() {
     let row = stats_after_one_failed_run(BATCH_CONFLICT_WORKFLOW, conflicting_batch).await;
+    assert_eq!(
+        (row.window_tasks, row.window_failures),
+        (1, 1),
+        "the rejected batch is one failure"
+    );
+}
+
+/// The same failure with the workflow-task timeout off. The worker then
+/// dispatches the task on its unbounded path, which has its own error arm
+/// (issue #1815).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_the_error_path_commits_counts_without_a_task_timeout() {
+    let row = stats_after_one_failed_run_with(BATCH_CONFLICT_WORKFLOW, conflicting_batch, |cfg| {
+        cfg.workflow_task_timeout = Duration::ZERO;
+    })
+    .await;
     assert_eq!(
         (row.window_tasks, row.window_failures),
         (1, 1),

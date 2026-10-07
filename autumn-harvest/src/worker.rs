@@ -36984,31 +36984,14 @@ impl Worker {
                         #[cfg(feature = "db")]
                         let recovery = if task_type == "workflow" {
                             drop(permit);
-                            let reset = reset_timed_out_workflow_task(
+                            reset_failed_workflow_task(
                                 &pool,
                                 task_id,
                                 &worker_id,
                                 claim_crash_strikes,
                                 claim_attempt,
                             )
-                            .await;
-                            // Issue #1815: an error path that failed the run
-                            // itself leaves no running row. That failure is
-                            // this claim's own, so the window counts it.
-                            if reset == ClaimRecovery::ClaimLost
-                                && claim_failed_its_task(
-                                    &pool,
-                                    task_id,
-                                    &worker_id,
-                                    claim_crash_strikes,
-                                    claim_attempt,
-                                )
-                                .await
-                            {
-                                ClaimRecovery::Applied
-                            } else {
-                                reset
-                            }
+                            .await
                         } else {
                             ClaimRecovery::Applied
                         };
@@ -37218,7 +37201,17 @@ impl Worker {
                     // all deadlines unset strands too after a pool acquire
                     // timeout (issue #1788). See `releases_claim_after_error`.
                     #[cfg(feature = "db")]
-                    let recovery = if releases_claim_after_error(&task_type, &error) {
+                    let recovery = if task_type == "workflow" {
+                        drop(permit);
+                        reset_failed_workflow_task(
+                            &pool,
+                            task_id,
+                            &worker_id,
+                            claim_crash_strikes,
+                            claim_attempt,
+                        )
+                        .await
+                    } else if releases_claim_after_error(&task_type, &error) {
                         drop(permit);
                         reset_timed_out_workflow_task(
                             &pool,
@@ -38195,6 +38188,33 @@ const RESET_POOL_RETRY_BACKOFF_MS: &[u64] =
 /// `crash_strikes`, so a failed row under this claim's fence is this claim's
 /// failure. A peer's claim carries another fence. A failed read answers
 /// `false`, so the window never counts a failure it cannot confirm.
+/// Release a workflow task whose dispatch returned an error, and say how the
+/// failure settled (issue #1815).
+///
+/// The reset gives the claim back. An error path that failed the run itself
+/// leaves no running row, so the reset reports a lost claim. That failure is
+/// this claim's own, so it settles as applied and the window counts it. Both
+/// dispatch arms, with and without a task timeout, release through here.
+#[cfg(feature = "db")]
+async fn reset_failed_workflow_task(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    claim_crash_strikes: i32,
+    claim_attempt: i32,
+) -> ClaimRecovery {
+    let reset =
+        reset_timed_out_workflow_task(pool, task_id, worker_id, claim_crash_strikes, claim_attempt)
+            .await;
+    if reset == ClaimRecovery::ClaimLost
+        && claim_failed_its_task(pool, task_id, worker_id, claim_crash_strikes, claim_attempt).await
+    {
+        ClaimRecovery::Applied
+    } else {
+        reset
+    }
+}
+
 #[cfg(feature = "db")]
 async fn claim_failed_its_task(
     pool: &DbPool,
