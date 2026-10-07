@@ -400,12 +400,17 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
 /// evidence is not yet cleared — which reads as covered, agrees across both
 /// miss reads, and escalates.
 ///
+/// The same transaction drops the worker's task-stats row (issue #1815). A
+/// restarted process starts with an empty outcome window. Without the
+/// delete, the previous process's row stays fresh until the first heartbeat.
+/// Its failures then reach peers and `GET /admin/status` under a live worker.
+///
 /// Returns the number of task rows whose evidence was cleared.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError`] on serialization or database failure. Either write
-/// failing rolls back both.
+/// Returns [`HarvestError`] on serialization or database failure. Any write
+/// failing rolls back all of them.
 pub async fn register_worker_and_clear_stale_miss_evidence(
     conn: &mut AsyncPgConnection,
     registration: &WorkerRegistration,
@@ -429,6 +434,7 @@ pub async fn register_worker_and_clear_stale_miss_evidence(
             registered_codec_key_ids,
         )
         .await?;
+        delete_worker_task_stats(tx, &registration.worker_id).await?;
         crate::queue::invalidate_capability_miss_evidence_for_worker(
             tx,
             &registration.worker_id,
@@ -437,6 +443,18 @@ pub async fn register_worker_and_clear_stale_miss_evidence(
         .await
     }))
     .await
+}
+
+/// Delete the task-stats row of `worker_id` (issue #1815).
+async fn delete_worker_task_stats(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<usize> {
+    diesel::sql_query("DELETE FROM harvest_worker_task_stats WHERE worker_id = $1")
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 /// Refresh `last_heartbeat_at` for a drained worker and clear its queues

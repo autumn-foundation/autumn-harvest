@@ -67,6 +67,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   shards hold a row for one worker, the higher sequence wins. Shard clocks
   can differ, so `updated_at` is not used to order them. A restarted worker
   that keeps its id always writes above the rows of its previous process.
+- Startup registration drops the worker's stats row in its transaction. A
+  restarted process therefore does not show its previous process's
+  failures before its first heartbeat.
 - Two workers in one process share the gauge, so it reports the OR of their
   verdicts.
 - The build id is the only code identity in the cohort key. Workers without

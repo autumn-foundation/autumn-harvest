@@ -777,6 +777,49 @@ async fn a_restarted_worker_outranks_the_rows_of_its_previous_process() {
     );
 }
 
+/// A restarted worker keeps its id, and its new process starts with an empty
+/// outcome window. Registration therefore drops the previous process's stats
+/// row, so its failures do not reach peers or `/admin/status` before the
+/// first heartbeat.
+#[tokio::test]
+async fn registration_drops_the_previous_process_stats() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("reregister-q");
+    let id = unique_id("w-reregister");
+    register(&mut conn, &id, &queue).await;
+    let failing = WorkerTaskStats {
+        tasks: 40,
+        failures: 30,
+        p99_latency_ms: Some(5),
+    };
+    workers::upsert_worker_task_stats(&mut conn, &id, &cohort(&queue), &failing)
+        .await
+        .expect("the previous process's snapshot");
+    assert_eq!(count_stats_rows(&mut conn, &id).await, 1);
+
+    let registration = workers::WorkerRegistration {
+        worker_id: id.clone(),
+        queues: vec![queue.clone()],
+        shard_assignments: vec![0],
+        max_concurrency: 4,
+        host: "test-host".to_owned(),
+        version: None,
+        build_id: String::new(),
+        deployment_name: None,
+        labels: HashMap::new(),
+        max_concurrent_sessions: 0,
+    };
+    workers::register_worker_and_clear_stale_miss_evidence(&mut conn, &registration, &[])
+        .await
+        .expect("register the new process");
+    assert_eq!(
+        count_stats_rows(&mut conn, &id).await,
+        0,
+        "the new process publishes its own snapshot"
+    );
+}
+
 /// An upsert for a worker with no row fails on the foreign key. The heartbeat
 /// logs it and retries on the next tick.
 #[tokio::test]
