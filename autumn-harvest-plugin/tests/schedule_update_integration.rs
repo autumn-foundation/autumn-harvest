@@ -39,187 +39,19 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
-    // issue #740: start_source provenance columns (read back by WorkflowExecution::as_select()).
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source_ref TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS started_by TEXT NULL;\n",
-    // issue #617: chain-scoped lifetime cap columns (read back by WorkflowExecution::as_select()).
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_execution_timeout INTERVAL NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n",
-    // issue #704: history-bloat early-warning guard column (read back by
-    // WorkflowExecution::as_select()).
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n",
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260504000000_harvest_workflow_parent_children/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260708000001_harvest_completion_trigger_condition/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260618000001_harvest_debounce/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260628000001_harvest_execution_origin/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260706000000_harvest_worker_sessions/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
-    ),
-    // issue #759: triage_note column on harvest_workflow_executions, referenced
-    // by every WorkflowExecution::as_select() read-back in this suite.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS triage_note TEXT NULL;\n",
-    // issue #804: capability_misses column on harvest_task_queue, referenced by
-    // every TaskQueueItem read (this suite drives a real `Worker`, whose
-    // `claim_task` deserializes `RETURNING harvest_task_queue.*`).
-    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;\n",
-    // issue #804 (round 6): the companion distinct-misser set. `TaskQueueItem`
-    // selects it too, so omitting it fails every read in this suite the same
-    // way omitting `capability_misses` would.
-    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
-    // issue #1824: the new-start marker on harvest_task_queue. Every claim
-    // orders by it and `TaskQueueItem` selects it, so each claim in this suite
-    // needs it. Added inline for the same reason as the columns above.
-    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
-    // 20260706000001_harvest_start_throttle is deliberately omitted: the tick's
-    // dispatch path probes `to_regclass('harvest_start_throttle')` and treats a
-    // missing table as "no pending throttled starts" (see
-    // `throttle::pending_throttle_count_for_workflow`), so scheduler-driven
-    // tests run correctly without it.
-);
+/// The full schema, without `harvest_start_throttle`.
+///
+/// The tick and `GET /admin/schedules` probe
+/// `to_regclass('harvest_start_throttle')` and read a missing table as "no
+/// pending throttled starts". The drop keeps that path under test. Other
+/// throttle paths need the table, but this suite does not reach them.
+/// The hand-rolled bundle this replaces drifted (issue #1799): it had no
+/// `quota_key` column, so the worker never claimed a task.
+fn init_sql() -> String {
+    let mut sql = autumn_harvest::test_init_sql();
+    sql.push_str("\nDROP TABLE harvest_start_throttle;\n");
+    sql
+}
 
 type HarvestApiApp = axum::Router;
 
@@ -227,7 +59,7 @@ type HarvestApiApp = axum::Router;
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql().into_bytes())
         .with_tag("16")
         .start()
         .await
@@ -235,6 +67,15 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    // The `to_regclass` path is under test only while the table is absent.
+    let mut conn = connect(&url).await;
+    let present: bool = diesel::select(diesel::dsl::sql::<diesel::sql_types::Bool>(
+        "to_regclass('harvest_start_throttle') IS NOT NULL",
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("probe harvest_start_throttle");
+    assert!(!present, "init_sql must drop harvest_start_throttle");
     (url, container)
 }
 

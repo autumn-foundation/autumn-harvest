@@ -1436,6 +1436,8 @@ pub type DeliverFuture<'a> =
 pub struct DeliveryAttempt {
     pub status: Option<u16>,
     pub transport_error: Option<String>,
+    /// The receiver's `Retry-After` delay, if it sent one (issue #1832).
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl DeliveryAttempt {
@@ -1444,6 +1446,7 @@ impl DeliveryAttempt {
         Self {
             status: Some(status),
             transport_error: None,
+            retry_after: None,
         }
     }
 
@@ -1452,13 +1455,35 @@ impl DeliveryAttempt {
         Self {
             status: None,
             transport_error: Some(message),
+            retry_after: None,
         }
+    }
+
+    /// Attach the receiver's `Retry-After` delay.
+    #[must_use]
+    pub const fn with_retry_after(mut self, delay: std::time::Duration) -> Self {
+        self.retry_after = Some(delay);
+        self
     }
 
     /// `true` only for a 2xx response status.
     #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(self.status, Some(s) if (200..300).contains(&s))
+    }
+
+    /// `true` for a 4xx status that a retry cannot fix (issue #1832).
+    ///
+    /// 408, 421, 425 and 429 are transient. RFC 9110, RFC 8470 and RFC 6585 let
+    /// a client retry them. A 413 with `Retry-After` is transient too (RFC 9110
+    /// section 15.5.14). Every other 4xx is permanent.
+    #[must_use]
+    pub fn is_permanent_failure(&self) -> bool {
+        match self.status {
+            Some(408 | 421 | 425 | 429) | None => false,
+            Some(413) => self.retry_after.is_none(),
+            Some(s) => (400..500).contains(&s),
+        }
     }
 }
 
@@ -1476,6 +1501,85 @@ pub trait CompletionCallbackDeliverer: Send + Sync + 'static {
         body: &'a [u8],
         headers: &'a [(&'static str, String)],
     ) -> DeliverFuture<'a>;
+}
+
+/// Parse a `Retry-After` header value into a delay from `now` (issue #1832).
+///
+/// The value is delta-seconds or an HTTP-date (RFC 9110 section 10.2.3).
+/// All three HTTP-date forms are read: IMF-fixdate, RFC 850 and asctime.
+/// A date in the past gives a zero delay. Any other value gives `None`.
+#[must_use]
+pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        // All digits, so only overflow fails. Overflow saturates.
+        let secs = value.parse::<u64>().unwrap_or(u64::MAX);
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    let at = parse_http_date(value, now)?;
+    Some((at - now).to_std().unwrap_or(std::time::Duration::ZERO))
+}
+
+/// Parse an HTTP-date in any of its three forms (RFC 9110 section 5.6.7).
+fn parse_http_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if let Ok(at) = DateTime::parse_from_rfc2822(value) {
+        return Some(at.with_timezone(&Utc));
+    }
+    // asctime, for example `Sun Nov  6 08:49:37 1994`. It is always in GMT.
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y") {
+        return Some(naive.and_utc());
+    }
+    parse_rfc850_date(value, now)
+}
+
+/// Parse an RFC 850 date, for example `Sunday, 06-Nov-94 08:49:37 GMT`.
+///
+/// The two-digit year gives the latest date that is not more than 50 years
+/// after `now` (RFC 9110 section 5.6.7). The cutoff compares the full
+/// timestamp, not only the year, and the window slides across a century
+/// boundary. Chrono's `%y` uses a fixed pivot instead, so this code sets the
+/// century itself. The weekday must match the date that results.
+fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let (weekday, rest) = value.split_once(", ")?;
+    let (date, time) = rest.split_once(' ')?;
+    let (day_month, two_digit_year) = date.rsplit_once('-')?;
+    if two_digit_year.len() != 2 {
+        return None;
+    }
+    let yy: i32 = two_digit_year.parse().ok()?;
+    let at_year = |year: i32| {
+        chrono::NaiveDateTime::parse_from_str(
+            &format!("{day_month}-{year} {time}"),
+            "%d-%b-%Y %H:%M:%S GMT",
+        )
+        .ok()
+        .map(|naive| naive.and_utc())
+    };
+    let now_year = chrono::Datelike::year(&now);
+    let century = now_year - now_year.rem_euclid(100);
+    let cutoff = now.checked_add_months(chrono::Months::new(50 * 12))?;
+    // Read the month, day and time in a leap year, so 29 February parses.
+    let in_leap_year = at_year(2000)?;
+    let key = |at: DateTime<Utc>| {
+        (
+            chrono::Datelike::year(&at),
+            chrono::Datelike::month(&at),
+            chrono::Datelike::day(&at),
+            at.time(),
+        )
+    };
+    let (_, month, day, time) = key(in_leap_year);
+    let cutoff_key = key(cutoff);
+    // The candidates are 100 years apart, so the latest one at or before
+    // the cutoff is the only one inside the 100-year window. Compare the
+    // calendar fields, so a date that is invalid in its year is not skipped.
+    let year = [century + 100, century, century - 100]
+        .into_iter()
+        .map(|base| base + yy)
+        .find(|year| (*year, month, day, time) <= cutoff_key)?;
+    let at = at_year(year)?;
+    let weekday: chrono::Weekday = weekday.parse().ok()?;
+    (chrono::Datelike::weekday(&at) == weekday).then_some(at)
 }
 
 #[cfg(test)]
@@ -1501,6 +1605,131 @@ mod deliverer_trait_tests {
     fn transport_error_is_never_success() {
         assert!(!DeliveryAttempt::transport_error("connection refused".to_string()).is_success());
     }
+
+    #[test]
+    fn constructors_carry_no_retry_after() {
+        assert_eq!(DeliveryAttempt::success(429).retry_after, None);
+        assert_eq!(
+            DeliveryAttempt::transport_error("x".to_string()).retry_after,
+            None
+        );
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn parse_retry_after_reads_delta_seconds() {
+        let ten = Some(std::time::Duration::from_secs(10));
+        assert_eq!(parse_retry_after("10", now()), ten);
+        assert_eq!(parse_retry_after(" 10 ", now()), ten);
+        assert_eq!(
+            parse_retry_after("0", now()),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_an_http_date() {
+        // 2026-01-01T00:00:00Z is a Thursday.
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 GMT", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_the_obsolete_date_forms() {
+        // RFC 9110 section 5.6.7: a recipient must accept RFC 850 and asctime.
+        let thirty = Some(std::time::Duration::from_secs(30));
+        assert_eq!(
+            parse_retry_after("Thursday, 01-Jan-26 00:00:30 GMT", now()),
+            thirty
+        );
+        assert_eq!(parse_retry_after("Thu Jan  1 00:00:30 2026", now()), thirty);
+    }
+
+    #[test]
+    fn parse_retry_after_resolves_an_rfc_850_year_relative_to_now() {
+        // RFC 9110 section 5.6.7: a two-digit year is in the current
+        // century unless that puts it more than 50 years ahead.
+        // 2075 is 49 years ahead of 2026, so `75` means 2075.
+        let in_2075 = parse_retry_after("Tuesday, 01-Jan-75 00:00:00 GMT", now())
+            .expect("a valid RFC 850 date");
+        assert!(in_2075 > std::time::Duration::from_secs(48 * 365 * 86_400));
+        // 2077 is 51 years ahead, so `77` means 1977, in the past.
+        assert_eq!(
+            parse_retry_after("Saturday, 01-Jan-77 00:00:00 GMT", now()),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_applies_the_rfc_850_cutoff_to_the_full_date() {
+        // The cutoff is 50 years after `now` to the second, not to the year.
+        let now = DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 2076-10-07 is past the cutoff, so `76` means 1976.
+        assert_eq!(
+            parse_retry_after("Thursday, 07-Oct-76 00:00:00 GMT", now),
+            Some(std::time::Duration::ZERO)
+        );
+        // 2076-10-05 is inside the cutoff, so `76` means 2076.
+        let ahead =
+            parse_retry_after("Monday, 05-Oct-76 00:00:00 GMT", now).expect("a valid RFC 850 date");
+        assert!(ahead > std::time::Duration::from_secs(49 * 365 * 86_400));
+    }
+
+    #[test]
+    fn parse_retry_after_resolves_an_rfc_850_year_across_a_century() {
+        // In 2076, `10` means 2110: 34 years ahead, inside the window.
+        let now = DateTime::parse_from_rfc3339("2076-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ahead = parse_retry_after("Wednesday, 01-Jan-10 00:00:00 GMT", now)
+            .expect("a valid RFC 850 date");
+        assert!(ahead > std::time::Duration::from_secs(33 * 365 * 86_400));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_a_date_that_does_not_exist_in_its_year() {
+        // In 2076, `00` means 2100, which has no 29 February. The parser must
+        // not fall back to 2000, where the date and the weekday are valid.
+        let now = DateTime::parse_from_rfc3339("2076-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_retry_after("Tuesday, 29-Feb-00 00:00:00 GMT", now),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_saturates_an_overflowing_number() {
+        assert_eq!(
+            parse_retry_after("99999999999999999999", now()),
+            Some(std::time::Duration::from_secs(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_treats_a_past_date_as_zero() {
+        assert_eq!(
+            parse_retry_after("Wed, 31 Dec 2025 23:59:00 GMT", now()),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_garbage() {
+        for value in ["", "soon", "-1", "1.5", "10s", "0x10"] {
+            assert_eq!(parse_retry_after(value, now()), None, "value {value:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1519,8 +1748,8 @@ pub enum OutcomeAction {
         last_status: Option<u16>,
         last_error: Option<String>,
     },
-    /// Non-2xx or transport error, and `attempt >= max_attempts` — mark the
-    /// delivery `FAILED` and route to the DLQ.
+    /// `attempt >= max_attempts`, or a permanent 4xx (issue #1832). Mark the
+    /// delivery `FAILED` and route it to the DLQ.
     DeadLetter {
         last_status: Option<u16>,
         last_error: Option<String>,
@@ -1559,6 +1788,11 @@ fn delivery_stream_seed(delivery_id: Uuid) -> u64 {
 /// (typically [`delivery_stream_seed`] of the delivery's id) drives
 /// `retry_policy.jitter` — without it, a configured `JitterPolicy` would be
 /// silently ignored and every delivery would back off in perfect lockstep.
+///
+/// A permanent 4xx dead-letters at once. A `Retry-After` hint sets the
+/// minimum backoff, clamped to
+/// [`DEFAULT_RETRY_AFTER_CEILING`](crate::builder::DEFAULT_RETRY_AFTER_CEILING)
+/// (issue #1832).
 #[must_use]
 pub fn classify_outcome(
     outcome: &DeliveryAttempt,
@@ -1574,14 +1808,20 @@ pub fn classify_outcome(
         return OutcomeAction::Delivered { status };
     }
 
-    if attempt >= max_attempts {
+    if attempt >= max_attempts || outcome.is_permanent_failure() {
         return OutcomeAction::DeadLetter {
             last_status: outcome.status,
             last_error: outcome.transport_error.clone(),
         };
     }
 
-    let delay = crate::policy::compute_retry_delay_with_seed(retry_policy, attempt, seed);
+    let mut delay = crate::policy::compute_retry_delay_with_seed(retry_policy, attempt, seed);
+    // `Retry-After` is a floor, never a cap. The engine's `Retry-After`
+    // ceiling (issue #744) bounds it. So a receiver cannot delay a delivery
+    // past 15 minutes per retry.
+    if let Some(retry_after) = outcome.retry_after {
+        delay = delay.max(retry_after.min(crate::builder::DEFAULT_RETRY_AFTER_CEILING));
+    }
     let next_attempt_at =
         now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(0));
 
@@ -1761,6 +2001,122 @@ mod classify_outcome_tests {
             "expected varying delays across seeds under Full jitter, got a single value \
              {delays:?} — classify_outcome is not honoring the seed"
         );
+    }
+
+    fn backoff_delay(action: &OutcomeAction) -> StdDuration {
+        let OutcomeAction::Backoff {
+            next_attempt_at, ..
+        } = action
+        else {
+            panic!("expected Backoff, got {action:?}");
+        };
+        (*next_attempt_at - now()).to_std().unwrap()
+    }
+
+    #[test]
+    fn permanent_4xx_dead_letters_on_the_first_attempt() {
+        // Issue #1832 AC: a receiver that returns 400 is not retried.
+        for status in [400_u16, 401, 403, 404, 410, 422] {
+            let outcome = DeliveryAttempt::success(status);
+            let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+            assert_eq!(
+                action,
+                OutcomeAction::DeadLetter {
+                    last_status: Some(status),
+                    last_error: None,
+                },
+                "a {status} response must dead-letter on attempt 1"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_4xx_still_backs_off() {
+        // 408, 421, 425 and 429 invite a retry (RFC 9110, RFC 8470, RFC 6585).
+        for status in [408_u16, 421, 425, 429] {
+            let outcome = DeliveryAttempt::success(status);
+            let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+            assert!(
+                matches!(action, OutcomeAction::Backoff { .. }),
+                "a {status} response must back off, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_413_with_retry_after_is_temporary() {
+        // RFC 9110 section 15.5.14: `Retry-After` marks a 413 as temporary.
+        let outcome = DeliveryAttempt::success(413).with_retry_after(StdDuration::from_secs(30));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(30));
+        // Without the header, a 413 is permanent.
+        let outcome = DeliveryAttempt::success(413);
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
+    }
+
+    #[test]
+    fn permanent_4xx_dead_letters_even_with_retry_after() {
+        let outcome = DeliveryAttempt::success(400).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
+    }
+
+    #[test]
+    fn retry_after_is_the_floor_of_the_backoff() {
+        // Issue #1832 AC: 429 with `Retry-After: 10` waits 10 s or more.
+        // The policy alone gives 1 s on attempt 1.
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(
+            backoff_delay(&action) >= StdDuration::from_secs(10),
+            "Retry-After must delay the retry, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_clamped_to_the_retry_after_ceiling() {
+        let outcome =
+            DeliveryAttempt::success(503).with_retry_after(StdDuration::from_secs(86_400));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(
+            backoff_delay(&action),
+            crate::builder::DEFAULT_RETRY_AFTER_CEILING
+        );
+    }
+
+    #[test]
+    fn retry_after_wins_over_a_fixed_policy_interval() {
+        // A fixed policy has `max_interval == initial_interval`. The hint
+        // must still apply, so the ceiling is not `max_interval`.
+        let policy = RetryPolicy::fixed(5, StdDuration::from_secs(2))
+            .with_jitter(crate::policy::JitterPolicy::None);
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &policy, 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(10));
+    }
+
+    #[test]
+    fn short_retry_after_keeps_the_longer_policy_backoff() {
+        // Attempt 4 of exponential(1 s) gives 8 s, more than the 2 s hint.
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(2));
+        let action = classify_outcome(&outcome, 4, 10, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(8));
+    }
+
+    #[test]
+    fn retry_after_applies_to_a_transport_error_too() {
+        let outcome = DeliveryAttempt::transport_error("reset".to_string())
+            .with_retry_after(StdDuration::from_secs(20));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(20));
+    }
+
+    #[test]
+    fn retry_after_does_not_extend_past_max_attempts() {
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 5, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
     }
 
     #[test]
@@ -3145,6 +3501,24 @@ pub async fn redrive_delivery(
     exec_id: crate::types::ExecutionId,
     delivery_id: Uuid,
 ) -> crate::error::HarvestResult<DeliveryRedriveOutcome> {
+    redrive_delivery_at(conn, exec_id, delivery_id, None).await
+}
+
+/// [`redrive_delivery`] with a time for the next attempt (issue #1832).
+///
+/// A bulk DLQ redrive spreads its deliveries with `not_before`, so they do
+/// not all reach one receiver at one instant. `None` makes the delivery due
+/// at once.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn redrive_delivery_at(
+    conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    delivery_id: Uuid,
+    not_before: Option<DateTime<Utc>>,
+) -> crate::error::HarvestResult<DeliveryRedriveOutcome> {
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
@@ -3188,7 +3562,7 @@ pub async fn redrive_delivery(
             .set((
                 dsl::state.eq("PENDING"),
                 dsl::max_attempts.eq(extended_max_attempts),
-                dsl::next_attempt_at.eq(Utc::now()),
+                dsl::next_attempt_at.eq(not_before.unwrap_or_else(Utc::now)),
                 dsl::last_status.eq(None::<i32>),
                 dsl::last_error.eq(None::<String>),
                 dsl::updated_at.eq(Utc::now()),

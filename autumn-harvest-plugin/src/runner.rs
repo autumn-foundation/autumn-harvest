@@ -691,6 +691,7 @@ fn prepare_audit_export_config(
             batch_size: audit_config.effective_batch_size(),
             backoff: audit_config.backoff.clone(),
             lease: audit_config.effective_lease(),
+            chain_key: autumn_harvest::audit_export::runtime_chain_key(audit_config),
         })
     })
 }
@@ -2427,6 +2428,29 @@ pub(crate) fn injected_runtime_state(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_plugin_audit_export_config_keeps_the_chain_key() {
+        struct Nowhere;
+        impl autumn_harvest::audit_export::AuditSink for Nowhere {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a autumn_harvest::audit_export::AuditBatch<'a>,
+            ) -> autumn_harvest::audit_export::SinkFuture<'a> {
+                Box::pin(async { autumn_harvest::audit_export::SinkAttempt::success(200) })
+            }
+        }
+        let built = autumn_harvest::HarvestBuilder::new()
+            .audit_export_sink(Nowhere)
+            .audit_export_chain_key(vec![2_u8; 32])
+            .try_build()
+            .expect("builds");
+        let config = super::prepare_audit_export_config(&built).expect("a sink is set");
+        assert_eq!(
+            config.chain_key.as_ref().map(|key| key.secret().as_bytes()),
+            Some(&[2_u8; 32][..])
+        );
+    }
     use super::{
         DeferredAuditExportInstall, HarvestRunnerResources, refuse_auto_pool_over_cells,
         registered_workflow_type_names, reserved_shards_under_auto_assignment,
@@ -2466,6 +2490,7 @@ mod tests {
                 batch_size,
                 backoff: autumn_harvest::audit_export::ExportBackoff::default(),
                 lease: std::time::Duration::from_secs(30),
+                chain_key: None,
             })
         }
 
