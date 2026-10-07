@@ -331,9 +331,6 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // deliberately excluded from the workflow-start-uniqueness column set, so it
     // must build a partial, hand-picked schema rather than the full bundle.
     "autumn-harvest/tests/integration/integration_e2e.rs",
-    // Omits `harvest_start_throttle` on purpose to exercise the `to_regclass`
-    // graceful-degradation path (the scheduler tolerates the table's absence).
-    "autumn-harvest-plugin/tests/schedule_update_integration.rs",
     // Inserts into `harvest_dag_runs`, which the full bundle drops
     // (`20260514000000_drop_harvest_dag_runs`); needs the pre-drop schema.
     "autumn-harvest-plugin/tests/timeline_integration.rs",

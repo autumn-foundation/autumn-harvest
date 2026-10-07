@@ -699,6 +699,14 @@ The response distinguishes `matched` (total filtered), `redriven`,
   as `skipped` — never a duplicate side-effect.
 - **Shard-aware.** A filtered redrive fans out across all shards; each row is
   re-enqueued on the shard that owns its `workflow_exec_id`.
+- **Spread, not a burst (issue #1832).** Redrive and bulk replay spread the
+  new tasks' `scheduled_at` over a window. Each task gets a jittered slot. So
+  1000 tasks do not hit the dependency that sent them to the DLQ at one
+  instant. The default window is 60 s for 1000 rows, scaled down for fewer
+  rows (100 rows: 6 s). `--spread-secs N` sets it, up to 3600. `--spread-secs 0`
+  makes every task due at once. The base instant is the database clock.
+  On a sharded cluster, every shard uses the window of the whole call. A
+  completion-callback entry gets its next delivery attempt in the window.
 
 The endpoint backing this is `POST /api/harvest/dlq/redrive` (admin auth,
 audit op `dlq.redrive`).

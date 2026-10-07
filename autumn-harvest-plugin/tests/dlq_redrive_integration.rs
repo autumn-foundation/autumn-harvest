@@ -346,3 +346,100 @@ async fn redrive_terminal_execution_surfaces_as_failure() {
         "body: {body}"
     );
 }
+
+// ── Redrive spread over HTTP (issue #1832) ───────────────────────────────────
+
+/// Insert `n` activity dead letters with no owning execution on `queue`.
+async fn seed_orphan_activity_rows(conn: &mut AsyncPgConnection, queue: &str, n: i32) {
+    diesel::sql_query(
+        "INSERT INTO harvest_dead_letters \
+         (id, original_task_id, queue_name, task_type, activity_name, input, error, attempts, failed_at) \
+         SELECT gen_random_uuid(), gen_random_uuid(), $1, 'activity', 'act', '{}'::jsonb, \
+                'overloaded', 3, now() - make_interval(secs => g) \
+         FROM generate_series(1, $2) AS g",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Integer, _>(n)
+    .execute(conn)
+    .await
+    .expect("seed dlq rows");
+}
+
+/// Seconds between the first and last `scheduled_at` on `queue`.
+async fn scheduled_span_secs(conn: &mut AsyncPgConnection, queue: &str) -> f64 {
+    #[derive(diesel::QueryableByName)]
+    struct Span {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        secs: f64,
+    }
+    diesel::sql_query(
+        "SELECT EXTRACT(EPOCH FROM max(scheduled_at) - min(scheduled_at))::float8 AS secs \
+         FROM harvest_task_queue WHERE queue_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .get_result::<Span>(conn)
+    .await
+    .expect("scheduled span")
+    .secs
+}
+
+// `spread_secs` in the body reaches each re-enqueued task's `scheduled_at`.
+#[tokio::test]
+async fn redrive_spread_secs_spreads_scheduled_at() {
+    let (url, _c) = setup_test_database_url().await;
+    let mut conn = connect(&url).await;
+    seed_orphan_activity_rows(&mut conn, "spread_http_q", 50).await;
+    let app = build_app(build_test_pool(&url));
+
+    let (status, body) = post_json(
+        &app,
+        "/dlq/redrive",
+        json!({"queue": "spread_http_q", "spread_secs": 60}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["redriven"], 50, "{body}");
+
+    // 50 rows over 60 s: the last row is in the slot [58.8, 60).
+    let span = scheduled_span_secs(&mut conn, "spread_http_q").await;
+    assert!((50.0..60.0).contains(&span), "span {span} s");
+}
+
+#[tokio::test]
+async fn bulk_replay_spread_secs_spreads_scheduled_at() {
+    let (url, _c) = setup_test_database_url().await;
+    let mut conn = connect(&url).await;
+    seed_orphan_activity_rows(&mut conn, "spread_replay_q", 50).await;
+    let app = build_app(build_test_pool(&url));
+
+    let (status, body) = post_json(
+        &app,
+        "/dead-letters/replay",
+        json!({"queue_name": "spread_replay_q", "spread_secs": 60}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["acted_on"], 50, "{body}");
+
+    let span = scheduled_span_secs(&mut conn, "spread_replay_q").await;
+    assert!((50.0..60.0).contains(&span), "span {span} s");
+}
+
+// `spread_secs: 0` keeps every task due at once.
+#[tokio::test]
+async fn redrive_zero_spread_is_due_at_once() {
+    let (url, _c) = setup_test_database_url().await;
+    let mut conn = connect(&url).await;
+    seed_orphan_activity_rows(&mut conn, "spread_zero_q", 20).await;
+    let app = build_app(build_test_pool(&url));
+
+    let (status, body) = post_json(
+        &app,
+        "/dlq/redrive",
+        json!({"queue": "spread_zero_q", "spread_secs": 0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let span = scheduled_span_secs(&mut conn, "spread_zero_q").await;
+    assert!(span < 5.0, "span {span} s");
+}

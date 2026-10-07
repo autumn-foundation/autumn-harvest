@@ -7112,6 +7112,7 @@ pub const fn management_api_request_fields()
                 "shard_id",
                 "limit",
                 "dry_run",
+                "spread_secs",
             ]),
         ),
         (
@@ -7149,6 +7150,7 @@ pub const fn management_api_request_fields()
                 "max",
                 "dry_run",
                 "reason",
+                "spread_secs",
             ]),
         ),
         // ── external activity handoff ─────────────────────────────────────────
@@ -32591,6 +32593,37 @@ struct BulkDlqApiBody {
     dry_run: bool,
 }
 
+/// The replay-only fields of a `POST /dead-letters/replay` JSON body.
+///
+/// Discard shares [`BulkDlqApiBody`] and has no use for `spread_secs`
+/// (issue #1832). So the replay route reads this second view of its body.
+#[derive(Debug, Deserialize)]
+struct ReplayOnlyApiBody {
+    #[serde(default)]
+    spread_secs: Option<u64>,
+}
+
+/// Read `spread_secs` from a bulk-replay JSON body (issue #1832).
+fn replay_spread_secs(body: &[u8]) -> Result<Option<u64>, AutumnError> {
+    serde_json::from_slice::<ReplayOnlyApiBody>(body)
+        .map(|replay| replay.spread_secs)
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))
+}
+
+/// [`parse_bulk_dlq_request`] plus the replay-only `spread_secs` field.
+///
+/// A form body sets `spread_secs` in `parse_bulk_dlq_form` already.
+fn parse_bulk_replay_request(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<ParsedBulkDlqRequest, AutumnError> {
+    let mut request = parse_bulk_dlq_request(headers, body)?;
+    if !is_form_urlencoded(headers) {
+        request.selector.filter.spread_secs = replay_spread_secs(body)?;
+    }
+    Ok(request)
+}
+
 impl BulkDlqApiBody {
     fn into_selector(self) -> Result<DlqBulkSelector, AutumnError> {
         let task_type = self
@@ -32619,6 +32652,7 @@ impl BulkDlqApiBody {
                 failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
+                spread_secs: None,
             },
             dead_letter_id: self.dead_letter_id,
             task_type,
@@ -32698,6 +32732,8 @@ struct RedriveApiBody {
     shard_id: Option<i32>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    spread_secs: Option<u64>,
 }
 
 impl RedriveApiBody {
@@ -32712,10 +32748,55 @@ impl RedriveApiBody {
                 dead_letter_ids: self.dead_letter_ids,
                 max: self.max,
                 dry_run: self.dry_run,
+                spread_secs: self.spread_secs,
             },
             shard_id: self.shard_id,
             reason: self.reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod dlq_spread_body_tests {
+    use super::*;
+
+    #[test]
+    fn redrive_body_carries_spread_secs() {
+        let body: RedriveApiBody =
+            serde_json::from_str(r#"{"queue":"q","spread_secs":90}"#).expect("valid body");
+        assert_eq!(body.into_request().filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn bulk_replay_body_carries_spread_secs() {
+        let body = br#"{"queue_name":"q","spread_secs":90}"#;
+        assert_eq!(replay_spread_secs(body).expect("valid body"), Some(90));
+        assert_eq!(
+            replay_spread_secs(br#"{"queue_name":"q"}"#).expect("valid"),
+            None
+        );
+        assert!(replay_spread_secs(br#"{"spread_secs":"soon"}"#).is_err());
+    }
+
+    #[test]
+    fn the_shared_bulk_body_leaves_spread_secs_to_replay() {
+        // Discard shares this body, so it never sets `spread_secs`.
+        let body: BulkDlqApiBody =
+            serde_json::from_str(r#"{"queue_name":"q","spread_secs":90}"#).expect("valid body");
+        let selector = body.into_selector().expect("valid selector");
+        assert_eq!(selector.filter.spread_secs, None);
+    }
+
+    #[test]
+    fn bulk_replay_form_carries_spread_secs() {
+        let parsed = parse_bulk_dlq_form(b"queue_name=q&spread_secs=90").expect("valid form");
+        assert_eq!(parsed.selector.filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn spread_secs_is_absent_by_default() {
+        let body: RedriveApiBody = serde_json::from_str(r#"{"queue":"q"}"#).expect("valid body");
+        assert_eq!(body.into_request().filter.spread_secs, None);
     }
 }
 
@@ -32795,6 +32876,10 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
                 selector.filter.failed_before = Some(parse_utc_datetime(value, "failed_before")?);
             }
             "limit" => selector.filter.limit = Some(parse_u32_field(value, "limit")?),
+            "spread_secs" => {
+                selector.filter.spread_secs =
+                    Some(u64::from(parse_u32_field(value, "spread_secs")?));
+            }
             "dry_run" => selector.filter.dry_run = parse_bool_field(value, "dry_run")?,
             "shard_id" => selector.shard_id = Some(parse_i32_field(value, "shard_id")?),
             "return_to" => return_to = Some(value.to_string()),
@@ -33032,7 +33117,7 @@ async fn bulk_replay_dead_letters_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let request = match parse_bulk_replay_request(&headers, &body) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -33241,6 +33326,61 @@ async fn bulk_discard_dead_letters_handler(
     }
 }
 
+/// The `spread_secs` each shard gets in a DLQ fan-out (issue #1832).
+///
+/// The default window scales with the rows in one call. Each shard sees only
+/// its own rows. So with N shards, each shard gets a shorter window, and the
+/// shards together start tasks N times faster than one shard. A call that
+/// spans more than one shard therefore gives every shard the window of all
+/// `rows` the call selects, rounded up to whole seconds. An explicit value is
+/// kept.
+fn fan_out_spread_secs(spread_secs: Option<u64>, rows: usize, shards: usize) -> Option<u64> {
+    if spread_secs.is_some() || shards <= 1 {
+        return spread_secs;
+    }
+    let window = dlq::redrive_spread_window(None, rows);
+    Some(window.as_secs() + u64::from(window.subsec_nanos() > 0))
+}
+
+/// The rows a fan-out selects: the matches on every shard, capped at `budget`.
+fn fan_out_rows(matched: usize, budget: u32) -> usize {
+    matched.min(usize::try_from(budget).unwrap_or(usize::MAX))
+}
+
+#[cfg(test)]
+mod fan_out_spread_secs_tests {
+    use super::fan_out_spread_secs;
+
+    #[test]
+    fn one_shard_keeps_the_per_call_default() {
+        assert_eq!(fan_out_spread_secs(None, 1000, 1), None);
+    }
+
+    #[test]
+    fn many_shards_share_the_window_of_all_selected_rows() {
+        // Two shards of 500 rows must not each get a 30 s window.
+        assert_eq!(fan_out_spread_secs(None, 1000, 2), Some(60));
+        // 100 rows: 6 s. 1 row: 60 ms, rounded up to 1 s.
+        assert_eq!(fan_out_spread_secs(None, 100, 4), Some(6));
+        assert_eq!(fan_out_spread_secs(None, 1, 4), Some(1));
+    }
+
+    #[test]
+    fn the_window_follows_the_matches_not_the_budget() {
+        use super::fan_out_rows;
+        // One match under the default budget of 100 waits at most 1 s, not 6 s.
+        assert_eq!(fan_out_spread_secs(None, fan_out_rows(1, 100), 2), Some(1));
+        // More matches than the budget scale to the budget.
+        assert_eq!(fan_out_rows(5000, 1000), 1000);
+    }
+
+    #[test]
+    fn an_explicit_value_is_kept() {
+        assert_eq!(fan_out_spread_secs(Some(0), 1000, 4), Some(0));
+        assert_eq!(fan_out_spread_secs(Some(90), 1000, 4), Some(90));
+    }
+}
+
 async fn bulk_replay_from_shards(
     api_state: &HarvestApiState,
     selector: &DlqBulkSelector,
@@ -33262,6 +33402,31 @@ async fn bulk_replay_from_shards(
     // conversions below are infallible in practice.
     let mut remaining: u32 =
         u32::try_from(selector.filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+    let shards = pool
+        .iter_shards()
+        .filter(|(shard_id, _)| selector.shard_id.is_none_or(|w| w == shard_id.as_i32()))
+        .count();
+    let mut spread_secs = selector.filter.spread_secs;
+    // A dry run schedules nothing, so it skips the extra count.
+    if spread_secs.is_none() && shards > 1 && !selector.dry_run() {
+        // Size the shared window from the rows the call selects.
+        let mut matched = 0_usize;
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            if selector
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                continue;
+            }
+            let mut conn = shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let n = count_api_bulk_filter_matches(&mut conn, selector).await?;
+            matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
+        }
+        spread_secs = fan_out_spread_secs(None, fan_out_rows(matched, remaining), shards);
+    }
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if selector
@@ -33286,6 +33451,7 @@ async fn bulk_replay_from_shards(
 
         let mut shard_selector = selector.clone();
         shard_selector.filter.limit = Some(remaining);
+        shard_selector.filter.spread_secs = spread_secs;
         let shard_result =
             bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector, registry).await?;
         // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
@@ -33419,6 +33585,31 @@ async fn redrive_from_shards(
     // Enforce `max` as a global cap across all shards, not per-shard.
     let mut remaining: u32 =
         u32::try_from(request.filter.effective_max()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+    let shards = pool
+        .iter_shards()
+        .filter(|(shard_id, _)| request.shard_id.is_none_or(|w| w == shard_id.as_i32()))
+        .count();
+    let mut spread_secs = request.filter.spread_secs;
+    // A dry run schedules nothing, so it skips the extra count.
+    if spread_secs.is_none() && shards > 1 && !request.filter.dry_run {
+        // Size the shared window from the rows the call selects.
+        let mut matched = 0_usize;
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            if request
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                continue;
+            }
+            let mut conn = shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let n = dlq::count_redrive_filter_matches(&mut conn, &request.filter).await?;
+            matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
+        }
+        spread_secs = fan_out_spread_secs(None, fan_out_rows(matched, remaining), shards);
+    }
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if request
@@ -33443,6 +33634,7 @@ async fn redrive_from_shards(
 
         let mut shard_filter = request.filter.clone();
         shard_filter.max = Some(remaining);
+        shard_filter.spread_secs = spread_secs;
         let shard_result =
             dlq::redrive_dead_letters(&mut conn, &shard_filter, registry, reason, metrics.as_ref())
                 .await?;
@@ -33620,35 +33812,23 @@ async fn bulk_replay_dead_letters_for_selector(
         .await
         .map(|n| usize::try_from(n).unwrap_or(0))?;
     let rows = query_dead_letters_for_api_bulk(conn, selector).await?;
-    let mut result = dlq::BulkDlqResult {
-        matched,
-        acted_on: 0,
-        skipped: 0,
-        ids: Vec::new(),
-        dry_run: selector.dry_run(),
-        failures: Vec::new(),
-    };
 
     if selector.dry_run() {
-        result.ids = rows.into_iter().map(|row| row.id.to_string()).collect();
-        return Ok(result);
+        return Ok(dlq::BulkDlqResult {
+            matched,
+            acted_on: 0,
+            skipped: 0,
+            ids: rows.into_iter().map(|row| row.id.to_string()).collect(),
+            dry_run: true,
+            failures: Vec::new(),
+        });
     }
 
-    for row in rows {
-        let id = row.id;
-        match dlq::replay_dead_letter(conn, id, registry).await {
-            Ok(_) => {
-                result.acted_on += 1;
-                result.ids.push(id.to_string());
-            }
-            Err(HarvestError::NotFound(_)) => result.skipped += 1,
-            Err(error) => result.failures.push(dlq::BulkDlqFailure {
-                id: id.to_string(),
-                reason: error.to_string(),
-            }),
-        }
-    }
-
+    // The core batch spreads the replayed tasks over a window (issue #1832).
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
+    let mut result =
+        dlq::replay_dead_letter_batch(conn, &ids, selector.filter.spread_secs, registry).await?;
+    result.matched = matched;
     Ok(result)
 }
 

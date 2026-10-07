@@ -314,12 +314,13 @@ pub const TRANSITIONS: &[Transition] = &[
         "resume_workflow_execution",
     ),
     // ── Exits from a terminal state ─────────────────────────────────────────
-    // DLQ redrive reopens a failed run (issue #510).
+    // DLQ redrive reopens a failed run (issue #510). The `_at` form holds
+    // the write. The plain form delegates to it (issue #1832).
     t(
         Some(Failed),
         Running,
         "execution.rs",
-        "reactivate_failed_execution",
+        "reactivate_failed_execution_at",
     ),
     // DAG retry-from-node seals a closed source before it forks (issue #366).
     t(
@@ -591,7 +592,7 @@ mod tests {
             .collect();
         assert_eq!(reopeners.len(), 1, "{reopeners:?}");
         assert_eq!(reopeners[0].from, Some(Failed));
-        assert_eq!(reopeners[0].writer, "reactivate_failed_execution");
+        assert_eq!(reopeners[0].writer, "reactivate_failed_execution_at");
     }
 
     /// Every pair of states, so the check is exhaustive (issue #1819).

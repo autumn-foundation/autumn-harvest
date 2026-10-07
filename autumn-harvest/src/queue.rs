@@ -8663,7 +8663,7 @@ async fn fetch_claim_batch(
 /// every other deadline check here trusts. It would still consider
 /// that candidate live, whenever the host clock runs ahead of the
 /// database's. No table access, so this never waits on a lock.
-async fn db_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
+pub(crate) async fn db_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
     #[derive(diesel::QueryableByName)]
     struct Now {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]

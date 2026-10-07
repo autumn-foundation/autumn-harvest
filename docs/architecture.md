@@ -1820,8 +1820,8 @@ Key types: `WorkflowReplayer`, `ReplayReport`, `ReplayStatus`, `NonDeterminismKi
 
 ### Deeper test methodology
 
-Beyond `cargo test`/`cargo bench` and `WorkflowReplayer`, four notes cover the
-randomized- and model-checking-based testing layers:
+Beyond `cargo test`/`cargo bench` and `WorkflowReplayer`, these notes cover the
+randomized- and model-checking-based testing layers, and CI run coverage:
 
 * [`docs/testing/property-and-fuzz.md`](testing/property-and-fuzz.md) —
   `proptest` property tests and fuzzing, the two complementary randomized-testing
@@ -1843,6 +1843,9 @@ randomized- and model-checking-based testing layers:
 * [`docs/testing/simulation.md`](testing/simulation.md) — seeded,
   deterministic simulation of the activity claim protocol, with a Postgres
   differential test (issue #1830).
+* [`docs/testing/ci-db-suite-allowlist.md`](testing/ci-db-suite-allowlist.md)
+  — the DB suites that CI does not run from the manifest, each with a
+  reason, and an owner for debt (issue #1799).
 
 ---
 
