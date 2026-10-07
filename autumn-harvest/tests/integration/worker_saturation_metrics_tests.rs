@@ -1133,6 +1133,35 @@ async fn a_single_pool_worker_labels_its_samples_like_its_gauges() {
     }
 }
 
+/// Issue #1815: an embedder can run its own scanner loop through the public
+/// `enforce_timeouts_once`. Its `scan` samples then carry the shards it
+/// scans, as the background checker's do, not a phantom shard 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_scanner_pass_labels_its_assigned_shards() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let recorder = PoolLabels::default();
+    timeout::enforce_timeouts_once(
+        &mut conn,
+        &recorder,
+        Duration::from_secs(60),
+        &None,
+        &[ShardId::new(7), ShardId::new(3)],
+        None,
+        None,
+        60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    )
+    .await
+    .expect("timeout sweep");
+    assert_eq!(
+        recorder.of(DbOp::Scan.as_str()),
+        std::collections::BTreeSet::from([3u16, 7]),
+        "the scan carries each assigned shard"
+    );
+}
+
 /// A running worker emits the pool, wait, query, poller and outlier metrics,
 /// and its heartbeat publishes a task-stats row that counts the failed
 /// activity attempts.

@@ -25,7 +25,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
     A drop guard records a transaction that a timeout cancels. A failure
     that an early error path or a history-cap breach commits instead is
     timed as a `persist` too.
-  - `scan` times one timeout-scanner pass.
+  - `scan` times one timeout-scanner pass. A direct `enforce_timeouts_once`
+    call labels it with the shard assignments it is given.
   - `heartbeat` times one activity heartbeat write.
 - `harvest.worker.pollers{queue}`: gauge set when a poll loop starts and
   ends. The count covers every worker in the process. A drained process reads 0.

@@ -5747,10 +5747,12 @@ pub async fn enforce_timeouts_once(
     payload_codecs: &crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
+    // Issue #1815: `conn` names no shard, so the scan carries each assigned
+    // shard, as the background checker on the single pool does.
     enforce_timeouts_once_on_conn_shard(
         conn,
         None,
-        &[0],
+        &scan_metric_shards(None, None, shard_assignments),
         TaskScan::All,
         metrics,
         unknown_target_grace_window,
