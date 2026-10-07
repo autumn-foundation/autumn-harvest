@@ -953,6 +953,39 @@ async fn one_decision_sends_one_wake_on_every_notify_path() {
 }
 
 #[tokio::test]
+async fn a_history_cap_failure_ends_with_a_boundary() {
+    // The cap failure is the terminal decision of the run. It writes
+    // `WorkflowFailed`, so it ends with a boundary like any other terminal.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("capfail");
+    let running = Running::start(&queue, &pool, boundaries_on().with_event_hard_cap(3));
+    let mut conn = connect(&url).await;
+    let exec_id = seed(
+        &mut conn,
+        "boundary_two_steps",
+        &queue,
+        serde_json::json!(1),
+    )
+    .await;
+    wait_for_execution_state_with_timeout(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
+    let worker_id = running.worker_id.clone();
+    running.stop().await;
+
+    let events = history(&url, exec_id).await;
+    let names = type_names(&events);
+    assert_eq!(
+        names[names.len() - 2..],
+        ["WorkflowFailed", "DecisionCommitted"],
+        "{names:?}"
+    );
+    assert_eq!(
+        boundaries(&events).last(),
+        Some(&(BUILD_ID.to_string(), worker_id))
+    );
+}
+
+#[tokio::test]
 async fn the_default_records_no_boundary() {
     // Boundaries are opt-in in this release. A process of the previous
     // release cannot decode one, and the rolling-deploy contract forbids

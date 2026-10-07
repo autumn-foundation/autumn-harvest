@@ -23636,77 +23636,116 @@ pub async fn move_workflow_to_dlq_for_history_cap(
     Vec<(ExecutionId, String)>,
     Vec<crate::execution::StartCancelledRun>,
 )> {
+    dead_letter_for_history_cap(
+        conn,
+        task,
+        exec_id,
+        next_event_id,
+        worker_id,
+        parent_exec_id,
+        reason,
+        metrics,
+        codecs,
+        None,
+    )
+    .await
+}
+
+/// [`move_workflow_to_dlq_for_history_cap`] that also appends `boundary`
+/// after the failure (issue #1833).
+///
+/// The cap failure is the terminal decision of the run, so it ends with a
+/// boundary like any other terminal decision. The notes of the transaction
+/// go out merged, so the wake counts the boundary.
+#[allow(clippy::too_many_arguments)]
+async fn dead_letter_for_history_cap(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    parent_exec_id: Option<ExecutionId>,
+    reason: DeadLetterReason,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    boundary: Option<&WorkflowEvent>,
+) -> HarvestResult<(
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<crate::execution::StartCancelledRun>,
+)> {
     let reason = reason.to_string();
 
     let (deferred, closed_children, pending_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-            use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-            let reason = reason.clone();
-            // Issue #1184 (Codex review round 3, P1): this transaction had no
-            // ownership recheck at all -- a stale dispatcher whose claim had
-            // already moved could still DLQ and terminally fail a run its new
-            // owner was actively driving. Lock the execution row FIRST (the
-            // documented `harvest_task_queue` convention -- see
-            // `lock_workflow_execution_row_only`'s doc comment -- and this
-            // function's own subsequent `update_workflow_execution_failed`
-            // write to that same row), before the task-row claim check, so
-            // this can never invert against `timeout::enforce_workflow_timeout`
-            // /`force_fail_activity`'s execution-then-task lock order.
-            lock_workflow_execution_row_only(conn, exec_id).await?;
-            if !queue::claim_still_held_for_update(
-                conn,
-                task.id,
-                worker_id,
-                task.crash_strikes,
-                task.attempt,
-            )
-            .await?
-            {
-                return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id: task.id });
-            }
-            let (owner, severity) = exec_dsl::harvest_workflow_executions
-                .find(exec_id.as_uuid())
-                .select((exec_dsl::owner, exec_dsl::severity))
-                .first::<(Option<String>, Option<String>)>(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .unwrap_or((None, None));
-            dlq::dead_letter(
-                conn,
-                &NewDeadLetterEntry {
-                    original_task_id: task.id,
-                    queue_name: task.queue_name.clone(),
-                    task_type: task.task_type.clone(),
-                    workflow_exec_id: task.workflow_exec_id,
-                    activity_name: task.activity_name.clone(),
-                    input: task.input.clone(),
-                    error: reason.clone(),
-                    attempts: task.attempt,
-                    owner,
-                    severity,
-                },
-            )
-            .await?;
-            store::append_events_with_codecs(
-                conn,
-                exec_id,
-                &[WorkflowEvent::workflow_failed(reason.clone())],
-                next_event_id,
-                codecs,
-            )
-            .await?;
-            update_workflow_execution_failed(conn, exec_id, worker_id, &reason, None).await?;
-            queue::fail_task(conn, task.id, &reason).await?;
-            // Drain any remaining sibling PENDING/RUNNING task rows so
-            // they are not claimed after a future redrive reactivates the
-            // execution to RUNNING. Mirrors the poison-pill quarantine and
-            // workflow-task-timeout seal paths.
-            queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
-            let (mut deferred, closed_children) =
-                apply_parent_close_cascade(conn, exec_id, codecs).await?;
-            let mut pending_cancel_metrics = Vec::new();
-            let failed_triggers =
+            crate::notify::coalesced(conn, async |conn| {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let reason = reason.clone();
+                // Issue #1184 (Codex review round 3, P1): this transaction had no
+                // ownership recheck at all -- a stale dispatcher whose claim had
+                // already moved could still DLQ and terminally fail a run its new
+                // owner was actively driving. Lock the execution row FIRST (the
+                // documented `harvest_task_queue` convention -- see
+                // `lock_workflow_execution_row_only`'s doc comment -- and this
+                // function's own subsequent `update_workflow_execution_failed`
+                // write to that same row), before the task-row claim check, so
+                // this can never invert against `timeout::enforce_workflow_timeout`
+                // /`force_fail_activity`'s execution-then-task lock order.
+                lock_workflow_execution_row_only(conn, exec_id).await?;
+                if !queue::claim_still_held_for_update(
+                    conn,
+                    task.id,
+                    worker_id,
+                    task.crash_strikes,
+                    task.attempt,
+                )
+                .await?
+                {
+                    return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id: task.id });
+                }
+                let (owner, severity) = exec_dsl::harvest_workflow_executions
+                    .find(exec_id.as_uuid())
+                    .select((exec_dsl::owner, exec_dsl::severity))
+                    .first::<(Option<String>, Option<String>)>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?
+                    .unwrap_or((None, None));
+                dlq::dead_letter(
+                    conn,
+                    &NewDeadLetterEntry {
+                        original_task_id: task.id,
+                        queue_name: task.queue_name.clone(),
+                        task_type: task.task_type.clone(),
+                        workflow_exec_id: task.workflow_exec_id,
+                        activity_name: task.activity_name.clone(),
+                        input: task.input.clone(),
+                        error: reason.clone(),
+                        attempts: task.attempt,
+                        owner,
+                        severity,
+                    },
+                )
+                .await?;
+                store::append_events_with_codecs(
+                    conn,
+                    exec_id,
+                    &[WorkflowEvent::workflow_failed(reason.clone())],
+                    next_event_id,
+                    codecs,
+                )
+                .await?;
+                update_workflow_execution_failed(conn, exec_id, worker_id, &reason, None).await?;
+                queue::fail_task(conn, task.id, &reason).await?;
+                // Drain any remaining sibling PENDING/RUNNING task rows so
+                // they are not claimed after a future redrive reactivates the
+                // execution to RUNNING. Mirrors the poison-pill quarantine and
+                // workflow-task-timeout seal paths.
+                queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
+                let (mut deferred, closed_children) =
+                    apply_parent_close_cascade(conn, exec_id, codecs).await?;
+                let mut pending_cancel_metrics = Vec::new();
+                let failed_triggers =
                 crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                     conn,
                     exec_id,
@@ -23716,12 +23755,25 @@ pub async fn move_workflow_to_dlq_for_history_cap(
                     codecs,
                 )
                 .await?;
-            deferred.extend(failed_triggers);
-            if let Some(parent_exec_id) = parent_exec_id {
-                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason, codecs)
+                deferred.extend(failed_triggers);
+                if let Some(parent_exec_id) = parent_exec_id {
+                    wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason, codecs)
+                        .await?;
+                }
+                if let Some(boundary) = boundary {
+                    store::append_decision_boundary(
+                        conn,
+                        exec_id,
+                        next_event_id,
+                        None,
+                        boundary,
+                        codecs,
+                    )
                     .await?;
-            }
-            Ok((deferred, closed_children, pending_cancel_metrics))
+                }
+                Ok((deferred, closed_children, pending_cancel_metrics))
+            })
+            .await
         }))
         .await?;
 
@@ -23946,10 +23998,24 @@ async fn fail_workflow_for_history_cap(
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    build_id: &str,
     started_at: std::time::Instant,
     breach: HistoryCapBreach,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
-    let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
+    // Issue #1833: the cap failure is a terminal decision, so it ends with a
+    // boundary when boundaries are on.
+    let boundary =
+        registry
+            .history_policy()
+            .decision_boundaries()
+            .then(|| WorkflowEvent::DecisionCommitted {
+                build_id: crate::types::BuildId::new(build_id),
+                worker_id: crate::types::WorkerId::new(worker_id),
+            });
+    let terminal_count = u64::try_from(next_event_id)
+        .unwrap_or(0)
+        .saturating_add(1)
+        .saturating_add(u64::from(boundary.is_some()));
 
     // Issue #704: decide the crossing from `terminal_count`, never from the
     // `breach` count. `terminal_count` is the durable post-failure event
@@ -24005,7 +24071,7 @@ async fn fail_workflow_for_history_cap(
         "workflow history reached a hard cap; failing the run and moving it to the DLQ"
     );
     let reason = breach.dead_letter_reason(execution.workflow_name.clone());
-    let (deferred, closed_children, pending_cancel_metrics) = move_workflow_to_dlq_for_history_cap(
+    let (deferred, closed_children, pending_cancel_metrics) = dead_letter_for_history_cap(
         conn,
         task,
         exec_id,
@@ -24015,6 +24081,7 @@ async fn fail_workflow_for_history_cap(
         reason,
         Some(telemetry.metrics.as_ref()),
         registry.payload_codecs(),
+        boundary.as_ref(),
     )
     .await?;
 
@@ -24854,6 +24921,7 @@ async fn process_workflow_task(
                                 prepared.exec_id,
                                 next_event_id,
                                 worker_id,
+                                build_id,
                                 started_at,
                                 HistoryCapBreach::Events {
                                     count: current_history_event_count,
@@ -24986,6 +25054,7 @@ async fn process_workflow_task(
                             prepared.exec_id,
                             next_event_id,
                             worker_id,
+                            build_id,
                             started_at,
                             breach,
                         )
@@ -25031,6 +25100,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         HistoryCapBreach::Events {
                             count: current_history_event_count,
@@ -25198,6 +25268,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         HistoryCapBreach::Events {
                             count: current_history_event_count,
@@ -25483,6 +25554,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         HistoryCapBreach::Events {
                             count: current_history_event_count,
@@ -25974,6 +26046,7 @@ async fn process_workflow_task(
             prepared.exec_id,
             next_event_id,
             worker_id,
+            build_id,
             started_at,
             HistoryCapBreach::Events {
                 count: current_history_event_count,
@@ -26004,6 +26077,7 @@ async fn process_workflow_task(
             prepared.exec_id,
             next_event_id,
             worker_id,
+            build_id,
             started_at,
             breach,
         )

@@ -174,7 +174,9 @@ close to a history limit before this release, raise that limit.
   crash between that commit and the outcome leaves those events without a
   boundary. The next boundary then covers them.
 - A decision that the engine ends before it persists an outcome writes no
-  boundary. Examples are the history cap and a non-determinism block.
+  boundary. An example is a non-determinism block.
+- A run that the history cap fails ends with a boundary. Its
+  `WorkflowFailed` is the terminal decision, like any other terminal.
 - A boundary never brings a running history to its event hard cap. Such a
   decision has no boundary. A terminal decision always writes its boundary.
 - The `event_count` of the decision's notification counts the boundary. Its
