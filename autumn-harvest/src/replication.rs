@@ -1987,6 +1987,24 @@ mod db {
         .load(conn)
         .await
         .map_err(database_error)?;
+        // A restored or edited database can lose a row. With no row, nothing
+        // proves authority, so the write fails closed. See the per-shard
+        // `assert_generation`, which does the same.
+        let present: std::collections::BTreeSet<i32> = rows.iter().map(|r| r.shard_id).collect();
+        if present.is_empty() {
+            return Err(match FenceRegistry::binding(ShardId::UNENCODED) {
+                Some((shard, pinned)) => crate::error::HarvestError::ShardFenced {
+                    shard_id: shard.as_i32(),
+                    pinned: pinned.as_i64(),
+                    current: None,
+                },
+                None => crate::error::HarvestError::Config(
+                    "this database holds no generation row, so this process cannot prove \
+                     write authority on it."
+                        .to_string(),
+                ),
+            });
+        }
         for row in rows {
             match FenceRegistry::expected(ShardId::new(row.shard_id)) {
                 Some(pinned) if pinned.as_i64() == row.generation => {}
@@ -2003,6 +2021,20 @@ mod db {
                          process did not pin. Restart the process to pin it.",
                         row.shard_id
                     )));
+                }
+            }
+        }
+        // Each pinned shard colocated with a row here must have its own row.
+        // An incomplete set fails closed like an empty one.
+        for shard in &present {
+            let bindings = FenceRegistry::claim_bindings(ShardId::new(*shard)).unwrap_or_default();
+            for (peer, pinned) in bindings {
+                if !present.contains(&peer.as_i32()) {
+                    return Err(crate::error::HarvestError::ShardFenced {
+                        shard_id: peer.as_i32(),
+                        pinned: pinned.as_i64(),
+                        current: None,
+                    });
                 }
             }
         }

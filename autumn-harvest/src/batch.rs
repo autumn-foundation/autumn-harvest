@@ -781,9 +781,9 @@ mod db {
         // Issue #1823: the tick holds a fence barrier on each pinned shard,
         // so a bump cannot commit while it claims or updates a job. A lost
         // barrier stops the tick before its next write. A checkout before a
-        // write is bounded, see `executor_conn`. Progress and completion
-        // writes finish work the pass already did, so the bump waits for
-        // them.
+        // write is bounded, see `executor_conn`. So is a progress or
+        // completion checkout. A timeout there ends the pass like a failed
+        // `record_progress`: the next tick dispatches the chunk again.
         let fence = crate::replication::begin_fenced_tick(pool).await?;
         crate::replication::run_fenced_pass(&fence, Box::pin(executor_pass(pool, config))).await?
     }
@@ -962,10 +962,7 @@ mod db {
             // This block acquires a fresh connection for this write and
             // drops it at the end of the chunk. The next chunk's dispatch
             // loop never finds it held (issue #1360).
-            let mut owning_conn = owning_shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let mut owning_conn = executor_conn(owning_shard_pool).await?;
             record_progress(
                 &mut owning_conn,
                 job.id,
@@ -980,10 +977,7 @@ mod db {
             }
         }
 
-        let mut owning_conn = owning_shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut owning_conn = executor_conn(owning_shard_pool).await?;
         mark_completed(&mut owning_conn, job.id).await?;
         Ok(())
     }

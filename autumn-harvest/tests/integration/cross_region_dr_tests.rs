@@ -3159,6 +3159,58 @@ async fn a_retention_tick_waiting_for_a_connection_does_not_block_a_bump() {
     );
 }
 
+/// The database-wide fence fails closed on a missing generation row (issue
+/// #1823). A restored or edited database may lose the row of a pinned shard.
+/// A write then cannot prove its authority.
+#[tokio::test]
+async fn a_missing_generation_row_stops_a_database_wide_write() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rowgone");
+    let mut conn = connect(&url).await;
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, input, state, worker_id, attempt) \
+         VALUES ($1, 'q', 'activity', '{}'::jsonb, 'RUNNING', 'w-1', 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a claimed task");
+    let (zero, five) = (ShardId::new(0), ShardId::new(5));
+    let g0 = ensure_generation_row(&mut conn, zero).await.unwrap();
+    let g5 = ensure_generation_row(&mut conn, five).await.unwrap();
+    FenceRegistry::publish(&[(zero, g0), (five, g5)], zero).expect("pin");
+    FenceRegistry::colocate(&[zero, five]);
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "w-1", 1);
+
+    // One colocated row is gone: the set is incomplete.
+    diesel::sql_query("DELETE FROM harvest_shard_generation WHERE shard_id = 5")
+        .execute(&mut conn)
+        .await
+        .expect("drop one row");
+    let incomplete =
+        autumn_harvest::queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"n": 1}))
+            .await;
+    assert!(
+        incomplete.is_err(),
+        "a database missing a pinned row must refuse the write: {incomplete:?}"
+    );
+
+    // Every row is gone.
+    diesel::sql_query("DELETE FROM harvest_shard_generation")
+        .execute(&mut conn)
+        .await
+        .expect("drop every row");
+    let empty =
+        autumn_harvest::queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"n": 2}))
+            .await;
+    assert!(
+        empty.is_err(),
+        "a database with no generation row must refuse the write: {empty:?}"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.
