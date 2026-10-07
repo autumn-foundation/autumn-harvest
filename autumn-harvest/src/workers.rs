@@ -1078,10 +1078,12 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 /// decides which tasks the worker can claim, and in which mix.
 ///
 /// - `queues`: without weights, the sorted queue list. Such a worker claims
-///   from all its queues in one query. With weights, the sorted list of
-///   `[queue, weight]` pairs. Such a worker tries its queues in a weighted
-///   order, so its task mix follows the weights. A queue missing from the map
-///   has weight 1, as
+///   from all its queues in one query. With weights, the sorted
+///   `[queue, weight]` pairs with a positive weight, duplicates kept, and the
+///   zero-weight queues in their configured order. Such a worker tries its
+///   queues in a weighted order, so its task mix follows the weights. A
+///   listed-twice queue is drawn more often. Zero-weight queues are tried
+///   last, in that order. A queue missing from the map has weight 1, as
 ///   [`effective_queue_weights`](crate::queue_fairness::effective_queue_weights)
 ///   gives. An entry for a queue the worker does not poll is ignored.
 /// - `build_id`: the claim predicate routes a task with `required_build_id`
@@ -1145,10 +1147,15 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         names.dedup();
         serde_json::json!(names)
     } else {
-        let mut pairs = crate::queue_fairness::effective_queue_weights(queues, weights);
-        pairs.sort_unstable();
-        pairs.dedup();
-        serde_json::json!(pairs)
+        // The weighted draw keeps every entry, so a listed-twice queue is
+        // drawn more often and keeps its multiplicity here. Zero-weight queues
+        // are tried last in their configured order, so that order stays too.
+        let pairs = crate::queue_fairness::effective_queue_weights(queues, weights);
+        let (fallback, mut drawn): (Vec<_>, Vec<_>) =
+            pairs.into_iter().partition(|(_, weight)| *weight == 0);
+        drawn.sort_unstable();
+        let fallback: Vec<&str> = fallback.into_iter().map(|(queue, _)| queue).collect();
+        serde_json::json!({ "drawn": drawn, "fallback": fallback })
     };
     let labels: std::collections::BTreeMap<&str, &str> = labels
         .iter()
@@ -4664,6 +4671,22 @@ mod tests {
         assert_eq!(
             equal,
             cohort_of(&["b", "a"], &[("b", 1), ("z", 9)], "", &[])
+        );
+        // The weighted draw keeps every entry, so a listed-twice queue is
+        // drawn more often. The order of weighted queues does not matter.
+        let twice = cohort_of(&["a", "a", "b"], &[("a", 1)], "", &[]);
+        assert_ne!(twice, equal, "a duplicate weighted queue changes the mix");
+        assert_eq!(twice, cohort_of(&["b", "a", "a"], &[("a", 1)], "", &[]));
+        // Zero-weight queues are tried last, in their configured order.
+        let fallback = cohort_of(&["a", "y", "z"], &[("y", 0), ("z", 0)], "", &[]);
+        assert_ne!(
+            fallback,
+            cohort_of(&["a", "z", "y"], &[("y", 0), ("z", 0)], "", &[]),
+            "the fallback order decides which idle queue is drained first"
+        );
+        assert_eq!(
+            fallback,
+            cohort_of(&["y", "a", "z"], &[("y", 0), ("z", 0)], "", &[])
         );
     }
 

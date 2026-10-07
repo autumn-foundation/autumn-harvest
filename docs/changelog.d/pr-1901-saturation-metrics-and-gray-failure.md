@@ -87,7 +87,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   one share a cohort across code versions that register the same names, so
   set `build_id` for a rolling deployment.
 - The peers are the live `Active` workers that poll the same queues with the
-  same `queue_weights`, on the same build with the same labels and the same
+  same `queue_weights` (with weights, a listed-twice queue and the order of
+  the zero-weight queues count too), on the same build with the same labels and the same
   slots per task kind (or the same slot-tuner band and tuner policy),
   session capacity, priority aging, activity eligibility, shards, registered
   handlers, circuit-breaker policies, retry-budget policies, adaptive-limit policies, dispatch route
