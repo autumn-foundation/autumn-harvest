@@ -17,7 +17,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use testcontainers::{ContainerAsync, ImageExt};
