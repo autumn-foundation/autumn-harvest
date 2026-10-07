@@ -1098,7 +1098,8 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
   installs it on the first `cargo` call. CI uses the same pin, so a new
   stable release changes CI only when that file changes.
 - Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
-  downloads one for you
+  downloads one for you. CI runs Harvest's own DB suites on Postgres 16 and
+  does not test 12 to 15.
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
   with `--no-default-features` for pure compile-checks on systems without
   libpq.
