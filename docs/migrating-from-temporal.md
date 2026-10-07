@@ -190,11 +190,13 @@ names each gap plainly. It does not imply a workaround exists.
   call has no direct harvest port. Use an ordinary API call or a message
   queue instead of a durable RPC.
 - **Multi-region / global namespaces.** Harvest runs against one or more
-  Postgres shards. See [`sharding.md`](sharding.md). Harvest does not
-  replicate workflow state across geographic regions. It does not fail a
-  region over automatically. Together, these two limits are a real gap for
-  a Temporal deployment that relies on global namespace replication for
-  disaster recovery.
+  Postgres shards. See [`sharding.md`](sharding.md). Each shard can
+  replicate to a standby region with stock Postgres replication, and an
+  operator runs a fenced failover. See
+  [`cross-region-dr.md`](cross-region-dr.md) (issue #954). Harvest does not
+  fail a region over automatically, and it has no active-active writing.
+  These limits are a real gap for a Temporal deployment that relies on
+  global namespace replication for automatic failover.
 - **Non-Rust SDKs.** Harvest ships a Rust SDK only. Suppose your Temporal
   workflows are in Go, TypeScript, Java, Python, .NET, or PHP. You rewrite
   them in Rust to move to harvest. No bridge or interop layer exists.

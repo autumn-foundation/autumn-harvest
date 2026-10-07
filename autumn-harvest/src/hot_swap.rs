@@ -510,7 +510,7 @@ pub fn sign_module_binding(
     workflow_name: &str,
     module_hash: &str,
 ) -> Result<String, HotSwapError> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use std::fmt::Write as _;
 
@@ -519,7 +519,7 @@ pub fn sign_module_binding(
     }
     #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length")]
     let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC-SHA256 takes any key length");
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC-SHA256 takes any key length");
     mac.update(MODULE_SIGNATURE_DOMAIN);
     for field in [build_id, workflow_name, module_hash] {
         // Length-prefix every field so concatenation is unambiguous.

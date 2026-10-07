@@ -41,7 +41,7 @@ Shows a single workflow execution in full detail.
 **Operator actions**
 
 - **Cancel** — POST to `/workflows/{exec_id}/cancel` with a confirmation dialog. Redirects to the detail page with a flash message.
-- **Terminate** — Disabled button (not yet available).
+- **Terminate** — POST to `/workflows/{exec_id}/terminate` with a confirmation dialog (issue #788). It seals the run as `TERMINATED`. The button is disabled once the workflow is terminal, and the route requires admin auth. Redirects to the detail page with a flash message.
 - **Send signal** — Expandable form (collapsed by default). POST to `/workflows/{exec_id}/signal` with `signal_name` and an optional JSON `payload`. Redirects with flash on success.
 - **Reset to event N** — Expandable form. POST to `/workflows/{exec_id}/reset` with `reset_to_event_id` (1-based event number, as shown in the timeline "#" column) and optional `reason`. Creates a new fork execution. Redirects with flash on success.
 - **Trigger update** — Expandable form. POST to `/workflows/{exec_id}/trigger-update` with `update_name` and optional JSON `payload`. Redirects with flash on success.

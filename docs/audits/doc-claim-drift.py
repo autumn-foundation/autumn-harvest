@@ -101,6 +101,26 @@ STALE_CLAIMS = [
         "the worker uses the crate as a dispatch channel for task references",
     ),
     (
+        "docs/vantage-ui.md",
+        r"Terminate\*\*\s+—\s+Disabled\s+button",
+        "the detail page posts to /workflows/{exec_id}/terminate (issue #788)",
+    ),
+    (
+        "docs/comparison.md",
+        r"\*\*Planned:\*\*\s+a\s+TypeScript\s+activity-worker\s+SDK",
+        "#959 and #955 closed as not planned; ADR 0002 rules out worker SDKs",
+    ),
+    (
+        "docs/comparison.md",
+        r"DAG\s+\*\*graph\*\*\s+visualization[^.]*still\s+Phase\s+4",
+        "the DAG detail page renders an inline SVG run graph (issue #690)",
+    ),
+    (
+        "skills/SKILL.md",
+        r"\*\*Version\*\*:\s+0\.[0-6]\.",
+        "the skill tracks the workspace version",
+    ),
+    (
         "autumn-harvest/src/worker.rs",
         r"TODO\(#606 step 9\)",
         "#606 step 9 is wired: build_activity_enqueue_plan pins session tasks",
