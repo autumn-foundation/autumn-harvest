@@ -6333,17 +6333,16 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 }
                 () = tokio::time::sleep(sleep) => {}
             }
-            // Issue #1823: the tick holds a fence barrier on this shard and on
-            // every pinned shard colocated with it. A held or fenced shard
-            // skips the tick, and a lost barrier stops it.
-            let Some(fence) = crate::replication::begin_shard_tick(&pool, pool_shard).await else {
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(pool_shard) {
                 skip_tick(&mut ran_last_tick, &mut leader_failures);
                 // The loop is still alive, so a skipped tick still counts.
                 for owner in &owners {
                     crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
                 }
                 continue;
-            };
+            }
 
             // Bounded to `interval`. Unbounded pool contention here would
             // silently stretch this loop's actual period past `interval`,
@@ -6366,6 +6365,19 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                     break;
                 }
                 result = tokio::time::timeout(interval, pool.get()) => result,
+            };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, pool_shard).await else {
+                skip_tick(&mut ran_last_tick, &mut leader_failures);
+                // The loop is still alive, so a skipped tick still counts.
+                for owner in &owners {
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
+                }
+                continue;
             };
             match get_result {
                 Ok(Ok(mut conn)) => {

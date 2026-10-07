@@ -1855,11 +1855,11 @@ pub fn spawn_worker_heartbeat(
             if crate::replication::FenceRegistry::is_fenced_out() {
                 break;
             }
-            // A held or fenced shard gets no beat. Otherwise the beat runs
-            // under the shard's fence barrier, so a bump waits for it.
-            let Some(fence) = crate::replication::begin_shard_tick(&pool, held_gate).await else {
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(held_gate) {
                 continue;
-            };
+            }
             // Loaded fresh each tick (issue #548 review): a tuned worker's
             // dispatch target can change between heartbeats, so a value
             // captured once at spawn time would drift from reality.
@@ -1883,6 +1883,14 @@ pub fn spawn_worker_heartbeat(
             let get_result = tokio::select! {
                 () = cancel.cancelled() => break,
                 result = pool.get() => result,
+            };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, held_gate).await else {
+                continue;
             };
             let registered_codec_key_ids = codecs.registered_key_ids();
             match get_result {

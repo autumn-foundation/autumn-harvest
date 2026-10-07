@@ -2970,6 +2970,109 @@ async fn a_superseded_pin_releases_no_retention_lease() {
     );
 }
 
+/// A loop that waits for a pooled connection holds no fence barrier (issue
+/// #1823). An exhausted pool must not block a bump.
+#[tokio::test]
+async fn a_loop_waiting_for_a_connection_does_not_block_a_bump() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("poolwait");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        );
+    let pool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool build");
+    // The only connection stays checked out, so the loop waits for it.
+    let busy = pool.get().await.expect("check out the only connection");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let reclaimer = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        std::time::Duration::from_millis(50),
+        3,
+        60,
+        None,
+        std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(shard),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bumped = bump_generation(&mut conn, shard, "failover", "test").await;
+    cancel.cancel();
+    drop(busy);
+    let _ = reclaimer.await;
+    assert!(
+        bumped.is_ok(),
+        "a loop parked on the pool must not hold the bump off: {bumped:?}"
+    );
+}
+
+/// An activity heartbeat asserts the fence in its own transaction (issue
+/// #1823). A process whose pin is superseded must not refresh a claim, even
+/// before the sampler cancels the activity.
+#[tokio::test]
+async fn a_superseded_pin_writes_no_activity_heartbeat() {
+    #[derive(diesel::QueryableByName)]
+    struct Beat {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        heartbeat_details: Option<serde_json::Value>,
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("beatfence");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, input, state, worker_id, attempt) \
+         VALUES ($1, 'q', 'activity', '{}'::jsonb, 'RUNNING', 'w-1', 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a claimed task");
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+    bump_generation(&mut conn, shard, "failover", "test")
+        .await
+        .expect("bump");
+
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "w-1", 1);
+    let written = autumn_harvest::queue::record_heartbeat(
+        &mut conn,
+        &claim,
+        serde_json::json!({"progress": 1}),
+    )
+    .await;
+
+    let rows: Vec<Beat> =
+        diesel::sql_query("SELECT heartbeat_details FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .load(&mut conn)
+            .await
+            .expect("read the beat");
+    assert_eq!(
+        <[Beat]>::first(&rows).and_then(|row| row.heartbeat_details.clone()),
+        None,
+        "a process that lost write authority must not write a heartbeat: {written:?}"
+    );
+    assert!(
+        matches!(
+            written,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "the beat must fail as fenced: {written:?}"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.

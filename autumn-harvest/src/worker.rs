@@ -29764,14 +29764,13 @@ fn spawn_pause_auto_resumer(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            // Issue #1823: the tick holds a fence barrier on this shard and on
-            // every pinned shard colocated with it. A held or fenced shard
-            // skips the tick, and a lost barrier stops it.
-            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(shard) {
                 // The loop is still alive, so a skipped tick still counts.
                 crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
                 continue;
-            };
+            }
 
             // Selected against `cancel` (issue #1426). See the comment
             // above `spawn_worker_heartbeat`'s own `pool.get()` call for
@@ -29780,6 +29779,16 @@ fn spawn_pause_auto_resumer(
             let get_result = tokio::select! {
                 () = cancel.cancelled() => break,
                 result = pool.get() => result,
+            };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
+                // The loop is still alive, so a skipped tick still counts.
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+                continue;
             };
             match get_result {
                 Ok(mut conn) => {

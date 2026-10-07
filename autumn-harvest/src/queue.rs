@@ -4078,10 +4078,36 @@ pub async fn record_heartbeat(
 /// measures `age` on its monotonic clock. A host clock that differs from the
 /// database clock thus does not move the stamp (issue #1807).
 ///
+/// A DR fence also guards the write (issue #1823). With fencing on, the beat
+/// asserts the fence in its own transaction, so a bump cannot commit in
+/// between. A process that lost write authority then refreshes no claim,
+/// even before the sampler cancels the activity.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Returns the fence's error when this process lost write authority.
 pub async fn record_heartbeat_sent_ago(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    details: serde_json::Value,
+    age: std::time::Duration,
+) -> HarvestResult<ClaimWrite> {
+    use diesel_async::AsyncConnection as _;
+    if !crate::replication::FenceRegistry::is_enabled() {
+        return write_heartbeat(conn, claim, details, age).await;
+    }
+    Box::pin(
+        conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+            crate::replication::assert_database_fence(conn).await?;
+            write_heartbeat(conn, claim, details, age).await
+        }),
+    )
+    .await
+}
+
+/// The update of [`record_heartbeat_sent_ago`], with no DR fence check.
+async fn write_heartbeat(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
     details: serde_json::Value,

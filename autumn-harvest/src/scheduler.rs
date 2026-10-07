@@ -1278,6 +1278,16 @@ async fn under_pass_fence<T>(
     Some(pass.await)
 }
 
+/// The fence key of one scheduler shard pass (issue #1823). A single pool
+/// names its shard through the default pin.
+const fn scheduler_fence_key(shard: ShardId, single_pool: bool) -> ShardId {
+    if single_pool {
+        ShardId::UNENCODED
+    } else {
+        shard
+    }
+}
+
 /// Open the fence for one scheduler shard pass, or `None` to skip the shard
 /// (issue #1823).
 ///
@@ -1287,11 +1297,7 @@ async fn under_pass_fence<T>(
 /// guard holds a commit-order barrier until the pass ends: a bump cannot
 /// commit while the pass writes. See [`crate::replication::FencePassGuard`].
 async fn scheduler_fence(pool: &DbPool, shard: ShardId, single_pool: bool) -> Option<PassFence> {
-    let fence_key = if single_pool {
-        ShardId::UNENCODED
-    } else {
-        shard
-    };
+    let fence_key = scheduler_fence_key(shard, single_pool);
     if crate::replication::shard_writes_held(Some(fence_key)) {
         return None;
     }
@@ -1388,14 +1394,20 @@ pub async fn tick_once_sharded_with_backoff(
 
     let single_pool = pool.len() == 1;
     for (shard, shard_pool) in pool.iter_shards() {
-        // Held until this shard's pass ends. See `scheduler_fence`.
-        let Some(fence) = scheduler_fence(shard_pool, shard, single_pool).await else {
+        // Issue #1823: a held shard is skipped before it takes a connection.
+        // It can be an unreachable standby, so a checkout could wait on it.
+        if crate::replication::shard_writes_held(Some(scheduler_fence_key(shard, single_pool))) {
             continue;
-        };
+        }
         let mut conn = shard_pool
             .get()
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
+        // Held until this shard's pass ends. See `scheduler_fence`. It opens
+        // only after the checkout, so pool pressure cannot block a bump.
+        let Some(fence) = scheduler_fence(shard_pool, shard, single_pool).await else {
+            continue;
+        };
 
         // The whole pass runs under the barrier. A lost barrier stops it.
         let pass = async {
