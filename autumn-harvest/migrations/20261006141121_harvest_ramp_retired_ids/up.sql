@@ -31,12 +31,19 @@ CREATE TABLE IF NOT EXISTS harvest_ramp_retired_ids (
 -- caller id. That id would then let an old abort clear the new ramp. The
 -- reset trigger already drops a stale `ramp_id` on such a write. It now
 -- drops the stale `ramp_caller_id` too.
+--
+-- An id-aware writer sets `harvest.ramp_id_aware` for its transaction. It
+-- can keep its id on purpose, for example to change only the percentage
+-- under the same caller id. The trigger leaves such a write alone.
 CREATE OR REPLACE FUNCTION harvest_build_policies_reset_ramp_id()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $$
 BEGIN
+    IF current_setting('harvest.ramp_id_aware', true) = 'on' THEN
+        RETURN NEW;
+    END IF;
     IF NEW.ramp_id IS NOT DISTINCT FROM OLD.ramp_id
        AND (NEW.target_build_id IS DISTINCT FROM OLD.target_build_id
             OR NEW.ramp_percent IS DISTINCT FROM OLD.ramp_percent

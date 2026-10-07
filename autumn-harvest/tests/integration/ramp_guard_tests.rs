@@ -2423,6 +2423,38 @@ async fn a_retry_of_an_aborted_ramp_after_a_base_change_is_refused() {
     assert!(!ramp_is_active(&mut conn).await);
 }
 
+/// An id-aware writer can change only the percentage under the same caller
+/// id. The reset trigger keeps the id, so an exact retry stays a no-op.
+#[tokio::test]
+async fn a_keyed_percent_change_keeps_its_ramp_id() {
+    let (url, _c) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let caller = uuid::Uuid::new_v4();
+    set_ramp_with_id(&mut conn, caller).await;
+    set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT + 10, caller)
+        .await
+        .expect("percent change");
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(caller, QUEUE, BUILD_A, BUILD_B)),
+        "the id stays"
+    );
+
+    let retry = set_build_ramp_with_id(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT + 10, caller).await;
+    assert!(retry.is_ok(), "an exact retry is a no-op: {retry:?}");
+    // A deployment change under the same caller id keeps the id too.
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("one"), caller)
+        .await
+        .expect("policy write");
+    set_build_policy_with_ramp_id(&mut conn, QUEUE, BUILD_A, Some("two"), caller)
+        .await
+        .expect("deployment change");
+    assert_eq!(
+        policy_ramp_id(&mut conn).await,
+        Some(ramp_generation_id(caller, QUEUE, BUILD_A, BUILD_B))
+    );
+}
+
 /// A later policy write that keeps the ramp supersedes an earlier one. A
 /// late retry of the earlier write is refused and leaves the newer ramp.
 #[tokio::test]

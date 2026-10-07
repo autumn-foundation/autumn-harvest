@@ -722,6 +722,11 @@ async fn update_build_ramp_with_id(
 /// Without the lock, an upsert could read the ledger from before the
 /// tombstone and the row from after the marker prune.
 ///
+/// It also sets `harvest.ramp_id_aware` for the transaction. The reset
+/// trigger of `harvest_build_policies` then leaves the writes of the
+/// transaction alone. Only a writer from before the `ramp_id` column, which
+/// never takes this lock, gets its stale ids dropped.
+///
 /// # Errors
 ///
 /// Returns `HarvestError::Database` on failure, for example when a
@@ -738,6 +743,12 @@ pub async fn lock_ramp_generations(
     .execute(conn)
     .await
     .map_err(database_error)?;
+    // Every caller writes ramp ids on purpose. The reset trigger leaves its
+    // writes alone, so a write that keeps its id keeps it.
+    diesel::sql_query("SET LOCAL harvest.ramp_id_aware = 'on'")
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
     Ok(())
 }
 

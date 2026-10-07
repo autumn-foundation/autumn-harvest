@@ -329,7 +329,10 @@ The guard fails safe: when it cannot read, it does not abort.
   pool has that tombstone.
 - A writer from before the `ramp_id` column keeps the old caller id when it
   changes a ramp. The reset trigger drops that stale `ramp_caller_id` along
-  with the stale `ramp_id`.
+  with the stale `ramp_id`. An id-aware writer sets `harvest.ramp_id_aware`
+  for its transaction, and the trigger leaves its writes alone. So a keyed
+  write that changes only the percentage, or only the deployment, keeps its
+  id, and an exact retry of it stays a no-op.
 - A guard can stop after its clear commits and before it reports, or its
   audit write can fail. Its marker then stays unreported. A pass finds a
   marker that is unreported and older than `report_grace`. A pool can still
