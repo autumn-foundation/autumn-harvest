@@ -86,8 +86,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22"
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 # AES-256-GCM payload codec (issue #1825). `autumn-web` already pins 0.10.3 in
 # the lockfile. No default features: the codec reads nonces from `rand`'s
 # `OsRng`, so `aead/getrandom` is not needed.
