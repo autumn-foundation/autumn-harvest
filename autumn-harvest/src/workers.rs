@@ -1534,17 +1534,27 @@ pub enum SnapshotWrite {
     Foreign,
 }
 
-/// Capture `window` for `cohort` and give it the next snapshot sequence, as
-/// one step (issue #1815).
+/// Read the cohort key, capture `window` for it and give it the next
+/// snapshot sequence, as one step (issue #1815).
 ///
 /// Two heartbeats of one worker then cannot pair an older window with a newer
-/// sequence. A new `cohort` starts the window empty.
-pub fn capture_task_stats(window: &TaskOutcomeWindow, cohort: &str) -> (WorkerTaskStats, i64) {
+/// sequence. A new cohort starts the window empty.
+///
+/// `cohort_key` runs inside the step too. A codec reload can change the key
+/// between two shard heartbeats. A heartbeat that read the old key could
+/// otherwise capture after the one that read the new key. It would move the
+/// window back to the old cohort and publish it with the higher sequence.
+pub fn capture_task_stats(
+    window: &TaskOutcomeWindow,
+    cohort_key: impl FnOnce() -> String,
+) -> (String, WorkerTaskStats, i64) {
     static CAPTURE: Mutex<()> = Mutex::new(());
     let _capture = CAPTURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    (window.snapshot_in_cohort(cohort), next_snapshot_seq())
+    let cohort = cohort_key();
+    let stats = window.snapshot_in_cohort(&cohort);
+    (cohort, stats, next_snapshot_seq())
 }
 
 /// Write one worker's task stats snapshot with sequence `seq` (issue #1815).
@@ -1830,9 +1840,10 @@ pub async fn run_outlier_tick(
 ) -> HarvestResult<Vec<OutlierDimension>> {
     // A row of the worker's previous process can hold a higher sequence. The
     // first write then moves the counter above it, and a fresh capture follows.
-    let cohort = probe.cohort_key();
+    let mut cohort = String::new();
     for _ in 0..2 {
-        let (own, seq) = capture_task_stats(&probe.window, &cohort);
+        let (key, own, seq) = capture_task_stats(&probe.window, || probe.cohort_key());
+        cohort = key;
         if write_task_stats_snapshot(conn, worker_id, &cohort, &own, seq).await?
             != SnapshotWrite::Foreign
         {
@@ -4372,7 +4383,7 @@ mod tests {
         codecs
             .register_key("k1", std::sync::Arc::new(IdentityCodec))
             .expect("register a key");
-        let (first, _) = super::capture_task_stats(&probe.window, &probe.cohort_key());
+        let (_, first, _) = super::capture_task_stats(&probe.window, || probe.cohort_key());
         assert_eq!(first, crate::worker_outlier::WorkerTaskStats::default());
     }
 
@@ -4392,14 +4403,51 @@ mod tests {
                 .window
                 .record(true, std::time::Duration::from_millis(40));
         }
-        let (old, _) = super::capture_task_stats(&probe.window, &probe.cohort_key());
+        let (_, old, _) = super::capture_task_stats(&probe.window, || probe.cohort_key());
         assert_eq!(old.failures, 30);
 
         codecs
             .register_key("k1", std::sync::Arc::new(IdentityCodec))
             .expect("register a key");
-        let (new, _) = super::capture_task_stats(&probe.window, &probe.cohort_key());
+        let (_, new, _) = super::capture_task_stats(&probe.window, || probe.cohort_key());
         assert_eq!(new, crate::worker_outlier::WorkerTaskStats::default());
+    }
+
+    /// Issue #1815: the cohort key is read inside the serialized capture. A
+    /// heartbeat that reads its key later always captures later, so a key
+    /// read before a codec reload can never outrank one read after it.
+    #[test]
+    fn the_cohort_key_is_read_inside_the_capture() {
+        use std::sync::mpsc;
+        let window = std::sync::Arc::new(crate::worker_outlier::TaskOutcomeWindow::default());
+        let (reading, read_started) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let old_window = std::sync::Arc::clone(&window);
+        let old = std::thread::spawn(move || {
+            super::capture_task_stats(&old_window, || {
+                reading.send(()).expect("signal the read");
+                released
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("released");
+                "old".to_owned()
+            })
+        });
+        read_started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the old heartbeat reads its key");
+        let new_window = std::sync::Arc::clone(&window);
+        let new =
+            std::thread::spawn(move || super::capture_task_stats(&new_window, || "new".to_owned()));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !new.is_finished(),
+            "a capture waits while another heartbeat reads its key"
+        );
+        release.send(()).expect("release the old heartbeat");
+        let (old_key, _, old_seq) = old.join().expect("old joins");
+        let (new_key, _, new_seq) = new.join().expect("new joins");
+        assert_eq!((old_key.as_str(), new_key.as_str()), ("old", "new"));
+        assert!(new_seq > old_seq, "the later key has the higher sequence");
     }
 
     /// Issue #1815: a worker decodes history only with the codecs it has
