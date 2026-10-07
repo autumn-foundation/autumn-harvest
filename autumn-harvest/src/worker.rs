@@ -29768,6 +29768,8 @@ fn spawn_pause_auto_resumer(
             // every pinned shard colocated with it. A held or fenced shard
             // skips the tick, and a lost barrier stops it.
             let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
+                // The loop is still alive, so a skipped tick still counts.
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
                 continue;
             };
 

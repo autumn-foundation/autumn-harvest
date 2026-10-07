@@ -6338,6 +6338,10 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             // skips the tick, and a lost barrier stops it.
             let Some(fence) = crate::replication::begin_shard_tick(&pool, pool_shard).await else {
                 skip_tick(&mut ran_last_tick, &mut leader_failures);
+                // The loop is still alive, so a skipped tick still counts.
+                for owner in &owners {
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
+                }
                 continue;
             };
 

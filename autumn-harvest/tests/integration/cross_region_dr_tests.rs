@@ -2855,6 +2855,70 @@ async fn an_unprobeable_peer_reuses_the_discovered_pin() {
     assert_eq!(fenced, vec![peer]);
 }
 
+/// A loop that skips a held shard still proves it is alive (issue #1823). A
+/// held shard is a supported state, so its scanners must not read as stale.
+#[tokio::test]
+async fn a_held_shard_keeps_its_scanners_live() {
+    #[derive(Default)]
+    struct Ticks(std::sync::Mutex<Vec<String>>);
+    impl autumn_harvest::telemetry::MetricsRecorder for Ticks {
+        fn record_scanner_tick(&self, scanner: &str, _shard: &str) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(scanner.to_owned());
+        }
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("heldlive");
+    let shard = ShardId::new(0);
+    FenceRegistry::hold(&[shard], shard).expect("hold");
+    let ticks = std::sync::Arc::new(Ticks::default());
+    let telemetry = std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: ticks.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let interval = std::time::Duration::from_millis(50);
+    let poison = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer_for_shard(
+        dr_pool(&url),
+        cancel.clone(),
+        interval,
+        3,
+        60,
+        None,
+        std::sync::Arc::clone(&telemetry),
+        Some(shard),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+    );
+    let export = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        dr_pool(&url),
+        cancel.clone(),
+        interval,
+        telemetry,
+        Some(shard),
+        None,
+        None,
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    cancel.cancel();
+    let _ = poison.await;
+    let _ = export.await;
+
+    let seen = ticks
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for scanner in ["poison_pill", "audit_export"] {
+        assert!(
+            seen.iter().filter(|tick| *tick == scanner).count() >= 2,
+            "{scanner} must keep ticking while its shard is held; saw {seen:?}"
+        );
+    }
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.

@@ -1711,8 +1711,8 @@ mod db {
         slot: Option<Box<dyn Send + Sync>>,
     }
 
-    /// How many guard connections this process may hold at once (issue
-    /// #1823).
+    /// How many guard connections concurrent operations may hold at once
+    /// (issue #1823).
     ///
     /// A guard opens its own connection outside the pool. An admin write
     /// holds one guard for each database it fences, until its handler
@@ -1722,10 +1722,15 @@ mod db {
     /// An operation takes one slot per guard, all at once, before it opens
     /// any guard. The semaphore serves waiters in order. So no operation
     /// holds some slots while it waits for more, and concurrent operations
-    /// cannot split the slots and stall each other. An operation that guards
-    /// more databases than the cap takes every slot and runs alone. An
-    /// operation waits for its slots for at most
-    /// [`FENCE_PASS_CONNECT_TIMEOUT`], then fails closed.
+    /// cannot split the slots and stall each other. An operation waits for
+    /// its slots for at most [`FENCE_PASS_CONNECT_TIMEOUT`], then fails
+    /// closed.
+    ///
+    /// An operation that guards more databases than the cap must still hold
+    /// one guard on each of them at once. It takes every slot, so it runs
+    /// alone, and it logs a warning. The process then holds one guard
+    /// connection per database, the most its configuration allows. Failing
+    /// closed instead would stop every fenced write on such a process.
     pub const FENCE_GUARD_LIMIT: usize = 64;
 
     /// The slots behind [`FENCE_GUARD_LIMIT`].
@@ -1745,6 +1750,14 @@ mod db {
     /// [`crate::error::HarvestError::Database`] when the slots do not free
     /// within [`FENCE_PASS_CONNECT_TIMEOUT`].
     async fn guard_slots(guards: usize) -> HarvestResult<GuardSlot> {
+        if guards > FENCE_GUARD_LIMIT {
+            tracing::warn!(
+                guards,
+                limit = FENCE_GUARD_LIMIT,
+                "a DR fence operation guards more databases than the guard cap; it takes every \
+                 slot and runs alone, with one guard connection per database"
+            );
+        }
         let wanted = u32::try_from(guards.clamp(1, FENCE_GUARD_LIMIT)).unwrap_or(1);
         let slot = tokio::time::timeout(
             FENCE_PASS_CONNECT_TIMEOUT,

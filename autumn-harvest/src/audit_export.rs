@@ -4216,7 +4216,9 @@ pub fn spawn_audit_export_checker_for_shard(
                 () = tokio::time::sleep(interval) => {}
             }
             // A held shard gets no write until the resolver releases it (issue #1823).
+            // The loop is still alive, so it still ticks.
             if crate::replication::shard_writes_held(shard) {
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
                 continue;
             }
 
