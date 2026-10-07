@@ -1425,12 +1425,13 @@ fn id_less_report_id(
 /// `ramp_id`. The clear then writes a marker with the same id, so a pool
 /// that did not clear holds a ramp that the marker matches. A later guard
 /// can finish that pool after a restart. The write changes only
-/// `ramp_id`, so the step and the reset trigger leave the ramp as is. A
-/// failure only logs a warning: that pool then stays unmatched, as before.
+/// `ramp_id`, so the step and the reset trigger leave the ramp as is.
 ///
 /// Returns the id that the row holds after the write. Another guard can
 /// stamp the row first. The caller then adopts that id, so the clear, the
-/// report and the mark of both guards use one id.
+/// report and the mark of both guards use one id. Returns `Ok(None)` when
+/// the row no longer holds the step, and `Err(())` when the write failed or
+/// timed out. The caller then defers the abort.
 #[cfg(feature = "db")]
 async fn stamp_report_id(
     pool: &crate::worker::DbPool,
@@ -1439,7 +1440,7 @@ async fn stamp_report_id(
     step: chrono::DateTime<chrono::Utc>,
     report_id: uuid::Uuid,
     bound: Duration,
-) -> Option<uuid::Uuid> {
+) -> Result<Option<uuid::Uuid>, ()> {
     use diesel::OptionalExtension;
     use diesel::sql_types::{Nullable, Text, Timestamptz};
     use diesel_async::{AsyncConnection, RunQueryDsl};
@@ -1501,14 +1502,14 @@ async fn stamp_report_id(
         .map_err(|e| e.to_string())
     };
     match tokio::time::timeout(bound.saturating_mul(2), stamp).await {
-        Ok(Ok(id)) => id,
+        Ok(Ok(id)) => Ok(id),
         Ok(Err(error)) => {
             tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard report id stamp failed");
-            None
+            Err(())
         }
         Err(_) => {
             tracing::warn!(queue = %queue, pool = index, "ramp guard report id stamp timed out");
-            None
+            Err(())
         }
     }
 }
@@ -2288,15 +2289,25 @@ impl RampGuard {
             // Every replica derives the same id, so a stamp normally finds
             // no other id. The first id on a row still wins, so a guard that
             // meets another id adopts it for the other pools.
+            // A pool that fails the stamp defers the whole abort to a later
+            // pass. A clear of the other pools would leave an unstamped ramp
+            // there, and no marker could match it after a restart.
             let mut adopted = None;
             for &(index, step) in steps {
                 if cancel.is_cancelled() {
-                    break;
+                    return None;
                 }
                 if let Some(pool) = pools.get(index) {
                     let stamp = adopted.unwrap_or(report_id);
-                    if let Some(id) = stamp_report_id(pool, index, &key, step, stamp, bound).await {
-                        adopted.get_or_insert(id);
+                    match stamp_report_id(pool, index, &key, step, stamp, bound).await {
+                        Ok(Some(id)) => {
+                            adopted.get_or_insert(id);
+                        }
+                        Ok(None) => {}
+                        Err(()) => {
+                            tracing::warn!(queue = %key.0, pool = index, "ramp guard defers an abort: a report id stamp failed");
+                            return None;
+                        }
                     }
                 }
             }

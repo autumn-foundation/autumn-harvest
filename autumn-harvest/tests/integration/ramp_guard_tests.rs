@@ -1997,6 +1997,77 @@ async fn a_partial_abort_of_an_id_less_ramp_is_finished_after_a_restart() {
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
 }
 
+/// A pool can reject the report-id stamp of an id-less ramp. The guard then
+/// clears no pool in that pass (issue #1814). A clear of the other pools would
+/// leave an unstamped ramp that no marker matches after a restart.
+#[tokio::test]
+async fn a_failed_stamp_defers_the_abort_of_an_id_less_ramp() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    for conn in [&mut conn_1, &mut conn_2] {
+        set_build_policy(conn, QUEUE, BUILD_A, None)
+            .await
+            .expect("set base policy");
+        // An old writer sets the ramp with no id.
+        diesel::sql_query(
+            "UPDATE harvest_build_policies \
+             SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+             WHERE queue_name = $1",
+        )
+        .bind::<Text, _>(QUEUE)
+        .bind::<Text, _>(BUILD_B)
+        .bind::<diesel::sql_types::Integer, _>(RAMP_PERCENT)
+        .execute(conn)
+        .await
+        .expect("old writer ramp");
+    }
+    seed_healthy_base(&mut conn_1, 5).await;
+    for _ in 0..6 {
+        seed(&mut conn_1, true, "FAILED", false).await;
+    }
+    // Pool 2 rejects the stamp and the clear.
+    diesel::sql_query(
+        "CREATE FUNCTION fail_ramp_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             IF OLD.target_build_id IS NOT NULL THEN \
+                 RAISE EXCEPTION 'injected write failure'; \
+             END IF; \
+             RETURN NEW; \
+         END $$",
+    )
+    .execute(&mut conn_2)
+    .await
+    .expect("create function");
+    diesel::sql_query(
+        "CREATE TRIGGER fail_ramp_write BEFORE UPDATE ON harvest_build_policies \
+         FOR EACH ROW EXECUTE FUNCTION fail_ramp_write()",
+    )
+    .execute(&mut conn_2)
+    .await
+    .expect("create trigger");
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "the abort waits: {aborts:?}");
+    assert!(ramp_is_active(&mut conn_1).await, "no pool clears alone");
+
+    diesel::sql_query("DROP TRIGGER fail_ramp_write ON harvest_build_policies")
+        .execute(&mut conn_2)
+        .await
+        .expect("drop trigger");
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert_eq!(aborts.len(), 1, "a later pass aborts: {aborts:?}");
+    assert!(!ramp_is_active(&mut conn_1).await);
+    assert!(!ramp_is_active(&mut conn_2).await);
+}
+
 /// Two guards can race to give an id-less ramp its report id (issue #1814).
 /// The guard that loses adopts the id on the row. Its clear, report and
 /// mark then all use that id, so the marker is reported once.
