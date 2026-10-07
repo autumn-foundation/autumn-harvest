@@ -14,7 +14,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   so it reports that pool under each assigned shard label.
 - `harvest.db.pool.wait_duration{shard}`: histogram of the wait for a pooled
   connection. The claim path, the timeout scanner and the activity heartbeat
-  flush record it. A failed or timed-out wait counts too.
+  flush record it. A failed or timed-out wait counts too. A single-pool
+  timeout scanner records its waits and its `scan` samples under each
+  assigned shard, as its pool gauges do.
 - `harvest.db.query.duration{op, shard}`: histogram per op and shard, so a
   slow shard of a multi-shard worker stays visible.
   - `claim` times one claim query.

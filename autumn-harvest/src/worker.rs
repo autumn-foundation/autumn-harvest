@@ -6700,7 +6700,7 @@ pub fn capability_miss_fleet_stale_secs(heartbeat_interval: Duration) -> i64 {
 /// Every assigned shard claims through that pool under its own label. So the
 /// pool gauges report it under each label, and a shard-filtered dashboard
 /// finds its pool state. A worker with no assignment uses shard 0.
-fn single_pool_shard_labels(assignments: &[crate::types::ShardId]) -> Vec<u16> {
+pub(crate) fn single_pool_shard_labels(assignments: &[crate::types::ShardId]) -> Vec<u16> {
     let mut labels: Vec<u16> = assignments.iter().map(|s| shard_metric_label(*s)).collect();
     labels.sort_unstable();
     labels.dedup();
