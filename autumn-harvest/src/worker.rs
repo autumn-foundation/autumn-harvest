@@ -1267,6 +1267,7 @@ impl HandlerRegistry {
             event_hard_cap: self.history_policy.event_hard_cap(),
             byte_hard_cap: self.history_policy.byte_hard_cap(),
             history_bloat_warn_fraction: self.history_policy.history_bloat_warn_fraction(),
+            decision_boundaries: self.history_policy.decision_boundaries(),
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,
             continue_as_new_deadline_fraction: self
                 .history_policy
@@ -24572,6 +24573,8 @@ async fn fail_workflow_for_history_cap(
     build_id: &str,
     started_at: std::time::Instant,
     breach: HistoryCapBreach,
+    // Issue #1815: the cap failure fails this workflow task terminally.
+    cycle_failure: &CycleFailure,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
     // Issue #1833: the cap failure is a terminal decision, so it ends with a
     // boundary when boundaries are on.
@@ -24655,6 +24658,9 @@ async fn fail_workflow_for_history_cap(
         boundary.as_ref(),
     )
     .await?;
+    // Issue #1815: the run failed under this claim, so the outlier window
+    // counts this workflow task as a failure, not as a success.
+    cycle_failure.failed_terminally();
 
     // Issue #1184 (Codex review round 3, self-applied): emitted only now
     // that `move_workflow_to_dlq_for_history_cap`'s transaction has actually
@@ -25509,6 +25515,7 @@ async fn process_workflow_task(
                                     count: current_history_event_count,
                                     cap,
                                 },
+                                cycle_failure,
                             )
                             .await?;
                             for start in deferred {
@@ -25639,6 +25646,7 @@ async fn process_workflow_task(
                             build_id,
                             started_at,
                             breach,
+                            cycle_failure,
                         )
                         .await?;
                         for start in deferred {
@@ -25688,6 +25696,7 @@ async fn process_workflow_task(
                             count: current_history_event_count,
                             cap,
                         },
+                        cycle_failure,
                     )
                     .await?;
                     for start in deferred {
@@ -25856,6 +25865,7 @@ async fn process_workflow_task(
                             count: current_history_event_count,
                             cap,
                         },
+                        cycle_failure,
                     )
                     .await?;
                     for start in deferred {
@@ -26142,6 +26152,7 @@ async fn process_workflow_task(
                             count: current_history_event_count,
                             cap,
                         },
+                        cycle_failure,
                     )
                     .await?;
                     for start in deferred {
@@ -26657,6 +26668,7 @@ async fn process_workflow_task(
                 count: current_history_event_count,
                 cap,
             },
+            cycle_failure,
         )
         .await?;
         for start in deferred {
@@ -26685,6 +26697,7 @@ async fn process_workflow_task(
             build_id,
             started_at,
             breach,
+            cycle_failure,
         )
         .await?;
         for start in deferred {
@@ -41112,6 +41125,28 @@ mod tests {
         assert_eq!(
             policy(base.with_byte_hard_cap(1 << 20)),
             policy(base.with_byte_hard_cap(1 << 20))
+        );
+    }
+
+    /// Issue #1815: a worker that records decision boundaries (issue #1833)
+    /// appends a `DecisionCommitted` event on each persist. Its tasks write
+    /// more and its history grows faster, so the flag is part of the cohort.
+    #[test]
+    fn payload_policy_holds_the_decision_boundaries() {
+        use crate::context::WorkflowHistoryPolicy;
+        let policy = |history: WorkflowHistoryPolicy| {
+            HandlerRegistry::new(vec![], vec![])
+                .with_history_policy(history)
+                .payload_policy()
+        };
+        let base = WorkflowHistoryPolicy::default();
+        assert_ne!(
+            policy(base.with_decision_boundaries(true)),
+            policy(base.with_decision_boundaries(false)),
+        );
+        assert_eq!(
+            policy(base.with_decision_boundaries(true)),
+            policy(base.with_decision_boundaries(true))
         );
     }
 

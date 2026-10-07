@@ -1272,14 +1272,15 @@ async fn stats_after_one_failed_run(
     workflow: &'static str,
     handler: autumn_harvest::info::WorkflowHandlerFn,
 ) -> StatsRow {
-    stats_after_one_failed_run_with(workflow, handler, |_| {}).await
+    stats_after_one_failed_run_with(workflow, handler, |builder| builder, |_| {}).await
 }
 
-/// [`stats_after_one_failed_run`] with `tune` applied to the worker's
-/// runtime config.
+/// [`stats_after_one_failed_run`] with `customize` applied to the builder
+/// and `tune` applied to the worker's runtime config.
 async fn stats_after_one_failed_run_with(
     workflow: &'static str,
     handler: autumn_harvest::info::WorkflowHandlerFn,
+    customize: impl FnOnce(HarvestBuilder) -> HarvestBuilder,
     tune: impl FnOnce(&mut WorkerRuntimeConfig),
 ) -> StatsRow {
     let (url, _container) = setup_test_database_url_or_env().await;
@@ -1287,18 +1288,20 @@ async fn stats_after_one_failed_run_with(
     let mut conn = connect(&url).await;
     let queue = unique_id("failed-run-q");
     let worker_id = unique_id("failed-run-w");
-    let built = HarvestBuilder::new()
-        .workflows(vec![WorkflowInfo {
-            name: workflow,
-            handler,
-            ..workflow_info()
-        }])
-        .worker(
-            WorkerConfig::default()
-                .with_queues([queue.as_str()])
-                .with_workflow_panic_max_attempts(0),
-        )
-        .build();
+    let built = customize(
+        HarvestBuilder::new()
+            .workflows(vec![WorkflowInfo {
+                name: workflow,
+                handler,
+                ..workflow_info()
+            }])
+            .worker(
+                WorkerConfig::default()
+                    .with_queues([queue.as_str()])
+                    .with_workflow_panic_max_attempts(0),
+            ),
+    )
+    .build();
     let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
     let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
     runtime_config.worker_id.clone_from(&worker_id);
@@ -1413,14 +1416,51 @@ async fn a_failure_the_error_path_commits_counts_as_a_failure() {
 /// (issue #1815).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failure_the_error_path_commits_counts_without_a_task_timeout() {
-    let row = stats_after_one_failed_run_with(BATCH_CONFLICT_WORKFLOW, conflicting_batch, |cfg| {
-        cfg.workflow_task_timeout = Duration::ZERO;
-    })
+    let row = stats_after_one_failed_run_with(
+        BATCH_CONFLICT_WORKFLOW,
+        conflicting_batch,
+        |builder| builder,
+        |cfg| {
+            cfg.workflow_task_timeout = Duration::ZERO;
+        },
+    )
     .await;
     assert_eq!(
         (row.window_tasks, row.window_failures),
         (1, 1),
         "the rejected batch is one failure"
+    );
+}
+
+const CAPPED_WORKFLOW: &str = "saturation_capped_wf";
+
+/// Starts a durable timer, so its first cycle adds an event to the history.
+fn waits_on_a_timer<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.timer("wait", 30).await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({}))
+    })
+}
+
+/// A run that reaches the history event cap fails and moves to the DLQ. The
+/// workflow task that failed it is a failure in the window, not a success
+/// (issue #1815).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_cap_failure_counts_as_a_failure() {
+    let row = stats_after_one_failed_run_with(
+        CAPPED_WORKFLOW,
+        waits_on_a_timer,
+        |builder| builder.history_event_hard_cap(2),
+        |_| {},
+    )
+    .await;
+    assert_eq!(
+        (row.window_tasks, row.window_failures),
+        (1, 1),
+        "the capped workflow task is one failure"
     );
 }
 

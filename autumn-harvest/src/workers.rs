@@ -1356,6 +1356,10 @@ pub struct PayloadPolicy {
     pub byte_hard_cap: Option<u64>,
     /// The history policy's history-bloat warning fraction.
     pub history_bloat_warn_fraction: f64,
+    /// Whether the history policy records decision boundaries (issue
+    /// #1833). Each persist then appends one more event, so tasks write more
+    /// and the history reaches its caps sooner.
+    pub decision_boundaries: bool,
     /// The fleet-wide workflow execution timeout ceiling. It caps a run's
     /// dispatch deadline and a continue-as-new successor's timeout.
     pub max_workflow_execution_timeout: Option<std::time::Duration>,
@@ -1407,6 +1411,7 @@ impl PayloadPolicy {
             "event_hard_cap": self.event_hard_cap,
             "byte_hard_cap": self.byte_hard_cap,
             "history_bloat_warn_fraction": self.history_bloat_warn_fraction,
+            "decision_boundaries": self.decision_boundaries,
             "max_workflow_execution_timeout": self.max_workflow_execution_timeout.map(duration_key),
             "continue_as_new_deadline_fraction": self.continue_as_new_deadline_fraction,
             "offload_threshold": self.offload_threshold,
@@ -4261,6 +4266,10 @@ mod tests {
             },
             PayloadPolicy {
                 history_bloat_warn_fraction: 0.5,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                decision_boundaries: true,
                 ..base.clone()
             },
             PayloadPolicy {

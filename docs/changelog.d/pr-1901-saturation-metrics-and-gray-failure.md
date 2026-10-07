@@ -60,7 +60,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   and when its cycle fails the run, as a workflow body that returns `Err` does.
   So does a cycle that deadlocks, or panics within its retry budget, and so
   re-pends the task while the run stays `RUNNING`. So does a panic past that
-  budget, which fails the run terminally.
+  budget, which fails the run terminally. So does a cycle whose history
+  reaches the event or byte cap, which moves the run to the DLQ.
   The failure counts after its claim-fenced reset or quarantine, with its
   latency taken then. It is left out when that write finds a peer owns the
   claim. An early error path can fail the run itself before the reset. The
