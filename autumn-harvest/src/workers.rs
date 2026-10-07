@@ -1594,16 +1594,32 @@ pub enum SnapshotWrite {
 /// between two shard heartbeats. A heartbeat that read the old key could
 /// otherwise capture after the one that read the new key. It would move the
 /// window back to the old cohort and publish it with the higher sequence.
+///
+/// A codec write does not take this step's lock. So a change can also land
+/// between the key read and the snapshot. A task dispatched under the new key
+/// would then be published under the old one. The step therefore reads the
+/// key again after each snapshot, and captures again until the key holds.
 pub fn capture_task_stats(
     window: &TaskOutcomeWindow,
-    cohort_key: impl FnOnce() -> (String, crate::worker_outlier::CohortEpoch),
+    cohort_key: impl Fn() -> (String, crate::worker_outlier::CohortEpoch),
 ) -> (String, WorkerTaskStats, i64) {
+    // Codec changes are operator actions, so a few reads always settle. The
+    // bound only stops a pathological writer from holding the heartbeat.
+    const MAX_RECAPTURES: usize = 4;
     static CAPTURE: Mutex<()> = Mutex::new(());
     let _capture = CAPTURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (cohort, epoch) = cohort_key();
-    let stats = window.snapshot_in_cohort_at(&cohort, epoch);
+    let (mut cohort, mut epoch) = cohort_key();
+    let mut stats = window.snapshot_in_cohort_at(&cohort, epoch);
+    for _ in 0..MAX_RECAPTURES {
+        let (now, now_epoch) = cohort_key();
+        if now == cohort && now_epoch == epoch {
+            break;
+        }
+        (cohort, epoch) = (now, now_epoch);
+        stats = window.snapshot_in_cohort_at(&cohort, epoch);
+    }
     (cohort, stats, next_snapshot_seq())
 }
 
@@ -4525,11 +4541,16 @@ mod tests {
         let (release, released) = mpsc::channel::<()>();
         let old_window = std::sync::Arc::clone(&window);
         let old = std::thread::spawn(move || {
+            let first = std::cell::Cell::new(true);
             super::capture_task_stats(&old_window, || {
-                reading.send(()).expect("signal the read");
-                released
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("released");
+                // Only the first read waits. The capture reads the key again
+                // after its snapshot.
+                if first.replace(false) {
+                    reading.send(()).expect("signal the read");
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("released");
+                }
                 (
                     "old".to_owned(),
                     crate::worker_outlier::CohortEpoch::default(),
@@ -4558,6 +4579,42 @@ mod tests {
         let (new_key, _, new_seq) = new.join().expect("new joins");
         assert_eq!((old_key.as_str(), new_key.as_str()), ("old", "new"));
         assert!(new_seq > old_seq, "the later key has the higher sequence");
+    }
+
+    /// Issue #1815: a codec change can land between the key read and the
+    /// snapshot. A task dispatched under the new key must then be published
+    /// under that key, not under the key read before the change.
+    #[test]
+    fn a_codec_change_during_the_capture_publishes_under_the_new_key() {
+        use crate::worker_outlier::{CohortEpoch, TaskOutcomeWindow};
+        use std::time::{Duration, Instant};
+        let window = TaskOutcomeWindow::default();
+        let reads = std::cell::Cell::new(0_u32);
+        let changed_at = std::cell::Cell::new(None);
+        let (key, stats, _) = super::capture_task_stats(&window, || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 {
+                // The old key is read. The codec then changes, and a task
+                // dispatched under the new key ends before the snapshot.
+                let at = Instant::now();
+                changed_at.set(Some(at));
+                window.record_at(at, true, Duration::ZERO);
+                return ("old".to_owned(), CohortEpoch::default());
+            }
+            (
+                "new".to_owned(),
+                CohortEpoch {
+                    generation: 1,
+                    changed_at: changed_at.get(),
+                },
+            )
+        });
+        assert_eq!(key, "new", "the snapshot carries the key it was taken in");
+        assert_eq!(
+            (stats.tasks, stats.failures),
+            (1, 1),
+            "the task dispatched under the new key stays"
+        );
     }
 
     /// Issue #1815: a worker decodes history only with the codecs it has
