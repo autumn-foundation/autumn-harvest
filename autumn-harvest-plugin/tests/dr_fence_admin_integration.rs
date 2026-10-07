@@ -214,6 +214,53 @@ async fn an_admin_maintenance_write_against_a_fenced_shard_is_rejected() {
     assert_eq!(read_status, StatusCode::OK, "read routes still answer");
 }
 
+/// An admin write that waits for a pooled connection drops its fence guards
+/// (issue #1823). An exhausted pool must not block a bump.
+#[tokio::test]
+async fn an_admin_write_waiting_for_a_connection_does_not_block_a_bump() {
+    let _serial = REGISTRY_SERIAL.lock().await;
+    let (url, _container) = setup_database().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool: DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool should build");
+    let app = build_app(&pool);
+    let mut direct = AsyncPgConnection::establish(&url).await.expect("connect");
+    ensure_generation_row(&mut direct, ShardId::new(0))
+        .await
+        .expect("provision generation 0");
+    FenceRegistry::clear();
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::INITIAL)],
+        ShardId::new(0),
+    )
+    .expect("no conflicting pin in this test");
+
+    // The only connection stays checked out, so the handler waits for it.
+    let busy = pool.get().await.expect("check out the only connection");
+    let request_app = app.clone();
+    let request = tokio::spawn(async move {
+        send(
+            &request_app,
+            "POST",
+            "/admin/queues/pool-wait/pause",
+            json!({"reason": "drill"}),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bumped = bump_generation(&mut direct, ShardId::new(0), "failover", "oncall").await;
+    drop(busy);
+    let _ = request.await;
+    FenceRegistry::clear();
+    assert!(
+        bumped.is_ok(),
+        "an admin write parked on the pool must not hold the bump off: {bumped:?}"
+    );
+}
+
 /// A lost fence session stops an admin write in flight (issue #1823). The
 /// server then frees the pass lock, so the handler must not write after it.
 #[tokio::test]

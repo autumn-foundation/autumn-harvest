@@ -4827,12 +4827,12 @@ mod db {
         // fence itself (issue #1803). The fence names `origin`, the shard
         // the authorizer hook showed the policy, as `checkout_entry` does.
         crate::shard_fence::check(origin)?;
-        let mut conn = pool.pool_for_execution(exec_id).get().await.map_err(|e| {
-            HarvestError::ShardUnavailable {
+        let mut conn = crate::replication::fenced_checkout(pool.pool_for_execution(exec_id))
+            .await
+            .map_err(|e| HarvestError::ShardUnavailable {
                 shard_id: origin.as_i32(),
                 reason: format!("pool checkout failed: {e}"),
-            }
-        })?;
+            })?;
 
         if pool.len() <= 1 {
             return Ok((conn, checkout_shard));
@@ -5143,8 +5143,7 @@ mod db {
         shard: ShardId,
     ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
         crate::shard_fence::check(shard)?;
-        pool.pool_for(shard)
-            .get()
+        crate::replication::fenced_checkout(pool.pool_for(shard))
             .await
             .map_err(|e| HarvestError::ShardUnavailable {
                 shard_id: shard.as_i32(),
@@ -5168,8 +5167,7 @@ mod db {
                     reason: "no database pool is configured for this shard on this node"
                         .to_string(),
                 })?;
-        shard_pool
-            .get()
+        crate::replication::fenced_checkout(shard_pool)
             .await
             .map_err(|e| HarvestError::ShardUnavailable {
                 shard_id: shard.as_i32(),

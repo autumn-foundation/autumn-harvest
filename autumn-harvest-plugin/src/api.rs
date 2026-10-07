@@ -11993,7 +11993,7 @@ async fn workflow_children_on_shard(
             error: Some("no connection pool configured for this shard".to_string()),
         };
     };
-    let mut conn = match shard_pool.get().await {
+    let mut conn = match autumn_harvest::replication::fenced_checkout(&shard_pool).await {
         Ok(c) => c,
         Err(e) => {
             return crate::shard_fanout::ShardObservation {
@@ -12032,7 +12032,7 @@ async fn workflow_children_multi_on_shard(
             error: Some("no connection pool configured for this shard".to_string()),
         };
     };
-    let mut conn = match shard_pool.get().await {
+    let mut conn = match autumn_harvest::replication::fenced_checkout(&shard_pool).await {
         Ok(c) => c,
         Err(e) => {
             return crate::shard_fanout::ShardObservation {
@@ -12435,7 +12435,7 @@ async fn lineage_children_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -12464,7 +12464,7 @@ async fn lineage_probe_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -12498,7 +12498,7 @@ async fn lineage_summary_probe_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -33470,10 +33470,7 @@ async fn bulk_replay_from_shards(
             {
                 continue;
             }
-            let mut conn = shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
             let n = count_api_bulk_filter_matches(&mut conn, selector).await?;
             matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
         }
@@ -33487,10 +33484,7 @@ async fn bulk_replay_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so matched reflects all shards.
@@ -33653,10 +33647,7 @@ async fn redrive_from_shards(
             {
                 continue;
             }
-            let mut conn = shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
             let n = dlq::count_redrive_filter_matches(&mut conn, &request.filter).await?;
             matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
         }
@@ -33670,10 +33661,7 @@ async fn redrive_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so `matched` reflects all shards.
@@ -33728,10 +33716,7 @@ async fn bulk_discard_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so matched reflects all shards.
@@ -36881,7 +36866,8 @@ async fn force_circuit(
         )
     };
     if let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut conn) = pool.default_pool().get().await
+        && let Ok(mut conn) =
+            autumn_harvest::replication::fenced_checkout(pool.default_pool()).await
     {
         let ar = NewAuditRecord {
             actor: &actor,
@@ -41096,7 +41082,9 @@ async fn check_ready_database(
         return verdict;
     };
     let select_one = async {
-        let mut conn = pool.default_pool().get().await.ok()?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(pool.default_pool())
+            .await
+            .ok()?;
         diesel::sql_query("SELECT 1").execute(&mut conn).await.ok()
     };
     if !matches!(
@@ -41145,8 +41133,14 @@ fn map_pool_error(error: &impl ToString) -> AutumnError {
     AutumnError::service_unavailable_msg(error.to_string())
 }
 
+/// Check out a connection for a handler (issue #1823). Under
+/// [`run_dr_fenced`], the wait stays below a bump's lock timeout, and a
+/// failed checkout drops the request's fence guards. See
+/// [`autumn_harvest::replication::fenced_checkout`].
 pub(crate) async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError> {
-    pool.get().await.map_err(|error| map_pool_error(&error))
+    autumn_harvest::replication::fenced_checkout(pool)
+        .await
+        .map_err(|error| map_pool_error(&error))
 }
 
 /// Resolve a connection to the shard that currently hosts `exec_id`.

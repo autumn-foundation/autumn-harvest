@@ -3709,8 +3709,14 @@ async fn acquire_shard_conn_for_export(
         >,
     >,
 > {
-    // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
-    match tokio::time::timeout(bound, pool.get()).await {
+    // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`. Under
+    // the tick's fence the wait stays below a bump's lock timeout, and a
+    // failed checkout drops the guards (issue #1823).
+    let checkout = tokio::time::timeout(crate::replication::fenced_wait(bound), pool.get()).await;
+    if !matches!(checkout, Ok(Ok(_))) {
+        crate::replication::abandon_fenced_pass();
+    }
+    match checkout {
         Ok(Ok(conn)) => Some(conn),
         Ok(Err(error)) => {
             tracing::error!(

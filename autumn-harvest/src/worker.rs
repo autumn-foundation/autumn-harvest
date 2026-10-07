@@ -6645,7 +6645,9 @@ async fn acquire_shard_conn(
     acquire_bound: Option<Duration>,
 ) -> HarvestResult<crate::pool::PooledConn> {
     let bound = acquire_bound.unwrap_or_else(|| crate::pool::acquire_bound(pool));
-    crate::pool::acquire(pool, bound).await
+    // A startup write runs under a fence (issue #1823). There the wait stays
+    // below a bump's lock timeout, and a failed checkout drops the guards.
+    crate::replication::fenced_acquire(pool, bound).await
 }
 
 /// Register the static rate-limit buckets of `registry`'s activities.

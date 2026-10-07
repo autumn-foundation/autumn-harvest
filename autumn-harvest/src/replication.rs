@@ -1708,15 +1708,50 @@ mod db {
     pub async fn fenced_checkout(
         pool: &crate::worker::DbPool,
     ) -> HarvestResult<crate::pool::PooledConn> {
-        let Ok(abandon) = PASS_ABANDON.try_with(Clone::clone) else {
+        if PASS_ABANDON.try_with(|_| ()).is_err() {
             return pool
                 .get()
                 .await
                 .map_err(|error| crate::error::HarvestError::Database(error.to_string()));
-        };
-        let checkout = crate::pool::acquire(pool, FENCED_CHECKOUT_BOUND).await;
+        }
+        fenced_acquire(pool, FENCED_CHECKOUT_BOUND).await
+    }
+
+    /// The wait for a checkout bounded by `bound` (issue #1823). Inside a
+    /// pass that [`run_fenced_pass`] runs under guards, the wait is at most
+    /// [`FENCED_CHECKOUT_BOUND`]. Elsewhere it is `bound`.
+    #[must_use]
+    pub fn fenced_wait(bound: std::time::Duration) -> std::time::Duration {
+        if PASS_ABANDON.try_with(|_| ()).is_ok() {
+            bound.min(FENCED_CHECKOUT_BOUND)
+        } else {
+            bound
+        }
+    }
+
+    /// Abandon the fenced pass this task runs, if any (issue #1823). A
+    /// checkout that gave up calls it, so the pass's guards drop. See
+    /// [`fenced_checkout`].
+    pub fn abandon_fenced_pass() {
+        let _ = PASS_ABANDON.try_with(tokio_util::sync::CancellationToken::cancel);
+    }
+
+    /// A fence-aware [`crate::pool::acquire`] (issue #1823).
+    ///
+    /// It waits at most [`fenced_wait`] of `bound`. Inside a fenced pass, a
+    /// failed checkout abandons the pass. Outside one, it is
+    /// [`crate::pool::acquire`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::pool::acquire`].
+    pub async fn fenced_acquire(
+        pool: &crate::worker::DbPool,
+        bound: std::time::Duration,
+    ) -> HarvestResult<crate::pool::PooledConn> {
+        let checkout = crate::pool::acquire(pool, fenced_wait(bound)).await;
         if checkout.is_err() {
-            abandon.cancel();
+            abandon_fenced_pass();
         }
         checkout
     }
@@ -3873,13 +3908,14 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, advance_sequences_after_promotion,
-    assert_admin_write_authority, assert_database_fence, assert_fence, assert_fence_group,
-    begin_fenced_group, begin_fenced_groups, begin_fenced_pass, begin_fenced_pass_at,
-    begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
-    ensure_generation_row, fenced_checkout, freeze_generation_rows_on, measure_rpo,
-    pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
-    record_replication_heartbeat, resolve_held, run_fenced_pass,
+    FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, abandon_fenced_pass,
+    advance_sequences_after_promotion, assert_admin_write_authority, assert_database_fence,
+    assert_fence, assert_fence_group, begin_fenced_group, begin_fenced_groups, begin_fenced_pass,
+    begin_fenced_pass_at, begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick,
+    bump_generation, current_generation, ensure_generation_row, fenced_acquire, fenced_checkout,
+    fenced_wait, freeze_generation_rows_on, measure_rpo, pin_process_fence, pin_worker_fence,
+    probe_dr_markers, query_replication_status, record_replication_heartbeat, resolve_held,
+    run_fenced_pass,
 };
 
 #[cfg(test)]
