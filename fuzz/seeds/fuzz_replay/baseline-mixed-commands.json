@@ -1,0 +1,73 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": {
+          "order": 7
+        },
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000001",
+        "name": "reserve",
+        "input": {
+          "sku": "a"
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityStarted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000001",
+        "worker_id": "w-1"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000001",
+        "output": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "type": "TimerStarted",
+      "data": {
+        "timer_id": "cool-off",
+        "duration_secs": 30
+      }
+    },
+    {
+      "type": "TimerFired",
+      "data": {
+        "timer_id": "cool-off"
+      }
+    },
+    {
+      "type": "SignalReceived",
+      "data": {
+        "signal_name": "approve",
+        "payload": {
+          "by": "ops"
+        }
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": {
+          "done": true
+        }
+      }
+    }
+  ]
+}

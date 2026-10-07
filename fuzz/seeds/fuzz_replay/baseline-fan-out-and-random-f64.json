@@ -1,0 +1,73 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": {
+          "order": 16
+        },
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "SideEffectRecorded",
+      "data": {
+        "kind": "Random",
+        "name": null,
+        "value": 0.25
+      }
+    },
+    {
+      "type": "MarkerRecorded",
+      "data": {
+        "name": "fan_out:1",
+        "details": 2
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000e1",
+        "name": "price",
+        "input": {
+          "sku": "a"
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000e2",
+        "name": "price",
+        "input": {
+          "sku": "b"
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000e2",
+        "output": 5
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000e1",
+        "output": 7
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": 12
+      }
+    }
+  ]
+}

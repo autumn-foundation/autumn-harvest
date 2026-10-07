@@ -3398,3 +3398,60 @@ fn workflow_diagnose_maps_to_the_diagnose_route() {
         assert_eq!(diagnose_request.body, None);
     }
 }
+
+// Issue #1832: `--spread-secs` reaches the redrive and bulk-replay bodies.
+#[test]
+fn dlq_redrive_sends_spread_secs() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "redrive",
+        "--queue",
+        "email-workers",
+        "--spread-secs",
+        "120",
+    ])
+    .expect("redrive args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.body,
+        Some(json!({ "queue": "email-workers", "spread_secs": 120 }))
+    );
+}
+
+#[test]
+fn dlq_bulk_replay_sends_spread_secs() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "bulk-replay",
+        "--queue-name",
+        "email-workers",
+        "--spread-secs",
+        "0",
+    ])
+    .expect("bulk-replay args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.body,
+        Some(json!({ "queue_name": "email-workers", "spread_secs": 0 }))
+    );
+}
+
+#[test]
+fn dlq_redrive_rejects_a_spread_over_one_hour() {
+    let parsed = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "redrive",
+        "--queue",
+        "q",
+        "--spread-secs",
+        "3601",
+    ]);
+    assert!(parsed.is_err(), "--spread-secs is capped at 3600");
+}

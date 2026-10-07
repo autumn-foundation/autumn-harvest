@@ -9,8 +9,9 @@
 # (as Rust 1.99 did on 2026-10-01).
 #
 # Jobs that need another release override this file explicitly: the MSRV job
-# sets `RUSTUP_TOOLCHAIN=1.88.0`, and the fuzz job calls `cargo +nightly`. The
-# MSRV itself is `rust-version` in Cargo.toml, not this file.
+# sets `RUSTUP_TOOLCHAIN=1.88.0`, and the fuzz jobs call `cargo +<nightly>`
+# with the nightly that `fuzz-nightly.yml` pins. The MSRV itself is
+# `rust-version` in Cargo.toml, not this file.
 [toolchain]
 channel = "1.99.0"
 components = ["rustfmt", "clippy"]

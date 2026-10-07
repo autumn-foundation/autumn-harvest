@@ -33,6 +33,10 @@ tls = [
     "dep:tokio-postgres-rustls",
 ]
 testing = []
+# Replay fuzz harness (issue #1835). Derives `arbitrary::Arbitrary` for
+# `WorkflowEvent` and adds the `fuzzing` module. For the `fuzz/` crate and its
+# seed test only. Not a stable API and not covered by semver.
+fuzzing = ["testing", "dep:arbitrary", "chrono/arbitrary", "uuid/arbitrary"]
 # Time-travel replay debugger (issue #949): a stepping/diff API over the existing
 # replay machinery. Read-only by construction -- no new `WorkflowEvent` variant, no
 # migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`
@@ -50,7 +54,7 @@ schema = ["dep:schemars"]
 # feature is out of the default build and the MSRV CI check (`cargo check
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
-wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
+wasm-activities = ["dep:wasmtime", "dep:wat", "db", "dep:ed25519-dalek"]
 # Hot code swap for workflow definitions via runtime modules (issue #967).
 #
 # R&D spike. Hosts `#[workflow]` logic as a runtime-loaded WebAssembly module
@@ -100,6 +104,7 @@ url = "2"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+arbitrary = { version = "1.4", features = ["derive"], optional = true }
 chrono-tz = { workspace = true }
 # Reads a migration's `metadata.toml` in `crate::migrate` with the SAME parser
 # Diesel reads it with, so what this applies and what `diesel migration run`
@@ -143,6 +148,9 @@ schemars = { version = "0.8", optional = true }
 # propagates to downstream consumers, only the manifest constraint does).
 wasmtime = { version = "48.0.4", optional = true }
 wat = { version = "1", optional = true }
+# Publisher signatures on WASM modules (issue #1838). The lockfile already
+# holds this version through `jsonwebtoken`, so it adds no new crate.
+ed25519-dalek = { version = "2.2", optional = true }
 
 [[test]]
 name = "integration"

@@ -77,6 +77,23 @@ async fn drain_cooperative(
     Err("cancelled".to_string())
 }
 
+static RACED_STARTS: AtomicU32 = AtomicU32::new(0);
+
+/// Runs until cancelled, then fails. The test lets a timeout take its claim
+/// just before the drain release (issue #1809).
+#[activity(start_to_close = "600s")]
+async fn drain_raced(
+    ctx: &ActivityContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let _ = input;
+    RACED_STARTS.fetch_add(1, Ordering::SeqCst);
+    while !ctx.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err("cancelled".to_string())
+}
+
 static STUBBORN_STARTS: AtomicU32 = AtomicU32::new(0);
 static STUBBORN_GO: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
@@ -118,14 +135,26 @@ async fn drain_lost(
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Counts the retries that a worker enqueues for `drain_cooperative`.
+/// Counts the retries that a worker enqueues for `drain_cooperative`, and
+/// the attempts that it records for `drain_raced`.
 #[derive(Default)]
-struct RetryCounter(AtomicU32);
+struct RetryCounter(AtomicU32, AtomicU32);
 
 impl autumn_harvest::telemetry::MetricsRecorder for RetryCounter {
     fn record_activity_retried(&self, activity_name: &str, _queue: &str) {
         if activity_name == "drain_cooperative" {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn record_activity_attempt(
+        &self,
+        activity_name: &str,
+        _queue: &str,
+        _outcome: autumn_harvest::telemetry::ActivityStatus,
+    ) {
+        if activity_name == "drain_raced" {
+            self.1.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -140,7 +169,7 @@ fn registry() -> Arc<HandlerRegistry> {
     });
     Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![drain_wf_info()],
-        activities![drain_cooperative, drain_stubborn, drain_lost],
+        activities![drain_cooperative, drain_stubborn, drain_lost, drain_raced],
         autumn_harvest::context::empty_shared_state(),
         telemetry,
     ))
@@ -611,6 +640,69 @@ async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
     let row = activity_row(&url, exec_id).await.expect("activity row");
     assert_eq!(row.state, "COMPLETED", "{row:?}");
     b.stop().await;
+}
+
+/// A timeout that takes the claim just before the drain release settles the
+/// attempt (issue #1809). The worker reads the timeout record after its
+/// release, as the normal finalization does. It takes the record, and it
+/// records no attempt of its own, because the enforcer counted that one.
+///
+/// A trigger stands in for the enforcer. It matches the release, frees the
+/// claim, records the timed-out claim, and skips the release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_before_the_drain_release_settles_the_attempt() {
+    use diesel_async::SimpleAsyncConnection as _;
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("raced");
+    let mut conn = connect(&url).await;
+    conn.batch_execute(&format!(
+        "CREATE OR REPLACE FUNCTION t1809_drain_race() RETURNS trigger AS $$ \
+         BEGIN \
+           IF NEW.queue_name = '{queue}' AND OLD.state = 'RUNNING' \
+              AND NEW.error LIKE 'worker shutdown%' THEN \
+             UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, \
+               timed_out_claims = array_append(COALESCE(timed_out_claims, '{{}}'), \
+                 OLD.attempt || '@' || to_char(OLD.started_at AT TIME ZONE 'UTC', \
+                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')) \
+               WHERE id = OLD.id; \
+             RETURN NULL; \
+           END IF; \
+           RETURN NEW; \
+         END $$ LANGUAGE plpgsql; \
+         DROP TRIGGER IF EXISTS t1809_drain_race ON harvest_task_queue; \
+         CREATE TRIGGER t1809_drain_race BEFORE UPDATE ON harvest_task_queue \
+           FOR EACH ROW EXECUTE FUNCTION t1809_drain_race();"
+    ))
+    .await
+    .expect("install the trigger");
+    let exec_id = seed_workflow(&mut conn, &queue, "drain_raced").await;
+    let pool = build_test_pool(&url);
+
+    let worker_a = format!("{queue}-a");
+    let a = Running::start(&worker_a, &queue, &pool);
+    wait_for_start(&url, exec_id, &worker_a, &RACED_STARTS).await;
+    a.stop().await;
+    conn.batch_execute("DROP TRIGGER IF EXISTS t1809_drain_race ON harvest_task_queue")
+        .await
+        .expect("drop the trigger");
+
+    let claims: Option<Vec<Option<String>>> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select(harvest_task_queue::timed_out_claims)
+        .first(&mut conn)
+        .await
+        .expect("load the timeout record");
+    assert_eq!(
+        claims,
+        Some(vec![]),
+        "the drained owner takes its timeout record"
+    );
+    assert_eq!(
+        AtomicU32::load(&COOPERATIVE_RETRIES.1, Ordering::SeqCst),
+        0,
+        "the enforcer counted the attempt, so the drained owner records none"
+    );
 }
 
 /// A running activity that ignores the cancel keeps its claim.

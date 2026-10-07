@@ -1137,9 +1137,14 @@ Four distinct timeouts, matching Temporal's model:
 | Timeout | What it measures | Default | Effect on failure |
 |---------|-----------------|---------|-------------------|
 | **Schedule-to-Start** | Time from task enqueued to worker claiming it | None (unlimited) | Task marked `TIMED_OUT`, NOT retried (requeuing to same queue would repeat the problem) |
-| **Start-to-Close** | Time from worker claiming task to completion | 5 minutes | Task marked `TIMED_OUT`, retried per policy |
-| **Heartbeat** | Time between consecutive heartbeats from the activity | None (disabled unless set) | Task marked `TIMED_OUT`, retried per policy |
+| **Start-to-Close** | Time from worker claiming task to completion | 10 minutes (`DEFAULT_ACTIVITY_START_TO_CLOSE`) | Attempt ends and retries per policy (row back to `PENDING`). The last attempt appends `ActivityTimedOut`, and the row becomes `FAILED` |
+| **Heartbeat** | Time between consecutive heartbeats from the activity | None (disabled unless set) | Same as start-to-close |
 | **Schedule-to-Close** | Total time from enqueue to final completion (across all retries) | None (unlimited) | Task and all retries cancelled |
+
+[ADR 0005](adr/0005-activity-timeout-retry-and-open-circuit.md) records the
+retry rule and how the code applies it (issue #1809). A retried timeout appends
+no event. Only the last attempt appends `ActivityTimedOut`. A timeout feeds the
+circuit breaker only when the attempt's handler started.
 
 The scheduler enforces timeouts by running a periodic check (every 10 seconds):
 
@@ -1737,6 +1742,6 @@ Harvest's value proposition is operational simplicity: one Rust binary, one Post
 
 1. **Workflow versioning.** When a workflow's code changes while executions are in-flight, replay will fail due to non-determinism. Temporal solves this with versioning APIs (`workflow.GetVersion()`). Harvest needs an equivalent — likely a `ctx.version("change-id", min_version, max_version)` call that records version markers in the event history.
 
-2. **Multi-tenancy.** Should Harvest support namespace isolation (like Temporal namespaces) for multi-tenant deployments? Initial answer: no, keep it simple. Namespaces can be added later by prefixing all table queries with a `namespace` column.
+2. **Multi-tenancy.** Should Harvest support namespace isolation (like Temporal namespaces) for multi-tenant deployments? Initial answer: no, keep it simple. Namespaces can be added later by prefixing all table queries with a `namespace` column. Resolved by [ADR 0004](adr/0004-tenant-isolation-cells.md) (issue #1837): no namespaces; isolate a tenant in a cell instead.
 
 3. **Exactly-once semantics.** Activity execution is at-least-once by design (retries after failure). For operations that must not be duplicated (e.g., charging a credit card), users must implement idempotency keys in their activity code. Should Harvest provide built-in idempotency key management? Initial answer: provide a `ctx.idempotency_key()` helper that generates a deterministic key from the workflow ID + activity ID + attempt number, but leave enforcement to the activity implementation.

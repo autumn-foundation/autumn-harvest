@@ -564,3 +564,99 @@ fn the_public_spawn_signatures_are_unchanged_by_shard_attribution() {
     let _: TimeoutCheckerFn = timeout::spawn_timeout_checker;
     let _: PoisonPillReclaimerFn = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer;
 }
+
+/// Issue #1879: the spawned reclaimer loop holds the last strike of a late
+/// worker's task. It quarantines only once the death is confirmed.
+///
+/// A loop that used the first-sight sweep would quarantine on its first
+/// iteration, about 50 ms after the spawn.
+#[tokio::test]
+async fn spawned_poison_pill_reclaimer_holds_the_last_strike_of_a_late_worker() {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct StateRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+
+    let _serial = TEST_SERIAL.lock().await;
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let worker_id = format!("late-{}", uuid::Uuid::new_v4());
+    let task_id = uuid::Uuid::new_v4();
+    let mut conn = pool.get().await.expect("connection");
+    diesel::sql_query(
+        "INSERT INTO harvest_workers (worker_id, last_heartbeat_at, max_concurrency, host) \
+         VALUES ($1, NOW() - INTERVAL '15 seconds', 10, 'localhost')",
+    )
+    .bind::<diesel::sql_types::Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a late worker");
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, worker_id, attempt, max_attempts, \
+          started_at, crash_strikes) \
+         VALUES ($1, $2, 'activity', '{}'::jsonb, 'RUNNING', $2, 1, 3, NOW(), 2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a task one strike from the threshold");
+    let state =
+        async |conn: &mut diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>| {
+            diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .get_result::<StateRow>(conn)
+                .await
+                .expect("task state")
+                .state
+        };
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        Duration::from_millis(50),
+        3,
+        10,
+        None,
+        std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        None,
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+    );
+    // A failed assertion must still stop the loop. A loop left running keeps
+    // its registration and breaks the delta checks of the other tests here.
+    let stop = cancel.clone().drop_guard();
+
+    // About 20 sweeps. The heartbeat is 15 s old, inside the 20 s confirm
+    // window, so every sweep must hold the row.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        state(&mut conn).await,
+        "RUNNING",
+        "a late worker keeps its task"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_workers SET last_heartbeat_at = NOW() - INTERVAL '25 seconds' \
+         WHERE worker_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("age the worker past the confirm window");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while state(&mut conn).await != "FAILED" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the loop must quarantine once the death is confirmed"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    drop(stop);
+    let _ = handle.await;
+}

@@ -35,6 +35,7 @@ use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::json;
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
@@ -57,7 +58,12 @@ fn scheduled_time_recorder<'a>(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
-    let container = Postgres::default().start().await.expect("postgres start");
+    // Pin Postgres 16 like every other suite. The image default is 11.
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("postgres start");
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");

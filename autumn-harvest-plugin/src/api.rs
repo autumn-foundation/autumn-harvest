@@ -423,6 +423,9 @@ pub struct HarvestApiState {
     /// Cap on distinct groups `GET /admin/usage` will return before failing
     /// loudly with `413` (issue #596). Defaults to 10,000.
     usage_max_groups: Arc<Mutex<usize>>,
+    /// Build ramp guard settings (issue #1814), mirrored from
+    /// `BuiltHarvest::ramp_guard` at startup. The default is disabled.
+    ramp_guard_config: Arc<Mutex<autumn_harvest::ramp_guard::RampGuardConfig>>,
     /// SSRF policy for completion-callback targets (issue #605), mirrored
     /// from `BuiltHarvest::completion_callback_config()` at startup so the
     /// HTTP start route can validate a per-execution target the same way
@@ -502,6 +505,9 @@ impl Default for HarvestApiState {
             )),
             usage_max_groups: Arc::new(Mutex::new(
                 autumn_harvest::usage::default_usage_max_groups(),
+            )),
+            ramp_guard_config: Arc::new(Mutex::new(
+                autumn_harvest::ramp_guard::RampGuardConfig::default(),
             )),
             completion_callback_ssrf_policy: Arc::new(Mutex::new(
                 autumn_harvest::completion_callback::SsrfPolicy::default(),
@@ -899,6 +905,26 @@ impl HarvestApiState {
             .usage_max_groups
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = cap;
+    }
+
+    /// The build ramp guard settings (issue #1814).
+    #[must_use]
+    pub fn ramp_guard_config(&self) -> autumn_harvest::ramp_guard::RampGuardConfig {
+        *self
+            .ramp_guard_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Set the build ramp guard settings (issue #1814).
+    ///
+    /// The boot path reads them when it spawns the guard loop, so set them
+    /// first.
+    pub fn set_ramp_guard_config(&self, config: autumn_harvest::ramp_guard::RampGuardConfig) {
+        *self
+            .ramp_guard_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = config;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
@@ -7112,6 +7138,7 @@ pub const fn management_api_request_fields()
                 "shard_id",
                 "limit",
                 "dry_run",
+                "spread_secs",
             ]),
         ),
         (
@@ -7149,6 +7176,7 @@ pub const fn management_api_request_fields()
                 "max",
                 "dry_run",
                 "reason",
+                "spread_secs",
             ]),
         ),
         // ── external activity handoff ─────────────────────────────────────────
@@ -8428,6 +8456,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         (
@@ -8443,6 +8472,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         (
@@ -8458,6 +8488,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         ("GET", "/admin/queues/scaling", None),
@@ -17292,9 +17323,14 @@ pub(crate) async fn start_workflow(
     // `MINT_CAP` and warn, only for the start to be rejected moments later on
     // the fresh-start path anyway. A dedup hit never uses the minted id (it
     // returns the original execution), so skipping the mint costs nothing.
+    //
+    // A reserved (cell) shard is writable, but unpinned placement never picks
+    // it (issue #1837). No minted id can hash there, so the loop skips it.
+    // A cell tenant must pin every start, as ADR 0004 states.
     if (idempotency_key.is_some() || !placement.is_auto())
         && !explicit_workflow_id
         && pin_is_writable
+        && runtime.router.accepts_unpinned(shard)
     {
         const MINT_CAP: u32 = 10_000;
         let mut attempts = 0u32;
@@ -32583,6 +32619,37 @@ struct BulkDlqApiBody {
     dry_run: bool,
 }
 
+/// The replay-only fields of a `POST /dead-letters/replay` JSON body.
+///
+/// Discard shares [`BulkDlqApiBody`] and has no use for `spread_secs`
+/// (issue #1832). So the replay route reads this second view of its body.
+#[derive(Debug, Deserialize)]
+struct ReplayOnlyApiBody {
+    #[serde(default)]
+    spread_secs: Option<u64>,
+}
+
+/// Read `spread_secs` from a bulk-replay JSON body (issue #1832).
+fn replay_spread_secs(body: &[u8]) -> Result<Option<u64>, AutumnError> {
+    serde_json::from_slice::<ReplayOnlyApiBody>(body)
+        .map(|replay| replay.spread_secs)
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))
+}
+
+/// [`parse_bulk_dlq_request`] plus the replay-only `spread_secs` field.
+///
+/// A form body sets `spread_secs` in `parse_bulk_dlq_form` already.
+fn parse_bulk_replay_request(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<ParsedBulkDlqRequest, AutumnError> {
+    let mut request = parse_bulk_dlq_request(headers, body)?;
+    if !is_form_urlencoded(headers) {
+        request.selector.filter.spread_secs = replay_spread_secs(body)?;
+    }
+    Ok(request)
+}
+
 impl BulkDlqApiBody {
     fn into_selector(self) -> Result<DlqBulkSelector, AutumnError> {
         let task_type = self
@@ -32611,6 +32678,7 @@ impl BulkDlqApiBody {
                 failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
+                spread_secs: None,
             },
             dead_letter_id: self.dead_letter_id,
             task_type,
@@ -32690,6 +32758,8 @@ struct RedriveApiBody {
     shard_id: Option<i32>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    spread_secs: Option<u64>,
 }
 
 impl RedriveApiBody {
@@ -32704,10 +32774,55 @@ impl RedriveApiBody {
                 dead_letter_ids: self.dead_letter_ids,
                 max: self.max,
                 dry_run: self.dry_run,
+                spread_secs: self.spread_secs,
             },
             shard_id: self.shard_id,
             reason: self.reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod dlq_spread_body_tests {
+    use super::*;
+
+    #[test]
+    fn redrive_body_carries_spread_secs() {
+        let body: RedriveApiBody =
+            serde_json::from_str(r#"{"queue":"q","spread_secs":90}"#).expect("valid body");
+        assert_eq!(body.into_request().filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn bulk_replay_body_carries_spread_secs() {
+        let body = br#"{"queue_name":"q","spread_secs":90}"#;
+        assert_eq!(replay_spread_secs(body).expect("valid body"), Some(90));
+        assert_eq!(
+            replay_spread_secs(br#"{"queue_name":"q"}"#).expect("valid"),
+            None
+        );
+        assert!(replay_spread_secs(br#"{"spread_secs":"soon"}"#).is_err());
+    }
+
+    #[test]
+    fn the_shared_bulk_body_leaves_spread_secs_to_replay() {
+        // Discard shares this body, so it never sets `spread_secs`.
+        let body: BulkDlqApiBody =
+            serde_json::from_str(r#"{"queue_name":"q","spread_secs":90}"#).expect("valid body");
+        let selector = body.into_selector().expect("valid selector");
+        assert_eq!(selector.filter.spread_secs, None);
+    }
+
+    #[test]
+    fn bulk_replay_form_carries_spread_secs() {
+        let parsed = parse_bulk_dlq_form(b"queue_name=q&spread_secs=90").expect("valid form");
+        assert_eq!(parsed.selector.filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn spread_secs_is_absent_by_default() {
+        let body: RedriveApiBody = serde_json::from_str(r#"{"queue":"q"}"#).expect("valid body");
+        assert_eq!(body.into_request().filter.spread_secs, None);
     }
 }
 
@@ -32787,6 +32902,10 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
                 selector.filter.failed_before = Some(parse_utc_datetime(value, "failed_before")?);
             }
             "limit" => selector.filter.limit = Some(parse_u32_field(value, "limit")?),
+            "spread_secs" => {
+                selector.filter.spread_secs =
+                    Some(u64::from(parse_u32_field(value, "spread_secs")?));
+            }
             "dry_run" => selector.filter.dry_run = parse_bool_field(value, "dry_run")?,
             "shard_id" => selector.shard_id = Some(parse_i32_field(value, "shard_id")?),
             "return_to" => return_to = Some(value.to_string()),
@@ -33024,7 +33143,7 @@ async fn bulk_replay_dead_letters_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let request = match parse_bulk_replay_request(&headers, &body) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -33233,6 +33352,61 @@ async fn bulk_discard_dead_letters_handler(
     }
 }
 
+/// The `spread_secs` each shard gets in a DLQ fan-out (issue #1832).
+///
+/// The default window scales with the rows in one call. Each shard sees only
+/// its own rows. So with N shards, each shard gets a shorter window, and the
+/// shards together start tasks N times faster than one shard. A call that
+/// spans more than one shard therefore gives every shard the window of all
+/// `rows` the call selects, rounded up to whole seconds. An explicit value is
+/// kept.
+fn fan_out_spread_secs(spread_secs: Option<u64>, rows: usize, shards: usize) -> Option<u64> {
+    if spread_secs.is_some() || shards <= 1 {
+        return spread_secs;
+    }
+    let window = dlq::redrive_spread_window(None, rows);
+    Some(window.as_secs() + u64::from(window.subsec_nanos() > 0))
+}
+
+/// The rows a fan-out selects: the matches on every shard, capped at `budget`.
+fn fan_out_rows(matched: usize, budget: u32) -> usize {
+    matched.min(usize::try_from(budget).unwrap_or(usize::MAX))
+}
+
+#[cfg(test)]
+mod fan_out_spread_secs_tests {
+    use super::fan_out_spread_secs;
+
+    #[test]
+    fn one_shard_keeps_the_per_call_default() {
+        assert_eq!(fan_out_spread_secs(None, 1000, 1), None);
+    }
+
+    #[test]
+    fn many_shards_share_the_window_of_all_selected_rows() {
+        // Two shards of 500 rows must not each get a 30 s window.
+        assert_eq!(fan_out_spread_secs(None, 1000, 2), Some(60));
+        // 100 rows: 6 s. 1 row: 60 ms, rounded up to 1 s.
+        assert_eq!(fan_out_spread_secs(None, 100, 4), Some(6));
+        assert_eq!(fan_out_spread_secs(None, 1, 4), Some(1));
+    }
+
+    #[test]
+    fn the_window_follows_the_matches_not_the_budget() {
+        use super::fan_out_rows;
+        // One match under the default budget of 100 waits at most 1 s, not 6 s.
+        assert_eq!(fan_out_spread_secs(None, fan_out_rows(1, 100), 2), Some(1));
+        // More matches than the budget scale to the budget.
+        assert_eq!(fan_out_rows(5000, 1000), 1000);
+    }
+
+    #[test]
+    fn an_explicit_value_is_kept() {
+        assert_eq!(fan_out_spread_secs(Some(0), 1000, 4), Some(0));
+        assert_eq!(fan_out_spread_secs(Some(90), 1000, 4), Some(90));
+    }
+}
+
 async fn bulk_replay_from_shards(
     api_state: &HarvestApiState,
     selector: &DlqBulkSelector,
@@ -33254,6 +33428,31 @@ async fn bulk_replay_from_shards(
     // conversions below are infallible in practice.
     let mut remaining: u32 =
         u32::try_from(selector.filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+    let shards = pool
+        .iter_shards()
+        .filter(|(shard_id, _)| selector.shard_id.is_none_or(|w| w == shard_id.as_i32()))
+        .count();
+    let mut spread_secs = selector.filter.spread_secs;
+    // A dry run schedules nothing, so it skips the extra count.
+    if spread_secs.is_none() && shards > 1 && !selector.dry_run() {
+        // Size the shared window from the rows the call selects.
+        let mut matched = 0_usize;
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            if selector
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                continue;
+            }
+            let mut conn = shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let n = count_api_bulk_filter_matches(&mut conn, selector).await?;
+            matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
+        }
+        spread_secs = fan_out_spread_secs(None, fan_out_rows(matched, remaining), shards);
+    }
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if selector
@@ -33278,6 +33477,7 @@ async fn bulk_replay_from_shards(
 
         let mut shard_selector = selector.clone();
         shard_selector.filter.limit = Some(remaining);
+        shard_selector.filter.spread_secs = spread_secs;
         let shard_result =
             bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector, registry).await?;
         // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
@@ -33411,6 +33611,31 @@ async fn redrive_from_shards(
     // Enforce `max` as a global cap across all shards, not per-shard.
     let mut remaining: u32 =
         u32::try_from(request.filter.effective_max()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+    let shards = pool
+        .iter_shards()
+        .filter(|(shard_id, _)| request.shard_id.is_none_or(|w| w == shard_id.as_i32()))
+        .count();
+    let mut spread_secs = request.filter.spread_secs;
+    // A dry run schedules nothing, so it skips the extra count.
+    if spread_secs.is_none() && shards > 1 && !request.filter.dry_run {
+        // Size the shared window from the rows the call selects.
+        let mut matched = 0_usize;
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            if request
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                continue;
+            }
+            let mut conn = shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let n = dlq::count_redrive_filter_matches(&mut conn, &request.filter).await?;
+            matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
+        }
+        spread_secs = fan_out_spread_secs(None, fan_out_rows(matched, remaining), shards);
+    }
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if request
@@ -33435,6 +33660,7 @@ async fn redrive_from_shards(
 
         let mut shard_filter = request.filter.clone();
         shard_filter.max = Some(remaining);
+        shard_filter.spread_secs = spread_secs;
         let shard_result =
             dlq::redrive_dead_letters(&mut conn, &shard_filter, registry, reason, metrics.as_ref())
                 .await?;
@@ -33612,35 +33838,23 @@ async fn bulk_replay_dead_letters_for_selector(
         .await
         .map(|n| usize::try_from(n).unwrap_or(0))?;
     let rows = query_dead_letters_for_api_bulk(conn, selector).await?;
-    let mut result = dlq::BulkDlqResult {
-        matched,
-        acted_on: 0,
-        skipped: 0,
-        ids: Vec::new(),
-        dry_run: selector.dry_run(),
-        failures: Vec::new(),
-    };
 
     if selector.dry_run() {
-        result.ids = rows.into_iter().map(|row| row.id.to_string()).collect();
-        return Ok(result);
+        return Ok(dlq::BulkDlqResult {
+            matched,
+            acted_on: 0,
+            skipped: 0,
+            ids: rows.into_iter().map(|row| row.id.to_string()).collect(),
+            dry_run: true,
+            failures: Vec::new(),
+        });
     }
 
-    for row in rows {
-        let id = row.id;
-        match dlq::replay_dead_letter(conn, id, registry).await {
-            Ok(_) => {
-                result.acted_on += 1;
-                result.ids.push(id.to_string());
-            }
-            Err(HarvestError::NotFound(_)) => result.skipped += 1,
-            Err(error) => result.failures.push(dlq::BulkDlqFailure {
-                id: id.to_string(),
-                reason: error.to_string(),
-            }),
-        }
-    }
-
+    // The core batch spreads the replayed tasks over a window (issue #1832).
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
+    let mut result =
+        dlq::replay_dead_letter_batch(conn, &ids, selector.filter.spread_secs, registry).await?;
+    result.matched = matched;
     Ok(result)
 }
 
@@ -47919,7 +48133,7 @@ async fn set_build_policy_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildPolicyBody>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::set_build_policy;
+    use autumn_harvest::build_routing::set_build_policy_with_ramp_id;
 
     let queue_name = body.queue_name.trim();
     let build_id = body.build_id.trim();
@@ -47935,7 +48149,20 @@ async fn set_build_policy_handler(
     let deployment = body.deployment_name.as_deref().filter(|s| !s.is_empty());
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
+    // One ramp id for every shard, so a retained ramp keeps one identity
+    // (issue #1814). A retry with the same `Idempotency-Key` reuses it.
+    let ramp_id = match fan_out_ramp_id(
+        &headers,
+        "policy",
+        queue_name,
+        &[Some(build_id), deployment],
+    ) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     let mut last_policy = None;
+    let mut last_conflict = None;
+    let mut shard_conflicts: Vec<String> = Vec::new();
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -47945,16 +48172,29 @@ async fn set_build_policy_handler(
                 continue;
             }
         };
-        match set_build_policy(&mut conn, queue_name, build_id, deployment)
+        match set_build_policy_with_ramp_id(&mut conn, queue_name, build_id, deployment, ramp_id)
             .await
-            .map_err(map_error)
         {
             Ok(p) => last_policy = Some(p),
+            Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                shard_conflicts.push(format!("shard {}: {e}", shard_id.as_i32()));
+                last_conflict = Some(e);
+            }
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {}: {}", shard_id.as_i32(), map_error(e)));
             }
         }
     }
+
+    // A later write superseded this keyed request on every shard that holds
+    // it (issue #1814). That is a conflict, not an outage.
+    if last_policy.is_none()
+        && shard_errors.is_empty()
+        && let Some(conflict) = last_conflict
+    {
+        return conflict_from(conflict).into_response();
+    }
+    shard_errors.extend(shard_conflicts);
 
     // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
@@ -48042,6 +48282,113 @@ async fn set_build_policy_handler(
     }
 }
 
+/// A caller `ramp_id` derived from the parts of one request (issue #1814).
+///
+/// Each part has a length prefix, and a missing part has its own marker. So
+/// no two different part lists give one id.
+pub(crate) fn derived_ramp_id(parts: &[Option<&str>]) -> uuid::Uuid {
+    use std::fmt::Write as _;
+
+    let mut name = String::from("build-routing");
+    for part in parts {
+        match part {
+            Some(text) => {
+                let _ = write!(name, "/{}:{text}", text.len());
+            }
+            None => name.push_str("/-"),
+        }
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
+}
+
+/// The `ramp_id` of one build-routing fan-out (issue #1814).
+///
+/// A request with an `Idempotency-Key` header gets an id derived from the
+/// route, the queue, the key and the payload. A retry after a partial
+/// fan-out therefore writes the same id on every shard. A reused key with a
+/// changed payload gets a new id, so every shard rewrites the ramp under
+/// that new id. A request with no key gets a new id.
+#[allow(clippy::result_large_err)]
+fn fan_out_ramp_id(
+    headers: &axum::http::HeaderMap,
+    route: &str,
+    queue_name: &str,
+    payload: &[Option<&str>],
+) -> Result<uuid::Uuid, axum::response::Response> {
+    let Some(key) = extract_start_idempotency_header_key(headers)? else {
+        return Ok(uuid::Uuid::new_v4());
+    };
+    let mut parts = vec![Some(route), Some(queue_name), Some(key.as_str())];
+    parts.extend_from_slice(payload);
+    Ok(derived_ramp_id(&parts))
+}
+
+/// Refuse a keyed ramp whose generation the ramp guard aborted (issue
+/// #1814).
+///
+/// A keyed retry derives the same `ramp_id`. A retry after an abort, for
+/// example after a lost response, would otherwise restore the aborted ramp.
+/// The check runs before any write, so no shard gets the ramp back. Each
+/// shard checks its abort markers for the generation id of its own base.
+/// The audit pool then checks its report ledger, which outlives the
+/// markers. The check fails closed with `503`. A shard that cannot be read
+/// could hold an aborted generation whose markers are pruned, and only the
+/// audit pool can then refuse it.
+#[allow(clippy::result_large_err)]
+async fn refuse_aborted_ramp(
+    pool: &HarvestDbPool,
+    queue_name: &str,
+    target_build_id: &str,
+    ramp_id: uuid::Uuid,
+) -> Result<(), axum::response::Response> {
+    use autumn_harvest::build_routing::{
+        aborted_generation_error, get_build_policy, ramp_caller_target_id, ramp_generation_aborted,
+        ramp_generation_id,
+    };
+
+    let caller_target = ramp_caller_target_id(ramp_id, queue_name, target_build_id);
+    let refused = || conflict_from(aborted_generation_error(queue_name, target_build_id));
+    let unchecked = |shard: ShardId, error: &dyn std::fmt::Display| {
+        AutumnError::service_unavailable_msg(format!(
+            "shard {}: cannot check the ramp for an earlier abort: {error}; no shard was \
+             written, retry the request",
+            shard.as_i32()
+        ))
+        .into_response()
+    };
+    let mut generations = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool)
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?;
+        // A shard with no base policy holds no ramp. Its write fails on the
+        // missing base.
+        let Some(policy) = get_build_policy(&mut conn, queue_name)
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?
+        else {
+            continue;
+        };
+        let generation = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
+        if ramp_generation_aborted(&mut conn, queue_name, &[generation, ramp_id, caller_target])
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?
+        {
+            return Err(refused().into_response());
+        }
+        generations.push(generation);
+    }
+    generations.extend([ramp_id, caller_target]);
+    let mut conn = acquire_conn(pool.default_pool())
+        .await
+        .map_err(axum::response::IntoResponse::into_response)?;
+    match ramp_generation_aborted(&mut conn, queue_name, &generations).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(refused().into_response()),
+        Err(e) => Err(map_error(e).into_response()),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SetBuildRampBody {
     queue_name: String,
@@ -48064,7 +48411,7 @@ async fn set_build_ramp_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildRampBody>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::{set_build_ramp, validate_ramp_percent};
+    use autumn_harvest::build_routing::{set_build_ramp_with_id, validate_ramp_percent};
 
     let queue_name = body.queue_name.trim();
     let target_build_id = body.target_build_id.trim();
@@ -48081,9 +48428,29 @@ async fn set_build_ramp_handler(
         Err(e) => return e.into_response(),
     };
     let (actor, source, request_id) = audit_context(&headers, &api_state);
+    // One id for this ramp on every shard. The ramp guard matches its abort
+    // markers to a ramp by this id, not by clocks (issue #1814). A retry with
+    // the same `Idempotency-Key` reuses it.
+    let percent = body.ramp_percent.to_string();
+    let ramp_id = match fan_out_ramp_id(
+        &headers,
+        "ramp",
+        queue_name,
+        &[Some(target_build_id), Some(percent.as_str())],
+    ) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if headers.contains_key(HEADER_IDEMPOTENCY_KEY)
+        && let Err(response) =
+            refuse_aborted_ramp(&pool, queue_name, target_build_id, ramp_id).await
+    {
+        return response;
+    }
 
     let mut last_policy = None;
     let mut last_conflict = None;
+    let mut shard_conflicts: Vec<String> = Vec::new();
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -48093,9 +48460,18 @@ async fn set_build_ramp_handler(
                 continue;
             }
         };
-        match set_build_ramp(&mut conn, queue_name, target_build_id, body.ramp_percent).await {
+        match set_build_ramp_with_id(
+            &mut conn,
+            queue_name,
+            target_build_id,
+            body.ramp_percent,
+            ramp_id,
+        )
+        .await
+        {
             Ok(p) => last_policy = Some(p),
             Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                shard_conflicts.push(format!("shard {}: {e}", shard_id.as_i32()));
                 last_conflict = Some(e);
             }
             Err(e) => {
@@ -48111,6 +48487,9 @@ async fn set_build_ramp_handler(
     {
         return conflict_from(conflict).into_response();
     }
+    // A conflict on one shard while another shard takes the ramp leaves the
+    // fan-out divergent. Report it as a partial failure (issue #1814).
+    shard_errors.extend(shard_conflicts);
 
     // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
@@ -50362,6 +50741,80 @@ mod reserved_idempotency_key_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ── issue #1814: one ramp id per keyed build-routing fan-out ────────────
+
+    const PAYLOAD: &[Option<&str>] = &[Some("canary-v2"), Some("25")];
+
+    /// A reused key with a changed payload gets a new id. An exact retry
+    /// keeps its id.
+    #[test]
+    fn a_keyed_ramp_id_depends_on_the_payload() {
+        let headers = idempotency_headers("deploy-42");
+        let id = |payload: &[Option<&str>]| {
+            fan_out_ramp_id(&headers, "ramp", "default", payload).expect("id")
+        };
+        assert_eq!(id(PAYLOAD), id(PAYLOAD));
+        assert_ne!(id(PAYLOAD), id(&[Some("canary-v2"), Some("50")]));
+        assert_ne!(id(&[Some("b"), None]), id(&[Some("b"), Some("")]));
+    }
+
+    fn idempotency_headers(key: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            HEADER_IDEMPOTENCY_KEY,
+            axum::http::HeaderValue::from_str(key).expect("header value"),
+        );
+        headers
+    }
+
+    /// A retry with the same key gets the same ramp id, so a partial
+    /// fan-out and its retry write one id on every shard.
+    #[test]
+    fn a_keyed_fan_out_gets_the_same_ramp_id_on_retry() {
+        let headers = idempotency_headers("deploy-42");
+        let first = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let retry = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        assert_eq!(first, retry);
+    }
+
+    /// The id depends on the key, the queue and the route.
+    #[test]
+    fn a_keyed_ramp_id_depends_on_key_queue_and_route() {
+        let headers = idempotency_headers("deploy-42");
+        let base = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let other_key = fan_out_ramp_id(
+            &idempotency_headers("deploy-43"),
+            "ramp",
+            "default",
+            PAYLOAD,
+        )
+        .expect("id");
+        let other_queue = fan_out_ramp_id(&headers, "ramp", "billing", PAYLOAD).expect("id");
+        let other_route = fan_out_ramp_id(&headers, "policy", "default", PAYLOAD).expect("id");
+        assert_ne!(base, other_key);
+        assert_ne!(base, other_queue);
+        assert_ne!(base, other_route);
+    }
+
+    /// A request with no key gets a new id each time.
+    #[test]
+    fn an_unkeyed_fan_out_gets_a_new_ramp_id() {
+        let headers = axum::http::HeaderMap::new();
+        let first = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let second = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        assert_ne!(first, second);
+    }
+
+    /// An empty key is a client error, as on the start route.
+    #[test]
+    fn an_empty_idempotency_key_is_rejected() {
+        let result = fan_out_ramp_id(&idempotency_headers("  "), "ramp", "default", PAYLOAD);
+        assert_eq!(
+            result.expect_err("an empty key is a 400").status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
 
     // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
     // ───────────────────────────────────────────────────────────────────────
