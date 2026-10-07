@@ -394,10 +394,12 @@ its own transaction, so a stale node writes no audit row.
 
 Three limits, stated plainly:
 
-- A barrier opens one extra connection per database. A process runs at most
-  64 fenced operations at once. One operation takes one slot, however many
-  databases it guards. An operation past that waits up to 10 seconds for a
-  free slot, then fails closed: an admin write answers `503`. On a DR node
+- A barrier opens one extra connection per database. A process holds at
+  most 64 of these at once. An operation takes the slots for all of its
+  databases at once, so it never holds some while it waits for more. One
+  that guards more than 64 databases takes every slot and runs alone. An
+  operation waits up to 10 seconds for its slots, then fails closed: an
+  admin write answers `503`. On a DR node
   every admin write, scheduler pass and partition pass pays that cost. The
   barrier pings that connection each second. If the session ends, the
   server frees the lock. The pass then stops: a scheduler pass before it

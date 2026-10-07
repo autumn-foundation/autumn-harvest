@@ -1702,28 +1702,30 @@ mod db {
     pub struct FencePassGuard {
         lost: tokio_util::sync::CancellationToken,
         keepalive: tokio::task::JoinHandle<()>,
-        /// A share of one slot of [`FENCE_GUARD_SLOTS`]. Every guard of one
-        /// operation shares that slot, and it frees when the last of them
-        /// drops. It is boxed as `dyn Send`. The guard then keeps the drop
+        /// A share of its operation's slots of [`FENCE_GUARD_SLOTS`]. The
+        /// operation takes one slot per guard. The slots free when the last
+        /// guard of the operation drops. It is boxed as `dyn Send`. The guard then keeps the drop
         /// behaviour it had before the slot. Callers hold a guard for a
         /// whole pass on purpose.
         #[allow(dead_code)]
         slot: Option<Box<dyn Send + Sync>>,
     }
 
-    /// How many fenced operations this process may run at once (issue #1823).
+    /// How many guard connections this process may hold at once (issue
+    /// #1823).
     ///
     /// A guard opens its own connection outside the pool. An admin write
     /// holds one guard for each database it fences, until its handler
     /// returns. Without a cap, heavy admin traffic could open sessions
     /// without limit and use up the server's connections.
     ///
-    /// One operation takes one slot, however many databases it guards. It
-    /// takes the slot before it opens any guard. It therefore never waits for
-    /// a slot while it holds one, so concurrent operations cannot split the
-    /// slots and stall each other. An operation past the cap waits for a
-    /// free slot, for at most [`FENCE_PASS_CONNECT_TIMEOUT`], then fails
-    /// closed.
+    /// An operation takes one slot per guard, all at once, before it opens
+    /// any guard. The semaphore serves waiters in order. So no operation
+    /// holds some slots while it waits for more, and concurrent operations
+    /// cannot split the slots and stall each other. An operation that guards
+    /// more databases than the cap takes every slot and runs alone. An
+    /// operation waits for its slots for at most
+    /// [`FENCE_PASS_CONNECT_TIMEOUT`], then fails closed.
     pub const FENCE_GUARD_LIMIT: usize = 64;
 
     /// The slots behind [`FENCE_GUARD_LIMIT`].
@@ -1732,20 +1734,21 @@ mod db {
             std::sync::Arc::new(tokio::sync::Semaphore::new(FENCE_GUARD_LIMIT))
         });
 
-    /// One slot of [`FENCE_GUARD_LIMIT`], shared by every guard of one
-    /// operation.
+    /// The slots of one operation, shared by its guards.
     type GuardSlot = std::sync::Arc<tokio::sync::OwnedSemaphorePermit>;
 
-    /// Take one slot of [`FENCE_GUARD_LIMIT`] for an operation (issue #1823).
+    /// Take one slot of [`FENCE_GUARD_LIMIT`] per guard, all at once (issue
+    /// #1823). A request above the cap takes every slot.
     ///
     /// # Errors
     ///
-    /// [`crate::error::HarvestError::Database`] when no slot frees within
-    /// [`FENCE_PASS_CONNECT_TIMEOUT`].
-    async fn guard_slot() -> HarvestResult<GuardSlot> {
+    /// [`crate::error::HarvestError::Database`] when the slots do not free
+    /// within [`FENCE_PASS_CONNECT_TIMEOUT`].
+    async fn guard_slots(guards: usize) -> HarvestResult<GuardSlot> {
+        let wanted = u32::try_from(guards.clamp(1, FENCE_GUARD_LIMIT)).unwrap_or(1);
         let slot = tokio::time::timeout(
             FENCE_PASS_CONNECT_TIMEOUT,
-            std::sync::Arc::clone(&FENCE_GUARD_SLOTS).acquire_owned(),
+            std::sync::Arc::clone(&FENCE_GUARD_SLOTS).acquire_many_owned(wanted),
         )
         .await
         .map_err(|_| {
@@ -1959,10 +1962,10 @@ mod db {
     /// [`begin_fenced_group`] for each `(pool, shard)` in `groups`, as one
     /// operation (issue #1823).
     ///
-    /// Every guard shares one slot of [`FENCE_GUARD_LIMIT`]. The operation
-    /// takes it before it opens any guard, so it never waits for a slot
-    /// while it holds one. A shard that an earlier group already guards is
-    /// not guarded twice. With no pin, this opens no connection.
+    /// The operation takes one slot of [`FENCE_GUARD_LIMIT`] per guard, all
+    /// at once, before it opens any guard. It therefore never waits for a
+    /// slot while it holds one. A shard that an earlier group already guards
+    /// is not guarded twice. With no pin, this opens no connection.
     ///
     /// # Errors
     ///
@@ -1988,7 +1991,7 @@ mod db {
         if plan.is_empty() {
             return Ok(Vec::new());
         }
-        let slot = guard_slot().await?;
+        let slot = guard_slots(plan.len()).await?;
         let mut guards = Vec::with_capacity(plan.len());
         for (pool, fresh, bindings) in plan {
             // One guard per database holds the barrier of every shard there,
@@ -2063,7 +2066,7 @@ mod db {
                 (shard_pool, if single { ShardId::UNENCODED } else { shard })
             })
             .collect();
-        // One slot for the whole tick. See `FENCE_GUARD_LIMIT`.
+        // The tick takes all of its slots at once. See `FENCE_GUARD_LIMIT`.
         begin_fenced_groups(&groups).await
     }
 
@@ -2093,7 +2096,7 @@ mod db {
         shards: &[(ShardId, ShardGeneration)],
         allowed: &[(ShardId, ShardGeneration)],
     ) -> HarvestResult<FencePassGuard> {
-        let slot = guard_slot().await?;
+        let slot = guard_slots(1).await?;
         open_checked_pass(pool, shards, allowed, slot).await
     }
 

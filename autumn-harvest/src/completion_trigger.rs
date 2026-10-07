@@ -1332,8 +1332,8 @@ impl DeferredTriggerStart {
             // Issue #1823: this relay runs detached, after its caller's fence
             // ends. It writes the source and the target shard, so it holds the
             // fence of both while it writes. A fenced or held shard leaves the
-            // outbox row for the scanner. Both guards share one slot, so the
-            // relay never waits for a slot while it holds one.
+            // outbox row for the scanner. The relay takes the slots of both
+            // guards at once, so it never waits for a slot while it holds one.
             let fence = match crate::replication::begin_fenced_groups(&[
                 (&source_pool, self.source_shard),
                 (&pool, self.target_shard),
