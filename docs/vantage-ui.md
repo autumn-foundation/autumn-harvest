@@ -253,6 +253,7 @@ Vantage translates raw `WorkflowEvent` type strings to friendlier labels:
 | `ActivityFailed` | Activity failed: `{error}` (truncated) |
 | `SignalReceived` | Signal received: `{signal_name}` |
 | `UpdateAdmitted` | Update admitted |
+| `DecisionCommitted` | Decision committed: build `{build_id}`, worker `{worker_id}` (`<none>` for an empty build, `?` for a missing worker id) |
 | `TimerStarted` | Timer started |
 | `TimerFired` | Timer fired |
 | `LocalActivityScheduled` | Local activity scheduled |

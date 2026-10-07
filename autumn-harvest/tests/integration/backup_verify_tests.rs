@@ -3201,3 +3201,69 @@ async fn a_payload_too_large_completion_trigger_fire_is_not_probed() {
         "a permanently rejected relay asserts no delivery: {report:#?}"
     );
 }
+
+/// Issue #1839 item 2. On the partitioned layout, two in-flight appends of one
+/// `event_id` can land in two cohorts. The decision is detection only, so
+/// `backup verify` must find the pair.
+#[tokio::test]
+async fn detects_a_duplicate_event_id_on_the_partitioned_layout() {
+    use autumn_harvest::partition::{EnableOptions, enable_partitioning};
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable the partitioned layout");
+
+    let exec = ExecutionId::new_for_shard(ShardId::new(0));
+    seed_execution(&mut conn, exec, "order_flow", "dup-1", "COMPLETED", 0).await;
+    append_event(&mut conn, exec, 1, "WorkflowStarted", json!({})).await;
+
+    let clean = verify_restore(&one_shard(&url), &opts(), &WorkflowReplayer::new()).await;
+    assert!(
+        !clean.detected(FindingClass::DuplicateEventId),
+        "a healthy partitioned shard has no duplicate: {clean:#?}"
+    );
+
+    // The insert trigger rejects this write. Only the race gets past it, so
+    // the fixture turns the triggers off.
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::sql_query(
+            "INSERT INTO harvest_events \
+             (workflow_exec_id, event_id, event_type, event_data, timestamp, cohort) \
+             VALUES ($1, 1, 'WorkflowStarted', \
+                     '{\"type\": \"WorkflowStarted\", \"data\": {}}'::jsonb, NOW(), \
+                     harvest_event_cohort(NOW() - INTERVAL '3 days'))",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+        .execute(c)
+        .await
+    })
+    .await
+    .expect("write the duplicate into an older cohort");
+
+    let report = verify_restore(&one_shard(&url), &opts(), &WorkflowReplayer::new()).await;
+    assert!(
+        report.detected(FindingClass::DuplicateEventId),
+        "expected the cross-cohort duplicate: {report:#?}"
+    );
+    assert_eq!(
+        FindingClass::DuplicateEventId.severity(),
+        FindingSeverity::Incoherent
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+    assert_eq!(report.exit_code(), 1, "a duplicate history fails the drill");
+
+    // Retention deletes the execution and leaves its rows for the partition
+    // sweeper. No run can replay an orphan history, so it is not reported.
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("retain the execution");
+    let retained = verify_restore(&one_shard(&url), &opts(), &WorkflowReplayer::new()).await;
+    assert!(
+        !retained.detected(FindingClass::DuplicateEventId),
+        "orphan rows of a retained execution are not a finding: {retained:#?}"
+    );
+}

@@ -1450,8 +1450,10 @@ pub struct ActivityInfo {
     /// `rate_limit(...)` form at compile time.
     pub rate_limit_key_expr: Option<&'static str>,
     /// Optional circuit-breaker policy (issue #369). When set, the worker
-    /// fast-fails dispatches of this activity with a non-retryable
-    /// `"CircuitOpen"` failure while the breaker is open. `None` retains
+    /// short-circuits dispatches of this activity while the breaker is open.
+    /// The policy's `open_mode` decides how (issue #1809). `Defer` (default)
+    /// puts the task back to `PENDING`. `FailFast` fails it with a
+    /// non-retryable `"CircuitOpen"` failure. `None` retains
     /// today's behaviour (no breaker; the full retry policy applies). Declared
     /// via `#[activity(circuit_breaker = CircuitBreakerPolicy::new(...))]`.
     pub circuit_breaker: Option<crate::policy::CircuitBreakerPolicy>,
