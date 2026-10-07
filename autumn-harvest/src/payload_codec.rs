@@ -1170,8 +1170,11 @@ impl PayloadCodecs {
                  activate a different key first"
             )));
         }
-        guard.keys.remove(key_id);
-        guard.changed();
+        // Issue #1815: a key that is not registered leaves the cohort as it
+        // was, so the epoch stays.
+        if guard.keys.remove(key_id).is_some() {
+            guard.changed();
+        }
         let any_left = !guard.keys.is_empty();
         // Under the guard, for the reason spelled out in `register_key`: the
         // mirror and the map must be mutated inside the same critical section
@@ -3628,7 +3631,8 @@ mod tests {
 
     /// Issue #1815: every key change moves the epoch when it happens, so a
     /// worker can tell when the policy behind its cohort changed. Activating
-    /// the key that is already active changes nothing.
+    /// the key that is already active changes nothing. Retiring a key that is
+    /// not registered changes nothing either.
     #[test]
     fn a_key_change_moves_the_key_epoch() {
         let codecs = PayloadCodecs::default();
@@ -3651,6 +3655,12 @@ mod tests {
         codecs.retire_key_local("k1").expect("retire k1");
         let state = codecs.key_state();
         assert_eq!(state.epoch.generation, 4);
+        codecs.retire_key_local("k1").expect("retire k1 again");
+        codecs
+            .retire_key_local("absent")
+            .expect("retire an unknown key");
+        let state = codecs.key_state();
+        assert_eq!(state.epoch.generation, 4, "no removal, no move");
         assert_eq!(
             (state.registered, state.active),
             (vec!["k2".to_owned()], "k2".to_owned())

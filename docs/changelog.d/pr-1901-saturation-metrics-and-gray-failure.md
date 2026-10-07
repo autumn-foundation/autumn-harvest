@@ -38,8 +38,9 @@ heartbeat check only. A worker that was alive but sick passed that check.
   drops the tasks dispatched before the reload, so outcomes from the old
   cohort do not flag it. The codec registry stamps each key change when it
   happens, so a task dispatched after the change stays, and a change back
-  to an earlier key still restarts the window. The worker enters its cohort
-  before any task runs.
+  to an earlier key still restarts the window. A retirement of a key that
+  is not registered changes nothing, so it keeps the window. The worker
+  enters its cohort before any task runs.
 - A failed activity attempt counts as a failure. So does an attempt that an
   open circuit breaker rejects, because the breaker belongs to the worker.
   An activity that succeeds but does not finalize also counts as a failure.
