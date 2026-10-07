@@ -1465,7 +1465,8 @@ fn parse_use_bindings(use_body: &str) -> (Vec<String>, bool) {
     }
     // Grouped import: `path::{a, b as c}`.
     if let Some(open) = s.find('{') {
-        let Some(close) = s.rfind('}') else {
+        // A `}` before the `{` is malformed too. Slicing it would panic.
+        let Some(close) = s.rfind('}').filter(|close| *close > open) else {
             return (Vec::new(), true); // malformed / multi-line group → conservative
         };
         let inner = &s[open + 1..close];
@@ -2934,6 +2935,14 @@ fn parse_suppression_comment(rule_id: &str, line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `}` before the first `{` is a malformed group, not a panic. The
+    /// `fuzz_det_check_source` target found inputs of this shape.
+    #[test]
+    fn a_close_brace_before_the_group_is_malformed() {
+        assert_eq!(parse_use_bindings("x}{a"), (Vec::new(), true));
+        assert_eq!(parse_use_bindings("a::}b::{c"), (Vec::new(), true));
+    }
 
     #[test]
     fn is_workflow_attr_matches_bare_and_parameterised() {
