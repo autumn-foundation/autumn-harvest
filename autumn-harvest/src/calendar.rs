@@ -1369,17 +1369,81 @@ mod tests {
 
     #[test]
     fn add_business_days_scan_exhaustion_rejects() {
-        // n = 1 derives a scan bound of 1 * 7 + 30 = 37 calendar days.
-        // 60 consecutive exclusions starve the scan before it finds a business day.
-        let mut all = std::collections::BTreeSet::new();
-        let mut d = date("2026-07-02");
-        for _ in 0..60 {
-            all.insert(d);
-            d = d.succ_opt().expect("in range");
-        }
+        // 60 consecutive exclusions. The scan stops after 31 of them.
+        let all = closure("2026-07-02", 60);
         assert_eq!(
             add_business_days(utc("2026-07-02T09:00:00Z"), 1, &all),
-            Err(BusinessDayRejection::ScanExhausted { scanned_days: 37 }),
+            Err(BusinessDayRejection::ScanExhausted { scanned_days: 31 }),
+        );
+    }
+
+    /// `days` consecutive holiday dates, from `start`.
+    fn closure(start: &str, days: u64) -> std::collections::BTreeSet<NaiveDate> {
+        let start = date(start);
+        (0..days)
+            .map(|i| {
+                start
+                    .checked_add_days(chrono::Days::new(i))
+                    .expect("in range")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn smaller_n_is_never_rejected_where_larger_n_succeeds() {
+        // Issue #1968. The old bound `n * 7 + 30` grew with `n`.
+        // A long closure then rejected a small `n` and accepted a larger `n`.
+        // Wed 2026-07-01 starts each closure.
+        let anchor = utc("2026-07-01T09:00:00Z");
+        for days in 25..=45 {
+            let cal = closure("2026-07-01", days);
+            for n in 0..8 {
+                if add_business_days(anchor, n + 1, &cal).is_ok() {
+                    assert!(
+                        add_business_days(anchor, n, &cal).is_ok(),
+                        "{days}-day closure: n = {} resolves, n = {n} rejects",
+                        n + 1
+                    );
+                }
+            }
+        }
+
+        // A 31-day closure rejects every `n` with the same value.
+        let cal = closure("2026-07-01", 31);
+        for n in [0, 1, 2, 10] {
+            assert_eq!(
+                add_business_days(anchor, n, &cal),
+                Err(BusinessDayRejection::ScanExhausted { scanned_days: 31 }),
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_month_long_closure_resolves_for_every_n() {
+        // Wed 2026-07-01 to Thu 2026-07-30 is a 30-day closure.
+        // Fri 2026-07-31 is the first business day.
+        let anchor = utc("2026-07-01T09:00:00Z");
+        let cal = closure("2026-07-01", 30);
+        assert_eq!(
+            add_business_days(anchor, 0, &cal).map(|r| r.deadline),
+            Ok(utc("2026-07-31T09:00:00Z"))
+        );
+        for n in [1, 2, 10, MAX_BUSINESS_DAYS] {
+            assert!(add_business_days(anchor, n, &cal).is_ok(), "n = {n}");
+        }
+    }
+
+    #[test]
+    fn a_long_closure_after_the_anchor_rejects() {
+        // Tue 2026-06-30 is a business day, so n = 0 resolves.
+        // The 31-day closure from Wed 2026-07-01 stops n = 1.
+        let anchor = utc("2026-06-30T09:00:00Z");
+        let cal = closure("2026-07-01", 31);
+        assert!(add_business_days(anchor, 0, &cal).is_ok());
+        assert_eq!(
+            add_business_days(anchor, 1, &cal),
+            Err(BusinessDayRejection::ScanExhausted { scanned_days: 31 }),
         );
     }
 
@@ -1781,6 +1845,58 @@ mod tests {
                 Some(date("2026-01-15"))
             );
         }
+    }
+
+    // ── NaiveDate range limits (issue #1968) ──────────────────────────────────
+
+    #[test]
+    fn apply_skip_policy_next_at_naivedate_max_returns_none() {
+        let max = NaiveDate::MAX;
+        assert_eq!(
+            apply_skip_policy(max, SkipPolicy::RunNextBusinessDay, &[max], false),
+            None
+        );
+        // A date that is not excluded keeps its value.
+        assert_eq!(
+            apply_skip_policy(max, SkipPolicy::RunNextBusinessDay, &[], false),
+            Some(max)
+        );
+    }
+
+    #[test]
+    fn apply_skip_policy_prev_at_naivedate_min_returns_none() {
+        let min = NaiveDate::MIN;
+        assert_eq!(
+            apply_skip_policy(min, SkipPolicy::RunPrevBusinessDay, &[min], false),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_skip_policy_scan_stops_at_naivedate_range_limits() {
+        // The first step is in range. The second step is not.
+        let max = NaiveDate::MAX;
+        let before_max = max.pred_opt().expect("in range");
+        assert_eq!(
+            apply_skip_policy(
+                before_max,
+                SkipPolicy::RunNextBusinessDay,
+                &[before_max, max],
+                false
+            ),
+            None
+        );
+        let min = NaiveDate::MIN;
+        let after_min = min.succ_opt().expect("in range");
+        assert_eq!(
+            apply_skip_policy(
+                after_min,
+                SkipPolicy::RunPrevBusinessDay,
+                &[after_min, min],
+                false
+            ),
+            None
+        );
     }
 
     // ── preview_schedule_firings ──────────────────────────────────────────────
