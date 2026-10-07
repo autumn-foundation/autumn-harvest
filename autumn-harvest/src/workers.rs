@@ -1317,6 +1317,9 @@ pub struct PayloadPolicy {
     pub byte_hard_cap: Option<u64>,
     /// The history policy's history-bloat warning fraction.
     pub history_bloat_warn_fraction: f64,
+    /// The fleet-wide workflow execution timeout ceiling. It caps a run's
+    /// dispatch deadline and a continue-as-new successor's timeout.
+    pub max_workflow_execution_timeout: Option<std::time::Duration>,
     /// The history policy's continue-as-new deadline fraction.
     pub continue_as_new_deadline_fraction: f64,
     /// The payload offloader's threshold. `None` without an offloader.
@@ -1365,6 +1368,7 @@ impl PayloadPolicy {
             "event_hard_cap": self.event_hard_cap,
             "byte_hard_cap": self.byte_hard_cap,
             "history_bloat_warn_fraction": self.history_bloat_warn_fraction,
+            "max_workflow_execution_timeout": self.max_workflow_execution_timeout.map(duration_key),
             "continue_as_new_deadline_fraction": self.continue_as_new_deadline_fraction,
             "offload_threshold": self.offload_threshold,
             "offload_store_id": self.offload_store_id,
@@ -4180,6 +4184,10 @@ mod tests {
             },
             PayloadPolicy {
                 history_bloat_warn_fraction: 0.5,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_workflow_execution_timeout: Some(std::time::Duration::from_secs(1)),
                 ..base.clone()
             },
             PayloadPolicy {

@@ -1246,8 +1246,10 @@ impl HandlerRegistry {
     /// Some registry settings stay out, because they do not change how this
     /// worker runs a task:
     ///
-    /// - The workflow attempt, chain and execution ceilings shape a child or a
-    ///   successor run when it starts, as a start-time policy does.
+    /// - The workflow attempt and chain ceilings shape a retry, a child or a
+    ///   successor run when it starts, as a start-time policy does. The
+    ///   execution ceiling is in: it caps this run's dispatch deadline, and it
+    ///   decides whether a cross-type continue-as-new fails the run.
     /// - The signal handler metadata serves discovery only.
     /// - A WASM activity runs the module that the database marks active, so
     ///   every worker runs the same bytes. The binding's sandbox policy is in.
@@ -1265,6 +1267,7 @@ impl HandlerRegistry {
             event_hard_cap: self.history_policy.event_hard_cap(),
             byte_hard_cap: self.history_policy.byte_hard_cap(),
             history_bloat_warn_fraction: self.history_policy.history_bloat_warn_fraction(),
+            max_workflow_execution_timeout: self.max_workflow_execution_timeout,
             continue_as_new_deadline_fraction: self
                 .history_policy
                 .continue_as_new_deadline_fraction(),
@@ -40691,6 +40694,27 @@ mod tests {
             policy(base.with_byte_hard_cap(1 << 20)),
             policy(base.with_byte_hard_cap(1 << 20))
         );
+    }
+
+    /// Issue #1815: the execution timeout ceiling caps the run's dispatch
+    /// deadline. It also decides whether a cross-type continue-as-new can form
+    /// a deadline or fails the run. Workers with different ceilings end the
+    /// same task differently, so the ceiling is part of the cohort.
+    #[test]
+    fn payload_policy_holds_the_execution_timeout_ceiling() {
+        let policy = |ceiling: Option<std::time::Duration>| {
+            HandlerRegistry::new(vec![], vec![])
+                .with_max_workflow_execution_timeout(ceiling)
+                .payload_policy()
+        };
+        let hour = Some(std::time::Duration::from_secs(3600));
+        assert_ne!(policy(hour), policy(None), "a ceiling and none");
+        assert_ne!(
+            policy(hour),
+            policy(Some(std::time::Duration::from_secs(60))),
+            "a different ceiling"
+        );
+        assert_eq!(policy(hour), policy(hour));
     }
 
     /// Issue #1815: near the warning threshold, a workflow task counts its
