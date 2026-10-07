@@ -46,8 +46,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   So does an activity whose setup loses its database write. A failed
   deferral write counts too, for the retry budget, the rate limit, an open
   breaker in defer mode and the adaptive limit. When that write
-  fails with a transient database error, the dispatch loop releases the
-  claim first. The attempt then counts with the release time, and not at all
+  fails with a transient database error, or with a transaction conflict
+  whose retries ran out, the dispatch loop releases the claim first. The attempt then counts with the release time, and not at all
   when a peer took the claim.
   A cancelled activity attempt is not counted, and neither is one whose
   claim a later owner took before it finalized. An attempt that the timeout

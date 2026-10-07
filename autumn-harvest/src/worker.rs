@@ -19491,7 +19491,7 @@ fn record_activity_outcome(
     failed: bool,
     error: Option<&HarvestError>,
 ) {
-    if failed && error.is_some_and(crate::pool::is_transient_db_error) {
+    if failed && error.is_some_and(releases_activity_claim) {
         deferred.defer();
     } else {
         window.record(failed, started.elapsed());
@@ -36915,8 +36915,8 @@ impl Worker {
                     };
                     #[cfg(not(feature = "db"))]
                     let recovery = ClaimRecovery::Applied;
-                    // An activity defers only a transient error, which the
-                    // release above handles.
+                    // An activity defers only an error that the release above
+                    // handles. See `releases_activity_claim`.
                     if workflow_failed == Some(true) || deferred_failure.take() {
                         record_failed_task(&task_outcomes, recovery, dispatched_at.elapsed());
                     }
@@ -37833,10 +37833,15 @@ async fn quarantine_workflow_task_timeout_outcome(
 /// database error is not released: it may repeat, and a release would skip
 /// the retry policy.
 fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
-    task_type == "workflow"
-        || (task_type == "activity"
-            && (crate::pool::is_transient_db_error(error)
-                || crate::tx_retry::classify_conflict(error).is_some()))
+    task_type == "workflow" || (task_type == "activity" && releases_activity_claim(error))
+}
+
+/// Whether the dispatch loop releases an activity's claim after `error`: a
+/// transient database error, or a transaction conflict whose retries ran out
+/// (issues #1822, #1815). The outlier window defers the sample of exactly
+/// these failures until the release.
+fn releases_activity_claim(error: &HarvestError) -> bool {
+    crate::pool::is_transient_db_error(error) || crate::tx_retry::classify_conflict(error).is_some()
 }
 
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
@@ -46099,6 +46104,38 @@ mod tests {
             1,
             "an ambiguous claim is released, so it is skipped"
         );
+    }
+
+    /// Issue #1815: the dispatch loop releases the claim of an activity
+    /// whose deadlock or serialization retries ran out (issue #1822). The
+    /// sample waits for that release, as for a transient error.
+    #[test]
+    fn an_exhausted_transaction_conflict_waits_for_the_claim_release() {
+        let window = crate::worker_outlier::TaskOutcomeWindow::default();
+        let deferred = DeferredActivityFailure::default();
+        for message in [
+            "deadlock detected",
+            "could not serialize access due to concurrent update",
+        ] {
+            let conflict = crate::error::database_error(message);
+            assert!(releases_claim_after_error("activity", &conflict));
+            record_activity_outcome(
+                &window,
+                &deferred,
+                std::time::Instant::now(),
+                true,
+                Some(&conflict),
+            );
+            assert_eq!(
+                window.snapshot().tasks,
+                0,
+                "{message}: no sample before the release"
+            );
+            assert!(
+                deferred.take(),
+                "{message}: the failure waits for the release"
+            );
+        }
     }
 
     /// Issue #1815: a transient setup error goes back to the dispatch loop,
