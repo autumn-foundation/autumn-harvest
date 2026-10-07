@@ -22,7 +22,7 @@ use autumn_harvest::telemetry::{DbOp, MetricsRecorder, NoOpPropagator, Telemetry
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::worker_outlier::{
-    OutlierConfig, OutlierDimension, TaskOutcomeWindow, WorkerTaskStats,
+    CohortEpoch, OutlierConfig, OutlierDimension, TaskOutcomeWindow, WorkerTaskStats,
 };
 use autumn_harvest::workers::{self, LiveWorkerTaskStats, OutlierProbe};
 use autumn_harvest::{
@@ -557,9 +557,9 @@ async fn a_late_write_of_an_older_snapshot_is_dropped() {
     let queue = unique_id("late-q");
     let id = unique_id("w-late");
     register(&mut conn, &id, &queue).await;
-    let (_, older, older_seq) = workers::capture_task_stats(&window(40, None), || "c".to_owned());
-    let (_, newer, newer_seq) =
-        workers::capture_task_stats(&window(60, Some(2)), || "c".to_owned());
+    let key = || ("c".to_owned(), CohortEpoch::default());
+    let (_, older, older_seq) = workers::capture_task_stats(&window(40, None), key);
+    let (_, newer, newer_seq) = workers::capture_task_stats(&window(60, Some(2)), key);
     assert!(
         newer_seq > older_seq,
         "a later capture has a higher sequence"

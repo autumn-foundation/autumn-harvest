@@ -82,6 +82,20 @@ impl WorkerTaskStats {
     }
 }
 
+/// When the policy behind a cohort key last changed (issue #1815).
+///
+/// The codec registry stamps each key change as it happens. `generation`
+/// counts the changes, so a change back to an earlier key is still a change.
+/// `changed_at` is the instant of the last one. The default stands for a
+/// cohort with no runtime changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CohortEpoch {
+    /// How many times the policy changed.
+    pub generation: u64,
+    /// When the policy last changed. `None` when it never changed.
+    pub changed_at: Option<Instant>,
+}
+
 /// The samples of a [`TaskOutcomeWindow`], and the instant its cohort last
 /// changed.
 #[derive(Debug, Default)]
@@ -109,8 +123,9 @@ struct Sample {
 #[derive(Debug)]
 pub struct TaskOutcomeWindow {
     samples: Mutex<Samples>,
-    // The cohort of the last snapshot. A new cohort clears the samples.
-    cohort: Mutex<Option<String>>,
+    // The cohort of the last snapshot, and its epoch generation. A change in
+    // either drops the samples of the old policy.
+    cohort: Mutex<Option<(String, u64)>>,
     capacity: usize,
     max_age: Duration,
 }
@@ -212,7 +227,14 @@ impl TaskOutcomeWindow {
     /// then judged only after it records enough samples in the new cohort.
     #[must_use]
     pub fn snapshot_in_cohort(&self, cohort: &str) -> WorkerTaskStats {
-        self.enter_cohort(cohort);
+        self.snapshot_in_cohort_at(cohort, CohortEpoch::default())
+    }
+
+    /// [`Self::snapshot_in_cohort`] for a cohort whose policy last changed at
+    /// `epoch`. See [`Self::enter_cohort_at`].
+    #[must_use]
+    pub fn snapshot_in_cohort_at(&self, cohort: &str, epoch: CohortEpoch) -> WorkerTaskStats {
+        self.enter_cohort_at(cohort, epoch);
         self.snapshot()
     }
 
@@ -222,19 +244,42 @@ impl TaskOutcomeWindow {
     /// the samples. A task dispatched before the change and recorded after it
     /// is dropped too. The worker enters its cohort before any task runs.
     pub fn enter_cohort(&self, cohort: &str) {
+        self.enter_cohort_at(cohort, CohortEpoch::default());
+    }
+
+    /// Enter `cohort`, whose policy last changed at `epoch` (issue #1815).
+    ///
+    /// A new key or a new generation is a change. A change back to an earlier
+    /// key still moves the generation. The window then keeps only the tasks
+    /// dispatched at or after `epoch.changed_at`, because they ran under the
+    /// new policy. Without a change instant, the change counts from now. The
+    /// cut-off never moves back.
+    pub fn enter_cohort_at(&self, cohort: &str, epoch: CohortEpoch) {
         let mut current = self
             .cohort
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.as_deref() == Some(cohort) {
+        let entered = Some((cohort, epoch.generation));
+        if current
+            .as_ref()
+            .map(|(key, generation)| (key.as_str(), *generation))
+            == entered
+        {
             return;
         }
         if current.is_some() {
             let mut guard = self.lock();
-            guard.queue.clear();
-            guard.since = Some(Instant::now());
+            let changed = epoch.changed_at.unwrap_or_else(Instant::now);
+            let since = guard.since.map_or(changed, |old| old.max(changed));
+            guard.queue.retain(|sample| {
+                sample
+                    .at
+                    .checked_sub(sample.latency)
+                    .is_some_and(|dispatched| dispatched >= since)
+            });
+            guard.since = Some(since);
         }
-        *current = Some(cohort.to_owned());
+        *current = Some((cohort.to_owned(), epoch.generation));
     }
 
     /// A poisoned lock still holds valid samples, so the window keeps them.
@@ -526,6 +571,77 @@ mod tests {
         assert_eq!(window.snapshot().tasks, 0, "an old-cohort task is dropped");
         window.record_at(now, false, Duration::ZERO);
         assert_eq!(window.snapshot().tasks, 1, "a new-cohort task counts");
+    }
+
+    /// Issue #1815: the codec registry stamps a key change when it happens.
+    /// A task dispatched after the change ran under the new policy, so it
+    /// stays, even when the next capture notices the change later.
+    #[test]
+    fn a_cohort_change_keeps_tasks_dispatched_after_it() {
+        let window = TaskOutcomeWindow::default();
+        window.enter_cohort("old");
+        let base = Instant::now();
+        let changed_at = base + Duration::from_millis(100);
+        // Dispatched before the change, ended after it.
+        window.record_at(
+            base + Duration::from_millis(150),
+            true,
+            Duration::from_millis(100),
+        );
+        // Dispatched and ended after the change, before the capture.
+        window.record_at(
+            base + Duration::from_millis(200),
+            false,
+            Duration::from_millis(50),
+        );
+        let new = CohortEpoch {
+            generation: 1,
+            changed_at: Some(changed_at),
+        };
+        let stats = window.snapshot_in_cohort_at("new", new);
+        assert_eq!(
+            (stats.tasks, stats.failures),
+            (1, 0),
+            "only the task dispatched after the change stays"
+        );
+        // Dispatched after the change, ended after the capture.
+        window.record_at(
+            base + Duration::from_millis(400),
+            false,
+            Duration::from_millis(250),
+        );
+        assert_eq!(window.snapshot_in_cohort_at("new", new).tasks, 2);
+    }
+
+    /// Issue #1815: a change from one key to another and back again before a
+    /// capture leaves the same key string. The generation still moves, so the
+    /// samples taken under the other key are dropped.
+    #[test]
+    fn a_change_back_to_the_same_key_still_restarts_the_window() {
+        let window = TaskOutcomeWindow::default();
+        window.enter_cohort("a");
+        let base = Instant::now();
+        // Dispatched under key B, between the two changes.
+        window.record_at(
+            base + Duration::from_millis(60),
+            true,
+            Duration::from_millis(10),
+        );
+        let back_to_a = CohortEpoch {
+            generation: 2,
+            changed_at: Some(base + Duration::from_millis(100)),
+        };
+        assert_eq!(
+            window.snapshot_in_cohort_at("a", back_to_a).tasks,
+            0,
+            "a sample from the other key does not stay in this cohort"
+        );
+        window.record_at(
+            base + Duration::from_millis(200),
+            false,
+            Duration::from_millis(10),
+        );
+        assert_eq!(window.snapshot_in_cohort_at("a", back_to_a).tasks, 1);
     }
 
     #[test]

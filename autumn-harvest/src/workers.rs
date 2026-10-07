@@ -864,7 +864,8 @@ impl OutlierProbe {
     /// the window drops the samples taken before it.
     #[must_use]
     pub fn seeded(self) -> Self {
-        self.window.enter_cohort(&self.cohort_key());
+        let (cohort, epoch) = self.cohort_and_epoch();
+        self.window.enter_cohort_at(&cohort, epoch);
         self
     }
 
@@ -877,9 +878,38 @@ impl OutlierProbe {
     /// worker runs, so they are read now, not at startup.
     #[must_use]
     pub fn cohort_key(&self) -> String {
+        self.cohort_and_epoch().0
+    }
+
+    /// [`Self::cohort_key`] and the epoch of the last codec key change, from
+    /// one read (issue #1815).
+    ///
+    /// The codec registry stamps each key change when it happens. The window
+    /// then keeps a task dispatched after the change, even when this tick
+    /// notices the change later. A change back to an earlier key still moves
+    /// the epoch.
+    #[must_use]
+    pub fn cohort_and_epoch(&self) -> (String, crate::worker_outlier::CohortEpoch) {
         let Some(codecs) = &self.codecs else {
-            return self.cohort.clone();
+            return (
+                self.cohort.clone(),
+                crate::worker_outlier::CohortEpoch::default(),
+            );
         };
+        let state = codecs.key_state();
+        let epoch = crate::worker_outlier::CohortEpoch {
+            generation: state.epoch.generation,
+            changed_at: state.epoch.changed_at,
+        };
+        (self.key_with_codecs(codecs, &state), epoch)
+    }
+
+    /// [`OutlierProbe::cohort`] with the codec ids and `state` added.
+    fn key_with_codecs(
+        &self,
+        codecs: &crate::payload_codec::PayloadCodecs,
+        state: &crate::payload_codec::KeyState,
+    ) -> String {
         match serde_json::from_str::<serde_json::Value>(&self.cohort) {
             Ok(serde_json::Value::Object(mut key)) => {
                 // A worker decodes only the codecs it has registered. One
@@ -895,11 +925,13 @@ impl OutlierProbe {
                 // The active key encodes new payloads, so an activation
                 // changes how this worker runs a task. One read gives a pair
                 // that the registry held at one time.
-                let (key_ids, active_key_id) = codecs.key_ids();
-                key.insert("codec_key_ids".to_owned(), serde_json::json!(key_ids));
+                key.insert(
+                    "codec_key_ids".to_owned(),
+                    serde_json::json!(state.registered),
+                );
                 key.insert(
                     "active_codec_key_id".to_owned(),
-                    serde_json::json!(active_key_id),
+                    serde_json::json!(state.active),
                 );
                 serde_json::Value::Object(key).to_string()
             }
@@ -1550,14 +1582,14 @@ pub enum SnapshotWrite {
 /// window back to the old cohort and publish it with the higher sequence.
 pub fn capture_task_stats(
     window: &TaskOutcomeWindow,
-    cohort_key: impl FnOnce() -> String,
+    cohort_key: impl FnOnce() -> (String, crate::worker_outlier::CohortEpoch),
 ) -> (String, WorkerTaskStats, i64) {
     static CAPTURE: Mutex<()> = Mutex::new(());
     let _capture = CAPTURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cohort = cohort_key();
-    let stats = window.snapshot_in_cohort(&cohort);
+    let (cohort, epoch) = cohort_key();
+    let stats = window.snapshot_in_cohort_at(&cohort, epoch);
     (cohort, stats, next_snapshot_seq())
 }
 
@@ -1846,7 +1878,7 @@ pub async fn run_outlier_tick(
     // first write then moves the counter above it, and a fresh capture follows.
     let mut cohort = String::new();
     for _ in 0..2 {
-        let (key, own, seq) = capture_task_stats(&probe.window, || probe.cohort_key());
+        let (key, own, seq) = capture_task_stats(&probe.window, || probe.cohort_and_epoch());
         cohort = key;
         if write_task_stats_snapshot(conn, worker_id, &cohort, &own, seq).await?
             != SnapshotWrite::Foreign
@@ -4361,11 +4393,11 @@ mod tests {
         // A Windows checkout has CRLF line ends. The end search needs LF.
         let src = include_str!("workers.rs").replace("\r\n", "\n");
         let start = src
-            .find("pub fn cohort_key(&self)")
-            .expect("cohort_key exists");
+            .find("pub fn cohort_and_epoch(&self)")
+            .expect("cohort_and_epoch exists");
         let body = &src[start..];
-        let body = &body[..body.find("\n    }\n").expect("cohort_key ends")];
-        assert!(body.contains("codecs.key_ids()"), "one snapshot read");
+        let body = &body[..body.find("\n    }\n").expect("cohort_and_epoch ends")];
+        assert!(body.contains("codecs.key_state()"), "one snapshot read");
         for split in ["registered_key_ids()", "active_key_id()"] {
             assert!(!body.contains(split), "no separate read: {split}");
         }
@@ -4391,7 +4423,7 @@ mod tests {
         codecs
             .register_key("k1", std::sync::Arc::new(IdentityCodec))
             .expect("register a key");
-        let (_, first, _) = super::capture_task_stats(&probe.window, || probe.cohort_key());
+        let (_, first, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch());
         assert_eq!(first, crate::worker_outlier::WorkerTaskStats::default());
     }
 
@@ -4411,14 +4443,46 @@ mod tests {
                 .window
                 .record(true, std::time::Duration::from_millis(40));
         }
-        let (_, old, _) = super::capture_task_stats(&probe.window, || probe.cohort_key());
+        let (_, old, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch());
         assert_eq!(old.failures, 30);
 
         codecs
             .register_key("k1", std::sync::Arc::new(IdentityCodec))
             .expect("register a key");
-        let (_, new, _) = super::capture_task_stats(&probe.window, || probe.cohort_key());
+        let (_, new, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch());
         assert_eq!(new, crate::worker_outlier::WorkerTaskStats::default());
+    }
+
+    /// Issue #1815: a change to another active key and back again before a
+    /// tick leaves the same cohort key. The codec epoch still moves, so the
+    /// samples taken before the changes do not stay in the cohort.
+    #[test]
+    fn a_codec_key_change_and_back_restarts_the_window() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        for key in ["k1", "k2"] {
+            codecs
+                .register_key(key, std::sync::Arc::new(IdentityCodec))
+                .expect("register a key");
+        }
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        }
+        .seeded();
+        let before = probe.cohort_key();
+        for _ in 0..30 {
+            probe
+                .window
+                .record(true, std::time::Duration::from_millis(40));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        codecs.set_active_key("k2").expect("activate k2");
+        codecs.set_active_key("k1").expect("activate k1 again");
+        assert_eq!(probe.cohort_key(), before, "the same key string");
+        let (_, stats, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch());
+        assert_eq!(stats, crate::worker_outlier::WorkerTaskStats::default());
     }
 
     /// Issue #1815: the cohort key is read inside the serialized capture. A
@@ -4437,15 +4501,24 @@ mod tests {
                 released
                     .recv_timeout(std::time::Duration::from_secs(10))
                     .expect("released");
-                "old".to_owned()
+                (
+                    "old".to_owned(),
+                    crate::worker_outlier::CohortEpoch::default(),
+                )
             })
         });
         read_started
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the old heartbeat reads its key");
         let new_window = std::sync::Arc::clone(&window);
-        let new =
-            std::thread::spawn(move || super::capture_task_stats(&new_window, || "new".to_owned()));
+        let new = std::thread::spawn(move || {
+            super::capture_task_stats(&new_window, || {
+                (
+                    "new".to_owned(),
+                    crate::worker_outlier::CohortEpoch::default(),
+                )
+            })
+        });
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(
             !new.is_finished(),

@@ -35,9 +35,11 @@ heartbeat check only. A worker that was alive but sick passed that check.
   at most 1024 samples, from the last 5 minutes or two heartbeat intervals,
   whichever is longer. A slow heartbeat then still publishes every outcome.
   When a codec key reload moves the worker into a new cohort, the window
-  starts empty, so outcomes from the old cohort do not flag it. A task
-  dispatched before the reload is dropped when it ends, and the worker
-  enters its cohort before any task runs.
+  drops the tasks dispatched before the reload, so outcomes from the old
+  cohort do not flag it. The codec registry stamps each key change when it
+  happens, so a task dispatched after the change stays, and a change back
+  to an earlier key still restarts the window. The worker enters its cohort
+  before any task runs.
 - A failed activity attempt counts as a failure. So does an attempt that an
   open circuit breaker rejects, because the breaker belongs to the worker.
   An activity that succeeds but does not finalize also counts as a failure.
