@@ -302,6 +302,45 @@ async fn an_admin_write_with_a_stalled_body_does_not_block_a_bump() {
     );
 }
 
+/// Every fence refusal of an admin write is a 503 (issue #1823). A row that
+/// another shard provisions after startup refuses the write as unpinned. A
+/// retry must reach an authoritative node, so that refusal is a 5xx too.
+#[tokio::test]
+async fn an_unpinned_row_refuses_an_admin_write_with_503() {
+    let _serial = REGISTRY_SERIAL.lock().await;
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut direct = AsyncPgConnection::establish(&url).await.expect("connect");
+    ensure_generation_row(&mut direct, ShardId::new(0))
+        .await
+        .expect("provision generation 0");
+    FenceRegistry::clear();
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::INITIAL)],
+        ShardId::new(0),
+    )
+    .expect("no conflicting pin in this test");
+    // Another logical shard starts on this database after the pin.
+    ensure_generation_row(&mut direct, ShardId::new(9))
+        .await
+        .expect("provision a later row");
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/admin/queues/unpinned-row/pause",
+        json!({"reason": "drill"}),
+    )
+    .await;
+    FenceRegistry::clear();
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a fence refusal must be a 503: {body}"
+    );
+}
+
 /// A lost fence session stops an admin write in flight (issue #1823). The
 /// server then frees the pass lock, so the handler must not write after it.
 #[tokio::test]

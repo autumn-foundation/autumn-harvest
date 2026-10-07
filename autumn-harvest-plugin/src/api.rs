@@ -5829,9 +5829,12 @@ pub(crate) async fn enforce_dr_fence(
         return Ok(Vec::new());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
+    // Every refusal here is a 503, whatever its error kind. A retry must
+    // reach an authoritative node, and a webhook releases its delivery id
+    // only on a 5xx.
     begin_fenced_tick(pool.sharded_pool())
         .await
-        .map_err(map_error)
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))
 }
 
 /// Whether the mutation gate admits a caller (issue #1802).

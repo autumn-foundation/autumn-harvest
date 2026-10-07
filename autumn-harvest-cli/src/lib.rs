@@ -6277,8 +6277,7 @@ async fn database_fence(
             shards.push(row.as_i32());
         }
     }
-    let mut guards = Vec::with_capacity(shards.len() + 1);
-    let mut guarded = Vec::with_capacity(shards.len());
+    let mut plan = Vec::with_capacity(shards.len());
     for shard in shards {
         let Some(expected) =
             expected_generation_for(expect_generation, shard).map_err(|e| e.to_string())?
@@ -6292,18 +6291,28 @@ async fn database_fence(
                  --expect-generation <N> for every shard, or {shard}=<N>."
             ));
         };
-        let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;
-        guards.push(
+        plan.push((ShardId::new(shard), expected));
+    }
+    // Issue #1823: every connection opens first, then every pass lock is
+    // taken together. Each lock waits a bounded time. A bump that holds one
+    // lock then fails the command fast. Its other guards drop before a bump
+    // on another shard times out.
+    let conns = futures::future::try_join_all(plan.iter().map(|_| dr_connect(dsn)))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut guards = futures::future::try_join_all(conns.into_iter().zip(&plan).map(
+        |(conn, (shard, expected))| {
             autumn_harvest::replication::begin_fenced_pass_on(
                 conn,
-                ShardId::new(shard),
-                autumn_harvest::replication::ShardGeneration::new(expected),
+                *shard,
+                autumn_harvest::replication::ShardGeneration::new(*expected),
             )
-            .await
-            .map_err(|e| e.to_string())?,
-        );
-        guarded.push(ShardId::new(shard));
-    }
+        },
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
+    guards.reserve(1);
+    let guarded: Vec<ShardId> = plan.iter().map(|(shard, _)| *shard).collect();
     // Frozen even when the table is empty: the first row must not appear
     // mid-command either.
     let conn = dr_connect(dsn).await.map_err(|e| e.to_string())?;

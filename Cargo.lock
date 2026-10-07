@@ -395,6 +395,7 @@ dependencies = [
  "clap",
  "crossterm",
  "diesel-async",
+ "futures",
  "percent-encoding",
  "ratatui",
  "reqwest",
