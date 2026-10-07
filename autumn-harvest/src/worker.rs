@@ -1335,8 +1335,11 @@ impl HandlerRegistry {
     /// it builds a task context and resolves a continue-as-new input. It also
     /// holds whether the workflow is a unified DAG. A continue-as-new into a
     /// DAG is refused. It also holds the quota, which a detached child start
-    /// and a continue-as-new enforce inside the task. Deadlines and start-time policies stay out: they shape
-    /// a later run, not the task that this worker runs.
+    /// and a continue-as-new enforce inside the task. It also holds the
+    /// declared execution timeout. That timeout sets the run's dispatch
+    /// deadline, and it decides whether a cross-type continue-as-new can form
+    /// a deadline. Other start-time policies stay out: they shape a later run,
+    /// not the task that this worker runs.
     fn workflow_policies(&self) -> Vec<(String, serde_json::Value)> {
         let mut policies: Vec<(String, serde_json::Value)> = self
             .workflows
@@ -1356,6 +1359,9 @@ impl HandlerRegistry {
                         quota.max_history_bytes,
                         quota.max_dead_letters,
                     ])),
+                    "execution_timeout": info
+                        .execution_timeout
+                        .map(crate::workers::duration_key),
                 });
                 (name.clone(), policy)
             })
@@ -40853,6 +40859,18 @@ mod tests {
             quota(tenant.with_max_active_executions(2)),
             "a different quota cap"
         );
+        let timeout = |secs: u64| {
+            HandlerRegistry::new(
+                vec![WorkflowInfo {
+                    execution_timeout: Some(std::time::Duration::from_secs(secs)),
+                    ..wf(None)
+                }],
+                vec![],
+            )
+            .payload_policy()
+        };
+        assert_ne!(plain, timeout(3600), "a declared execution timeout");
+        assert_ne!(timeout(3600), timeout(60), "a different declared timeout");
         assert_eq!(
             plain,
             HandlerRegistry::new(vec![wf(None)], vec![]).payload_policy()

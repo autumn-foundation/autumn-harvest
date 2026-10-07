@@ -99,7 +99,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
   activity's own retry, start-to-close and schedule-to-close defaults, the registry's
   local-activity defaults and retry-after ceiling, the hot-code-swap
   module-host policy, each workflow's effective input cap, DAG
-  classification and quota, the declarative query and update handlers, and the workflow
+  classification, quota and declared execution timeout, the declarative
+  query and update handlers, and the workflow
   log policy), the registered payload codec ids and default codec, and
   the registered and active codec key ids, which the
   heartbeat reads on every tick because a reload can change them, with
