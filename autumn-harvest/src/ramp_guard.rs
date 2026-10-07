@@ -507,6 +507,27 @@ pub const fn mark_abort_reported_query() -> &'static str {
                jsonb_build_object('id', $2::text, 'reported', false))"
 }
 
+/// Bounds the lock and statement waits of the open transaction to
+/// `timeout_ms`, then checks write authority.
+///
+/// Issue #1823: a process that lost write authority writes no ramp change.
+/// The fence check reads the generation rows in this transaction, so the
+/// same bounds apply to it.
+#[cfg(feature = "db")]
+async fn bound_and_fence(
+    conn: &mut diesel_async::AsyncPgConnection,
+    timeout_ms: u128,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+    for setting in ["lock_timeout", "statement_timeout"] {
+        diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+    crate::replication::assert_database_fence(conn).await
+}
+
 /// Mark the abort markers of `ramp_id` on `queue` as reported.
 ///
 /// Returns `true` when this call changed the row. A guard that recovers an
@@ -528,12 +549,7 @@ pub async fn mark_abort_reported(
     let timeout_ms = bound.as_millis().max(1);
     let id = ramp_id.to_string();
     conn.transaction(async |conn| -> crate::error::HarvestResult<bool> {
-        for setting in ["lock_timeout", "statement_timeout"] {
-            diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-        }
+        bound_and_fence(conn, timeout_ms).await?;
         let changed = diesel::sql_query(mark_abort_reported_query())
             .bind::<Text, _>(queue)
             .bind::<Text, _>(&id)
@@ -597,12 +613,7 @@ pub async fn claim_unreported_abort(
     let lease_ms = i64::try_from(lease.as_millis()).unwrap_or(i64::MAX);
     let id = ramp_id.to_string();
     conn.transaction(async |conn| -> crate::error::HarvestResult<bool> {
-        for setting in ["lock_timeout", "statement_timeout"] {
-            diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-        }
+        bound_and_fence(conn, timeout_ms).await?;
         let changed = diesel::sql_query(claim_unreported_abort_query())
             .bind::<Text, _>(queue)
             .bind::<Text, _>(&id)
@@ -704,12 +715,7 @@ async fn clear_ramp(
     let timeout_ms = bound.as_millis().max(1);
     conn.transaction(
         async |conn| -> crate::error::HarvestResult<Option<uuid::Uuid>> {
-            for setting in ["lock_timeout", "statement_timeout"] {
-                diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
+            bound_and_fence(conn, timeout_ms).await?;
             let cleared: Option<Cleared> = diesel::sql_query(abort_ramp_query())
                 .bind::<Text, _>(queue)
                 .bind::<Text, _>(base)
@@ -1324,12 +1330,7 @@ async fn record_abort_tombstones(
         conn.build_transaction()
         .read_committed()
         .run(async |conn| -> crate::error::HarvestResult<()> {
-            for setting in ["lock_timeout", "statement_timeout"] {
-                diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
+            bound_and_fence(conn, timeout_ms).await?;
             // A ramp writer of the queue holds this lock for its whole write.
             // So no write can read the ledger before the tombstone and the
             // row after the prune.
@@ -1484,12 +1485,7 @@ async fn stamp_report_id(
         let mut conn = pool.get().await.map_err(|e| e.to_string())?;
         conn.transaction(
             async |conn| -> crate::error::HarvestResult<Option<uuid::Uuid>> {
-                for setting in ["lock_timeout", "statement_timeout"] {
-                    diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-                }
+                bound_and_fence(conn, timeout_ms).await?;
                 let stamped: Option<Stamped> = diesel::sql_query(
                     "UPDATE harvest_build_policies SET ramp_id = $5 \
                      WHERE queue_name = $1 AND build_id = $2 AND target_build_id = $3 \
@@ -1562,12 +1558,7 @@ async fn prune_finished_markers(
     let prune = async {
         let mut conn = pool.get().await.map_err(|e| e.to_string())?;
         conn.transaction(async |conn| -> crate::error::HarvestResult<()> {
-            for setting in ["lock_timeout", "statement_timeout"] {
-                diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
+            bound_and_fence(conn, timeout_ms).await?;
             diesel::sql_query(prune_abort_markers_query())
                 .bind::<Text, _>(queue)
                 .bind::<Array<Text>, _>(&ids)

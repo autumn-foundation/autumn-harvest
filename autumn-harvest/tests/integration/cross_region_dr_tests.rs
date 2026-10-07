@@ -3368,6 +3368,37 @@ async fn a_pass_waiting_on_one_database_does_not_block_a_bump_on_another() {
     );
 }
 
+/// A ramp-guard write asserts the fence in its own transaction (issue
+/// #1823). The guard runs in an API process with its own token, outside any
+/// tick fence. After a bump, it must change no build policy.
+#[tokio::test]
+async fn a_superseded_pin_refuses_a_ramp_guard_write() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rampfence");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+    bump_generation(&mut conn, shard, "failover", "test")
+        .await
+        .expect("bump");
+
+    let written = autumn_harvest::ramp_guard::mark_abort_reported(
+        &mut conn,
+        "q",
+        uuid::Uuid::new_v4(),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        matches!(
+            written,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a ramp-guard write after a bump must fail as fenced: {written:?}"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.
