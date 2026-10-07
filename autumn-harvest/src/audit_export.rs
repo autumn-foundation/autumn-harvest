@@ -1770,7 +1770,10 @@ fn index_build_finished(key: &BuildKey, end: BuildEnd) {
 /// The connection is never pooled. It closes when this function returns, or
 /// when the caller drops the future. Postgres then cancels a running build and
 /// leaves an invalid index, which the next attempt drops and rebuilds.
-#[cfg(feature = "db")]
+///
+/// The exporter itself builds under a fence, through
+/// [`build_unexported_index_fenced`]. This unfenced form serves the tests.
+#[cfg(all(feature = "db", test))]
 async fn build_unexported_index_on_dedicated_connection(
     dsn: &str,
     schema: &str,
