@@ -27658,7 +27658,7 @@ async fn handle_ambiguous_terminal_write_claim(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn process_task(
     pool: &DbPool,
     registry: Arc<HandlerRegistry>,

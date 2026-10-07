@@ -489,9 +489,9 @@ async fn flush(
             beat.sent_order.elapsed(),
         )
         .await;
-        let wrote = write_started.elapsed().as_secs_f64();
+        let latency = write_started.elapsed().as_secs_f64();
         for shard in shards.iter() {
-            metrics.record_db_query_duration(crate::telemetry::DbOp::Heartbeat, *shard, wrote);
+            metrics.record_db_query_duration(crate::telemetry::DbOp::Heartbeat, *shard, latency);
         }
         let connection_works = match &written {
             Ok(write) => *write == ClaimWrite::Applied,
