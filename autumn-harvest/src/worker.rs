@@ -34847,6 +34847,7 @@ impl Worker {
                         workflow_panic_max_attempts: self.config.workflow_panic_max_attempts,
                         poison_pill_threshold: self.config.poison_pill_threshold,
                         cancellation_grace_period: self.config.cancellation_grace_period,
+                        dr_fencing: self.config.dr.fencing,
                     },
                     payload: self.registry.payload_policy(),
                 }),

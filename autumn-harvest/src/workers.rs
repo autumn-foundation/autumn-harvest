@@ -1457,6 +1457,10 @@ pub struct ExecutionPolicy {
     /// cancellation runs this long before the timeout is recorded. So the
     /// period adds to the latency that the window records.
     pub cancellation_grace_period: std::time::Duration,
+    /// `dr_fencing`. A fenced worker checks its shard generation in each
+    /// claim query and before each history persist. That check adds to the
+    /// latency that the window records.
+    pub dr_fencing: bool,
 }
 
 impl Default for ExecutionPolicy {
@@ -1471,6 +1475,7 @@ impl Default for ExecutionPolicy {
             workflow_panic_max_attempts: 3,
             poison_pill_threshold: 3,
             cancellation_grace_period: std::time::Duration::from_secs(5),
+            dr_fencing: false,
         }
     }
 }
@@ -1488,6 +1493,7 @@ impl ExecutionPolicy {
             // one setting.
             "poison_pill_threshold": self.poison_pill_threshold.max(0),
             "cancellation_grace_period": duration_key(self.cancellation_grace_period),
+            "dr_fencing": self.dr_fencing,
         })
     }
 }
@@ -4221,6 +4227,10 @@ mod tests {
             },
             ExecutionPolicy {
                 cancellation_grace_period: Duration::from_secs(1),
+                ..base
+            },
+            ExecutionPolicy {
+                dr_fencing: true,
                 ..base
             },
         ];
