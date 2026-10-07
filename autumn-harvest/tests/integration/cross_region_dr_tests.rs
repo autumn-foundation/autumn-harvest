@@ -3211,6 +3211,89 @@ async fn a_missing_generation_row_stops_a_database_wide_write() {
     );
 }
 
+/// A fenced timeout scanner leaves its lease alone on shutdown (issue
+/// #1823). The promoted region may hold the lease under the same worker id.
+/// A stale release would expire it.
+#[tokio::test]
+async fn a_fenced_timeout_scanner_does_not_release_its_lease_on_shutdown() {
+    #[derive(diesel::QueryableByName)]
+    struct Live {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    async fn live_leases(conn: &mut AsyncPgConnection) -> i64 {
+        let rows: Vec<Live> = diesel::sql_query(
+            "SELECT count(*) AS n FROM harvest_scanner_leases \
+             WHERE holder = 'dr-holder' AND lease_until > NOW()",
+        )
+        .load(conn)
+        .await
+        .expect("read the lease");
+        <[Live]>::first(&rows).map_or(0, |row| row.n)
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("leaseshut");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+
+    // Open a connection now. The checker's checkout is bounded by its 50 ms
+    // tick, which may be too short to open one.
+    let pool = dr_pool(&url);
+    drop(pool.get().await.expect("connection"));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let checker = autumn_harvest::timeout::spawn_coordinated_timeout_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(50),
+        std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        std::time::Duration::from_secs(5),
+        None,
+        vec![shard],
+        std::sync::Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        Some(shard),
+        Some(shard),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+        autumn_harvest::scanner_lease::ScannerCoordination::elected("dr-holder"),
+        100,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while live_leases(&mut conn).await == 0 {
+        if std::time::Instant::now() >= deadline {
+            #[derive(diesel::QueryableByName, Debug)]
+            struct Row {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                row: String,
+            }
+            let rows: Vec<Row> = diesel::sql_query(
+                "SELECT concat_ws(' ', shard_id, scanner, holder, lease_until > NOW()) AS row \
+                 FROM harvest_scanner_leases",
+            )
+            .load(&mut conn)
+            .await
+            .unwrap_or_default();
+            panic!("the scanner must take its lease: {rows:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    bump_generation(&mut conn, shard, "failover", "test")
+        .await
+        .expect("bump");
+    cancel.cancel();
+    let _ = checker.await;
+
+    assert_eq!(
+        live_leases(&mut conn).await,
+        1,
+        "a fenced scanner must not expire the lease on shutdown"
+    );
+}
+
 /// A worker writes nothing to a held shard (issue #1823). The shard may be
 /// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
 /// the release, and the heartbeat then registers the worker.

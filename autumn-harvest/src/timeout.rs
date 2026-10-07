@@ -6538,10 +6538,24 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         //
         // The bound is fixed, not the scan interval. Worker shutdown awaits
         // each checker in turn, so a long interval would add up per shard.
+        //
+        // Issue #1823: the tick's fence is gone by now, so the release takes a
+        // fresh one. A held or fenced shard skips it, and the lease expires
+        // after its TTL. A stale release could expire a lease that the
+        // promoted region holds under the same worker id.
         if let Some(lease) = &lease {
             let release = async {
-                let mut conn = pool.get().await.map_err(|e| e.to_string())?;
-                lease.release(&mut conn).await.map_err(|e| e.to_string())
+                let fence = crate::replication::begin_shard_tick(&pool, pool_shard)
+                    .await
+                    .ok_or_else(|| "the shard is held or fenced".to_string())?;
+                crate::replication::run_fenced_pass(&fence, async {
+                    let mut conn = crate::replication::fenced_checkout(&pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    lease.release(&mut conn).await.map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?
             };
             match tokio::time::timeout(crate::scanner_lease::LEASE_RELEASE_BOUND, release).await {
                 Ok(Ok(())) => {}
