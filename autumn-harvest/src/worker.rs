@@ -6716,6 +6716,24 @@ pub(crate) fn single_pool_shard_labels(assignments: &[crate::types::ShardId]) ->
     labels
 }
 
+/// The `shard` labels under which a worker records its use of the pool that
+/// serves `shard` (issue #1815).
+///
+/// A sharded pool serves one shard, so its samples carry that shard. One
+/// shared pool serves every assigned shard. So its waits and its query times
+/// carry each label that its gauges carry.
+pub(crate) fn pool_metric_labels(
+    sharded: bool,
+    shard: Option<crate::types::ShardId>,
+    assignments: &[crate::types::ShardId],
+) -> Arc<[u16]> {
+    if sharded {
+        Arc::from([shard.map_or(0, shard_metric_label)])
+    } else {
+        single_pool_shard_labels(assignments).into()
+    }
+}
+
 pub(crate) fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
     let raw = shard.as_i32();
     debug_assert!(
@@ -18125,7 +18143,7 @@ async fn process_activity_task(
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
     task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
     deferred_failure: &DeferredActivityFailure,
-    pool_shard: u16,
+    pool_labels: &Arc<[u16]>,
     shutdown: &CancellationToken,
     drain_cancel: &CancellationToken,
 ) -> HarvestResult<()> {
@@ -18662,7 +18680,7 @@ async fn process_activity_task(
         crate::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: crate::pool::acquire_bound(pool),
             metrics: Arc::clone(&registry.telemetry().metrics),
-            shard: pool_shard,
+            shards: Arc::clone(pool_labels),
         },
     );
     let trace_carrier = task
@@ -24838,6 +24856,8 @@ async fn process_workflow_task(
     // deadlock or a contained panic. The run stays RUNNING, but the task
     // failed, so the worker's outcome window counts it unless the claim is lost.
     cycle_failure: &CycleFailure,
+    // Issue #1815: the `shard` labels of the pool that `conn` came from.
+    pool_labels: &[u16],
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -26934,11 +26954,7 @@ async fn process_workflow_task(
 
     // Issue #1815: the `persist` op spans the whole transaction, COMMIT
     // included. The guard also records a transaction that a timeout cancels.
-    let persist_timer = DbOpTimer::start(
-        &registry.telemetry().metrics,
-        DbOp::Persist,
-        shard_metric_label(crate::types::ShardId::new(prepared.execution.shard_id)),
-    );
+    let persist_timer = DbOpTimer::start(&registry.telemetry().metrics, DbOp::Persist, pool_labels);
     // Issue #1833: one merged wake per execution, also on the fallback path.
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
@@ -27682,8 +27698,8 @@ async fn process_task(
     task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
     // Issue #1815: an activity failure that waits for the claim release.
     deferred_failure: &DeferredActivityFailure,
-    // Issue #1815: the `shard` label of `pool`.
-    pool_shard: u16,
+    // Issue #1815: the `shard` labels of `pool`.
+    pool_labels: &Arc<[u16]>,
     // Issue #1813: the drain's cancel for running activities.
     drain_cancel: &CancellationToken,
 ) -> HarvestResult<TaskDispatchOutcome> {
@@ -27726,6 +27742,7 @@ async fn process_task(
                     workflow_task_deadline,
                     &frontier_reset_committed,
                     &cycle_failure,
+                    pool_labels,
                 ))
                 .await;
                 Ok::<_, HarvestError>((conn, outcome))
@@ -27757,7 +27774,7 @@ async fn process_task(
                 session_slots_in_use,
                 task_outcomes,
                 deferred_failure,
-                pool_shard,
+                pool_labels,
                 shutdown,
                 drain_cancel,
             )
@@ -30091,31 +30108,35 @@ impl Drop for PollerGuard {
 /// A guard records an op that a timeout cancels, too. A timeout cancels the
 /// slowest ops first. A plain timer after the `await` would then drop exactly
 /// the samples that show saturation.
-struct DbOpTimer {
+struct DbOpTimer<'a> {
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
     op: DbOp,
-    shard: u16,
+    shards: &'a [u16],
     started: std::time::Instant,
 }
 
-impl DbOpTimer {
-    fn start(metrics: &Arc<dyn crate::telemetry::MetricsRecorder>, op: DbOp, shard: u16) -> Self {
+impl<'a> DbOpTimer<'a> {
+    fn start(
+        metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+        op: DbOp,
+        shards: &'a [u16],
+    ) -> Self {
         Self {
             metrics: Arc::clone(metrics),
             op,
-            shard,
+            shards,
             started: std::time::Instant::now(),
         }
     }
 }
 
-impl Drop for DbOpTimer {
+impl Drop for DbOpTimer<'_> {
     fn drop(&mut self) {
-        self.metrics.record_db_query_duration(
-            self.op,
-            self.shard,
-            self.started.elapsed().as_secs_f64(),
-        );
+        let elapsed = self.started.elapsed().as_secs_f64();
+        for shard in self.shards {
+            self.metrics
+                .record_db_query_duration(self.op, *shard, elapsed);
+        }
     }
 }
 
@@ -36292,11 +36313,24 @@ impl Worker {
     ) -> HarvestResult<crate::pool::PooledConn> {
         let started = std::time::Instant::now();
         let result = acquire_shard_conn(pool, acquire_bound).await;
-        self.registry.telemetry().metrics.record_db_pool_wait(
-            shard.map_or(0, shard_metric_label),
-            started.elapsed().as_secs_f64(),
-        );
+        let waited = started.elapsed().as_secs_f64();
+        for label in self.pool_labels(shard).iter() {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_db_pool_wait(*label, waited);
+        }
         result
+    }
+
+    /// The `shard` labels of the pool that serves `shard` (issue #1815). See
+    /// [`pool_metric_labels`].
+    fn pool_labels(&self, shard: Option<crate::types::ShardId>) -> Arc<[u16]> {
+        #[cfg(feature = "db")]
+        let sharded = self.config.sharded_pool.is_some();
+        #[cfg(not(feature = "db"))]
+        let sharded = false;
+        pool_metric_labels(sharded, shard, &self.config.shard_assignments)
     }
 
     /// Count this poll loop until the guard drops (issue #1815).
@@ -36305,18 +36339,20 @@ impl Worker {
     }
 
     /// Record the duration of one database op on `shard` that began at
-    /// `started` (issue #1815). The shard label matches the pool-wait one.
+    /// `started` (issue #1815). The shard labels match the pool-wait ones.
     fn record_db_op(
         &self,
         op: DbOp,
         shard: Option<crate::types::ShardId>,
         started: std::time::Instant,
     ) {
-        self.registry.telemetry().metrics.record_db_query_duration(
-            op,
-            shard.map_or(0, shard_metric_label),
-            started.elapsed().as_secs_f64(),
-        );
+        let elapsed = started.elapsed().as_secs_f64();
+        for label in self.pool_labels(shard).iter() {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_db_query_duration(op, *label, elapsed);
+        }
     }
 
     /// Run one claim transaction and run it again after a conflict abort.
@@ -36639,7 +36675,7 @@ impl Worker {
             .record_task_dispatched(&task.queue_name);
 
         let pool = pool.clone();
-        let pool_shard = shard.map_or(0, shard_metric_label);
+        let pool_labels = self.pool_labels(shard);
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
@@ -36824,7 +36860,7 @@ impl Worker {
                     Some(workflow_task_timeout),
                     &task_outcomes,
                     &deferred_failure,
-                    pool_shard,
+                    &pool_labels,
                     &drain_cancel,
                 )
                 .await;
@@ -37113,7 +37149,7 @@ impl Worker {
                     None,
                     &task_outcomes,
                     &deferred_failure,
-                    pool_shard,
+                    &pool_labels,
                     &drain_cancel,
                 )
                 .await;
@@ -38375,6 +38411,7 @@ pub async fn chaos_drive_one_workflow_task(
             None,
             &frontier_reset_committed,
             &cycle_failure,
+            &[0],
         ))
         .await
     })
@@ -38443,6 +38480,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             None,
             &frontier_reset_committed,
             &cycle_failure,
+            &[0],
         ));
         let cancelled_at_hold = tokio::select! {
             () = hold.reached() => true,

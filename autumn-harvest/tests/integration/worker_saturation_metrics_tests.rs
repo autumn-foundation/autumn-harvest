@@ -851,14 +851,27 @@ fn failing_activity<'a>(
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
         ACTIVITY_CALLS.fetch_add(1, Ordering::SeqCst);
-        // One heartbeat, then a wait past the one-second flush interval, so
-        // the flusher records the `heartbeat` op and its pool wait.
-        ctx.heartbeat(serde_json::json!({ "step": 1 }))
-            .await
-            .map_err(|e| e.to_string())?;
-        tokio::time::sleep(Duration::from_millis(1_300)).await;
-        Err("boom".to_owned())
+        heartbeat_then_fail(ctx).await
     })
+}
+
+/// [`failing_activity`] without the call count. A test that runs beside the
+/// count's test uses it, so the count stays exact.
+fn uncounted_failing_activity<'a>(
+    ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(heartbeat_then_fail(ctx))
+}
+
+/// One heartbeat, then a wait past the one-second flush interval, so the
+/// flusher records the `heartbeat` op and its pool wait.
+async fn heartbeat_then_fail(ctx: &ActivityContext) -> Result<serde_json::Value, String> {
+    ctx.heartbeat(serde_json::json!({ "step": 1 }))
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    Err("boom".to_owned())
 }
 
 fn calls_failing_activity<'a>(
@@ -927,18 +940,33 @@ fn activity_info() -> ActivityInfo {
 }
 
 fn build_worker(queue: &str, worker_id: &str, metrics: Arc<Recording>) -> Arc<Worker> {
+    build_worker_on(queue, worker_id, metrics, activity_info(), None)
+}
+
+/// [`build_worker`] with any recorder, this activity and, when given, these
+/// shard assignments on the worker's one pool.
+fn build_worker_on(
+    queue: &str,
+    worker_id: &str,
+    metrics: Arc<dyn MetricsRecorder>,
+    activity: ActivityInfo,
+    shards: Option<Vec<ShardId>>,
+) -> Arc<Worker> {
     let built = HarvestBuilder::new()
         .workflows(vec![workflow_info()])
-        .activities(vec![activity_info()])
+        .activities(vec![activity])
         .telemetry(TelemetryConfig {
             service_name: Arc::from("worker_saturation_metrics_tests"),
             propagator: Arc::new(NoOpPropagator),
-            metrics: metrics as Arc<dyn MetricsRecorder>,
+            metrics,
         })
         .worker(WorkerConfig::default().with_queues([queue]))
         .build();
     let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
     let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    if let Some(shards) = shards {
+        runtime_config.shard_assignments = shards;
+    }
     runtime_config.worker_id = worker_id.to_string();
     runtime_config.poll_interval = Duration::from_millis(50);
     runtime_config.worker_heartbeat_interval = Duration::from_millis(100);
@@ -1007,6 +1035,100 @@ struct StatsRow {
     window_tasks: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     window_failures: i32,
+}
+
+/// Records the `shard` labels of the pool gauges, the pool waits and each
+/// query op.
+#[derive(Default)]
+struct PoolLabels {
+    labels: Mutex<std::collections::BTreeMap<&'static str, std::collections::BTreeSet<u16>>>,
+}
+
+impl PoolLabels {
+    fn add(&self, kind: &'static str, shard: u16) {
+        self.labels
+            .lock()
+            .expect("lock")
+            .entry(kind)
+            .or_default()
+            .insert(shard);
+    }
+
+    fn of(&self, kind: &str) -> std::collections::BTreeSet<u16> {
+        self.labels
+            .lock()
+            .expect("lock")
+            .get(kind)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+impl MetricsRecorder for PoolLabels {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    fn record_db_pool(&self, shard: u16, _in_use: u64, _idle: u64) {
+        self.add("gauge", shard);
+    }
+
+    fn record_db_pool_wait(&self, shard: u16, _seconds: f64) {
+        self.add("pool_wait", shard);
+    }
+
+    fn record_db_query_duration(&self, op: DbOp, shard: u16, _seconds: f64) {
+        self.add(op.as_str(), shard);
+    }
+}
+
+/// Issue #1815: a worker without a sharded pool serves each assigned shard
+/// from its one pool. The pool gauges carry each shard label. So each pool
+/// wait and each query time carries the same labels. A shard-filtered panel
+/// then shows the state and the use of one pool together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_pool_worker_labels_its_samples_like_its_gauges() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool: DbPool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("labels-q");
+    let worker_id = unique_id("labels-w");
+    let recorder = Arc::new(PoolLabels::default());
+    let worker = build_worker_on(
+        &queue,
+        &worker_id,
+        Arc::clone(&recorder) as Arc<dyn MetricsRecorder>,
+        ActivityInfo {
+            handler: uncounted_failing_activity,
+            ..activity_info()
+        },
+        Some(vec![ShardId::new(0), ShardId::new(1)]),
+    );
+
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("labels-wf");
+    start_or_load_workflow_execution(&mut conn, start_params(exec_id, &workflow_id, &queue), None)
+        .await
+        .expect("start workflow");
+    let runner = Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&run_pool).await });
+    wait_for_execution_state_with_timeout(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
+    // One more sampler pass, so the gauges have run.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+
+    let both = std::collections::BTreeSet::from([0u16, 1]);
+    assert_eq!(recorder.of("gauge"), both, "the gauges of the one pool");
+    for kind in [
+        "pool_wait",
+        DbOp::Claim.as_str(),
+        DbOp::Persist.as_str(),
+        DbOp::Heartbeat.as_str(),
+    ] {
+        assert_eq!(recorder.of(kind), both, "{kind} carries the gauge labels");
+    }
 }
 
 /// A running worker emits the pool, wait, query, poller and outlier metrics,

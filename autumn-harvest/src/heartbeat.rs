@@ -236,9 +236,10 @@ pub struct HeartbeatFlushOptions {
     /// Receives `harvest.heartbeat.flush_failed` and
     /// `harvest.db.pool_acquire_timeout{site="heartbeat_flush"}`.
     pub metrics: Arc<dyn MetricsRecorder>,
-    /// The `shard` label of the pool (issue #1815). Each flush records its
-    /// pool wait and its write latency under it.
-    pub shard: u16,
+    /// The `shard` labels of the pool (issue #1815). Each flush records its
+    /// pool wait and its write latency under each of them. A pool that serves
+    /// several shards carries each shard's label, as its gauges do.
+    pub shards: Arc<[u16]>,
 }
 
 /// A heartbeat flusher for payloads that their sender stamps (issue #1788).
@@ -410,7 +411,7 @@ pub async fn flush_heartbeat(
         &HeartbeatFlushOptions {
             acquire_timeout,
             metrics: Arc::new(crate::telemetry::NoOpMetrics),
-            shard: 0,
+            shards: Arc::from([0]),
         },
         Duration::MAX,
     )
@@ -460,11 +461,14 @@ async fn flush(
     interval: Duration,
 ) -> Result<ClaimWrite, FlushFailure> {
     let metrics = options.metrics.as_ref();
-    let shard = options.shard;
+    let shards = &options.shards;
     let mut started = tokio::time::Instant::now();
     let wait_started = std::time::Instant::now();
     let acquired = crate::pool::acquire(pool, options.acquire_timeout).await;
-    metrics.record_db_pool_wait(shard, wait_started.elapsed().as_secs_f64());
+    let waited = wait_started.elapsed().as_secs_f64();
+    for shard in shards.iter() {
+        metrics.record_db_pool_wait(*shard, waited);
+    }
     let mut conn = acquired.map_err(|error| FlushFailure {
         reason: if error.is_pool_acquire_timeout() {
             "acquire_timeout"
@@ -485,11 +489,10 @@ async fn flush(
             beat.sent_order.elapsed(),
         )
         .await;
-        metrics.record_db_query_duration(
-            crate::telemetry::DbOp::Heartbeat,
-            shard,
-            write_started.elapsed().as_secs_f64(),
-        );
+        let wrote = write_started.elapsed().as_secs_f64();
+        for shard in shards.iter() {
+            metrics.record_db_query_duration(crate::telemetry::DbOp::Heartbeat, *shard, wrote);
+        }
         let connection_works = match &written {
             Ok(write) => *write == ClaimWrite::Applied,
             Err(error) => crate::pool::is_session_timeout(error),
@@ -946,7 +949,7 @@ mod tests {
                 HeartbeatFlushOptions {
                     acquire_timeout: bound,
                     metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
-                    shard: 0,
+                    shards: Arc::from([0]),
                 },
             );
             assert!(tx.send(serde_json::json!({"p": 1})));
@@ -985,7 +988,7 @@ mod tests {
                 HeartbeatFlushOptions {
                     acquire_timeout: Duration::from_millis(100),
                     metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
-                    shard: 0,
+                    shards: Arc::from([0]),
                 },
             );
             assert!(tx.send(serde_json::json!({"p": 1})));
@@ -1030,7 +1033,7 @@ mod tests {
                 HeartbeatFlushOptions {
                     acquire_timeout: Duration::from_millis(100),
                     metrics: Arc::clone(&waits) as Arc<dyn crate::telemetry::MetricsRecorder>,
-                    shard: 3,
+                    shards: Arc::from([3]),
                 },
             );
             assert!(tx.send(serde_json::json!({"p": 1})));

@@ -1324,7 +1324,7 @@ async fn a_retried_heartbeat_keeps_its_receipt_time() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_millis(200),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
-            shard: 0,
+            shards: Arc::from([0]),
         },
     );
     let sent_at = Utc::now();
@@ -1402,7 +1402,7 @@ async fn a_heartbeat_keeps_its_send_time_on_a_busy_runtime() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(5),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
-            shard: 0,
+            shards: Arc::from([0]),
         },
     );
     let sent_at = Utc::now();
@@ -1907,7 +1907,7 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(3),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
-            shard: 0,
+            shards: Arc::from([0]),
         },
     );
     assert!(tx.send(serde_json::json!({"progress": 1})));
@@ -1986,7 +1986,7 @@ async fn a_newer_heartbeat_follows_a_blocked_flush_at_once() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(10),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
-            shard: 0,
+            shards: Arc::from([0]),
         },
     );
     assert!(tx.send(serde_json::json!({"progress": 1})));
@@ -2076,7 +2076,7 @@ async fn a_scanner_behind_a_blocked_flush_sees_the_newer_heartbeat() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(10),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
-            shard: 0,
+            shards: Arc::from([0]),
         },
     );
     assert!(tx.send(serde_json::json!({"progress": 1})));
@@ -2414,7 +2414,7 @@ async fn a_scanner_behind_a_timed_out_heartbeat_sees_the_newer_one() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(10),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
-            shard: 0,
+            shards: Arc::from([0]),
         },
     );
     assert!(tx.send(serde_json::json!({"progress": 1})));
