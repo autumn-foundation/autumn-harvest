@@ -1,0 +1,59 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": null,
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000911",
+        "name": "slow",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "SignalReceived",
+      "data": {
+        "signal_name": "go",
+        "payload": null
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000912",
+        "name": "next",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000912",
+        "output": 2
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000911",
+        "output": 1
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": null
+      }
+    }
+  ]
+}

@@ -199,6 +199,8 @@ pub fn test_partitioned_layout_requested() -> bool {
 
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
+/// Adaptive concurrency limit per activity type (issue #1836).
+pub mod adaptive_limit;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
 /// AES-256-GCM payload codec and data-key providers (issue #1825).
@@ -212,6 +214,8 @@ pub mod append_only;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
+/// Keyed hash chain over exported audit rows (issue #1838).
+pub mod audit_chain;
 /// Audit-record export to an external sink for SIEM compliance (issue #953).
 pub mod audit_export;
 /// Open-awaitables diagnostic projection (issue #615).
@@ -242,8 +246,8 @@ pub mod canary;
 /// `#[cfg(feature = "chaos")]` and never part of a production binary.
 #[doc(hidden)]
 pub mod chaos;
-/// Per-activity circuit breaker that fast-fails dispatch during downstream
-/// outages (issue #369).
+/// Per-activity circuit breaker that stops dispatch during downstream
+/// outages (issues #369, #1809).
 pub mod circuit_breaker;
 /// Payload-codec key rotation and the lazy re-encryption sweep (issue #948).
 ///
@@ -330,6 +334,14 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+/// Replay fuzz harness (issue #1835). Not a stable API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+#[allow(
+    clippy::expect_used,
+    reason = "fuzz harness code: a failed `expect` is a finding"
+)]
+pub mod fuzzing;
 /// Deterministic workflow guardrail rule catalog (issue #173).
 pub mod guardrail;
 #[cfg(feature = "db")]
@@ -408,6 +420,9 @@ mod quota_lock_order;
 /// [`quota_reconcile::ReconcileSummary`]) compiles without the `db` feature;
 /// the sweep and its periodic spawner are DB-gated.
 pub mod quota_reconcile;
+/// Automatic resume of a shard rebalance stalled after its cutover (issue
+/// #1839).
+pub mod rebalance_resume;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
@@ -452,6 +467,13 @@ pub mod shard_fence;
 pub mod shard_rebalance;
 /// Shared, immutable JSON payload for the workflow start path (issue #1733).
 pub mod shared_json;
+/// Retry a transaction after a deadlock or serialization abort (issue #1822).
+///
+/// Engine internal with no stability guarantee. It is `pub` for the
+/// integration tests only.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub mod tx_retry;
 
 /// `cfg(shuttle)` async-primitive shim (tokio under normal builds).
 ///
@@ -517,6 +539,8 @@ pub mod notify;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod queue;
+/// Metric-gated automatic abort of a build ramp (issue #1814).
+pub mod ramp_guard;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
 #[cfg(feature = "db")]
@@ -536,6 +560,9 @@ pub mod store;
 pub mod timeout;
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_activities;
+/// Ed25519 publisher signatures for WASM modules (issue #1838).
+#[cfg(feature = "wasm-activities")]
+pub mod wasm_signing;
 /// Postgres storage and dispatch resolution for WASM activities (issue #965).
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_store;
@@ -545,6 +572,7 @@ pub mod worker;
 #[cfg(feature = "db")]
 pub mod workers;
 
+pub use adaptive_limit::AdaptiveLimitConfig;
 pub use admission_gate::{
     AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateMode, GateScope,
     MAX_ACTIVE_GATES, ProducerContractEntry, ProducerGateStatus, StartProducer, check_admission,
@@ -676,8 +704,9 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
-    Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    AdaptiveLimitPolicy, CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy,
+    RetryBudgetPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
+    WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
@@ -806,9 +835,10 @@ pub use wasm_activities::{
 #[cfg(feature = "wasm-activities")]
 pub use wasm_store::{
     MAX_WASM_MODULE_BYTES, PreparedWasmActivity, WasmActivityRegistration, WasmBinding,
-    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules, publish_wasm_module,
-    resolve_active_wasm_hash, resolve_active_wasm_module, resolve_wasm_dispatch,
-    seed_registered_wasm_modules, seed_wasm_module,
+    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules,
+    publish_signed_wasm_module, publish_wasm_module, resolve_active_wasm_hash,
+    resolve_active_wasm_module, resolve_active_wasm_version, resolve_wasm_dispatch,
+    seed_registered_wasm_modules, seed_signed_wasm_module, seed_wasm_module,
 };
 
 #[cfg(feature = "db")]

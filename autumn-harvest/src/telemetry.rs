@@ -929,6 +929,12 @@ pub const METRIC_CIRCUIT_TRIPPED: &str = "harvest.activity.circuit.tripped";
 /// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_CIRCUIT_CLOSED: &str = "harvest.activity.circuit.closed";
 
+/// Counter: incremented each time an open circuit breaker defers a claimed
+/// task back to `PENDING` (issue #1809, `CircuitOpenMode::Defer`).
+///
+/// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_CIRCUIT_DEFERRED: &str = "harvest.activity.circuit.deferred";
+
 /// Counter: incremented each time an activity handler **panics** (unwinds)
 /// instead of returning a clean `Err`, and the engine contains the panic as a
 /// retryable typed `HandlerPanic` failure (issue #782).
@@ -1251,6 +1257,15 @@ pub const METRIC_LOAD_SHED_ACTIVE: &str = "harvest.load_shed.active";
 ///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the shed queue.
 pub const METRIC_LOAD_SHED_REJECTED: &str = "harvest.load_shed.rejected";
 
+/// Counter: one per build ramp that the ramp guard aborted (issue #1814).
+///
+/// Labels:
+///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the queue of the ramp.
+///   - `"reason"` (= [`METRIC_LABEL_REASON`]) — `"failure_rate"`,
+///     `"nd_block_rate"` or `"unreported"`, from
+///     `ramp_guard::RampAbortReason::as_str`.
+pub const METRIC_BUILD_RAMP_ABORTED: &str = "harvest.build.ramp_aborted";
+
 /// Counter: one per request the API rate limiter refused with `429` (issue
 /// #1827).
 ///
@@ -1284,6 +1299,34 @@ pub const METRIC_RETRY_BUDGET_AVAILABLE: &str = "harvest.retry.budget.available"
 /// Labeled by `activity`. Prometheus exports it as
 /// `harvest_retry_budget_exhausted_total`.
 pub const METRIC_RETRY_BUDGET_EXHAUSTED: &str = "harvest.retry.budget.exhausted";
+
+/// Gauge: the adaptive concurrency limit of one activity type (issue #1836).
+///
+/// Labeled by `activity`. It is the cap on in-flight attempts on one worker.
+/// The limit registry sets it after every change, under its lock.
+pub const METRIC_ACTIVITY_CONCURRENCY_LIMIT: &str = "harvest.activity.concurrency_limit";
+
+/// Gauge: in-flight attempts of one activity type that hold an adaptive
+/// limit slot (issue #1836).
+///
+/// Labeled by `activity`. When it equals the limit, the worker claims no
+/// more tasks of that type.
+pub const METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT: &str = "harvest.activity.concurrency_in_flight";
+
+/// Gauge: the no-load handler latency estimate of one activity type, in
+/// seconds (issue #1836).
+///
+/// Labeled by `activity`. The adaptive limit compares the mean latency of
+/// each window with it. A probe clears it. The gauge keeps its last value
+/// until the probe window closes.
+pub const METRIC_ACTIVITY_LATENCY_BASELINE: &str = "harvest.activity.latency_baseline_seconds";
+
+/// Counter: claimed attempts that the adaptive limit deferred (issue #1836).
+///
+/// Labeled by `activity`. The claim skips a type at its cap, so this counts
+/// only the claims that raced past the cap. A steady rate means churn.
+/// Prometheus exports it as `harvest_activity_concurrency_deferred_total`.
+pub const METRIC_ACTIVITY_CONCURRENCY_DEFERRED: &str = "harvest.activity.concurrency_deferred";
 
 /// Counter: incremented on each scheduler tick-loop fire attempt for a due schedule slot.
 ///
@@ -1482,6 +1525,22 @@ pub const METRIC_SCANNER_PASS: &str = "harvest.scanner.pass";
 /// pool is too small or a connection is stuck. See
 /// `docs/operations/postgres-timeouts.md`.
 pub const METRIC_DB_POOL_ACQUIRE_TIMEOUT: &str = "harvest.db.pool_acquire_timeout";
+
+/// Counter: Postgres aborted a transaction and the engine ran it again
+/// (issue #1822).
+///
+/// Labelled `{site, reason}`. `site` is `persist`, `workflow_task`, `claim`
+/// or `scanner`. `reason` is `deadlock` (`40P01`) or `serialization_failure`
+/// (`40001`). A steady `deadlock` rate points to a lock-order defect. See the
+/// lock-order table in `docs/architecture.md`.
+pub const METRIC_DB_TRANSACTION_RETRY: &str = "harvest.db.transaction_retry";
+
+/// Counter: a transaction still hit a conflict abort after its last retry
+/// (issue #1822).
+///
+/// Labelled `{site, reason}` like [`METRIC_DB_TRANSACTION_RETRY`]. The error
+/// then reaches the caller, so any non-zero rate needs attention.
+pub const METRIC_DB_TRANSACTION_RETRY_EXHAUSTED: &str = "harvest.db.transaction_retry_exhausted";
 
 /// Counter: an activity heartbeat flush failed (issue #1788).
 ///
@@ -1919,7 +1978,36 @@ pub const METRIC_LABEL_CLIENT_KIND: &str = "client_kind";
 /// Metric label: the in-process start producer (issue #618).
 pub const METRIC_LABEL_PRODUCER: &str = "producer";
 /// Metric label: the build ID of the worker.
+///
+/// The worker passes each value through [`build_id_label`], which caps the
+/// cardinality (issue #1814). A custom recorder that forwards to another
+/// recorder must forward the `*_for_build` methods too, or the build is lost.
 pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
+/// `build_id` label value when the build is not known or is empty
+/// (issue #1814).
+pub const BUILD_ID_LABEL_NONE: &str = "none";
+/// `build_id` label value for a build over the cap (issue #1814).
+///
+/// [`build_id_label`] uses it for a build after the first
+/// [`MAX_BUILD_ID_LABELS`] distinct builds, and for a build id longer than
+/// [`MAX_BUILD_ID_LABEL_LEN`] bytes.
+pub const BUILD_ID_LABEL_OTHER: &str = "__other__";
+/// The escape prefix of a `build_id` label value (issue #1814).
+///
+/// [`build_id_label`] adds it to a real build id that equals a sentinel, and
+/// to a real build id that already starts with it. So `none` reports
+/// `build:none`, and `build:none` reports `build:build:none`. The encoding is
+/// one-to-one, so no two real builds share a series, and no real build shares
+/// a sentinel series.
+pub const BUILD_ID_LABEL_ESCAPE_PREFIX: &str = "build:";
+/// The maximum number of distinct `build_id` label values in one process
+/// (issue #1814).
+///
+/// A worker process normally reports one build, its own. The cap is a safety
+/// limit for a process that reports many builds.
+pub const MAX_BUILD_ID_LABELS: usize = 16;
+/// The maximum byte length of a `build_id` label value (issue #1814).
+pub const MAX_BUILD_ID_LABEL_LEN: usize = 128;
 /// Metric label: worker dispatch-slot type (`"workflow"` or `"activity"`).
 pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
@@ -1947,6 +2035,7 @@ pub const METRIC_LABEL_ROLE: &str = "role";
 ///
 /// Bounded: `claim` or `heartbeat_flush`.
 pub const METRIC_LABEL_SITE: &str = "site";
+
 /// `shard` label value for a control loop that is **not** per-shard (issue #797).
 ///
 /// The `retention` and `schedule` loops run once per process rather than once
@@ -1955,6 +2044,154 @@ pub const METRIC_LABEL_SITE: &str = "site";
 /// [`METRIC_SCANNER_TICK`] series carries the same label set — a family with a
 /// sometimes-present label is awkward to query and easy to mis-aggregate.
 pub const SCANNER_SHARD_LABEL_NONE: &str = "none";
+
+/// The `messaging.system` value for Harvest's own task queues (issue #1838).
+pub const SEMCONV_MESSAGING_SYSTEM: &str = "harvest";
+
+/// The kind of instrument a [`SemconvMapping`] copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemconvInstrument {
+    /// A monotonic counter. Prometheus exposes it with a `_total` suffix.
+    Counter,
+    /// A histogram in seconds.
+    Histogram,
+}
+
+/// One `harvest.*` metric that has an OpenTelemetry messaging semantic
+/// convention equivalent (issue #1838).
+///
+/// Harvest keeps its own names. The OpenTelemetry Collector recipe in
+/// `docs/operations/otel-collector.md` copies each mapped series under the
+/// semconv name. A test renders that recipe from this table, so the two
+/// cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemconvMapping {
+    /// The Harvest metric name.
+    pub source: &'static str,
+    /// The instrument kind of the source.
+    pub instrument: SemconvInstrument,
+    /// The semantic convention metric name.
+    pub target: &'static str,
+    /// The `messaging.operation.name` value.
+    pub operation_name: &'static str,
+    /// The `messaging.operation.type` value.
+    pub operation_type: &'static str,
+    /// The Harvest label that becomes `messaging.destination.name`.
+    pub destination_label: &'static str,
+    /// The UCUM unit the semconv metric requires. The Collector recipe sets
+    /// it, because the source carries no unit.
+    pub unit: &'static str,
+}
+
+/// Every `harvest.*` metric with a messaging semconv equivalent (issue #1838).
+///
+/// See ADR 0004 for the metrics that stay unmapped, and why.
+pub const SEMCONV_METRIC_MAPPINGS: &[SemconvMapping] = &[
+    // A worker claims a task from a queue: one consumed message.
+    SemconvMapping {
+        source: METRIC_QUEUE_DISPATCHED,
+        instrument: SemconvInstrument::Counter,
+        target: "messaging.client.consumed.messages",
+        operation_name: "claim",
+        operation_type: "receive",
+        destination_label: METRIC_LABEL_QUEUE,
+        unit: "{message}",
+    },
+    // An activity attempt runs a claimed task: the processing duration.
+    SemconvMapping {
+        source: METRIC_ACTIVITY_DURATION,
+        instrument: SemconvInstrument::Histogram,
+        target: "messaging.process.duration",
+        operation_name: "process",
+        operation_type: "process",
+        destination_label: METRIC_LABEL_QUEUE,
+        unit: "s",
+    },
+];
+
+// ---------------------------------------------------------------------------
+// Bounded `build_id` label (issue #1814)
+// ---------------------------------------------------------------------------
+
+/// A cap on the distinct `build_id` label values (issue #1814).
+///
+/// The cap admits the first `max` distinct build ids. A later build id gets
+/// [`BUILD_ID_LABEL_OTHER`].
+#[derive(Debug)]
+pub struct BuildIdLabelCap {
+    max: usize,
+    admitted: std::sync::RwLock<std::collections::HashSet<Box<str>>>,
+}
+
+impl BuildIdLabelCap {
+    /// Make a cap that admits `max` distinct build ids.
+    #[must_use]
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            admitted: std::sync::RwLock::default(),
+        }
+    }
+
+    /// Return the label value for `raw`.
+    ///
+    /// An empty `raw` gets [`BUILD_ID_LABEL_NONE`]. A real build id that
+    /// equals a sentinel, or starts with [`BUILD_ID_LABEL_ESCAPE_PREFIX`],
+    /// gets that prefix added, so the encoding is one-to-one. A label longer
+    /// than [`MAX_BUILD_ID_LABEL_LEN`] bytes gets [`BUILD_ID_LABEL_OTHER`].
+    #[must_use]
+    pub fn label<'a>(&self, raw: &'a str) -> std::borrow::Cow<'a, str> {
+        use std::borrow::Cow;
+
+        if raw.is_empty() {
+            return Cow::Borrowed(BUILD_ID_LABEL_NONE);
+        }
+        let escape = raw == BUILD_ID_LABEL_NONE
+            || raw == BUILD_ID_LABEL_OTHER
+            || raw.starts_with(BUILD_ID_LABEL_ESCAPE_PREFIX);
+        let label: Cow<'a, str> = if escape {
+            Cow::Owned(format!("{BUILD_ID_LABEL_ESCAPE_PREFIX}{raw}"))
+        } else {
+            Cow::Borrowed(raw)
+        };
+        if label.len() > MAX_BUILD_ID_LABEL_LEN {
+            return Cow::Borrowed(BUILD_ID_LABEL_OTHER);
+        }
+        let admitted = self
+            .admitted
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(label.as_ref());
+        if admitted {
+            return label;
+        }
+        let mut set = self
+            .admitted
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Check again under the write lock: another thread can admit the
+        // label between the two locks.
+        if set.contains(label.as_ref()) {
+            return label;
+        }
+        if set.len() >= self.max {
+            return Cow::Borrowed(BUILD_ID_LABEL_OTHER);
+        }
+        set.insert(label.as_ref().into());
+        label
+    }
+}
+
+/// Return the capped `build_id` label value for `raw` (issue #1814).
+///
+/// One process-wide [`BuildIdLabelCap`] of [`MAX_BUILD_ID_LABELS`] holds the
+/// admitted values.
+#[must_use]
+pub fn build_id_label(raw: &str) -> std::borrow::Cow<'_, str> {
+    static CAP: std::sync::LazyLock<BuildIdLabelCap> =
+        std::sync::LazyLock::new(|| BuildIdLabelCap::new(MAX_BUILD_ID_LABELS));
+    CAP.label(raw)
+}
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)
@@ -2462,6 +2699,14 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = queue;
     }
 
+    /// The ramp guard aborted the build ramp of `queue` (issue #1814).
+    ///
+    /// Maps to [`METRIC_BUILD_RAMP_ABORTED`]. `reason` is
+    /// `ramp_guard::RampAbortReason::as_str`.
+    fn record_build_ramp_aborted(&self, queue: &str, reason: &str) {
+        let _ = (queue, reason);
+    }
+
     /// A fresh workflow start was rejected because its resolved per-tenant
     /// quota key is at or over a declared cap (issue #946).
     ///
@@ -2535,6 +2780,38 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue, outcome);
     }
 
+    /// [`record_workflow_terminal`](Self::record_workflow_terminal) with the
+    /// build of the worker that ran the task (issue #1814).
+    ///
+    /// `build_id` is a value from [`build_id_label`]. The default drops it, so
+    /// an existing recorder stays correct with no change.
+    fn record_workflow_terminal_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
+        outcome: WorkflowStatus,
+    ) {
+        let _ = build_id;
+        self.record_workflow_terminal(workflow_name, queue, outcome);
+    }
+
+    /// [`record_workflow_completed`](Self::record_workflow_completed) with the
+    /// build of the worker that ran the task (issue #1814).
+    ///
+    /// The default drops `build_id`.
+    fn record_workflow_completed_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
+        duration_secs: f64,
+        status: WorkflowStatus,
+    ) {
+        let _ = build_id;
+        self.record_workflow_completed(workflow_name, queue, duration_secs, status);
+    }
+
     /// A workflow execution rotated using continue-as-new.
     fn record_workflow_continue_as_new(&self, workflow_name: &str) {
         let _ = workflow_name;
@@ -2554,6 +2831,20 @@ pub trait MetricsRecorder: Send + Sync {
     /// Per ADR-0001 §7, `execution.id` must never be a label here.
     fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// [`record_workflow_nondeterministic_block`](Self::record_workflow_nondeterministic_block)
+    /// with the build of the worker that hit the divergence (issue #1814).
+    ///
+    /// The default drops `build_id`.
+    fn record_workflow_nondeterministic_block_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
+    ) {
+        let _ = build_id;
+        self.record_workflow_nondeterministic_block(workflow_name, queue);
     }
 
     /// An activity handler panicked (unwound) and the engine contained the
@@ -2678,6 +2969,44 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (activity_name, queue, outcome);
     }
 
+    /// [`record_activity_attempt`](Self::record_activity_attempt) with the
+    /// build of the worker that ran the attempt (issue #1814).
+    ///
+    /// The default drops `build_id`.
+    fn record_activity_attempt_for_build(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        build_id: &str,
+        outcome: ActivityStatus,
+    ) {
+        let _ = build_id;
+        self.record_activity_attempt(activity_name, queue, outcome);
+    }
+
+    /// [`record_activity_completed_with_error_type`](Self::record_activity_completed_with_error_type)
+    /// with the build of the worker that ran the attempt (issue #1814).
+    ///
+    /// The default drops `build_id`.
+    fn record_activity_completed_for_build(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        build_id: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+        error_type: Option<&str>,
+    ) {
+        let _ = build_id;
+        self.record_activity_completed_with_error_type(
+            activity_name,
+            queue,
+            duration_secs,
+            status,
+            error_type,
+        );
+    }
+
     /// A retry was scheduled for an activity (one per retry actually enqueued).
     ///
     /// Increments [`METRIC_ACTIVITY_RETRIES`] with labels `activity` and `queue`.
@@ -2800,6 +3129,24 @@ pub trait MetricsRecorder: Send + Sync {
     /// `site` is `claim` or `heartbeat_flush`. Additive with a no-op default.
     fn record_db_pool_acquire_timeout(&self, site: &str) {
         let _ = site;
+    }
+
+    /// Postgres aborted a transaction and the engine runs it again
+    /// (issue #1822).
+    ///
+    /// `site` is `persist`, `workflow_task`, `claim` or `scanner`. `reason`
+    /// is `deadlock` or `serialization_failure`. Additive with a no-op default.
+    fn record_db_transaction_retry(&self, site: &str, reason: &str) {
+        let _ = (site, reason);
+    }
+
+    /// A transaction still hit a conflict abort after its last retry
+    /// (issue #1822).
+    ///
+    /// Labels as [`Self::record_db_transaction_retry`]. Additive with a no-op
+    /// default.
+    fn record_db_transaction_retry_exhausted(&self, site: &str, reason: &str) {
+        let _ = (site, reason);
     }
 
     /// An activity heartbeat flush failed (issue #1788).
@@ -2964,6 +3311,31 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.retry.budget.exhausted{activity}`. The
     /// `activity` argument is the registered activity name.
     fn record_retry_budget_exhausted(&self, activity: &str) {
+        let _ = activity;
+    }
+
+    /// Record the adaptive concurrency limit state of one activity type
+    /// (issue #1836). The registry calls it only when the state changes.
+    ///
+    /// Maps to three gauges, each labeled by `activity`:
+    /// `harvest.activity.concurrency_limit`,
+    /// `harvest.activity.concurrency_in_flight` and
+    /// `harvest.activity.latency_baseline_seconds`. A `baseline` of `None`
+    /// means no estimate yet. The baseline gauge then keeps its last value.
+    fn record_activity_concurrency_limit(
+        &self,
+        activity: &str,
+        state: &crate::adaptive_limit::LimitSnapshot,
+    ) {
+        let _ = (activity, state);
+    }
+
+    /// Record one claimed attempt that the adaptive limit deferred (issue
+    /// #1836).
+    ///
+    /// Maps to the counter `harvest.activity.concurrency_deferred{activity}`.
+    /// The `activity` argument is the registered activity name.
+    fn record_activity_concurrency_deferred(&self, activity: &str) {
         let _ = activity;
     }
 
@@ -3473,6 +3845,14 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = activity_name;
     }
 
+    /// An open circuit breaker deferred a claimed task back to `PENDING`
+    /// (issue #1809).
+    ///
+    /// Maps to the counter `harvest.activity.circuit.deferred{activity.name}`.
+    fn record_circuit_deferred(&self, activity_name: &str) {
+        let _ = activity_name;
+    }
+
     /// A payload was observed at a write boundary (issue #252).
     ///
     /// Called for every payload written (accepted or rejected) to
@@ -3922,6 +4302,24 @@ pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
         return;
     }
     metrics.record_workflow_terminal(workflow_name, queue, outcome);
+}
+
+/// [`emit_workflow_terminal`] with the build of the worker that ran the task
+/// (issue #1814).
+///
+/// It skips canary probes in the same way. `build_id` is a value from
+/// [`build_id_label`].
+pub fn emit_workflow_terminal_for_build<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    workflow_name: &str,
+    queue: &str,
+    build_id: &str,
+    outcome: WorkflowStatus,
+) {
+    if crate::canary::is_canary_workflow(workflow_name) {
+        return;
+    }
+    metrics.record_workflow_terminal_for_build(workflow_name, queue, build_id, outcome);
 }
 
 /// Emit [`METRIC_CONCURRENCY_SUPERSEDED`] once per superseded run (issue #811).
@@ -5689,5 +6087,175 @@ mod tests {
         // construction.
         let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         rec.record_task_capability_miss("default", "workflow", "released");
+    }
+
+    // ── Bounded build_id label (issue #1814) ────────────────────────────
+
+    #[test]
+    fn build_id_label_cap_admits_up_to_max_then_buckets() {
+        let cap = BuildIdLabelCap::new(2);
+        assert_eq!(cap.label("a"), "a");
+        assert_eq!(cap.label("b"), "b");
+        assert_eq!(cap.label("c"), BUILD_ID_LABEL_OTHER, "over the cap");
+        assert_eq!(cap.label("a"), "a", "an admitted build stays admitted");
+        assert_eq!(cap.label("b"), "b");
+    }
+
+    #[test]
+    fn build_id_label_cap_maps_empty_to_none_and_long_to_other() {
+        let cap = BuildIdLabelCap::new(4);
+        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
+        let long = "x".repeat(MAX_BUILD_ID_LABEL_LEN + 1);
+        assert_eq!(cap.label(&long), BUILD_ID_LABEL_OTHER);
+        let edge = "y".repeat(MAX_BUILD_ID_LABEL_LEN);
+        assert_eq!(
+            cap.label(&edge),
+            edge.as_str(),
+            "the length bound is inclusive"
+        );
+        // Neither sentinel uses an admission slot.
+        for build in ["p", "q", "r"] {
+            assert_eq!(cap.label(build), build);
+        }
+    }
+
+    #[test]
+    fn the_label_encoding_is_one_to_one_and_keeps_sentinels_apart() {
+        let cap = BuildIdLabelCap::new(16);
+        assert_eq!(cap.label(BUILD_ID_LABEL_NONE), "build:none");
+        assert_eq!(cap.label(BUILD_ID_LABEL_OTHER), "build:__other__");
+        assert_eq!(cap.label("build:none"), "build:build:none");
+        assert_eq!(cap.label("build:x"), "build:build:x");
+        assert_eq!(cap.label("v1"), "v1");
+        // Distinct real ids give distinct labels, none of them a sentinel.
+        let ids = [
+            "none",
+            "build:none",
+            "build:build:none",
+            "__other__",
+            "build:__other__",
+            "v1",
+        ];
+        let labels: std::collections::HashSet<String> =
+            ids.iter().map(|id| cap.label(id).into_owned()).collect();
+        assert_eq!(labels.len(), ids.len());
+        assert!(!labels.contains(BUILD_ID_LABEL_NONE));
+        assert!(!labels.contains(BUILD_ID_LABEL_OTHER));
+        // The sentinels still mean "no build" and "over the cap" only.
+        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
+    }
+
+    #[test]
+    fn an_escaped_label_over_the_length_bound_is_bucketed() {
+        let cap = BuildIdLabelCap::new(4);
+        let id = format!("build:{}", "y".repeat(MAX_BUILD_ID_LABEL_LEN - 6));
+        assert_eq!(id.len(), MAX_BUILD_ID_LABEL_LEN);
+        assert_eq!(
+            cap.label(&id),
+            BUILD_ID_LABEL_OTHER,
+            "the prefix pushes it over"
+        );
+    }
+
+    #[test]
+    fn build_id_label_cap_of_zero_buckets_every_build() {
+        let cap = BuildIdLabelCap::new(0);
+        assert_eq!(cap.label("v1"), BUILD_ID_LABEL_OTHER);
+        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
+    }
+
+    #[test]
+    fn global_build_id_label_applies_the_sentinel_rules() {
+        // This test admits no build, so it cannot fill the process-wide cap
+        // that other tests in this binary share.
+        assert_eq!(build_id_label(""), BUILD_ID_LABEL_NONE);
+        let long = "z".repeat(MAX_BUILD_ID_LABEL_LEN + 1);
+        assert_eq!(build_id_label(&long), BUILD_ID_LABEL_OTHER);
+    }
+
+    #[test]
+    fn build_labelled_defaults_forward_to_the_unlabelled_methods() {
+        #[derive(Default)]
+        struct Rec(std::sync::Mutex<Vec<&'static str>>);
+        impl MetricsRecorder for Rec {
+            fn record_workflow_terminal(&self, _: &str, _: &str, _: WorkflowStatus) {
+                self.0.lock().unwrap().push("terminal");
+            }
+            fn record_workflow_completed(&self, _: &str, _: &str, _: f64, _: WorkflowStatus) {
+                self.0.lock().unwrap().push("wf_duration");
+            }
+            fn record_workflow_nondeterministic_block(&self, _: &str, _: &str) {
+                self.0.lock().unwrap().push("nd_block");
+            }
+            fn record_activity_attempt(&self, _: &str, _: &str, _: ActivityStatus) {
+                self.0.lock().unwrap().push("attempt");
+            }
+            fn record_activity_completed(&self, _: &str, _: &str, _: f64, _: ActivityStatus) {
+                self.0.lock().unwrap().push("act_duration");
+            }
+        }
+        let rec = Rec::default();
+        rec.record_workflow_terminal_for_build("wf", "q", "b", WorkflowStatus::Failed);
+        rec.record_workflow_completed_for_build("wf", "q", "b", 1.0, WorkflowStatus::Completed);
+        rec.record_workflow_nondeterministic_block_for_build("wf", "q", "b");
+        rec.record_activity_attempt_for_build("a", "q", "b", ActivityStatus::Failed);
+        rec.record_activity_completed_for_build("a", "q", "b", 1.0, ActivityStatus::Failed, None);
+        rec.record_build_ramp_aborted("q", "failure_rate");
+        assert_eq!(
+            rec.0.lock().unwrap().as_slice(),
+            &[
+                "terminal",
+                "wf_duration",
+                "nd_block",
+                "attempt",
+                "act_duration"
+            ]
+        );
+    }
+
+    #[test]
+    fn emit_workflow_terminal_for_build_skips_canary_and_passes_the_label() {
+        #[derive(Default)]
+        struct Rec(std::sync::Mutex<Vec<(String, String)>>);
+        impl MetricsRecorder for Rec {
+            fn record_workflow_terminal_for_build(
+                &self,
+                wf: &str,
+                _: &str,
+                build_id: &str,
+                _: WorkflowStatus,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((wf.to_owned(), build_id.to_owned()));
+            }
+        }
+        let rec = Rec::default();
+        emit_workflow_terminal_for_build(
+            &rec,
+            "__harvest_canary_probe__default",
+            "default",
+            "b1",
+            WorkflowStatus::Completed,
+        );
+        emit_workflow_terminal_for_build(
+            &rec,
+            "orders",
+            "default",
+            &build_id_label(""),
+            WorkflowStatus::Failed,
+        );
+        assert_eq!(
+            rec.0.lock().unwrap().as_slice(),
+            &[("orders".to_owned(), BUILD_ID_LABEL_NONE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn metric_build_ramp_aborted_name_is_stable() {
+        assert_eq!(METRIC_BUILD_RAMP_ABORTED, "harvest.build.ramp_aborted");
+        assert_eq!(BUILD_ID_LABEL_NONE, "none");
+        assert_eq!(BUILD_ID_LABEL_OTHER, "__other__");
     }
 }

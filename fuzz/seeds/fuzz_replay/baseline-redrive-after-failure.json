@@ -1,0 +1,79 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": {
+          "order": 15
+        },
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000aa",
+        "name": "charge",
+        "input": {
+          "cents": 900
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityFailed",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000aa",
+        "error": "card declined",
+        "attempt": 1,
+        "error_type": "Error",
+        "non_retryable": true
+      }
+    },
+    {
+      "type": "WorkflowFailed",
+      "data": {
+        "error": "card declined"
+      }
+    },
+    {
+      "type": "WorkflowRedriven",
+      "data": {
+        "redriven_at": "2026-09-01T12:00:00Z",
+        "dead_letter_id": "01928f6e-0000-7000-8000-0000000000dd",
+        "reason": "card updated"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000ab",
+        "name": "charge",
+        "input": {
+          "cents": 900
+        },
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-0000000000ab",
+        "output": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": {
+          "paid": true
+        }
+      }
+    }
+  ]
+}

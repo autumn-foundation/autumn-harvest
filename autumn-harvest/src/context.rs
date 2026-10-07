@@ -229,6 +229,9 @@ pub struct WorkflowHistoryPolicy {
     /// via [`Self::with_history_bloat_warn_fraction`], the sole (guarded)
     /// entry point, since this field is private.
     history_bloat_warn_fraction: f64,
+    /// Whether each decision appends a `DecisionCommitted` boundary
+    /// (issue #1833). Defaults to `false`.
+    decision_boundaries: bool,
 }
 
 impl Default for WorkflowHistoryPolicy {
@@ -239,6 +242,7 @@ impl Default for WorkflowHistoryPolicy {
             byte_hard_cap: Some(DEFAULT_HISTORY_BYTE_HARD_CAP),
             continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
             history_bloat_warn_fraction: DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
+            decision_boundaries: false,
         }
     }
 }
@@ -325,6 +329,26 @@ impl WorkflowHistoryPolicy {
     #[must_use]
     pub const fn history_bloat_warn_fraction(self) -> f64 {
         self.history_bloat_warn_fraction
+    }
+
+    /// Whether each decision appends a
+    /// [`DecisionCommitted`](crate::event::WorkflowEvent::DecisionCommitted)
+    /// boundary (issue #1833). Defaults to `false`.
+    #[must_use]
+    pub const fn decision_boundaries(self) -> bool {
+        self.decision_boundaries
+    }
+
+    /// Turn decision boundaries on or off (issue #1833).
+    ///
+    /// A process older than this release cannot decode a boundary. An old
+    /// worker fails the execution that holds one. So boundaries are off by
+    /// default, as the rolling-deploy contract requires. Turn them on when
+    /// no older process runs.
+    #[must_use]
+    pub const fn with_decision_boundaries(mut self, enabled: bool) -> Self {
+        self.decision_boundaries = enabled;
+        self
     }
 
     /// The event count at which the history-bloat warning fires (issue

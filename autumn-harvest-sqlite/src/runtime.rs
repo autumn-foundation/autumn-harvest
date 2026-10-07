@@ -1784,8 +1784,9 @@ impl SqliteRuntime {
 ///   cap, immediate requeue, no policy non-retryable list).
 /// - `start_to_close_override` — honored: persisted (milliseconds) so the worker
 ///   enforces it as a post-execution outcome (a body exceeding its budget records a
-///   terminal `ActivityTimedOut { StartToClose }`, byte-equivalent to the Postgres
-///   timeout scanner). `None` = no budget (unbounded).
+///   terminal `ActivityTimedOut { StartToClose }`). `None` = no budget (unbounded).
+///   Postgres differs here: it retries a start-to-close timeout per the retry
+///   policy (issue #1809, ADR 0005). This backend does not.
 /// - `schedule_to_close` (the `ActivityInfo::default_schedule_to_close`, issue #378)
 ///   and the other three resolved defaults — FROZEN onto the row here when the
 ///   activity is already registered (issue #1068). It is not a command field, so it

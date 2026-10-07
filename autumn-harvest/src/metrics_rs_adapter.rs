@@ -44,35 +44,39 @@
 use metrics::{Key, Label, counter, gauge, histogram};
 
 use crate::telemetry::{
-    ActivityPauseAction, ActivityStatus, ConnectorOutcome, METRIC_ACTIVITY_ATTEMPTS,
-    METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_ACTIVITY_PANIC,
-    METRIC_ACTIVITY_PAUSE_ACTIONS, METRIC_ACTIVITY_RETRIES, METRIC_ADMISSION_BLOCKED,
-    METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE, METRIC_API_RATE_LIMITED,
-    METRIC_CANARY_FAILURE, METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED,
+    ActivityPauseAction, ActivityStatus, BUILD_ID_LABEL_NONE, ConnectorOutcome,
+    METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_CONCURRENCY_DEFERRED,
+    METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT, METRIC_ACTIVITY_CONCURRENCY_LIMIT,
+    METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_ACTIVITY_LATENCY_BASELINE,
+    METRIC_ACTIVITY_PANIC, METRIC_ACTIVITY_PAUSE_ACTIONS, METRIC_ACTIVITY_RETRIES,
+    METRIC_ADMISSION_BLOCKED, METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE,
+    METRIC_API_RATE_LIMITED, METRIC_BUILD_RAMP_ABORTED, METRIC_CANARY_FAILURE,
+    METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_DEFERRED,
     METRIC_CIRCUIT_TRIPPED, METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
     METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED,
     METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
-    METRIC_CONNECTOR_RECEIVED, METRIC_DB_POOL_ACQUIRE_TIMEOUT, METRIC_DEBOUNCE_FIRED,
-    METRIC_DISPATCH_DROPPED_HINTS, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
-    METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT, METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
-    METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED, METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE,
-    METRIC_EXTERNAL_CANCEL_SENT, METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE,
-    METRIC_EXTERNAL_SIGNAL_SENT, METRIC_HEARTBEAT_FLUSH_FAILED, METRIC_LABEL_ACTION,
-    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID,
-    METRIC_LABEL_CLIENT_KIND, METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_GAP,
-    METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE,
-    METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY,
-    METRIC_LABEL_QUEUE, METRIC_LABEL_RATE_LIMIT_FAMILY, METRIC_LABEL_REASON,
-    METRIC_LABEL_REASON_CODE, METRIC_LABEL_RESOURCE, METRIC_LABEL_ROLE, METRIC_LABEL_ROUTE_CLASS,
-    METRIC_LABEL_SCANNER, METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SITE,
-    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE, METRIC_LABEL_STATUS,
-    METRIC_LABEL_TASK_TYPE, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW,
-    METRIC_LABEL_WORKFLOW_TYPE, METRIC_LOAD_SHED_ACTIVE, METRIC_LOAD_SHED_REJECTED,
-    METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT, METRIC_NOTIFY_QUEUE_USAGE,
-    METRIC_NOTIFY_SEND_FAILURES, METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION,
-    METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH,
-    METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED,
-    METRIC_QUEUE_SCHEDULE_TO_START, METRIC_QUOTA_REJECTED, METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED,
+    METRIC_CONNECTOR_RECEIVED, METRIC_DB_POOL_ACQUIRE_TIMEOUT, METRIC_DB_TRANSACTION_RETRY,
+    METRIC_DB_TRANSACTION_RETRY_EXHAUSTED, METRIC_DEBOUNCE_FIRED, METRIC_DISPATCH_DROPPED_HINTS,
+    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+    METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD, METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
+    METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_CANCEL_SENT,
+    METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_SIGNAL_SENT,
+    METRIC_HEARTBEAT_FLUSH_FAILED, METRIC_LABEL_ACTION, METRIC_LABEL_ACTIVITY,
+    METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID, METRIC_LABEL_CLIENT_KIND,
+    METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_GAP, METRIC_LABEL_KEY,
+    METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME,
+    METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE,
+    METRIC_LABEL_RATE_LIMIT_FAMILY, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
+    METRIC_LABEL_RESOURCE, METRIC_LABEL_ROLE, METRIC_LABEL_ROUTE_CLASS, METRIC_LABEL_SCANNER,
+    METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SITE, METRIC_LABEL_SLOT_TYPE,
+    METRIC_LABEL_SOURCE, METRIC_LABEL_STATE, METRIC_LABEL_STATUS, METRIC_LABEL_TASK_TYPE,
+    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
+    METRIC_LOAD_SHED_ACTIVE, METRIC_LOAD_SHED_REJECTED, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD,
+    METRIC_MUTEX_WAIT, METRIC_NOTIFY_QUEUE_USAGE, METRIC_NOTIFY_SEND_FAILURES,
+    METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
+    METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
+    METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED, METRIC_QUEUE_SCHEDULE_TO_START,
+    METRIC_QUOTA_REJECTED, METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED,
     METRIC_RATE_LIMIT_BUCKETS_DELETED, METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED,
     METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED, METRIC_RETRY_BUDGET_AVAILABLE,
     METRIC_RETRY_BUDGET_EXHAUSTED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
@@ -124,10 +128,30 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(count);
     }
 
+    // Issue #1814: the five outcome, ND-block and latency families always
+    // carry `build_id`. A call with no build reports `none`, so every series
+    // of a family has the same label set.
     fn record_workflow_completed(
         &self,
         workflow_name: &str,
         queue: &str,
+        duration_secs: f64,
+        status: WorkflowStatus,
+    ) {
+        self.record_workflow_completed_for_build(
+            workflow_name,
+            queue,
+            BUILD_ID_LABEL_NONE,
+            duration_secs,
+            status,
+        );
+    }
+
+    fn record_workflow_completed_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
         duration_secs: f64,
         status: WorkflowStatus,
     ) {
@@ -136,16 +160,28 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
             METRIC_LABEL_STATUS => status.as_str(),
+            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
         )
         .record(duration_secs);
     }
 
     fn record_workflow_terminal(&self, workflow_name: &str, queue: &str, outcome: WorkflowStatus) {
+        self.record_workflow_terminal_for_build(workflow_name, queue, BUILD_ID_LABEL_NONE, outcome);
+    }
+
+    fn record_workflow_terminal_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
+        outcome: WorkflowStatus,
+    ) {
         counter!(
             METRIC_WORKFLOW_TERMINAL,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
             METRIC_LABEL_OUTCOME => outcome.as_str(),
+            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
         )
         .increment(1);
     }
@@ -177,10 +213,24 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
+        self.record_workflow_nondeterministic_block_for_build(
+            workflow_name,
+            queue,
+            BUILD_ID_LABEL_NONE,
+        );
+    }
+
+    fn record_workflow_nondeterministic_block_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
+    ) {
         counter!(
             METRIC_WORKFLOW_ND_BLOCKED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
         )
         .increment(1);
     }
@@ -192,19 +242,39 @@ impl MetricsRecorder for MetricsRsRecorder {
         duration_secs: f64,
         status: ActivityStatus,
     ) {
-        histogram!(
-            METRIC_ACTIVITY_DURATION,
-            METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
-            METRIC_LABEL_STATUS => status.as_str(),
-        )
-        .record(duration_secs);
+        self.record_activity_completed_for_build(
+            activity_name,
+            queue,
+            BUILD_ID_LABEL_NONE,
+            duration_secs,
+            status,
+            None,
+        );
     }
 
     fn record_activity_completed_with_error_type(
         &self,
         activity_name: &str,
         queue: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+        error_type: Option<&str>,
+    ) {
+        self.record_activity_completed_for_build(
+            activity_name,
+            queue,
+            BUILD_ID_LABEL_NONE,
+            duration_secs,
+            status,
+            error_type,
+        );
+    }
+
+    fn record_activity_completed_for_build(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        build_id: &str,
         duration_secs: f64,
         status: ActivityStatus,
         error_type: Option<&str>,
@@ -218,10 +288,18 @@ impl MetricsRecorder for MetricsRsRecorder {
                 METRIC_LABEL_QUEUE => queue.to_owned(),
                 METRIC_LABEL_STATUS => status.as_str(),
                 METRIC_LABEL_ERROR_TYPE => error_type.to_owned(),
+                METRIC_LABEL_BUILD_ID => build_id.to_owned(),
             )
             .record(duration_secs);
         } else {
-            self.record_activity_completed(activity_name, queue, duration_secs, status);
+            histogram!(
+                METRIC_ACTIVITY_DURATION,
+                METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
+                METRIC_LABEL_QUEUE => queue.to_owned(),
+                METRIC_LABEL_STATUS => status.as_str(),
+                METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+            )
+            .record(duration_secs);
         }
     }
 
@@ -243,11 +321,22 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_activity_attempt(&self, activity_name: &str, queue: &str, outcome: ActivityStatus) {
+        self.record_activity_attempt_for_build(activity_name, queue, BUILD_ID_LABEL_NONE, outcome);
+    }
+
+    fn record_activity_attempt_for_build(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        build_id: &str,
+        outcome: ActivityStatus,
+    ) {
         counter!(
             METRIC_ACTIVITY_ATTEMPTS,
             METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
             METRIC_LABEL_QUEUE => queue.to_owned(),
             METRIC_LABEL_OUTCOME => outcome.as_str(),
+            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
         )
         .increment(1);
     }
@@ -578,6 +667,26 @@ impl MetricsRecorder for MetricsRsRecorder {
         counter!(METRIC_DB_POOL_ACQUIRE_TIMEOUT, METRIC_LABEL_SITE => site.to_owned()).increment(1);
     }
 
+    fn record_db_transaction_retry(&self, site: &str, reason: &str) {
+        // Bounded labels: three sites and two reasons (issue #1822).
+        counter!(
+            METRIC_DB_TRANSACTION_RETRY,
+            METRIC_LABEL_SITE => site.to_owned(),
+            METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_db_transaction_retry_exhausted(&self, site: &str, reason: &str) {
+        // Bounded labels, as for the retry counter (issue #1822).
+        counter!(
+            METRIC_DB_TRANSACTION_RETRY_EXHAUSTED,
+            METRIC_LABEL_SITE => site.to_owned(),
+            METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_heartbeat_flush_failed(&self, reason: &str) {
         // Bounded label: one of three fixed reasons (issue #1788).
         counter!(METRIC_HEARTBEAT_FLUSH_FAILED, METRIC_LABEL_REASON => reason.to_owned())
@@ -859,6 +968,39 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_activity_concurrency_limit(
+        &self,
+        activity: &str,
+        state: &crate::adaptive_limit::LimitSnapshot,
+    ) {
+        gauge!(
+            METRIC_ACTIVITY_CONCURRENCY_LIMIT,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .set(f64::from(state.limit));
+        gauge!(
+            METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .set(f64::from(state.in_flight));
+        // No estimate yet: keep the last published baseline.
+        if let Some(baseline) = state.baseline {
+            gauge!(
+                METRIC_ACTIVITY_LATENCY_BASELINE,
+                METRIC_LABEL_ACTIVITY => activity.to_owned(),
+            )
+            .set(baseline.as_secs_f64());
+        }
+    }
+
+    fn record_activity_concurrency_deferred(&self, activity: &str) {
+        counter!(
+            METRIC_ACTIVITY_CONCURRENCY_DEFERRED,
+            METRIC_LABEL_ACTIVITY => activity.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_schedule_manual_trigger(&self, schedule_name: &str, outcome: &str) {
         counter!(
             METRIC_SCHEDULE_MANUAL_TRIGGER,
@@ -1009,6 +1151,14 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_circuit_deferred(&self, activity_name: &str) {
+        counter!(
+            METRIC_CIRCUIT_DEFERRED,
+            METRIC_LABEL_ACTIVITY_NAME => activity_name.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
         counter!(
             METRIC_COMPLETION_TRIGGER_FIRED,
@@ -1078,6 +1228,15 @@ impl MetricsRecorder for MetricsRsRecorder {
         counter!(
             METRIC_LOAD_SHED_REJECTED,
             METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_build_ramp_aborted(&self, queue: &str, reason: &str) {
+        counter!(
+            METRIC_BUILD_RAMP_ABORTED,
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_REASON => reason.to_owned(),
         )
         .increment(1);
     }
@@ -2936,5 +3095,192 @@ mod tests {
 
     const fn autumn_harvest_capability_outcome_escalated() -> &'static str {
         crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED
+    }
+
+    // -----------------------------------------------------------------------
+    // build_id label on outcome, ND-block and latency families (issue #1814)
+    // -----------------------------------------------------------------------
+
+    /// One registered series: the metric name and its sorted labels.
+    type SeriesKey = (String, Vec<(String, String)>);
+
+    /// Captures the key of every registered counter and histogram.
+    #[derive(Default)]
+    struct SeriesCapture {
+        series: std::sync::Mutex<Vec<SeriesKey>>,
+    }
+
+    impl SeriesCapture {
+        fn push(&self, key: &metrics::Key) {
+            let mut labels: Vec<(String, String)> = key
+                .labels()
+                .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                .collect();
+            labels.sort();
+            self.series
+                .lock()
+                .unwrap()
+                .push((key.name().to_owned(), labels));
+        }
+
+        /// The `build_id` label of each captured series, in order.
+        fn build_ids(&self) -> Vec<(String, Option<String>)> {
+            self.series
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, labels)| {
+                    let build = labels
+                        .iter()
+                        .find(|(k, _)| k == METRIC_LABEL_BUILD_ID)
+                        .map(|(_, v)| v.clone());
+                    (name.clone(), build)
+                })
+                .collect()
+        }
+    }
+
+    impl metrics::Recorder for &SeriesCapture {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            self.push(key);
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            self.push(key);
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn build_labelled_methods_carry_the_build_id_label() {
+        let capture = SeriesCapture::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_workflow_terminal_for_build("wf", "q", "b1", WorkflowStatus::Failed);
+            rec.record_workflow_completed_for_build("wf", "q", "b1", 1.0, WorkflowStatus::Failed);
+            rec.record_workflow_nondeterministic_block_for_build("wf", "q", "b1");
+            rec.record_activity_attempt_for_build("act", "q", "b1", ActivityStatus::Failed);
+            rec.record_activity_completed_for_build(
+                "act",
+                "q",
+                "b1",
+                0.5,
+                ActivityStatus::Failed,
+                Some("Timeout"),
+            );
+            rec.record_activity_completed_for_build(
+                "act",
+                "q",
+                "b1",
+                0.5,
+                ActivityStatus::Completed,
+                None,
+            );
+        });
+        let b1 = Some("b1".to_owned());
+        assert_eq!(
+            capture.build_ids(),
+            vec![
+                (METRIC_WORKFLOW_TERMINAL.to_owned(), b1.clone()),
+                (METRIC_WORKFLOW_DURATION.to_owned(), b1.clone()),
+                (METRIC_WORKFLOW_ND_BLOCKED.to_owned(), b1.clone()),
+                (METRIC_ACTIVITY_ATTEMPTS.to_owned(), b1.clone()),
+                (METRIC_ACTIVITY_DURATION.to_owned(), b1.clone()),
+                (METRIC_ACTIVITY_DURATION.to_owned(), b1),
+            ]
+        );
+        // The labels that existed before issue #1814 stay.
+        let series = capture.series.lock().unwrap().clone();
+        let keys =
+            |i: usize| -> Vec<String> { series[i].1.iter().map(|(k, _)| k.clone()).collect() };
+        assert_eq!(keys(0), ["build_id", "outcome", "queue", "workflow"]);
+        assert_eq!(
+            keys(4),
+            ["activity", "build_id", "error.type", "queue", "status"]
+        );
+        assert_eq!(keys(5), ["activity", "build_id", "queue", "status"]);
+    }
+
+    #[test]
+    fn unlabelled_methods_report_build_id_none() {
+        // One label set per family: a call with no build reports "none".
+        let capture = SeriesCapture::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_workflow_terminal("wf", "q", WorkflowStatus::TimedOut);
+            rec.record_workflow_completed("wf", "q", 1.0, WorkflowStatus::Completed);
+            rec.record_workflow_nondeterministic_block("wf", "q");
+            rec.record_activity_attempt("act", "q", ActivityStatus::Completed);
+            rec.record_activity_completed("act", "q", 0.5, ActivityStatus::Completed);
+            rec.record_activity_completed_with_error_type(
+                "act",
+                "q",
+                0.5,
+                ActivityStatus::Failed,
+                Some("Timeout"),
+            );
+        });
+        let none = Some(crate::telemetry::BUILD_ID_LABEL_NONE.to_owned());
+        assert_eq!(
+            capture.build_ids(),
+            vec![
+                (METRIC_WORKFLOW_TERMINAL.to_owned(), none.clone()),
+                (METRIC_WORKFLOW_DURATION.to_owned(), none.clone()),
+                (METRIC_WORKFLOW_ND_BLOCKED.to_owned(), none.clone()),
+                (METRIC_ACTIVITY_ATTEMPTS.to_owned(), none.clone()),
+                (METRIC_ACTIVITY_DURATION.to_owned(), none.clone()),
+                (METRIC_ACTIVITY_DURATION.to_owned(), none),
+            ]
+        );
+    }
+
+    #[test]
+    fn bridges_build_ramp_aborted_with_queue_and_reason_labels() {
+        let capture = SeriesCapture::default();
+        metrics::with_local_recorder(&&capture, || {
+            MetricsRsRecorder.record_build_ramp_aborted("default", "failure_rate");
+        });
+        assert_eq!(
+            capture.series.lock().unwrap().as_slice(),
+            &[(
+                METRIC_BUILD_RAMP_ABORTED.to_owned(),
+                vec![
+                    (METRIC_LABEL_QUEUE.to_owned(), "default".to_owned()),
+                    (METRIC_LABEL_REASON.to_owned(), "failure_rate".to_owned()),
+                ],
+            )]
+        );
     }
 }

@@ -422,26 +422,23 @@ impl ResidentWorkflow {
     }
 
     /// Returns the event in `delta` that resolves the awaited command.
+    ///
+    /// Decision boundaries (issue #1833) are skipped. Replay never reads them.
     fn resolving_event<'a>(
         &self,
         delta: &'a [WorkflowEvent],
     ) -> Result<&'a WorkflowEvent, ResumeDeclined> {
-        let own = self.own_events.len();
-        let head = &delta[..own.min(delta.len())];
+        let mut events = delta.iter().filter(|event| !event.is_decision_boundary());
+        // A delta shorter than the own events is checked as far as it goes.
         let own_match = self
             .own_events
             .iter()
-            .zip(head)
-            .all(|(expected, event)| expected.matches(event));
+            .all(|expected| events.next().is_none_or(|event| expected.matches(event)));
         if !own_match {
             return Err(ResumeDeclined::OwnEventsMismatch);
         }
         // Replay skips progress events only up to the resolving event.
-        let mut rest = delta
-            .get(own..)
-            .unwrap_or_default()
-            .iter()
-            .skip_while(|event| self.awaiting.is_progress(event));
+        let mut rest = events.skip_while(|event| self.awaiting.is_progress(event));
         match (rest.next(), rest.next()) {
             (Some(event), None) => Ok(event),
             (Some(_), Some(_)) => Err(ResumeDeclined::ExtraEvents),
@@ -521,6 +518,13 @@ mod tests {
 
     type HandlerFuture<'a> =
         Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
+
+    fn decision_boundary() -> WorkflowEvent {
+        WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("b"),
+            worker_id: crate::types::WorkerId::new("w"),
+        }
+    }
 
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
@@ -680,6 +684,8 @@ mod tests {
                 };
             };
             history.extend(own_events(&commands));
+            // A live worker closes each decision with a boundary (issue #1833).
+            history.push(decision_boundary());
             history.push(resolution(&commands));
         }
         panic!("the run did not finish in 32 decisions");
@@ -704,6 +710,7 @@ mod tests {
             };
             let start_len = history.len();
             history.extend(own_events(commands));
+            history.push(decision_boundary());
             history.push(resolution(commands));
             let delta = &history[start_len..];
             let warm_step = match resident.take() {
@@ -1332,5 +1339,19 @@ mod tests {
             "{outcome:?}"
         );
         assert!(next.is_none(), "a completed run is not resident");
+    }
+
+    #[tokio::test]
+    async fn a_decision_boundary_in_the_delta_is_skipped() {
+        let (resident, own, id) = suspended_activity().await;
+        let delta = [own, vec![decision_boundary(), completed(id)]].concat();
+        let (outcome, _) = resident
+            .resume(&delta)
+            .await
+            .expect("a boundary must not decline a warm resume");
+        assert!(
+            matches!(outcome, WorkflowOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
     }
 }
