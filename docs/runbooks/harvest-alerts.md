@@ -690,6 +690,14 @@ The response distinguishes `matched` (total filtered), `redriven`,
   as `skipped` — never a duplicate side-effect.
 - **Shard-aware.** A filtered redrive fans out across all shards; each row is
   re-enqueued on the shard that owns its `workflow_exec_id`.
+- **Spread, not a burst (issue #1832).** Redrive and bulk replay spread the
+  new tasks' `scheduled_at` over a window. Each task gets a jittered slot. So
+  1000 tasks do not hit the dependency that sent them to the DLQ at one
+  instant. The default window is 60 s for 1000 rows, scaled down for fewer
+  rows (100 rows: 6 s). `--spread-secs N` sets it, up to 3600. `--spread-secs 0`
+  makes every task due at once. The base instant is the database clock.
+  On a sharded cluster, every shard uses the window of the whole call. A
+  completion-callback entry gets its next delivery attempt in the window.
 
 The endpoint backing this is `POST /api/harvest/dlq/redrive` (admin auth,
 audit op `dlq.redrive`).
@@ -1244,8 +1252,9 @@ self-resolves within one evaluation window is expected.
 
 1. If a downstream outage is confirmed, force-open the failing activity's
    circuit breaker (`POST /api/harvest/admin/circuits/{activity}/force-open`)
-   so new sagas fail fast at the first step instead of committing work they
-   will immediately unwind.
+   so new sagas stop at the first step instead of committing work they will
+   immediately unwind. In defer mode they wait in `PENDING`. In fail-fast mode
+   they fail at once.
 2. Pause the schedules or gate the admissions that feed the affected workflow
    type until the downstream recovers.
 3. Let in-flight unwinds run — compensations are idempotent by contract and
@@ -1883,6 +1892,7 @@ own work counters and its `tracing::error!`, not this heartbeat.
 | `schedule` | `Scheduler::spawn_sharded` | Every cron/interval schedule firing |
 | `pause_auto_resume` | `spawn_pause_auto_resumer` | Bounded-pause auto-resume (#383) |
 | `audit_export` | `spawn_audit_export_checker_for_shard` | Audit-record export to the configured SIEM sink (#1269) |
+| `rebalance_resume` | `spawn_rebalance_resume_scanner` | Settles a shard migration that stalled after its cutover (#1839) |
 
 ### Triage steps
 
@@ -1939,7 +1949,8 @@ own work counters and its `tracing::error!`, not this heartbeat.
   API-only pod.
 - **A loop polling slower than the alert window.** The loops do *not* share a
   cadence: `timeout`/`sla`/`external_outbox` poll every 500 ms, `schedule`
-  every 1 s, `poison_pill`/`pause_auto_resume` every 5 s — but `retention`
+  every 1 s, `poison_pill`/`pause_auto_resume`/`rebalance_resume` every 5 s —
+  but `retention`
   polls **hourly** by default. That is why the shipped rule carries two
   expressions with different windows; a single 5-minute window would page
   continuously on a perfectly healthy retention janitor. Retune both if you
@@ -2035,7 +2046,8 @@ own work counters and its `tracing::error!`, not this heartbeat.
   `scanner_liveness` check, which needs no gate because it knows what is
   registered.
 - **Not a false positive: one wedged shard.** A multi-shard worker spawns a
-  `timeout`, `poison_pill`, and `pause_auto_resume` loop **per assigned shard**,
+  `timeout`, `poison_pill`, `pause_auto_resume` and `rebalance_resume` loop
+  **per assigned shard**,
   all under one `scanner` label. Both surfaces handle this, and both have to:
   the counter carries a bounded **`shard`** label (the shard id, or `none` for
   the process-wide `retention`/`schedule` loops and single-shard deployments),

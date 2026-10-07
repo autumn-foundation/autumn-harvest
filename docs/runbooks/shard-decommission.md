@@ -107,6 +107,11 @@ run the resume sweep before the next batch. It is idempotent:
 harvest shard rebalance-resume --shard 0=... --shard 1=... --from 0
 ```
 
+A running worker settles a migration that stalled after its cutover on its
+own (issue #1839). It writes a `shard.rebalance.auto_resume` audit row. The
+resume sweep is still needed for a migration that stopped before the cutover.
+See [`sharding.md`](../sharding.md#automatic-resume-after-a-stalled-cutover-issue-1839).
+
 ## 3. Converge: deal with what will not move
 
 Re-run the dry run until it reports nothing left to migrate. What remains falls
@@ -181,7 +186,8 @@ Deploy fleet-wide and verify with the config diff from step 1 before step 5.
 Only after step 4 is deployed everywhere:
 
 - **Export the audit trail first.** Every migration wrote its
-  `shard.rebalance.migrate` rows to *this* shard's `harvest_audit_log`, so
+  `shard.rebalance.migrate` and `shard.rebalance.auto_resume` rows to *this*
+  shard's `harvest_audit_log`, so
   retiring the database retires the record of the drill. Ship them off-box with
   the audit exporter (issue #953) before going further.
 - **Settle your erasure obligations on this shard before it leaves reach.** The

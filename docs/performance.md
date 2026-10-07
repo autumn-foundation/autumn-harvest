@@ -2013,3 +2013,8 @@ standalone note rather than part of the claim-path attribution table above:
   `execution.rs`, and `completion_trigger.rs`; batched into a chunked
   `eq_any` query via `check_and_report_unfinished_handlers_batch` (calls
   400→4 at a 400-child fixture, 100 executions per chunk).
+* [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
+  — the three-write derived `Hash` for `timeline::AccKey`, the lookup key of
+  `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
+  replaced by a manual impl that writes one 128-bit value (instructions
+  -8.3%, callgrind).

@@ -1,0 +1,110 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": null,
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000850",
+        "name": "slow",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "MarkerRecorded",
+      "data": {
+        "name": "fan_out:1",
+        "details": 2
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000851",
+        "name": "task",
+        "input": 0,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000852",
+        "name": "task",
+        "input": 1,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityFailed",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000851",
+        "error": "boom",
+        "attempt": 1,
+        "error_type": "Error",
+        "non_retryable": true
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000857",
+        "name": "cleanup",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000852",
+        "output": null
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000857",
+        "output": null
+      }
+    },
+    {
+      "type": "ActivityScheduled",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000859",
+        "name": "next",
+        "input": null,
+        "queue": "default"
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000859",
+        "output": null
+      }
+    },
+    {
+      "type": "ActivityCompleted",
+      "data": {
+        "activity_id": "01928f6e-0000-7000-8000-000000000850",
+        "output": null
+      }
+    },
+    {
+      "type": "WorkflowCompleted",
+      "data": {
+        "output": null
+      }
+    }
+  ]
+}

@@ -158,33 +158,28 @@ fn is_db_harness_only(source: &str) -> bool {
     !code.contains("#[tokio::test") && !code.contains("block_on")
 }
 
-// ── Allowlist: DB-gated tests without a covering manifest row (technical debt) ─
+// ── Allowlist: DB-gated tests without a covering manifest row ──────────────
 //
 // Keyed `core:<module>` / `plugin:<file-stem>`. Every entry carries a reason.
-// Seeded fail-closed with the tests that currently lack a covering manifest row
-// so the guard is green on commit. SHRINK this by adding manifest rows. The
-// ratchet below forbids silent growth. An entry that a row covers is stale.
+// Issue #1799 wired every suite that passes against Docker Postgres. What is
+// left is either debt with an owner, or a suite that CI does not run by
+// design. `docs/testing/ci-db-suite-allowlist.md` lists each entry with its
+// owner. A reason that `BY_DESIGN_REASONS` does not list is debt. An entry
+// that a covering row makes stale must go.
 // This guard PROVED it bites: during development `nd_block_tests` was left
-// out and the guard failed naming it (the TDD red step). `nd_block_tests`, `worker_session_tests`, and the plugin
-// `build_ramp_integration` suites are wired (they have `linux` manifest rows),
-// so they are no longer here.
+// out and the guard failed naming it (the TDD red step).
 
-const ALLOWLIST_DEBT_REASON: &str =
-    "DB integration test not yet wired to a covering manifest row; test-coverage debt to shrink";
-const ALLOWLIST_TESTING_REASON: &str = "DB+testing-gated integration test not yet wired to a covering manifest row (needs the `testing` feature when wired)";
-// mcp_tools_integration / webhook_* integration: paved-path DB tests
+// mcp_tools_integration / webhook_durable_integration: paved-path DB tests
 // (autumn_web::test::TestDb + run_pending(MIGRATIONS)) that are feature-gated
-// AND have every test #[ignore]d, so no CI run can execute them. The mcp one is
-// only `compileonly` in the manifest; the webhooks feature is enabled by no CI
-// run. Wiring real Docker-backed runs for #[ignore]d/feature-gated suites is
-// out of scope for this test-infra PR — tracked here honestly instead.
+// AND have every test #[ignore]d, so no CI run can execute them. Issue #1959
+// tracks the fix.
 const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `compileonly` in the manifest) AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness) — no CI run can execute it; tracked";
+     (TestDb/run_pending paved-path DB harness) — no CI run can execute it; tracked in #1959";
 const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI, via a dedicated Linux-only \
      ci.yml step (it needs an apt libcurl/cmake install first, and the manifest's compile mode would try to build \
      vendored librdkafka on macOS/Windows). Not a coverage gap — see the `Run plugin Kafka broker connector tests` step.";
 const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness); tracked";
+     (TestDb/run_pending paved-path DB harness); tracked in #1959";
 const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): not in the manifest's `test` job. \
      The `chaos` feature is off by default, and the seeded sweep is slow, so each PR does not run it. \
      It runs only in the nightly and manual job in .github/workflows/chaos.yml, with at least 5 seeds. \
@@ -204,68 +199,17 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "core:audit_log_unexported_idx_write_cost_perf",
         ALLOWLIST_EVIDENCE_HARNESS_REASON,
     ),
-    ("core:audit_tests", ALLOWLIST_DEBT_REASON),
-    ("core:build_routing_tests", ALLOWLIST_DEBT_REASON),
-    ("core:cache_delta_load_tests", ALLOWLIST_DEBT_REASON),
     ("core:chaos_tests", ALLOWLIST_CHAOS_REASON),
-    ("core:child_policy_tests", ALLOWLIST_DEBT_REASON),
-    ("core:cross_workflow_cancel_tests", ALLOWLIST_DEBT_REASON),
-    ("core:debounce_tests", ALLOWLIST_DEBT_REASON),
-    ("core:delayed_start_tests", ALLOWLIST_DEBT_REASON),
-    ("core:legal_hold_tests", ALLOWLIST_DEBT_REASON),
-    ("core:payload_offload_db_tests", ALLOWLIST_DEBT_REASON),
-    ("core:queue_fairness_tests", ALLOWLIST_DEBT_REASON),
-    ("core:replay_canary_tests", ALLOWLIST_TESTING_REASON),
-    ("core:retry_now_tests", ALLOWLIST_DEBT_REASON),
-    ("core:schedule_decisions", ALLOWLIST_DEBT_REASON),
-    ("core:schedule_to_close_tests", ALLOWLIST_DEBT_REASON),
-    ("core:schedule_update_tests", ALLOWLIST_DEBT_REASON),
-    ("core:scheduled_time_tests", ALLOWLIST_TESTING_REASON),
-    ("core:scheduler_bounded_runs_tests", ALLOWLIST_DEBT_REASON),
-    ("core:scheduler_carryover_tests", ALLOWLIST_TESTING_REASON),
-    ("core:scheduler_catchup_tests", ALLOWLIST_DEBT_REASON),
-    ("core:signal_with_start_tests", ALLOWLIST_DEBT_REASON),
-    ("core:sla_breach_tests", ALLOWLIST_DEBT_REASON),
-    ("core:sticky_routing_tests", ALLOWLIST_DEBT_REASON),
-    ("core:telemetry_span_tests", ALLOWLIST_DEBT_REASON),
-    ("core:throttle_tests", ALLOWLIST_DEBT_REASON),
-    ("core:transactional_activity_tests", ALLOWLIST_DEBT_REASON),
-    ("core:typed_stubs_tests", ALLOWLIST_DEBT_REASON),
-    ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
-    ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:build_routing_ui_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:connector_kafka_broker",
         ALLOWLIST_KAFKA_BROKER_REASON,
     ),
-    ("plugin:dag_retry_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:event_batch_integration", ALLOWLIST_DEBT_REASON),
-    (
-        "plugin:external_handoffs_integration",
-        ALLOWLIST_DEBT_REASON,
-    ),
-    ("plugin:history_export_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:mcp_tools_integration", ALLOWLIST_MCP_IGNORED_REASON),
-    ("plugin:outbox_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:outbox_start_relay_perf",
         ALLOWLIST_PERF_EVIDENCE_REASON,
     ),
-    ("plugin:preflight_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:replay_canary_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:retirement_check_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:scaling_api_tests", ALLOWLIST_DEBT_REASON),
-    ("plugin:schedule_update_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:shard_health_integration", ALLOWLIST_DEBT_REASON),
-    (
-        "plugin:signal_with_start_integration",
-        ALLOWLIST_DEBT_REASON,
-    ),
-    ("plugin:stalled_workflow_tests", ALLOWLIST_DEBT_REASON),
-    ("plugin:telemetry_propagation_tests", ALLOWLIST_DEBT_REASON),
-    ("plugin:usage_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:version_usage_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:webhook_durable_integration",
         ALLOWLIST_WEBHOOKS_IGNORED_REASON,
@@ -274,13 +218,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // `TestApp::plugin` deadlock was fixed (multi-thread flavor) and its tests
     // un-ignored, so it is now wired to a covering `linux` manifest row and runs
     // for real against Docker Postgres in CI.
-    ("plugin:workflow_count_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:workflow_filter_integration", ALLOWLIST_DEBT_REASON),
-    (
-        "plugin:workflow_history_pagination_integration",
-        ALLOWLIST_DEBT_REASON,
-    ),
-    ("plugin:workflow_result_integration", ALLOWLIST_DEBT_REASON),
 ];
 
 /// Hard ratchet: the cap must equal `ALLOWLIST.len()` (issue #1799).
@@ -298,7 +235,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// `chaos.yml`.
 /// Then 55: issue #1799 wired five suites. It also removed three entries
 /// for suites that CI already ran.
-const ALLOWLIST_MAX_LEN: usize = 55;
+/// Then 6: issue #1799 wired the other 49 suites, 27 core and 22 plugin.
+/// Four of them needed a test fix first.
+const ALLOWLIST_MAX_LEN: usize = 6;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
@@ -828,17 +767,79 @@ fn claim_bench_support_is_classified_as_a_harness_not_a_suite() {
     );
 }
 
-/// Issue #1799 names five resilience suites that never ran in CI. Each must
-/// have a covering row and must not stay on the allowlist.
+/// Core suites that issue #1799 wired, with the features each row needs.
+///
+/// The first four are resilience suites the issue names. The fifth,
+/// `erase_payloads_integration`, is in [`ISSUE_1799_PLUGIN`]. The other 27
+/// are the second batch. Each must have a covering row and no allowlist entry.
+const ISSUE_1799_CORE: &[(&str, &[&str])] = &[
+    ("scheduler_ha_tests", &[]),
+    ("poison_pill_tests", &[]),
+    ("signal_tests", &[]),
+    ("replayer_integration_tests", &["testing"]),
+    ("audit_tests", &[]),
+    ("build_routing_tests", &[]),
+    ("cache_delta_load_tests", &[]),
+    ("child_policy_tests", &[]),
+    ("cross_workflow_cancel_tests", &[]),
+    ("debounce_tests", &[]),
+    ("delayed_start_tests", &[]),
+    ("legal_hold_tests", &[]),
+    ("payload_offload_db_tests", &[]),
+    ("queue_fairness_tests", &[]),
+    ("replay_canary_tests", &["testing"]),
+    ("retry_now_tests", &[]),
+    ("schedule_decisions", &[]),
+    ("schedule_to_close_tests", &[]),
+    ("schedule_update_tests", &[]),
+    ("scheduled_time_tests", &["testing"]),
+    ("scheduler_bounded_runs_tests", &[]),
+    ("scheduler_carryover_tests", &["testing"]),
+    ("scheduler_catchup_tests", &[]),
+    ("signal_with_start_tests", &[]),
+    ("sla_breach_tests", &[]),
+    ("sticky_routing_tests", &[]),
+    ("telemetry_span_tests", &[]),
+    ("throttle_tests", &[]),
+    ("transactional_activity_tests", &["testing"]),
+    ("typed_stubs_tests", &[]),
+    ("updt_with_start_tests", &[]),
+];
+
+/// Plugin suites that issue #1799 wired.
+const ISSUE_1799_PLUGIN: &[&str] = &[
+    "erase_payloads_integration",
+    "archival_integration",
+    "build_routing_ui_integration",
+    "dag_retry_integration",
+    "event_batch_integration",
+    "external_handoffs_integration",
+    "history_export_integration",
+    "outbox_integration",
+    "preflight_integration",
+    "replay_canary_integration",
+    "retirement_check_integration",
+    "scaling_api_tests",
+    "schedule_update_integration",
+    "shard_health_integration",
+    "signal_with_start_integration",
+    "stalled_workflow_tests",
+    "telemetry_propagation_tests",
+    "usage_integration",
+    "version_usage_integration",
+    "workflow_count_integration",
+    "workflow_filter_integration",
+    "workflow_history_pagination_integration",
+    "workflow_result_integration",
+];
+
+/// The suites that issue #1799 wired must keep a covering row. Removing a row
+/// fails this test. To move a suite back to the allowlist, also edit this
+/// list, so review sees it.
 #[test]
 fn issue_1799_suites_have_covering_rows() {
     let rows = parse_manifest();
-    for (module, required) in [
-        ("scheduler_ha_tests", &[][..]),
-        ("poison_pill_tests", &[]),
-        ("signal_tests", &[]),
-        ("replayer_integration_tests", &["testing"]),
-    ] {
+    for &(module, required) in ISSUE_1799_CORE {
         assert!(
             core_covers(&rows, module, &feats(required)),
             "core:{module} needs a covering `linux` manifest row"
@@ -848,17 +849,18 @@ fn issue_1799_suites_have_covering_rows() {
             "core:{module} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
         );
     }
-    let stem = "erase_payloads_integration";
-    let required =
-        plugin_required_features(&read_source(&plugin_tests_dir().join(format!("{stem}.rs"))));
-    assert!(
-        plugin_covered(&rows, stem, &required),
-        "plugin:{stem} needs a covering `linux` manifest row"
-    );
-    assert!(
-        !allowlisted(&format!("plugin:{stem}")),
-        "plugin:{stem} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
-    );
+    for &stem in ISSUE_1799_PLUGIN {
+        let required =
+            plugin_required_features(&read_source(&plugin_tests_dir().join(format!("{stem}.rs"))));
+        assert!(
+            plugin_covered(&rows, stem, &required),
+            "plugin:{stem} needs a covering `linux` manifest row"
+        );
+        assert!(
+            !allowlisted(&format!("plugin:{stem}")),
+            "plugin:{stem} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
+        );
+    }
 }
 
 #[test]
@@ -1140,6 +1142,153 @@ fn allowlist_entries_are_unique() {
     for &(k, _) in ALLOWLIST {
         assert!(seen.insert(k), "duplicate ALLOWLIST entry: {k}");
     }
+}
+
+// ── Tracking table: every allowlist entry has an owner or a reason (#1799) ──
+
+/// The tracking table for the allowlist (issue #1799).
+const TRACKING_DOC: &str = include_str!("../../../docs/testing/ci-db-suite-allowlist.md");
+
+/// The owner value of a suite that CI does not run by design.
+const WONT_WIRE: &str = "won't wire";
+
+/// Reasons that mark a suite that CI does not run by design. Every other
+/// reason is debt, so a new reason needs an owner until it is listed here.
+const BY_DESIGN_REASONS: &[&str] = &[
+    ALLOWLIST_EVIDENCE_HARNESS_REASON,
+    ALLOWLIST_CHAOS_REASON,
+    ALLOWLIST_KAFKA_BROKER_REASON,
+    ALLOWLIST_PERF_EVIDENCE_REASON,
+];
+
+/// True when an allowlist entry with `reason` is debt that needs an owner.
+fn entry_is_debt(reason: &str) -> bool {
+    !BY_DESIGN_REASONS.contains(&reason)
+}
+
+/// One table row: the suite key, the owner and the reason.
+struct TrackingRow {
+    key: String,
+    owner: String,
+    reason: String,
+}
+
+/// Reads the rows between the table markers of [`TRACKING_DOC`].
+fn parse_tracking_table(doc: &str) -> Vec<TrackingRow> {
+    let begin = doc
+        .find("<!-- allowlist-tracking:begin -->")
+        .expect("the tracking doc must have a begin marker");
+    let end = doc
+        .find("<!-- allowlist-tracking:end -->")
+        .expect("the tracking doc must have an end marker");
+    doc[begin..end]
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("| `"))
+        .map(|l| {
+            let cols: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+            assert_eq!(cols.len(), 3, "a tracking row has 3 columns: {l:?}");
+            TrackingRow {
+                key: cols[0].trim_matches('`').to_string(),
+                owner: cols[1].to_string(),
+                reason: cols[2].to_string(),
+            }
+        })
+        .collect()
+}
+
+/// True when `owner` names a person (`@login`) or a tracking issue (`#123`).
+/// A cell that says [`WONT_WIRE`] names no owner.
+fn names_an_owner(owner: &str) -> bool {
+    let is_login = |w: &str| {
+        w.strip_prefix('@').is_some_and(|l| {
+            !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    };
+    let is_issue = |w: &str| {
+        w.strip_prefix('#')
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    !owner.contains(WONT_WIRE)
+        && owner
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| matches!(c, '(' | ')' | ',')))
+            .any(|w| is_login(w) || is_issue(w))
+}
+
+/// Issue #1799 asks for a table of the remaining suites. Each row has an
+/// owner, or [`WONT_WIRE`] and a reason. The table and `ALLOWLIST` must
+/// agree, so the table cannot go stale.
+#[test]
+fn tracking_table_lists_every_allowlist_entry_with_an_owner_or_reason() {
+    let rows = parse_tracking_table(TRACKING_DOC);
+    let table: BTreeSet<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+    let code: BTreeSet<&str> = ALLOWLIST.iter().map(|&(k, _)| k).collect();
+    assert_eq!(
+        rows.len(),
+        table.len(),
+        "the tracking table has a duplicate row"
+    );
+    assert_eq!(
+        table, code,
+        "docs/testing/ci-db-suite-allowlist.md must list each ALLOWLIST key once, and no other key"
+    );
+    for row in &rows {
+        let &(_, reason) = ALLOWLIST.iter().find(|&&(k, _)| k == row.key).unwrap();
+        assert!(!row.reason.is_empty(), "{}: the reason is empty", row.key);
+        if entry_is_debt(reason) {
+            assert!(
+                names_an_owner(&row.owner),
+                "{}: debt needs an `@login` or `#issue` owner, got {:?}",
+                row.key,
+                row.owner
+            );
+        } else {
+            assert_eq!(
+                row.owner, WONT_WIRE,
+                "{}: CI does not run it by design, so its owner is {WONT_WIRE:?}",
+                row.key
+            );
+        }
+    }
+}
+
+#[test]
+fn tracking_table_parser_reads_owner_and_reason() {
+    let doc = "intro\n<!-- allowlist-tracking:begin -->\n| Suite | Owner | Reason |\n|---|---|---|\n| `core:a` | @someone (#12) | debt |\n| `plugin:b` | won't wire | manual |\n<!-- allowlist-tracking:end -->\n| `core:outside` | x | y |\n";
+    let rows = parse_tracking_table(doc);
+    assert_eq!(rows.len(), 2, "rows outside the markers do not count");
+    assert_eq!(rows[0].key, "core:a");
+    assert!(names_an_owner(&rows[0].owner));
+    assert_eq!(rows[1].owner, WONT_WIRE);
+    assert!(!names_an_owner(&rows[1].owner));
+    assert_eq!(rows[1].reason, "manual");
+
+    let padded = "<!-- allowlist-tracking:begin -->\n| `core:a` | #12 | debt |  \n<!-- allowlist-tracking:end -->";
+    assert_eq!(
+        parse_tracking_table(padded).len(),
+        1,
+        "trailing spaces do not add a column"
+    );
+}
+
+#[test]
+fn names_an_owner_needs_a_login_or_an_issue_number() {
+    for owner in ["@madmax983", "#1959", "@madmax983 (#1959)"] {
+        assert!(names_an_owner(owner), "{owner:?} names an owner");
+    }
+    for owner in ["#", "@", "(#)", "won't wire (#1959)", "TBD"] {
+        assert!(!names_an_owner(owner), "{owner:?} names no owner");
+    }
+}
+
+/// A new reason is debt until it is listed as by design. A forgotten list
+/// edit then asks for an owner, not for [`WONT_WIRE`].
+#[test]
+fn a_new_reason_counts_as_debt() {
+    assert!(entry_is_debt("a reason that no list names"));
+    assert!(entry_is_debt(ALLOWLIST_MCP_IGNORED_REASON));
+    assert!(!entry_is_debt(ALLOWLIST_CHAOS_REASON));
 }
 
 // ── Feature-gate coverage (DB or not) ───────────────────────────────────────

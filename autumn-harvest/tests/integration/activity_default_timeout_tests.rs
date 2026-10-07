@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::builder::{DEFAULT_ACTIVITY_START_TO_CLOSE, HarvestBuilder, WorkerConfig};
-use autumn_harvest::error::TimeoutType;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
@@ -467,15 +466,37 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
     .await
     .expect("timeout sweep");
 
-    // The timeout fails the activity call. It does not retry.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while load_execution(&url, exec_id).await.state != "FAILED" {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the workflow must fail after the timeout"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // The timeout ends the attempt. It retries per the retry policy (issue
+    // #1809, ADR 0005). The default policy allows 3 attempts, so the run
+    // does not fail, and no event is appended yet.
+    let row: TaskQueueItem = harvest_task_queue::table
+        .find(task.id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("load the task row");
+    assert!(
+        row.state == "PENDING" || row.attempt > task.attempt,
+        "the timeout must requeue the task for a retry: {row:?}"
+    );
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|e| e.contains("StartToClose")),
+        "the retry records the timeout as the previous failure: {:?}",
+        row.error
+    );
+    let events = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("load history")
+        .events;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityTimedOut { .. })),
+        "a retried timeout appends no ActivityTimedOut"
+    );
+    assert_ne!(load_execution(&url, exec_id).await.state, "FAILED");
 
     // The worker drops the hung future, so the slot is free again. Check
     // this before shutdown, because shutdown also drops it.
@@ -488,27 +509,6 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     stop(&worker, handle).await;
-
-    let history = store::load_history(&mut conn, exec_id)
-        .await
-        .expect("load history")
-        .events;
-    let timeouts = history
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                WorkflowEvent::ActivityTimedOut {
-                    timeout_type: TimeoutType::StartToClose,
-                    ..
-                }
-            )
-        })
-        .count();
-    assert_eq!(
-        timeouts, 1,
-        "history must record one start_to_close timeout; history={history:?}"
-    );
 }
 
 /// The opt-out restores the old behavior: no timeout on the task row.

@@ -578,6 +578,22 @@ pub struct TaskQueueItem {
     /// owns this row, or once a different wake reason repends it.
     #[serde(default)]
     pub timer_fires_at: Option<DateTime<Utc>>,
+    /// The `attempt` whose activity handler started (issue #1809). Written
+    /// with `ActivityStarted`. Equal to `attempt` only after the current
+    /// claim started its handler. `NULL` when no attempt started.
+    #[serde(default)]
+    pub handler_started_attempt: Option<i32>,
+    /// One entry per claim that the timeout enforcer timed out after its
+    /// handler started, newest last (issue #1809). An entry names the claim
+    /// by `attempt` and `started_at` (see `queue::timed_out_claim_key`). The
+    /// worker that held a claim takes its own entry out of here. `NULL`
+    /// until a claim times out.
+    #[serde(default)]
+    pub timed_out_claims: Option<Vec<Option<String>>>,
+    /// When the handler of `handler_started_attempt` started (issue #1809).
+    /// A timeout enforcer measures the attempt duration from it.
+    #[serde(default)]
+    pub handler_started_at: Option<DateTime<Utc>>,
     /// `true` on the first workflow task of a freshly admitted run (issue
     /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
     #[serde(default)]
@@ -1104,6 +1120,14 @@ pub struct AuditExportRow {
     pub shard_id: Option<i32>,
     pub source: String,
     pub export_seq: Option<i64>,
+    /// Audit-chain link of the previous row (issue #1838).
+    pub chain_prev: Option<Vec<u8>>,
+    /// Newest `occurred_at` chained before this row (issue #1838).
+    pub chain_newest_before: Option<DateTime<Utc>>,
+    /// Audit-chain link of this row (issue #1838).
+    pub chain_hash: Option<Vec<u8>>,
+    /// The shard whose exporter made the links (issue #1838).
+    pub chain_shard: Option<i32>,
 }
 
 /// The per-shard audit-export delivery cursor (issue #953).
@@ -1128,6 +1152,16 @@ pub struct AuditExportCursor {
     /// themselves; a retired cursor is inert — retention ignores it and a
     /// redrive refuses it.
     pub retired_at: Option<DateTime<Utc>>,
+    /// Newest audit-chain link on this shard (issue #1838).
+    pub chain_head: Option<Vec<u8>>,
+    /// First chained `export_seq` on this shard (issue #1838).
+    pub chain_start_seq: Option<i64>,
+    /// `export_seq` of the newest chained row (issue #1838).
+    pub chain_head_seq: Option<i64>,
+    /// Newest `occurred_at` of the chain, through the head (issue #1838).
+    pub chain_newest_at: Option<DateTime<Utc>>,
+    /// Keyed MAC over the checkpoint columns (issue #1838).
+    pub chain_mac: Option<Vec<u8>>,
 }
 
 // ── ApiToken ──────────────────────────────────────────────────────────────────
@@ -1199,6 +1233,12 @@ pub struct HarvestBuildPolicy {
     pub target_build_id: Option<String>,
     /// Ramp percentage 0..=100 (issue #604). `None` = no ramp configured.
     pub ramp_percent: Option<i32>,
+    /// One operator ramp's identity, the same on every shard pool (issue
+    /// #1814). `None` = no ramp, or a ramp set before the column existed.
+    pub ramp_id: Option<Uuid>,
+    /// The ramp guard's abort markers on this pool, newest first (issue
+    /// #1814). Each is `{"id": ramp_id, "base": build_id}`.
+    pub ramp_aborted: serde_json::Value,
 }
 
 /// Insert struct for a new build policy.
@@ -1762,6 +1802,8 @@ pub struct NewHarvestWasmModule<'a> {
     pub activity_name: &'a str,
     pub wasm_bytes: &'a [u8],
     pub active: bool,
+    /// Hex Ed25519 publisher signature (issue #1838). `None` = unsigned.
+    pub signature: Option<&'a str>,
 }
 
 // ── Durable mutex locks (issue #691) ────────────────────────────────────────

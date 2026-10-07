@@ -676,6 +676,33 @@ for the mechanism. Security-relevant properties:
 
 ---
 
+## Multi-tenant deployment (issue #1837)
+
+[ADR 0004](./adr/0004-tenant-isolation-cells.md) records the decision.
+
+- **Harvest supports cooperative multi-tenancy.** Many tenants of one
+  operator can share a deployment. Quotas, throttles and concurrency caps bound a
+  tenant on a shared shard. A **cell** gives a tenant its own shard and its
+  own worker pool. See [Tenant cells](./sharding.md#tenant-cells-issue-1837).
+- **A cell is not a security boundary between tenants.** It bounds load,
+  not access. Any caller that may start a workflow may also pin it into any
+  cell. To confine a caller to its tenant, install an
+  [authorizer hook](#authorizer-hook-issue-1803). On a pinned start, check
+  the shard. On a route where the hook sees no shard, check the target in
+  `path`, or deny it.
+- **A workflow can pin a child into a cell.** `ChildPlacement::Shard` and
+  `ChildPlacement::ResidencyKey` place a child on any shard. The hook does
+  not see that decision. Do not build a child pin from caller input.
+- **The tenant header is not an identity.** The caller declares
+  `x-harvest-tenant`. Harvest does not bind it to stored executions.
+- **Name cells, not tenants.** A cell residency key appears in requests,
+  CLI calls and audit rows. Use `cell-a`, not a customer name. Keep the
+  tenant-to-cell map in the application.
+- **Harvest has no namespaces.** All tenants on one shard share its
+  tables. Harvest has no per-tenant row scoping.
+
+---
+
 ## Business-key targeting for signal/cancel (issue #751)
 
 `WorkflowContext::signal_external_workflow_by_id` and
@@ -788,6 +815,44 @@ and `workflow.erase_payloads`. A legal hold exempts a single execution's history
 from the retention janitor and from PII erasure until released — see
 [`docs/archival.md`](archival.md) for the retention/erasure lifecycle.
 
+### Tamper-evident audit rows (issue #1838)
+
+Audit export ships each row off-box. The optional audit hash chain also makes
+the rows in the database tamper-evident. Set
+`HarvestBuilder::audit_export_chain_key` with a key kept outside the database.
+`audit_chain::verify_shard_chain` then reports changed, missing and unlinked
+rows. See [The audit hash chain](audit-export.md#the-audit-hash-chain) and
+[ADR 0004](adr/0004-security-extras.md).
+
+---
+
+## Signed WASM modules (issue #1838)
+
+No HTTP route publishes a WASM module. A future route under `/modules` or
+`/admin/modules` needs the `admin` scope. As defence in depth, a worker can
+also require a publisher signature on every WASM activity module. Hot-swap
+workflow modules keep their own HMAC check.
+
+- Sign offline with `wasm_signing::sign_wasm_module` and a key that workers
+  never hold.
+- Give workers the public key with
+  `HarvestBuilder::wasm_trusted_publisher_key`.
+- Publish with `wasm_store::publish_signed_wasm_module`, or attach the
+  signature to a registration with `WasmActivityRegistration::with_signature`.
+
+The signing helper needs the `wasm-activities` feature. A publisher tool that
+uses it therefore compiles `wasmtime`.
+
+The worker checks the signature before each run. A module written by direct
+SQL, or published without a signature, fails with the non-retryable
+`WasmModuleInvalid` error.
+
+A signature covers the activity name and the module hash. It has no version
+and no expiry. So anyone who can write the module table can reactivate any
+version a trusted key ever signed, including an old, vulnerable one. To
+revoke a version, remove its key from the trusted set and re-sign the
+versions you keep with a new key. See [ADR 0004](adr/0004-security-extras.md).
+
 ---
 
 ## Payload encryption at rest (issue #1825)
@@ -852,7 +917,9 @@ the codec encrypts. Set it with `WorkflowFailure::with_details` or
 `ActivityFailure::with_details`. A plain `Err(String)` sets no `details`. The
 other variants have no encrypted field for failure data.
 
-Event types, ids, timestamps and workflow names also stay in clear. Do not put
+Event types, ids, timestamps and workflow names also stay in clear. So do the
+build id and the worker id in `DecisionCommitted` (issue #1833). A worker id
+often holds a host name or a pod name. The redacted export keeps both. Do not put
 PII in a memo, a search attribute, a workflow id or a workflow name. If these
 columns must not hold PII, encrypt the value in workflow code before Harvest
 sees it. Also use Postgres disk encryption.
@@ -1126,6 +1193,10 @@ record. Without it, records default to `"anonymous"`.
 Authentication middleware applies uniformly across all shards because it wraps
 the router layer, not individual handlers. No extra configuration is needed for
 multi-shard deployments.
+
+A deployment with tenant cells needs one more check. The authorizer hook
+must refuse a pin into a cell the caller does not own. See
+[Multi-tenant deployment](#multi-tenant-deployment-issue-1837).
 
 ### 6. The API rate limiter is on
 
