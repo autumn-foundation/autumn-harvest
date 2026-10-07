@@ -229,6 +229,8 @@ mod quota_reconcile_candidate_bound_tests;
 mod quota_reconcile_candidate_scan_perf_tests;
 mod quota_reconcile_tests;
 mod quota_supersede_ordering_tests;
+#[cfg(feature = "db")]
+mod ramp_guard_tests;
 mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
 mod redrive_tests;

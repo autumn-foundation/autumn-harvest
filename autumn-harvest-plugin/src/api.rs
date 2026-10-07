@@ -423,6 +423,9 @@ pub struct HarvestApiState {
     /// Cap on distinct groups `GET /admin/usage` will return before failing
     /// loudly with `413` (issue #596). Defaults to 10,000.
     usage_max_groups: Arc<Mutex<usize>>,
+    /// Build ramp guard settings (issue #1814), mirrored from
+    /// `BuiltHarvest::ramp_guard` at startup. The default is disabled.
+    ramp_guard_config: Arc<Mutex<autumn_harvest::ramp_guard::RampGuardConfig>>,
     /// SSRF policy for completion-callback targets (issue #605), mirrored
     /// from `BuiltHarvest::completion_callback_config()` at startup so the
     /// HTTP start route can validate a per-execution target the same way
@@ -502,6 +505,9 @@ impl Default for HarvestApiState {
             )),
             usage_max_groups: Arc::new(Mutex::new(
                 autumn_harvest::usage::default_usage_max_groups(),
+            )),
+            ramp_guard_config: Arc::new(Mutex::new(
+                autumn_harvest::ramp_guard::RampGuardConfig::default(),
             )),
             completion_callback_ssrf_policy: Arc::new(Mutex::new(
                 autumn_harvest::completion_callback::SsrfPolicy::default(),
@@ -899,6 +905,26 @@ impl HarvestApiState {
             .usage_max_groups
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = cap;
+    }
+
+    /// The build ramp guard settings (issue #1814).
+    #[must_use]
+    pub fn ramp_guard_config(&self) -> autumn_harvest::ramp_guard::RampGuardConfig {
+        *self
+            .ramp_guard_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Set the build ramp guard settings (issue #1814).
+    ///
+    /// The boot path reads them when it spawns the guard loop, so set them
+    /// first.
+    pub fn set_ramp_guard_config(&self, config: autumn_harvest::ramp_guard::RampGuardConfig) {
+        *self
+            .ramp_guard_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = config;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
@@ -48107,7 +48133,7 @@ async fn set_build_policy_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildPolicyBody>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::set_build_policy;
+    use autumn_harvest::build_routing::set_build_policy_with_ramp_id;
 
     let queue_name = body.queue_name.trim();
     let build_id = body.build_id.trim();
@@ -48123,7 +48149,20 @@ async fn set_build_policy_handler(
     let deployment = body.deployment_name.as_deref().filter(|s| !s.is_empty());
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
+    // One ramp id for every shard, so a retained ramp keeps one identity
+    // (issue #1814). A retry with the same `Idempotency-Key` reuses it.
+    let ramp_id = match fan_out_ramp_id(
+        &headers,
+        "policy",
+        queue_name,
+        &[Some(build_id), deployment],
+    ) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     let mut last_policy = None;
+    let mut last_conflict = None;
+    let mut shard_conflicts: Vec<String> = Vec::new();
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -48133,16 +48172,29 @@ async fn set_build_policy_handler(
                 continue;
             }
         };
-        match set_build_policy(&mut conn, queue_name, build_id, deployment)
+        match set_build_policy_with_ramp_id(&mut conn, queue_name, build_id, deployment, ramp_id)
             .await
-            .map_err(map_error)
         {
             Ok(p) => last_policy = Some(p),
+            Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                shard_conflicts.push(format!("shard {}: {e}", shard_id.as_i32()));
+                last_conflict = Some(e);
+            }
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {}: {}", shard_id.as_i32(), map_error(e)));
             }
         }
     }
+
+    // A later write superseded this keyed request on every shard that holds
+    // it (issue #1814). That is a conflict, not an outage.
+    if last_policy.is_none()
+        && shard_errors.is_empty()
+        && let Some(conflict) = last_conflict
+    {
+        return conflict_from(conflict).into_response();
+    }
+    shard_errors.extend(shard_conflicts);
 
     // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
@@ -48230,6 +48282,113 @@ async fn set_build_policy_handler(
     }
 }
 
+/// A caller `ramp_id` derived from the parts of one request (issue #1814).
+///
+/// Each part has a length prefix, and a missing part has its own marker. So
+/// no two different part lists give one id.
+pub(crate) fn derived_ramp_id(parts: &[Option<&str>]) -> uuid::Uuid {
+    use std::fmt::Write as _;
+
+    let mut name = String::from("build-routing");
+    for part in parts {
+        match part {
+            Some(text) => {
+                let _ = write!(name, "/{}:{text}", text.len());
+            }
+            None => name.push_str("/-"),
+        }
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
+}
+
+/// The `ramp_id` of one build-routing fan-out (issue #1814).
+///
+/// A request with an `Idempotency-Key` header gets an id derived from the
+/// route, the queue, the key and the payload. A retry after a partial
+/// fan-out therefore writes the same id on every shard. A reused key with a
+/// changed payload gets a new id, so every shard rewrites the ramp under
+/// that new id. A request with no key gets a new id.
+#[allow(clippy::result_large_err)]
+fn fan_out_ramp_id(
+    headers: &axum::http::HeaderMap,
+    route: &str,
+    queue_name: &str,
+    payload: &[Option<&str>],
+) -> Result<uuid::Uuid, axum::response::Response> {
+    let Some(key) = extract_start_idempotency_header_key(headers)? else {
+        return Ok(uuid::Uuid::new_v4());
+    };
+    let mut parts = vec![Some(route), Some(queue_name), Some(key.as_str())];
+    parts.extend_from_slice(payload);
+    Ok(derived_ramp_id(&parts))
+}
+
+/// Refuse a keyed ramp whose generation the ramp guard aborted (issue
+/// #1814).
+///
+/// A keyed retry derives the same `ramp_id`. A retry after an abort, for
+/// example after a lost response, would otherwise restore the aborted ramp.
+/// The check runs before any write, so no shard gets the ramp back. Each
+/// shard checks its abort markers for the generation id of its own base.
+/// The audit pool then checks its report ledger, which outlives the
+/// markers. The check fails closed with `503`. A shard that cannot be read
+/// could hold an aborted generation whose markers are pruned, and only the
+/// audit pool can then refuse it.
+#[allow(clippy::result_large_err)]
+async fn refuse_aborted_ramp(
+    pool: &HarvestDbPool,
+    queue_name: &str,
+    target_build_id: &str,
+    ramp_id: uuid::Uuid,
+) -> Result<(), axum::response::Response> {
+    use autumn_harvest::build_routing::{
+        aborted_generation_error, get_build_policy, ramp_caller_target_id, ramp_generation_aborted,
+        ramp_generation_id,
+    };
+
+    let caller_target = ramp_caller_target_id(ramp_id, queue_name, target_build_id);
+    let refused = || conflict_from(aborted_generation_error(queue_name, target_build_id));
+    let unchecked = |shard: ShardId, error: &dyn std::fmt::Display| {
+        AutumnError::service_unavailable_msg(format!(
+            "shard {}: cannot check the ramp for an earlier abort: {error}; no shard was \
+             written, retry the request",
+            shard.as_i32()
+        ))
+        .into_response()
+    };
+    let mut generations = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool)
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?;
+        // A shard with no base policy holds no ramp. Its write fails on the
+        // missing base.
+        let Some(policy) = get_build_policy(&mut conn, queue_name)
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?
+        else {
+            continue;
+        };
+        let generation = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
+        if ramp_generation_aborted(&mut conn, queue_name, &[generation, ramp_id, caller_target])
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?
+        {
+            return Err(refused().into_response());
+        }
+        generations.push(generation);
+    }
+    generations.extend([ramp_id, caller_target]);
+    let mut conn = acquire_conn(pool.default_pool())
+        .await
+        .map_err(axum::response::IntoResponse::into_response)?;
+    match ramp_generation_aborted(&mut conn, queue_name, &generations).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(refused().into_response()),
+        Err(e) => Err(map_error(e).into_response()),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SetBuildRampBody {
     queue_name: String,
@@ -48252,7 +48411,7 @@ async fn set_build_ramp_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildRampBody>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::{set_build_ramp, validate_ramp_percent};
+    use autumn_harvest::build_routing::{set_build_ramp_with_id, validate_ramp_percent};
 
     let queue_name = body.queue_name.trim();
     let target_build_id = body.target_build_id.trim();
@@ -48269,9 +48428,29 @@ async fn set_build_ramp_handler(
         Err(e) => return e.into_response(),
     };
     let (actor, source, request_id) = audit_context(&headers, &api_state);
+    // One id for this ramp on every shard. The ramp guard matches its abort
+    // markers to a ramp by this id, not by clocks (issue #1814). A retry with
+    // the same `Idempotency-Key` reuses it.
+    let percent = body.ramp_percent.to_string();
+    let ramp_id = match fan_out_ramp_id(
+        &headers,
+        "ramp",
+        queue_name,
+        &[Some(target_build_id), Some(percent.as_str())],
+    ) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if headers.contains_key(HEADER_IDEMPOTENCY_KEY)
+        && let Err(response) =
+            refuse_aborted_ramp(&pool, queue_name, target_build_id, ramp_id).await
+    {
+        return response;
+    }
 
     let mut last_policy = None;
     let mut last_conflict = None;
+    let mut shard_conflicts: Vec<String> = Vec::new();
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -48281,9 +48460,18 @@ async fn set_build_ramp_handler(
                 continue;
             }
         };
-        match set_build_ramp(&mut conn, queue_name, target_build_id, body.ramp_percent).await {
+        match set_build_ramp_with_id(
+            &mut conn,
+            queue_name,
+            target_build_id,
+            body.ramp_percent,
+            ramp_id,
+        )
+        .await
+        {
             Ok(p) => last_policy = Some(p),
             Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                shard_conflicts.push(format!("shard {}: {e}", shard_id.as_i32()));
                 last_conflict = Some(e);
             }
             Err(e) => {
@@ -48299,6 +48487,9 @@ async fn set_build_ramp_handler(
     {
         return conflict_from(conflict).into_response();
     }
+    // A conflict on one shard while another shard takes the ramp leaves the
+    // fan-out divergent. Report it as a partial failure (issue #1814).
+    shard_errors.extend(shard_conflicts);
 
     // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
@@ -50550,6 +50741,80 @@ mod reserved_idempotency_key_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ── issue #1814: one ramp id per keyed build-routing fan-out ────────────
+
+    const PAYLOAD: &[Option<&str>] = &[Some("canary-v2"), Some("25")];
+
+    /// A reused key with a changed payload gets a new id. An exact retry
+    /// keeps its id.
+    #[test]
+    fn a_keyed_ramp_id_depends_on_the_payload() {
+        let headers = idempotency_headers("deploy-42");
+        let id = |payload: &[Option<&str>]| {
+            fan_out_ramp_id(&headers, "ramp", "default", payload).expect("id")
+        };
+        assert_eq!(id(PAYLOAD), id(PAYLOAD));
+        assert_ne!(id(PAYLOAD), id(&[Some("canary-v2"), Some("50")]));
+        assert_ne!(id(&[Some("b"), None]), id(&[Some("b"), Some("")]));
+    }
+
+    fn idempotency_headers(key: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            HEADER_IDEMPOTENCY_KEY,
+            axum::http::HeaderValue::from_str(key).expect("header value"),
+        );
+        headers
+    }
+
+    /// A retry with the same key gets the same ramp id, so a partial
+    /// fan-out and its retry write one id on every shard.
+    #[test]
+    fn a_keyed_fan_out_gets_the_same_ramp_id_on_retry() {
+        let headers = idempotency_headers("deploy-42");
+        let first = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let retry = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        assert_eq!(first, retry);
+    }
+
+    /// The id depends on the key, the queue and the route.
+    #[test]
+    fn a_keyed_ramp_id_depends_on_key_queue_and_route() {
+        let headers = idempotency_headers("deploy-42");
+        let base = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let other_key = fan_out_ramp_id(
+            &idempotency_headers("deploy-43"),
+            "ramp",
+            "default",
+            PAYLOAD,
+        )
+        .expect("id");
+        let other_queue = fan_out_ramp_id(&headers, "ramp", "billing", PAYLOAD).expect("id");
+        let other_route = fan_out_ramp_id(&headers, "policy", "default", PAYLOAD).expect("id");
+        assert_ne!(base, other_key);
+        assert_ne!(base, other_queue);
+        assert_ne!(base, other_route);
+    }
+
+    /// A request with no key gets a new id each time.
+    #[test]
+    fn an_unkeyed_fan_out_gets_a_new_ramp_id() {
+        let headers = axum::http::HeaderMap::new();
+        let first = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let second = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        assert_ne!(first, second);
+    }
+
+    /// An empty key is a client error, as on the start route.
+    #[test]
+    fn an_empty_idempotency_key_is_rejected() {
+        let result = fan_out_ramp_id(&idempotency_headers("  "), "ramp", "default", PAYLOAD);
+        assert_eq!(
+            result.expect_err("an empty key is a 400").status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
 
     // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
     // ───────────────────────────────────────────────────────────────────────

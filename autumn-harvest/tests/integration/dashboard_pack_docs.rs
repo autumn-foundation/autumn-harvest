@@ -141,6 +141,8 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_quota_rejected_total",
     // Automatic load shedding (issue #1794).
     "harvest_load_shed_rejected_total",
+    // Build ramp guard (issue #1814).
+    "harvest_build_ramp_aborted_total",
     // API rate limiting (issue #1827).
     "harvest_api_rate_limited_total",
     "harvest_codec_reencrypted_total",
@@ -265,11 +267,11 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_workflow_duration",
-        &["workflow", "queue", "status"],
+        &["workflow", "queue", "status", "build_id"],
     ),
     (
         "harvest_workflow_terminal",
-        &["workflow", "queue", "outcome"],
+        &["workflow", "queue", "outcome", "build_id"],
     ),
     ("harvest_workflow_history_size", &["workflow_type"]),
     ("harvest_workflow_continue_as_new", &["workflow_type"]),
@@ -279,7 +281,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_workflow_nondeterministic_block",
-        &["workflow", "queue"],
+        &["workflow", "queue", "build_id"],
     ),
     ("harvest_workflow_cache_hit", &["workflow", "queue"]),
     ("harvest_workflow_cache_miss", &["workflow", "queue"]),
@@ -342,7 +344,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_mutex_contention_depth", &["workflow"]),
     (
         "harvest_activity_duration",
-        &["activity", "queue", "status", "error_type"],
+        &["activity", "queue", "status", "error_type", "build_id"],
     ),
     (
         "harvest_activity_failed",
@@ -350,7 +352,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_activity_attempts",
-        &["activity", "queue", "outcome"],
+        &["activity", "queue", "outcome", "build_id"],
     ),
     ("harvest_activity_retries", &["activity", "queue"]),
     ("harvest_retry_budget_available", &["activity"]),
@@ -429,6 +431,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_quota_rejected", &["workflow", "resource"]),
     ("harvest_load_shed_active", &["queue"]),
     ("harvest_load_shed_rejected", &["queue"]),
+    ("harvest_build_ramp_aborted", &["queue", "reason"]),
     ("harvest_api_rate_limited", &["route_class", "client_kind"]),
     ("harvest_codec_reencrypted", &["shard"]),
     (

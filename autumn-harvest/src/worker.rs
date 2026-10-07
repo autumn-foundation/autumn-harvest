@@ -8992,9 +8992,10 @@ async fn block_workflow_for_non_determinism(
     // fires speculatively before its pause-guarded transaction even opens
     // (an accepted "best-effort, may over-count in a rare pause race"
     // pattern already established in this codebase).
-    telemetry
-        .metrics
-        .record_workflow_non_determinism(&execution.workflow_name, build_id);
+    telemetry.metrics.record_workflow_non_determinism(
+        &execution.workflow_name,
+        &crate::telemetry::build_id_label(build_id),
+    );
 
     if parked_paused {
         // The nd_blocked_at/reason/count columns were never actually
@@ -9014,7 +9015,11 @@ async fn block_workflow_for_non_determinism(
 
     telemetry
         .metrics
-        .record_workflow_nondeterministic_block(&execution.workflow_name, &task.queue_name);
+        .record_workflow_nondeterministic_block_for_build(
+            &execution.workflow_name,
+            &task.queue_name,
+            &crate::telemetry::build_id_label(build_id),
+        );
     tracing::warn!(
         execution_id = %exec_id,
         workflow = %execution.workflow_name,
@@ -16909,6 +16914,8 @@ struct AttemptMetrics<'a> {
     metrics: &'a dyn crate::telemetry::MetricsRecorder,
     activity_name: &'a str,
     queue: &'a str,
+    /// The `build_id` label of the worker that ran the attempt (issue #1814).
+    build: &'a str,
     duration_secs: f64,
     status: ActivityStatus,
     /// The error type and the non-retryable flag of a failed attempt.
@@ -16921,9 +16928,10 @@ impl Drop for AttemptMetrics<'_> {
         if self.counted_by_enforcer {
             return;
         }
-        self.metrics.record_activity_completed_with_error_type(
+        self.metrics.record_activity_completed_for_build(
             self.activity_name,
             self.queue,
+            self.build,
             self.duration_secs,
             self.status,
             self.failure
@@ -16934,8 +16942,12 @@ impl Drop for AttemptMetrics<'_> {
         // SLOs. Fires for both outcomes so `completed / (completed + failed)`
         // is one metric family, the activity-level mirror of
         // harvest.workflow.terminal.
-        self.metrics
-            .record_activity_attempt(self.activity_name, self.queue, self.status);
+        self.metrics.record_activity_attempt_for_build(
+            self.activity_name,
+            self.queue,
+            self.build,
+            self.status,
+        );
         if let Some((error_type, non_retryable)) = self.failure.as_ref() {
             // `workflow.type` is empty here: looking it up costs an extra
             // `harvest_workflow_executions` query per failure. The
@@ -17855,6 +17867,7 @@ async fn process_activity_task(
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
+    build_id: &str,
     cancellation_grace_period: Duration,
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
@@ -18254,9 +18267,12 @@ async fn process_activity_task(
             crate::failure::ActivityFailure::circuit_open(activity_name, opened_at, retry_after)
                 .into_error_payload();
         let telemetry = registry.telemetry().clone();
-        telemetry.metrics.record_activity_completed_with_error_type(
+        let build_label = crate::telemetry::build_id_label(build_id);
+        let build_label = build_label.as_ref();
+        telemetry.metrics.record_activity_completed_for_build(
             activity_name,
             &task.queue_name,
+            build_label,
             0.0,
             ActivityStatus::Failed,
             Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN),
@@ -18267,9 +18283,10 @@ async fn process_activity_task(
             crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
             true,
         );
-        telemetry.metrics.record_activity_attempt(
+        telemetry.metrics.record_activity_attempt_for_build(
             activity_name,
             &task.queue_name,
+            build_label,
             ActivityStatus::Failed,
         );
         // `ActivityStarted` is already committed, and a start is not
@@ -18773,10 +18790,13 @@ async fn process_activity_task(
     // The attempt metrics record when this guard drops, after the outcome is
     // known (issue #1809). A claim lost to a timeout skips them: the timeout
     // enforcer counted that attempt as failed.
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
     let mut attempt_metrics = AttemptMetrics {
         metrics: telemetry.metrics.as_ref(),
         activity_name,
         queue: &task.queue_name,
+        build: build_label.as_ref(),
         duration_secs,
         status,
         failure: failure_info
@@ -22911,10 +22931,14 @@ fn emit_pending_workflow_metrics(
     build_id: &str,
     pending: &PendingWorkflowMetrics,
 ) {
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
     if !pending.is_canary {
-        telemetry.metrics.record_workflow_completed(
+        telemetry.metrics.record_workflow_completed_for_build(
             &execution.workflow_name,
             queue_name,
+            build_label,
             pending.duration_secs,
             pending.status,
         );
@@ -22950,10 +22974,11 @@ fn emit_pending_workflow_metrics(
                     pending.canary_roundtrip_secs.unwrap_or(0.0),
                 );
             } else {
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     &*telemetry.metrics,
                     &execution.workflow_name,
                     queue_name,
+                    build_label,
                     WorkflowStatus::Completed,
                 );
             }
@@ -22971,19 +22996,21 @@ fn emit_pending_workflow_metrics(
                  process_workflow_task, before terminal metrics are recorded"
             );
             if *had_nd_details {
-                telemetry
-                    .metrics
-                    .record_workflow_non_determinism(&execution.workflow_name, build_id);
+                telemetry.metrics.record_workflow_non_determinism(
+                    &execution.workflow_name,
+                    &crate::telemetry::build_id_label(build_id),
+                );
             }
             if pending.is_canary {
                 telemetry
                     .metrics
                     .record_canary_failure(queue_name, pending.canary_shard);
             } else {
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     &*telemetry.metrics,
                     &execution.workflow_name,
                     queue_name,
+                    build_label,
                     WorkflowStatus::Failed,
                 );
             }
@@ -22991,10 +23018,11 @@ fn emit_pending_workflow_metrics(
         TerminalMetricsKind::ContinuedAsNew => {
             // A canary never continues-as-new; the choke point skips it anyway
             // (AC8), so this is effectively unreachable for a canary.
-            crate::telemetry::emit_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal_for_build(
                 &*telemetry.metrics,
                 &execution.workflow_name,
                 queue_name,
+                build_label,
                 WorkflowStatus::ContinuedAsNew,
             );
         }
@@ -24101,19 +24129,24 @@ async fn fail_workflow_for_history_cap(
     // completion-trigger latest-wins supersede counters this call's inline
     // same-shard trigger start may have collected.
     crate::execution::emit_start_cancel_metrics(&*telemetry.metrics, &pending_cancel_metrics);
-    telemetry.metrics.record_workflow_completed(
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
+    telemetry.metrics.record_workflow_completed_for_build(
         &execution.workflow_name,
         &task.queue_name,
+        build_label,
         duration_secs,
         WorkflowStatus::Failed,
     );
     telemetry
         .metrics
         .record_workflow_history_size(&execution.workflow_name, terminal_count);
-    crate::telemetry::emit_workflow_terminal(
+    crate::telemetry::emit_workflow_terminal_for_build(
         &*telemetry.metrics,
         &execution.workflow_name,
         &task.queue_name,
+        build_label,
         WorkflowStatus::Failed,
     );
 
@@ -27061,6 +27094,7 @@ async fn process_task(
                 registry.as_ref(),
                 &task,
                 worker_id,
+                build_id,
                 cancellation_grace_period,
                 dispatched_at,
                 max_concurrent_sessions,
@@ -35736,12 +35770,13 @@ impl Worker {
                                         exec_id,
                                     );
                                 }
-                                let quarantined = quarantine_workflow_task_timeout(
+                                let quarantined = quarantine_workflow_task_timeout_for_build(
                                     &pool,
                                     task_id,
                                     exec_id_for_timeout,
                                     &worker_id,
                                     claim_attempt,
+                                    &build_id,
                                     new_strikes,
                                     timeout_secs,
                                     &workflow_name_str,
@@ -36311,7 +36346,10 @@ async fn workflow_task_timeout_metric_names(
 /// The write is fenced on the claim `(worker_id, attempt)`. The acquire can
 /// retry for longer than the stuck-running backstop. A peer can then hold a
 /// new claim, and its run must not fail. A lost claim also returns `false`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+///
+/// The terminal metric reports `build_id="none"`. The worker calls the
+/// crate-private variant that reports its own build (issue #1814).
+#[allow(clippy::too_many_arguments)]
 pub async fn quarantine_workflow_task_timeout(
     pool: &DbPool,
     task_id: uuid::Uuid,
@@ -36325,6 +36363,40 @@ pub async fn quarantine_workflow_task_timeout(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> bool {
+    quarantine_workflow_task_timeout_for_build(
+        pool,
+        task_id,
+        exec_id_opt,
+        worker_id,
+        attempt,
+        "",
+        new_strikes,
+        timeout_secs,
+        workflow_name,
+        queue_name,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`quarantine_workflow_task_timeout`] with the build of the worker that ran
+/// the task, for the `build_id` label of the terminal metric (issue #1814).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn quarantine_workflow_task_timeout_for_build(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    exec_id_opt: Option<uuid::Uuid>,
+    worker_id: &str,
+    attempt: i32,
+    build_id: &str,
+    new_strikes: i32,
+    timeout_secs: u64,
+    workflow_name: &str,
+    queue_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> bool {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
@@ -36654,10 +36726,11 @@ pub async fn quarantine_workflow_task_timeout(
                     .map_or((workflow_name, q.as_str()), |(name, queue)| {
                         (name.as_str(), queue.as_str())
                     });
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     metrics,
                     workflow_name,
                     q,
+                    &crate::telemetry::build_id_label(build_id),
                     crate::telemetry::WorkflowStatus::Failed,
                 );
                 // The terminal above skips a canary probe. A quarantined probe

@@ -44,7 +44,8 @@ use autumn_harvest::audit::{
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
-    list_build_compat, list_build_policies, merge_reachability, revoke_compat, set_build_policy,
+    list_build_compat, list_build_policies, merge_reachability, revoke_compat,
+    set_build_policy_with_ramp_id,
 };
 use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::execution::StartWorkflowParams;
@@ -459,6 +460,10 @@ pub(crate) struct BuildRoutingListParams {
     set_policy_build_id: Option<String>,
     #[serde(default)]
     set_policy_deployment_name: Option<String>,
+    /// The operation id of a failed "Set Build Policy" submission, so a
+    /// retry reuses its ramp id (issue #1814).
+    #[serde(default)]
+    set_policy_operation_id: Option<String>,
     /// Error text for the "Declare Compatibility" form, if its last submission failed.
     #[serde(default)]
     compat_error: Option<String>,
@@ -477,6 +482,7 @@ struct BuildRoutingActionEcho {
     set_policy_queue_name: Option<String>,
     set_policy_build_id: Option<String>,
     set_policy_deployment_name: Option<String>,
+    set_policy_operation_id: Option<String>,
     compat_error: Option<String>,
     compat_build_id: Option<String>,
     compat_compatible_with: Option<String>,
@@ -489,6 +495,7 @@ impl From<&BuildRoutingListParams> for BuildRoutingActionEcho {
             set_policy_queue_name: params.set_policy_queue_name.clone(),
             set_policy_build_id: params.set_policy_build_id.clone(),
             set_policy_deployment_name: params.set_policy_deployment_name.clone(),
+            set_policy_operation_id: params.set_policy_operation_id.clone(),
             compat_error: params.compat_error.clone(),
             compat_build_id: params.compat_build_id.clone(),
             compat_compatible_with: params.compat_compatible_with.clone(),
@@ -502,6 +509,60 @@ struct BuildRoutingSetPolicyForm {
     build_id: String,
     #[serde(default)]
     deployment_name: Option<String>,
+    /// The operation id that the form carries (issue #1814).
+    #[serde(default)]
+    operation_id: Option<String>,
+}
+
+/// The operation id of one "Set Build Policy" submission (issue #1814).
+///
+/// The form carries the id in a hidden field. A failed submission echoes it
+/// back, so a retry of the same form reuses it. The handler passes it to
+/// every shard as the caller ramp id, so a partial fan-out and its retry
+/// give a retained ramp one identity. A missing or malformed id gets a new
+/// one.
+fn set_policy_operation_id(raw: Option<&str>) -> uuid::Uuid {
+    raw.and_then(|id| uuid::Uuid::parse_str(id.trim()).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4)
+}
+
+/// The caller `ramp_id` of one "Set Build Policy" submission (issue #1814).
+///
+/// It derives from the operation id and the request. A retry of the same
+/// form gets the same id. A changed request under the same operation id
+/// gets a new id, so every shard rewrites the ramp under that new id.
+fn set_policy_ramp_id(
+    operation_id: uuid::Uuid,
+    queue_name: &str,
+    build_id: &str,
+    deployment_name: Option<&str>,
+) -> uuid::Uuid {
+    let operation = operation_id.to_string();
+    crate::api::derived_ramp_id(&[
+        Some("ui-policy"),
+        Some(operation.as_str()),
+        Some(queue_name),
+        Some(build_id),
+        deployment_name,
+    ])
+}
+
+/// The redirect after a failed "Set Build Policy" submission. It echoes the
+/// entered values, the error and the operation id back into the form.
+fn set_policy_failure_redirect(
+    error: &str,
+    queue_name: &str,
+    build_id: &str,
+    deployment_name: &str,
+    operation_id: uuid::Uuid,
+) -> String {
+    format!(
+        "../build-routing?set_policy_error={}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}&set_policy_operation_id={operation_id}",
+        url_encode(error),
+        url_encode(queue_name),
+        url_encode(build_id),
+        url_encode(deployment_name),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -8219,18 +8280,22 @@ async fn build_routing_set_policy_ui(
     let queue_name = form.queue_name.trim().to_string();
     let build_id = form.build_id.trim().to_string();
     let deployment_name_raw = form.deployment_name.clone().unwrap_or_default();
+    // A retry of the same form reuses the operation id (issue #1814).
+    let operation_id = set_policy_operation_id(form.operation_id.as_deref());
     if queue_name.is_empty() || build_id.is_empty() {
-        let error = url_encode("queue_name and build_id must not be empty");
-        let redirect_url = format!(
-            "../build-routing?set_policy_error={error}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}",
-            url_encode(&queue_name),
-            url_encode(&build_id),
-            url_encode(&deployment_name_raw),
+        let redirect_url = set_policy_failure_redirect(
+            "queue_name and build_id must not be empty",
+            &queue_name,
+            &build_id,
+            &deployment_name_raw,
+            operation_id,
         );
         return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
+    // One ramp id for every shard, so a retained ramp keeps one identity.
+    let ramp_id = set_policy_ramp_id(operation_id, &queue_name, &build_id, deployment_name);
     // Fan out to all shards so every shard's get_build_policy() sees the new policy
     // when evaluating assigned_build_id at workflow start time.
     let mut last_policy = None;
@@ -8238,9 +8303,15 @@ async fn build_routing_set_policy_ui(
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => {
-                match set_build_policy(&mut conn, &queue_name, &build_id, deployment_name)
-                    .await
-                    .map_err(map_error)
+                match set_build_policy_with_ramp_id(
+                    &mut conn,
+                    &queue_name,
+                    &build_id,
+                    deployment_name,
+                    ramp_id,
+                )
+                .await
+                .map_err(map_error)
                 {
                     Ok(p) => last_policy = Some(p),
                     Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
@@ -8291,15 +8362,15 @@ async fn build_routing_set_policy_ui(
                 .into_response(),
         );
     }
-    let error = url_encode(&format!(
-        "Partial failure setting build policy: {}",
-        shard_errors.join("; ")
-    ));
-    let redirect_url = format!(
-        "../build-routing?set_policy_error={error}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}",
-        url_encode(&queue_name),
-        url_encode(&build_id),
-        url_encode(&deployment_name_raw),
+    let redirect_url = set_policy_failure_redirect(
+        &format!(
+            "Partial failure setting build policy: {}",
+            shard_errors.join("; ")
+        ),
+        &queue_name,
+        &build_id,
+        &deployment_name_raw,
+        operation_id,
     );
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
@@ -8641,6 +8712,7 @@ fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
         .set_policy_deployment_name
         .as_deref()
         .unwrap_or_default();
+    let operation_id = set_policy_operation_id(echo.set_policy_operation_id.as_deref());
     let compat_build_id = echo.compat_build_id.as_deref().unwrap_or_default();
     let compat_compatible_with = echo.compat_compatible_with.as_deref().unwrap_or_default();
     html! {
@@ -8656,6 +8728,7 @@ fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
                 }
                 form method="post" action="build-routing/set-policy"
                       style="display:flex;flex-direction:column;gap:10px" {
+                    input type="hidden" name="operation_id" value=(operation_id);
                     label style=(label_style) { "Queue name"
                         input type="text" name="queue_name" required placeholder="e.g. default" style=(input_style) value=(set_policy_queue_name);
                     }
@@ -15763,6 +15836,89 @@ mod tests {
     /// now carry the entered values and an inline error back through the
     /// redirect's query params, which `list_build_routing_ui` turns into a
     /// `BuildRoutingActionEcho`.
+    /// A failed submission echoes its operation id into a hidden field, so a
+    /// retry of the form reuses its ramp id (issue #1814).
+    #[test]
+    fn render_build_routing_page_set_policy_keeps_the_operation_id() {
+        let id = uuid::Uuid::new_v4();
+        let echo = BuildRoutingActionEcho {
+            set_policy_operation_id: Some(id.to_string()),
+            ..BuildRoutingActionEcho::default()
+        };
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None, &echo)
+                .into_string();
+        assert!(
+            html.contains(&format!(
+                r#"type="hidden" name="operation_id" value="{id}""#
+            )),
+            "the form must carry the echoed operation id: {html}"
+        );
+    }
+
+    /// A fresh page gives the form a new, valid operation id.
+    #[test]
+    fn render_build_routing_page_set_policy_has_a_fresh_operation_id() {
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
+        let marker = r#"type="hidden" name="operation_id" value=""#;
+        let start = html.find(marker).expect("hidden operation_id field") + marker.len();
+        let value = &html[start..start + 36];
+        assert!(uuid::Uuid::parse_str(value).is_ok(), "{value}");
+    }
+
+    /// A valid echoed id is kept. A missing or malformed one gets a new id.
+    #[test]
+    fn set_policy_operation_id_reuses_only_a_valid_id() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(set_policy_operation_id(Some(&id.to_string())), id);
+        assert_ne!(set_policy_operation_id(None), set_policy_operation_id(None));
+        assert_ne!(
+            set_policy_operation_id(Some("not-a-uuid")),
+            set_policy_operation_id(Some("not-a-uuid"))
+        );
+    }
+
+    /// A retry of the same form keeps its ramp id. A changed request under
+    /// the same operation id gets a new one.
+    #[test]
+    fn set_policy_ramp_id_depends_on_the_request() {
+        let op = uuid::Uuid::new_v4();
+        let id = |build: &str, deployment: Option<&str>| {
+            set_policy_ramp_id(op, "default", build, deployment)
+        };
+        assert_eq!(id("sha-1", Some("prod")), id("sha-1", Some("prod")));
+        assert_ne!(id("sha-1", Some("prod")), id("sha-1", Some("prod-v2")));
+        assert_ne!(id("sha-1", None), id("sha-2", None));
+        assert_ne!(
+            id("sha-1", None),
+            set_policy_ramp_id(uuid::Uuid::new_v4(), "default", "sha-1", None)
+        );
+    }
+
+    /// The failure redirect carries the operation id back to the form.
+    #[test]
+    fn set_policy_failure_redirect_echoes_the_operation_id() {
+        let id = uuid::Uuid::new_v4();
+        let url = set_policy_failure_redirect("shard 1: down", "default", "sha-1", "", id);
+        assert!(
+            url.contains(&format!("&set_policy_operation_id={id}")),
+            "{url}"
+        );
+        assert!(url.contains("set_policy_queue_name=default"), "{url}");
+    }
+
     #[test]
     fn render_build_routing_page_set_policy_error_echoes_entered_values() {
         let echo = BuildRoutingActionEcho {

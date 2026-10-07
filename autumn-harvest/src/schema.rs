@@ -560,6 +560,13 @@ diesel::table! {
         updated_at -> Timestamptz,
         target_build_id -> Nullable<Text>,
         ramp_percent -> Nullable<Integer>,
+        /// One operator ramp's identity, the same on every shard pool (issue
+        /// #1814). NULL = no ramp, or a ramp set before the column existed.
+        ramp_id -> Nullable<Uuid>,
+        /// The ramp guard's abort markers on this pool, newest first (issue
+        /// #1814). Each is `{"id": ramp_id, "base": build_id}`. A later guard
+        /// uses them to finish a partial abort.
+        ramp_aborted -> Jsonb,
     }
 }
 

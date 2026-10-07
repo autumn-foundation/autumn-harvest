@@ -1123,6 +1123,9 @@
           "401": {
             "description": "Unauthenticated request."
           },
+          "409": {
+            "description": "Every shard refused the write: the policy carries a ramp that the build-ramp guard aborted, or a later write superseded this request."
+          },
           "503": {
             "description": "Database unavailable."
           }
