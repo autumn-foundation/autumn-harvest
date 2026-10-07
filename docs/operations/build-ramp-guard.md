@@ -347,7 +347,10 @@ The guard fails safe: when it cannot read, it does not abort.
   still make: one claim, one audit row and one mark per pool. It is at least
   `report_grace`. With one pool and a bound of 30 s, the lease is 150 s. The claim leaves the marker
   unreported. That guard reports the abort with reason `unreported`, no
-  rates and `ramp_percent=0`, because the verdict is gone. After the audit
+  rates and `ramp_percent=0`, because the verdict is gone. A pool that
+  still rejects the clear in that pass makes the report incomplete. Its
+  audit row then has `status=failed` and names that pool, as a fresh
+  report does. After the audit
   row commits, it marks the markers as reported. A guard that stops before
   that leaves the claim to expire, and another guard reports the abort.
 - When some markers of an abort are reported, a guard reported it and

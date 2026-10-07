@@ -1149,6 +1149,9 @@ struct UnreportedAbort {
     ramp_id: uuid::Uuid,
     /// The pools that hold an unreported marker for it, in pool order.
     pools: Vec<usize>,
+    /// The pools whose clear this guard must still retry, in pool order.
+    /// The report names them, as the report of a fresh abort does.
+    pending: Vec<usize>,
 }
 
 /// Group the finished abort markers of every pool per abort, and sort the
@@ -1238,6 +1241,7 @@ fn classify_finished_markers(
                     target,
                     ramp_id,
                     pools,
+                    pending: Vec::new(),
                 });
             }
         }
@@ -2185,6 +2189,23 @@ impl RampGuard {
         aborts
     }
 
+    /// The pools whose clear of the abort `report_id` on `queue` this guard
+    /// must still retry, in pool order.
+    ///
+    /// The pass tries to finish a marked abort before it recovers the
+    /// report. So the list holds only the pools that rejected that clear.
+    fn pending_pools(&self, queue: &str, report_id: uuid::Uuid) -> Vec<usize> {
+        let mut pools: Vec<usize> = self
+            .pending
+            .iter()
+            .filter(|((key, _), entry)| key.0 == queue && entry.report_id == report_id)
+            .flat_map(|(_, entry)| entry.steps.iter().map(|&(index, _, _)| index))
+            .collect();
+        pools.sort_unstable();
+        pools.dedup();
+        pools
+    }
+
     /// Report the unreported aborts, finish half-marked ones and remove the
     /// finished markers.
     ///
@@ -2202,10 +2223,11 @@ impl RampGuard {
         for (queue, ramp_id, marker_pools) in half_marked {
             mark_reported(pools, &marker_pools, &queue, Some(ramp_id), bound, cancel).await;
         }
-        for lost in unreported {
+        for mut lost in unreported {
             if cancel.is_cancelled() {
                 return aborts;
             }
+            lost.pending = self.pending_pools(&lost.queue, lost.ramp_id);
             if let Some(abort) = report_unreported(
                 pools,
                 audit_pool,
@@ -2610,7 +2632,9 @@ async fn mark_reported(
 /// The claim is a lease of `lease`. Only the guard that took the claim
 /// reports. The report has reason
 /// [`RampAbortReason::Unreported`] and no rates, because the verdict is
-/// gone. The report ledger makes the report exactly-once. After a committed
+/// gone. A pool whose clear this guard must still retry makes the report
+/// incomplete. Its audit row then has the failed status and names that pool.
+/// The report ledger makes the report exactly-once. After a committed
 /// report, or when the ledger already held it, the guard marks every marker
 /// as reported. A guard that stops before that leaves the markers
 /// unreported, and after the lease another guard tries again. Returns the
@@ -2656,9 +2680,17 @@ async fn report_unreported(
         target_lower_bound: 0.0,
         base: BuildOutcomeStats::default(),
         target: BuildOutcomeStats::default(),
-        incomplete: false,
+        incomplete: !lost.pending.is_empty(),
     };
-    let outcome = report_abort(&abort, Some(lost.ramp_id), audit_pool, metrics, &[], bound).await;
+    let outcome = report_abort(
+        &abort,
+        Some(lost.ramp_id),
+        audit_pool,
+        metrics,
+        &lost.pending,
+        bound,
+    )
+    .await;
     if outcome != ReportOutcome::Failed {
         mark_reported(
             pools,

@@ -973,6 +973,7 @@ async fn a_failed_report_of_a_partial_abort_is_retried() {
 /// A guard clears pool 1, cannot clear pool 2, and fails its report. It then
 /// restarts with its pending report lost. Pool 2 still holds the ramp. The
 /// unreported marker on pool 1 is still recovered once the audit pool works.
+/// The recovered report names pool 2 as pending, as a fresh report does.
 #[tokio::test]
 async fn an_unaudited_partial_abort_is_reported_after_a_restart() {
     let (url_1, _c1) = setup().await;
@@ -1028,6 +1029,27 @@ async fn an_unaudited_partial_abort_is_reported_after_a_restart() {
         .expect("rollback");
     assert_eq!(reported.len(), 1, "the abort is reported: {reported:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn_1).await, 1);
+    // Pool 2 still holds the ramp, so the recovered report is incomplete.
+    assert!(reported[0].incomplete, "pool 2 is pending: {reported:?}");
+    let rows: Vec<(String, Option<String>)> = autumn_harvest::schema::harvest_audit_log::table
+        .filter(
+            autumn_harvest::schema::harvest_audit_log::operation
+                .eq("build_routing.ramp.auto_abort"),
+        )
+        .select((
+            autumn_harvest::schema::harvest_audit_log::status,
+            autumn_harvest::schema::harvest_audit_log::error_summary,
+        ))
+        .load(&mut conn_1)
+        .await
+        .expect("load audit row");
+    let (status, summary) = rows[0].clone();
+    assert_eq!(status, autumn_harvest::audit::STATUS_FAILED);
+    let summary = summary.expect("summary set");
+    assert!(
+        summary.contains("clear pending on pools 1"),
+        "pool 2 is named by its index: {summary}"
+    );
 }
 
 /// A fan-out reaches pool 1 only, and the guard aborts it there. Pool 2 has
