@@ -1465,7 +1465,9 @@ fn parse_use_bindings(use_body: &str) -> (Vec<String>, bool) {
     }
     // Grouped import: `path::{a, b as c}`.
     if let Some(open) = s.find('{') {
-        let Some(close) = s.rfind('}') else {
+        // The close brace must follow the open one. A stray `}` before the
+        // `{` is malformed, so the parse is conservative.
+        let Some(close) = s.rfind('}').filter(|&close| close > open) else {
             return (Vec::new(), true); // malformed / multi-line group → conservative
         };
         let inner = &s[open + 1..close];
@@ -3167,5 +3169,13 @@ mod tests {
         let src = "async fn foo() { let _ = std::time::SystemTime::now(); }\n";
         let report = check_source(src, "test.rs");
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn a_use_whose_close_brace_precedes_its_open_brace_is_conservative() {
+        // Found by fuzz_det_check_source: `rfind('}')` landed before `find('{')`.
+        assert_eq!(parse_use_bindings("a::}{b"), (Vec::new(), true));
+        let src = "#[workflow]\nasync fn wf() {\n    use a::}{b;\n}\n";
+        let _ = check_source(src, "test.rs");
     }
 }
