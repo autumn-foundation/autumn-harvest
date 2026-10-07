@@ -57,7 +57,7 @@ impl fmt::Debug for RedisTlsOptions {
 /// both count, whatever their case or leading whitespace.
 pub fn is_tls(client: &Client) -> bool {
     matches!(
-        client.get_connection_info().addr,
+        client.get_connection_info().addr(),
         ConnectionAddr::TcpTls { .. }
     )
 }
@@ -81,7 +81,7 @@ pub fn is_tls(client: &Client) -> bool {
 /// URL cannot be parsed.
 pub fn client(url: &str, tls: Option<&RedisTlsOptions>) -> RedisAdapterResult<Client> {
     let info = url.into_connection_info()?;
-    let wants_tls = match &info.addr {
+    let wants_tls = match info.addr() {
         ConnectionAddr::TcpTls { insecure: true, .. } => {
             return Err(RedisAdapterError::InvalidConfig(
                 "the #insecure url fragment turns certificate checks off and is refused"

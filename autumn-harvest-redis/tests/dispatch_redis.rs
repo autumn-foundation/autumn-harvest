@@ -63,6 +63,7 @@ impl Fixture {
         match reply {
             redis::streams::StreamPendingReply::Empty => 0,
             redis::streams::StreamPendingReply::Data(data) => data.count,
+            other => panic!("unexpected XPENDING reply: {other:?}"),
         }
     }
 
@@ -213,6 +214,40 @@ async fn a_future_hint_is_invisible_until_due() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let leases = read(&fixture, &queues, 10).await;
     assert_eq!(leases.len(), 1, "a due hint must be promoted and delivered");
+    assert_eq!(leases[0].task_id, task_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_due_hint_is_promoted_after_the_server_forgets_the_script() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["flushed".to_string()];
+    let task_id = Uuid::new_v4();
+
+    fixture
+        .dispatch
+        .publish(&[hint(
+            "flushed",
+            task_id,
+            Utc::now() + chrono::Duration::milliseconds(200),
+        )])
+        .await
+        .expect("publish");
+    assert!(read(&fixture, &queues, 10).await.is_empty());
+
+    // A restart or `SCRIPT FLUSH` drops the promote script. The pipeline then
+    // gets NOSCRIPT, and the dispatch must load the script and run it again.
+    let mut conn = fixture.raw.clone();
+    let _: String = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut conn)
+        .await
+        .expect("script flush");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 1, "a due hint must survive a script flush");
     assert_eq!(leases[0].task_id, task_id);
 }
 

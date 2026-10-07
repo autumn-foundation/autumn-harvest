@@ -538,7 +538,9 @@ impl RedisDispatch {
             .await
         {
             Ok(counts) => counts,
-            Err(err) if err.kind() == redis::ErrorKind::NoScriptError => {
+            Err(err)
+                if err.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) =>
+            {
                 // The server forgot the script. A restart or `SCRIPT FLUSH`
                 // does that. Load it once and run the pipeline again.
                 let _: String = redis::cmd("SCRIPT")
@@ -1433,7 +1435,7 @@ impl RedisDispatch {
         for (queue, value) in queues.iter().zip(replies) {
             let pending = match value
                 .extract_error()
-                .and_then(StreamPendingCountReply::from_owned_redis_value)
+                .and_then(|value| Ok(StreamPendingCountReply::from_redis_value(value)?))
             {
                 Ok(pending) => pending,
                 Err(error) => {
@@ -1518,8 +1520,8 @@ impl TaskDispatch for RedisDispatch {
 /// Open one connection manager with the contract C4 timeouts.
 async fn open_manager(client: &redis::Client) -> RedisAdapterResult<ConnectionManager> {
     let config = ConnectionManagerConfig::new()
-        .set_connection_timeout(CONNECT_TIMEOUT)
-        .set_response_timeout(RESPONSE_TIMEOUT);
+        .set_connection_timeout(Some(CONNECT_TIMEOUT))
+        .set_response_timeout(Some(RESPONSE_TIMEOUT));
     // The manager retries the first connection with its own backoff, so the
     // per-attempt timeout alone does not bound this call. The outer deadline
     // does. A black-holed address therefore fails in about `CONNECT_TIMEOUT`
@@ -2145,7 +2147,7 @@ mod tests {
 
     #[test]
     fn another_error_is_not_read_as_nogroup() {
-        let other = RedisError::from((redis::ErrorKind::IoError, "connection reset"));
+        let other = RedisError::from((redis::ErrorKind::Io, "connection reset"));
         assert!(
             !is_nogroup(&other),
             "a transport failure must not trigger a group heal"
