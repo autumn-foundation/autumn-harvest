@@ -285,6 +285,18 @@ pub async fn admit_batched_start_with_codecs(
                         priority,
                     } = crate::debounce::decode_deferred_admission_fields(&opts);
 
+                    // Clone-class note. This `batch_start_source` restore
+                    // and the `quota_key_input_override` capture below
+                    // near-duplicate the identical blocks in
+                    // `fire_claimed_batch_row`. Commits 3fa812d2 (#740),
+                    // 6f122f5d (#1230 Finding 1), 0924a27d (diesel-async
+                    // upgrade), and 7cf9475f (#1849) each touched both
+                    // copies in the same change. This is one
+                    // hand-maintained decision, not coincidental
+                    // similarity. Only two instances exist repo-wide, so
+                    // it does not clear the rule-of-three merge bar.
+                    // Apply a fix to either block to both.
+                    //
                     // Restore the provenance captured at admission (#740),
                     // defaulting to `Batch` for a pre-#740 row.
                     let batch_start_source = opts.start_source.as_deref().map_or(
@@ -622,7 +634,8 @@ async fn fire_claimed_batch_row(
     let batch_key = row.batch_key.clone();
     let row_id = row.id;
     // Restore the provenance captured at admission (#740), defaulting to `Batch`
-    // for a pre-#740 row.
+    // for a pre-#740 row. See the clone-class note on the identical restore
+    // in `admit_batched_start_with_codecs` above.
     let batch_start_source = opts.start_source.as_deref().map_or(
         crate::types::StartSource::Batch,
         crate::types::StartSource::from_str,
@@ -630,9 +643,10 @@ async fn fire_claimed_batch_row(
     let batch_start_source_ref = opts.start_source_ref.clone();
     let batch_started_by = opts.started_by.clone();
 
-    // Issue #1230 Finding 1: see the identical capture in
-    // `admit_batched_start` above for the full rationale. `row.buffered_payloads`
-    // here is the merged array; the first element is the quota-key override.
+    // Issue #1230 Finding 1: see the clone-class note on the identical
+    // capture in `admit_batched_start_with_codecs` above for the full
+    // rationale. `row.buffered_payloads` here is the merged array; the
+    // first element is the quota-key override.
     let quota_key_input_override: Option<serde_json::Value> = row
         .buffered_payloads
         .as_array()

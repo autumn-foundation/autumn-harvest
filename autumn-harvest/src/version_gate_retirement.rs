@@ -216,6 +216,19 @@ static RETIREMENT_CHECK_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::
     )
 });
 
+/// Clone-class note. This accessor's doc comment, `load_retirement_check`'s
+/// row-mapping closure, and `tests::assert_lists_every_state` below
+/// near-duplicate the identical pieces in `version_usage.rs`. PR #223 added
+/// `version_usage.rs` first; PR #228 added this file the same day, reusing
+/// its shape for a retirement-specific read model (issue #164). Commit
+/// 3bd7c5f3 (#1546) later applied the same terminal-state-derivation fix
+/// to both files in one change. Only two instances exist repo-wide, so
+/// this does not clear the rule-of-three merge bar.
+///
+/// The row-mapping closure also differs: this file additionally parses
+/// `sample_active_execution_ids`, which `version_usage.rs` has no use
+/// for. Apply a fix to any of the three pieces to both files.
+///
 /// Returns the retirement query, rendered once.
 ///
 /// `MIGRATED` stays outside the list, so a seal counts as active here.

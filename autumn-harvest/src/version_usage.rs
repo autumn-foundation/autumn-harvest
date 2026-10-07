@@ -148,6 +148,10 @@ static VERSION_USAGE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
     )
 });
 
+/// Clone-class note. See the full record on the identical accessor, the
+/// row-mapping closure, and the test helper in
+/// `version_gate_retirement.rs`.
+///
 /// Returns the usage query, rendered once.
 ///
 /// `MIGRATED` stays outside the list, so a seal counts as active here.
