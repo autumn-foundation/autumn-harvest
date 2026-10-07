@@ -342,8 +342,9 @@ event, an `ActivityCompleted`.
   #1788 fixed #1871 for a session that the server ends. The worker now
   writes the result again, up to 10 times, and gets a new connection after
   a lost one.
-- #1870: a `StartToClose` timeout ignores the retry policy and fails the
-  workflow.
+- #1870: a `StartToClose` timeout ignored the retry policy and failed the
+  workflow. #1809 and #1870 fixed it. A timeout with attempts left now starts
+  a new attempt.
 - #1876: Postgres keeps the open transaction of a partitioned worker until
   TCP keepalive ends the session. That transaction keeps its row locks.
   Orphan reclaim blocked on such a lock, so no orphan was reclaimed. The
@@ -362,13 +363,10 @@ Each test works around a bug only where the bug applies:
   worker gives the claim back and a second attempt runs. Only the attempt
   check fails. In the ack-lost test, the commit landed, so the repeat must
   change nothing.
-- #1870 fails the workflow after one `StartToClose` timeout. A result write
-  reaches that timeout, for example, when its repeats and the claim give-back
-  all fail. A crash restart can cause that. So the restart test accepts that
-  outcome, but only for workflows with an activity that the old Postgres
-  instance claimed. Each accepted `FAILED` must have the exact history: one
-  activity terminal event, a `StartToClose` timeout, and one terminal event,
-  a `WorkflowFailed` for the timeout.
+- A result write reaches the `StartToClose` timeout when its repeats and
+  the claim give-back all fail. A crash restart can cause that. The retry
+  policy then starts a new attempt (#1870), so the restart test requires
+  `COMPLETED` for every workflow.
 - The partition test sets `idle_in_transaction_session_timeout = 5s` on the
   server. This setting is no longer a #1876 workaround. A row that the
   cut-off session locks stays locked until the session ends. The 5 s limit

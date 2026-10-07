@@ -62,7 +62,9 @@ discarded. It also covers the four broker-connector families
 (`harvest.connector.received`, `harvest.connector.dispatched`,
 `harvest.connector.poisoned`, `harvest.connector.lag`), which back the shipped
 connector dashboard panels — without them a dropped metric would be
-indistinguishable from an idle consumer. **It does not back the full starter alert pack**
+indistinguishable from an idle consumer. It also covers
+`harvest.build.ramp_aborted` from the build ramp guard (issue #1814), which
+backs the starter dashboard's ramp-abort panel. **It does not back the full starter alert pack**
 (`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
 endpoint never emits (e.g. `harvest_workflow_terminal_total`,
 `harvest_activity_attempts_total`/`retries_total`,
@@ -352,6 +354,7 @@ metric is emitted in the source code.
 | `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth; excludes PAUSED executions, skew-discounted, periodic (5 s default) (issue #501). Aggregated across all shards as the **max** age per queue (the single oldest task fleet-wide) (issue #522) |
 | `harvest.load_shed.active` | Gauge | `load_shed.rs` — `sample_once`, the load-shed sampler. It writes 1 or 0 for every configured queue on every tick, also after a failed read (issue #1794) |
 | `harvest.load_shed.rejected` | Counter | `execution.rs` — `admit_fresh_start`, once per fresh start that load shedding refuses. The start and batch routes in `api.rs` (plugin) also count a throttled start that they shed before its defer (issue #1794) |
+| `harvest.build.ramp_aborted` | Counter | `ramp_guard.rs` — `guard_once`, once per build ramp that the ramp guard aborts. See `docs/operations/build-ramp-guard.md` (issue #1814) |
 | `harvest.api.rate_limited` | Counter | `api_rate_limit.rs` (plugin) — `enforce_api_rate_limit`, once per request the optional API rate limiter refuses with `429` (issue #1827) |
 | `harvest.queue.dispatched` | Counter | `worker.rs` — `dispatch_task`, once per dispatched task; lets operators confirm the live per-queue dispatch split matches `WorkerConfig::queue_weights` (issue #515) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
@@ -427,10 +430,10 @@ metric is emitted in the source code.
 | Metric | Labels |
 |--------|--------|
 | `harvest.workflow.started` | `workflow`, `queue` |
-| `harvest.workflow.duration` | `workflow`, `queue`, `status` (`completed\|failed\|suspended\|continued_as_new`) |
-| `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`) |
+| `harvest.workflow.duration` | `workflow`, `queue`, `status` (`completed\|failed\|suspended\|continued_as_new`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
+| `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
 | `harvest.activity.failed` | `activity`, `workflow.type`, `error.type`, `non_retryable` |
-| `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`) |
+| `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
 | `harvest.activity.retries` | `activity`, `queue` |
 | `harvest.retry.budget.available` | `activity` |
 | `harvest.retry.budget.exhausted` | `activity` |
@@ -445,6 +448,7 @@ metric is emitted in the source code.
 | `harvest.queue.oldest_pending_age` | `queue` |
 | `harvest.load_shed.active` | `queue` — only queues with a load-shed policy (issue #1794) |
 | `harvest.load_shed.rejected` | `queue` — only queues with a load-shed policy (issue #1794) |
+| `harvest.build.ramp_aborted` | `queue`, `reason` (`failure_rate\|nd_block_rate\|unreported`) (issue #1814) |
 | `harvest.api.rate_limited` | `route_class` (`mutating`, `read`), `client_kind` (`token`, `ip`, `unknown`, `overflow`). Never the token id or address (issue #1827) |
 | `harvest.dlq.entries` | `shard` |
 | `harvest.shard.stranded_pending` | `shard` |
@@ -485,7 +489,7 @@ metric is emitted in the source code.
 | `harvest.retention.summary_deleted` | `workflow` |
 | `harvest.retention.rate_limit_buckets_deleted` | `family` (`dyn-rate\|start-throttle`) — never the bucket key (unbounded per tenant) |
 | `harvest.retention.terminal_tasks_deleted` | `state` (`COMPLETED\|FAILED\|CANCELLED`) |
-| `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |
+| `harvest.workflow.nondeterministic_block` | `workflow`, `queue`, `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
 | `harvest.workflow.history_bloat` | `workflow` (= `METRIC_LABEL_WORKFLOW`) — no `execution.id` label (ADR-0001 §7); see `GET /api/harvest/workflows?history_bloat_min_events=<N>` to find the specific execution(s) driving a crossing (issue #704) |
 | `harvest.workflow.start_throttled` | `workflow` (the resolved throttle key is deliberately **not** a label — unbounded cardinality; see `GET /admin/start-throttle` for per-key backlog, issue #607) |
 | `harvest.concurrency.superseded` | `workflow` (the **superseded** run's workflow type; the concurrency key is deliberately **not** a label — unbounded tenant input, per ADR-0001 §7. Use `GET /admin/concurrency` for the per-key view and the effective `on_conflict` strategy, issue #811) |
@@ -518,6 +522,31 @@ metric is emitted in the source code.
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by
 construction — no `record_*` method accepts an `ExecutionId`.
+
+### `build_id` label
+
+Five families carry a `build_id` label (issue #1814):
+`harvest.workflow.terminal`, `harvest.activity.attempts`,
+`harvest.workflow.nondeterministic_block`, `harvest.workflow.duration` and
+`harvest.activity.duration`. The value is the build of the worker that ran the
+task. An outcome that no worker code produced reports `none`. Examples are the
+timeout scanner, a cancel through a signal and a race-loser cancel.
+
+`telemetry::build_id_label` caps the values. A process admits the first 16
+distinct builds that it sees (`MAX_BUILD_ID_LABELS`), and it never evicts one.
+A later build, or a build id longer than 128 bytes, reports `__other__`. A
+real build id equal to a sentinel, or one that starts with `build:`, gets a
+`build:` prefix, so it never merges with a sentinel or another build. A
+worker process normally reports only its own build.
+`harvest.workflow.non_determinism` goes through the same cap.
+
+A custom recorder gets the build through the `*_for_build` methods of
+`MetricsRecorder`. Their defaults drop the build and call the method without
+it, so an existing recorder needs no change. A recorder that forwards to
+another recorder must forward these methods too, or the build is lost.
+
+The ramp guard does not read these metrics. It counts runs in the database by
+`assigned_build_id`. See `docs/operations/build-ramp-guard.md`.
 
 ### Saga compensation metrics (issue #801)
 

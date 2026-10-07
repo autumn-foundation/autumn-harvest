@@ -121,6 +121,10 @@ mod dashboard_pack_docs;
 mod debounce_tests;
 #[cfg(feature = "debugger")]
 mod debugger_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod decision_boundary_db_tests;
+#[cfg(feature = "testing")]
+mod decision_boundary_replay_tests;
 mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
@@ -225,6 +229,8 @@ mod quota_reconcile_candidate_bound_tests;
 mod quota_reconcile_candidate_scan_perf_tests;
 mod quota_reconcile_tests;
 mod quota_supersede_ordering_tests;
+#[cfg(feature = "db")]
+mod ramp_guard_tests;
 mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
 mod redrive_tests;

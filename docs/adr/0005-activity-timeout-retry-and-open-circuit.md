@@ -40,6 +40,10 @@ A retried timeout follows the same rules as a retried handler failure:
 - The timeout is not retried when the next attempt would start after
   `schedule_to_close`. A paused execution is the exception, because a pause
   stops that clock. The task then fails with its own timeout type.
+- A timeout applies only to an open run, `RUNNING` or `PAUSED` (issue
+  #1870). A workflow can end while its activity still runs. The timeout of a
+  sealed run then fails the orphan task only: no retry, no event and no wake,
+  as for a workflow task. A staged shard copy is left alone.
 - The last attempt appends `ActivityTimedOut` with its timeout type, as
   before. The workflow sees only that final outcome.
 

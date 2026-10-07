@@ -157,6 +157,9 @@ pub struct HarvestBuilder {
     /// Automatic per-queue load shedding (issue #1794). An empty config turns
     /// it off.
     load_shed: crate::load_shed::LoadShedConfig,
+    /// Metric-gated automatic build-ramp abort (issue #1814). The default
+    /// config is disabled.
+    ramp_guard: crate::ramp_guard::RampGuardConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on `workflow_attempt` (issue #523).
@@ -229,6 +232,7 @@ impl Default for HarvestBuilder {
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
             load_shed: crate::load_shed::LoadShedConfig::new(),
+            ramp_guard: crate::ramp_guard::RampGuardConfig::default(),
             completion_triggers: Vec::new(),
             max_workflow_attempts: None,
             usage_window_ceiling: None,
@@ -292,6 +296,7 @@ impl std::fmt::Debug for HarvestBuilder {
             )
             .field("batch_start_config", &self.batch_start_config)
             .field("load_shed", &self.load_shed)
+            .field("ramp_guard", &self.ramp_guard)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -407,6 +412,9 @@ pub struct BuiltHarvest {
     /// Automatic per-queue load shedding (issue #1794). An empty config turns
     /// it off.
     pub load_shed: crate::load_shed::LoadShedConfig,
+    /// Metric-gated automatic build-ramp abort (issue #1814). The default
+    /// config is disabled.
+    pub ramp_guard: crate::ramp_guard::RampGuardConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
@@ -494,6 +502,7 @@ impl std::fmt::Debug for BuiltHarvest {
             )
             .field("batch_start_config", &self.batch_start_config)
             .field("load_shed", &self.load_shed)
+            .field("ramp_guard", &self.ramp_guard)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -2353,6 +2362,17 @@ impl HarvestBuilder {
         self
     }
 
+    /// Record a `DecisionCommitted` boundary after each decision (issue #1833).
+    ///
+    /// Off by default. A worker older than this release fails an execution
+    /// whose history holds a boundary. Pass `true` only when no older
+    /// process runs. See `docs/decision-boundaries.md`.
+    #[must_use]
+    pub const fn record_decision_boundaries(mut self, enabled: bool) -> Self {
+        self.history_policy = self.history_policy.with_decision_boundaries(enabled);
+        self
+    }
+
     /// Set a server-side hard ceiling on the number of durable events a RUNNING
     /// workflow execution may accumulate (issue #493).
     ///
@@ -2601,6 +2621,19 @@ impl HarvestBuilder {
         self
     }
 
+    /// Turn on the build ramp guard (issue #1814).
+    ///
+    /// The guard aborts a build ramp when the target build fails or ND-blocks
+    /// more runs than the base build. See
+    /// `docs/operations/build-ramp-guard.md`. The default config is disabled.
+    /// The plugin boot spawns the guard loop. A bare builder only stores the
+    /// config, so call `ramp_guard::run_ramp_guard` without the plugin.
+    #[must_use]
+    pub const fn ramp_guard(mut self, config: crate::ramp_guard::RampGuardConfig) -> Self {
+        self.ramp_guard = config;
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -2811,6 +2844,7 @@ impl HarvestBuilder {
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
             load_shed: self.load_shed,
+            ramp_guard: self.ramp_guard,
             completion_triggers: self.completion_triggers,
             max_workflow_attempts: self.max_workflow_attempts,
             usage_window_ceiling,

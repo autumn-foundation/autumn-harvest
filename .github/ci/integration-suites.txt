@@ -154,6 +154,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          quota_reconcile_candidate_scan_perf_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_tests
 linux        autumn-harvest         integration                      -                          quota_supersede_ordering_tests
+linux        autumn-harvest         integration                      -                          ramp_guard_tests
 linux        autumn-harvest         integration                      -                          rate_limit_bucket_gc_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
 linux        autumn-harvest         integration                      -                          redrive_tests
@@ -223,6 +224,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    dag_mapping_tests
 linux        autumn-harvest         integration                      testing                    dag_signal_gate_tests
 linux        autumn-harvest         integration                      testing                    dag_unified_tests
+linux        autumn-harvest         integration                      testing                    decision_boundary_db_tests
 linux        autumn-harvest         integration                      testing                    dispatch_tests
 linux        autumn-harvest         integration                      testing                    nd_block
 linux        autumn-harvest         integration                      testing                    replay_canary_tests
@@ -342,3 +344,4 @@ linuxpart    autumn-harvest         integration                      -          
 linuxpart    autumn-harvest         integration                      -                          retention_overrides_tests
 linuxpart    autumn-harvest         integration                      -                          retention_summary_tests
 linuxpart    autumn-harvest         integration                      -                          workflow_retry_tests
+linuxpart    autumn-harvest         integration                      testing                    decision_boundary_db_tests
