@@ -202,7 +202,7 @@ HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 ./benchmarks/run
 | `HARVEST_BENCH_CHECK` | also print the reproduction verdict |
 | `HARVEST_BENCH_KEEP` | leave the containers running afterwards |
 | `HARVEST_BENCH_OUT` | write the report somewhere other than `benchmarks/results/` |
-| `HARVEST_BENCH_STATS_DIR` | write each shard's `pg_stat_statements` and `pg_stat_user_tables` to this directory, before teardown drops the database (issue #1956) |
+| `HARVEST_BENCH_STATS_DIR` | write each shard's `pg_stat_user_tables` and `pg_stat_statements` to this absolute path before teardown drops the shard database. The statements file needs `pg_stat_statements` in `shared_preload_libraries`; the compose shards do not set it |
 
 The two latency scenarios have no size knob; their populations are fixed so the
 published percentiles always rest on the same sample count.

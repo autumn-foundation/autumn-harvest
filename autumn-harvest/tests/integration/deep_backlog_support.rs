@@ -99,11 +99,24 @@ pub struct FixtureSpec {
 /// The churn that makes the dead tuples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Churn {
-    /// Live rows updated once, as a claim that a worker released.
-    pub updated: u64,
-    /// Extra terminal rows inserted and deleted, as a hygiene sweep.
-    pub deleted: u64,
+    /// Live `PENDING` rows that a worker claims and releases:
+    /// `PENDING -> RUNNING -> PENDING`. Each leaves two dead versions.
+    pub released: u64,
+    /// Extra rows that run, complete and go to the hygiene sweep:
+    /// `PENDING -> RUNNING -> COMPLETED -> deleted`. Each leaves three.
+    pub reclaimed: u64,
 }
+
+impl Churn {
+    /// Dead tuples the churn leaves.
+    #[must_use]
+    pub const fn dead_tuples(&self) -> u64 {
+        2 * self.released + 3 * self.reclaimed
+    }
+}
+
+/// Task slots per seeded worker, as `harvest_workers.max_concurrency`.
+pub const WORKER_SLOTS: i32 = 16;
 
 impl FixtureSpec {
     /// The Ledger defaults at [`LEDGER_LIVE_ROWS`].
@@ -196,8 +209,11 @@ impl FixtureSpec {
         self.live_rows.div_ceil(self.tasks_per_execution)
     }
 
-    /// The churn that gives [`Self::dead_ratio`]. Half the dead tuples come
-    /// from updates and half from deletes.
+    /// The churn that gives [`Self::dead_ratio`].
+    ///
+    /// The churn follows the task lifecycle, so every update changes `state`.
+    /// About half the dead tuples come from released claims, and the rest
+    /// from reclaimed tasks.
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,
@@ -207,11 +223,19 @@ impl FixtureSpec {
     pub fn churn(&self) -> Churn {
         let dead = (self.live_rows as f64 * self.dead_ratio / (1.0 - self.dead_ratio)).round();
         let dead = dead as u64;
-        let updated = (dead / 2).min(self.live_rows);
+        let released = (dead / 4).min(self.live_rows);
+        let reclaimed = ((dead - 2 * released) as f64 / 3.0).round() as u64;
         Churn {
-            updated,
-            deleted: dead - updated,
+            released,
+            reclaimed,
         }
+    }
+
+    /// Task slots of the seeded fleet.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub const fn fleet_slots(&self) -> u64 {
+        self.workers * WORKER_SLOTS as u64
     }
 
     /// Every queue name, head queue first.
@@ -245,28 +269,21 @@ impl FixtureSpec {
         format!("md5('{}:{tag}:' || ({ordinal})::text)::uuid", self.seed)
     }
 
-    /// The seed script, one statement per entry: [`Self::seed_script`],
-    /// load phase first.
-    #[must_use]
-    pub fn seed_sql(&self) -> Vec<String> {
-        let script = self.seed_script();
-        script.load.into_iter().chain(script.churn).collect()
-    }
-
-    /// The seed script in two phases. A pure function of the spec.
+    /// The seed script in three phases. A pure function of the spec.
     ///
-    /// The churn runs in one transaction, so neither statement prunes the
-    /// dead tuples of the other.
+    /// The churn runs in one transaction, so no statement in it prunes the
+    /// dead tuples of another.
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn seed_script(&self) -> SeedScript {
         let live = self.live_rows;
         let churn = self.churn();
+        let released = churn.released;
         let execs = self.executions();
         let tpe = self.tasks_per_execution;
-        let total = live + churn.deleted;
-        // The execution of task ordinal `i`. A deleted row belongs to the
-        // execution of a live row, as an earlier attempt of the same run.
+        let total = live + churn.reclaimed;
+        // The execution of task ordinal `i`. A reclaimed row belongs to the
+        // execution of a live row, as an earlier task of the same run.
         let exec_of = format!(
             "(CASE WHEN i < {live} THEN i / {tpe} ELSE ((i - {live}) / {tpe}) % {execs} END)"
         );
@@ -290,8 +307,11 @@ impl FixtureSpec {
         let task_id = self.uuid("task", "i");
         let activity_id = self.uuid("activity-id", "i");
         let workers = self.workers;
+        let fleet = self.fleet_slots();
         let cap = self.key_cap;
         let seed = self.seed;
+        let at_i = format!("{EPOCH} + i * INTERVAL '1 millisecond'");
+        let seq = "(input->>'seq')::bigint";
         let load = vec![
             "TRUNCATE harvest_task_queue, harvest_workflow_executions, harvest_workers CASCADE"
                 .to_string(),
@@ -299,8 +319,10 @@ impl FixtureSpec {
             "ALTER TABLE harvest_workflow_executions SET (autovacuum_enabled = false)".to_string(),
             format!(
                 "INSERT INTO harvest_workers \
-                   (worker_id, max_concurrency, host, build_id, queues, labels) \
-                 SELECT '{PREFIX}-worker-' || i, 16, '{PREFIX}-host', '', '[]'::jsonb, '{{}}'::jsonb \
+                   (worker_id, max_concurrency, host, build_id, queues, labels, started_at, \
+                    last_heartbeat_at) \
+                 SELECT '{PREFIX}-worker-' || i, {WORKER_SLOTS}, '{PREFIX}-host', '', '[]'::jsonb, \
+                        '{{}}'::jsonb, {EPOCH}, {EPOCH} \
                  FROM generate_series(0, {last}) AS s(i)",
                 last = workers - 1
             ),
@@ -317,59 +339,95 @@ impl FixtureSpec {
                 run_id = self.uuid("run", "e"),
                 last = execs - 1,
             ),
+            // Layer `b` draws each row. Layer `k` ranks the RUNNING draws of
+            // one key and task type, and `f` keeps at most `cap` of them. Layer
+            // `r` ranks the rest, and `t` keeps at most one fleet of them. A
+            // draw past a cap stays PENDING, as a claim the gate refuses.
             format!(
                 "INSERT INTO harvest_task_queue \
                    (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, input, \
                     state, priority, worker_id, attempt, max_attempts, scheduled_at, started_at, \
                     completed_at, last_heartbeat_at, concurrency_key, concurrency_cap, created_at) \
-                 SELECT {task_id}, '{PREFIX}-q-' || {queue}, \
-                        CASE WHEN i < {live} AND i % {tpe} = 0 THEN 'workflow' ELSE 'activity' END, \
-                        {exec_id}, \
-                        CASE WHEN i < {live} AND i % {tpe} = 0 THEN NULL \
-                             ELSE '{PREFIX}-activity-' || {activity} END, \
-                        CASE WHEN i < {live} AND i % {tpe} = 0 THEN NULL ELSE {activity_id} END, \
+                 SELECT {task_id}, '{PREFIX}-q-' || {queue}, ttype, {exec_id}, \
+                        CASE WHEN ttype = 'activity' THEN '{PREFIX}-activity-' || {activity} END, \
+                        CASE WHEN ttype = 'activity' THEN {activity_id} END, \
                         jsonb_build_object('seq', i, 'pad', repeat('x', 96)), \
                         st, \
                         CASE WHEN {prio_u} < 0.9 THEN 0 ELSE 1 + (i % 9)::int END, \
-                        CASE WHEN st = 'RUNNING' THEN '{PREFIX}-worker-' || (i % {workers}) END, \
+                        CASE WHEN st = 'RUNNING' \
+                             THEN '{PREFIX}-worker-' || ((run_rank - 1) % {workers}) END, \
                         CASE WHEN st = 'PENDING' THEN 0 ELSE 1 END, 3, \
-                        CASE WHEN st = 'PENDING' AND {future_u} < {future:?} THEN {FAR_FUTURE} \
-                             ELSE {EPOCH} + i * INTERVAL '1 millisecond' END, \
-                        CASE WHEN st <> 'PENDING' THEN {EPOCH} + i * INTERVAL '1 millisecond' END, \
-                        CASE WHEN st IN ('COMPLETED', 'FAILED') \
-                             THEN {EPOCH} + i * INTERVAL '1 millisecond' END, \
-                        CASE WHEN st = 'RUNNING' THEN {EPOCH} + i * INTERVAL '1 millisecond' END, \
-                        CASE WHEN {keyed} THEN '{PREFIX}-k-' || {key} END, \
-                        CASE WHEN {keyed} THEN {cap} END, \
-                        {EPOCH} + i * INTERVAL '1 millisecond' \
+                        CASE WHEN st = 'PENDING' AND i < {live} AND i >= {released} \
+                                  AND {future_u} < {future:?} THEN {FAR_FUTURE} \
+                             ELSE {at_i} END, \
+                        CASE WHEN st <> 'PENDING' THEN {at_i} END, \
+                        CASE WHEN st IN ('COMPLETED', 'FAILED') THEN {at_i} END, \
+                        CASE WHEN st = 'RUNNING' THEN {at_i} END, \
+                        ckey, \
+                        CASE WHEN ckey IS NOT NULL THEN {cap} END, \
+                        {at_i} \
                  FROM ( \
-                   SELECT i, e, \
-                          CASE WHEN i >= {live} THEN 'COMPLETED' \
-                               WHEN {state_u} < {running:?} THEN 'RUNNING' \
-                               WHEN {state_u} < {terminal:?} \
-                                 THEN CASE WHEN i % 5 = 0 THEN 'FAILED' ELSE 'COMPLETED' END \
-                               ELSE 'PENDING' END AS st \
-                   FROM generate_series(0, {last}) AS s(i), LATERAL (SELECT {exec_of} AS e) AS x \
+                   SELECT r.*, \
+                          CASE WHEN may_run AND run_rank <= {fleet} THEN 'RUNNING' \
+                               WHEN base = 'RUNNING' THEN 'PENDING' \
+                               ELSE base END AS st \
+                   FROM ( \
+                     SELECT f.*, row_number() OVER (PARTITION BY may_run ORDER BY i) AS run_rank \
+                     FROM ( \
+                       SELECT k.*, (base = 'RUNNING' AND (ckey IS NULL OR key_rank <= {cap})) AS may_run \
+                       FROM ( \
+                         SELECT b.*, \
+                                row_number() OVER (PARTITION BY ckey, ttype, base ORDER BY i) AS key_rank \
+                         FROM ( \
+                           SELECT i, e, \
+                                  CASE WHEN i < {live} AND i % {tpe} = 0 \
+                                       THEN 'workflow' ELSE 'activity' END AS ttype, \
+                                  CASE WHEN {keyed} THEN '{PREFIX}-k-' || {key} END AS ckey, \
+                                  CASE WHEN i >= {live} OR i < {released} THEN 'PENDING' \
+                                       WHEN {state_u} < {running:?} THEN 'RUNNING' \
+                                       WHEN {state_u} < {terminal:?} \
+                                         THEN CASE WHEN i % 5 = 0 THEN 'FAILED' ELSE 'COMPLETED' END \
+                                       ELSE 'PENDING' END AS base \
+                           FROM generate_series(0, {last}) AS s(i), \
+                                LATERAL (SELECT {exec_of} AS e) AS x \
+                         ) AS b \
+                       ) AS k \
+                     ) AS f \
+                   ) AS r \
                  ) AS t \
                  ORDER BY md5('{seed}:task-order:' || i::text)",
                 last = total - 1,
             ),
         ];
-        let churn = vec![
-            format!(
-                "BEGIN; \
-                 UPDATE harvest_task_queue \
-                    SET attempt = attempt + 1, error = '{PREFIX}: released by a worker' \
-                  WHERE (input->>'seq')::bigint < {updated}; \
-                 DELETE FROM harvest_task_queue WHERE (input->>'seq')::bigint >= {live}; \
-                 COMMIT",
-                updated = churn.updated,
-            ),
+        let churn = vec![format!(
+            "BEGIN; \
+             UPDATE harvest_task_queue \
+                SET state = 'RUNNING', worker_id = '{PREFIX}-worker-0', started_at = {EPOCH}, \
+                    attempt = attempt + 1 \
+              WHERE {seq} < {released}; \
+             UPDATE harvest_task_queue \
+                SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
+                    error = '{PREFIX}: released by a worker' \
+              WHERE {seq} < {released}; \
+             UPDATE harvest_task_queue \
+                SET state = 'RUNNING', worker_id = '{PREFIX}-worker-0', started_at = {EPOCH}, \
+                    attempt = 1 \
+              WHERE {seq} >= {live}; \
+             UPDATE harvest_task_queue SET state = 'COMPLETED', completed_at = {EPOCH} \
+              WHERE {seq} >= {live}; \
+             DELETE FROM harvest_task_queue WHERE {seq} >= {live}; \
+             COMMIT"
+        )];
+        let analyze = vec![
             "ANALYZE harvest_task_queue".to_string(),
             "ANALYZE harvest_workflow_executions".to_string(),
             "ANALYZE harvest_workers".to_string(),
         ];
-        SeedScript { load, churn }
+        SeedScript {
+            load,
+            churn,
+            analyze,
+        }
     }
 }
 
@@ -378,8 +436,17 @@ impl FixtureSpec {
 pub struct SeedScript {
     /// Create the rows. Every row is live after this phase.
     pub load: Vec<String>,
-    /// Make the dead tuples, then `ANALYZE`.
+    /// Make the dead tuples, in one transaction.
     pub churn: Vec<String>,
+    /// Refresh the planner statistics.
+    pub analyze: Vec<String>,
+}
+
+impl SeedScript {
+    /// Every statement, in the order [`seed`] runs them.
+    pub fn statements(&self) -> impl Iterator<Item = &String> {
+        self.load.iter().chain(&self.churn).chain(&self.analyze)
+    }
 }
 
 /// The share of rank 0 under power skew `k` over `n` ranks: `(1/n)^(1/k)`.
@@ -415,7 +482,7 @@ pub struct FixtureShape {
     pub live_rows: u64,
     /// Rows per queue, largest first.
     pub queue_counts: Vec<(String, i64)>,
-    /// Rows of the hottest key over all keyed rows.
+    /// The share of keyed rows that carry the hottest key.
     pub top_key_share: f64,
     pub keyed_rows: u64,
     /// Rows per state, largest first.
@@ -425,6 +492,10 @@ pub struct FixtureShape {
     /// `pg_stat_user_tables.n_dead_tup` of the task queue.
     pub n_dead_tup: i64,
     pub heap_bytes: i64,
+    /// The most `RUNNING` rows of one concurrency key and task type.
+    pub max_running_per_key: i64,
+    /// The most `RUNNING` rows of one worker.
+    pub max_running_per_worker: i64,
 }
 
 impl FixtureShape {
@@ -492,8 +563,8 @@ pub async fn connect(url: &str) -> AsyncPgConnection {
 /// Seed `spec` into the database of `conn`. The database must be migrated.
 ///
 /// The census runs between the load and the churn. A read after the churn
-/// prunes pages, and pruning lowers `n_dead_tup`. So the dead-tuple stats
-/// are read once, right after `ANALYZE`, before any scan of the heap.
+/// prunes pages, and pruning lowers `n_dead_tup`. So `seed` reads the table
+/// stats once, right after `ANALYZE`, before any scan of the heap.
 ///
 /// # Panics
 /// Panics when the spec is invalid or a statement fails.
@@ -505,9 +576,13 @@ pub async fn seed(conn: &mut AsyncPgConnection, spec: &FixtureSpec) -> SeedRepor
     run_all(conn, &script.load).await;
     let census = census(conn, spec.live_rows).await;
     run_all(conn, &script.churn).await;
-    let snapshot = stats::capture(conn).await;
-    let tq = snapshot
-        .tables
+    // `ANALYZE` must see the churn counters, or it counts them twice.
+    stats::flush_counters(conn).await;
+    run_all(conn, &script.analyze).await;
+    let tables = stats::read_table_stats(conn)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let tq = tables
         .iter()
         .find(|t| t.relname == "harvest_task_queue")
         .expect("pg_stat_user_tables lists harvest_task_queue")
@@ -523,7 +598,7 @@ pub async fn seed(conn: &mut AsyncPgConnection, spec: &FixtureSpec) -> SeedRepor
             heap_bytes,
             ..census
         },
-        tables: snapshot.tables,
+        tables,
     }
 }
 
@@ -600,6 +675,25 @@ async fn census(conn: &mut AsyncPgConnection, live: u64) -> FixtureShape {
         ),
     )
     .await;
+    let max_running_per_key = count(
+        conn,
+        &format!(
+            "SELECT COALESCE(MAX(n), 0) AS n FROM ( \
+               SELECT COUNT(*) AS n FROM harvest_task_queue \
+               WHERE {live_filter} AND state = 'RUNNING' AND concurrency_key IS NOT NULL \
+               GROUP BY concurrency_key, task_type) AS k"
+        ),
+    )
+    .await;
+    let max_running_per_worker = count(
+        conn,
+        &format!(
+            "SELECT COALESCE(MAX(n), 0) AS n FROM ( \
+               SELECT COUNT(*) AS n FROM harvest_task_queue \
+               WHERE {live_filter} AND state = 'RUNNING' GROUP BY worker_id) AS w"
+        ),
+    )
+    .await;
     FixtureShape {
         live_rows,
         queue_counts,
@@ -609,13 +703,15 @@ async fn census(conn: &mut AsyncPgConnection, live: u64) -> FixtureShape {
         n_live_tup: 0,
         n_dead_tup: 0,
         heap_bytes: 0,
+        max_running_per_key,
+        max_running_per_worker,
     }
 }
 
 /// An `md5` over the seeded content and the physical row order.
 ///
-/// Columns with a server default are left out, because the seed does not
-/// write them.
+/// The hash leaves out columns with a server default, because the seed does
+/// not write them.
 ///
 /// # Panics
 /// Panics when the query fails.
@@ -803,8 +899,9 @@ impl Tally {
     }
 }
 
-/// Errors in a row after which a claimer stops. A broken connection fails
-/// every call, so more retries only use up the budget.
+/// Failed calls in a row after which a claimer stops. Any call that succeeds
+/// resets the count. A broken connection fails every call, so more retries
+/// only use up the budget.
 const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 
 /// The pause after a failed claim, so a failing claimer does not spin.
@@ -818,19 +915,23 @@ async fn by_deadline<T>(deadline: Instant, fut: impl std::future::Future<Output 
 }
 
 /// A replacement for a completed task, so the backlog keeps its depth.
+///
+/// The replacement is always an activity task of the same execution, queue,
+/// key and priority. In the engine, a workflow task that completes schedules
+/// activities. It does not enqueue a second workflow task.
 fn replacement(task: &autumn_harvest::models::TaskQueueItem) -> EnqueueParams {
-    let kind = if task.task_type == "workflow" {
-        TaskType::Workflow
-    } else {
-        TaskType::Activity
-    };
     let mut params = EnqueueParams::new(
         task.queue_name.clone(),
-        kind,
+        TaskType::Activity,
         serde_json::json!({ "replaces": task.id }),
     );
     params.workflow_exec_id = task.workflow_exec_id;
-    params.activity_name.clone_from(&task.activity_name);
+    params.activity_name = Some(
+        task.activity_name
+            .clone()
+            .unwrap_or_else(|| format!("{PREFIX}-activity-0")),
+    );
+    params.priority = task.priority;
     params.concurrency_key.clone_from(&task.concurrency_key);
     params.max_concurrent = task.concurrency_cap.and_then(|cap| u32::try_from(cap).ok());
     params
@@ -872,7 +973,10 @@ pub async fn drive_claims(
                     break;
                 };
                 let task = match claimed {
-                    Ok(Some(task)) => task,
+                    Ok(Some(task)) => {
+                        consecutive_errors = 0;
+                        task
+                    }
                     Ok(None) => {
                         tally.empty_polls.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -898,7 +1002,10 @@ pub async fn drive_claims(
                     Some(Ok(())) => {
                         tally.completions.fetch_add(1, Ordering::Relaxed);
                     }
-                    Some(Err(e)) => tally.error("complete", &e),
+                    Some(Err(e)) => {
+                        tally.error("complete", &e);
+                        consecutive_errors += 1;
+                    }
                 }
                 let params = replacement(&task);
                 match by_deadline(deadline, queue::enqueue(&mut conn, &params)).await {
@@ -914,6 +1021,9 @@ pub async fn drive_claims(
                         tally.error("enqueue", &e);
                         consecutive_errors += 1;
                     }
+                }
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    break;
                 }
             }
         }));
@@ -953,8 +1063,8 @@ pub fn artifact_dir() -> PathBuf {
 /// The `u64` in env var `name`, or `default` when it is unset or blank.
 ///
 /// # Panics
-/// Panics when the value is not a `u64`. A typo in a knob must not run a
-/// different experiment without a word.
+/// Panics when the value is not a `u64`. A typo in a knob must not silently
+/// run a different experiment.
 #[must_use]
 pub fn env_u64(name: &str, default: u64) -> u64 {
     match std::env::var(name) {
@@ -964,6 +1074,22 @@ pub fn env_u64(name: &str, default: u64) -> u64 {
             .unwrap_or_else(|e| panic!("{name}={v:?} is not a whole number: {e}")),
         _ => default,
     }
+}
+
+/// The server version and the settings that move claim cost.
+///
+/// JIT matters most. The claim plan costs more than `jit_above_cost` on a deep
+/// backlog, and the planner plans each claim again.
+async fn server_settings(conn: &mut AsyncPgConnection) -> String {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(
+        "SELECT format('%s; jit=%s, shared_buffers=%s, work_mem=%s, max_parallel_workers_per_gather=%s', \
+                version(), current_setting('jit'), current_setting('shared_buffers'), \
+                current_setting('work_mem'), current_setting('max_parallel_workers_per_gather')) AS t",
+    )
+    .get_result::<TextRow>(conn)
+    .await
+    .map_or_else(|e| format!("unknown ({e})"), |row| row.t)
 }
 
 /// Seed `spec`, drive `workload`, snapshot, drop, and write the artifacts.
@@ -986,6 +1112,7 @@ pub async fn capture_run(
     let name = db.name().to_string();
     let mut conn = connect(&db.url()).await;
     let seeded = seed(&mut conn, spec).await;
+    let settings = server_settings(&mut conn).await;
     let shape = &seeded.shape;
     std::fs::write(
         out_dir.join(format!("{label}-post-seed-pg_stat_user_tables.txt")),
@@ -1006,7 +1133,8 @@ pub async fn capture_run(
     std::fs::write(
         out_dir.join(format!("{label}-workload-pg_stat_user_tables.txt")),
         format!(
-            "-- pg_stat_user_tables, workload deltas (n_live_tup and n_dead_tup are final) --\n{}",
+            "-- pg_stat_user_tables, workload deltas (n_live_tup and n_dead_tup are final) --\n{}{}",
+            stats::partial_banner(&snapshot),
             stats::render_tables(&deltas)
         ),
     )
@@ -1014,8 +1142,10 @@ pub async fn capture_run(
     std::fs::write(
         out_dir.join(format!("{label}-pg_stat_statements.txt")),
         format!(
-            "-- pg_stat_statements over the workload, this database only, top 25 by buffers --\n{}",
-            stats::render_statements(&snapshot.statements, 25)
+            "-- pg_stat_statements over the workload, this database only, top {} by buffers --\n{}{}",
+            stats::TOP_STATEMENTS,
+            stats::partial_banner(&snapshot),
+            stats::render_statements(&snapshot.statements, stats::TOP_STATEMENTS)
         ),
     )
     .expect("write the statements");
@@ -1059,6 +1189,16 @@ pub async fn capture_run(
         head_share(spec.keys, spec.key_skew)
     );
     let _ = writeln!(s, "states: {:?}", shape.states);
+    let _ = writeln!(
+        s,
+        "running: {} rows, at most {} per key and task type (cap {}), at most {} per worker ({} slots)",
+        shape.state_count("RUNNING"),
+        shape.max_running_per_key,
+        spec.key_cap,
+        shape.max_running_per_worker,
+        WORKER_SLOTS
+    );
+    let _ = writeln!(s, "server: {settings}");
     let _ = writeln!(
         s,
         "pg_stat_statements reset: {}",

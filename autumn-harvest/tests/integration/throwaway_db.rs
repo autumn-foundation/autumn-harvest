@@ -6,7 +6,8 @@
 //! cannot share a database. With `HARVEST_TEST_DATABASE_URL` set, such a
 //! suite creates its own database on that server. [`ThrowawayDb`] drops it
 //! again, after a pass and during an unwind. The DSN can be a URL or a libpq
-//! keyword/value string.
+//! keyword/value string. [`ThrowawayDb::create_on`] takes any admin URL, for
+//! a harness that starts its own server.
 
 /// The DSN `url` with its database set to `database`.
 ///
@@ -155,12 +156,6 @@ impl ThrowawayDb {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// The admin URL of the server that holds the database.
-    #[must_use]
-    pub fn admin_url(&self) -> &str {
-        &self.admin_url
     }
 
     /// The connection URL of the throwaway database.

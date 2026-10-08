@@ -3028,39 +3028,41 @@ pub mod db {
 
         /// [`Self::teardown`], with a stats snapshot of each shard first.
         ///
-        /// With [`STATS_DIR_ENV_VAR`] set, each shard's stats views are
-        /// written before the drop. The drop discards `pg_stat_user_tables`,
-        /// so the snapshot must come first (issue #1956). Unset, this is
+        /// With [`STATS_DIR_ENV_VAR`] set, this writes the stats views of each
+        /// shard before the drop. The drop discards `pg_stat_user_tables`, so
+        /// the snapshot comes first (issue #1956). Unset, this is
         /// [`Self::teardown`].
+        pub async fn teardown_with_stats(self, scenario: BenchScenario) -> Vec<String> {
+            let mut failures = self.snapshot_stats(scenario).await;
+            failures.extend(self.teardown().await);
+            failures
+        }
+
+        /// Write each shard's stats views to [`STATS_DIR_ENV_VAR`], if set.
         ///
-        /// A failed or timed-out snapshot is a reported failure. The drop
-        /// always runs after it. The leases stay open until the snapshots
-        /// end, so a concurrent stale sweep cannot drop a shard first.
-        pub async fn teardown_with_stats(mut self, scenario: BenchScenario) -> Vec<String> {
-            let mut failures = Vec::new();
+        /// A failed or timed-out snapshot is a reported failure, never a
+        /// panic, so the drop after it always runs. The leases stay open
+        /// meanwhile, so a concurrent stale sweep cannot drop a shard first.
+        async fn snapshot_stats(&self, scenario: BenchScenario) -> Vec<String> {
+            use super::super::pg_stats_snapshot::{SNAPSHOT_BOUND, snapshot_to_dir};
             let raw = std::env::var(STATS_DIR_ENV_VAR).ok();
-            if let Some(dir) = stats_dir_from(raw.as_deref()) {
-                let shards = self.urls.len();
-                for (idx, url) in self.urls.values().enumerate() {
-                    let label = stats_label(scenario, shards, idx);
-                    let snapshot = tokio::time::timeout(
-                        super::super::pg_stats_snapshot::SNAPSHOT_BOUND,
-                        super::super::pg_stats_snapshot::snapshot_to_dir(url, &dir, &label),
-                    )
-                    .await;
-                    match snapshot {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => failures.push(format!("{label} stats snapshot: {e}")),
-                        Err(_) => failures.push(format!(
-                            "{label} stats snapshot: no result within {:?}",
-                            super::super::pg_stats_snapshot::SNAPSHOT_BOUND
-                        )),
-                    }
+            let Some(dir) = stats_dir_from(raw.as_deref()) else {
+                return Vec::new();
+            };
+            let mut failures = Vec::new();
+            let shards = self.urls.len();
+            for (shard, url) in &self.urls {
+                let index = usize::try_from(shard.as_i32()).unwrap_or_default();
+                let label = stats_label(scenario, shards, index);
+                match tokio::time::timeout(SNAPSHOT_BOUND, snapshot_to_dir(url, &dir, &label)).await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => failures.push(format!("{label} stats snapshot: {e}")),
+                    Err(_) => failures.push(format!(
+                        "{label} stats snapshot: no result within {SNAPSHOT_BOUND:?}"
+                    )),
                 }
             }
-            // Release our own backends first, or `DROP DATABASE` blocks on them.
-            self.leases.clear();
-            failures.extend(drop_created(&self.created).await);
             failures
         }
 

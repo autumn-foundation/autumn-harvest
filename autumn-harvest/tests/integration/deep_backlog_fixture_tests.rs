@@ -96,7 +96,12 @@ fn the_churn_plan_hits_the_target_dead_tuple_ratio() {
     for live in [CI_LIVE_ROWS, LEDGER_LIVE_ROWS] {
         let spec = FixtureSpec::ledger(7).at_scale(live);
         let churn = spec.churn();
-        let dead = churn.updated + churn.deleted;
+        let dead = churn.dead_tuples();
+        assert_eq!(
+            dead,
+            2 * churn.released + 3 * churn.reclaimed,
+            "a released claim leaves two versions, a reclaimed task three"
+        );
         #[allow(clippy::cast_precision_loss)]
         let ratio = dead as f64 / (live + dead) as f64;
         assert!(
@@ -105,10 +110,10 @@ fn the_churn_plan_hits_the_target_dead_tuple_ratio() {
             spec.dead_ratio
         );
         assert!(
-            churn.updated > 0 && churn.deleted > 0,
+            churn.released > 0 && churn.reclaimed > 0,
             "both churn kinds run"
         );
-        assert!(churn.updated <= live, "an update needs a live row");
+        assert!(churn.released <= live, "a released claim is a live row");
     }
 }
 
@@ -127,10 +132,15 @@ fn the_power_skew_has_the_documented_head_share_and_sums_to_one() {
 
 #[test]
 fn the_seed_sql_is_a_pure_function_of_the_spec() {
-    let a = ci_spec(1).seed_sql();
-    assert_eq!(a, ci_spec(1).seed_sql(), "one seed gives one script");
-    assert_ne!(a, ci_spec(2).seed_sql(), "a new seed gives a new script");
-    let text = a.join("\n").to_lowercase();
+    let a = ci_spec(1).seed_script();
+    assert_eq!(a, ci_spec(1).seed_script(), "one seed gives one script");
+    assert_ne!(a, ci_spec(2).seed_script(), "a new seed gives a new script");
+    let text = a
+        .statements()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
     for volatile in [
         "random(",
         "gen_random_uuid",
@@ -157,8 +167,6 @@ fn statement(query: &str, calls: i64, hit: i64, read: i64) -> StatementStats {
         total_exec_ms: 1.0,
         shared_blks_hit: hit,
         shared_blks_read: read,
-        shared_blks_dirtied: 0,
-        shared_blks_written: 0,
         temp_blks_written: 0,
     }
 }
@@ -265,8 +273,25 @@ async fn the_fixture_has_skewed_queues_and_keys_and_the_target_dead_ratio() {
     let db = server.create_database().await;
     let spec = ci_spec(1956);
     let mut conn = fixture::connect(&db.url()).await;
-    let shape = fixture::seed(&mut conn, &spec).await.shape;
+    let seeded = fixture::seed(&mut conn, &spec).await;
+    let shape = seeded.shape;
     assert_eq!(shape.live_rows, spec.live_rows, "exact live row count");
+    #[allow(clippy::cast_possible_wrap)]
+    let live = spec.live_rows as i64;
+    assert_eq!(
+        shape.n_live_tup, live,
+        "ANALYZE reads every page at CI scale, so n_live_tup is exact"
+    );
+    let tq = seeded
+        .tables
+        .iter()
+        .find(|t| t.relname == "harvest_task_queue")
+        .expect("task queue stats");
+    assert!(tq.n_tup_upd > 0, "the churn updates rows");
+    assert_eq!(
+        tq.n_tup_hot_upd, 0,
+        "every churn update changes `state`, so none is HOT and each leaves index entries"
+    );
 
     let head = shape.queue_share(0);
     let expected = head_share(spec.queues, spec.queue_skew);
@@ -305,6 +330,37 @@ async fn the_fixture_has_skewed_queues_and_keys_and_the_target_dead_ratio() {
             "the fixture holds {state} rows"
         );
     }
+}
+
+#[tokio::test]
+async fn running_rows_fit_the_fleet_and_the_key_caps() {
+    let Some(server) = server().await else { return };
+    let db = server.create_database().await;
+    // A large running share makes both caps bind at CI scale.
+    let spec = FixtureSpec {
+        running_share: 0.2,
+        ..ci_spec(77)
+    };
+    let mut conn = fixture::connect(&db.url()).await;
+    let shape = fixture::seed(&mut conn, &spec).await.shape;
+    let fleet = spec.fleet_slots();
+    assert_eq!(
+        shape.state_count("RUNNING"),
+        i64::try_from(fleet).expect("small"),
+        "the fleet is full, and no row runs beyond it"
+    );
+    assert!(
+        shape.max_running_per_key <= i64::from(spec.key_cap),
+        "a key runs {} rows, above its cap of {}",
+        shape.max_running_per_key,
+        spec.key_cap
+    );
+    assert!(
+        shape.max_running_per_worker <= i64::from(fixture::WORKER_SLOTS),
+        "a worker runs {} rows, above its {} slots",
+        shape.max_running_per_worker,
+        fixture::WORKER_SLOTS
+    );
 }
 
 #[tokio::test]
