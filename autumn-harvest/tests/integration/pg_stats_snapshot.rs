@@ -181,19 +181,78 @@ pub async fn reset_statements(conn: &mut AsyncPgConnection) -> Result<(), String
     .map_err(|e| format!("reset pg_stat_statements for this database: {e}"))
 }
 
+/// What [`reset_counters`] could not reset. `None` means that reset worked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResetOutcome {
+    /// The error of the `pg_stat_reset` call, if any.
+    pub tables: Option<String>,
+    /// The error of the `pg_stat_statements` reset, if any.
+    pub statements: Option<String>,
+}
+
+impl ResetOutcome {
+    /// Whether both views were reset.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.tables.is_none() && self.statements.is_none()
+    }
+}
+
 /// Clear both views for this database, so a later snapshot holds only what
-/// runs after this call.
-///
-/// # Errors
-/// Returns the server error when the role cannot reset the counters.
-pub async fn reset_counters(conn: &mut AsyncPgConnection) -> Result<(), String> {
-    // Unflushed counters of this session would land after the reset and
-    // bring the setup back. So they flush first.
+/// runs after this call. Each view is reset on its own, so a server without
+/// `pg_stat_statements` still gets clean table counters.
+pub async fn reset_counters(conn: &mut AsyncPgConnection) -> ResetOutcome {
     flush_counters(conn).await;
-    conn.batch_execute("SELECT pg_stat_reset()")
+    let tables = conn
+        .batch_execute("SELECT pg_stat_reset()")
         .await
-        .map_err(|e| format!("reset the table counters of this database: {e}"))?;
-    reset_statements(conn).await
+        .err()
+        .map(|e| format!("reset the table counters of this database: {e}"));
+    let statements = reset_statements(conn).await.err();
+    ResetOutcome { tables, statements }
+}
+
+/// What a teardown does with a shard snapshot, given its setup reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotPlan {
+    /// The table counters hold the setup too, so no file is written.
+    Refuse(String),
+    /// Write both files. A note replaces the statements when their reset
+    /// failed, because the view then holds the setup too.
+    Write { statements_note: Option<String> },
+}
+
+/// The [`SnapshotPlan`] for a shard whose setup reset gave `reset`.
+#[must_use]
+pub fn snapshot_plan(reset: &ResetOutcome) -> SnapshotPlan {
+    if let Some(e) = &reset.tables {
+        return SnapshotPlan::Refuse(format!(
+            "the setup reset failed, so the table counters hold the setup too: {e}"
+        ));
+    }
+    SnapshotPlan::Write {
+        statements_note: reset.statements.as_ref().map(|e| {
+            format!(
+                "not captured: the setup reset of pg_stat_statements failed, so the view \
+                 holds the setup too: {e}"
+            )
+        }),
+    }
+}
+
+/// Remove the snapshot pair of `label` from `dir`, if it is there.
+pub fn remove_snapshot(dir: &Path, label: &str) {
+    for path in snapshot_paths(dir, label) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The statements file and the tables file of `label` in `dir`.
+fn snapshot_paths(dir: &Path, label: &str) -> [PathBuf; 2] {
+    [
+        dir.join(format!("{label}-pg_stat_statements.txt")),
+        dir.join(format!("{label}-pg_stat_user_tables.txt")),
+    ]
 }
 
 /// Wait until every other session on this database has flushed its counters,
@@ -358,7 +417,7 @@ pub async fn snapshot_to_dir(url: &str, dir: &Path, label: &str) -> Result<Vec<P
     let mut conn = AsyncPgConnection::establish(url)
         .await
         .map_err(|e| format!("connect for the stats snapshot: {e}"))?;
-    snapshot_conn_to_dir(&mut conn, dir, label).await
+    snapshot_conn_to_dir(&mut conn, dir, label, None).await
 }
 
 /// Capture both views on `conn` and write them to `dir`.
@@ -366,14 +425,21 @@ pub async fn snapshot_to_dir(url: &str, dir: &Path, label: &str) -> Result<Vec<P
 /// The e2e bench calls this on each shard's lease, before the drop. A
 /// session flushes its own counters, so the lease needs no wait.
 ///
+/// A `statements_note` replaces the statements, for a view whose setup reset
+/// failed.
+///
 /// # Errors
 /// Returns an error when the read or a file write fails.
 pub async fn snapshot_conn_to_dir(
     conn: &mut AsyncPgConnection,
     dir: &Path,
     label: &str,
+    statements_note: Option<&str>,
 ) -> Result<Vec<PathBuf>, String> {
-    let snapshot = try_capture(conn).await?;
+    let mut snapshot = try_capture(conn).await?;
+    if let Some(note) = statements_note {
+        snapshot.statements = Statements::Unavailable(note.to_string());
+    }
     write_snapshot(dir, label, &snapshot, TOP_STATEMENTS)
         .map_err(|e| format!("write the stats snapshot: {e}"))
 }
@@ -394,8 +460,12 @@ pub fn partial_banner(snapshot: &StatsSnapshot) -> String {
 
 /// Write `{label}-pg_stat_statements.txt` and `{label}-pg_stat_user_tables.txt`.
 ///
+/// Both files are staged as `.tmp` files and then renamed. On an error, the
+/// staged files and both targets are removed. So `dir` never keeps a pair
+/// from an older run next to a file from this run.
+///
 /// # Errors
-/// Returns the I/O error of the first write that fails.
+/// Returns the I/O error of the first step that fails.
 pub fn write_snapshot(
     dir: &Path,
     label: &str,
@@ -404,25 +474,38 @@ pub fn write_snapshot(
 ) -> std::io::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir)?;
     let partial = partial_banner(snapshot);
-    let statements = dir.join(format!("{label}-pg_stat_statements.txt"));
-    let tables = dir.join(format!("{label}-pg_stat_user_tables.txt"));
-    std::fs::write(
-        &statements,
+    let [statements, tables] = snapshot_paths(dir, label);
+    let bodies = [
         format!(
             "-- pg_stat_statements, dbid of {} only, since its last reset, top {top} by shared buffers --\n{partial}{}",
             snapshot.database,
             render_statements(&snapshot.statements, top)
         ),
-    )?;
-    std::fs::write(
-        &tables,
         format!(
             "-- pg_stat_user_tables of {} --\n{partial}{}",
             snapshot.database,
             render_tables(&snapshot.tables)
         ),
-    )?;
-    Ok(vec![statements, tables])
+    ];
+    let targets = [statements, tables];
+    let staged = targets.clone().map(|p| p.with_extension("txt.tmp"));
+    let result = staged
+        .iter()
+        .zip(&bodies)
+        .try_for_each(|(path, body)| std::fs::write(path, body))
+        .and_then(|()| {
+            staged
+                .iter()
+                .zip(&targets)
+                .try_for_each(|(from, to)| std::fs::rename(from, to))
+        });
+    if let Err(e) = result {
+        for path in staged.iter().chain(&targets) {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(e);
+    }
+    Ok(targets.to_vec())
 }
 
 /// One line of SQL text, cut to `max` characters.

@@ -281,6 +281,63 @@ fn table_deltas_subtract_counters_and_keep_gauges() {
     assert!(rendered.contains("dead_pct"), "{rendered}");
 }
 
+#[test]
+fn a_failed_table_reset_refuses_the_snapshot_and_a_failed_statements_reset_keeps_the_tables() {
+    use stats::{ResetOutcome, SnapshotPlan, snapshot_plan};
+    assert_eq!(
+        snapshot_plan(&ResetOutcome::default()),
+        SnapshotPlan::Write {
+            statements_note: None
+        }
+    );
+    let no_extension = ResetOutcome {
+        tables: None,
+        statements: Some("pg_stat_statements must be loaded".to_string()),
+    };
+    let SnapshotPlan::Write {
+        statements_note: Some(note),
+    } = snapshot_plan(&no_extension)
+    else {
+        panic!("clean table counters are still written");
+    };
+    assert!(note.contains("pg_stat_statements must be loaded"), "{note}");
+    let no_permission = ResetOutcome {
+        tables: Some("permission denied for function pg_stat_reset".to_string()),
+        statements: None,
+    };
+    let SnapshotPlan::Refuse(reason) = snapshot_plan(&no_permission) else {
+        panic!("table counters that hold the setup are refused");
+    };
+    assert!(reason.contains("permission denied"), "{reason}");
+}
+
+#[test]
+fn a_snapshot_pair_is_written_whole_and_removed_whole() {
+    let dir = std::env::temp_dir().join(format!("harvest-snap-{}", uuid::Uuid::new_v4()));
+    let snapshot = stats::StatsSnapshot {
+        database: "db".to_string(),
+        tables: vec![table("harvest_task_queue", 1, 0)],
+        statements: Statements::Unavailable("not preloaded".to_string()),
+        lingering: Vec::new(),
+    };
+    let written = stats::write_snapshot(&dir, "cell-s0", &snapshot, 5).expect("write the pair");
+    assert_eq!(written.len(), 2);
+    assert!(written.iter().all(|p| p.exists()), "{written:?}");
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read the dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "no staging file stays behind");
+    stats::remove_snapshot(&dir, "cell-s0");
+    assert!(
+        written.iter().all(|p| !p.exists()),
+        "a failed cell leaves no stale pair"
+    );
+    stats::remove_snapshot(&dir, "cell-s0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── DB tests ──────────────────────────────────────────────────────────────
 
 /// Start a server, or return `None` and print why the test skips.
@@ -506,12 +563,13 @@ async fn a_counter_reset_leaves_setup_traffic_out_of_the_snapshot() {
     // Setup traffic on this session: the migration already ran, and a seed
     // writes many rows.
     fixture::seed(&mut conn, &ci_spec(3)).await;
-    if let Err(e) = stats::reset_counters(&mut conn).await {
+    let outcome = stats::reset_counters(&mut conn).await;
+    if !outcome.is_clean() {
         assert!(
             std::env::var("HARVEST_TEST_DATABASE_URL").is_ok(),
-            "the test container allows the reset: {e}"
+            "the test container allows the reset: {outcome:?}"
         );
-        eprintln!("SKIP the reset test: {e}");
+        eprintln!("SKIP the reset test: {outcome:?}");
         return;
     }
     drop(conn);

@@ -2592,6 +2592,7 @@ pub mod db {
     };
 
     use super::super::claim_bench_support::LatencyStats;
+    use super::super::pg_stats_snapshot::ResetOutcome;
     use super::{
         BENCH_ACTIVITIES, BENCH_QUEUE, BENCH_SIGNAL, BENCH_SIGNAL_WORKFLOW, BENCH_WORKFLOW,
         BenchScenario, DISPATCH_WORKFLOWS_PER_SHARD, FEEDER_CONNECTIONS_PER_SHARD,
@@ -2653,9 +2654,10 @@ pub mod db {
         /// run on a shared server can see the databases are in use. Same
         /// rationale as the claim harness's lease.
         leases: BTreeMap<ShardId, AsyncPgConnection>,
-        /// Shards whose setup-counter reset failed. Their views hold the setup
-        /// too, so teardown writes no snapshot for them and reports why.
-        reset_failures: BTreeMap<ShardId, String>,
+        /// Shards whose setup-counter reset failed, in full or in part. A
+        /// view that was not reset holds the setup too, so teardown leaves it
+        /// out and reports why.
+        reset_failures: BTreeMap<ShardId, ResetOutcome>,
     }
 
     static DB_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2877,7 +2879,7 @@ pub mod db {
         admin_url: &str,
         shard: ShardId,
         sweep: bool,
-    ) -> Result<(String, String, AsyncPgConnection, Option<String>), SkipReason> {
+    ) -> Result<(String, String, AsyncPgConnection, Option<ResetOutcome>), SkipReason> {
         let (url, name, mut conn) = if sweep {
             with_stale_sweep(admin_url, create_shard_database_lease(admin_url, shard)).await?
         } else {
@@ -2890,12 +2892,12 @@ pub mod db {
         }
         // With a stats snapshot to come, clear the setup out of both views.
         // The teardown snapshot then holds the scenario only, warmup included.
-        // A failed reset is kept, so teardown can refuse that snapshot.
+        // A failed reset is kept, so teardown can leave out the view that
+        // still holds the setup.
         let raw = std::env::var(STATS_DIR_ENV_VAR).ok();
         let reset_failure = if stats_dir_from(raw.as_deref()).is_some() {
-            super::super::pg_stats_snapshot::reset_counters(&mut conn)
-                .await
-                .err()
+            Some(super::super::pg_stats_snapshot::reset_counters(&mut conn).await)
+                .filter(|outcome| !outcome.is_clean())
         } else {
             None
         };
@@ -3127,7 +3129,9 @@ pub mod db {
         /// the drop. A failed or timed-out snapshot is a reported failure,
         /// never a panic, so the drop after it always runs.
         async fn snapshot_stats(&mut self, scenario: BenchScenario) -> Vec<String> {
-            use super::super::pg_stats_snapshot::{SNAPSHOT_BOUND, snapshot_conn_to_dir};
+            use super::super::pg_stats_snapshot::{
+                SNAPSHOT_BOUND, SnapshotPlan, remove_snapshot, snapshot_conn_to_dir, snapshot_plan,
+            };
             let raw = std::env::var(STATS_DIR_ENV_VAR).ok();
             let Some(dir) = stats_dir_from(raw.as_deref()) else {
                 return Vec::new();
@@ -3137,24 +3141,31 @@ pub mod db {
             for (shard, lease) in &mut self.leases {
                 let index = usize::try_from(shard.as_i32()).unwrap_or_default();
                 let label = stats_label(scenario, shards, index);
-                if let Some(e) = self.reset_failures.get(shard) {
-                    failures.push(format!(
-                        "{label} stats snapshot: not written, because the setup reset failed \
-                         and the views hold the setup too: {e}"
-                    ));
-                    continue;
-                }
-                match tokio::time::timeout(
+                let reset = self.reset_failures.get(shard).cloned().unwrap_or_default();
+                let note = match snapshot_plan(&reset) {
+                    SnapshotPlan::Refuse(reason) => {
+                        // A pair from an older run must not pass for this one.
+                        remove_snapshot(&dir, &label);
+                        failures.push(format!("{label} stats snapshot: not written: {reason}"));
+                        continue;
+                    }
+                    SnapshotPlan::Write { statements_note } => statements_note,
+                };
+                let outcome = tokio::time::timeout(
                     SNAPSHOT_BOUND,
-                    snapshot_conn_to_dir(lease, &dir, &label),
+                    snapshot_conn_to_dir(lease, &dir, &label, note.as_deref()),
                 )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => failures.push(format!("{label} stats snapshot: {e}")),
-                    Err(_) => failures.push(format!(
-                        "{label} stats snapshot: no result within {SNAPSHOT_BOUND:?}"
-                    )),
+                .await;
+                let failure = match outcome {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(_) => Some(format!("no result within {SNAPSHOT_BOUND:?}")),
+                };
+                if let Some(e) = failure {
+                    remove_snapshot(&dir, &label);
+                    failures.push(format!("{label} stats snapshot: {e}"));
+                } else if let Some(note) = note {
+                    failures.push(format!("{label} pg_stat_statements {note}"));
                 }
             }
             failures
