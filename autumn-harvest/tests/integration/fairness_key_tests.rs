@@ -435,10 +435,19 @@ async fn prune_resets_a_queue_with_no_pending_task() {
     assert_eq!(left.len(), 5);
     assert!((clock(&left) - 1.4).abs() < 1e-9, "V holds: {left:?}");
 
+    // The rows below `V` go first. The clock row waits for a later pass,
+    // so a concurrent or rolled-back pruner never lowers `V`.
     let deleted = prune_fairness_state(&mut conn, Some(&idle), cutoff, 100, false)
         .await
         .unwrap();
-    assert_eq!(deleted, 5, "the idle queue resets");
+    assert_eq!(deleted, 4);
+    let left = list_fairness_state(&mut conn, &idle).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert!((clock(&left) - 1.4).abs() < 1e-9, "V holds: {left:?}");
+    let deleted = prune_fairness_state(&mut conn, Some(&idle), cutoff, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1, "the idle queue resets");
     let left = list_fairness_state(&mut conn, &idle).await.unwrap();
     assert_eq!(left.len(), 0, "{left:?}");
 
@@ -447,6 +456,57 @@ async fn prune_resets_a_queue_with_no_pending_task() {
         .await
         .unwrap();
     assert_eq!(deleted, 0);
+}
+
+/// A pruner that holds a lower row blocks the reset of the clock row.
+///
+/// The second connection plays a concurrent pruner that locked the lowest
+/// row and then rolls back. `V` must hold through both.
+#[tokio::test]
+async fn a_held_lower_row_keeps_the_clock_row_in_an_idle_reset() {
+    use diesel_async::RunQueryDsl;
+    let (mut conn, _container) = connect().await;
+    let (mut other, _other_container) = connect().await;
+    let idle = fresh_queue("held");
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) VALUES \
+         ('{idle}', 'low', 1, 0, NOW() - INTERVAL '30 minutes'), \
+         ('{idle}', 'mid', 1.5, 0.5, NOW() - INTERVAL '30 minutes'), \
+         ('{idle}', 'clock', 2, 1, NOW() - INTERVAL '30 minutes')"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed state");
+    diesel::sql_query("BEGIN")
+        .execute(&mut other)
+        .await
+        .unwrap();
+    diesel::sql_query(format!(
+        "SELECT 1 FROM harvest_fairness_state \
+         WHERE queue_name = '{idle}' AND fairness_key = 'low' FOR UPDATE"
+    ))
+    .execute(&mut other)
+    .await
+    .expect("hold the low row");
+
+    let cutoff = Utc::now() - Duration::minutes(10);
+    let deleted = prune_fairness_state(&mut conn, Some(&idle), cutoff, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1, "only the free lower row goes");
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut other)
+        .await
+        .unwrap();
+
+    let mut left: Vec<String> = list_fairness_state(&mut conn, &idle)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.fairness_key)
+        .collect();
+    left.sort();
+    assert_eq!(left, ["clock", "low"], "the clock row and V hold");
 }
 
 /// A claim without fairness keys writes no state.

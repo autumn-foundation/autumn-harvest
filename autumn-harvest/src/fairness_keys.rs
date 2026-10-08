@@ -261,10 +261,11 @@ pub const MAX_PRUNE_BATCHES: usize = 10;
 ///   without its row, so prune changes no claim. The property test
 ///   `prune_is_invisible_to_the_claim` proves that on the model.
 /// - **An idle queue.** The queue has no `PENDING` task, and no claim charged
-///   any of its keys since `cutoff`. Every row of the queue goes, lowest
-///   `last_start` first, so `V` holds until the last row. This is the idle
-///   rule of start-time fair queuing: with no backlog, every debt is
-///   forgiven. See [`crate::queue_fairness::FairClock::reset_if_idle`].
+///   any of its keys since `cutoff`. Every row of the queue goes. The rows
+///   that set `V` go only after every lower row, in a later pass, so `V`
+///   holds until the last row. This is the idle rule of start-time fair
+///   queuing: with no backlog, every debt is forgiven. See
+///   [`crate::queue_fairness::FairClock::reset_if_idle`].
 ///
 /// Rows are locked `SKIP LOCKED`, so prune never waits for a claim.
 ///
@@ -336,8 +337,10 @@ pub async fn prune_fairness_state(
 ///   behind another, so every debt is forgiven. Keys that claim once never
 ///   move `V`, so without this rule their rows would never go.
 ///
-/// Rows go in `last_start` order. A partial reset thus keeps `V` until the
-/// last row of the queue goes.
+/// A row that sets `V` goes only when no row of its queue has a lower
+/// `last_start`. A row that another pruner holds still counts, so a partial
+/// or rolled-back reset never lowers `V`. The rows that set `V` thus go in a
+/// later pass than the rest.
 ///
 /// `active` reads the pending keys of the pruned queues once. The planner
 /// can then hash it for the anti-join. A probe per state row would scan the
@@ -375,6 +378,14 @@ const PRUNE_VICTIMS_SQL: &str = "\
                   AND NOT EXISTS ( \
                       SELECT 1 FROM active a WHERE a.queue_name = s.queue_name \
                   ) \
+                  AND ( \
+                      s.last_start < c.v \
+                      OR NOT EXISTS ( \
+                          SELECT 1 FROM harvest_fairness_state o \
+                          WHERE o.queue_name = s.queue_name \
+                            AND o.last_start < c.v \
+                      ) \
+                  ) \
               ) \
           ) \
         ORDER BY s.last_start, s.updated_at \
@@ -409,5 +420,8 @@ mod tests {
             PRUNE_VICTIMS_SQL.contains("SELECT 1 FROM active a WHERE a.queue_name = s.queue_name")
         );
         assert!(PRUNE_VICTIMS_SQL.contains("ORDER BY s.last_start, s.updated_at"));
+        // A clock row waits for every lower row, even one another pruner
+        // holds.
+        assert!(PRUNE_VICTIMS_SQL.contains("AND o.last_start < c.v"));
     }
 }
