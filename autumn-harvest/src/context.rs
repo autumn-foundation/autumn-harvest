@@ -15685,9 +15685,7 @@ impl ActivityContext {
             return Ok(());
         }
 
-        let mut conn = check
-            .pool
-            .get()
+        let mut conn = crate::replication::fenced_checkout(&check.pool)
             .await
             .map_err(crate::error::database_error)?;
         let task_id = check.claim.task_id;
@@ -15855,10 +15853,9 @@ impl ActivityContext {
         let codecs = self.payload_codecs.clone();
         let max_result_bytes = txn.max_result_bytes;
 
-        let mut conn =
-            txn.pool.get().await.map_err(|e| {
-                format!("transactional activity failed to acquire DB connection: {e}")
-            })?;
+        let mut conn = crate::replication::fenced_checkout(&txn.pool)
+            .await
+            .map_err(|e| format!("transactional activity failed to acquire DB connection: {e}"))?;
 
         // Issue #1429 (Codex review): `wake_workflow_task` below raises a
         // dispatch hint. `buffered_checkpoint` ties its publish to this

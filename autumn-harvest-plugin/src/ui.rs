@@ -3411,14 +3411,14 @@ async fn list_workers_ui(
     Query(params): Query<WorkerListParams>,
 ) -> Result<Markup, AutumnError> {
     // Issue: an unrecognized status/stale value used to `?`-abort the whole
-    // page (bare 400, no HTML) before the filter form was ever rendered,
-    // discarding the build_id/shard filters the operator had already
+    // page (bare 400, no HTML) before the filter form was ever rendered.
+    // That discarded the build_id/shard filters the operator had already
     // entered. `parse_worker_status_filter`/`parse_worker_stale_filter`
-    // instead degrade to "filter not applied" and hand back an error to
-    // redisplay inline, so a bad value costs one field, not the page — same
-    // fix as `parse_started_bound` on the Workflows page (#1333). The raw
-    // text is carried alongside the parsed value so pagination and form
-    // resubmission don't silently drop it (Codex review, #1378 P2).
+    // instead degrade to "filter not applied". They hand back an error to
+    // redisplay inline. So a bad value costs one field, not the page. This is
+    // the same fix as `parse_started_bound` on the Workflows page (#1333).
+    // The raw text is carried alongside the parsed value so pagination and
+    // form resubmission do not silently drop it (#1378).
     let (status_filter, status_raw, status_error) =
         parse_worker_status_filter(params.status.as_deref());
     let (stale_only, stale_raw, stale_error) = parse_worker_stale_filter(params.stale.as_deref());
@@ -3554,18 +3554,18 @@ async fn list_workers_ui(
 }
 
 /// Parses the Workers page's `status` filter from a raw query-string value.
-/// Returns `(parsed, raw_display, error)`: on success `error` is `None`; on
-/// an unrecognized value `parsed` is `None` (the filter is not applied)
-/// while `error` carries a message to render next to the field — so a bad
+/// Returns `(parsed, raw_display, error)`. On success `error` is `None`. On
+/// an unrecognized value `parsed` is `None`, so the filter is not applied.
+/// `error` then carries a message to render next to the field. So a bad
 /// value drops one filter instead of the whole page (see `list_workers_ui`).
-/// `raw_display` echoes the operator's exact trimmed input in both cases (a
-/// no-op on success, since the only valid inputs are the canonical labels
-/// modulo case) so the caller can carry it through pagination and
-/// resubmission — Codex review on #1378 P2: without this, a bad value's
-/// error vanished on the next Next/Previous click or Apply resubmit,
-/// because the `<select>` and the pagination query string were both built
-/// from the already-`None`d parsed value, silently discarding the operator's
-/// input rather than persisting the error "until resolved" as intended.
+/// `raw_display` echoes the operator's exact trimmed input in both cases.
+/// On success this is a no-op, since the only valid inputs are the canonical
+/// labels modulo case. The caller carries it through pagination and
+/// resubmission (#1378). Without it, a bad value's error vanished on the
+/// next Next/Previous click or Apply resubmit. The `<select>` and the
+/// pagination query string were both built from the already-`None`d parsed
+/// value. That silently discarded the operator's input. The intent is to
+/// persist the error "until resolved".
 fn parse_worker_status_filter(raw: Option<&str>) -> (Option<&'static str>, String, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (None, String::new(), None);
@@ -5168,10 +5168,10 @@ fn render_worker_filters(
                         option value=(s) selected[status_filter == Some(s)] { (s) }
                     }
                     // An unrecognized value is rendered as its own option so
-                    // the select echoes it back (rather than silently
-                    // reverting to "All") until the operator picks a valid
-                    // one — the `<select>` equivalent of a text input's
-                    // `value=` (Codex review, #1378 P2).
+                    // the select echoes it back until the operator picks a
+                    // valid one. It does not silently revert to "All". This
+                    // is the `<select>` equivalent of a text input's
+                    // `value=` (#1378).
                     @if status_error.is_some() {
                         option value=(status_raw) selected { (status_raw) }
                     }
@@ -5289,9 +5289,9 @@ fn build_worker_query_string(
         let _ = write!(out, "&limit={limit}");
     }
     // Carry the raw text (not the parsed value) so an invalid value's inline
-    // error persists across pagination instead of being silently dropped —
-    // same reasoning as `build_query_string`'s started_after/started_before
-    // handling on the Workflows page (Codex review, #1378 P2).
+    // error persists across pagination instead of being silently dropped.
+    // The reasoning is the same as for `build_query_string`'s
+    // started_after/started_before handling on the Workflows page (#1378).
     if !status_raw.is_empty() {
         let _ = write!(out, "&status={}", url_encode(status_raw));
     }
@@ -14373,10 +14373,10 @@ mod tests {
         assert!(q.contains("stale=true"));
     }
 
-    /// GREEN — the fix under test: an invalid raw value (which a caller would
-    /// otherwise have parsed to `None`/`false` and lost) is carried through
-    /// verbatim, so a Next/Previous click doesn't drop the still-unresolved
-    /// filter and its inline error (Codex review, #1378 P2).
+    /// GREEN — the fix under test: an invalid raw value is carried through
+    /// verbatim. A caller would otherwise have parsed it to `None`/`false`
+    /// and lost it. So a Next/Previous click does not drop the
+    /// still-unresolved filter and its inline error (#1378).
     #[test]
     fn build_worker_query_string_carries_invalid_raw_values() {
         let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "zombie", "north", "True", None);
@@ -16062,10 +16062,10 @@ mod tests {
     }
 
     /// GREEN — the fix under test: the invalid raw value is echoed back as
-    /// the `<select>`'s selected option (not silently reverted to "All"), so
-    /// resubmitting the form unchanged resends the same bad value and the
-    /// operator sees the same error again rather than it vanishing (Codex
-    /// review, #1378 P2).
+    /// the `<select>`'s selected option. It is not silently reverted to
+    /// "All". So resubmitting the form unchanged resends the same bad value.
+    /// The operator sees the same error again rather than it vanishing
+    /// (#1378).
     #[test]
     fn render_worker_filters_echoes_invalid_raw_value_as_selected_option() {
         let html = render_worker_filters(
@@ -16168,13 +16168,13 @@ mod tests {
 
     /// GREEN — the fix under test: an unrecognized status no longer aborts
     /// `list_workers_ui`. It degrades to "filter not applied" (parsed is
-    /// `None`) while carrying the raw text and a recovery message, so the
-    /// page can redisplay the form inline instead of discarding it — same
-    /// contract as `parse_started_bound` on the Workflows page (#1333).
+    /// `None`). It carries the raw text and a recovery message, so the page
+    /// can redisplay the form inline instead of discarding it. This is the
+    /// same contract as `parse_started_bound` on the Workflows page (#1333).
     /// Before this change, `parse_worker_ui_filters` `?`-propagated a bare
-    /// `AutumnError::bad_request_msg` here, which aborted the whole
-    /// `/workers` response before the filter form (or the `build_id`/`shard`
-    /// filters the operator had already typed) was ever rendered — see the
+    /// `AutumnError::bad_request_msg` here. That aborted the whole
+    /// `/workers` response before the filter form, or the `build_id`/`shard`
+    /// filters the operator had already typed, was ever rendered. See the
     /// RED baseline in
     /// `tests/ui_integration.rs::ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page`.
     #[test]
@@ -16216,10 +16216,10 @@ mod tests {
         );
     }
 
-    /// Same fix, applied to the `stale` field: an unrecognized value (e.g.
-    /// the very plausible `True`, since matching is case-sensitive by
-    /// design — see the field's existing semantics) no longer `?`-aborts the
-    /// page.
+    /// Same fix, applied to the `stale` field: an unrecognized value no
+    /// longer `?`-aborts the page. An example is the very plausible `True`,
+    /// since matching is case-sensitive by design (see the field's existing
+    /// semantics).
     #[test]
     fn parse_worker_stale_filter_rejects_unknown_value_without_erroring() {
         let (parsed, raw, error) = parse_worker_stale_filter(Some("True"));

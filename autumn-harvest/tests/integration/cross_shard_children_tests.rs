@@ -2302,3 +2302,101 @@ async fn a_cross_shard_typed_failure_reaches_the_parent_with_its_type_intact() {
         "the human message must still be the decoded message, got {data}"
     );
 }
+
+/// **Issue #1823.** A cross-shard child sweep can run inside a fenced pass of
+/// the parent's shard. A target checkout that waits on a busy pool then gives
+/// up within the fenced checkout bound and abandons the pass. Its guard drops,
+/// so it does not hold a bump off for the whole multi-shard acquire bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_child_sweep_abandons_its_pass_on_a_busy_target_pool() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    // Shard 1 has one connection, so the test can make its pool busy.
+    let pools: BTreeMap<ShardId, DbPool> = urls
+        .iter()
+        .map(|(shard, url)| {
+            let size = if shard.as_i32() == 1 { 1 } else { 6 };
+            let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+            let pool = deadpool::managed::Pool::builder(manager)
+                .max_size(size)
+                .build()
+                .expect("failed to build test pool");
+            (*shard, pool)
+        })
+        .collect();
+    let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let parent = start_parent(&sharded, "child_echo", "fenced-busy-target-1").await;
+    let child_id = ExecutionId::new_for_shard(ShardId::new(1));
+    let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
+        input: json!({}),
+        queue_name: "default".to_string(),
+        assigned_build_id: None,
+        context_headers: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla_secs: None,
+        execution_timeout_secs: None,
+        chain_execution_timeout_secs: None,
+        retry_policy: None,
+        quota_key: None,
+        quota: None,
+        concurrency_key: None,
+        max_concurrent: None,
+        trace_context: None,
+    };
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &spec,
+    )
+    .await
+    .expect("record cross-shard child");
+    let pinned =
+        autumn_harvest::replication::ensure_generation_row(&mut conn, ShardId::new(PARENT_SHARD))
+            .await
+            .expect("generation row");
+    let parent_pool = sharded
+        .exact_pool_for(ShardId::new(PARENT_SHARD))
+        .expect("parent pool")
+        .clone();
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(
+        &parent_pool,
+        ShardId::new(PARENT_SHARD),
+        pinned,
+    )
+    .await
+    .expect("open the pass");
+    let _busy = shard_conn(&sharded, 1).await;
+
+    let started = std::time::Instant::now();
+    let swept = tokio::time::timeout(
+        Duration::from_secs(20),
+        autumn_harvest::replication::run_fenced_pass(
+            Some(&guard),
+            autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+                &mut conn,
+                &Some(sharded.clone()),
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                &autumn_harvest::telemetry::NoOpMetrics,
+            ),
+        ),
+    )
+    .await
+    .expect("the pass must return");
+    let elapsed = started.elapsed();
+
+    assert!(
+        swept.is_err(),
+        "a target checkout that gives up must abandon the pass, got {swept:?}"
+    );
+    assert!(
+        elapsed < autumn_harvest::replication::FENCED_CHECKOUT_BOUND + Duration::from_millis(1500),
+        "the pass must stop within the fenced checkout bound, took {elapsed:?}"
+    );
+}

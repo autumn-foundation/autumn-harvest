@@ -1475,20 +1475,20 @@ async fn ui_workers_filter_stale_true() {
 }
 
 /// RED (was): `?status=zombie` used to `?`-abort `list_workers_ui` with a
-/// bare 400 before the filter form was ever rendered, discarding the
-/// `build_id` filter the operator had already typed alongside it — the same
-/// discard-the-page-on-bad-filter pattern fixed for the Workflows page's
-/// `started_after`/`started_before` in #1333 (that PR's commit message
-/// names this exact test, `ui_workers_unknown_status_value_returns_400`, as
-/// evidence the pattern was systemic, not a one-off).
+/// bare 400 before the filter form was ever rendered. That discarded the
+/// `build_id` filter the operator had already typed alongside it. It is the
+/// same discard-the-page-on-bad-filter pattern fixed for the Workflows page's
+/// `started_after`/`started_before` in #1333. That PR's commit message names
+/// this exact test, `ui_workers_unknown_status_value_returns_400`, as
+/// evidence the pattern was systemic, not a one-off.
 ///
-/// GREEN (this commit): the request still renders the Workers page (`200`),
-/// preserves the other filter (`build_id=abc123`, still in its input's
-/// `value=`), and surfaces a `role="alert"` message naming the bad value and
-/// the valid options next to the Status field — the same four error-path
-/// booleans (adjacent to cause, persists until resolved, says how to
-/// recover, entered data preserved) the Workflows-page fix established now
-/// hold here too.
+/// GREEN (this commit): the request still renders the Workers page (`200`).
+/// It preserves the other filter (`build_id=abc123`, still in its input's
+/// `value=`). It surfaces a `role="alert"` message next to the Status field.
+/// That message names the bad value and the valid options. The Workflows-page
+/// fix established four error-path booleans: adjacent to cause, persists
+/// until resolved, says how to recover, entered data preserved. The same
+/// four now hold here too.
 #[tokio::test]
 async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -1634,14 +1634,13 @@ async fn ui_workers_invalid_page_redisplays_list_instead_of_aborting_page() {
     );
 }
 
-/// Codex review on #1378 (P2): the first version of this fix parsed the
-/// invalid value down to `None` before it ever reached
-/// `render_workers_page`, so the pagination links and a plain form
-/// resubmission were built without it — a Next click (or clicking Apply
-/// with nothing changed) silently dropped the still-unresolved `status`
-/// filter and its error, one click after the operator saw it. Fixed by
-/// carrying the raw text alongside the parsed value all the way to
-/// `build_worker_query_string`.
+/// #1378: the first version of this fix parsed the invalid value down to
+/// `None` before it ever reached `render_workers_page`. So the pagination
+/// links and a plain form resubmission were built without it. A Next click,
+/// or a click on Apply with nothing changed, silently dropped the
+/// still-unresolved `status` filter and its error. That happened one click
+/// after the operator saw it. The fix carries the raw text alongside the
+/// parsed value all the way to `build_worker_query_string`.
 #[tokio::test]
 async fn ui_workers_invalid_status_value_persists_across_pagination() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -1663,12 +1662,13 @@ async fn ui_workers_invalid_status_value_persists_across_pagination() {
     );
 }
 
-/// Same fix, `stale` side — a distinct code path in `list_workers_ui`, and
-/// the one most likely to be hit organically rather than only by hand-edited
-/// URLs: matching is case-sensitive by design (only the literal `true`
-/// applies the filter), so a capitalized `True` — plausible from a
-/// runbook example, a shell variable, or a JSON boolean serialized
-/// upstream — used to `?`-abort the page the same way `status=zombie` did.
+/// Same fix, `stale` side. This is a distinct code path in
+/// `list_workers_ui`. It is also the one most likely to be hit organically
+/// rather than only by hand-edited URLs. Matching is case-sensitive by
+/// design: only the literal `true` applies the filter. So a capitalized
+/// `True` used to `?`-abort the page the same way `status=zombie` did. That
+/// value is plausible from a runbook example, a shell variable, or a JSON
+/// boolean serialized upstream.
 #[tokio::test]
 async fn ui_workers_unknown_stale_value_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;

@@ -2020,9 +2020,7 @@ pub(crate) enum ShardConnectError {
 
 /// A pooled connection to one shard, as returned by [`connect_to_shard`].
 #[cfg(feature = "db")]
-pub(crate) type ShardConn = deadpool::managed::Object<
-    diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>,
->;
+pub(crate) type ShardConn = crate::replication::FencedConn;
 
 /// Get `shard`'s own connection from `sharded_pool`.
 ///
@@ -2059,7 +2057,9 @@ pub(crate) async fn connect_to_shard(
     let Some(pool) = sharded_pool.exact_pool_for(shard).cloned() else {
         return Ok(None);
     };
-    match pool.get().await {
+    // Issue #1823: inside a fenced pass, a busy pool must not hold a bump
+    // off, and a lost guard must end this backend.
+    match crate::replication::fenced_checkout(&pool).await {
         Ok(conn) => Ok(Some(conn)),
         Err(e) => match on_connect_error {
             ShardConnectError::LogAndSkip => {

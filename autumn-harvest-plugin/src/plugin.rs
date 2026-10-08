@@ -2082,9 +2082,13 @@ async fn start_harvest_runtime(
                         ));
                     };
                     let pool = harvest_db.pool_for(shard).clone();
-                    let mut conn = pool.get().await.map_err(|e| {
-                        autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
-                    })?;
+                    // Issue #1823: fence-aware, as this start can run inside a
+                    // fenced handler.
+                    let mut conn = autumn_harvest::replication::fenced_checkout(&pool)
+                        .await
+                        .map_err(|e| {
+                            autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
+                        })?;
 
                     // Issue #618, Finding A (round 9 → round 12): the OUTBOUND
                     // webhook-delivery producer is gated as a FRESH in-process start —

@@ -582,10 +582,10 @@ mod same_module_vs_nested_module_parity_tests {
 
 // ── Characterization tests: signature-validation error paths ────────────────
 //
-// Sibling of `query.rs`'s test of the same name -- pins `update_macro`'s
+// Sibling of `query.rs`'s test of the same name. Pins `update_macro`'s
 // current rejection messages for `first_param_is_ctx`/`returns_result`/the
-// async check before those checks route through the already-shared
-// `attr_util` helpers.
+// async check. A later change routes those checks through the
+// already-shared `attr_util` helpers.
 #[cfg(test)]
 mod signature_validation_characterization_tests {
     use super::update_macro;

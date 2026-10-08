@@ -4220,7 +4220,7 @@ pub async fn walk_retry_chain(
     // checkout.
     enum ActiveConn<'a> {
         Held(&'a mut AsyncPgConnection),
-        Owned(Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>),
+        Owned(Box<crate::replication::FencedConn>),
     }
     impl ActiveConn<'_> {
         fn as_mut(&mut self) -> &mut AsyncPgConnection {
@@ -4451,8 +4451,7 @@ async fn walk_retry_chain_on_conn_only(
 /// A connection this call checked out itself, for a caller of
 /// [`resolve_live_attempt_id_best_effort`] to use for every follow-up
 /// operation against the resolved live attempt.
-pub type BestEffortRebind =
-    Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>;
+pub type BestEffortRebind = Box<crate::replication::FencedConn>;
 
 /// [`resolve_live_attempt_id`], for a caller with no [`ShardedDbPool`] of its
 /// own to pass in (issue #1596 review).

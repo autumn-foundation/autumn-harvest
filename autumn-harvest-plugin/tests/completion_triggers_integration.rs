@@ -1947,15 +1947,15 @@ async fn test_trigger_outbox_retry_and_sweep() {
         .is_some();
     assert!(outbox_still_exists);
 
-    // Issue #1227 Finding 4 (Codex round-4 P1 on PR #1386): a missing target-shard
-    // pool now stamps `next_attempt_at` with a backoff (`OUTBOX_RELAY_FAILURE_BACKOFF`)
-    // so a durably-unreachable shard can't dominate every claim batch forever. The
-    // row above just got stamped by the failed sweep, so the very next sweep call
-    // (with no time elapsed) would not yet reclaim it -- back the timestamp into the
-    // past to simulate the backoff having elapsed, i.e. this test is exercising
-    // "the connection issue clears and a LATER scan retries successfully", not
-    // "retried on the very next tick with zero delay" (the hot-spin issue #1227
-    // itself fixed).
+    // Issue #1227 Finding 4 (PR #1386): a missing target-shard pool now stamps
+    // `next_attempt_at` with a backoff (`OUTBOX_RELAY_FAILURE_BACKOFF`). So a
+    // durably-unreachable shard cannot dominate every claim batch forever. The
+    // failed sweep just stamped the row above. So the very next sweep call, with
+    // no time elapsed, would not yet reclaim it. Back the timestamp into the past
+    // to simulate that the backoff has elapsed. This test exercises "the
+    // connection issue clears and a LATER scan retries successfully". It does not
+    // exercise "retried on the very next tick with zero delay". That zero-delay
+    // retry is the hot-spin that issue #1227 itself fixed.
     diesel::update(
         outbox_dsl::harvest_completion_trigger_outbox
             .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid())),
@@ -2559,12 +2559,16 @@ async fn test_runner_startup_fails_on_sync_failure() {
     )
     .await;
 
-    // Verify it failed to start
+    // Verify it failed to start. Since issue #1823 the DR fence probe runs
+    // first, before any write, so an unreachable database now refuses there.
+    // Trigger sync never runs against a database the runner cannot probe.
     assert!(result.is_err());
     let err_str = result.err().unwrap().to_string();
     assert!(
         err_str.contains("Failed to get DB connection")
             || err_str.contains("sync completion triggers")
+            || err_str.contains("cross-region DR fencing could not be resolved"),
+        "{err_str}"
     );
 }
 
