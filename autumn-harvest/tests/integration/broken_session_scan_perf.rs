@@ -25,7 +25,7 @@ use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, SessionId};
 use autumn_harvest::{sessions, store};
-use diesel::sql_types::{BigInt, Text, Timestamptz, Uuid as SqlUuid};
+use diesel::sql_types::{BigInt, Text, Uuid as SqlUuid};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
