@@ -1240,12 +1240,6 @@ mod db {
     }
 
     #[derive(diesel::QueryableByName)]
-    struct NullableBigIntRow {
-        #[diesel(sql_type = Nullable<BigInt>)]
-        value: Option<i64>,
-    }
-
-    #[derive(diesel::QueryableByName)]
     struct StagedKeyRow {
         #[diesel(sql_type = Text)]
         state: String,
@@ -2982,20 +2976,10 @@ mod db {
         // Durable stream chunks stored after the copy (issue #1974). A
         // decision between verification and cutover can store chunks and park
         // with no new event, so the history guard does not see it. The source
-        // is sealed now and gets no more chunks. Copy every chunk above the
-        // target's highest real offset. The marker sorts last, so it comes too.
-        let target_high: Option<i64> = diesel::sql_query(
-            "SELECT max(stream_offset) AS value FROM harvest_stream_chunks \
-              WHERE workflow_exec_id = $1 AND stream_offset < $2",
-        )
-        .bind::<SqlUuid, _>(exec_id.as_uuid())
-        .bind::<BigInt, _>(crate::store::DURABLE_STREAM_TRUNCATION_OFFSET)
-        .get_result::<NullableBigIntRow>(target)
-        .await
-        .map_err(database_error)?
-        .value;
-        let late_chunk_pages =
-            read_stream_chunk_pages(source, exec_id, target_high.unwrap_or(-1)).await?;
+        // is sealed now and gets no more chunks. Copy all of them: a re-run
+        // can fill an offset below the target's highest one, so a high-water
+        // mark is not enough. `ON CONFLICT DO NOTHING` keeps the staged copies.
+        let late_chunk_pages = read_stream_chunk_pages(source, exec_id, -1).await?;
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             if fenced && let Some(settle) = settle {
@@ -3031,10 +3015,6 @@ mod db {
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
-
-                // Not gated on `activated`: the chunks are author output that
-                // erasure must reach on the live shard, whatever the state.
-                insert_stream_chunk_pages(&mut *conn, &late_chunk_pages).await?;
 
                 // Staging can have vacated an unrelated same-key row to free
                 // the target's active-uniqueness slot for this copy (issue
@@ -3084,6 +3064,13 @@ mod db {
                 // already has the task from the original transaction.
                 // Gating here never loses legitimate work.
                 if activated > 0 {
+                    // Gated like the task: an operator can terminate the
+                    // staged copy, and erasure can then scrub it, before this
+                    // runs. Copying then would restore erased author output.
+                    // The chunks stay on the sealed source, where erasure
+                    // also reaches them.
+                    insert_stream_chunk_pages(&mut *conn, &late_chunk_pages).await?;
+
                     // `jsonb_populate_record` over a NULL base turns a missing
                     // key into NULL, and the column DEFAULT does not apply.
                     // A row staged before a NOT NULL column existed, or by a

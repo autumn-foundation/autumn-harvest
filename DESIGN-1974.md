@@ -41,7 +41,7 @@ an opt-in durable mode. The best-effort mode stays the default.
 | R13 | Let a stalled client stop the `LISTEN` driver. A stopped driver holds back the NOTIFY queue of the whole cluster. | A forwarder task reads every wake at once and merges it into one pending wake. A client that takes no frame for 60 s loses the stream and resumes. |
 | R14 | Hold a `LISTEN` connection for a finished run. | A run that is terminal at connect gets its chunks and `event: end` with no `LISTEN`. |
 | R15 | Treat live code as replay. A signal that waits at the cursor makes the raw cursor check report replay, so the chunks before `wait_for_signal` are lost. | The durable gate first runs `prepare_match`, which moves such events to their stashes, as the next match does. A unit test and an SSE test cover a signal that arrives before the first cycle. |
-| R16 | Lose chunks in a shard move. A decision between verification and cutover can store chunks and park with no new event, so the history guard passes. | Activation copies every source chunk above the target's highest offset. The source is sealed then, so no later chunk can appear. |
+| R16 | Lose chunks in a shard move. A decision between verification and cutover can store chunks and park with no new event, so the history guard passes. | Activation copies every source chunk, with `ON CONFLICT DO NOTHING`. A re-run can fill an offset below the target's highest one, so a high-water mark is not enough. The source is sealed then, so no later chunk can appear. The copy runs only when activation moves the target to `RUNNING`: a terminated copy can be erased, and a copy would restore erased output. |
 
 ### 0.3 Six thinking hats
 

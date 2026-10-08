@@ -846,7 +846,7 @@ The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
 | The parked workflow task row | ✅ | none |
 | Terminal task rows (activity history) | ❌ stays on the sealed source | none — the durable record is in `harvest_events` |
 | Workflow logs | ✅ | none — copied for a privacy reason as much as an operational one: they are free text, so a PII sink, and `erase.rs` scrubs them via the execution's own shard. Logs left behind would be out of reach of an erasure issued against the run. |
-| Durable stream chunks (`harvest_stream_chunks`, #1974) | ✅ in pages of 1,000 rows, and again at activation for chunks stored after verification | none — copied for the same reason as the logs: they are author output, and erasure must reach them |
+| Durable stream chunks (`harvest_stream_chunks`, #1974) | ✅ in pages of 1,000 rows, and again at activation, so a chunk stored after verification is not lost | none — copied for the same reason as the logs: they are author output, and erasure must reach them |
 | Start idempotency keys | ❌ | none for an existing run: a keyed start still hashes to the same shard |
 | Debounce rows | ❌ | at most one extra debounced start per key immediately after the move |
 | Start-throttle tokens, rate-limit buckets | ❌ | already per-shard; unaffected for an existing run |
