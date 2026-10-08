@@ -1606,6 +1606,16 @@ pub enum ClaimFairness {
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// The queues of a fair claim, each once, in first-seen order.
+///
+/// The fair claim polls the queues in a random order. A name listed twice
+/// would get two places in that order, and so a larger share. The plain
+/// claim matches `= ANY($2)`, where a repeated name counts once.
+fn distinct_queues(queues: &[String]) -> Vec<&String> {
+    let mut seen = std::collections::HashSet::new();
+    queues.iter().filter(|q| seen.insert(q.as_str())).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn claim_task_with_fairness(
     conn: &mut AsyncPgConnection,
@@ -1621,7 +1631,7 @@ pub async fn claim_task_with_fairness(
 ) -> HarvestResult<Option<TaskQueueItem>> {
     if fairness == ClaimFairness::Keys && queues.len() > 1 {
         use rand::seq::SliceRandom as _;
-        let mut order: Vec<&String> = queues.iter().collect();
+        let mut order = distinct_queues(queues);
         order.shuffle(&mut rand::thread_rng());
         for queue in order {
             let claimed = claim_task_one_statement(
@@ -13538,6 +13548,17 @@ mod tests {
 
     /// A by-id claim names one row, so a fair by-id claim skips the lag
     /// sort. It still charges the key.
+    /// A repeated queue name gets one place in the fair poll order.
+    #[test]
+    fn a_fair_claim_polls_each_queue_once() {
+        let queues = ["a", "a", "b", "a"].map(String::from);
+        let order: Vec<&str> = distinct_queues(&queues)
+            .into_iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["a", "b"]);
+    }
+
     #[test]
     fn a_fair_by_id_claim_uses_the_plain_statement() {
         for fenced in [false, true] {
