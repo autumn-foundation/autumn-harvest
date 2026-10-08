@@ -1129,6 +1129,64 @@ pub async fn drive_claims(
     }
 }
 
+/// A staging directory for one Ledger capture.
+///
+/// The capture writes its artifacts here. [`Self::publish`] moves them into
+/// the target only after the run passes every check. A stage that drops
+/// without a publish removes itself, so a failed run never replaces part of
+/// the committed evidence.
+#[derive(Debug)]
+pub struct StagedArtifacts {
+    staging: PathBuf,
+    target: PathBuf,
+}
+
+impl StagedArtifacts {
+    /// Make a new staging directory inside `target`.
+    ///
+    /// # Errors
+    /// Returns the I/O error of the directory create.
+    pub fn new(target: &Path) -> std::io::Result<Self> {
+        // Inside the target, so each move is a rename on one file system.
+        let staging = target.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&staging)?;
+        Ok(Self {
+            staging,
+            target: target.to_path_buf(),
+        })
+    }
+
+    /// The directory that the capture writes to.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.staging
+    }
+
+    /// Move every staged file over its target, then remove the stage.
+    ///
+    /// # Errors
+    /// Returns the I/O error of the first move that fails.
+    pub fn publish(self) -> std::io::Result<Vec<PathBuf>> {
+        let mut staged: Vec<PathBuf> = std::fs::read_dir(&self.staging)?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<std::io::Result<_>>()?;
+        staged.sort();
+        let mut published = Vec::with_capacity(staged.len());
+        for from in staged {
+            let to = self.target.join(from.file_name().unwrap_or_default());
+            std::fs::rename(&from, &to)?;
+            published.push(to);
+        }
+        Ok(published)
+    }
+}
+
+impl Drop for StagedArtifacts {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.staging);
+    }
+}
+
 /// Where the Ledger capture writes. `HARVEST_DEEP_BACKLOG_OUT` overrides the
 /// default, `docs/perf-artifacts/deep-backlog`.
 #[must_use]

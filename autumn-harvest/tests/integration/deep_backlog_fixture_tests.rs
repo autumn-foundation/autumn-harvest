@@ -338,6 +338,51 @@ fn a_snapshot_pair_is_written_whole_and_removed_whole() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_capture_replaces_its_artifacts_only_when_it_completes() {
+    let out = std::env::temp_dir().join(format!("harvest-ledger-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&out).expect("create the out dir");
+    std::fs::write(out.join("fixture-summary.txt"), "old").expect("seed the old summary");
+    std::fs::write(out.join("e2e-cell.txt"), "e2e").expect("seed an unrelated file");
+    {
+        let failed = fixture::StagedArtifacts::new(&out).expect("stage a run");
+        std::fs::write(failed.dir().join("fixture-summary.txt"), "half").expect("stage");
+        // The run fails here, so the stage drops without a publish.
+    }
+    let names = |dir: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .expect("read the out dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&out), ["e2e-cell.txt", "fixture-summary.txt"]);
+    let read = |name: &str| std::fs::read_to_string(out.join(name)).expect("read");
+    assert_eq!(
+        read("fixture-summary.txt"),
+        "old",
+        "a failed run keeps the old set"
+    );
+    let done = fixture::StagedArtifacts::new(&out).expect("stage a run");
+    std::fs::write(done.dir().join("fixture-summary.txt"), "new").expect("stage");
+    std::fs::write(done.dir().join("deep-claim.explain.txt"), "plan").expect("stage");
+    done.publish().expect("publish the run");
+    assert_eq!(
+        names(&out),
+        [
+            "deep-claim.explain.txt",
+            "e2e-cell.txt",
+            "fixture-summary.txt"
+        ],
+        "the stage is gone and unrelated files stay"
+    );
+    assert_eq!(read("fixture-summary.txt"), "new");
+    assert_eq!(read("e2e-cell.txt"), "e2e");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
 // ── DB tests ──────────────────────────────────────────────────────────────
 
 /// Start a server, or return `None` and print why the test skips.
@@ -604,14 +649,17 @@ async fn a_counter_reset_leaves_setup_traffic_out_of_the_snapshot() {
 async fn zz_capture_deep_backlog_ledger_evidence() {
     let Some(server) = server().await else { return };
     let out_dir = fixture::artifact_dir();
-    std::fs::create_dir_all(&out_dir).expect("create the artifact directory");
+    // The run writes to a stage. A failed check below drops the stage, so the
+    // committed artifacts stay one whole set.
+    let stage = fixture::StagedArtifacts::new(&out_dir).expect("stage the artifacts");
     let seed = fixture::env_u64("HARVEST_DEEP_BACKLOG_SEED", 1956);
     let deep_rows = fixture::env_u64("HARVEST_DEEP_BACKLOG_ROWS", LEDGER_LIVE_ROWS);
     let mut summary = String::new();
     for (label, rows) in [("shallow", fixture::SHALLOW_LIVE_ROWS), ("deep", deep_rows)] {
         let spec = FixtureSpec::ledger(seed).at_scale(rows);
         let workload = WorkloadConfig::ledger(&spec);
-        let (text, report) = fixture::capture_run(&server, label, &spec, &workload, &out_dir).await;
+        let (text, report) =
+            fixture::capture_run(&server, label, &spec, &workload, stage.dir()).await;
         summary.push_str(&text);
         assert!(report.claims > 0, "{label}: the workload claimed nothing");
         assert_eq!(
@@ -625,7 +673,8 @@ async fn zz_capture_deep_backlog_ledger_evidence() {
             report.first_error
         );
     }
-    std::fs::write(out_dir.join("fixture-summary.txt"), &summary).expect("write the summary");
+    std::fs::write(stage.dir().join("fixture-summary.txt"), &summary).expect("write the summary");
+    stage.publish().expect("publish the artifacts");
     println!("{summary}");
     println!("== capture complete: artifacts in {} ==", out_dir.display());
 }
