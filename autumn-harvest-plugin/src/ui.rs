@@ -3004,7 +3004,7 @@ async fn list_dead_letters_ui(
         // audit row per page render that touched ≥1 envelope.
         let mut outcome = LossyDecodeOutcome::default();
         for row in &mut page_rows {
-            outcome = outcome.merged(codecs.decode_value_lossy(&mut row.dead_letter.input));
+            outcome = outcome.merged(codecs.decode_column_lossy(&mut row.dead_letter.input));
             outcome = outcome.merged(decode_error_field(codecs, &mut row.dead_letter.error));
             for event in &mut row.events {
                 outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));

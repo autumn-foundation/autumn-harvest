@@ -1377,6 +1377,47 @@ mod tests {
     }
 
     #[test]
+    fn a_column_read_shows_the_same_plaintext_with_the_switch_off_or_on() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        let plaintext = json!({"ssn": PAYLOAD_SECRET});
+        // A caller hands the engine a value that is already an envelope.
+        let client = codecs.encode_payload(&plaintext).unwrap();
+        let legacy_row = client.clone();
+        let escaped_row = codecs.encode_column(&client).unwrap();
+        codecs.set_column_encoding(true);
+        let encoded_row = codecs.encode_column(&client).unwrap();
+        for mut row in [legacy_row, escaped_row, encoded_row] {
+            let outcome = codecs.decode_column_lossy(&mut row);
+            assert_eq!(row, plaintext);
+            assert!(outcome.decoded >= 1 && outcome.failed == 0);
+        }
+    }
+
+    #[test]
+    fn a_column_read_decodes_a_plain_row_once_and_marks_a_missing_key() {
+        let writer = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&writer).unwrap();
+        let mut plain = json!({"ssn": PAYLOAD_SECRET});
+        let outcome = writer.decode_column_lossy(&mut plain);
+        assert_eq!(plain, json!({"ssn": PAYLOAD_SECRET}));
+        assert!(!outcome.touched());
+
+        writer.set_column_encoding(true);
+        let mut stored = writer
+            .encode_column(&json!({"ssn": PAYLOAD_SECRET}))
+            .unwrap();
+        let outcome = PayloadCodecs::default().decode_column_lossy(&mut stored);
+        assert_eq!(outcome.failed, 1);
+        assert!(
+            stored
+                .get(crate::payload_codec::UNDECODABLE_MARKER_KEY)
+                .is_some()
+        );
+        assert!(!stored.to_string().contains(PAYLOAD_SECRET));
+    }
+
+    #[test]
     fn the_builder_switch_turns_column_encoding_on() {
         let builder = crate::HarvestBuilder::new();
         assert!(!builder.payload_codecs().column_encoding());

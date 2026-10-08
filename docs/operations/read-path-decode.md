@@ -163,6 +163,11 @@ Two attribution details:
   dead-letter inputs and workflow task rows. The surfaces above decode them under the same rules. A
   non-admin caller, and the undecoded list surfaces, see the envelopes. See
   the column coverage table in `docs/security-posture.md`.
+- A column write can wrap the whole value in one envelope: the column codec,
+  or an identity escape while the switch is off. A column read removes that
+  layer first, then applies the walk below. So a decoded column shows the
+  same value with the switch off or on, and the same value as a row written
+  before issue #1979.
 - Because the walk is envelope-driven, business data stored as plaintext that
   happens to be byte-for-byte a codec envelope — at any nesting depth — is
   transformed on the decoded view: decoded when its `codec_id` is registered,

@@ -12,7 +12,8 @@ input, output and memo, signal payloads and DLQ inputs stayed in clear.
 - **Readers first.** This release always decodes these columns. Upgrade every
   process, then turn the switch on.
 - **Escape guard.** A new write escapes a value shaped like a codec envelope,
-  with the switch on or off (issue #1253).
+  with the switch on or off (issue #1253). An operator read removes the
+  escape or column layer first, so it shows the same value as before.
 - **Engine reads.** These paths decode first:
   - the workflow handler, signal ingest, the client handle and queries;
   - retries, reruns, forks and DLQ replay;

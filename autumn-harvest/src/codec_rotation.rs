@@ -1354,43 +1354,14 @@ mod db {
             for cell in cells {
                 examined += 1;
                 cursor.after = Some(cell.id);
-                let converted =
-                    match reencrypt_column_value_under(codecs, active_key_id, &cell.value) {
-                        Ok(Some(candidate)) => {
-                            compare_and_swap_column(
-                            conn,
-                            shard,
-                            column,
-                            cell.id,
-                            &cell.value,
-                            &candidate,
-                        )
-                        .await?
-                            // An erasure, a row delete or another sweeper won
-                            // the race. Only a cell still on an old key is
-                            // left to convert.
-                            || !column_cell_pending(conn, column, cell.id, active_key_id)
-                                .await?
-                        }
-                        Ok(None) => true,
-                        Err(error) => {
-                            // Bounded and content-free, as for an event row.
-                            tracing::warn!(
-                                table = column.table,
-                                column = column.column,
-                                row_id = %cell.id,
-                                key_id = ?crate::payload_codec::codec_envelope_key_id(&cell.value),
-                                shard_id = shard.as_i32(),
-                                error_kind = super::sweep_error_kind(&error),
-                                "codec re-encryption skipped: the column cell could not be decoded"
-                            );
-                            false
-                        }
-                    };
-                if converted {
-                    rewritten += 1;
-                } else {
-                    cursor.unresolved = cursor.unresolved.saturating_add(1);
+                let outcome =
+                    sweep_column_cell(conn, shard, codecs, column, &cell, active_key_id).await?;
+                match outcome {
+                    CellOutcome::Swapped => rewritten += 1,
+                    CellOutcome::Resolved => {}
+                    CellOutcome::Unresolved => {
+                        cursor.unresolved = cursor.unresolved.saturating_add(1);
+                    }
                 }
             }
             if i64::try_from(page_len).unwrap_or(i64::MAX) < remaining {
@@ -1422,6 +1393,58 @@ mod db {
             }
         };
         Ok(pass)
+    }
+
+    /// Re-encrypt one codec-column cell and classify the result.
+    async fn sweep_column_cell(
+        conn: &mut AsyncPgConnection,
+        shard: crate::types::ShardId,
+        codecs: &PayloadCodecs,
+        column: &CodecColumn,
+        cell: &ColumnCell,
+        active_key_id: &str,
+    ) -> HarvestResult<CellOutcome> {
+        let outcome = match reencrypt_column_value_under(codecs, active_key_id, &cell.value) {
+            Ok(Some(candidate)) => {
+                if compare_and_swap_column(conn, shard, column, cell.id, &cell.value, &candidate)
+                    .await?
+                {
+                    CellOutcome::Swapped
+                } else if column_cell_pending(conn, column, cell.id, active_key_id).await? {
+                    CellOutcome::Unresolved
+                } else {
+                    // An erasure, a row delete or another sweeper won
+                    // the race. This call wrote nothing, so it does
+                    // not count the cell as a rewrite.
+                    CellOutcome::Resolved
+                }
+            }
+            Ok(None) => CellOutcome::Resolved,
+            Err(error) => {
+                // Bounded and content-free, as for an event row.
+                tracing::warn!(
+                    table = column.table,
+                    column = column.column,
+                    row_id = %cell.id,
+                    key_id = ?crate::payload_codec::codec_envelope_key_id(&cell.value),
+                    shard_id = shard.as_i32(),
+                    error_kind = super::sweep_error_kind(&error),
+                    "codec re-encryption skipped: the column cell could not be decoded"
+                );
+                CellOutcome::Unresolved
+            }
+        };
+        Ok(outcome)
+    }
+
+    /// The result of one codec-column cell in the column pass.
+    enum CellOutcome {
+        /// This call wrote the cell onto the active key.
+        Swapped,
+        /// The cell needs no work, or another writer resolved it.
+        Resolved,
+        /// The cell still holds an old key.
+        Unresolved,
     }
 
     /// Whether one codec-column cell still holds an envelope under a key

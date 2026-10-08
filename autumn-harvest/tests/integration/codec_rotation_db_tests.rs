@@ -4087,6 +4087,84 @@ async fn the_column_sweep_keeps_to_its_budget_and_finishes_over_several_ticks() 
 }
 
 #[tokio::test]
+async fn a_column_swap_lost_to_another_writer_is_not_counted_as_a_rewrite() {
+    #[derive(diesel::QueryableByName)]
+    struct Input {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        input: Value,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Waiting {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut seed = connect(&url).await;
+    let codecs = two_key_registry();
+    seed_codec_columns(&mut seed, &codecs, "k1").await;
+    codecs.set_active_key("k2").expect("flip");
+
+    // Another writer converts the execution input and holds the row lock.
+    let mut rival = connect(&url).await;
+    let stored: Input = diesel::sql_query("SELECT input FROM harvest_workflow_executions")
+        .get_result(&mut rival)
+        .await
+        .expect("load input");
+    let converted =
+        autumn_harvest::codec_rotation::reencrypt_column_value_under(&codecs, "k2", &stored.input)
+            .expect("re-encode")
+            .expect("an old-key cell");
+    rival.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query("UPDATE harvest_workflow_executions SET input = $1")
+        .bind::<diesel::sql_types::Jsonb, _>(&converted)
+        .execute(&mut rival)
+        .await
+        .expect("rival update");
+
+    // The sweep reads the old bytes, then blocks on the rival's row lock.
+    let sweep_codecs = codecs.clone();
+    let mut sweeper = connect(&url).await;
+    let sweep = tokio::spawn(async move {
+        sweep_codec_reencryption_once(&mut sweeper, 0, &sweep_codecs, 100, &NoOpMetrics).await
+    });
+    let mut watcher = connect(&url).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: Waiting = diesel::sql_query(
+            "SELECT count(*) AS n FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .get_result(&mut watcher)
+        .await
+        .expect("pg_stat_activity");
+        if waiting.n > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sweep never blocked on the rival's row lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rival.batch_execute("COMMIT").await.expect("commit");
+
+    let rewritten = sweep.await.expect("join").expect("sweep");
+    assert_eq!(
+        rewritten, 7,
+        "the rival wrote the execution input, so the sweep rewrote only the other 7 cells"
+    );
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut seed)
+        .await
+        .expect("census");
+    assert_eq!(
+        by_key.get("k1").copied().unwrap_or(0),
+        0,
+        "no cell is left on k1"
+    );
+}
+
+#[tokio::test]
 async fn two_databases_in_one_process_keep_separate_column_cursors() {
     let (url_a, _a) = setup_isolated_db().await;
     let (url_b, _b) = setup_isolated_db().await;

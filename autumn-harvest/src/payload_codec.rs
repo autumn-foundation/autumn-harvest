@@ -1914,6 +1914,29 @@ impl PayloadCodecs {
         outcome
     }
 
+    /// [`PayloadCodecs::decode_value_lossy`] for one codec-column value
+    /// (issue #1979).
+    ///
+    /// A column write can wrap the whole value in one envelope: the column
+    /// codec, or the identity escape while the switch is off. This removes
+    /// that layer first, then decodes the result as
+    /// `decode_value_lossy` does. So a read shows the same value whether the
+    /// switch is off or on, and the same value as a row written before
+    /// issue #1979. A layer that fails to decode becomes a marker, as in
+    /// `decode_value_lossy`.
+    ///
+    /// For the operator read path only. Never write the result back.
+    pub fn decode_column_lossy(&self, value: &mut Value) -> LossyDecodeOutcome {
+        if codec_envelope_parts(value).is_none() {
+            return self.decode_value_lossy(value);
+        }
+        let layer = self.decode_value_lossy(value);
+        if layer.failed > 0 {
+            return layer;
+        }
+        layer.merged(self.decode_value_lossy(value))
+    }
+
     fn decode_value_lossy_inner(&self, value: &mut Value, outcome: &mut LossyDecodeOutcome) {
         let replacement =
             codec_envelope_parts(value).map(|parts| self.decode_envelope_lossy(&parts));
