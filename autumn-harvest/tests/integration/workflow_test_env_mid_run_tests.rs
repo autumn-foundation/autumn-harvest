@@ -10,6 +10,10 @@
 //!   --test integration workflow_test_env_mid_run_tests
 //! ```
 
+// The `#[workflow]`, `#[query]` and `#[update]` macros need an `async fn` or
+// a `Result` return, even when the body neither awaits nor fails.
+#![allow(clippy::unused_async, clippy::unnecessary_wraps)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -171,6 +175,19 @@ fn branch_on_handlers_workflow<'a>(
             .await
             .map_err(|e| e.to_string())
     })
+}
+
+/// Sleeps one hour, then waits for `go`. Its `clock` update reports the
+/// handler's view of `ctx.now()`.
+#[workflow]
+async fn timed_workflow(ctx: &WorkflowContext) -> Result<Value, String> {
+    ctx.timer("nap", 3600).await.map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+#[update(workflow = "timed_workflow")]
+async fn clock(ctx: &WorkflowContext) -> Result<String, String> {
+    Ok(ctx.now().to_rfc3339())
 }
 
 fn string_schema() -> Value {
@@ -539,6 +556,18 @@ async fn replay_check_sees_the_declarative_handlers() {
             "{report}"
         );
     }
+}
+
+/// A declarative update handler sees the virtual time, as the body does.
+#[tokio::test]
+async fn declarative_update_handler_sees_the_virtual_clock() {
+    let env = WorkflowTestEnv::new().updates(updates![clock]);
+    let mut run = env.start(timed_workflow_info().handler, json!(null));
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+
+    let seen = run.update("clock", json!(null)).await.expect("update");
+    assert_eq!(seen, json!(run.now().to_rfc3339()));
+    assert_eq!(run.now(), env.now() + chrono::Duration::hours(1));
 }
 
 // ─────────────────────────────── queries ─────────────────────────────────────
