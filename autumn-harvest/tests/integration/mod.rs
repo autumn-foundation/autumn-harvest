@@ -141,6 +141,7 @@ mod executor_span_tests;
 mod external_completion_tests;
 mod external_outbox_scan_tests;
 mod fairness_key_tests;
+mod fairness_key_worker_tests;
 mod fanout_tests;
 mod force_fail_tests;
 mod formal_models_coverage;

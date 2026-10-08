@@ -2290,6 +2290,8 @@ pub(crate) struct StartWorkflowRequest {
     context_headers: Option<std::collections::HashMap<String, String>>,
     /// Dispatch priority for this execution's tasks. Omitted defaults to `Normal`.
     priority: Option<autumn_harvest::types::Priority>,
+    /// The fairness key of the run (issue #1976). Omitted takes the quota key.
+    fairness_key: Option<String>,
     /// Request-scoped idempotency key (issue #808). Two starts carrying the same
     /// key (within the configured retention window, default 24h) converge on
     /// exactly one execution — the second returns the same `execution_id` as a
@@ -2374,6 +2376,7 @@ impl StartWorkflowRequest {
             engine_derived_idempotency_key: false,
             start_source_override: None,
             start_source_ref_override: None,
+            fairness_key: None,
         }
     }
 
@@ -2420,6 +2423,7 @@ impl StartWorkflowRequest {
             engine_derived_idempotency_key: false,
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
             start_source_ref_override: None,
+            fairness_key: None,
         }
     }
 
@@ -2476,6 +2480,7 @@ impl StartWorkflowRequest {
             engine_derived_idempotency_key: true,
             start_source_override: Some(autumn_harvest::StartSource::Broker),
             start_source_ref_override: coordinates,
+            fairness_key: None,
         }
     }
 }
@@ -6971,6 +6976,7 @@ pub const fn management_api_request_fields()
                 "residency_key",
                 "context_headers",
                 "priority",
+                "fairness_key",
             ]),
         ),
         (
@@ -19274,6 +19280,7 @@ pub(crate) async fn start_workflow(
                 concurrency_limit,
                 concurrency_on_conflict,
                 priority: request.priority.unwrap_or_default(),
+                fairness_key: request.fairness_key.clone(),
                 max_workflow_input_bytes: effective_wf_cap,
                 start_at: request.start_at,
                 delay,
@@ -19500,6 +19507,7 @@ pub(crate) async fn start_workflow(
         concurrency_limit,
         concurrency_on_conflict,
         priority: request.priority.unwrap_or_default(),
+        fairness_key: request.fairness_key.clone(),
         max_workflow_input_bytes: effective_wf_cap,
         start_at: request.start_at,
         delay,
@@ -20709,6 +20717,7 @@ async fn batch_start_workflows(
                         concurrency_limit,
                         concurrency_on_conflict,
                         priority: item.priority.unwrap_or_default(),
+                        fairness_key: item.fairness_key.clone(),
                         max_workflow_input_bytes: effective_wf_cap,
                         owner,
                         runbook_url,
@@ -53826,6 +53835,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
             },
             None,
             None,
@@ -53915,6 +53925,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
             },
             None,
             None,
@@ -54042,6 +54053,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
             },
             None,
             None,
@@ -54175,6 +54187,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
             },
             None,
             None,

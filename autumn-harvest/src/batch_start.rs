@@ -95,6 +95,11 @@ pub struct BatchStartItem {
     /// Dispatch priority for this item's tasks. Omitted defaults to `Normal`.
     #[serde(default)]
     pub priority: Option<Priority>,
+
+    /// The fairness key of this item's run (issue #1976). Omitted takes the
+    /// quota key.
+    #[serde(default)]
+    pub fairness_key: Option<String>,
 }
 
 // ── Per-item result ───────────────────────────────────────────────────────────
@@ -191,6 +196,7 @@ mod tests {
                 "abc123".to_string(),
             )])),
             priority: Some(Priority::High),
+            fairness_key: None,
         };
         let serialised = serde_json::to_value(&item).unwrap();
         let back: BatchStartItem = serde_json::from_value(serialised).unwrap();

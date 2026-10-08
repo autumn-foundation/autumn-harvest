@@ -516,6 +516,7 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )
@@ -932,6 +933,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
             },
             None,
         )

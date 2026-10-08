@@ -460,6 +460,17 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_build_compat",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
+    // Fairness keys (issue #1976). A fair claim reads both tables and upserts
+    // the state row of the key it claims. Prune deletes idle state rows. The
+    // weight API writes the overrides.
+    (
+        "harvest_fairness_state",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    (
+        "harvest_fairness_weights",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     (
         // DELETE is required by the idle-bucket GC (issue #1127). Without it
         // here, a least-privilege role passes preflight and then every janitor

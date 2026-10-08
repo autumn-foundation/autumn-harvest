@@ -200,6 +200,7 @@ fn start_params<'a>(
         start_source,
         start_source_ref,
         started_by: None,
+        fairness_key: None,
     }
 }
 

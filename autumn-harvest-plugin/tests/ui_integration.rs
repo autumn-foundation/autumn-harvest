@@ -314,6 +314,7 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )
@@ -4709,6 +4710,7 @@ async fn insert_child_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )
@@ -6364,6 +6366,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )
@@ -6556,6 +6559,7 @@ async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )
@@ -6646,6 +6650,7 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )
@@ -6943,6 +6948,7 @@ async fn dag957_seed_run(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )

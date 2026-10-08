@@ -188,6 +188,7 @@ fn worker_config(worker_id: &str, local_cap: Duration) -> WorkerRuntimeConfig {
         sharded_pool: None,
         slot_tuner: None,
         max_concurrent_sessions: 0,
+        fairness_keys: false,
     }
 }
 

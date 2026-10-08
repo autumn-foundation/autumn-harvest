@@ -1886,6 +1886,23 @@ pub fn claim_task_by_id_query_fenced() -> &'static str {
     &BY_ID_FENCED
 }
 
+/// The by-id claim statement for one `(fenced, fairness)` choice.
+///
+/// [`ClaimFairness::Off`] returns the unchanged by-id statement.
+#[must_use]
+pub fn claim_by_id_query_for(fenced: bool, fairness: ClaimFairness) -> &'static str {
+    use std::sync::LazyLock;
+    static FAIR: LazyLock<String> = LazyLock::new(|| splice_fairness(claim_task_by_id_query()));
+    static FAIR_FENCED: LazyLock<String> =
+        LazyLock::new(|| splice_fairness(claim_task_by_id_query_fenced()));
+    match (fenced, fairness) {
+        (false, ClaimFairness::Off) => claim_task_by_id_query(),
+        (true, ClaimFairness::Off) => claim_task_by_id_query_fenced(),
+        (false, ClaimFairness::Keys) => &FAIR,
+        (true, ClaimFairness::Keys) => &FAIR_FENCED,
+    }
+}
+
 /// Splice a literal task-kind predicate into the `candidate` CTE of `base`.
 ///
 /// The by-id anchor appears exactly once in the base query. The assertion
@@ -1921,8 +1938,180 @@ pub fn claim_query_for(
         (Some(kind), fenced) => claim_task_query_for_kind(kind, fenced),
     };
     match fairness {
-        ClaimFairness::Off | ClaimFairness::Keys => base,
+        ClaimFairness::Off => base,
+        ClaimFairness::Keys => fair_variant(kind, fenced),
     }
+}
+
+/// The fair form of each `(kind, fenced)` claim statement (issue #1976).
+fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static FAIR: [LazyLock<String>; 6] = [
+        LazyLock::new(|| splice_fairness(claim_task_query())),
+        LazyLock::new(|| splice_fairness(claim_task_query_fenced())),
+        LazyLock::new(|| splice_fairness(claim_task_query_for_kind(TaskType::Workflow, false))),
+        LazyLock::new(|| splice_fairness(claim_task_query_for_kind(TaskType::Workflow, true))),
+        LazyLock::new(|| splice_fairness(claim_task_query_for_kind(TaskType::Activity, false))),
+        LazyLock::new(|| splice_fairness(claim_task_query_for_kind(TaskType::Activity, true))),
+    ];
+    let slot = match kind {
+        None => 0,
+        Some(TaskType::Workflow) => 2,
+        Some(TaskType::Activity) => 4,
+    } + usize::from(fenced);
+    &FAIR[slot]
+}
+
+/// The fairness CTEs of the fair claim (issue #1976).
+///
+/// `fair_state` holds the state rows of the polled queues. `fair_clock` holds
+/// the queue clock `V` of each queue: its largest `last_start`. Both are
+/// `MATERIALIZED`, so each runs once per claim. The column names carry a
+/// prefix, so no unqualified column of `candidate` becomes ambiguous.
+pub const FAIR_CTES_SQL: &str = "fair_state AS MATERIALIZED ( \
+         SELECT queue_name AS fs_queue, fairness_key AS fs_key, \
+                pass AS fs_pass, last_start AS fs_last \
+         FROM harvest_fairness_state \
+         WHERE queue_name = ANY($2) \
+     ), \
+     fair_clock AS MATERIALIZED ( \
+         SELECT fs_queue AS fc_queue, MAX(fs_last) AS fc_v \
+         FROM fair_state GROUP BY fs_queue \
+     ), ";
+
+/// The joins that give each candidate row the state of its key.
+pub const FAIR_JOINS_SQL: &str = "LEFT JOIN fair_state \
+         ON fair_state.fs_queue = harvest_task_queue.queue_name \
+        AND fair_state.fs_key = COALESCE(harvest_task_queue.fairness_key, '') \
+     LEFT JOIN fair_clock ON fair_clock.fc_queue = harvest_task_queue.queue_name ";
+
+/// The start tag of a candidate row's key: `max(pass, V)`.
+///
+/// A key with no state starts at `V`. A queue with no state has `V = 0`. See
+/// [`crate::queue_fairness::fair_start`].
+pub const FAIR_START_SQL: &str = "GREATEST(COALESCE(fair_state.fs_pass, fair_clock.fc_v, 0), \
+     COALESCE(fair_clock.fc_v, 0))";
+
+/// The lag of a candidate row's key: its start tag minus `V`.
+///
+/// The fair claim sorts on the lag, not on the start tag. Each queue's front
+/// key then has a small lag, so one queue's large clock does not push its rows
+/// behind another queue in a multi-queue claim. See
+/// [`crate::queue_fairness::fair_lag`].
+pub const FAIR_LAG_SQL: &str = "GREATEST(COALESCE(fair_state.fs_pass - fair_clock.fc_v, 0), 0)";
+
+/// The weight of the key `(q, k)`: its override, else the default `1`.
+macro_rules! fair_weight_sql {
+    ($q:literal, $k:literal) => {
+        concat!(
+            "COALESCE((SELECT fw.weight FROM harvest_fairness_weights fw \
+              WHERE fw.queue_name = ",
+            $q,
+            " AND fw.fairness_key = ",
+            $k,
+            "), 1.0)"
+        )
+    };
+}
+
+/// The charge of the claimed row's key (issue #1976).
+///
+/// It runs only when `claimed` returns a row, so a lost claim charges
+/// nothing. The upsert waits for a concurrent charge of the same key. It then
+/// starts from the current `pass`, as [`crate::queue_fairness::FairClock`]
+/// does, so two charges never share one slot.
+///
+/// The claim locks the task row first, then the state row. No other writer
+/// locks a state row first, so the order cannot deadlock.
+pub const FAIR_CHARGE_SQL: &str = concat!(
+    "fair_charge AS ( \
+         INSERT INTO harvest_fairness_state AS fs \
+             (queue_name, fairness_key, pass, last_start, updated_at) \
+         SELECT candidate.fair_queue, candidate.fair_key, \
+                candidate.fair_start + 1.0 / ",
+    fair_weight_sql!("candidate.fair_queue", "candidate.fair_key"),
+    ", candidate.fair_start, NOW() \
+         FROM candidate JOIN claimed ON claimed.id = candidate.id \
+         ON CONFLICT (queue_name, fairness_key) DO UPDATE \
+         SET last_start = GREATEST(fs.pass, EXCLUDED.last_start), \
+             pass = GREATEST(fs.pass, EXCLUDED.last_start) + 1.0 / ",
+    fair_weight_sql!("EXCLUDED.queue_name", "EXCLUDED.fairness_key"),
+    ", updated_at = NOW() \
+     ) "
+);
+
+/// Anchors of [`splice_fairness`]. Each appears exactly once in every claim
+/// variant.
+const FAIR_CTE_ANCHOR: &str = "candidate AS ( ";
+const FAIR_SELECT_ANCHOR: &str = "activity_name, workflow_exec_id FROM harvest_task_queue ";
+const FAIR_JOIN_ANCHOR: &str = "CROSS JOIN paused_activities ";
+const FAIR_ORDER_ANCHOR: &str = concat!("END DESC, ", claim_order_due_sql!(), " ASC");
+const FAIR_TAIL_ANCHOR: &str = "SELECT * FROM claimed";
+
+/// Splice the fair claim into a claim statement (issue #1976).
+///
+/// Five edits, each at an anchor that appears exactly once:
+///
+/// 1. `fair_state` and `fair_clock` go before `candidate`.
+/// 2. `candidate` selects the queue, the key and the start tag of each row.
+/// 3. `candidate` joins the state of each row's key.
+/// 4. The sort takes the lag after the effective priority and before the due
+///    time. Sticky rank and priority keep their meaning. Within one key the
+///    order is the old order.
+/// 5. `fair_charge` goes after `claimed`.
+///
+/// No bind is added, so the fenced and by-id binds keep their numbers. Every
+/// gate stays the same text. `fair_claim_query_preserves_every_gate` pins
+/// that.
+///
+/// # Panics
+///
+/// Panics at first use if an anchor does not appear exactly once. That makes
+/// a future edit of the base query fail loudly, not claim unfairly.
+#[must_use]
+pub fn splice_fairness(base: &str) -> String {
+    for anchor in [
+        FAIR_CTE_ANCHOR,
+        FAIR_SELECT_ANCHOR,
+        FAIR_JOIN_ANCHOR,
+        FAIR_ORDER_ANCHOR,
+        FAIR_TAIL_ANCHOR,
+    ] {
+        assert_eq!(
+            base.matches(anchor).count(),
+            1,
+            "fair claim anchor {anchor:?} must appear exactly once"
+        );
+    }
+    base.replace(
+        FAIR_CTE_ANCHOR,
+        &format!("{FAIR_CTES_SQL}{FAIR_CTE_ANCHOR}"),
+    )
+    .replace(
+        FAIR_SELECT_ANCHOR,
+        &format!(
+            "activity_name, workflow_exec_id, \
+                 harvest_task_queue.queue_name AS fair_queue, \
+                 COALESCE(harvest_task_queue.fairness_key, '') AS fair_key, \
+                 {FAIR_START_SQL} AS fair_start \
+                 FROM harvest_task_queue "
+        ),
+    )
+    .replace(
+        FAIR_JOIN_ANCHOR,
+        &format!("{FAIR_JOIN_ANCHOR}{FAIR_JOINS_SQL}"),
+    )
+    .replace(
+        FAIR_ORDER_ANCHOR,
+        &format!(
+            "END DESC, {FAIR_LAG_SQL} ASC, {} ASC",
+            claim_order_due_sql!()
+        ),
+    )
+    .replace(
+        FAIR_TAIL_ANCHOR,
+        &format!(", {FAIR_CHARGE_SQL}{FAIR_TAIL_ANCHOR}"),
+    )
 }
 
 /// [`claim_task_query`] limited to one task kind (issue #1787).
@@ -2116,6 +2305,43 @@ pub async fn claim_task_by_id_on_shard(
     ineligible_activities: &[String],
     shard: Option<crate::types::ShardId>,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_by_id_with_fairness(
+        conn,
+        task_id,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        ClaimFairness::Off,
+    )
+    .await
+}
+
+/// [`claim_task_by_id_on_shard`] with a fairness mode (issue #1976).
+///
+/// A by-id claim names its row, so the key order does not apply. With
+/// [`ClaimFairness::Keys`] the claim still charges the key of the row. The
+/// poll path then sees the true share of each key.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_by_id_with_fairness(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    fairness: ClaimFairness,
+) -> HarvestResult<Option<TaskQueueItem>> {
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let mut tx = conn.build_transaction().read_committed();
@@ -2127,7 +2353,7 @@ pub async fn claim_task_by_id_on_shard(
                 // heap-allocates per bind and dispatches dynamically.
                 let result: Vec<TaskQueueItem> = match fence_binding(shard) {
                     None => {
-                        diesel::sql_query(claim_task_by_id_query())
+                        diesel::sql_query(claim_by_id_query_for(false, fairness))
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                             .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -2145,7 +2371,7 @@ pub async fn claim_task_by_id_on_shard(
                             .await
                     }
                     Some((fence_shard, generation)) => {
-                        diesel::sql_query(claim_task_by_id_query_fenced())
+                        diesel::sql_query(claim_by_id_query_for(true, fairness))
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                             .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -13213,5 +13439,142 @@ mod tests {
     fn primary_repend_returns_every_hint_column() {
         let sql = primary_repend_workflow_task_query();
         assert!(sql.contains("RETURNING id, queue_name, scheduled_at, priority, task_type"));
+    }
+
+    // -------------------------------------------------------------------
+    // Fair claim splice (issue #1976).
+    // -------------------------------------------------------------------
+
+    /// Every fair claim variant, with the unfair variant it derives from.
+    fn fair_pairs() -> Vec<(&'static str, &'static str)> {
+        let mut pairs = Vec::new();
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                pairs.push((
+                    claim_query_for(kind, fenced, ClaimFairness::Off),
+                    claim_query_for(kind, fenced, ClaimFairness::Keys),
+                ));
+            }
+        }
+        for fenced in [false, true] {
+            pairs.push((
+                claim_by_id_query_for(fenced, ClaimFairness::Off),
+                claim_by_id_query_for(fenced, ClaimFairness::Keys),
+            ));
+        }
+        pairs
+    }
+
+    /// The `$n` binds of a statement, sorted and deduplicated.
+    fn binds(sql: &str) -> Vec<u32> {
+        let mut out: Vec<u32> = sql
+            .match_indices('$')
+            .filter_map(|(i, _)| {
+                let digits: String = sql[i + 1..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse().ok()
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn fairness_off_claim_is_byte_identical() {
+        assert_eq!(
+            claim_query_for(None, false, ClaimFairness::Off),
+            claim_task_query()
+        );
+        assert_eq!(
+            claim_query_for(None, true, ClaimFairness::Off),
+            claim_task_query_fenced()
+        );
+        for kind in [TaskType::Workflow, TaskType::Activity] {
+            for fenced in [false, true] {
+                assert_eq!(
+                    claim_query_for(Some(kind), fenced, ClaimFairness::Off),
+                    claim_task_query_for_kind(kind, fenced)
+                );
+            }
+        }
+        assert_eq!(
+            claim_by_id_query_for(false, ClaimFairness::Off),
+            claim_task_by_id_query()
+        );
+        assert_eq!(
+            claim_by_id_query_for(true, ClaimFairness::Off),
+            claim_task_by_id_query_fenced()
+        );
+    }
+
+    #[test]
+    fn fair_claim_query_preserves_every_gate_and_bind() {
+        for (base, fair) in fair_pairs() {
+            for gate in CLAIM_GATES {
+                assert_eq!(
+                    base.matches(gate).count(),
+                    fair.matches(gate).count(),
+                    "the fair splice changed gate {gate:?}"
+                );
+            }
+            assert_eq!(
+                binds(base),
+                binds(fair),
+                "the fair splice changed the binds"
+            );
+            assert_eq!(
+                base.matches("FOR UPDATE").count(),
+                fair.matches("FOR UPDATE").count(),
+                "the fair splice changed the row locks"
+            );
+            assert_eq!(
+                base.matches("advisory_xact_lock").count(),
+                fair.matches("advisory_xact_lock").count()
+            );
+        }
+    }
+
+    #[test]
+    fn fair_claim_sorts_on_the_lag_before_the_due_time() {
+        let order = format!("END DESC, {FAIR_LAG_SQL} ASC, {CLAIM_ORDER_DUE_SQL} ASC");
+        for (_, fair) in fair_pairs() {
+            assert_eq!(fair.matches(order.as_str()).count(), 1, "{fair}");
+            assert_eq!(fair.matches(FAIR_CTES_SQL).count(), 1);
+            assert_eq!(fair.matches(FAIR_JOINS_SQL).count(), 1);
+            assert!(fair.contains("AS fair_start"));
+        }
+    }
+
+    #[test]
+    fn fair_charge_runs_once_and_only_after_a_claim() {
+        for (_, fair) in fair_pairs() {
+            assert_eq!(fair.matches("fair_charge AS (").count(), 1);
+            assert!(fair.contains("FROM candidate JOIN claimed ON claimed.id = candidate.id"));
+            assert!(fair.ends_with("SELECT * FROM claimed"));
+            // The upsert restarts from the current pass after a wait.
+            assert!(fair.contains("GREATEST(fs.pass, EXCLUDED.last_start)"));
+        }
+    }
+
+    #[test]
+    fn fair_sql_mirrors_the_model_rules() {
+        // start = max(pass, V); a key with no state starts at V.
+        assert!(FAIR_START_SQL.contains("COALESCE(fair_state.fs_pass, fair_clock.fc_v, 0)"));
+        assert!(FAIR_START_SQL.contains("COALESCE(fair_clock.fc_v, 0)"));
+        // lag = max(pass - V, 0); a key with no state has lag 0.
+        assert!(FAIR_LAG_SQL.contains("COALESCE(fair_state.fs_pass - fair_clock.fc_v, 0), 0"));
+        // V is the largest last_start of the queue.
+        assert!(FAIR_CTES_SQL.contains("MAX(fs_last) AS fc_v"));
+        // A key with no override has weight 1.
+        assert!(FAIR_CHARGE_SQL.contains("), 1.0)"));
+    }
+
+    #[test]
+    #[should_panic(expected = "fair claim anchor")]
+    fn fair_splice_panics_when_an_anchor_is_missing() {
+        let _ = splice_fairness("WITH candidate AS ( SELECT 1 ) SELECT * FROM claimed");
     }
 }

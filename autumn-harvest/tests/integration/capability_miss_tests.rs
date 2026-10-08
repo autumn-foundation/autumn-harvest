@@ -303,6 +303,7 @@ fn build_worker_tuned(
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )

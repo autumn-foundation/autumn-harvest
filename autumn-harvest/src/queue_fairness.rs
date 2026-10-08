@@ -172,6 +172,15 @@ pub fn validate_fairness_key(key: &str) -> HarvestResult<()> {
     Ok(())
 }
 
+/// The fairness key of a new run: the explicit key, else the quota key.
+///
+/// A quota key names a tenant already, so it is the natural default. A run
+/// with neither key gets `None`, which is [`DEFAULT_FAIRNESS_KEY`].
+#[must_use]
+pub fn fairness_key_for(explicit: Option<&str>, quota_key: Option<&str>) -> Option<String> {
+    explicit.or(quota_key).map(str::to_owned)
+}
+
 /// Check a weight override.
 ///
 /// # Errors
@@ -490,5 +499,59 @@ mod tests {
                 "'light' must always appear in the permutation"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fairness keys (issue #1976)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn explicit_key_wins_over_the_quota_key() {
+        assert_eq!(fairness_key_for(Some("a"), Some("q")).as_deref(), Some("a"));
+        assert_eq!(fairness_key_for(None, Some("q")).as_deref(), Some("q"));
+        assert_eq!(fairness_key_for(None, None), None);
+    }
+
+    #[test]
+    fn fairness_key_validation_rejects_reserved_and_malformed_keys() {
+        assert!(validate_fairness_key("tenant-a").is_ok());
+        assert!(validate_fairness_key(&"x".repeat(MAX_FAIRNESS_KEY_LEN)).is_ok());
+        assert!(validate_fairness_key(DEFAULT_FAIRNESS_KEY).is_err());
+        assert!(validate_fairness_key(" a").is_err());
+        assert!(validate_fairness_key("a\n").is_err());
+        assert!(validate_fairness_key(&"x".repeat(MAX_FAIRNESS_KEY_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn fairness_weight_validation_is_inclusive_at_both_bounds() {
+        assert!(validate_fairness_weight(MIN_FAIRNESS_WEIGHT).is_ok());
+        assert!(validate_fairness_weight(MAX_FAIRNESS_WEIGHT).is_ok());
+        assert!(validate_fairness_weight(DEFAULT_FAIRNESS_WEIGHT).is_ok());
+        for bad in [0.0, -1.0, 0.000_9, 1000.1, f64::NAN, f64::INFINITY] {
+            assert!(validate_fairness_weight(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_flood_cannot_hold_a_new_key_for_more_than_one_claim() {
+        let mut clock = FairClock::default();
+        for _ in 0..1_000 {
+            clock.charge("a", 1.0);
+        }
+        // A new key has lag 0; the flood's key has lag 1.
+        assert!(clock.lag("b") < clock.lag("a"));
+        assert_eq!(clock.pick([("a", 0u64), ("b", 9)]), Some("b"));
+    }
+
+    #[test]
+    fn a_heavier_key_gets_its_weight_in_claims() {
+        let mut clock = FairClock::default();
+        let mut served = [0u32; 2];
+        for _ in 0..400 {
+            let k = clock.pick([("light", 0u8), ("heavy", 0u8)]).unwrap();
+            served[usize::from(k == "heavy")] += 1;
+            clock.charge(k, if k == "heavy" { 3.0 } else { 1.0 });
+        }
+        assert_eq!(served, [100, 300]);
     }
 }

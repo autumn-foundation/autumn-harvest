@@ -496,6 +496,7 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )
@@ -593,6 +594,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )

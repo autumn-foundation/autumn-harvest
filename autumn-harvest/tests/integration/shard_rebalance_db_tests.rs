@@ -5063,6 +5063,7 @@ fn terminate_existing_start<'a>(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
     }
 }
 

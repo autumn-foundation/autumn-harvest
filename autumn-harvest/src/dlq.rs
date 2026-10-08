@@ -561,6 +561,9 @@ fn requeue_params(
     params.workflow_exec_id = entry.workflow_exec_id;
     params.activity_name = entry.activity_name;
     params.max_attempts = entry.attempts.max(1);
+    // The dead letter keeps the run's quota key. It is the redriven task's
+    // fairness key (issue #1976).
+    params.fairness_key = entry.quota_key;
     if let Some(at) = not_before {
         params.scheduled_at = at;
     }

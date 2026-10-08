@@ -1452,6 +1452,7 @@ fn e2e_start_params(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
     }
 }
 

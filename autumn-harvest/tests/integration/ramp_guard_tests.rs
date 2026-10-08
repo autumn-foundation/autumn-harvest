@@ -270,6 +270,7 @@ fn make_worker(build_id: &str, info: WorkflowInfo, metrics: Arc<RecordingMetrics
             max_workflow_history_events: None,
             slot_tuner: None,
             max_concurrent_sessions: 0,
+            fairness_keys: false,
         },
         registry,
     )
@@ -366,6 +367,7 @@ async fn start_run(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )

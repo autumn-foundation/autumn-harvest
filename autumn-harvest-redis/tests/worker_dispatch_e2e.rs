@@ -713,6 +713,7 @@ async fn start_workflow(
             start_source: StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
         },
         None,
     )

@@ -864,6 +864,7 @@ mod db_tests {
                         // this test is that whichever wins hosts *all* of
                         // the pipeline's member activities.
                         max_concurrent_sessions: 1,
+                        fairness_keys: false,
                     },
                     registry.clone(),
                 )

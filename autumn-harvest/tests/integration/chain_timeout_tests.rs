@@ -237,6 +237,7 @@ fn default_params(exec_id: ExecutionId, workflow_id: &str) -> StartWorkflowParam
         start_source: StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
     }
 }
 

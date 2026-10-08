@@ -121,6 +121,12 @@ pub struct StartWorkflowParams<'a> {
     /// replay determinism. Defaults to [`Priority::Normal`] so pre-upgrade
     /// callers that do not set this field are unaffected.
     pub priority: Priority,
+    /// The fairness key of the run (issue #1976).
+    ///
+    /// Stored on the run's task rows. A worker with fairness keys on rotates
+    /// its claims across the keys of a queue. `None` takes the run's quota
+    /// key, if any. Does not affect the event history or replay.
+    pub fairness_key: Option<String>,
     /// Maximum allowed byte size for the workflow input payload (issue #252).
     ///
     /// Enforced only on the fresh-insert path: duplicate collisions resolve
@@ -274,6 +280,7 @@ impl<'a> StartWorkflowParams<'a> {
             concurrency_limit: None,
             concurrency_on_conflict: ConcurrencyOnConflict::default(),
             priority: Priority::default(),
+            fairness_key: None,
             max_workflow_input_bytes: 0,
             start_at: None,
             delay: None,
@@ -556,6 +563,7 @@ mod start_params_new_tests {
             concurrency_limit,
             concurrency_on_conflict,
             priority,
+            fairness_key,
             max_workflow_input_bytes,
             start_at,
             delay,
@@ -599,6 +607,7 @@ mod start_params_new_tests {
         assert!(concurrency_limit.is_none());
         assert_eq!(concurrency_on_conflict, ConcurrencyOnConflict::Defer);
         assert_eq!(priority, Priority::Normal);
+        assert_eq!(fairness_key, None);
         assert_eq!(max_workflow_input_bytes, 0);
         assert!(start_at.is_none());
         assert!(delay.is_none());
@@ -1273,6 +1282,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // typed rejection (issue #946 Codex review, "bound resolved quota keys
     // before indexing them"). Rejecting rather than truncating/hashing is
     // deliberate -- see `quota::MAX_QUOTA_KEY_BYTES`'s doc comment for why.
+    // An explicit fairness key is caller input. Check it before any DB work.
+    if let Some(key) = request.fairness_key.as_deref() {
+        crate::queue_fairness::validate_fairness_key(key)?;
+    }
     if let Some(key) = quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
     {
@@ -1514,6 +1527,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
     enqueue.priority = request.priority.as_i32();
+    // The run's fairness key: the explicit key, else the quota key (issue
+    // #1976). Activities take it from this row.
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(
+        request.fairness_key.as_deref(),
+        quota_key.as_deref(),
+    );
     // A fresh admission yields to continuations at claim (issue #1824). A
     // workflow retry continues a failed run, so it does not yield.
     enqueue.new_start = request.retry_of_exec_id.is_none();
@@ -6778,8 +6797,9 @@ fn should_escalate_terminal_prior(
 ///
 /// A with-start call always begins a fresh chain origin, so the macro sets no
 /// inherited chain deadline (issue #617). The start step enforces the input
-/// cap, so the macro sets none. The macro leaves priority and `started_by` at
-/// their defaults.
+/// cap, so the macro sets none. The macro leaves priority, the fairness key
+/// and `started_by` at their defaults. The run then takes its quota key as
+/// its fairness key.
 macro_rules! with_start_params {
     ($request:ident, $exec_id:expr, $policy:expr, $source:expr, $source_ref:expr) => {
         crate::execution::StartWorkflowParams {
@@ -6803,6 +6823,7 @@ macro_rules! with_start_params {
             concurrency_limit: $request.concurrency_limit,
             concurrency_on_conflict: $request.concurrency_on_conflict,
             priority: crate::types::Priority::default(),
+            fairness_key: None,
             max_workflow_input_bytes: 0,
             start_at: None,
             delay: None,
@@ -8055,6 +8076,8 @@ pub async fn rerun_workflow_execution_with_codecs(
                 // Documented gap: priority (issue #249) lives on the task-queue
                 // row, not the execution row, so it cannot be recovered here.
                 priority: Priority::default(),
+                // Same gap as priority. The re-run takes its quota key.
+                fairness_key: None,
                 max_workflow_input_bytes: request.max_workflow_input_bytes,
                 start_at: None,
                 delay: None,

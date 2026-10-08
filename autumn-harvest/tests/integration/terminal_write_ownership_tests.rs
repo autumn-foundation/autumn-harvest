@@ -332,6 +332,7 @@ async fn persist_workflow_failure_makes_no_terminal_decision_when_the_claim_move
         None,
         None,
         autumn_harvest::types::Priority::default(),
+        None,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
         &mut Vec::new(),
     )
@@ -721,6 +722,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 None,
                 None,
                 autumn_harvest::types::Priority::default(),
+                None,
                 &autumn_harvest::payload_codec::PayloadCodecs::default(),
                 &mut Vec::new(),
             )
@@ -1041,6 +1043,7 @@ async fn persist_workflow_failure_rejects_a_stale_attempt_on_the_same_worker_180
         None,
         None,
         autumn_harvest::types::Priority::default(),
+        None,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
         &mut Vec::new(),
     )
