@@ -149,10 +149,23 @@ pub async fn send_signal_idempotent_with_codecs(
                 .map_err(crate::error::database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
+            // A keyed retry of a signal that already landed must still dedupe
+            // to `Ok(false)` when the codec fails now (issue #1979).
+            let payload = match codecs.encode_column(&payload) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    if let Some(key) = idempotency_key
+                        && signal_idempotency_key_exists(conn, exec_id, key).await?
+                    {
+                        return Ok(false);
+                    }
+                    return Err(error);
+                }
+            };
             let row = NewHarvestSignal {
                 workflow_exec_id: exec_id.as_uuid(),
                 signal_name,
-                payload: codecs.encode_column(&payload)?,
+                payload,
                 idempotency_key,
             };
 

@@ -1253,16 +1253,41 @@ mod db {
         unresolved: i64,
     }
 
-    /// Column cursors by shard id.
-    static COLUMN_CURSORS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<i32, ColumnCursor>>> =
+    /// Column cursors by database identity and shard id.
+    ///
+    /// One process can host several runtimes on different databases, so the
+    /// shard id alone is not a unique scope.
+    static COLUMN_CURSORS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, ColumnCursor>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
-    fn load_column_cursor(shard_id: i32, active_key_id: &str) -> ColumnCursor {
+    #[derive(diesel::QueryableByName)]
+    struct CursorScope {
+        #[diesel(sql_type = Text)]
+        scope: String,
+    }
+
+    /// The cursor key for this connection's database and `shard_id`.
+    async fn column_cursor_scope(
+        conn: &mut AsyncPgConnection,
+        shard_id: i32,
+    ) -> HarvestResult<String> {
+        let row: CursorScope = diesel::sql_query(
+            "SELECT current_database() || '@' \
+                 || COALESCE(host(inet_server_addr()), 'local') || ':' \
+                 || COALESCE(inet_server_port()::TEXT, '') AS scope",
+        )
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(format!("{}/{shard_id}", row.scope))
+    }
+
+    fn load_column_cursor(scope: &str, active_key_id: &str) -> ColumnCursor {
         let cursors = COLUMN_CURSORS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cursors
-            .get(&shard_id)
+            .get(scope)
             .filter(|cursor| cursor.active_key_id == active_key_id)
             .cloned()
             .unwrap_or_else(|| ColumnCursor {
@@ -1271,11 +1296,11 @@ mod db {
             })
     }
 
-    fn store_column_cursor(shard_id: i32, cursor: ColumnCursor) {
+    fn store_column_cursor(scope: String, cursor: ColumnCursor) {
         COLUMN_CURSORS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(shard_id, cursor);
+            .insert(scope, cursor);
     }
 
     /// Re-encrypt the codec columns onto `active_key_id` (issue #1979).
@@ -1293,7 +1318,8 @@ mod db {
         active_key_id: &str,
         batch_limit: i64,
     ) -> HarvestResult<ColumnPass> {
-        let mut cursor = load_column_cursor(shard.as_i32(), active_key_id);
+        let scope = column_cursor_scope(conn, shard.as_i32()).await?;
+        let mut cursor = load_column_cursor(&scope, active_key_id);
         let budget = usize::try_from(batch_limit).unwrap_or(usize::MAX);
         let key_id = key_id_expr("$1");
         let mut examined = 0usize;
@@ -1376,7 +1402,7 @@ mod db {
         let pass = if cursor.column >= CODEC_COLUMNS.len() {
             let unresolved = cursor.unresolved;
             store_column_cursor(
-                shard.as_i32(),
+                scope,
                 ColumnCursor {
                     active_key_id: active_key_id.to_string(),
                     ..ColumnCursor::default()
@@ -1388,7 +1414,7 @@ mod db {
                 pending: false,
             }
         } else {
-            store_column_cursor(shard.as_i32(), cursor);
+            store_column_cursor(scope, cursor);
             ColumnPass {
                 rewritten,
                 unresolved: 0,

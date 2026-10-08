@@ -608,14 +608,23 @@ fn replay_codecs(registry: Option<&HandlerRegistry>) -> &PayloadCodecs {
 
 /// The input as a dead-letter row stores it (issue #1979).
 ///
-/// The source task row can already hold an envelope. Decoding it once and
-/// then encoding keeps the row to one envelope layer. An input this registry
-/// cannot decode is already ciphertext, so it is kept as it is. A quarantine
-/// must not fail on a missing key.
+/// Only a workflow task row stores its input encoded. So only a workflow
+/// input is decoded once before it is encoded, which keeps the row to one
+/// envelope layer. An input this registry cannot decode is already
+/// ciphertext, so it is kept as it is. A quarantine must not fail on a
+/// missing key.
+///
+/// An activity or callback input is clear by design. It is encoded as it
+/// is, so an argument that only looks like an envelope is escaped, never
+/// unwrapped.
 fn dead_letter_input(
     codecs: &PayloadCodecs,
+    task_type: &str,
     input: &serde_json::Value,
 ) -> HarvestResult<serde_json::Value> {
+    if !task_type.eq_ignore_ascii_case("workflow") {
+        return codecs.encode_column(input);
+    }
     codecs
         .decode_column(input)
         .map_or_else(|_| Ok(input.clone()), |plain| codecs.encode_column(&plain))
@@ -734,7 +743,7 @@ pub async fn dead_letter_with_codecs(
         task_type: &entry.task_type,
         workflow_exec_id: entry.workflow_exec_id,
         activity_name: entry.activity_name.as_deref(),
-        input: dead_letter_input(codecs, &entry.input)?,
+        input: dead_letter_input(codecs, &entry.task_type, &entry.input)?,
         error: &entry.error,
         attempts: entry.attempts,
         owner: entry.owner.as_deref(),

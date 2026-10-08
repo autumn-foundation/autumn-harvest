@@ -4085,3 +4085,32 @@ async fn the_column_sweep_keeps_to_its_budget_and_finishes_over_several_ticks() 
         "the pass completes once the columns are clean"
     );
 }
+
+#[tokio::test]
+async fn two_databases_in_one_process_keep_separate_column_cursors() {
+    let (url_a, _a) = setup_isolated_db().await;
+    let (url_b, _b) = setup_isolated_db().await;
+    let mut conn_a = connect(&url_a).await;
+    let mut conn_b = connect(&url_b).await;
+    let codecs = two_key_registry();
+    for conn in [&mut conn_a, &mut conn_b] {
+        seed_codec_columns(conn, &codecs, "k1").await;
+        seed_codec_columns(conn, &codecs, "k1").await;
+    }
+    codecs.set_active_key("k2").expect("flip");
+
+    // Alternate the two shard-0 sweeps, as two runtimes in one process do.
+    // Each converts its 16 cells at 3 per tick, so 6 ticks each suffice
+    // when neither reuses the other's cursor.
+    let (mut total_a, mut total_b) = (0, 0);
+    for _ in 0..6 {
+        total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs, 3, &NoOpMetrics)
+            .await
+            .expect("sweep a");
+        total_b += sweep_codec_reencryption_once(&mut conn_b, 0, &codecs, 3, &NoOpMetrics)
+            .await
+            .expect("sweep b");
+    }
+    assert_eq!(total_a, 16, "database a converts every cell");
+    assert_eq!(total_b, 16, "database b converts every cell");
+}

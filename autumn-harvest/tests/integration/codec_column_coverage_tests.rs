@@ -631,3 +631,48 @@ async fn a_child_workflow_runs_on_plaintext_and_its_rows_hold_ciphertext() {
         assert_ciphertext(&input, INPUT_SECRET, "child workflow task input");
     }
 }
+
+#[tokio::test]
+async fn an_envelope_shaped_activity_input_survives_a_dead_letter_round_trip() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    // A clear activity argument that only looks like an identity envelope.
+    let shaped = json!({
+        autumn_harvest::payload_codec::CODEC_ENVELOPE_KEY: 1,
+        "codec_id": "identity",
+        "data": "e30=",
+    });
+    let entry = NewDeadLetterEntry {
+        original_task_id: Uuid::new_v4(),
+        queue_name: format!("cc-{}", Uuid::new_v4().simple()),
+        task_type: "ACTIVITY".to_string(),
+        workflow_exec_id: None,
+        activity_name: Some("cc_echo".to_string()),
+        input: shaped.clone(),
+        error: "boom".to_string(),
+        attempts: 1,
+        owner: None,
+        severity: None,
+    };
+    let dead_letter_id = dlq::dead_letter_with_codecs(&mut conn, &entry, &codecs)
+        .await
+        .expect("dead letter");
+    let registry = registry(Vec::new(), Vec::new(), &codecs);
+    let task_id = dlq::replay_dead_letter(&mut conn, dead_letter_id, Some(&registry))
+        .await
+        .expect("replay");
+    let requeued: Value = {
+        use autumn_harvest::schema::harvest_task_queue;
+        harvest_task_queue::table
+            .find(task_id)
+            .select(harvest_task_queue::input)
+            .first(&mut conn)
+            .await
+            .expect("load task")
+    };
+    assert_eq!(
+        requeued, shaped,
+        "the activity argument is replayed exactly as it was, never unwrapped"
+    );
+}
