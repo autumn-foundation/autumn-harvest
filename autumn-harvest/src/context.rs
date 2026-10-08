@@ -454,6 +454,28 @@ fn should_check_durable_cancellation(
 // WorkflowCommand -- commands emitted during live execution
 // ---------------------------------------------------------------------------
 
+/// Why a [`WorkflowCommand::CancelRaceLosers`] cancels its operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoserCancelReason {
+    /// A sibling branch of a race won.
+    #[default]
+    RaceLoser,
+    /// The cancellation scope that started the operations was cancelled
+    /// (issue #1984).
+    ScopeCancelled,
+}
+
+impl LoserCancelReason {
+    /// The error text of the synthetic terminal that the worker records.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::RaceLoser => "lost race to a sibling branch",
+            Self::ScopeCancelled => "cancelled by its cancellation scope",
+        }
+    }
+}
+
 /// A command emitted by the workflow coroutine during live (non-replay) execution.
 ///
 /// The worker drains these after the coroutine suspends, then schedules real
@@ -841,7 +863,12 @@ pub enum WorkflowCommand {
     ///   necessary terminal event to the parent's history and is idempotent
     ///   against an already-terminal child.
     /// - `timers`: deleting the still-pending `harvest_timers` row.
+    ///
+    /// A cancellation scope (issue #1984) pushes the same command for its
+    /// members. `reason` selects the text of the synthetic terminals.
     CancelRaceLosers {
+        /// Why the operations are cancelled.
+        reason: LoserCancelReason,
         /// Activity execution IDs of losing activity branches still open
         /// (`PENDING`/`RUNNING`) at race-resolution time.
         activities: Vec<ActivityExecId>,
@@ -1136,11 +1163,13 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("already_requested", already_requested)
                 .finish_non_exhaustive(),
             Self::CancelRaceLosers {
+                reason,
                 activities,
                 children,
                 timers,
             } => f
                 .debug_struct("CancelRaceLosers")
+                .field("reason", reason)
                 .field("activities", activities)
                 .field("children", children)
                 .field("timers", timers)
@@ -2762,6 +2791,12 @@ pub(crate) struct SagaUnwindObservation {
     pub(crate) counted: bool,
 }
 
+/// A buffered command and the cancellation scopes that issued it (issue #1984).
+struct BufferedCommand {
+    cmd: WorkflowCommand,
+    scopes: Vec<u32>,
+}
+
 /// Context passed to every workflow function.
 ///
 /// In **replay mode** (resuming from Postgres history): commands are matched
@@ -2779,7 +2814,8 @@ pub struct WorkflowContext {
     /// Replay engine -- matches commands against recorded event history.
     matcher: Mutex<HistoryMatcher>,
     /// Commands accumulated during live execution, drained by the worker.
-    commands: Mutex<Vec<WorkflowCommand>>,
+    /// Each command keeps the cancellation scopes that issued it (issue #1984).
+    commands: Mutex<Vec<BufferedCommand>>,
     /// Harvest futures parked with no result channel (issue #1797).
     parks: ParkCounter,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
@@ -2865,6 +2901,12 @@ pub struct WorkflowContext {
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
     /// replays, mirroring `fan_out_seq`.
     race_seq: Mutex<u32>,
+    /// Sequence counter for `ctx.cancellation_scope()` (issue #1984).
+    scope_seq: Mutex<u32>,
+    /// Sequence counter for `ctx.non_cancellable()` (issue #1984).
+    shield_seq: Mutex<u32>,
+    /// The scopes and shields whose body is polled now, innermost last.
+    scope_stack: Mutex<Vec<crate::cancellation_scope::ScopeFrame>>,
     /// Monotonically increasing counter for naming worker-session identity
     /// markers (issue #606). Each `create_session()` call increments this once
     /// so each session has a stable, unique `session:{seq}` marker name across
@@ -3568,6 +3610,9 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -3741,6 +3786,9 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -3812,6 +3860,9 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -8616,6 +8667,7 @@ impl WorkflowContext {
             // bookkeeping-only command.
             ChildOrTimerMatch::ChildCompleted { output } => {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities: Vec::new(),
                     children: Vec::new(),
                     timers: vec![TimerId::new(&timer_id)],
@@ -8631,6 +8683,7 @@ impl WorkflowContext {
                 // Child wins — tear down the deadline timer (see the
                 // `ChildCompleted` branch above for the retention rationale).
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities: Vec::new(),
                     children: Vec::new(),
                     timers: vec![TimerId::new(&timer_id)],
@@ -8659,6 +8712,7 @@ impl WorkflowContext {
                 // re-push so strict replay sees no spurious bookkeeping command.
                 if !child_already_terminal {
                     self.push_command(WorkflowCommand::CancelRaceLosers {
+                        reason: LoserCancelReason::RaceLoser,
                         activities: Vec::new(),
                         children: vec![child_id],
                         timers: Vec::new(),
@@ -9289,6 +9343,7 @@ impl WorkflowContext {
                 // mixed batch.)
                 if self.match_history(|m| m.history_contains_timer_started(&timer_id)) {
                     self.push_command(WorkflowCommand::CancelRaceLosers {
+                        reason: LoserCancelReason::RaceLoser,
                         activities: Vec::new(),
                         children: Vec::new(),
                         timers: vec![TimerId::new(&timer_id)],
@@ -12149,6 +12204,7 @@ impl WorkflowContext {
             self.match_history(|m| m.consume_race_loser_frontier(&activities, &children));
             if !activities.is_empty() || !children.is_empty() || !timers.is_empty() {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities,
                     children,
                     timers,
@@ -13760,6 +13816,9 @@ impl WorkflowContext {
     pub fn drain_commands(&self) -> Vec<WorkflowCommand> {
         let mut cmds = self.commands.lock().expect("commands lock poisoned");
         std::mem::take(&mut *cmds)
+            .into_iter()
+            .map(|buffered| buffered.cmd)
+            .collect()
     }
 
     /// Non-consuming count of the pending command buffer: returns how many
@@ -13792,7 +13851,7 @@ impl WorkflowContext {
             .lock()
             .expect("commands lock poisoned")
             .iter()
-            .filter(|c| pred(c))
+            .filter(|buffered| pred(&buffered.cmd))
             .count()
     }
 
@@ -13842,15 +13901,172 @@ impl WorkflowContext {
                 .lock()
                 .expect("commands lock poisoned")
                 .iter()
-                .any(WorkflowCommand::awaits_result)
+                .any(|buffered| buffered.cmd.awaits_result())
     }
 
     /// Push a command onto the pending commands queue.
-    fn push_command(&self, cmd: WorkflowCommand) {
-        self.commands
+    ///
+    /// The scopes on the scope stack see the command first (issue #1984). A
+    /// scope that holds commands keeps it, and the worker never gets it.
+    pub(crate) fn push_command(&self, cmd: WorkflowCommand) {
+        let routed = {
+            let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+            crate::cancellation_scope::route_command(&stack, cmd)
+        };
+        if let Some((cmd, scopes)) = routed {
+            self.commands
+                .lock()
+                .expect("commands lock poisoned")
+                .push(BufferedCommand { cmd, scopes });
+        }
+    }
+
+    // ── Cancellation scope support (issue #1984) ──────────────────────
+
+    /// Next cancellation-scope sequence number.
+    pub(crate) fn next_scope_seq(&self) -> u32 {
+        let mut seq = self.scope_seq.lock().expect("scope_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Next non-cancellable block sequence number.
+    pub(crate) fn next_shield_seq(&self) -> u32 {
+        let mut seq = self.shield_seq.lock().expect("shield_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Run `f` with `frame` on top of the scope stack.
+    pub(crate) fn with_scope_frame<R>(
+        &self,
+        frame: crate::cancellation_scope::ScopeFrame,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Pop<'a>(&'a Mutex<Vec<crate::cancellation_scope::ScopeFrame>>);
+        impl Drop for Pop<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut stack) = self.0.lock() {
+                    stack.pop();
+                }
+            }
+        }
+        self.scope_stack
             .lock()
-            .expect("commands lock poisoned")
-            .push(cmd);
+            .expect("scope stack lock poisoned")
+            .push(frame);
+        let _pop = Pop(&self.scope_stack);
+        f()
+    }
+
+    /// Whether a cancellable scope is on the scope stack.
+    pub(crate) fn in_cancellable_scope(&self) -> bool {
+        self.scope_stack
+            .lock()
+            .expect("scope stack lock poisoned")
+            .iter()
+            .any(crate::cancellation_scope::ScopeFrame::is_cancellable)
+    }
+
+    /// The number of history events that this cycle can see.
+    pub(crate) fn history_len(&self) -> usize {
+        self.matcher.lock().expect("matcher lock poisoned").len()
+    }
+
+    /// Run `f` while the matcher sees only the first `horizon` events.
+    ///
+    /// A cancelled scope replays its body this way. The body then sees the
+    /// history that it saw when the scope was cancelled live.
+    pub(crate) fn with_history_horizon<R>(&self, horizon: usize, f: impl FnOnce() -> R) -> R {
+        struct Restore<'a> {
+            matcher: &'a Mutex<HistoryMatcher>,
+            cut: Option<crate::replay::ViewCut>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                if let (Some(cut), Ok(mut matcher)) = (self.cut.take(), self.matcher.lock()) {
+                    matcher.restore_view(cut);
+                }
+            }
+        }
+        let cut = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .cut_view(horizon);
+        let _restore = Restore {
+            matcher: &self.matcher,
+            cut,
+        };
+        f()
+    }
+
+    /// Remove the buffered commands that scope `seq` issued, and return them.
+    ///
+    /// `ReleaseMutex` stays, so a guard dropped in the body still releases.
+    pub(crate) fn withdraw_scope_commands(&self, seq: u32) -> Vec<WorkflowCommand> {
+        let mut cmds = self.commands.lock().expect("commands lock poisoned");
+        let (withdrawn, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *cmds)
+                .into_iter()
+                .partition(|buffered| {
+                    buffered.scopes.contains(&seq)
+                        && !matches!(buffered.cmd, WorkflowCommand::ReleaseMutex { .. })
+                });
+        *cmds = kept;
+        withdrawn.into_iter().map(|buffered| buffered.cmd).collect()
+    }
+
+    /// Keep only the members whose start event is in history.
+    pub(crate) fn recorded_scope_members(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+    ) -> crate::cancellation_scope::ScopeMembers {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .recorded_members(members)
+    }
+
+    /// Find the details of an unconsumed marker without consuming it.
+    pub(crate) fn peek_marker_details(&self, name: &str) -> Option<Value> {
+        self.match_history(|m| m.unconsumed_marker_details(name))
+    }
+
+    /// Whether an unconsumed marker with this name is in history.
+    pub(crate) fn has_unconsumed_marker(&self, name: &str) -> bool {
+        self.match_history(|m| m.has_unconsumed_marker(name))
+    }
+
+    /// Consume the marker `name`, tolerating interleaved sibling events.
+    ///
+    /// Returns the marker's index and details, or `None` at the frontier.
+    pub(crate) fn take_marker(&self, name: &str) -> Option<(usize, Value)> {
+        self.match_history(|m| m.take_marker(name))
+    }
+
+    /// Consume the events of a cancelled scope's members on replay.
+    pub(crate) fn consume_scope_members(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+        timer_window: std::ops::Range<usize>,
+    ) {
+        self.match_history(|m| m.consume_scope_members(members, timer_window));
+    }
+
+    /// Consume the start and heartbeat events of members cancelled live.
+    pub(crate) fn consume_cancelled_member_frontier(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+    ) {
+        self.match_history(|m| {
+            m.consume_race_loser_frontier(&members.activities, &members.children);
+        });
+    }
+
+    /// Build a non-determinism error for a scope or a shield.
+    pub(crate) fn scope_nd_error(&self, reason: String, expected: String) -> HarvestError {
+        self.nd_error(reason, None, Some(expected), Some("no match".to_string()))
     }
 }
 
@@ -13915,8 +14131,8 @@ where
             }
             // Unconditionally clean up any stale StartTimer command pushed to commands queue.
             if let Ok(mut cmds) = this.context.commands.lock() {
-                cmds.retain(|cmd| {
-                    if let WorkflowCommand::StartTimer { timer_id: id, .. } = cmd {
+                cmds.retain(|buffered| {
+                    if let WorkflowCommand::StartTimer { timer_id: id, .. } = &buffered.cmd {
                         id.as_str() != this.timer_id
                     } else {
                         true
@@ -22500,6 +22716,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -22561,6 +22778,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -23427,6 +23645,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -23484,6 +23703,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -23716,6 +23936,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -28035,7 +28256,7 @@ mod tests {
         assert!(
             commands.iter().any(|c| matches!(
                 c,
-                WorkflowCommand::CancelRaceLosers { activities, children, timers }
+                WorkflowCommand::CancelRaceLosers { activities, children, timers, .. }
                     if activities.is_empty()
                         && children.is_empty()
                         && timers == &vec![TimerId::new(&timer_id)]

@@ -56,7 +56,7 @@ No route change.**
 | R4 | A sibling's event sits between the cursor and the cancel marker. | The marker is found with the tolerant scan that `ctx.race` uses for its winner marker. |
 | R5 | A non-cancellable block is dropped before it closes. The cancel then waits for ever. | `Drop` records the close marker, except when the cycle suspends. This is the `MutexGuard` rule. A terminate is never deferred. |
 | R6 | A non-cancellable block nests inside a cancellable scope. The scope drops the body and the block never closes. | Nesting in that order returns `HarvestError::Config`. The other order is allowed. |
-| R7 | A start policy that terminates the old run waits on a deferred cancel. | Those two callers use the non-deferring cancel. |
+| R7 | A start policy that replaces the old run, or a latest-wins supersede, waits on a deferred cancel. The new run then overlaps the old one. | `TerminateIfRunning`, signal-with-start replace and supersede use the non-deferring cancel. |
 | R8 | An N-1 worker reads `WorkflowCancelRequested` and fails to decode. | Only a run that uses `non_cancellable` gets the event. That code needs N. The upgrade guide lists it under known limits. |
 | R9 | The workflow sees the pending cancel through `is_cancelled()`. A cancel-checking primitive then fails on replay but not live. | `is_cancelled()` still reads only `WorkflowCancelled`. The pending cancel is invisible to workflow code. |
 

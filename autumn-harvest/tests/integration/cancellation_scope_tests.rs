@@ -102,7 +102,7 @@ static CLEANUP_GATE: AtomicBool = AtomicBool::new(false);
 
 fn gated_cleanup(_ctx: &autumn_harvest::ActivityContext, _input: Value) -> ActFuture {
     Box::pin(async move {
-        while !CLEANUP_GATE.load(Ordering::SeqCst) {
+        while !AtomicBool::load(&CLEANUP_GATE, Ordering::SeqCst) {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(json!("cleaned"))
@@ -202,7 +202,10 @@ async fn assert_replay_is_clean(
     let ctx = WorkflowContext::for_replay(exec_id, events);
     let replayed = handler(&ctx, Value::Null).await;
     assert_eq!(replayed.as_ref(), Ok(expected), "replay result");
-    assert!(ctx.take_nd_details().is_none(), "replay must be deterministic");
+    assert!(
+        ctx.take_nd_details().is_none(),
+        "replay must be deterministic"
+    );
     let commands = ctx.drain_commands();
     assert!(commands.is_empty(), "replay must add nothing: {commands:?}");
 }
@@ -248,7 +251,10 @@ async fn scope_cancel_tears_down_an_activity_a_timer_and_a_child() {
     assert_eq!(children[0].state, "CANCELLED", "the child is cancelled");
     assert!(timers.is_empty(), "the timer row is deleted: {timers:?}");
     assert_eq!(tasks.len(), 1, "{tasks:?}");
-    assert_eq!(tasks[0].state, "CANCELLED", "the activity task is cancelled");
+    assert_eq!(
+        tasks[0].state, "CANCELLED",
+        "the activity task is cancelled"
+    );
     assert!(
         history.events.iter().any(|e| matches!(
             e,
@@ -327,15 +333,22 @@ async fn non_cancellable_block_completes_after_the_workflow_is_cancelled() {
             .unwrap_or_else(|| panic!("event missing: {:?}", history.events))
     };
     let requested = position(&|e| matches!(e, WorkflowEvent::WorkflowCancelRequested { .. }));
-    let cleaned = position(&|e| {
-        matches!(e, WorkflowEvent::ActivityCompleted { output, .. } if output == &json!("cleaned"))
-    });
-    let closed = position(&|e| {
-        matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name == "non_cancellable_close:1")
-    });
+    let cleaned = position(
+        &|e| matches!(e, WorkflowEvent::ActivityCompleted { output, .. } if output == &json!("cleaned")),
+    );
+    let closed = position(
+        &|e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name == "non_cancellable_close:1"),
+    );
     let terminal = position(&|e| matches!(e, WorkflowEvent::WorkflowCancelled { .. }));
-    assert!(requested < cleaned, "the cleanup completes after the cancel");
-    assert!(cleaned < closed && closed < terminal, "{:?}", history.events);
+    assert!(
+        requested < cleaned,
+        "the cleanup completes after the cancel"
+    );
+    assert!(
+        cleaned < closed && closed < terminal,
+        "{:?}",
+        history.events
+    );
     assert!(
         tasks
             .iter()

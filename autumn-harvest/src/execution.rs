@@ -412,6 +412,10 @@ pub struct CancelledWorkflowExecution {
     pub queue_name: String,
     /// The state the execution was in before this transition.
     pub prior_state: String,
+    /// `true` when an open non-cancellable block deferred the cancel
+    /// (issue #1984). The run keeps running and `state` is its live state.
+    /// The engine cancels the run when the last open block closes.
+    pub deferred: bool,
 }
 
 impl CancelledWorkflowExecution {
@@ -437,6 +441,23 @@ impl CancelledWorkflowExecution {
             workflow_name: execution.workflow_name,
             queue_name: execution.queue_name,
             prior_state: execution.state,
+            deferred: false,
+        }
+    }
+
+    /// Result for a cancel that an open non-cancellable block deferred
+    /// (issue #1984).
+    fn deferred(exec_id: ExecutionId, execution: WorkflowExecution, reason: String) -> Self {
+        Self {
+            exec_id,
+            state: execution.state.clone(),
+            reason,
+            newly_cancelled: false,
+            failed_task_count: 0,
+            workflow_name: execution.workflow_name,
+            queue_name: execution.queue_name,
+            prior_state: execution.state,
+            deferred: true,
         }
     }
 
@@ -488,7 +509,86 @@ impl CancelledWorkflowExecution {
             workflow_name,
             queue_name,
             prior_state,
+            deferred: false,
         }
+    }
+}
+
+/// The deferred-cancel state of one history (issue #1984).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeferredCancelState {
+    /// Non-cancellable blocks that opened and did not close.
+    pub(crate) open_blocks: usize,
+    /// The reason of the first `WorkflowCancelRequested`, if any.
+    pub(crate) requested: Option<String>,
+}
+
+impl DeferredCancelState {
+    pub(crate) fn of(events: &[WorkflowEvent]) -> Self {
+        use crate::cancellation_scope::{SHIELD_CLOSE_MARKER_PREFIX, SHIELD_OPEN_MARKER_PREFIX};
+        let mut open = std::collections::HashSet::new();
+        let mut requested = None;
+        for event in events {
+            match event {
+                WorkflowEvent::MarkerRecorded { name, .. } => {
+                    if let Some(seq) = name.strip_prefix(SHIELD_OPEN_MARKER_PREFIX) {
+                        open.insert(seq);
+                    } else if let Some(seq) = name.strip_prefix(SHIELD_CLOSE_MARKER_PREFIX) {
+                        open.remove(seq);
+                    }
+                }
+                WorkflowEvent::WorkflowCancelRequested { reason } if requested.is_none() => {
+                    requested = Some(reason.clone());
+                }
+                _ => {}
+            }
+        }
+        Self {
+            open_blocks: open.len(),
+            requested,
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferred_cancel_state_tests {
+    use super::DeferredCancelState;
+    use crate::event::WorkflowEvent;
+
+    fn marker(name: &str) -> WorkflowEvent {
+        WorkflowEvent::MarkerRecorded {
+            name: name.into(),
+            details: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn counts_blocks_that_opened_and_did_not_close() {
+        let events = [
+            marker("non_cancellable_open:1"),
+            marker("non_cancellable_close:1"),
+            marker("non_cancellable_open:2"),
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "first".into(),
+            },
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "second".into(),
+            },
+            marker("race:1"),
+        ];
+
+        let state = DeferredCancelState::of(&events);
+
+        assert_eq!(state.open_blocks, 1);
+        assert_eq!(state.requested.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn no_block_and_no_request_is_the_default() {
+        assert_eq!(
+            DeferredCancelState::of(&[marker("race:1")]),
+            DeferredCancelState::default()
+        );
     }
 }
 
@@ -1389,7 +1489,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // Ignore Config errors: the execution may have transitioned to a terminal
         // state between the pre-check and the cancel lock. In that race the prior
         // run is already done, so we just continue to the start transaction below.
-        match cancel_workflow_execution_collect(
+        match cancel_workflow_execution_collect_now(
             conn,
             existing_exec_id,
             "terminated to start new execution",
@@ -3703,7 +3803,9 @@ async fn notify_awaited_parent_of_child_terminal(
 /// # Errors
 ///
 /// Same as [`cancel_workflow_execution`].
-#[allow(clippy::too_many_lines)]
+///
+/// An open non-cancellable block defers the cancel (issue #1984). See
+/// [`CancelledWorkflowExecution::deferred`].
 pub async fn cancel_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -3714,12 +3816,71 @@ pub async fn cancel_workflow_execution_collect(
     // recorder instead of unconditionally falling back to the process-global
     // one. `None` at every call site that never had a recorder in scope.
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<(
+) -> HarvestResult<CancelCollected> {
+    cancel_workflow_execution_collect_mode(conn, exec_id, reason, metrics, true).await
+}
+
+/// The result of [`cancel_workflow_execution_collect`]: the cancel, the
+/// deferred starts, the handler checks and the terminal metric labels.
+pub type CancelCollected = (
     CancelledWorkflowExecution,
     Vec<DeferredTriggerStart>,
     Vec<(ExecutionId, String)>,
     Option<(String, String)>,
-)> {
+);
+
+/// [`cancel_workflow_execution_collect`] that an open non-cancellable block
+/// does not defer (issue #1984).
+///
+/// For a caller that must end the run now: a start policy that replaces the
+/// running execution.
+///
+/// # Errors
+///
+/// Same as [`cancel_workflow_execution`].
+pub async fn cancel_workflow_execution_collect_now(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<CancelCollected> {
+    cancel_workflow_execution_collect_mode(conn, exec_id, reason, metrics, false).await
+}
+
+/// Complete a deferred cancel when no non-cancellable block is open
+/// (issue #1984).
+///
+/// The worker calls this inside a decision transaction that closed a block.
+/// Returns `None` when no cancel is pending or a block is still open.
+///
+/// # Errors
+///
+/// Same as [`cancel_workflow_execution`].
+pub(crate) async fn complete_deferred_cancel(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<Option<CancelCollected>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    let state = DeferredCancelState::of(&history.events);
+    match state.requested {
+        Some(reason) if state.open_blocks == 0 => {
+            cancel_workflow_execution_collect_mode(conn, exec_id, &reason, metrics, true)
+                .await
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn cancel_workflow_execution_collect_mode(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    defer_for_open_blocks: bool,
+) -> HarvestResult<CancelCollected> {
     let reason = reason.trim();
     let reason = if reason.is_empty() {
         "workflow cancellation requested".to_string()
@@ -3782,6 +3943,35 @@ pub async fn cancel_workflow_execution_collect(
                 }
             }
 
+            // Undecoded: this reads `next_event_id` and the marker names only
+            // (see the loader's docs). Payload codecs never encode those.
+            let history = store::load_history_undecoded(conn, exec_id).await?;
+
+            // Issue #1984: an open non-cancellable block defers the cancel.
+            // The request is recorded once. State and tasks stay as they are.
+            if defer_for_open_blocks {
+                let pending = DeferredCancelState::of(&history.events);
+                if pending.open_blocks > 0 {
+                    if pending.requested.is_none() {
+                        store::append_events_with_codecs(
+                            conn,
+                            exec_id,
+                            &[WorkflowEvent::WorkflowCancelRequested {
+                                reason: reason.clone(),
+                            }],
+                            history.next_event_id,
+                            &crate::store::DEFAULT_PAYLOAD_CODECS,
+                        )
+                        .await?;
+                    }
+                    return Ok((
+                        CancelledWorkflowExecution::deferred(exec_id, execution, reason),
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+            }
+
             let deleted_pending = diesel::delete(
                 crate::schema::harvest_task_queue::table
                     .filter(
@@ -3796,8 +3986,6 @@ pub async fn cancel_workflow_execution_collect(
             .await
             .map_err(database_error)?;
 
-            // Undecoded: this reads `next_event_id` only (see the loader's docs).
-            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -7340,7 +7528,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                 && matches!(prior.state.as_str(), "RUNNING" | "PAUSED")
             {
                 let prior_exec_id = ExecutionId::from_uuid(prior.id);
-                match cancel_workflow_execution_collect(
+                match cancel_workflow_execution_collect_now(
                     conn,
                     prior_exec_id,
                     "terminated by signal-with-start",

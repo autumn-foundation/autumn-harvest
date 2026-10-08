@@ -5,50 +5,562 @@
 //! cancel. See `DESIGN-1984.md` for the design record.
 
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll, Waker};
 
-use crate::context::WorkflowContext;
-use crate::error::HarvestResult;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::context::{LoserCancelReason, WorkflowCommand, WorkflowContext};
+use crate::error::{HarvestError, HarvestResult};
+use crate::types::{ActivityExecId, ExecutionId, TimerId};
+
+/// The reason that a cancelled scope reports.
+const SCOPE_CANCEL_REASON: &str = "cancellation scope cancelled";
+
+/// The marker that records the cancel decision of scope `seq`.
+fn cancel_marker_name(seq: u32) -> String {
+    format!("cancel_scope:{seq}")
+}
+
+/// The marker that opens non-cancellable block `seq`.
+pub(crate) fn shield_open_marker_name(seq: u32) -> String {
+    format!("{SHIELD_OPEN_MARKER_PREFIX}{seq}")
+}
+
+/// The marker that closes non-cancellable block `seq`.
+pub(crate) fn shield_close_marker_name(seq: u32) -> String {
+    format!("{SHIELD_CLOSE_MARKER_PREFIX}{seq}")
+}
+
+/// Name prefix of the marker that opens a non-cancellable block.
+pub const SHIELD_OPEN_MARKER_PREFIX: &str = "non_cancellable_open:";
+
+/// Name prefix of the marker that closes a non-cancellable block.
+pub const SHIELD_CLOSE_MARKER_PREFIX: &str = "non_cancellable_close:";
+
+/// The operations that a scope cancels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ScopeMembers {
+    #[serde(default)]
+    pub(crate) activities: Vec<ActivityExecId>,
+    #[serde(default)]
+    pub(crate) children: Vec<ExecutionId>,
+    #[serde(default)]
+    pub(crate) timers: Vec<TimerId>,
+}
+
+impl ScopeMembers {
+    /// Add the activity, timer or child that `cmd` starts or waits on.
+    fn add_from(&mut self, cmd: &WorkflowCommand) {
+        match cmd {
+            WorkflowCommand::ScheduleActivity { activity_id, .. }
+            | WorkflowCommand::WaitForActivity { activity_id, .. } => {
+                if !self.activities.contains(activity_id) {
+                    self.activities.push(*activity_id);
+                }
+            }
+            WorkflowCommand::StartChildWorkflow { child_id, .. } => {
+                if !self.children.contains(child_id) {
+                    self.children.push(*child_id);
+                }
+            }
+            WorkflowCommand::StartTimer { timer_id, .. }
+            | WorkflowCommand::ArmTimer {
+                timer_id,
+                for_await: true,
+                ..
+            } => {
+                if !self.timers.contains(timer_id) {
+                    self.timers.push(timer_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.activities.is_empty() && self.children.is_empty() && self.timers.is_empty()
+    }
+}
+
+/// The details of a `cancel_scope:{seq}` marker.
+#[derive(Debug, Serialize, Deserialize)]
+struct CancelMarker {
+    reason: String,
+    /// The number of history events that the cancelling cycle saw.
+    horizon: usize,
+    #[serde(flatten)]
+    members: ScopeMembers,
+}
+
+/// One entry of the context's scope stack.
+#[derive(Clone)]
+pub(crate) enum ScopeFrame {
+    /// The body of a cancellable scope is being polled.
+    Cancellable(Arc<ScopeShared>),
+    /// The body of a non-cancellable block is being polled.
+    Shield,
+}
+
+impl ScopeFrame {
+    pub(crate) const fn is_cancellable(&self) -> bool {
+        matches!(self, Self::Cancellable(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Running,
+    Done,
+}
+
+/// State that a scope handle and its run future share.
+pub(crate) struct ScopeShared {
+    seq: u32,
+    inner: Mutex<ScopeInner>,
+}
+
+struct ScopeInner {
+    phase: Phase,
+    cancel_requested: bool,
+    waker: Option<Waker>,
+    /// On replay of a cancelled scope, the body's commands stay here.
+    holding: bool,
+    held: Vec<WorkflowCommand>,
+    members: ScopeMembers,
+}
+
+impl ScopeShared {
+    fn lock(&self) -> MutexGuard<'_, ScopeInner> {
+        self.inner.lock().expect("scope lock poisoned")
+    }
+}
+
+/// Route `cmd` through the scope stack, innermost scope first.
+///
+/// A shield stops the walk. A holding scope keeps the command and returns
+/// `None`. Otherwise each scope records the command's operation as a member,
+/// and the command goes to the buffer tagged with the scope numbers.
+pub(crate) fn route_command(
+    stack: &[ScopeFrame],
+    cmd: WorkflowCommand,
+) -> Option<(WorkflowCommand, Vec<u32>)> {
+    let scopes: Vec<&Arc<ScopeShared>> = stack
+        .iter()
+        .rev()
+        .map_while(|frame| match frame {
+            ScopeFrame::Cancellable(shared) => Some(shared),
+            ScopeFrame::Shield => None,
+        })
+        .collect();
+    // The outermost holding scope lives longest, so it keeps the command.
+    if let Some(holder) = scopes.iter().rev().find(|shared| shared.lock().holding) {
+        holder.lock().held.push(cmd);
+        return None;
+    }
+    let mut tags = Vec::with_capacity(scopes.len());
+    for shared in scopes {
+        shared.lock().members.add_from(&cmd);
+        tags.push(shared.seq);
+    }
+    Some((cmd, tags))
+}
 
 /// A group of workflow operations that cancel together (issue #1984).
 ///
-/// Create one with [`WorkflowContext::cancellation_scope`].
+/// Create one with [`WorkflowContext::cancellation_scope`]. Run a body in
+/// it with [`run`](Self::run). The scope tracks each activity, timer and
+/// child workflow that the body starts. [`cancel`](Self::cancel) cancels all
+/// of them. The run future then returns [`HarvestError::Cancelled`].
+///
+/// The cancel decision is a recorded marker, so a replay takes the same
+/// decision at the same point.
+///
+/// ```rust,no_run
+/// use autumn_harvest::{HarvestError, HarvestResult, WorkflowContext};
+/// use serde_json::Value;
+///
+/// # async fn example(ctx: &WorkflowContext) -> HarvestResult<Value> {
+/// let scope = ctx.cancellation_scope();
+/// let (charged, ()) = tokio::join!(
+///     scope.run(ctx.execute_activity_raw("charge", Value::Null, "default")),
+///     async {
+///         let _ = ctx.wait_for_signal("abort").await;
+///         scope.cancel();
+///     },
+/// );
+/// match charged {
+///     Err(HarvestError::Cancelled(_)) => Ok(Value::from("aborted")),
+///     other => other?,
+/// }
+/// # }
+/// ```
+///
+/// Local activities, external activities and detached children are not
+/// cancelled, but the body still stops. A scope runs one body only.
+#[derive(Clone)]
 pub struct CancellationScope<'a> {
     ctx: &'a WorkflowContext,
+    shared: Arc<ScopeShared>,
 }
 
 impl<'a> CancellationScope<'a> {
-    pub(crate) const fn new(ctx: &'a WorkflowContext) -> Self {
-        Self { ctx }
+    fn new(ctx: &'a WorkflowContext) -> Self {
+        Self {
+            ctx,
+            shared: Arc::new(ScopeShared {
+                seq: ctx.next_scope_seq(),
+                inner: Mutex::new(ScopeInner {
+                    phase: Phase::Idle,
+                    cancel_requested: false,
+                    waker: None,
+                    holding: false,
+                    held: Vec::new(),
+                    members: ScopeMembers::default(),
+                }),
+            }),
+        }
     }
 
     /// Run `body` inside this scope.
     ///
+    /// The future returns `Ok` with the body's output when the body
+    /// completes first. It returns `Err` when the scope is cancelled first.
+    /// The body is then dropped.
+    ///
     /// # Errors
     ///
-    /// Returns `HarvestError::Cancelled` when the scope is cancelled first.
-    pub async fn run<F: Future>(&self, body: F) -> HarvestResult<F::Output> {
-        let _ = self.ctx;
-        Ok(body.await)
+    /// - [`HarvestError::Cancelled`] when the scope is cancelled first.
+    /// - [`HarvestError::Config`] when the scope already ran a body.
+    /// - [`HarvestError::NonDeterministic`] when replay cannot find the
+    ///   recorded cancel.
+    pub fn run<F: Future>(&self, body: F) -> ScopeRun<'a, F> {
+        ScopeRun {
+            ctx: self.ctx,
+            shared: Arc::clone(&self.shared),
+            body: Some(Box::pin(body)),
+            started: false,
+            finished: false,
+            replay: None,
+        }
     }
 
-    /// Cancel every operation that the body started.
-    pub const fn cancel(&self) {}
+    /// Cancel every activity, timer and child workflow that the body started.
+    ///
+    /// The cancel takes effect at the next poll of the run future. A cancel
+    /// after the body completes does nothing.
+    pub fn cancel(&self) {
+        let waker = {
+            let mut inner = self.shared.lock();
+            if inner.phase == Phase::Done {
+                return;
+            }
+            inner.cancel_requested = true;
+            inner.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Whether [`cancel`](Self::cancel) was called before the body completed.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.shared.lock().cancel_requested
+    }
+}
+
+/// The future that [`CancellationScope::run`] returns.
+#[must_use = "futures do nothing unless you .await or poll them"]
+pub struct ScopeRun<'a, F: Future> {
+    ctx: &'a WorkflowContext,
+    shared: Arc<ScopeShared>,
+    body: Option<Pin<Box<F>>>,
+    started: bool,
+    finished: bool,
+    /// The recorded cancel, when this run replays a cancelled scope.
+    replay: Option<CancelMarker>,
+}
+
+impl<F: Future> ScopeRun<'_, F> {
+    /// Look for this scope's recorded cancel before the first poll.
+    fn start(&mut self) -> HarvestResult<()> {
+        {
+            let mut inner = self.shared.lock();
+            if inner.phase != Phase::Idle {
+                return Err(HarvestError::Config(format!(
+                    "cancellation scope {} already ran a body",
+                    self.shared.seq
+                )));
+            }
+            inner.phase = Phase::Running;
+        }
+        let name = cancel_marker_name(self.shared.seq);
+        if let Some(details) = self.ctx.peek_marker_details(&name) {
+            let marker = parse_cancel_marker(self.ctx, &name, details)?;
+            self.shared.lock().holding = true;
+            self.replay = Some(marker);
+        }
+        Ok(())
+    }
+
+    /// Settle a cancelled scope: replay the recorded cancel or record it.
+    fn settle_cancel(&mut self) -> HarvestResult<F::Output> {
+        let ctx = self.ctx;
+        let seq = self.shared.seq;
+        let name = cancel_marker_name(seq);
+        let mut withdrawn = Vec::new();
+        let result = if let Some((index, details)) = ctx.take_marker(&name) {
+            parse_cancel_marker(ctx, &name, details).map(|marker| {
+                ctx.consume_scope_members(&marker.members, marker.horizon..index);
+                marker.reason
+            })
+        } else if self.replay.is_some() || ctx.has_unconsumed_marker(&name) {
+            Err(ctx.scope_nd_error(
+                format!(
+                    "cancellation scope {seq}: the recorded cancel is not at this point on \
+                     replay"
+                ),
+                name,
+            ))
+        } else {
+            withdrawn = ctx.withdraw_scope_commands(seq);
+            let members = ctx.recorded_scope_members(&self.shared.lock().members);
+            ctx.consume_cancelled_member_frontier(&members);
+            let marker = CancelMarker {
+                reason: SCOPE_CANCEL_REASON.to_string(),
+                horizon: ctx.history_len(),
+                members,
+            };
+            ctx.push_command(WorkflowCommand::RecordMarker {
+                name,
+                details: serde_json::to_value(&marker).unwrap_or(Value::Null),
+            });
+            if !marker.members.is_empty() {
+                ctx.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::ScopeCancelled,
+                    activities: marker.members.activities,
+                    children: marker.members.children,
+                    timers: marker.members.timers,
+                });
+            }
+            Ok(marker.reason)
+        };
+        // Drop the body before the commands that hold its result channels.
+        self.body = None;
+        drop(withdrawn);
+        result.and_then(|reason| Err(HarvestError::Cancelled(reason)))
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        self.body = None;
+        let held = {
+            let mut inner = self.shared.lock();
+            inner.phase = Phase::Done;
+            inner.holding = false;
+            inner.waker = None;
+            std::mem::take(&mut inner.held)
+        };
+        drop(held);
+    }
+}
+
+fn parse_cancel_marker(
+    ctx: &WorkflowContext,
+    name: &str,
+    details: Value,
+) -> HarvestResult<CancelMarker> {
+    serde_json::from_value(details).map_err(|e| {
+        ctx.scope_nd_error(
+            format!("{name}: the recorded cancel cannot be read: {e}"),
+            name.to_string(),
+        )
+    })
+}
+
+impl<F: Future> Future for ScopeRun<'_, F> {
+    type Output = HarvestResult<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Err(HarvestError::Config(
+                "cancellation scope run polled after it finished".to_string(),
+            )));
+        }
+        if !this.started {
+            this.started = true;
+            if let Err(err) = this.start() {
+                this.finished = true;
+                this.body = None;
+                return Poll::Ready(Err(err));
+            }
+        }
+        this.shared.lock().waker = Some(cx.waker().clone());
+
+        let ctx = this.ctx;
+        let horizon = this.replay.as_ref().map(|marker| marker.horizon);
+        if let Some(body) = this.body.as_mut() {
+            let frame = ScopeFrame::Cancellable(Arc::clone(&this.shared));
+            let polled = ctx.with_scope_frame(frame, || match horizon {
+                Some(horizon) => ctx.with_history_horizon(horizon, || body.as_mut().poll(cx)),
+                None => body.as_mut().poll(cx),
+            });
+            if let Poll::Ready(value) = polled {
+                if horizon.is_none() {
+                    this.finish();
+                    return Poll::Ready(Ok(value));
+                }
+                // On replay the live body did not complete before the cancel.
+                this.body = None;
+            }
+        }
+
+        if !this.shared.lock().cancel_requested {
+            return Poll::Pending;
+        }
+        let result = this.settle_cancel();
+        this.finish();
+        Poll::Ready(result)
+    }
+}
+
+/// The future that [`WorkflowContext::non_cancellable`] returns.
+#[must_use = "futures do nothing unless you .await or poll them"]
+pub struct NonCancellable<'a, F: Future> {
+    ctx: &'a WorkflowContext,
+    body: Option<Pin<Box<F>>>,
+    seq: Option<u32>,
+    open: bool,
+    finished: bool,
+}
+
+/// Replay the shield marker `name`, or record it live.
+fn record_shield_marker(ctx: &WorkflowContext, name: String) -> HarvestResult<()> {
+    if ctx.take_marker(&name).is_some() {
+        return Ok(());
+    }
+    if ctx.has_unconsumed_marker(&name) {
+        return Err(ctx.scope_nd_error(
+            format!("{name}: the recorded marker is not at this point on replay"),
+            name,
+        ));
+    }
+    ctx.push_command(WorkflowCommand::RecordMarker {
+        name,
+        details: Value::Null,
+    });
+    Ok(())
+}
+
+impl<F: Future> Future for NonCancellable<'_, F> {
+    type Output = HarvestResult<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Err(HarvestError::Config(
+                "non-cancellable block polled after it finished".to_string(),
+            )));
+        }
+        let ctx = this.ctx;
+        let seq = match this.seq {
+            Some(seq) => seq,
+            None => {
+                if ctx.in_cancellable_scope() {
+                    this.finished = true;
+                    this.body = None;
+                    return Poll::Ready(Err(HarvestError::Config(
+                        "ctx.non_cancellable cannot run inside a cancellation scope".to_string(),
+                    )));
+                }
+                let seq = ctx.next_shield_seq();
+                this.seq = Some(seq);
+                if let Err(err) = record_shield_marker(ctx, shield_open_marker_name(seq)) {
+                    this.finished = true;
+                    this.body = None;
+                    return Poll::Ready(Err(err));
+                }
+                this.open = true;
+                seq
+            }
+        };
+        let Some(body) = this.body.as_mut() else {
+            return Poll::Pending;
+        };
+        let polled = ctx.with_scope_frame(ScopeFrame::Shield, || body.as_mut().poll(cx));
+        let Poll::Ready(value) = polled else {
+            return Poll::Pending;
+        };
+        this.body = None;
+        this.finished = true;
+        this.open = false;
+        Poll::Ready(record_shield_marker(ctx, shield_close_marker_name(seq)).map(|()| value))
+    }
+}
+
+impl<F: Future> Drop for NonCancellable<'_, F> {
+    /// A block dropped before it completes still closes, so it cannot defer
+    /// a workflow cancel for ever. A suspension drops every future, so it
+    /// closes nothing (the `MutexGuard` rule).
+    fn drop(&mut self) {
+        if let Some(seq) = self.seq
+            && self.open
+            && !self.ctx.is_suspending()
+        {
+            self.body = None;
+            let _ = record_shield_marker(self.ctx, shield_close_marker_name(seq));
+        }
+    }
 }
 
 impl WorkflowContext {
     /// Create a [`CancellationScope`] (issue #1984).
     #[must_use]
-    pub const fn cancellation_scope(&self) -> CancellationScope<'_> {
+    pub fn cancellation_scope(&self) -> CancellationScope<'_> {
         CancellationScope::new(self)
     }
 
     /// Run `body` so that a workflow cancel cannot stop it (issue #1984).
     ///
+    /// The block records a marker when it opens and when it closes. A
+    /// workflow cancel that arrives while a block is open is deferred. The
+    /// cancel request is recorded as `WorkflowCancelRequested`, and the run
+    /// continues. When the last open block closes, the engine cancels the
+    /// run at the end of that cycle. A terminate is never deferred.
+    ///
+    /// Workflow code does not see a deferred cancel: `is_cancelled` stays
+    /// `false` until the cancel completes.
+    ///
+    /// ```rust,no_run
+    /// use autumn_harvest::{HarvestResult, WorkflowContext};
+    /// use serde_json::Value;
+    ///
+    /// # async fn example(ctx: &WorkflowContext) -> HarvestResult<Value> {
+    /// let released = ctx
+    ///     .non_cancellable(ctx.execute_activity_raw("release_hold", Value::Null, "default"))
+    ///     .await??;
+    /// # Ok(released)
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
-    /// Returns `HarvestError::Config` inside a cancellable scope.
-    pub async fn non_cancellable<F: Future>(&self, body: F) -> HarvestResult<F::Output> {
-        Ok(body.await)
+    /// The future returns [`HarvestError::Config`] inside a cancellable
+    /// scope, and [`HarvestError::NonDeterministic`] when replay cannot find
+    /// a recorded marker.
+    pub fn non_cancellable<F: Future>(&self, body: F) -> NonCancellable<'_, F> {
+        NonCancellable {
+            ctx: self,
+            body: Some(Box::pin(body)),
+            seq: None,
+            open: false,
+            finished: false,
+        }
     }
 }
 
@@ -139,8 +651,10 @@ mod tests {
     #[tokio::test]
     async fn scope_cancel_cancels_an_in_flight_activity() {
         let a = ActivityExecId::new();
-        let ctx =
-            WorkflowContext::for_replay(ExecutionId::new(), vec![started(), scheduled(a, "charge")]);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![started(), scheduled(a, "charge")],
+        );
 
         let result = bounded(run_then_cancel(
             &ctx,
@@ -148,13 +662,22 @@ mod tests {
         ))
         .await;
 
-        assert!(matches!(result, Err(HarvestError::Cancelled(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
         let commands = ctx.drain_commands();
         let losers = losers(&commands).expect("the scope must cancel its members");
         assert_eq!(losers.activities, vec![a]);
-        assert!(marker(&commands, "cancel_scope:1").is_some(), "{commands:?}");
+        assert!(
+            marker(&commands, "cancel_scope:1").is_some(),
+            "{commands:?}"
+        );
         assert_eq!(
-            count(&commands, |c| matches!(c, WorkflowCommand::WaitForActivity { .. })),
+            count(&commands, |c| matches!(
+                c,
+                WorkflowCommand::WaitForActivity { .. }
+            )),
             0,
             "a cancelled member must not park again: {commands:?}"
         );
@@ -175,12 +698,18 @@ mod tests {
 
         let result = bounded(run_then_cancel(&ctx, ctx.timer("deadline", 60))).await;
 
-        assert!(matches!(result, Err(HarvestError::Cancelled(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
         let commands = ctx.drain_commands();
         let losers = losers(&commands).expect("the scope must cancel its members");
         assert_eq!(losers.timers, vec![TimerId::new("deadline")]);
         assert_eq!(
-            count(&commands, |c| matches!(c, WorkflowCommand::StartTimer { .. })),
+            count(&commands, |c| matches!(
+                c,
+                WorkflowCommand::StartTimer { .. }
+            )),
             0,
             "a cancelled timer must not be armed again: {commands:?}"
         );
@@ -207,12 +736,18 @@ mod tests {
         ))
         .await;
 
-        assert!(matches!(result, Err(HarvestError::Cancelled(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
         let commands = ctx.drain_commands();
         let losers = losers(&commands).expect("the scope must cancel its members");
         assert_eq!(losers.children, vec![child]);
         assert_eq!(
-            count(&commands, |c| matches!(c, WorkflowCommand::StartChildWorkflow { .. })),
+            count(&commands, |c| matches!(
+                c,
+                WorkflowCommand::StartChildWorkflow { .. }
+            )),
             0,
             "a cancelled child must not be started again: {commands:?}"
         );
@@ -233,9 +768,15 @@ mod tests {
         }))
         .await;
 
-        assert!(matches!(result, Err(HarvestError::Cancelled(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
         let commands = ctx.drain_commands();
-        assert!(marker(&commands, "cancel_scope:1").is_some(), "{commands:?}");
+        assert!(
+            marker(&commands, "cancel_scope:1").is_some(),
+            "{commands:?}"
+        );
         assert_eq!(
             count(&commands, |c| matches!(
                 c,
@@ -268,10 +809,16 @@ mod tests {
 
         let result = bounded(scope.run(ctx.timer("deadline", 60))).await;
 
-        assert!(matches!(result, Err(HarvestError::Cancelled(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
         let commands = ctx.drain_commands();
         assert_eq!(
-            count(&commands, |c| matches!(c, WorkflowCommand::StartTimer { .. })),
+            count(&commands, |c| matches!(
+                c,
+                WorkflowCommand::StartTimer { .. }
+            )),
             0,
             "{commands:?}"
         );
@@ -291,11 +838,17 @@ mod tests {
 
     /// The workflow under the replay tests. Cycle 1 starts `charge` and
     /// waits for `abort`. The signal cancels the scope. The workflow then
-    /// runs `cleanup`.
+    /// runs `cleanup`. The body runs `ship` after `charge`, so a replay that
+    /// sees a completion the live cycle did not see would diverge.
     async fn charge_or_abort(ctx: &WorkflowContext) -> HarvestResult<Value> {
         let scope = ctx.cancellation_scope();
         let (charged, ()) = tokio::join!(
-            scope.run(ctx.execute_activity_raw("charge", Value::Null, "default")),
+            scope.run(async {
+                ctx.execute_activity_raw("charge", Value::Null, "default")
+                    .await?;
+                ctx.execute_activity_raw("ship", Value::Null, "default")
+                    .await
+            }),
             async {
                 let _ = ctx.wait_for_signal("abort").await;
                 scope.cancel();
@@ -397,6 +950,51 @@ mod tests {
         replay_after_scope_cancel(true).await;
     }
 
+    /// A deferred cancel lands between a schedule and its completion.
+    /// Replay skips it, and the next command lands at the frontier.
+    #[tokio::test]
+    async fn replay_skips_a_deferred_cancel_request() {
+        let a = ActivityExecId::new();
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                scheduled(a, "cleanup"),
+                WorkflowEvent::WorkflowCancelRequested {
+                    reason: "operator abort".into(),
+                },
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: a,
+                    output: json!("cleaned"),
+                },
+            ],
+        );
+
+        let cleaned = bounded(ctx.execute_activity_raw("cleanup", Value::Null, "default")).await;
+        let next = tokio::time::timeout(
+            Duration::from_millis(50),
+            ctx.execute_activity_raw("next", Value::Null, "default"),
+        )
+        .await;
+
+        assert_eq!(cleaned.ok(), Some(json!("cleaned")));
+        assert!(next.is_err(), "the next activity parks at the frontier");
+        assert!(ctx.take_nd_details().is_none());
+        assert!(
+            !ctx.is_cancelled(),
+            "workflow code does not see the request"
+        );
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            count(&commands, |c| matches!(
+                c,
+                WorkflowCommand::ScheduleActivity { .. }
+            )),
+            1,
+            "{commands:?}"
+        );
+    }
+
     #[tokio::test]
     async fn non_cancellable_records_open_and_close_markers() {
         let ctx = WorkflowContext::new_test();
@@ -405,8 +1003,14 @@ mod tests {
 
         assert!(matches!(value, Ok(3)), "{value:?}");
         let commands = ctx.drain_commands();
-        assert!(marker(&commands, "non_cancellable_open:1").is_some(), "{commands:?}");
-        assert!(marker(&commands, "non_cancellable_close:1").is_some(), "{commands:?}");
+        assert!(
+            marker(&commands, "non_cancellable_open:1").is_some(),
+            "{commands:?}"
+        );
+        assert!(
+            marker(&commands, "non_cancellable_close:1").is_some(),
+            "{commands:?}"
+        );
     }
 
     #[tokio::test]

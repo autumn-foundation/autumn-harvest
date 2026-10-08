@@ -109,6 +109,11 @@ roll.
 - **API token scopes.** A 0.6 API server reads an `admin` token as `read`.
   It also lets a `mutate` token reach admin routes (issue #1803 is 0.7
   only). Mint `admin` tokens after the roll.
+- **Non-cancellable blocks (issue #1984).** A cancel that finds an open
+  `ctx.non_cancellable` block writes the new `WorkflowCancelRequested`
+  event. A worker of an earlier version cannot read it. Only a run whose
+  code calls `ctx.non_cancellable` gets the event, and that code needs the
+  new version. Deploy such code after the roll.
 - **Codec key rotation, shard rebalancing, DR fencing and
   `harvest partition enable`.** 0.6 does not know these features. Start
   them after the roll. The codec fleet gate above enforces this for key

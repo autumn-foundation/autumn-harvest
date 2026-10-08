@@ -6221,6 +6221,7 @@ impl WorkflowTestEnv {
                 // path's `CancelRaceLosers` handling in `process_command`. Timers
                 // carry no history footprint in the harness.
                 WorkflowCommand::CancelRaceLosers {
+                    reason,
                     activities,
                     children,
                     timers: _,
@@ -6228,7 +6229,7 @@ impl WorkflowTestEnv {
                     for activity_id in activities {
                         history.push(WorkflowEvent::ActivityFailed {
                             activity_id: *activity_id,
-                            error: "lost race to a sibling branch".to_string(),
+                            error: reason.message().to_string(),
                             attempt: 1,
                             error_type: "Error".to_string(),
                             non_retryable: true,
@@ -6238,7 +6239,7 @@ impl WorkflowTestEnv {
                     for child_id in children {
                         history.push(WorkflowEvent::child_workflow_failed(
                             *child_id,
-                            "lost race to a sibling branch".to_string(),
+                            reason.message().to_string(),
                         ));
                     }
                 }
@@ -6663,6 +6664,7 @@ impl WorkflowTestEnv {
             // `ActivityInProgress`/`ChildInProgress`. Timers carry no history
             // footprint in the harness (no `harvest_timers` table to clean up).
             WorkflowCommand::CancelRaceLosers {
+                reason,
                 activities,
                 children,
                 timers: _,
@@ -6670,7 +6672,7 @@ impl WorkflowTestEnv {
                 for activity_id in activities {
                     deferred_events.push(WorkflowEvent::ActivityFailed {
                         activity_id,
-                        error: "lost race to a sibling branch".to_string(),
+                        error: reason.message().to_string(),
                         attempt: 1,
                         error_type: "Error".to_string(),
                         non_retryable: true,
@@ -6680,7 +6682,7 @@ impl WorkflowTestEnv {
                 for child_id in children {
                     deferred_events.push(WorkflowEvent::child_workflow_failed(
                         child_id,
-                        "lost race to a sibling branch".to_string(),
+                        reason.message().to_string(),
                     ));
                 }
                 Ok(true)
