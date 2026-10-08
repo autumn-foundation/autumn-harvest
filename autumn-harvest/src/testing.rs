@@ -5343,8 +5343,8 @@ pub enum TestRunStatus {
 /// An update or a query runs its handler in a context rebuilt from history.
 /// Before the first drive, that rebuild runs the body up to its first
 /// command, so values such as `new_uuid` differ from the real run.
-/// The engine does not run a completed update handler again on replay. So a
-/// change that the handler makes to state captured by the workflow body is
+/// The engine does not run a completed update handler again on replay. A
+/// handler can change state that the workflow body captured. That change is
 /// gone at the next drive, as after a replay in production.
 pub struct WorkflowTestRun<'env> {
     env: &'env WorkflowTestEnv,
