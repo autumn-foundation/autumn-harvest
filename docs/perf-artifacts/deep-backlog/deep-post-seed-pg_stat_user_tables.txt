@@ -1,7 +1,7 @@
 -- pg_stat_user_tables after seeding, before the workload --
 | relname | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_upd | n_tup_hot_upd | n_tup_del | n_live_tup | n_dead_tup | dead_pct |
 |--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| harvest_task_queue | 47 | 40740 | 2 | 68 | 4074 | 370 | 0 | 74 | 4000 | 444 | 10.0 |
+| harvest_task_queue | 57 | 10185190 | 2 | 1558 | 1018519 | 92592 | 0 | 18519 | 999571 | 111358 | 10.0 |
 | harvest_activity_pauses | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_admission_gates | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_api_tokens | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
@@ -48,6 +48,6 @@
 | harvest_wasm_modules | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_worker_task_stats | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_workers | 6 | 0 | 0 | 0 | 64 | 0 | 0 | 0 | 64 | 0 | 0.0 |
-| harvest_workflow_executions | 77 | 0 | 4259 | 4259 | 1000 | 0 | 0 | 0 | 1000 | 0 | 0.0 |
+| harvest_workflow_executions | 77 | 0 | 1064815 | 1064815 | 250000 | 0 | 0 | 0 | 250000 | 0 | 0.0 |
 | harvest_workflow_logs | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_workflow_modules | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |

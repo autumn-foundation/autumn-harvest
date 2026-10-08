@@ -1,0 +1,188 @@
+-- EXPLAIN (ANALYZE, BUFFERS, SETTINGS) of one claim over every queue, after the seed, rolled back --
+CTE Scan on claimed  (cost=27290762.96..27290762.98 rows=1 width=870) (actual time=15295.465..15295.515 rows=1 loops=1)
+  Buffers: shared hit=17776 read=149780 dirtied=32334 written=43978, temp read=19888 written=38834
+  CTE paused_queues
+    ->  Aggregate  (cost=19.32..19.33 rows=1 width=32) (actual time=0.010..0.012 rows=1 loops=1)
+          ->  Seq Scan on harvest_queue_pauses  (cost=0.16..19.16 rows=64 width=32) (actual time=0.004..0.005 rows=0 loops=1)
+                Filter: (queue_name = ANY ('{deep-backlog-q-0,deep-backlog-q-1,deep-backlog-q-2,deep-backlog-q-3,deep-backlog-q-4,deep-backlog-q-5,deep-backlog-q-6,deep-backlog-q-7,deep-backlog-q-8,deep-backlog-q-9,deep-backlog-q-10,deep-backlog-q-11,deep-backlog-q-12,deep-backlog-q-13,deep-backlog-q-14,deep-backlog-q-15,deep-backlog-q-16,deep-backlog-q-17,deep-backlog-q-18,deep-backlog-q-19,deep-backlog-q-20,deep-backlog-q-21,deep-backlog-q-22,deep-backlog-q-23,deep-backlog-q-24,deep-backlog-q-25,deep-backlog-q-26,deep-backlog-q-27,deep-backlog-q-28,deep-backlog-q-29,deep-backlog-q-30,deep-backlog-q-31,deep-backlog-q-32,deep-backlog-q-33,deep-backlog-q-34,deep-backlog-q-35,deep-backlog-q-36,deep-backlog-q-37,deep-backlog-q-38,deep-backlog-q-39,deep-backlog-q-40,deep-backlog-q-41,deep-backlog-q-42,deep-backlog-q-43,deep-backlog-q-44,deep-backlog-q-45,deep-backlog-q-46,deep-backlog-q-47,deep-backlog-q-48,deep-backlog-q-49,deep-backlog-q-50,deep-backlog-q-51,deep-backlog-q-52,deep-backlog-q-53,deep-backlog-q-54,deep-backlog-q-55,deep-backlog-q-56,deep-backlog-q-57,deep-backlog-q-58,deep-backlog-q-59,deep-backlog-q-60,deep-backlog-q-61,deep-backlog-q-62,deep-backlog-q-63}'::text[]))
+  CTE paused_activities
+    ->  Aggregate  (cost=17.50..17.51 rows=1 width=32) (actual time=0.017..0.019 rows=1 loops=1)
+          ->  Seq Scan on harvest_activity_pauses  (cost=0.00..16.00 rows=600 width=32) (actual time=0.011..0.012 rows=0 loops=1)
+  CTE concurrency_pending_keys
+    ->  HashAggregate  (cost=80129.80..80199.62 rows=6982 width=27) (actual time=337.754..338.638 rows=8192 loops=1)
+          Group Key: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+          Batches: 1  Memory Usage: 1169kB
+          Buffers: shared hit=16320 read=40200 dirtied=97 written=113
+          ->  Seq Scan on harvest_task_queue  (cost=0.16..79010.51 rows=223859 width=27) (actual time=0.065..243.318 rows=454617 loops=1)
+                Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (state = 'PENDING'::text) AND (queue_name = ANY ('{deep-backlog-q-0,deep-backlog-q-1,deep-backlog-q-2,deep-backlog-q-3,deep-backlog-q-4,deep-backlog-q-5,deep-backlog-q-6,deep-backlog-q-7,deep-backlog-q-8,deep-backlog-q-9,deep-backlog-q-10,deep-backlog-q-11,deep-backlog-q-12,deep-backlog-q-13,deep-backlog-q-14,deep-backlog-q-15,deep-backlog-q-16,deep-backlog-q-17,deep-backlog-q-18,deep-backlog-q-19,deep-backlog-q-20,deep-backlog-q-21,deep-backlog-q-22,deep-backlog-q-23,deep-backlog-q-24,deep-backlog-q-25,deep-backlog-q-26,deep-backlog-q-27,deep-backlog-q-28,deep-backlog-q-29,deep-backlog-q-30,deep-backlog-q-31,deep-backlog-q-32,deep-backlog-q-33,deep-backlog-q-34,deep-backlog-q-35,deep-backlog-q-36,deep-backlog-q-37,deep-backlog-q-38,deep-backlog-q-39,deep-backlog-q-40,deep-backlog-q-41,deep-backlog-q-42,deep-backlog-q-43,deep-backlog-q-44,deep-backlog-q-45,deep-backlog-q-46,deep-backlog-q-47,deep-backlog-q-48,deep-backlog-q-49,deep-backlog-q-50,deep-backlog-q-51,deep-backlog-q-52,deep-backlog-q-53,deep-backlog-q-54,deep-backlog-q-55,deep-backlog-q-56,deep-backlog-q-57,deep-backlog-q-58,deep-backlog-q-59,deep-backlog-q-60,deep-backlog-q-61,deep-backlog-q-62,deep-backlog-q-63}'::text[])) AND (scheduled_at <= now()))
+                Rows Removed by Filter: 545383
+                Buffers: shared hit=16320 read=40200 dirtied=97 written=113
+  CTE concurrency_running_counts
+    ->  GroupAggregate  (cost=168.17..168.19 rows=1 width=35) (actual time=516.961..517.113 rows=401 loops=1)
+          Group Key: t.concurrency_key, t.task_type
+          Buffers: shared hit=16635 read=73183 dirtied=32328 written=17814
+          ->  Sort  (cost=168.17..168.17 rows=1 width=27) (actual time=516.941..516.971 rows=534 loops=1)
+                Sort Key: t.concurrency_key, t.task_type
+                Sort Method: quicksort  Memory: 54kB
+                Buffers: shared hit=16635 read=73183 dirtied=32328 written=17814
+                ->  Hash Join  (cost=165.40..168.16 rows=1 width=27) (actual time=515.856..516.655 rows=534 loops=1)
+                      Hash Cond: (concurrency_pending_keys.concurrency_key = t.concurrency_key)
+                      Buffers: shared hit=16635 read=73183 dirtied=32328 written=17814
+                      ->  HashAggregate  (cost=157.10..159.10 rows=200 width=32) (actual time=342.411..342.774 rows=4096 loops=1)
+                            Group Key: concurrency_pending_keys.concurrency_key
+                            Batches: 1  Memory Usage: 737kB
+                            Buffers: shared hit=16320 read=40200 dirtied=97 written=113
+                            ->  CTE Scan on concurrency_pending_keys  (cost=0.00..139.64 rows=6982 width=32) (actual time=337.761..340.740 rows=8192 loops=1)
+                                  Buffers: shared hit=16320 read=40200 dirtied=97 written=113
+                      ->  Hash  (cost=8.29..8.29 rows=1 width=27) (actual time=173.416..173.417 rows=534 loops=1)
+                            Buckets: 1024  Batches: 1  Memory Usage: 40kB
+                            Buffers: shared hit=315 read=32983 dirtied=32231 written=17701
+                            ->  Index Scan using harvest_task_queue_running_worker_idx on harvest_task_queue t  (cost=0.28..8.29 rows=1 width=27) (actual time=2.167..173.165 rows=1024 loops=1)
+                                  Buffers: shared hit=315 read=32983 dirtied=32231 written=17701
+  CTE expired_runs
+    ->  Bitmap Heap Scan on harvest_workflow_executions  (cost=8.27..12.29 rows=1 width=16) (actual time=14.556..14.559 rows=0 loops=1)
+          Recheck Cond: (((deadline_at < now()) AND (state = 'RUNNING'::text)) OR ((chain_deadline_at < now()) AND (state = 'RUNNING'::text)))
+          Filter: ((deadline_at < now()) OR (chain_deadline_at < now()))
+          Buffers: shared hit=2
+          ->  BitmapOr  (cost=8.27..8.27 rows=1 width=0) (actual time=14.551..14.553 rows=0 loops=1)
+                Buffers: shared hit=2
+                ->  Bitmap Index Scan on idx_harvest_executions_deadline  (cost=0.00..4.14 rows=1 width=0) (actual time=14.535..14.535 rows=0 loops=1)
+                      Index Cond: (deadline_at < now())
+                      Buffers: shared hit=1
+                ->  Bitmap Index Scan on idx_harvest_executions_chain_deadline  (cost=0.00..4.14 rows=1 width=0) (actual time=0.014..0.014 rows=0 loops=1)
+                      Index Cond: (chain_deadline_at < now())
+                      Buffers: shared hit=1
+  CTE candidate
+    ->  Limit  (cost=27210304.07..27210304.08 rows=1 width=253) (actual time=13009.130..13009.145 rows=1 loops=1)
+          Buffers: shared hit=16995 read=149763 dirtied=32329 written=43978, temp read=19888 written=38834
+          InitPlan 11 (returns $11)
+            ->  Function Scan on unnest marked  (cost=0.00..0.02 rows=1 width=32) (actual time=0.016..0.016 rows=0 loops=1)
+                  Filter: ("left"(marked, 1) = ''::text)
+          ->  LockRows  (cost=27210304.05..27212022.36 rows=137465 width=253) (actual time=13009.114..13009.127 rows=1 loops=1)
+                Buffers: shared hit=16995 read=149763 dirtied=32329 written=43978, temp read=19888 written=38834
+                ->  Sort  (cost=27210304.05..27210647.71 rows=137465 width=253) (actual time=13009.070..13009.081 rows=1 loops=1)
+                      Sort Key: (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'deep-backlog-worker-0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_1.priority DESC, ((harvest_task_queue_1.scheduled_at + CASE WHEN (harvest_task_queue_1.new_start AND (harvest_task_queue_1.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END))
+                      Sort Method: external merge  Disk: 155168kB
+                      Buffers: shared hit=16994 read=149763 dirtied=32328 written=43978, temp read=19888 written=38834
+                      ->  Nested Loop  (cost=66368.95..27209616.72 rows=137465 width=253) (actual time=781.058..9581.190 rows=868423 loops=1)
+                            Join Filter: ((harvest_task_queue_1.task_type <> 'activity'::text) OR (harvest_task_queue_1.activity_name IS NULL) OR (harvest_task_queue_1.activity_name <> ALL (paused_activities.names)))
+                            Buffers: shared hit=16994 read=149763 dirtied=32328 written=43978
+                            ->  CTE Scan on paused_activities  (cost=0.00..0.02 rows=1 width=88) (actual time=0.268..0.270 rows=1 loops=1)
+                            ->  Nested Loop  (cost=66368.95..27204388.59 rows=140392 width=238) (actual time=780.780..9392.109 rows=868423 loops=1)
+                                  Join Filter: (harvest_task_queue_1.queue_name <> ALL (paused_queues.names))
+                                  Buffers: shared hit=16994 read=149763 dirtied=32328 written=43978
+                                  ->  CTE Scan on paused_queues  (cost=0.00..0.02 rows=1 width=88) (actual time=0.015..0.016 rows=1 loops=1)
+                                  ->  Bitmap Heap Scan on harvest_task_queue harvest_task_queue_1  (cost=66368.95..27201067.37 rows=147609 width=199) (actual time=780.721..9223.654 rows=868423 loops=1)
+                                        Recheck Cond: ((state = ANY ('{PENDING,RUNNING}'::text[])) AND (queue_name = ANY ('{deep-backlog-q-0,deep-backlog-q-1,deep-backlog-q-2,deep-backlog-q-3,deep-backlog-q-4,deep-backlog-q-5,deep-backlog-q-6,deep-backlog-q-7,deep-backlog-q-8,deep-backlog-q-9,deep-backlog-q-10,deep-backlog-q-11,deep-backlog-q-12,deep-backlog-q-13,deep-backlog-q-14,deep-backlog-q-15,deep-backlog-q-16,deep-backlog-q-17,deep-backlog-q-18,deep-backlog-q-19,deep-backlog-q-20,deep-backlog-q-21,deep-backlog-q-22,deep-backlog-q-23,deep-backlog-q-24,deep-backlog-q-25,deep-backlog-q-26,deep-backlog-q-27,deep-backlog-q-28,deep-backlog-q-29,deep-backlog-q-30,deep-backlog-q-31,deep-backlog-q-32,deep-backlog-q-33,deep-backlog-q-34,deep-backlog-q-35,deep-backlog-q-36,deep-backlog-q-37,deep-backlog-q-38,deep-backlog-q-39,deep-backlog-q-40,deep-backlog-q-41,deep-backlog-q-42,deep-backlog-q-43,deep-backlog-q-44,deep-backlog-q-45,deep-backlog-q-46,deep-backlog-q-47,deep-backlog-q-48,deep-backlog-q-49,deep-backlog-q-50,deep-backlog-q-51,deep-backlog-q-52,deep-backlog-q-53,deep-backlog-q-54,deep-backlog-q-55,deep-backlog-q-56,deep-backlog-q-57,deep-backlog-q-58,deep-backlog-q-59,deep-backlog-q-60,deep-backlog-q-61,deep-backlog-q-62,deep-backlog-q-63}'::text[])) AND (state = 'PENDING'::text) AND (scheduled_at <= now()))
+                                        Filter: ((required_build_id IS NULL) AND ((session_id IS NULL) OR (sticky_worker_id = 'deep-backlog-worker-0'::text)) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = 'deep-backlog-worker-0'::text) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (activity_name <> ALL ($11))) AND ((workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 10))) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR (COALESCE((SubPlan 6), '0'::bigint) < concurrency_cap)) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 18)) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 8))) AND ((required_capabilities IS NULL) OR (NOT (SubPlan 16))))
+                                        Rows Removed by Filter: 42549
+                                        Heap Blocks: exact=56265
+                                        Buffers: shared hit=16994 read=149763 dirtied=32328 written=43978
+                                        ->  BitmapAnd  (cost=66368.79..66368.79 rows=870891 width=0) (actual time=237.399..237.400 rows=0 loops=1)
+                                              Buffers: shared hit=94 read=15258 written=12344
+                                              ->  Bitmap Index Scan on idx_harvest_tq_live_created  (cost=0.00..30451.53 rows=958222 width=0) (actual time=87.199..87.200 rows=1053732 loops=1)
+                                                    Buffers: shared read=6393 written=5119
+                                              ->  Bitmap Index Scan on idx_harvest_tq_poll  (cost=0.00..35843.20 rows=908471 width=0) (actual time=148.074..148.074 rows=957268 loops=1)
+                                                    Index Cond: ((queue_name = ANY ('{deep-backlog-q-0,deep-backlog-q-1,deep-backlog-q-2,deep-backlog-q-3,deep-backlog-q-4,deep-backlog-q-5,deep-backlog-q-6,deep-backlog-q-7,deep-backlog-q-8,deep-backlog-q-9,deep-backlog-q-10,deep-backlog-q-11,deep-backlog-q-12,deep-backlog-q-13,deep-backlog-q-14,deep-backlog-q-15,deep-backlog-q-16,deep-backlog-q-17,deep-backlog-q-18,deep-backlog-q-19,deep-backlog-q-20,deep-backlog-q-21,deep-backlog-q-22,deep-backlog-q-23,deep-backlog-q-24,deep-backlog-q-25,deep-backlog-q-26,deep-backlog-q-27,deep-backlog-q-28,deep-backlog-q-29,deep-backlog-q-30,deep-backlog-q-31,deep-backlog-q-32,deep-backlog-q-33,deep-backlog-q-34,deep-backlog-q-35,deep-backlog-q-36,deep-backlog-q-37,deep-backlog-q-38,deep-backlog-q-39,deep-backlog-q-40,deep-backlog-q-41,deep-backlog-q-42,deep-backlog-q-43,deep-backlog-q-44,deep-backlog-q-45,deep-backlog-q-46,deep-backlog-q-47,deep-backlog-q-48,deep-backlog-q-49,deep-backlog-q-50,deep-backlog-q-51,deep-backlog-q-52,deep-backlog-q-53,deep-backlog-q-54,deep-backlog-q-55,deep-backlog-q-56,deep-backlog-q-57,deep-backlog-q-58,deep-backlog-q-59,deep-backlog-q-60,deep-backlog-q-61,deep-backlog-q-62,deep-backlog-q-63}'::text[])) AND (state = 'PENDING'::text) AND (scheduled_at <= now()))
+                                                    Buffers: shared hit=94 read=8865 written=7225
+                                        SubPlan 10
+                                          ->  CTE Scan on expired_runs x  (cost=0.00..0.02 rows=1 width=16) (actual time=14.558..14.558 rows=0 loops=1)
+                                                Buffers: shared hit=2
+                                        SubPlan 6
+                                          ->  CTE Scan on concurrency_running_counts rc  (cost=0.00..0.03 rows=1 width=8) (actual time=0.014..0.018 rows=0 loops=454617)
+                                                Filter: ((concurrency_key = harvest_task_queue_1.concurrency_key) AND (task_type = harvest_task_queue_1.task_type))
+                                                Rows Removed by Filter: 401
+                                                Buffers: shared hit=16635 read=73183 dirtied=32328 written=17814
+                                        SubPlan 18
+                                          ->  Seq Scan on harvest_rate_limit_buckets b  (cost=0.00..43.00 rows=183 width=32) (never executed)
+                                                Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
+                                        SubPlan 8
+                                          ->  Seq Scan on harvest_workflow_executions e  (cost=0.00..8445.00 rows=1 width=16) (actual time=35.772..35.772 rows=0 loops=1)
+                                                Filter: (state = 'PAUSED'::text)
+                                                Rows Removed by Filter: 250000
+                                                Buffers: shared read=5320 written=17
+                                        SubPlan 16
+                                          ->  Function Scan on jsonb_array_elements r  (cost=11.20..17.45 rows=2 width=0) (never executed)
+                                                Filter: (((value ? 'Exact'::text) AND (((COALESCE($12, '{}'::jsonb) ->> ((value -> 'Exact'::text) ->> 'key'::text)) IS NULL) OR ((COALESCE($13, '{}'::jsonb) ->> ((value -> 'Exact'::text) ->> 'key'::text)) <> ((value -> 'Exact'::text) ->> 'value'::text)))) OR ((value ? 'In'::text) AND (((COALESCE($14, '{}'::jsonb) ->> ((value -> 'In'::text) ->> 'key'::text)) IS NULL) OR (NOT (((value -> 'In'::text) -> 'values'::text) @> jsonb_build_array((COALESCE($15, '{}'::jsonb) ->> ((value -> 'In'::text) ->> 'key'::text))))))))
+                                                InitPlan 12 (returns $12)
+                                                  ->  Seq Scan on harvest_workers  (cost=0.00..2.80 rows=1 width=5) (never executed)
+                                                        Filter: (worker_id = 'deep-backlog-worker-0'::text)
+                                                InitPlan 13 (returns $13)
+                                                  ->  Seq Scan on harvest_workers harvest_workers_1  (cost=0.00..2.80 rows=1 width=5) (never executed)
+                                                        Filter: (worker_id = 'deep-backlog-worker-0'::text)
+                                                InitPlan 14 (returns $14)
+                                                  ->  Seq Scan on harvest_workers harvest_workers_2  (cost=0.00..2.80 rows=1 width=5) (never executed)
+                                                        Filter: (worker_id = 'deep-backlog-worker-0'::text)
+                                                InitPlan 15 (returns $15)
+                                                  ->  Seq Scan on harvest_workers harvest_workers_3  (cost=0.00..2.80 rows=1 width=5) (never executed)
+                                                        Filter: (worker_id = 'deep-backlog-worker-0'::text)
+  CTE fresh_now
+    ->  Nested Loop Left Join  (cost=0.15..8.26 rows=1 width=8) (actual time=0.050..0.054 rows=1 loops=1)
+          ->  Result  (cost=0.00..0.01 rows=1 width=0) (actual time=0.005..0.005 rows=1 loops=1)
+          ->  Subquery Scan on locked  (cost=0.15..8.24 rows=1 width=0) (actual time=0.037..0.040 rows=0 loops=1)
+                ->  LockRows  (cost=0.15..8.23 rows=1 width=66) (actual time=0.036..0.039 rows=0 loops=1)
+                      ->  Nested Loop  (cost=0.15..8.22 rows=1 width=66) (actual time=0.035..0.037 rows=0 loops=1)
+                            ->  CTE Scan on candidate c  (cost=0.00..0.02 rows=1 width=88) (actual time=0.026..0.027 rows=1 loops=1)
+                                  Filter: (activity_name <> ALL ('{}'::text[]))
+                            ->  Index Scan using harvest_rate_limit_buckets_pkey on harvest_rate_limit_buckets b_1  (cost=0.15..8.17 rows=1 width=38) (actual time=0.003..0.004 rows=0 loops=1)
+                                  Index Cond: ((key)::text = (c.rate_limit_key)::text)
+  CTE run_expired_now
+    ->  Result  (cost=8.51..8.52 rows=1 width=1) (actual time=13009.395..13009.399 rows=1 loops=1)
+          Buffers: shared hit=16995 read=149767 dirtied=32329 written=43978, temp read=19888 written=38834
+          InitPlan 23 (returns $27)
+            ->  Nested Loop  (cost=0.46..8.51 rows=1 width=0) (actual time=13009.372..13009.374 rows=0 loops=1)
+                  Buffers: shared hit=16995 read=149767 dirtied=32329 written=43978, temp read=19888 written=38834
+                  InitPlan 21 (returns $24)
+                    ->  CTE Scan on fresh_now  (cost=0.00..0.02 rows=1 width=8) (actual time=0.054..0.055 rows=1 loops=1)
+                  InitPlan 22 (returns $25)
+                    ->  CTE Scan on fresh_now fresh_now_1  (cost=0.00..0.02 rows=1 width=8) (actual time=0.000..0.001 rows=1 loops=1)
+                  ->  CTE Scan on candidate c_1  (cost=0.00..0.02 rows=1 width=16) (actual time=13009.181..13009.181 rows=1 loops=1)
+                        Buffers: shared hit=16995 read=149763 dirtied=32329 written=43978, temp read=19888 written=38834
+                  ->  Index Scan using harvest_workflow_executions_pkey on harvest_workflow_executions e_1  (cost=0.42..8.45 rows=1 width=16) (actual time=0.180..0.181 rows=0 loops=1)
+                        Index Cond: (id = c_1.workflow_exec_id)
+                        Filter: ((state = 'RUNNING'::text) AND ((deadline_at < $24) OR (chain_deadline_at < $25)))
+                        Rows Removed by Filter: 1
+                        Buffers: shared read=4
+  CTE rate_limit_debit
+    ->  Update on harvest_rate_limit_buckets b_2  (cost=0.17..8.32 rows=1 width=78) (actual time=0.030..0.030 rows=0 loops=1)
+          InitPlan 25 (returns $29)
+            ->  CTE Scan on run_expired_now  (cost=0.00..0.02 rows=1 width=1) (actual time=0.001..0.001 rows=1 loops=1)
+          ->  Result  (cost=0.15..8.30 rows=1 width=78) (actual time=0.029..0.029 rows=0 loops=1)
+                One-Time Filter: (NOT $29)
+                ->  Nested Loop  (cost=0.15..8.25 rows=1 width=118) (actual time=0.023..0.023 rows=0 loops=1)
+                      ->  CTE Scan on candidate  (cost=0.00..0.02 rows=1 width=88) (actual time=0.012..0.013 rows=1 loops=1)
+                            Filter: (activity_name <> ALL ('{}'::text[]))
+                      ->  Index Scan using harvest_rate_limit_buckets_pkey on harvest_rate_limit_buckets b_2  (cost=0.15..8.22 rows=1 width=94) (actual time=0.005..0.005 rows=0 loops=1)
+                            Index Cond: ((key)::text = (candidate.rate_limit_key)::text)
+                            Filter: (LEAST(COALESCE(CASE WHEN (override_expires_at > now()) THEN override_burst ELSE NULL::double precision END, burst), ((tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(override_expires_at, last_refilled_at), now()) - last_refilled_at))))::double precision * COALESCE(override_refill_rate, refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(override_expires_at, last_refilled_at), last_refilled_at)))))::double precision * refill_rate))) >= '1'::double precision)
+  CTE claimed
+    ->  Update on harvest_task_queue harvest_task_queue_2  (cost=0.45..16.84 rows=1 width=123) (actual time=15295.459..15295.466 rows=1 loops=1)
+          Buffers: shared hit=17776 read=149780 dirtied=32334 written=43978, temp read=19888 written=38834
+          InitPlan 30 (returns $37)
+            ->  CTE Scan on run_expired_now run_expired_now_1  (cost=0.00..0.02 rows=1 width=1) (actual time=13009.401..13009.402 rows=1 loops=1)
+                  Buffers: shared hit=16995 read=149767 dirtied=32329 written=43978, temp read=19888 written=38834
+          ->  Result  (cost=0.42..16.82 rows=1 width=123) (actual time=15271.246..15271.252 rows=1 loops=1)
+                One-Time Filter: (NOT $37)
+                Buffers: shared hit=16996 read=149770 dirtied=32329 written=43978, temp read=19888 written=38834
+                ->  Nested Loop  (cost=0.42..16.81 rows=1 width=50) (actual time=0.048..0.052 rows=1 loops=1)
+                      Buffers: shared hit=1 read=3
+                      ->  CTE Scan on candidate candidate_1  (cost=0.00..8.36 rows=1 width=56) (actual time=0.014..0.016 rows=1 loops=1)
+                            Filter: (((rate_limit_key IS NULL) OR (activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 29)) AND ((concurrency_key IS NULL) OR (pg_try_advisory_xact_lock((hashtext(concurrency_key))::bigint) AND ((concurrency_cap IS NULL) OR ((SubPlan 27) < concurrency_cap)))))
+                            SubPlan 29
+                              ->  CTE Scan on rate_limit_debit  (cost=0.00..0.02 rows=1 width=32) (never executed)
+                            SubPlan 27
+                              ->  Aggregate  (cost=8.29..8.30 rows=1 width=8) (never executed)
+                                    ->  Index Scan using harvest_task_queue_concurrency_key_running on harvest_task_queue recheck  (cost=0.27..8.29 rows=1 width=0) (never executed)
+                                          Index Cond: (concurrency_key = candidate_1.concurrency_key)
+                                          Filter: ((worker_id IS NOT NULL) AND (task_type = candidate_1.task_type))
+                      ->  Index Scan using harvest_task_queue_pkey on harvest_task_queue harvest_task_queue_2  (cost=0.42..8.44 rows=1 width=26) (actual time=0.027..0.028 rows=1 loops=1)
+                            Index Cond: (id = candidate_1.id)
+                            Buffers: shared hit=1 read=3
+Planning:
+  Buffers: shared hit=667 read=59
+Planning Time: 4.692 ms
+JIT:
+  Functions: 199
+  Options: Inlining true, Optimization true, Expressions true, Deforming true
+  Timing: Generation 11.023 ms, Inlining 40.604 ms, Optimization 1374.128 ms, Emission 899.517 ms, Total 2325.272 ms
+Execution Time: 15320.551 ms
