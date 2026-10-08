@@ -8,10 +8,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
+use crate::heartbeat::{HeartbeatTask, Precheck};
+use crate::memory::{MemoryScope, MemoryStore, MemoryTool, render_snapshot};
 use crate::message::RunId;
 use crate::model::{AgentModel, ChatRequest};
-use crate::policy::{AllowAll, RunInfo, ToolDecision, ToolPolicy};
+use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::tool::{Tool, ToolContext};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
@@ -63,6 +66,9 @@ pub struct AgentHarness {
     model_timeout: Duration,
     tool_timeout: Duration,
     policy_timeout: Duration,
+    memory: Option<Arc<dyn MemoryStore>>,
+    delivery: Arc<dyn Delivery>,
+    precheck: Option<Arc<dyn Precheck>>,
 }
 
 impl AgentHarness {
@@ -79,6 +85,9 @@ impl AgentHarness {
             model_timeout: DEFAULT_MODEL_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             policy_timeout: DEFAULT_POLICY_TIMEOUT,
+            memory: None,
+            delivery: Arc::new(LogDelivery),
+            precheck: None,
         }
     }
 
@@ -147,6 +156,28 @@ impl AgentHarness {
         self
     }
 
+    /// Set the memory store. A run with a memory scope reads a snapshot from
+    /// it and gets the `memory` tool.
+    #[must_use]
+    pub fn memory(mut self, store: Arc<dyn MemoryStore>) -> Self {
+        self.memory = Some(store);
+        self
+    }
+
+    /// Set where reports go. The default is [`LogDelivery`].
+    #[must_use]
+    pub fn delivery(mut self, delivery: Arc<dyn Delivery>) -> Self {
+        self.delivery = delivery;
+        self
+    }
+
+    /// Set the cheap check that can skip a heartbeat before any model call.
+    #[must_use]
+    pub fn precheck(mut self, precheck: Arc<dyn Precheck>) -> Self {
+        self.precheck = Some(precheck);
+        self
+    }
+
     /// Run one model call, then ask the policy about each tool call.
     ///
     /// The decisions are part of the result. Replay reads them back, so a
@@ -158,9 +189,13 @@ impl AgentHarness {
     /// retryable: a rate limit, a transport fault, a provider outage, or the
     /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
+        let memory = self.memory_tool(request.memory_scope.as_ref());
+        let mut tools: Vec<_> = self.tools.iter().map(|tool| tool.definition()).collect();
+        tools.extend(memory.iter().map(Tool::definition));
+        tools.extend(request.extra_tools.iter().cloned());
         let chat = ChatRequest {
             messages: request.messages,
-            tools: self.tools.iter().map(|tool| tool.definition()).collect(),
+            tools,
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
@@ -191,8 +226,19 @@ impl AgentHarness {
         // One deadline bounds the whole decision phase. A per-call budget
         // would let many stalled calls add up past `start_to_close`.
         let deadline = tokio::time::Instant::now() + self.policy_timeout;
+        let read_only: Arc<dyn ToolPolicy>;
+        let policy: &dyn ToolPolicy = if request.read_only {
+            read_only = Arc::new(Strictest::new(vec![
+                Arc::clone(&self.policy),
+                Arc::new(ToolRules::read_only()),
+            ]));
+            read_only.as_ref()
+        } else {
+            self.policy.as_ref()
+        };
         for call in turn.calls() {
-            let decide = self.policy.decide(&call, self.find(&call.name), &info);
+            let tool = self.find_with(&call.name, memory.as_ref());
+            let decide = policy.decide(&call, tool, &info);
             // A stalled policy denies the call. That fails closed, and the
             // model reads why.
             let decision = tokio::time::timeout_at(deadline, decide)
@@ -216,7 +262,8 @@ impl AgentHarness {
     /// the activity signature.
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
-        let Some(tool) = self.find(&call.name) else {
+        let memory = self.memory_tool(request.memory_scope.as_ref());
+        let Some(tool) = self.find_with(&call.name, memory.as_ref()) else {
             return Ok(self.error_outcome(&format!("unknown tool {:?}", call.name)));
         };
         let ctx = ToolContext {
@@ -256,11 +303,68 @@ impl AgentHarness {
         ToolOutcome::error(&cut_bytes(message, max))
     }
 
-    fn find(&self, name: &str) -> Option<&dyn Tool> {
+    /// Load the memory of `scope` and render it as the frozen snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error when no store is installed, and the
+    /// store error otherwise.
+    pub async fn memory_snapshot(&self, scope: MemoryScope) -> Result<String, String> {
+        let Some(store) = &self.memory else {
+            return Err(ActivityFailure::non_retryable(
+                "MemoryStoreMissing",
+                "the run has a memory scope, but no memory store is installed: call AgentHarness::memory",
+            )
+            .into_error_payload());
+        };
+        let blocks = store
+            .load(&scope)
+            .await
+            .map_err(|err| model_failure(&err))?;
+        Ok(render_snapshot(&blocks))
+    }
+
+    /// Send one report to the delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns the delivery error. A retryable kind retries.
+    pub async fn deliver(&self, report: Report) -> Result<(), String> {
+        self.delivery
+            .deliver(&report)
+            .await
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// Ask the precheck whether a heartbeat tick should run. With no
+    /// precheck, every tick runs.
+    ///
+    /// # Errors
+    ///
+    /// This method returns `Ok` for every answer. The `Result` matches the
+    /// activity signature.
+    pub async fn precheck_tick(&self, task: HeartbeatTask) -> Result<bool, String> {
+        Ok(match &self.precheck {
+            Some(precheck) => precheck.should_run(&task).await,
+            None => true,
+        })
+    }
+
+    /// The memory tool of a run with a scope, when a store is installed.
+    fn memory_tool(&self, scope: Option<&MemoryScope>) -> Option<MemoryTool> {
+        Some(MemoryTool::new(
+            Arc::clone(self.memory.as_ref()?),
+            scope?.clone(),
+        ))
+    }
+
+    /// The registered tool with this name, or the memory tool.
+    fn find_with<'a>(&'a self, name: &str, memory: Option<&'a MemoryTool>) -> Option<&'a dyn Tool> {
         self.tools
             .iter()
-            .find(|tool| tool.name() == name)
             .map(AsRef::as_ref)
+            .chain(memory.map(|tool| tool as &dyn Tool))
+            .find(|tool| tool.name() == name)
     }
 }
 

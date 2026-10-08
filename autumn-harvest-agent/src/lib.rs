@@ -7,7 +7,9 @@
 //! history.
 //!
 //! The crate owns its agent primitives: [`AgentModel`], [`Tool`],
-//! [`ToolPolicy`], [`Approval`] and the message types. It depends on the core
+//! [`ToolPolicy`], [`Approval`] and the message types. It also has the
+//! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
+//! [`memory`] and [`loop_guard`]. It depends on the core
 //! engine only, with no default features. It has no Autumn plugin dependency.
 //! An app implements [`AgentModel`] for its provider, or bridges a framework
 //! it already uses.
@@ -15,6 +17,7 @@
 //! # Use it on SQLite
 //!
 //! ```no_run
+//! # #[cfg(feature = "sqlite")]
 //! # async fn demo(model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>)
 //! # -> Result<(), autumn_harvest_sqlite::SqliteError> {
 //! use std::sync::Arc;
@@ -33,7 +36,7 @@
 //!
 //! # Use it on Postgres
 //!
-//! Register the workflow and the two activities, and install the harness as
+//! Register the workflows and the activities, and install the harness as
 //! worker state:
 //!
 //! ```
@@ -54,8 +57,13 @@
 
 pub mod approval;
 pub mod bounds;
+pub mod delivery;
 pub mod error;
+pub mod followup;
 pub mod harness;
+pub mod heartbeat;
+pub mod loop_guard;
+pub mod memory;
 pub mod message;
 pub mod model;
 pub mod policy;
@@ -73,12 +81,13 @@ pub use message::{
     ToolDefinition,
 };
 pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
-pub use policy::{AllowAll, Rule, RunInfo, ToolDecision, ToolPolicy, ToolRules};
+pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use types::{
     AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
 };
 pub use workflow::{
-    WORKFLOW_NAME, activities, agent_loop, agent_loop_info, agent_model_turn,
-    agent_model_turn_info, agent_tool_call, agent_tool_call_info, workflows,
+    WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_loop, agent_loop_info,
+    agent_memory_snapshot, agent_memory_snapshot_info, agent_model_turn, agent_model_turn_info,
+    agent_precheck, agent_precheck_info, agent_tool_call, agent_tool_call_info, workflows,
 };

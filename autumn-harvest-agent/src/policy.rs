@@ -5,6 +5,7 @@
 //! is never asked twice about one call.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +160,48 @@ impl ToolPolicy for ToolRules {
     }
 }
 
+/// Combines policies and keeps the strictest answer. Any
+/// [`ToolDecision::Deny`] wins, then any [`ToolDecision::RequireApproval`],
+/// else [`ToolDecision::Allow`].
+///
+/// A read-only run uses it to put [`ToolRules::read_only`] on top of the app
+/// policy.
+#[derive(Debug, Clone)]
+pub struct Strictest(Vec<Arc<dyn ToolPolicy>>);
+
+impl Strictest {
+    /// Combine these policies.
+    #[must_use]
+    pub const fn new(policies: Vec<Arc<dyn ToolPolicy>>) -> Self {
+        Self(policies)
+    }
+}
+
+impl ToolPolicy for Strictest {
+    fn decide<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        tool: Option<&'a dyn Tool>,
+        info: &'a RunInfo,
+    ) -> BoxFuture<'a, ToolDecision> {
+        Box::pin(async move {
+            let mut verdict = ToolDecision::Allow;
+            for policy in &self.0 {
+                match policy.decide(call, tool, info).await {
+                    deny @ ToolDecision::Deny { .. } => return deny,
+                    ask @ ToolDecision::RequireApproval { .. } => {
+                        if verdict == ToolDecision::Allow {
+                            verdict = ask;
+                        }
+                    }
+                    ToolDecision::Allow => {}
+                }
+            }
+            verdict
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +249,35 @@ mod tests {
             ToolDecision::Deny { .. }
         ));
         assert_eq!(rules.decide_now(&call("ghost"), None), ToolDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn the_strictest_answer_wins() {
+        let info = RunInfo {
+            run_id: RunId::new("r"),
+            session_id: None,
+            steps_used: 0,
+            max_steps: 1,
+            usage: TokenUsage::default(),
+        };
+        let write = tool("write", ToolEffect::Write);
+        let ask: Arc<dyn ToolPolicy> = Arc::new(ToolRules::ask_before_acting());
+        let deny: Arc<dyn ToolPolicy> = Arc::new(ToolRules::read_only());
+        let both = Strictest::new(vec![ask.clone(), deny]);
+        assert!(matches!(
+            both.decide(&call("write"), Some(&write), &info).await,
+            ToolDecision::Deny { .. }
+        ));
+        let only_ask = Strictest::new(vec![Arc::new(AllowAll), ask]);
+        assert!(matches!(
+            only_ask.decide(&call("write"), Some(&write), &info).await,
+            ToolDecision::RequireApproval { .. }
+        ));
+        let none = Strictest::new(Vec::new());
+        assert_eq!(
+            none.decide(&call("x"), None, &info).await,
+            ToolDecision::Allow
+        );
     }
 
     #[test]

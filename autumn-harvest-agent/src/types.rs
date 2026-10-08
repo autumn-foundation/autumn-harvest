@@ -8,6 +8,10 @@
 
 use std::time::Duration;
 
+use crate::followup::Followups;
+use crate::loop_guard::LoopGuard;
+use crate::memory::MemoryScope;
+use crate::message::ToolDefinition;
 use crate::message::{
     ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall,
 };
@@ -49,6 +53,23 @@ pub struct AgentTask {
     /// `TranscriptFull` before it sends a request over this size.
     #[serde(default)]
     pub max_request_bytes: Option<u64>,
+    /// Send the final answer to the harness delivery.
+    #[serde(default)]
+    pub deliver: bool,
+    /// The memory scope. With a scope, the run reads a memory snapshot and
+    /// gets the `memory` tool.
+    #[serde(default)]
+    pub memory_scope: Option<MemoryScope>,
+    /// The follow-up settings. With settings, the run gets the
+    /// `schedule_followup` tool.
+    #[serde(default)]
+    pub followups: Option<Followups>,
+    /// The loop guard.
+    #[serde(default)]
+    pub loop_guard: LoopGuard,
+    /// Refuse every tool call that writes or acts outside the app.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl AgentTask {
@@ -65,7 +86,47 @@ impl AgentTask {
             max_output_tokens: None,
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
             max_request_bytes: None,
+            deliver: false,
+            memory_scope: None,
+            followups: None,
+            loop_guard: LoopGuard::default(),
+            read_only: false,
         }
+    }
+
+    /// Send the final answer to the harness delivery.
+    #[must_use]
+    pub const fn deliver(mut self) -> Self {
+        self.deliver = true;
+        self
+    }
+
+    /// Read and write the memory of this scope.
+    #[must_use]
+    pub fn memory(mut self, scope: MemoryScope) -> Self {
+        self.memory_scope = Some(scope);
+        self
+    }
+
+    /// Let the agent schedule follow-ups.
+    #[must_use]
+    pub const fn followups(mut self, followups: Followups) -> Self {
+        self.followups = Some(followups);
+        self
+    }
+
+    /// Set the loop guard.
+    #[must_use]
+    pub const fn loop_guard(mut self, guard: LoopGuard) -> Self {
+        self.loop_guard = guard;
+        self
+    }
+
+    /// Refuse every tool call that writes or acts outside the app.
+    #[must_use]
+    pub const fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// Set the system prompt.
@@ -155,6 +216,15 @@ pub struct ModelTurnRequest {
     /// The output cap of this call.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Apply read-only rules on top of the harness policy.
+    #[serde(default)]
+    pub read_only: bool,
+    /// The memory scope of the run, if any.
+    #[serde(default)]
+    pub memory_scope: Option<MemoryScope>,
+    /// Tools that the workflow handles itself, such as `schedule_followup`.
+    #[serde(default)]
+    pub extra_tools: Vec<ToolDefinition>,
 }
 
 /// The recorded result of one model-turn activity.
@@ -221,6 +291,9 @@ pub struct ToolCallRequest {
     pub step: u32,
     /// The call to run, with the arguments a reviewer may have edited.
     pub call: ToolCall,
+    /// The memory scope of the run, if any.
+    #[serde(default)]
+    pub memory_scope: Option<MemoryScope>,
 }
 
 /// The recorded result of one tool call.
@@ -266,6 +339,8 @@ pub enum AgentStop {
     TokensExhausted,
     /// The next request was too large to record. It was not sent.
     TranscriptFull,
+    /// The model repeated the same tool call with the same result too often.
+    LoopDetected,
 }
 
 /// The workflow output: how the run ended and what it produced.
@@ -285,6 +360,9 @@ pub struct AgentReport {
     /// The transcript without the system prompt. Pass it as the history of the
     /// next run to continue the conversation.
     pub messages: Vec<ChatMessage>,
+    /// Follow-ups that ran before this report.
+    #[serde(default)]
+    pub followups: u32,
 }
 
 /// The transcript without system messages.
