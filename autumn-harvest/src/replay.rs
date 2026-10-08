@@ -2062,8 +2062,8 @@ impl HistoryMatcher {
         }
         // Signals buffered early (via drain_early_signals) that were never
         // consumed by wait_for_signal represent unconsumed history, except
-        // for the exact events excused by a lost race or rejected by a
-        // payload predicate (issue #1985).
+        // for the exact events excused by a lost race. A signal that a
+        // payload predicate rejected is excused too (issue #1985).
         if self.pending_signals.iter().any(|(_, _, idx)| {
             !self.late_race_signal_events.contains(idx)
                 && !self.predicate_rejected_signal_events.contains(idx)
