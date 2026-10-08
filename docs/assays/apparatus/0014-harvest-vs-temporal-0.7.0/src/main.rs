@@ -809,6 +809,11 @@ async fn run_once(settings: &Settings, arm: Arm, depth: usize) -> RunOutcome {
         tokio::time::sleep(SAMPLE_EVERY).await;
     }
     let elapsed = started.elapsed().as_secs_f64();
+    // The completion query can return after the cap. Such a run is over the
+    // cap too.
+    if elapsed >= settings.cap_secs as f64 {
+        truncated = true;
+    }
 
     workers.stop().await;
     autumn_harvest::dispatch::uninstall();
