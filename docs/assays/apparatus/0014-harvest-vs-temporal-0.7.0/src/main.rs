@@ -618,7 +618,7 @@ async fn start_one(
             workflow_name: WORKFLOW,
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input,
+            input: input.into(),
             parent_id: None,
             queue_name: QUEUE,
             execution_timeout: None,
