@@ -173,10 +173,17 @@ step by step:
 | `run.update(name, input).await` | Runs the validator, then the handler. Records `UpdateAdmitted` and `UpdateCompleted` or `UpdateFailed`. |
 | `run.query(name, args).await` | Runs a query handler. Writes no event. |
 | `run.events()` | Returns the history so far. |
+| `run.now()` | Returns the virtual time after the history so far. |
 | `run.finish().await` | Drives the run to its end and returns the `TestRunOutcome`. |
 
 `signal`, `update` and `query` do not drive the run. Call
 `run_until_blocked` or `finish` to continue.
+
+In the example below, `approval_handler` runs a `prepare` activity, then
+waits for an `approve` signal. Its `seen` query returns each value the
+workflow has received. Its `set_limit` update accepts a positive number
+only. The full workflow is `approval_workflow` in
+`autumn-harvest/tests/integration/workflow_test_env_mid_run_tests.rs`.
 
 ```rust
 use autumn_harvest::error::HarvestError;
@@ -213,18 +220,29 @@ Rules:
 
 - A drive ingests pending signals before the workflow runs, as the worker
   does.
-- Timers still fire when the workflow waits on them. So a drive stops only
-  on a wait with no timer, such as a signal or a contended mutex. To make a
-  signal win a race against a timer, send it before the drive that reaches
-  the race.
+- A classic timer still fires when the workflow waits on it. So a drive
+  does not stop on such a wait. It stops on a signal, a contended mutex, or
+  an awaited cancellable timer that races another wait. To make a signal win
+  a race against a timer, send it before the drive that reaches the race.
 - An update and a query replay the history to rebuild the workflow state.
   Their handlers then run against that state.
 - An update's `UpdateAdmitted` timestamp is the current virtual time.
+- An update first checks the declarative `arg_schema`, then every
+  validator, imperative ones too. A rejection writes no event.
+- An update handler that does not finish in 5 seconds returns
+  `HarvestError::Timeout`. A handler that panics records `UpdateFailed`.
+- The update metrics and the metrics of an update handler are not recorded.
+- An update handler runs in that rebuilt context. The engine does not run a
+  completed handler again on replay. So a change that the handler makes to
+  state captured by the workflow body is gone at the next drive.
 - Declarative `#[query]` and `#[update]` handlers need
-  `env.queries(queries![...])` and `env.updates(updates![...])`.
-- After the run finishes, `signal` and `update` return
-  `HarvestError::WorkflowNotRunning`. `query` still reads the final state.
-- `env.run(handler, input)` is `env.start(handler, input).finish()`.
+  `env.queries(queries![...])` and `env.updates(updates![...])`. With
+  `with_workflow_name` set, only the handlers of that workflow are
+  registered, as in the worker.
+- After the run finishes, `signal` returns `HarvestError::WorkflowNotRunning`.
+  `update` returns `HarvestError::UpdateRejected`, as the update API does.
+  `query` still reads the final state.
+- `env.run(handler, input)` is `env.start(handler, input).finish().await`.
 
 ---
 

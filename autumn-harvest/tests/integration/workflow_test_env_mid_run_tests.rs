@@ -4,8 +4,11 @@
 //! it again. No database is involved.
 //!
 //! Run with:
-//!   cargo test -p autumn-harvest --no-default-features --features testing \
-//!     --test integration `workflow_test_env_mid_run_tests`
+//!
+//! ```text
+//! cargo test -p autumn-harvest --no-default-features --features testing \
+//!   --test integration workflow_test_env_mid_run_tests
+//! ```
 
 use std::future::Future;
 use std::pin::Pin;
@@ -14,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::prelude::{queries, query, update, updates};
+use autumn_harvest::prelude::{queries, query, update, updates, workflow};
 use autumn_harvest::testing::{ReplayStatus, TestRunStatus, WorkflowTestEnv};
 use serde_json::{Value, json};
 
@@ -72,11 +75,17 @@ fn approval_workflow<'a>(
 }
 
 /// Waits for one `go` signal. Declarative handlers serve its query and update.
-fn declarative_workflow<'a>(
-    ctx: &'a WorkflowContext,
-    _input: Value,
-) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
-    Box::pin(async move { ctx.wait_for_signal("go").await.map_err(|e| e.to_string()) })
+///
+/// The `#[workflow]` declaration gives the handlers below their typed stub.
+#[workflow]
+async fn declarative_workflow(ctx: &WorkflowContext) -> Result<Value, String> {
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Owns the foreign handlers that the workflow-name filter must skip.
+#[workflow]
+async fn other_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
 }
 
 #[query(workflow = "declarative_workflow")]
@@ -95,6 +104,59 @@ fn validate_rename(input: &Value) -> Result<(), String> {
 #[update(workflow = "declarative_workflow", validator = validate_rename)]
 async fn rename(_ctx: &WorkflowContext, name: String) -> Result<String, String> {
     Ok(format!("renamed to {name}"))
+}
+
+#[query(workflow = "other_workflow")]
+fn foreign_phase(_ctx: &WorkflowContext) -> Result<String, String> {
+    Ok("foreign".to_string())
+}
+
+#[update(workflow = "other_workflow")]
+async fn foreign_rename(_ctx: &WorkflowContext, name: String) -> Result<String, String> {
+    Ok(name)
+}
+
+/// Registers an update that never finishes and one that panics, then waits
+/// for `go`.
+fn faulty_update_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.register_update_handler_no_validator("hang", |_input: Value| async move {
+            std::future::pending::<Result<Value, String>>().await
+        });
+        ctx.register_update_handler_no_validator("boom", |_input: Value| async move {
+            panic!("boom handler")
+        });
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+    })
+}
+
+/// A child wins its deadline race, then the workflow waits for `go`.
+///
+/// Every later cycle replays the win and emits `CancelRaceLosers` for the
+/// deadline timer. That command appends no event.
+fn child_then_signal_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let child = ctx
+            .spawn_child_workflow_timeout(
+                "child_processing",
+                json!(null),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let go = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        Ok(json!({ "child": child, "go": go }))
+    })
+}
+
+fn string_schema() -> Value {
+    json!({ "type": "string" })
 }
 
 // ─────────────────────────────── helpers ─────────────────────────────────────
@@ -125,6 +187,7 @@ async fn signal_sent_after_block_unblocks_the_workflow() {
 
     assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
     assert_eq!(count(run.events(), "SignalReceived"), 0);
+    assert_eq!(run.now(), env.now(), "no timer has fired yet");
     assert_eq!(
         run.query("seen", Value::Null).await.expect("query"),
         json!(["prepared"])
@@ -303,6 +366,7 @@ async fn update_timestamp_follows_the_virtual_clock() {
     run.signal("approve", json!(1)).expect("signal");
     assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
 
+    assert_eq!(run.now(), env.now() + chrono::Duration::hours(1));
     run.update("set_limit", json!(2)).await.expect("update");
     let stamp = run.events().iter().find_map(|e| match e {
         WorkflowEvent::UpdateAdmitted { timestamp, .. } => Some(*timestamp),
@@ -318,7 +382,7 @@ async fn declarative_handlers_serve_query_and_update() {
     let env = WorkflowTestEnv::new()
         .queries(queries![phase])
         .updates(updates![rename]);
-    let mut run = env.start(declarative_workflow, json!(null));
+    let mut run = env.start(declarative_workflow_info().handler, json!(null));
     assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
 
     assert_eq!(
@@ -333,6 +397,107 @@ async fn declarative_handlers_serve_query_and_update() {
     assert!(
         matches!(err, HarvestError::UpdateRejected { .. }),
         "{err:?}"
+    );
+}
+
+/// With a workflow name set, the env registers only that workflow's
+/// declarative handlers, as the worker does.
+#[tokio::test]
+async fn declarative_handlers_of_another_workflow_are_not_registered() {
+    let env = WorkflowTestEnv::new()
+        .with_workflow_name("declarative_workflow")
+        .queries(queries![phase, foreign_phase])
+        .updates(updates![rename, foreign_rename]);
+    let mut run = env.start(declarative_workflow_info().handler, json!(null));
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+
+    assert_eq!(
+        run.query("phase", Value::Null).await.expect("own query"),
+        json!("waiting")
+    );
+    let err = run
+        .query("foreign_phase", Value::Null)
+        .await
+        .expect_err("foreign query");
+    assert!(
+        matches!(err, HarvestError::QueryHandlerNotFound(_)),
+        "{err:?}"
+    );
+    let err = run
+        .update("foreign_rename", json!("x"))
+        .await
+        .expect_err("foreign update");
+    assert!(
+        matches!(err, HarvestError::UpdateHandlerNotFound(_)),
+        "{err:?}"
+    );
+}
+
+/// An update handler that never finishes returns a timeout. The admitted
+/// update stays in history with no result, as in production.
+#[tokio::test(start_paused = true)]
+async fn update_handler_that_never_finishes_times_out() {
+    let env = WorkflowTestEnv::new();
+    let mut run = env.start(faulty_update_workflow, json!(null));
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+
+    let err = run.update("hang", json!(null)).await.expect_err("timeout");
+    assert!(matches!(err, HarvestError::Timeout { .. }), "{err:?}");
+    assert_eq!(count(run.events(), "UpdateAdmitted"), 1);
+    assert_eq!(count(run.events(), "UpdateCompleted"), 0);
+    assert_eq!(count(run.events(), "UpdateFailed"), 0);
+
+    // The run still works after the timeout.
+    run.signal("go", json!(1)).expect("signal");
+    assert_eq!(run.finish().await.result, Ok(json!(1)));
+}
+
+/// A panic in an update handler records `UpdateFailed`. The test does not
+/// unwind.
+#[tokio::test]
+async fn update_handler_panic_records_update_failed() {
+    let env = WorkflowTestEnv::new();
+    let mut run = env.start(faulty_update_workflow, json!(null));
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+
+    let err = run.update("boom", json!(null)).await.expect_err("panic");
+    assert!(err.to_string().contains("boom handler"), "{err}");
+    assert_eq!(count(run.events(), "UpdateFailed"), 1);
+}
+
+/// The `arg_schema` of a declarative update rejects a bad input before the
+/// validator runs, and writes no event (issue #610).
+#[tokio::test]
+async fn update_arg_schema_rejects_a_bad_input() {
+    let with_schema = updates![rename]
+        .into_iter()
+        .map(|info| info.with_arg_schema_fn(string_schema))
+        .collect();
+    let env = WorkflowTestEnv::new().updates(with_schema);
+    let mut run = env.start(declarative_workflow_info().handler, json!(null));
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+    let before = run.events().len();
+
+    let err = run.update("rename", json!(7)).await.expect_err("schema");
+    assert!(
+        matches!(err, HarvestError::InputValidationFailed { .. }),
+        "{err:?}"
+    );
+    assert_eq!(run.events().len(), before);
+}
+
+/// A replayed child-timeout win emits `CancelRaceLosers` with no event. The
+/// run still reports `Blocked` on the next wait.
+#[tokio::test]
+async fn child_timeout_win_then_wait_reports_blocked() {
+    let env = WorkflowTestEnv::new().mock_child_workflow("child_processing", |_| Ok(json!("done")));
+    let mut run = env.start(child_then_signal_workflow, json!(null));
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+
+    run.signal("go", json!(2)).expect("signal");
+    assert_eq!(
+        run.finish().await.result,
+        Ok(json!({ "child": "done", "go": 2 }))
     );
 }
 
@@ -375,8 +540,9 @@ async fn query_before_the_first_drive_sees_the_initial_state() {
 
 // ─────────────────────────────── finished runs ───────────────────────────────
 
-/// After the run finishes, a signal or update returns `WorkflowNotRunning`.
-/// A query still reads the final state.
+/// After the run finishes, a signal returns `WorkflowNotRunning` and an
+/// update returns `UpdateRejected`, as the update API does. A query still
+/// reads the final state.
 #[tokio::test]
 async fn finished_run_rejects_signal_and_update_but_serves_query() {
     let env = approval_env()
@@ -392,7 +558,10 @@ async fn finished_run_rejects_signal_and_update_but_serves_query() {
         .update("set_limit", json!(1))
         .await
         .expect_err("finished");
-    assert!(matches!(err, HarvestError::WorkflowNotRunning(id) if id == exec_id));
+    assert!(
+        matches!(err, HarvestError::UpdateRejected { ref reason } if reason.contains("not RUNNING")),
+        "{err:?}"
+    );
     assert_eq!(
         run.query("seen", Value::Null)
             .await

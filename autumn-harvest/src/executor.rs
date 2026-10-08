@@ -2286,7 +2286,8 @@ impl DriveResult {
 /// Core executor body: emit the `OTel` span, run the handler cycle, and return
 /// the outcome.  Shared by all public entry points so the advancing-clock
 /// variant (`run_workflow_with_state_advancing_clock`) does not duplicate the
-/// span/cycle/drain logic.
+/// span/cycle/drain logic. The test harness also calls it for each
+/// `WorkflowTestRun` cycle.
 pub(crate) async fn drive_workflow(
     ctx: WorkflowContext,
     handler: WorkflowHandlerFn,

@@ -777,7 +777,7 @@ pub use test_generator::TestHarnessGenerator;
 pub use testing::{
     BatchReplayReport, CiReport, FailOnMode, FixtureResult, FixtureStatus, HarnessErrorKind,
     ReplayBlocked, ReplayDrift, ReplayDriftReport, ReplayVerifier, ReportFormat, TestRunOutcome,
-    WorkflowTestEnv,
+    TestRunStatus, WorkflowTestEnv, WorkflowTestRun,
 };
 #[cfg(all(feature = "db", any(test, feature = "testing")))]
 pub use testing::{

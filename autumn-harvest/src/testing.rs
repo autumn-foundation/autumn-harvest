@@ -4945,11 +4945,11 @@ async fn replay_fixture_file(
 // ───────────────────────────────
 // `start` returns a `WorkflowTestRun` that owns this loop. When no command
 // resolves, `run_until_blocked` returns `Blocked` and keeps the run. The test
-// can then send a signal, which the next cycle ingests at task-prep. It can
-// also run an update or a query. Each one replays the history into a fresh
-// context, as the plugin query path does, and calls the handler there. An
-// update appends `UpdateAdmitted` and its result event. `run` is
-// `start(..).finish()`, so both APIs share one loop.
+// can then send a signal, which the next cycle ingests at task-prep. An
+// update or a query replays the history into a fresh context, as the plugin
+// query path does. It then calls the handler there. An update appends
+// `UpdateAdmitted` and its result event. `run` is `start(..).finish()`, so
+// both APIs share one loop.
 
 /// Maximum number of executor iterations before declaring an infinite loop.
 const MAX_TEST_ITERATIONS: usize = 1_000;
@@ -5307,7 +5307,8 @@ impl TestRunOutcome {
 // ---------------------------------------------------------------------------
 
 /// Time limit for the replay that rebuilds state for a mid-run query or
-/// update. It matches the default in-process query timeout.
+/// update, and for an update handler. It matches the default in-process
+/// query timeout.
 const MID_RUN_REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where a [`WorkflowTestRun`] stopped after a drive.
@@ -5333,9 +5334,18 @@ pub enum TestRunStatus {
 /// [`run_until_blocked`](Self::run_until_blocked) or
 /// [`finish`](Self::finish) to continue.
 ///
-/// Timers fire when the workflow waits on them. So `run_until_blocked` stops
-/// only on a wait with no timer. To make a signal win a race against a timer,
-/// send the signal before the drive that reaches the race.
+/// A classic timer fires when the workflow waits on it. So
+/// `run_until_blocked` does not stop on such a wait. To make a signal win a
+/// race against a timer, send the signal before the drive that reaches the
+/// race. An awaited cancellable timer that races another wait does not fire
+/// in the harness. The drive then reports `Blocked`.
+///
+/// An update or a query runs its handler in a context rebuilt from history.
+/// Before the first drive, that rebuild runs the body up to its first
+/// command, so values such as `new_uuid` differ from the real run.
+/// The engine does not run a completed update handler again on replay. So a
+/// change that the handler makes to state captured by the workflow body is
+/// gone at the next drive, as after a replay in production.
 pub struct WorkflowTestRun<'env> {
     env: &'env WorkflowTestEnv,
     handler: WorkflowHandlerFn,
@@ -5348,6 +5358,9 @@ pub struct WorkflowTestRun<'env> {
     pending_signals: Vec<(String, Value)>,
     retry_sequences: HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
     recorded_logs: std::collections::BTreeMap<u64, RecordedLogLine>,
+    /// History length at the last `Blocked`. A drive with no new event and
+    /// no pending signal returns `Blocked` again without running the body.
+    blocked_at: Option<usize>,
     /// `Some` once the run ends. It then owns the history.
     outcome: Option<TestRunOutcome>,
 }
@@ -5367,6 +5380,14 @@ impl WorkflowTestRun<'_> {
             .map_or(&self.history, |outcome| &outcome.events)
     }
 
+    /// The virtual time after the history so far.
+    ///
+    /// It is the start time plus the time of every timer that fired.
+    #[must_use]
+    pub fn now(&self) -> DateTime<Utc> {
+        virtual_now(self.start_time, self.events())
+    }
+
     /// Drive the run until the workflow blocks or the run ends.
     ///
     /// The drive first ingests every pending signal into history. A finished
@@ -5374,6 +5395,11 @@ impl WorkflowTestRun<'_> {
     pub async fn run_until_blocked(&mut self) -> TestRunStatus {
         if self.outcome.is_some() {
             return TestRunStatus::Finished;
+        }
+        // Nothing changed since the last block. A new cycle would only run the
+        // frontier code again and emit its metrics twice.
+        if self.pending_signals.is_empty() && self.blocked_at == Some(self.history.len()) {
+            return TestRunStatus::Blocked;
         }
         let span_meta = self.env.span_meta();
         for _iter in 0..MAX_TEST_ITERATIONS {
@@ -5424,7 +5450,10 @@ impl WorkflowTestRun<'_> {
                         &mut self.retry_sequences,
                     ) {
                         Ok(true) => {}
-                        Ok(false) => return TestRunStatus::Blocked,
+                        Ok(false) => {
+                            self.blocked_at = Some(self.history.len());
+                            return TestRunStatus::Blocked;
+                        }
                         Err(error) => {
                             self.end_with_error(error);
                             return TestRunStatus::Finished;
@@ -5473,7 +5502,9 @@ impl WorkflowTestRun<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::WorkflowNotRunning`] after the run ends.
+    /// Returns [`HarvestError::WorkflowNotRunning`] after the run ends. The
+    /// signal API returns a `Config` error in that case. The harness uses a
+    /// typed variant so a test can match it.
     ///
     /// [`HarvestError::WorkflowNotRunning`]: crate::error::HarvestError::WorkflowNotRunning
     pub fn signal(
@@ -5486,33 +5517,57 @@ impl WorkflowTestRun<'_> {
         Ok(())
     }
 
-    /// Run an update against the current state, as the engine does.
+    /// Run an update against the current state.
     ///
     /// The harness replays the history to rebuild the workflow state and its
     /// handlers. The validator runs first. A rejection writes no event. An
     /// admitted update records `UpdateAdmitted` at the virtual time. The
-    /// handler then runs, and its result records `UpdateCompleted` or
-    /// `UpdateFailed`. The update does not drive the run.
+    /// handler then runs. The harness records `UpdateCompleted` or
+    /// `UpdateFailed` with the result. The update does not drive the run.
+    ///
+    /// The checks run in this order: the declarative `arg_schema` (issue
+    /// #610), then every validator that `validate_update` knows. Imperative
+    /// validators run too. An unknown name writes no event.
+    ///
+    /// The update metrics and the metrics of the handler are not recorded.
     ///
     /// # Errors
     ///
-    /// - [`HarvestError::WorkflowNotRunning`] after the run ends.
+    /// - [`HarvestError::UpdateRejected`] after the run ends, as the update
+    ///   API does for an execution that is not `RUNNING`.
+    /// - [`HarvestError::InputValidationFailed`] if the input fails the
+    ///   `arg_schema` of a declarative handler.
     /// - [`HarvestError::UpdateHandlerNotFound`] if no handler has the name.
     /// - [`HarvestError::UpdateRejected`] if the validator rejects the input.
-    /// - [`HarvestError::WorkflowFailed`] if the handler returns an error,
-    ///   as the in-process update client reports it.
+    /// - [`HarvestError::WorkflowFailed`] if the handler returns an error or
+    ///   panics, as the in-process update client reports it. The harness
+    ///   records `UpdateFailed`.
+    /// - [`HarvestError::Timeout`] if the handler does not finish in 5
+    ///   seconds. The admitted update keeps no result.
     /// - [`HarvestError::QueryHandlerPanicked`] or
     ///   [`HarvestError::QueryTimedOut`] if the replay that rebuilds the
-    ///   state panics or times out.
+    ///   state panics or times out. These errors keep their query names
+    ///   because the rebuild uses the query replay path.
     ///
-    /// [`HarvestError::WorkflowNotRunning`]: crate::error::HarvestError::WorkflowNotRunning
+    /// [`HarvestError::InputValidationFailed`]: crate::error::HarvestError::InputValidationFailed
+    /// [`HarvestError::Timeout`]: crate::error::HarvestError::Timeout
     /// [`HarvestError::UpdateHandlerNotFound`]: crate::error::HarvestError::UpdateHandlerNotFound
     /// [`HarvestError::UpdateRejected`]: crate::error::HarvestError::UpdateRejected
     /// [`HarvestError::WorkflowFailed`]: crate::error::HarvestError::WorkflowFailed
     /// [`HarvestError::QueryHandlerPanicked`]: crate::error::HarvestError::QueryHandlerPanicked
     /// [`HarvestError::QueryTimedOut`]: crate::error::HarvestError::QueryTimedOut
     pub async fn update(&mut self, name: &str, input: Value) -> crate::error::HarvestResult<Value> {
-        self.ensure_running()?;
+        if self.outcome.is_some() {
+            return Err(crate::error::HarvestError::UpdateRejected {
+                reason: format!("workflow {} is not RUNNING", self.exec_id),
+            });
+        }
+        // The update API checks the declarative `arg_schema` first (issue #610).
+        if let Some(info) = self.env.own_update(name)
+            && let Err(violations) = info.validate_arg(&input)
+        {
+            return Err(crate::error::HarvestError::InputValidationFailed { violations });
+        }
         let ctx = self.rebuild_state(name).await?;
         ctx.validate_update(name, &input)?;
 
@@ -5524,8 +5579,29 @@ impl WorkflowTestRun<'_> {
             timestamp: virtual_now(self.start_time, &self.history),
         });
         // The context replayed the history before the admission. So the
-        // update has no result in it, and the handler runs live.
-        let result = ctx.execute_admitted_update(update_id, name, input).await;
+        // update has no result in it, and the handler runs live. The time
+        // limit stops a handler that waits on a command no one resolves.
+        let handler =
+            std::panic::AssertUnwindSafe(ctx.execute_admitted_update(update_id, name, input));
+        let result = match tokio::time::timeout(
+            MID_RUN_REPLAY_TIMEOUT,
+            futures::FutureExt::catch_unwind(handler),
+        )
+        .await
+        {
+            // The admitted update keeps no result, as in production.
+            Err(_elapsed) => {
+                return Err(crate::error::HarvestError::Timeout {
+                    timeout_type: crate::error::TimeoutType::ScheduleToClose,
+                    task_name: format!("update {name}"),
+                });
+            }
+            Ok(Err(panic)) => Err(format!(
+                "update handler panicked: {}",
+                crate::error::panic_message(panic)
+            )),
+            Ok(Ok(result)) => result,
+        };
         self.history.push(match &result {
             Ok(output) => WorkflowEvent::UpdateCompleted {
                 update_id,
@@ -5551,8 +5627,9 @@ impl WorkflowTestRun<'_> {
     ///
     /// - [`HarvestError::QueryHandlerNotFound`] if no handler has the name.
     /// - [`HarvestError::QueryHandlerFailed`] if the handler returns an error.
-    /// - [`HarvestError::QueryHandlerPanicked`] or
-    ///   [`HarvestError::QueryTimedOut`] if the replay panics or times out.
+    /// - [`HarvestError::QueryHandlerPanicked`] if the replay or a declarative
+    ///   handler panics.
+    /// - [`HarvestError::QueryTimedOut`] if the replay times out.
     ///
     /// [`HarvestError::QueryHandlerNotFound`]: crate::error::HarvestError::QueryHandlerNotFound
     /// [`HarvestError::QueryHandlerFailed`]: crate::error::HarvestError::QueryHandlerFailed
@@ -5919,8 +5996,8 @@ impl WorkflowTestEnv {
         self
     }
 
-    /// Pre-queue a signal for delivery when the workflow calls
-    /// `ctx.wait_for_signal(name)`.
+    /// Queue a signal. The first drive ingests it before the workflow body
+    /// runs.
     ///
     /// Signals are delivered in the order they are queued, matched by name.
     /// Queuing a signal for name "approve" will satisfy the first
@@ -5933,9 +6010,10 @@ impl WorkflowTestEnv {
 
     /// Register declarative `#[query]` handlers (issue #1991).
     ///
-    /// The worker registers these before the workflow body runs. Pass the
-    /// `queries![...]` of the workflow under test, so
-    /// [`WorkflowTestRun::query`] can find them.
+    /// The worker registers these before the workflow body runs, so
+    /// [`WorkflowTestRun::query`] can find them. With
+    /// [`with_workflow_name`](Self::with_workflow_name) set, only the handlers
+    /// of that workflow are registered, as in the worker.
     #[must_use]
     pub fn queries(mut self, queries: Vec<crate::info::QueryHandlerInfo>) -> Self {
         self.declarative_queries = queries;
@@ -5944,8 +6022,8 @@ impl WorkflowTestEnv {
 
     /// Register declarative `#[update]` handlers (issue #1991).
     ///
-    /// Pass the `updates![...]` of the workflow under test, so
-    /// [`WorkflowTestRun::update`] can find them. Their validators run too.
+    /// [`WorkflowTestRun::update`] can then find them, and their validators
+    /// run. The workflow-name filter of [`queries`](Self::queries) applies.
     #[must_use]
     pub fn updates(mut self, updates: Vec<crate::info::UpdateHandlerInfo>) -> Self {
         self.declarative_updates = updates;
@@ -6298,6 +6376,7 @@ impl WorkflowTestEnv {
             // accumulated across every decision cycle and de-duplicated by `seq`
             // exactly the way the store's unique index does.
             recorded_logs: std::collections::BTreeMap::new(),
+            blocked_at: None,
             outcome: None,
         }
     }
@@ -6365,13 +6444,36 @@ impl WorkflowTestEnv {
             metrics,
             workflow_log_policy,
         );
-        for info in &self.declarative_queries {
+        for info in self
+            .declarative_queries
+            .iter()
+            .filter(|h| self.owns(h.workflow))
+        {
             ctx.register_declarative_query_handler(info);
         }
-        for info in &self.declarative_updates {
+        for info in self
+            .declarative_updates
+            .iter()
+            .filter(|h| self.owns(h.workflow))
+        {
             ctx.register_declarative_update_handler(info);
         }
         ctx
+    }
+
+    /// Whether a declarative handler for `workflow` applies to this env.
+    ///
+    /// The worker registers only the handlers of this workflow type. With no
+    /// workflow name set, the harness registers every handler it has.
+    fn owns(&self, workflow: &str) -> bool {
+        self.workflow_name.is_empty() || workflow == self.workflow_name
+    }
+
+    /// The declarative update handler named `name` that applies to this env.
+    fn own_update(&self, name: &str) -> Option<&crate::info::UpdateHandlerInfo> {
+        self.declarative_updates
+            .iter()
+            .find(|h| h.name == name && self.owns(h.workflow))
     }
 
     /// Wrap a result and its history into a [`TestRunOutcome`].
@@ -6974,6 +7076,9 @@ impl WorkflowTestEnv {
                 children,
                 timers: _,
             } => {
+                // A timer-only cancel appends no event. The child-timeout race
+                // emits one on every replay, so it is not progress (issue #1991).
+                let made_progress = !activities.is_empty() || !children.is_empty();
                 for activity_id in activities {
                     deferred_events.push(WorkflowEvent::ActivityFailed {
                         activity_id,
@@ -6990,7 +7095,7 @@ impl WorkflowTestEnv {
                         "lost race to a sibling branch".to_string(),
                     ));
                 }
-                Ok(true)
+                Ok(made_progress)
             }
 
             // Cancellable/renewable durable timer arm (issue #768, Codex P2
