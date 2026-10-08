@@ -2027,6 +2027,10 @@ jobs:
       # `runner.rs` never reach the MSRV compiler. Issue #1312.
       - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
         run: cargo check -p autumn-harvest-plugin --features redis
+      # Issue #1983. The locked `aws-sdk-s3` declares Rust 1.88, the MSRV
+      # itself. This step makes a lockfile bump past it fail.
+      - name: Check MSRV compiles (autumn-harvest-plugin s3 and gcs features, issue #1983)
+        run: cargo check -p autumn-harvest-plugin --features s3,gcs
 
   # Concurrency model checking (issue #1800). The loom and Shuttle targets
   # compile to empty crates unless RUSTFLAGS sets their cfg, so a normal

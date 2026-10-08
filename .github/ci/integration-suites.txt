@@ -276,8 +276,8 @@ linux        autumn-harvest-plugin  interface_schema_integration     -          
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  lineage_tree_integration         -                          -
 linux        autumn-harvest-plugin  load_shed_localpg                -                          -
-linux        autumn-harvest-plugin  object_store_gcs_emulator        gcs                        -
-linux        autumn-harvest-plugin  object_store_s3_minio            s3                         -
+linux        autumn-harvest-plugin  object_store_gcs_emulator        s3,gcs                     -
+linux        autumn-harvest-plugin  object_store_s3_minio            s3,gcs                     -
 linux        autumn-harvest-plugin  openapi_response_conformance     -                          -
 linux        autumn-harvest-plugin  outbox_integration               -                          -
 linux        autumn-harvest-plugin  pacing_override_integration      -                          -

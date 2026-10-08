@@ -22,12 +22,12 @@ const FORBIDDEN: &[&str] = &[
     "kafka",
     // AWS / SQS
     "aws_sdk_sqs",
-    // S3 object store (issue #1983)
-    "aws_sdk_s3",
     "aws_config",
     "aws_smithy_runtime",
     "aws_smithy_client",
     "aws_types",
+    // S3 object store (issue #1983)
+    "aws_sdk_s3",
     // Other brokers a future adapter might reach for — the invariant is
     // "no broker client in core", not "no Kafka in core".
     "async_nats",
@@ -117,7 +117,7 @@ fn the_guard_actually_sees_the_plugins_broker_clients() {
         "-p",
         "autumn-harvest-plugin",
         "--features",
-        "connectors,kafka,sqs",
+        "connectors,kafka,sqs,s3",
         "--edges",
         "normal,build",
         "--prefix",
@@ -127,7 +127,7 @@ fn the_guard_actually_sees_the_plugins_broker_clients() {
     ]);
 
     let names = crate_names(&tree);
-    for expected in ["rdkafka", "aws_sdk_sqs"] {
+    for expected in ["rdkafka", "aws_sdk_sqs", "aws_sdk_s3"] {
         assert!(
             names.contains(&expected),
             "expected `{expected}` in the plugin's kafka+sqs graph; if this \
