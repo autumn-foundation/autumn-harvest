@@ -123,6 +123,15 @@ impl ThrowawayDb {
     /// Panics when the server is unreachable or the migration fails.
     pub async fn create_on(admin_url: &str, prefix: &str) -> Self {
         use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
+        // The name goes into SQL text, and Postgres cuts a name at 63 bytes.
+        // A short `[a-z0-9_]` prefix keeps it safe and whole.
+        assert!(
+            (1..=30).contains(&prefix.len())
+                && prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "a throwaway prefix must match [a-z0-9_]{{1,30}}: {prefix:?}"
+        );
         let admin_url = admin_url.to_string();
         let name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
         let mut admin = AsyncPgConnection::establish(&admin_url)

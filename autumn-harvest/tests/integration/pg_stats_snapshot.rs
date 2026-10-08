@@ -27,6 +27,10 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncC
 /// margin.
 const QUIESCE_BOUND: Duration = Duration::from_secs(15);
 
+/// The wall-clock bound on one [`snapshot_to_dir`] call: the quiesce bound
+/// plus time to connect, read and write.
+pub const SNAPSHOT_BOUND: Duration = Duration::from_secs(45);
+
 /// The longest time an idle session keeps unflushed counters.
 ///
 /// `PostgreSQL` 15 and later flush an idle session within
@@ -223,7 +227,7 @@ async fn flush(conn: &mut AsyncPgConnection) {
     let _ = conn.batch_execute("SELECT pg_stat_clear_snapshot()").await;
 }
 
-async fn read_tables(conn: &mut AsyncPgConnection) -> Vec<TableStats> {
+async fn read_tables(conn: &mut AsyncPgConnection) -> Result<Vec<TableStats>, String> {
     diesel::sql_query(
         "SELECT relname::text AS relname, seq_scan, seq_tup_read, \
                 COALESCE(idx_scan, 0) AS idx_scan, COALESCE(idx_tup_fetch, 0) AS idx_tup_fetch, \
@@ -232,7 +236,7 @@ async fn read_tables(conn: &mut AsyncPgConnection) -> Vec<TableStats> {
     )
     .load::<TableStats>(conn)
     .await
-    .unwrap_or_else(|e| panic!("read pg_stat_user_tables: {e}"))
+    .map_err(|e| format!("read pg_stat_user_tables: {e}"))
 }
 
 async fn read_statements(conn: &mut AsyncPgConnection) -> Statements {
@@ -265,13 +269,13 @@ async fn read_statements(conn: &mut AsyncPgConnection) -> Statements {
 
 /// Read both views from the database `conn` uses.
 ///
-/// The read waits for other sessions to end, then flushes counters. Call it
-/// after the workload closes its pools and before the database is dropped.
+/// The read waits for other sessions to flush their counters. Call it after
+/// the workload closes its pools and before the database is dropped.
 ///
-/// # Panics
-/// Panics when `pg_stat_user_tables` cannot be read. That view exists on every
-/// supported server, so a failure is a real fault.
-pub async fn capture(conn: &mut AsyncPgConnection) -> StatsSnapshot {
+/// # Errors
+/// Returns an error when `pg_stat_user_tables` cannot be read. A missing
+/// statements view is not an error: [`Statements::Unavailable`] records it.
+pub async fn try_capture(conn: &mut AsyncPgConnection) -> Result<StatsSnapshot, String> {
     let lingering = quiesce(conn).await;
     if !lingering.is_empty() {
         eprintln!(
@@ -285,27 +289,36 @@ pub async fn capture(conn: &mut AsyncPgConnection) -> StatsSnapshot {
         .get_result::<TextRow>(conn)
         .await
         .map_or_else(|_| String::new(), |row| row.t);
-    let tables = read_tables(conn).await;
+    let tables = read_tables(conn).await?;
     let statements = read_statements(conn).await;
-    StatsSnapshot {
+    Ok(StatsSnapshot {
         database,
         tables,
         statements,
         lingering,
-    }
+    })
+}
+
+/// [`try_capture`] for a harness that cannot go on without the snapshot.
+///
+/// # Panics
+/// Panics when `pg_stat_user_tables` cannot be read.
+pub async fn capture(conn: &mut AsyncPgConnection) -> StatsSnapshot {
+    try_capture(conn).await.unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Connect to `url`, capture both views, and write them to `dir`.
 ///
-/// The e2e bench calls this from its teardown, before the drop.
+/// The e2e bench calls this from its teardown, before the drop. It never
+/// panics, so a failed snapshot cannot skip the drop.
 ///
 /// # Errors
-/// Returns an error when the connection or a file write fails.
+/// Returns an error when the connection, the read or a file write fails.
 pub async fn snapshot_to_dir(url: &str, dir: &Path, label: &str) -> Result<Vec<PathBuf>, String> {
     let mut conn = AsyncPgConnection::establish(url)
         .await
         .map_err(|e| format!("connect for the stats snapshot: {e}"))?;
-    let snapshot = capture(&mut conn).await;
+    let snapshot = try_capture(&mut conn).await?;
     drop(conn);
     write_snapshot(dir, label, &snapshot, 25).map_err(|e| format!("write the stats snapshot: {e}"))
 }
@@ -335,7 +348,7 @@ pub fn write_snapshot(
     std::fs::write(
         &statements,
         format!(
-            "-- pg_stat_statements, dbid of {} only, top {top} by shared buffers --\n{partial}{}",
+            "-- pg_stat_statements, dbid of {} only, since its last reset, top {top} by shared buffers --\n{partial}{}",
             snapshot.database,
             render_statements(&snapshot.statements, top)
         ),

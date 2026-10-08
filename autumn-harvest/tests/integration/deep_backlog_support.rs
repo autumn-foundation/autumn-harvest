@@ -40,6 +40,10 @@ pub const LEDGER_LIVE_ROWS: u64 = 1_000_000;
 /// drained queues of about this depth.
 pub const SHALLOW_LIVE_ROWS: u64 = 4_000;
 
+/// The largest fixture [`FixtureSpec::validate`] accepts. It keeps every
+/// ordinal well inside `bigint` and every count inside `u64` arithmetic.
+pub const MAX_LIVE_ROWS: u64 = 1_000_000_000;
+
 /// Prefix of every name the fixture writes.
 pub const PREFIX: &str = "deep-backlog";
 
@@ -157,6 +161,12 @@ impl FixtureSpec {
             if v == 0 {
                 return Err(format!("{name} must be at least 1"));
             }
+        }
+        if self.live_rows > MAX_LIVE_ROWS {
+            return Err(format!(
+                "live_rows = {} is above the {MAX_LIVE_ROWS} cap",
+                self.live_rows
+            ));
         }
         for (name, v) in [("queue_skew", self.queue_skew), ("key_skew", self.key_skew)] {
             if !v.is_finite() || v < 1.0 {
@@ -699,7 +709,8 @@ impl FixtureServer {
             .bind::<Text, _>(name)
             .get_result::<CountRow>(&mut admin)
             .await
-            .map_or(0, |row| row.n)
+            .unwrap_or_else(|e| panic!("look up database {name}: {e}"))
+            .n
             > 0
     }
 }
@@ -765,6 +776,8 @@ pub struct WorkloadReport {
     pub enqueues: u64,
     pub empty_polls: u64,
     pub errors: u64,
+    /// Calls still in flight at the budget. The claimer drops them.
+    pub cut_at_deadline: u64,
     pub first_error: Option<String>,
     pub elapsed: Duration,
 }
@@ -776,6 +789,7 @@ struct Tally {
     enqueues: AtomicU64,
     empty_polls: AtomicU64,
     errors: AtomicU64,
+    cut_at_deadline: AtomicU64,
     first_error: std::sync::Mutex<Option<String>>,
 }
 
@@ -787,6 +801,20 @@ impl Tally {
             *first = Some(format!("{what}: {e}"));
         }
     }
+}
+
+/// Errors in a row after which a claimer stops. A broken connection fails
+/// every call, so more retries only use up the budget.
+const MAX_CONSECUTIVE_ERRORS: u32 = 20;
+
+/// The pause after a failed claim, so a failing claimer does not spin.
+const ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Run `fut` until `deadline`. Returns `None` when the deadline comes first.
+async fn by_deadline<T>(deadline: Instant, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), fut)
+        .await
+        .ok()
 }
 
 /// A replacement for a completed task, so the backlog keeps its depth.
@@ -824,7 +852,9 @@ pub async fn drive_claims(
     let tally = Arc::new(Tally::default());
     let queues = Arc::new(spec.queue_names());
     let started = Instant::now();
-    let deadline = started + config.budget;
+    let deadline = started
+        .checked_add(config.budget)
+        .expect("the workload budget fits in an Instant");
     let mut handles = Vec::new();
     for n in 0..config.claimers {
         let tally = Arc::clone(&tally);
@@ -834,9 +864,13 @@ pub async fn drive_claims(
         handles.push(tokio::spawn(async move {
             let mut conn = connect(&url).await;
             let worker = format!("{PREFIX}-worker-{n}");
+            let mut consecutive_errors = 0;
             while Instant::now() < deadline && tally.claims.load(Ordering::Relaxed) < max {
-                let claimed =
-                    queue::claim_task(&mut conn, &queues, &worker, "", None, &[], &[]).await;
+                let claim = queue::claim_task(&mut conn, &queues, &worker, "", None, &[], &[]);
+                let Some(claimed) = by_deadline(deadline, claim).await else {
+                    tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
+                    break;
+                };
                 let task = match claimed {
                     Ok(Some(task)) => task,
                     Ok(None) => {
@@ -846,21 +880,40 @@ pub async fn drive_claims(
                     }
                     Err(e) => {
                         tally.error("claim", &e);
+                        consecutive_errors += 1;
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            break;
+                        }
+                        tokio::time::sleep(ERROR_BACKOFF).await;
                         continue;
                     }
                 };
                 tally.claims.fetch_add(1, Ordering::Relaxed);
-                match queue::complete_task(&mut conn, task.id, serde_json::json!({})).await {
-                    Ok(()) => {
+                let complete = queue::complete_task(&mut conn, task.id, serde_json::json!({}));
+                match by_deadline(deadline, complete).await {
+                    None => {
+                        tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    Some(Ok(())) => {
                         tally.completions.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => tally.error("complete", &e),
+                    Some(Err(e)) => tally.error("complete", &e),
                 }
-                match queue::enqueue(&mut conn, &replacement(&task)).await {
-                    Ok(_) => {
+                let params = replacement(&task);
+                match by_deadline(deadline, queue::enqueue(&mut conn, &params)).await {
+                    None => {
+                        tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        consecutive_errors = 0;
                         tally.enqueues.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => tally.error("enqueue", &e),
+                    Some(Err(e)) => {
+                        tally.error("enqueue", &e);
+                        consecutive_errors += 1;
+                    }
                 }
             }
         }));
@@ -875,6 +928,7 @@ pub async fn drive_claims(
         enqueues: tally.enqueues.load(Ordering::Relaxed),
         empty_polls: tally.empty_polls.load(Ordering::Relaxed),
         errors: tally.errors.load(Ordering::Relaxed),
+        cut_at_deadline: tally.cut_at_deadline.load(Ordering::Relaxed),
         first_error,
         elapsed: started.elapsed(),
     }
@@ -884,28 +938,38 @@ pub async fn drive_claims(
 /// default, `docs/perf-artifacts/deep-backlog`.
 #[must_use]
 pub fn artifact_dir() -> PathBuf {
-    std::env::var_os("HARVEST_DEEP_BACKLOG_OUT").map_or_else(
-        || {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("docs/perf-artifacts/deep-backlog")
-        },
-        PathBuf::from,
-    )
+    std::env::var_os("HARVEST_DEEP_BACKLOG_OUT")
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("docs/perf-artifacts/deep-backlog")
+            },
+            PathBuf::from,
+        )
 }
 
-/// The `u64` in env var `name`, or `default` when it is unset or not a number.
+/// The `u64` in env var `name`, or `default` when it is unset or blank.
+///
+/// # Panics
+/// Panics when the value is not a `u64`. A typo in a knob must not run a
+/// different experiment without a word.
 #[must_use]
 pub fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}={v:?} is not a whole number: {e}")),
+        _ => default,
+    }
 }
 
 /// Seed `spec`, drive `workload`, snapshot, drop, and write the artifacts.
 ///
-/// Returns the summary text for `fixture-summary.txt`.
+/// Returns the summary text for `fixture-summary.txt` and the workload
+/// report, so the caller can reject a run that measured nothing.
 ///
 /// # Panics
 /// Panics when seeding fails or an artifact cannot be written.
@@ -916,7 +980,7 @@ pub async fn capture_run(
     spec: &FixtureSpec,
     workload: &WorkloadConfig,
     out_dir: &Path,
-) -> String {
+) -> (String, WorkloadReport) {
     eprintln!("== {label}: seeding {} live rows ==", spec.live_rows);
     let db = server.create_database().await;
     let name = db.name().to_string();
@@ -1002,13 +1066,14 @@ pub async fn capture_run(
     );
     let _ = writeln!(
         s,
-        "workload: {} claimers, {} claims, {} completions, {} enqueues, {} empty polls, {} errors in {:.1}s ({:.1} claims/s)",
+        "workload: {} claimers, {} claims, {} completions, {} enqueues, {} empty polls, {} errors, {} cut at the budget, in {:.1}s ({:.1} claims/s)",
         workload.claimers,
         report.claims,
         report.completions,
         report.enqueues,
         report.empty_polls,
         report.errors,
+        report.cut_at_deadline,
         report.elapsed.as_secs_f64(),
         report.claims as f64 / report.elapsed.as_secs_f64().max(1e-9)
     );
@@ -1020,5 +1085,5 @@ pub async fn capture_run(
         let _ = writeln!(s, "statements: {} rows, {total} shared buffers", rows.len());
     }
     let _ = writeln!(s, "database dropped after the snapshot: {dropped}\n");
-    s
+    (s, report)
 }

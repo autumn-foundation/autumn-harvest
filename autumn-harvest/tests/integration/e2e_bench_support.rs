@@ -3032,21 +3032,34 @@ pub mod db {
         /// written before the drop. The drop discards `pg_stat_user_tables`,
         /// so the snapshot must come first (issue #1956). Unset, this is
         /// [`Self::teardown`].
+        ///
+        /// A failed or timed-out snapshot is a reported failure. The drop
+        /// always runs after it. The leases stay open until the snapshots
+        /// end, so a concurrent stale sweep cannot drop a shard first.
         pub async fn teardown_with_stats(mut self, scenario: BenchScenario) -> Vec<String> {
-            self.leases.clear();
             let mut failures = Vec::new();
             let raw = std::env::var(STATS_DIR_ENV_VAR).ok();
             if let Some(dir) = stats_dir_from(raw.as_deref()) {
                 let shards = self.urls.len();
                 for (idx, url) in self.urls.values().enumerate() {
                     let label = stats_label(scenario, shards, idx);
-                    if let Err(e) =
-                        super::super::pg_stats_snapshot::snapshot_to_dir(url, &dir, &label).await
-                    {
-                        failures.push(format!("{label}: {e}"));
+                    let snapshot = tokio::time::timeout(
+                        super::super::pg_stats_snapshot::SNAPSHOT_BOUND,
+                        super::super::pg_stats_snapshot::snapshot_to_dir(url, &dir, &label),
+                    )
+                    .await;
+                    match snapshot {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => failures.push(format!("{label} stats snapshot: {e}")),
+                        Err(_) => failures.push(format!(
+                            "{label} stats snapshot: no result within {:?}",
+                            super::super::pg_stats_snapshot::SNAPSHOT_BOUND
+                        )),
                     }
                 }
             }
+            // Release our own backends first, or `DROP DATABASE` blocks on them.
+            self.leases.clear();
             failures.extend(drop_created(&self.created).await);
             failures
         }
@@ -4579,9 +4592,7 @@ pub mod db {
                 // server -- exactly what `teardown` exists to prevent.
                 fleet.stop().await;
                 drop(sharded);
-                let _ = cluster
-                    .teardown_with_stats(BenchScenario::SignalRoundtrip)
-                    .await;
+                let _ = cluster.teardown().await;
                 return Err(SkipReason(format!("bind the signal endpoint: {e}")));
             }
         };

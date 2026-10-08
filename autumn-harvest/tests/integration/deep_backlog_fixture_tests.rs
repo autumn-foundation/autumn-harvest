@@ -316,9 +316,15 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
     {
         let mut conn = fixture::connect(&db.url()).await;
         fixture::seed(&mut conn, &spec).await;
-        stats::reset_statements(&mut conn)
-            .await
-            .expect("pg_stat_statements is preloaded on the test server");
+        if let Err(e) = stats::reset_statements(&mut conn).await {
+            // CI's container preloads the extension. A developer server may not.
+            assert!(
+                std::env::var("HARVEST_TEST_DATABASE_URL").is_ok(),
+                "the test container preloads pg_stat_statements: {e}"
+            );
+            eprintln!("SKIP the snapshot test: {e}");
+            return;
+        }
     }
     let workload = fixture::drive_claims(
         &db.url(),
@@ -378,7 +384,14 @@ async fn zz_capture_deep_backlog_ledger_evidence() {
     let mut summary = String::new();
     for (label, rows) in [("shallow", fixture::SHALLOW_LIVE_ROWS), ("deep", deep_rows)] {
         let spec = FixtureSpec::ledger(seed).at_scale(rows);
-        summary.push_str(&fixture::capture_run(&server, label, &spec, &workload, &out_dir).await);
+        let (text, report) = fixture::capture_run(&server, label, &spec, &workload, &out_dir).await;
+        summary.push_str(&text);
+        assert!(report.claims > 0, "{label}: the workload claimed nothing");
+        assert_eq!(
+            report.errors, 0,
+            "{label}: the workload failed: {:?}",
+            report.first_error
+        );
     }
     std::fs::write(out_dir.join("fixture-summary.txt"), &summary).expect("write the summary");
     println!("{summary}");
