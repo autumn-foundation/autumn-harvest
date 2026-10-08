@@ -336,6 +336,11 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
     );
 
     let snapshot = db.snapshot_and_drop().await;
+    assert!(
+        snapshot.lingering.is_empty(),
+        "the workload closed its sessions, so the snapshot is complete: {:?}",
+        snapshot.lingering
+    );
     let tq = snapshot
         .tables
         .iter()

@@ -9,6 +9,9 @@
 //! database can reuse the OID of a dropped one, and the old rows stay in the
 //! view until a reset.
 
+// `benches/e2e_bench.rs` includes this file and uses only part of it.
+#![allow(dead_code)]
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -17,11 +20,19 @@ use diesel::QueryableByName;
 use diesel::sql_types::{BigInt, Double, Text};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 
-/// How long [`capture`] waits for other sessions on the database to end.
+/// How long [`capture`] waits for other sessions to flush their counters.
 ///
-/// A session flushes its pending table counters when it ends. A snapshot taken
-/// while a pool still closes can miss the last few statements.
-const QUIESCE_BOUND: Duration = Duration::from_secs(10);
+/// A session flushes its pending table counters when it ends. An idle session
+/// flushes them within [`IDLE_FLUSH`]. The bound covers that interval with a
+/// margin.
+const QUIESCE_BOUND: Duration = Duration::from_secs(15);
+
+/// The longest time an idle session keeps unflushed counters.
+///
+/// `PostgreSQL` 15 and later flush an idle session within
+/// `PGSTAT_IDLE_INTERVAL`, which is 10 seconds. A session idle for longer has
+/// no counters that the snapshot can miss.
+const IDLE_FLUSH: &str = "10 seconds";
 
 /// One `pg_stat_statements` row, scoped to one database.
 #[derive(Debug, Clone, PartialEq, QueryableByName)]
@@ -122,6 +133,9 @@ pub struct StatsSnapshot {
     pub database: String,
     pub tables: Vec<TableStats>,
     pub statements: Statements,
+    /// Sessions that had not flushed their counters at the read. A non-empty
+    /// list marks a partial snapshot.
+    pub lingering: Vec<String>,
 }
 
 #[derive(QueryableByName)]
@@ -160,27 +174,36 @@ pub async fn reset_statements(conn: &mut AsyncPgConnection) -> Result<(), String
     .map_err(|e| format!("reset pg_stat_statements for this database: {e}"))
 }
 
-/// Wait until no other session uses this database, up to [`QUIESCE_BOUND`].
+/// Wait until every other session on this database has flushed its counters,
+/// up to [`QUIESCE_BOUND`].
 ///
-/// Returns `false` when sessions remain at the bound. The snapshot still
-/// runs, because partial counters are better than no counters.
-async fn quiesce(conn: &mut AsyncPgConnection) -> bool {
+/// A session has flushed when it has ended, or when it has been idle for
+/// longer than [`IDLE_FLUSH`]. Returns the sessions that have not flushed at
+/// the bound. The snapshot still runs then, because partial counters are
+/// better than no counters.
+async fn quiesce(conn: &mut AsyncPgConnection) -> Vec<String> {
     let deadline = Instant::now() + QUIESCE_BOUND;
+    let sql = format!(
+        "SELECT format('pid %s, application %L, state %s for %ss, query %L', \
+                pid, application_name, state, \
+                round(extract(epoch FROM now() - state_change)), left(query, 80)) AS t \
+         FROM pg_stat_activity \
+         WHERE datname = current_database() AND pid <> pg_backend_pid() \
+           AND NOT (state = 'idle' AND state_change < now() - INTERVAL '{IDLE_FLUSH}') \
+         ORDER BY pid"
+    );
     loop {
-        let others = diesel::sql_query(
-            "SELECT COUNT(*) AS n FROM pg_stat_activity \
-             WHERE datname = current_database() AND pid <> pg_backend_pid()",
-        )
-        .get_result::<IntRow>(conn)
-        .await
-        .map_or(0, |row| row.n);
-        if others == 0 {
-            return true;
+        let others = diesel::sql_query(&sql)
+            .load::<TextRow>(conn)
+            .await
+            .map_or_else(
+                |e| vec![format!("cannot list sessions: {e}")],
+                |rows| rows.into_iter().map(|row| row.t).collect(),
+            );
+        if others.is_empty() || Instant::now() >= deadline {
+            return others;
         }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -213,6 +236,11 @@ async fn read_tables(conn: &mut AsyncPgConnection) -> Vec<TableStats> {
 }
 
 async fn read_statements(conn: &mut AsyncPgConnection) -> Statements {
+    // The view exists only where the extension is installed. A failure here
+    // shows up as the read error below.
+    let _ = conn
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        .await;
     // `total_time` became `total_exec_time` in PostgreSQL 13.
     let time_col = if server_version_num(conn).await >= 130_000 {
         "total_exec_time"
@@ -244,9 +272,13 @@ async fn read_statements(conn: &mut AsyncPgConnection) -> Statements {
 /// Panics when `pg_stat_user_tables` cannot be read. That view exists on every
 /// supported server, so a failure is a real fault.
 pub async fn capture(conn: &mut AsyncPgConnection) -> StatsSnapshot {
-    let quiet = quiesce(conn).await;
-    if !quiet {
-        eprintln!("warning: other sessions still use the database; the counters can be partial");
+    let lingering = quiesce(conn).await;
+    if !lingering.is_empty() {
+        eprintln!(
+            "warning: {} session(s) had not flushed their counters, so the snapshot can be \
+             partial: {lingering:?}",
+            lingering.len()
+        );
     }
     flush(conn).await;
     let database = diesel::sql_query("SELECT current_database()::text AS t")
@@ -259,6 +291,7 @@ pub async fn capture(conn: &mut AsyncPgConnection) -> StatsSnapshot {
         database,
         tables,
         statements,
+        lingering,
     }
 }
 
@@ -288,12 +321,21 @@ pub fn write_snapshot(
     top: usize,
 ) -> std::io::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir)?;
+    let partial = if snapshot.lingering.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "-- PARTIAL: {} session(s) had not flushed their counters: {:?} --\n",
+            snapshot.lingering.len(),
+            snapshot.lingering
+        )
+    };
     let statements = dir.join(format!("{label}-pg_stat_statements.txt"));
     let tables = dir.join(format!("{label}-pg_stat_user_tables.txt"));
     std::fs::write(
         &statements,
         format!(
-            "-- pg_stat_statements, dbid of {} only, top {top} by shared buffers --\n{}",
+            "-- pg_stat_statements, dbid of {} only, top {top} by shared buffers --\n{partial}{}",
             snapshot.database,
             render_statements(&snapshot.statements, top)
         ),
@@ -301,7 +343,7 @@ pub fn write_snapshot(
     std::fs::write(
         &tables,
         format!(
-            "-- pg_stat_user_tables of {} --\n{}",
+            "-- pg_stat_user_tables of {} --\n{partial}{}",
             snapshot.database,
             render_tables(&snapshot.tables)
         ),
