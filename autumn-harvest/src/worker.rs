@@ -11018,21 +11018,68 @@ struct ActivityEnqueuePlan {
     dynamic_rate_buckets: Vec<(String, f64, f64)>,
 }
 
-/// The execution's context headers plus `RESULT_WRITER_HEADER` (issue #1986).
+/// The context headers for one activity row (issue #1986).
 ///
-/// The header rides in the row's existing `context_headers` column, so no
-/// migration is needed. A non-object value is replaced, as the worker reads
-/// such a value as an empty map.
-fn with_result_writer_header(context_headers: Option<&serde_json::Value>) -> serde_json::Value {
-    let mut headers = context_headers
-        .and_then(serde_json::Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    headers.insert(
-        crate::fan_out::RESULT_WRITER_HEADER.to_string(),
-        serde_json::Value::from("1"),
-    );
-    serde_json::Value::Object(headers)
+/// Only the engine sets `RESULT_WRITER_HEADER`. A caller can set any
+/// execution header, so an inherited copy of the reserved header is removed.
+/// A row with the result writer gets the header. The header rides in the
+/// row's existing `context_headers` column, so no migration is needed.
+fn activity_row_context_headers(
+    context_headers: Option<&serde_json::Value>,
+    result_writer: bool,
+) -> Option<serde_json::Value> {
+    let key = crate::fan_out::RESULT_WRITER_HEADER;
+    let inherited = context_headers.and_then(serde_json::Value::as_object);
+    if !result_writer && !inherited.is_some_and(|headers| headers.contains_key(key)) {
+        return context_headers.cloned();
+    }
+    let mut headers = inherited.cloned().unwrap_or_default();
+    headers.remove(key);
+    if result_writer {
+        headers.insert(key.to_string(), serde_json::Value::from("1"));
+    }
+    Some(serde_json::Value::Object(headers))
+}
+
+#[cfg(test)]
+mod result_writer_header_tests {
+    use super::activity_row_context_headers;
+    use crate::fan_out::RESULT_WRITER_HEADER;
+    use serde_json::json;
+
+    #[test]
+    fn a_plain_row_keeps_the_execution_headers() {
+        let headers = json!({ "tenant": "a" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), false),
+            Some(headers)
+        );
+        assert_eq!(activity_row_context_headers(None, false), None);
+    }
+
+    #[test]
+    fn a_writer_row_adds_the_header() {
+        let headers = json!({ "tenant": "a" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), true),
+            Some(json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" }))
+        );
+        assert_eq!(
+            activity_row_context_headers(None, true),
+            Some(json!({ RESULT_WRITER_HEADER: "1" }))
+        );
+    }
+
+    /// A caller can set execution headers. A plain row never inherits the
+    /// reserved header, so a caller cannot turn on the writer.
+    #[test]
+    fn a_plain_row_drops_a_caller_supplied_writer_header() {
+        let headers = json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), false),
+            Some(json!({ "tenant": "a" }))
+        );
+    }
 }
 
 /// Whether the task row asks the worker to write the result (issue #1986).
@@ -11323,11 +11370,8 @@ fn build_activity_enqueue_plan(
             { ATTR_QUEUE } = %queue_name,
         )
         .in_scope(|| registry.telemetry().capture_trace_context());
-        params.context_headers = if scheduled.result_writer {
-            Some(with_result_writer_header(context_headers))
-        } else {
-            context_headers.cloned()
-        };
+        params.context_headers =
+            activity_row_context_headers(context_headers, scheduled.result_writer);
         enqueued.push(params);
     }
 
