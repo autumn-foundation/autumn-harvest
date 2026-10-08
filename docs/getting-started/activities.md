@@ -204,9 +204,10 @@ an interceptor `Err`/panic is contained exactly like a handler failure. See
 
 ## Run one durable job
 
-Harvest has no standalone-activity start path yet.
-[ADR 0006](../adr/0006-standalone-activity.md) records the decision to
-build one. Until it ships, wrap the job in a one-step workflow:
+Harvest has no standalone-activity start path.
+[ADR 0006](../adr/0006-standalone-activity.md) records why: a one-step
+workflow costs little more than a standalone job would. Wrap the job in a
+one-step workflow:
 
 ```rust
 use std::time::Duration;
@@ -230,9 +231,11 @@ async fn render_invoice_job(
 }
 ```
 
-Use the job id as the `workflow_id`. A second start with the same id then
-returns the first run, so the job runs once. The run result is the job
-result.
+Use the job id as the `workflow_id`. With the default reuse policy,
+`AllowDuplicate`, a second start of the same workflow and id returns the
+first run, even a failed one. Use `AllowDuplicateFailedOnly` to rerun a
+failed job. This holds while retention keeps the run. The run result is
+the job result.
 
 For short in-process work, use a local activity. The job then has one task
 row and one claim, not two rows and three claims:
@@ -249,9 +252,10 @@ async fn checksum_job(ctx: &WorkflowContext, input: serde_json::Value) -> Harves
 }
 ```
 
-A local activity cannot heartbeat, cannot use another queue, and is capped
-by `max_local_activity_start_to_close`. Use the regular form when the job
-needs any of these.
+A local activity cannot heartbeat or use another queue.
+`WorkerConfig::max_local_activity_start_to_close` caps its
+`start_to_close` (60 s by default). Use the regular form when the job needs
+any of these.
 
 Cost per job, from
 [One-step workflow overhead against a bare activity](../performance-standalone-activity-overhead.md):
@@ -260,4 +264,4 @@ Cost per job, from
 |---|--:|--:|--:|--:|
 | One-step workflow, regular activity | 5 | 2 | 3 | 17 |
 | One-step workflow, local activity | 4 | 1 | 1 | 10 |
-| Bare task row (no worker path runs it) | 0 | 1 | 1 | 3 |
+| Modelled standalone job (no such API) | 0 | 1 | 1 | 6 |

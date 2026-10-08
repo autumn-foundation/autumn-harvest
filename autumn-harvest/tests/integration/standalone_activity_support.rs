@@ -6,52 +6,50 @@
 //!
 //! Pure: no database, no async.
 
-// Only the `db`-gated harness reads some of these.
-#![cfg_attr(not(feature = "db"), allow(dead_code))]
-
 /// The published measurement page.
-pub(crate) const PERF_DOC: &str = "docs/performance-standalone-activity-overhead.md";
+pub const PERF_DOC: &str = "docs/performance-standalone-activity-overhead.md";
 
 /// The decision record.
-pub(crate) const ADR_DOC: &str = "docs/adr/0006-standalone-activity.md";
+pub const ADR_DOC: &str = "docs/adr/0006-standalone-activity.md";
 
 /// The guide page that shows the one-step pattern.
-pub(crate) const GUIDE_DOC: &str = "docs/getting-started/activities.md";
+pub const GUIDE_DOC: &str = "docs/getting-started/activities.md";
 
 /// The guide heading for the pattern.
-pub(crate) const GUIDE_HEADING: &str = "## Run one durable job";
+pub const GUIDE_HEADING: &str = "## Run one durable job";
 
 /// Where the evidence capture writes its raw output.
-pub(crate) const ARTIFACT_DIR: &str = "docs/perf-artifacts/standalone-activity-overhead";
+pub const ARTIFACT_DIR: &str = "docs/perf-artifacts/standalone-activity-overhead";
 
 /// Jobs per arm in the evidence capture.
-pub(crate) const JOBS_PER_ARM: usize = 50;
+pub const JOBS_PER_ARM: usize = 50;
 
-/// The decision line from `DESIGN-1987.md` §0.4.
+/// The decision line from `DESIGN-1987.md` §0.4 and §0.6.
 ///
-/// Arm B at or below this multiple of arm C, on both deciders, means
-/// "document the pattern". Above it on either means "build".
-pub(crate) const BUILD_LINE: f64 = 2.0;
+/// Arm B at or below this multiple of the floor, on both deciders, means
+/// "document the pattern". Above it on either means "build". §0.4 used arm
+/// C as the floor. §0.6 uses arm D, and §0.6 decides.
+pub const BUILD_LINE: f64 = 2.0;
 
 /// The ADR text for each verdict.
-pub(crate) const VERDICT_DOCUMENT: &str = "Document the one-step-workflow pattern";
-pub(crate) const VERDICT_BUILD: &str = "Build a standalone-activity API";
+pub const VERDICT_DOCUMENT: &str = "Document the one-step-workflow pattern";
+pub const VERDICT_BUILD: &str = "Build a standalone-activity API";
 
 /// One measured shape and its exact per-job structure.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Arm {
+pub struct Arm {
     /// The label in the published table.
-    pub(crate) label: &'static str,
+    pub label: &'static str,
     /// `harvest_events` rows per job.
-    pub(crate) events: i64,
+    pub events: i64,
     /// `harvest_task_queue` rows per job.
-    pub(crate) task_rows: i64,
+    pub task_rows: i64,
     /// Task claims per job, read as `SUM(attempt)` over its task rows.
-    pub(crate) claims: i64,
+    pub claims: i64,
 }
 
 /// One-step workflow that runs a regular activity.
-pub(crate) const ARM_A: Arm = Arm {
+pub const ARM_A: Arm = Arm {
     label: "A",
     events: 5,
     task_rows: 2,
@@ -59,7 +57,7 @@ pub(crate) const ARM_A: Arm = Arm {
 };
 
 /// One-step workflow that runs a local activity.
-pub(crate) const ARM_B: Arm = Arm {
+pub const ARM_B: Arm = Arm {
     label: "B",
     events: 4,
     task_rows: 1,
@@ -67,12 +65,21 @@ pub(crate) const ARM_B: Arm = Arm {
 };
 
 /// The bare floor: one task row with no workflow.
-pub(crate) const ARM_C: Arm = Arm {
+pub const ARM_C: Arm = Arm {
     label: "C",
     events: 0,
     task_rows: 1,
     claims: 1,
 };
 
+/// The realistic floor: a task row, a job record and the handler-start
+/// marker, with no events.
+pub const ARM_D: Arm = Arm {
+    label: "D",
+    events: 0,
+    task_rows: 1,
+    claims: 1,
+};
+
 /// Every arm, in table order.
-pub(crate) const ARMS: [Arm; 3] = [ARM_A, ARM_B, ARM_C];
+pub const ARMS: [Arm; 4] = [ARM_A, ARM_B, ARM_C, ARM_D];

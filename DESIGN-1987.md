@@ -71,7 +71,7 @@ line. It is reported in full.
 
 ### 0.5 Corrections after the first measurement
 
-The rule in §0.4 did not change. Three method claims in §0.1 and §0.2 were
+The rule in §0.4 did not change. Method claims in §0.1 and §0.2 were
 wrong. Each fix removed noise from the deciders. None moved a figure across
 the line.
 
@@ -88,9 +88,22 @@ the line.
 3. **Latency.** Each arm enqueues all its jobs and then drains them. A
    start-to-completion time measures the queue, not the job. The harness
    no longer reports it.
+4. **Worker stop.** Aborting the worker task left its background loops
+   running. The harness now stops the worker, waits for every worker
+   connection to close, and then reads the counters. A stopping worker
+   updates its `harvest_workers` row twice. The idle control pays the same
+   writes, and the capture subtracts them.
+5. **Source of rows written.** §1.2 first named `pg_stat_statements`. The
+   red-phase harness already read `pg_stat_user_tables`, before any
+   measurement.
+6. **Guide scope.** §1.3 first wrote the guide section only for a
+   "document" verdict. It now ships with either verdict, as the pattern
+   to use today.
 
 Before the fixes, the first capture read B/C 3.58x on rows and 4.22x on
-WAL. After them, it reads 3.33x and 3.39x. The verdict is the same.
+WAL. After them, it reads 3.33x and 3.39x. The verdict is the same. The
+first capture file was overwritten and is not kept; the figures above
+come from its console output.
 
 ### 0.6 Re-charter: a realistic floor (fixed before arm D runs)
 
@@ -142,6 +155,7 @@ right comparator, not surprise. The ADR states both verdicts.
 | A | One-step workflow, regular activity | `start_or_load_workflow_execution`, then a live `Worker` |
 | B | One-step workflow, local activity | The same, with `execute_local_activity_raw` |
 | C | Bare floor | `queue::enqueue` (no execution), `queue::claim_task`, handler call, `queue::complete_claimed_task` |
+| D | Realistic floor (§0.6) | Arm C plus a `harvest_workflow_executions` record and the handler-start marker |
 
 All arms run the same handler on the same input.
 
@@ -155,8 +169,7 @@ calls (from `pg_stat_statements`). Calls are context, not a decider.
 
 - `docs/performance-standalone-activity-overhead.md`: the measurement.
 - `docs/adr/0006-standalone-activity.md`: the decision.
-- `docs/getting-started/activities.md`: the pattern, as the interim
-  answer until a built API ships.
+- `docs/getting-started/activities.md`: the pattern.
 - A changelog fragment.
 
 ## 2. Tests
@@ -164,5 +177,5 @@ calls (from `pg_stat_statements`). Calls are context, not a decider.
 | Test | Phase |
 |------|-------|
 | `standalone_activity_docs::*` (pure): the ADR, the perf page and the guide exist, agree with each other and with the asserted constants | Red, then green |
-| `standalone_activity_overhead_perf::arm_*_structural_counts` (live DB): events, task rows and claims per job equal the constants | Red, then green |
+| `standalone_activity_overhead_perf::arm_*_structural_counts` (live DB): events, task rows and claims per job equal the constants | Characterization; a mutated constant fails it |
 | `standalone_activity_overhead_perf::zz_capture_*` (ignored): writes the evidence | Evidence |

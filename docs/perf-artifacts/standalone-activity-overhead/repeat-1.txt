@@ -2,64 +2,50 @@
 
 | Arm | Rows written | WAL bytes | Statement calls | Calls net of idle |
 |---|--:|--:|--:|--:|
-| A | 17.00 | 13382 | 256.24 | 203.91 |
-| B | 10.00 | 7873 | 145.24 | 114.03 |
-| C | 3.00 | 2327 | 10.00 | 10.00 |
+| A | 17.00 | 13437 | 145.18 | 114.78 |
+| B | 10.00 | 7878 | 85.32 | 64.83 |
+| C | 3.00 | 2326 | 10.00 | 10.00 |
+| D | 6.00 | 5073 | 18.00 | 18.00 |
 
 | Ratio | Rows written | WAL bytes |
 |---|--:|--:|
-| A / C | 5.67x | 5.75x |
-| B / C | 3.33x | 3.38x |
+| A / C | 5.67x | 5.78x |
+| B / C | 3.33x | 3.39x |
+| B / D | 1.67x | 1.55x |
 
-Idle control over 2834 ms: rows written 0, WAL bytes 0, calls 2617
+Idle control over 2662 ms: rows written 2, WAL bytes 762, calls 1521
 
-Verdict at the 2.0x line: Build a standalone-activity API
+Verdict at the 2.0x line against arm C (§0.4): Build a standalone-activity API
+Verdict at the 2.0x line against arm D (§0.6, decides): Document the one-step-workflow pattern
 
-## Arm A: 50 jobs, window 2833 ms
+## Arm A: 50 jobs, window 2660 ms
 
-rows written 850, WAL bytes 669079, full-page image bytes 200028, calls 12812
+rows written 852, WAL bytes 672588, full-page image bytes 0, calls 7259
 
 | table | ins | upd | del |
 |---|--:|--:|--:|
 | harvest_events | 250 | 0 | 0 |
 | harvest_task_queue | 100 | 400 | 0 |
+| harvest_workers | 0 | 2 | 0 |
 | harvest_workflow_executions | 50 | 50 | 0 |
 
 | calls | rows | statement |
 |--:|--:|---|
-| 1371 | 0 | `COMMIT` |
-| 1216 | 0 | `BEGIN` |
-| 1054 | 1054 | `SELECT to_regclass($1) IS NOT NULL AS present` |
-| 884 | 884 | `SELECT $1` |
-| 641 | 641 | `SELECT NOW() AS as_of` |
-| 483 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id` |
-| 372 | 372 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(S` |
+| 711 | 711 | `SELECT $1` |
+| 590 | 0 | `COMMIT` |
+| 436 | 0 | `BEGIN` |
+| 405 | 405 | `SELECT to_regclass($1) IS NOT NULL AS present` |
 | 350 | 350 | `SELECT txid_current() AS txid, current_database()::text AS database, pg_postmaster_start_time() AS started_at` |
+| 326 | 326 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(S` |
 | 250 | 250 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)` |
-| 228 | 393 | `SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)` |
+| 220 | 380 | `SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)` |
 | 200 | 550 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_even` |
 | 200 | 200 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv` |
-| 161 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 161 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 161 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 161 | 0 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks` |
-| 161 | 0 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv` |
-| 161 | 161 | `SELECT EXISTS (SELECT $1 FROM harvest_start_throttle LIMIT $2) AS present` |
-| 161 | 0 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_eve` |
-| 161 | 0 | `SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHER` |
-| 161 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_executions e ` |
-| 161 | 0 | `SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON ` |
-| 161 | 0 | `UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) ` |
-| 161 | 161 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 161 | 161 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 160 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now()` |
-| 160 | 0 | `SELECT key_id FROM harvest_codec_key_state WHERE state = $1 LIMIT $2` |
-| 160 | 160 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 160 | 160 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 157 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
-| 155 | 150 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
+| 154 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 152 | 149 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
 | 150 | 150 | `SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired` |
 | 150 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
+| 124 | 124 | `SELECT NOW() AS as_of` |
 | 100 | 0 | `RELEASE SAVEPOINT diesel_savepoint_1` |
 | 100 | 0 | `SAVEPOINT diesel_savepoint_1` |
 | 100 | 150 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_even` |
@@ -71,6 +57,7 @@ rows written 850, WAL bytes 669079, full-page image bytes 200028, calls 12812
 | 100 | 100 | `SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2 FOR` |
 | 100 | 0 | `UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1` |
 | 100 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
+| 93 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id` |
 | 50 | 50 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", ` |
 | 50 | 50 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", ` |
 | 50 | 50 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard_id", "input", "parent_id", "queue_name", "` |
@@ -93,54 +80,58 @@ rows written 850, WAL bytes 669079, full-page image bytes 200028, calls 12812
 | 50 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
 | 50 | 50 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clock_timestamp(), activity_name ` |
 | 50 | 50 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = $4 AND state = $5 FOR UPDATE ), updated ` |
-| 6 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name =` |
+| 31 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now()` |
+| 31 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 31 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 31 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 31 | 0 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks` |
+| 31 | 0 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv` |
+| 31 | 31 | `SELECT EXISTS (SELECT $1 FROM harvest_start_throttle LIMIT $2) AS present` |
+| 31 | 0 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_eve` |
+| 31 | 0 | `SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHER` |
+| 31 | 0 | `SELECT key_id FROM harvest_codec_key_state WHERE state = $1 LIMIT $2` |
+| 31 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_executions e ` |
+| 31 | 0 | `SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON ` |
+| 31 | 0 | `UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) ` |
+| 31 | 31 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 31 | 31 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 31 | 31 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 31 | 31 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
 | 5 | 0 | `SET CLIENT_ENCODING TO 'UTF8'` |
 | 5 | 0 | `SET TIME ZONE 'UTC'` |
-| 2 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
+| 4 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name =` |
+| 2 | 2 | `UPDATE "harvest_workers" SET "status" = $1 WHERE ("harvest_workers"."worker_id" = $2)` |
+| 2 | 0 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = $3, sticky_timeout = $4 WHERE sticky_worker_id = $1 AND session_id IS NU` |
+| 2 | 1 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
+| 1 | 0 | `SELECT "harvest_task_queue"."id", "harvest_task_queue"."attempt", "harvest_task_queue"."started_at" FROM "harvest_task_queue" WHERE (("harve` |
 
-## Arm B: 50 jobs, window 1690 ms
+## Arm B: 50 jobs, window 1793 ms
 
-rows written 500, WAL bytes 393663, full-page image bytes 0, calls 7262
+rows written 502, WAL bytes 394643, full-page image bytes 0, calls 4266
 
 | table | ins | upd | del |
 |---|--:|--:|--:|
 | harvest_events | 200 | 0 | 0 |
 | harvest_task_queue | 50 | 150 | 0 |
+| harvest_workers | 0 | 2 | 0 |
 | harvest_workflow_executions | 50 | 50 | 0 |
 
 | calls | rows | statement |
 |--:|--:|---|
-| 804 | 0 | `COMMIT` |
-| 734 | 0 | `BEGIN` |
-| 645 | 645 | `SELECT to_regclass($1) IS NOT NULL AS present` |
-| 432 | 432 | `SELECT $1` |
-| 356 | 356 | `SELECT NOW() AS as_of` |
-| 267 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id` |
+| 376 | 0 | `COMMIT` |
+| 368 | 368 | `SELECT $1` |
+| 305 | 0 | `BEGIN` |
+| 290 | 290 | `SELECT to_regclass('harvest_debounce') IS NOT NULL AS present` |
 | 250 | 250 | `SELECT txid_current() AS txid, current_database()::text AS database, pg_postmaster_start_time() AS started_at` |
-| 228 | 228 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(S` |
+| 230 | 230 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(S` |
 | 200 | 200 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)` |
-| 160 | 241 | `SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)` |
+| 158 | 245 | `SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)` |
 | 150 | 150 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv` |
 | 100 | 250 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_even` |
-| 90 | 0 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks` |
-| 90 | 0 | `UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) ` |
-| 90 | 90 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 89 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now()` |
-| 89 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 89 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 89 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 89 | 0 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv` |
-| 89 | 89 | `SELECT EXISTS (SELECT $1 FROM harvest_start_throttle LIMIT $2) AS present` |
-| 89 | 0 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_eve` |
-| 89 | 0 | `SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHER` |
-| 89 | 0 | `SELECT key_id FROM harvest_codec_key_state WHERE state = $1 LIMIT $2` |
-| 89 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_executions e ` |
-| 89 | 0 | `SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON ` |
-| 89 | 89 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 89 | 89 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 89 | 89 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 70 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 71 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 68 | 68 | `SELECT NOW() AS as_of` |
 | 53 | 50 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
+| 51 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id` |
 | 50 | 50 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", ` |
 | 50 | 50 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard_id", "input", "parent_id", "queue_name", "` |
 | 50 | 0 | `RELEASE SAVEPOINT diesel_savepoint_1` |
@@ -166,14 +157,33 @@ rows written 500, WAL bytes 393663, full-page image bytes 0, calls 7262
 | 50 | 50 | `UPDATE harvest_task_queue SET capability_misses = $3, capability_miss_workers = $4 WHERE id = $1 AND state = $5 AND worker_id = $2` |
 | 50 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
 | 50 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
-| 20 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name =` |
-| 17 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
-| 5 | 0 | `SET CLIENT_ENCODING TO 'UTF8'` |
-| 5 | 0 | `SET TIME ZONE 'UTC'` |
+| 21 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name =` |
+| 18 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now()` |
+| 18 | 18 | `SELECT EXISTS (SELECT $1 FROM harvest_start_throttle LIMIT $2) AS present` |
+| 18 | 0 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_eve` |
+| 18 | 0 | `SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHER` |
+| 18 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_executions e ` |
+| 18 | 0 | `SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON ` |
+| 18 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
+| 17 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 17 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 17 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 17 | 0 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks` |
+| 17 | 0 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv` |
+| 17 | 0 | `SELECT key_id FROM harvest_codec_key_state WHERE state = $1 LIMIT $2` |
+| 17 | 0 | `UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) ` |
+| 17 | 17 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 17 | 17 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 17 | 17 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 17 | 17 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 4 | 0 | `SET CLIENT_ENCODING TO 'UTF8'` |
+| 4 | 0 | `SET TIME ZONE 'UTC'` |
+| 2 | 2 | `UPDATE "harvest_workers" SET "status" = $1 WHERE ("harvest_workers"."worker_id" = $2)` |
+| 2 | 0 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = $3, sticky_timeout = $4 WHERE sticky_worker_id = $1 AND session_id IS NU` |
 
-## Arm C: 50 jobs, window 1367 ms
+## Arm C: 50 jobs, window 1099 ms
 
-rows written 150, WAL bytes 116349, full-page image bytes 0, calls 500
+rows written 150, WAL bytes 116314, full-page image bytes 0, calls 500
 
 | table | ins | upd | del |
 |---|--:|--:|--:|
@@ -186,47 +196,77 @@ rows written 150, WAL bytes 116349, full-page image bytes 0, calls 500
 | 50 | 50 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", ` |
 | 50 | 50 | `SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)` |
 | 50 | 50 | `SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired` |
-| 50 | 50 | `SELECT txid_current_if_assigned() AS txid, current_database()::text AS database, pg_postmaster_start_time() AS started_at` |
+| 50 | 50 | `SELECT txid_current_if_assigned()` |
 | 50 | 50 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE ((("harvest_t` |
 | 50 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
 | 50 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
 | 50 | 50 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
 
-## Arm idle: 0 jobs, window 2834 ms
+## Arm D: 50 jobs, window 1624 ms
 
-rows written 0, WAL bytes 0, full-page image bytes 0, calls 2617
+rows written 300, WAL bytes 253639, full-page image bytes 0, calls 900
 
 | table | ins | upd | del |
 |---|--:|--:|--:|
+| harvest_task_queue | 50 | 150 | 0 |
+| harvest_workflow_executions | 50 | 50 | 0 |
 
 | calls | rows | statement |
 |--:|--:|---|
-| 393 | 0 | `COMMIT` |
-| 321 | 0 | `BEGIN` |
-| 265 | 265 | `SELECT to_regclass($1) IS NOT NULL AS present` |
-| 213 | 213 | `SELECT NOW() AS as_of` |
-| 161 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id` |
-| 131 | 131 | `SELECT $1` |
-| 74 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
-| 73 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name =` |
-| 73 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
-| 54 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 54 | 0 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks` |
-| 54 | 0 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv` |
-| 54 | 0 | `UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) ` |
-| 54 | 54 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 53 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now()` |
-| 53 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 53 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
-| 53 | 53 | `SELECT EXISTS (SELECT $1 FROM harvest_start_throttle LIMIT $2) AS present` |
-| 53 | 0 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_eve` |
-| 53 | 0 | `SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHER` |
-| 53 | 0 | `SELECT key_id FROM harvest_codec_key_state WHERE state = $1 LIMIT $2` |
-| 53 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_executions e ` |
-| 53 | 0 | `SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON ` |
-| 53 | 53 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 53 | 53 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 53 | 53 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
-| 5 | 5 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(S` |
+| 150 | 0 | `COMMIT` |
+| 100 | 0 | `BEGIN` |
+| 50 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 50 | 50 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", ` |
+| 50 | 50 | `INSERT INTO harvest_workflow_executions (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, started_at, created_at)` |
+| 50 | 0 | `RELEASE SAVEPOINT diesel_savepoint_1` |
+| 50 | 0 | `SAVEPOINT diesel_savepoint_1` |
+| 50 | 50 | `SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)` |
+| 50 | 50 | `SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired` |
+| 50 | 50 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE ((("harvest_t` |
+| 50 | 50 | `UPDATE harvest_task_queue SET handler_started_attempt = $3, handler_started_at = clock_timestamp() WHERE id = $1 AND worker_id = $2 AND atte` |
+| 50 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
+| 50 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8` |
+| 50 | 50 | `UPDATE harvest_workflow_executions SET state = $3, output = $2, completed_at = NOW() WHERE id = $1` |
+| 50 | 50 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
+
+## Arm idle: 0 jobs, window 2662 ms
+
+rows written 2, WAL bytes 762, full-page image bytes 0, calls 1521
+
+| table | ins | upd | del |
+|---|--:|--:|--:|
+| harvest_workers | 0 | 2 | 0 |
+
+| calls | rows | statement |
+|--:|--:|---|
+| 234 | 0 | `COMMIT` |
+| 168 | 0 | `BEGIN` |
+| 140 | 140 | `SELECT to_regclass($1) IS NOT NULL AS present` |
+| 112 | 112 | `SELECT NOW() AS as_of` |
+| 100 | 100 | `SELECT $1` |
+| 84 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id` |
+| 66 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 66 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name =` |
+| 66 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA` |
+| 28 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now()` |
+| 28 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 28 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 28 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."` |
+| 28 | 0 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks` |
+| 28 | 0 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harv` |
+| 28 | 28 | `SELECT EXISTS (SELECT $1 FROM harvest_start_throttle LIMIT $2) AS present` |
+| 28 | 0 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_eve` |
+| 28 | 0 | `SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHER` |
+| 28 | 0 | `SELECT key_id FROM harvest_codec_key_state WHERE state = $1 LIMIT $2` |
+| 28 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_executions e ` |
+| 28 | 0 | `SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON ` |
+| 28 | 0 | `UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) ` |
+| 28 | 28 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 28 | 28 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 28 | 28 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 28 | 28 | `WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbea` |
+| 3 | 3 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(S` |
+| 2 | 2 | `UPDATE "harvest_workers" SET "status" = $1 WHERE ("harvest_workers"."worker_id" = $2)` |
+| 2 | 0 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = $3, sticky_timeout = $4 WHERE sticky_worker_id = $1 AND session_id IS NU` |
 | 1 | 0 | `SET CLIENT_ENCODING TO 'UTF8'` |
 | 1 | 0 | `SET TIME ZONE 'UTC'` |

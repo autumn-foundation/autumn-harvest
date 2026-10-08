@@ -7,20 +7,27 @@
 //!
 //! * Arm A: a one-step workflow that runs a regular activity.
 //! * Arm B: a one-step workflow that runs a local activity.
-//! * Arm C: the floor. It inserts one task row with no workflow, claims it
-//!   and completes it through the `queue` API. No worker path runs such a
-//!   row, so arm C is the least that a durable job can cost here.
+//! * Arm C: the bare floor. It inserts one task row with no workflow,
+//!   claims it and completes it through the `queue` API. No worker path
+//!   runs such a row.
+//! * Arm D: the realistic floor (`DESIGN-1987.md` §0.6). It adds a job
+//!   record and the handler-start marker to arm C, and writes no events.
 //!
 //! The structural tests assert events, task rows and claims per job. Those
-//! counts are exact. The ignored capture measures the two deciders: rows
-//! written and WAL bytes. The harness turns off scanner election, which
-//! renews a lease row on a timer. It counts only WAL records on the arm's
-//! own tables. An idle-worker control then writes no row and no WAL.
-//! Statement calls are context only, because idle polls add calls. The
-//! capture removes the idle call rate from them.
+//! counts are exact, and the tests need only a plain database. The ignored
+//! capture also measures the two deciders: rows written and WAL bytes. It
+//! needs a superuser and a preloaded `pg_stat_statements`.
 //!
-//! Each arm gets a fresh, migrated database. `HARVEST_TEST_DATABASE_URL`
-//! is an admin URL. Without it the harness starts a Postgres container.
+//! The harness turns off scanner election and sets a 10-minute worker
+//! heartbeat, because both write rows on a timer. It stops the worker and
+//! waits for its connections to close before it reads any counter. It
+//! counts only WAL records on the arm's own tables. An idle-worker control
+//! then writes no row and no WAL. Statement calls are context only, because
+//! idle polls add calls. The capture removes the idle call rate from them.
+//!
+//! Each arm gets a fresh, migrated database, dropped after the arm.
+//! `HARVEST_TEST_DATABASE_URL` is an admin URL. Without it the harness
+//! starts a Postgres container.
 
 #![allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 
@@ -36,7 +43,7 @@ use autumn_harvest::queue::{self, EnqueueParams, TaskClaim, TaskType};
 use autumn_harvest::types::{
     ExecutionId, Priority, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
-use autumn_harvest::worker::{HandlerRegistry, Worker};
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{StartSource, StartWorkflowParams, start_or_load_workflow_execution};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::{Value, json};
@@ -45,7 +52,7 @@ use testcontainers_modules::postgres::Postgres;
 
 use super::integration_e2e::{build_test_pool, runtime_config, spawn_test_worker};
 use super::standalone_activity_support::{
-    ARM_A, ARM_B, ARM_C, ARTIFACT_DIR, Arm, BUILD_LINE, JOBS_PER_ARM, VERDICT_BUILD,
+    ARM_A, ARM_B, ARM_C, ARM_D, ARTIFACT_DIR, Arm, BUILD_LINE, JOBS_PER_ARM, VERDICT_BUILD,
     VERDICT_DOCUMENT,
 };
 
@@ -54,10 +61,12 @@ const JOB: &str = "standalone_job";
 const JOB_LOCAL: &str = "standalone_job_local";
 const WF_REGULAR: &str = "one_step_regular";
 const WF_LOCAL: &str = "one_step_local";
+const RECORD_NAME: &str = "standalone_record";
 const BARE_WORKER: &str = "standalone-bare";
 
 /// Opens every harness query, so the statement capture can drop them.
-/// `pg_stat_statements` keeps the comment in the stored query text.
+/// `pg_stat_statements` keeps the comment in the stored query text. Each
+/// tagged query has a shape that no engine query shares.
 const HARNESS: &str = "/* harness */ ";
 
 /// Jobs per arm in the structural tests. Small, because the counts are exact.
@@ -69,8 +78,8 @@ fn job_input(n: usize) -> Value {
 }
 
 /// The same body for every arm: return the input.
-fn job_body(input: Value) -> Result<Value, String> {
-    Ok(input)
+const fn job_body(input: Value) -> Value {
+    input
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
@@ -78,7 +87,7 @@ fn job_body(input: Value) -> Result<Value, String> {
 type BoxFut<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
 fn job_handler(_ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
-    Box::pin(async move { job_body(input) })
+    Box::pin(async move { Ok(job_body(input)) })
 }
 
 fn regular_workflow(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
@@ -164,6 +173,13 @@ fn registry() -> Arc<HandlerRegistry> {
 
 type DbGuard = Option<ContainerAsync<Postgres>>;
 
+/// Whether an arm also captures WAL and statement statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stats {
+    Off,
+    On,
+}
+
 async fn setup_server() -> (String, DbGuard) {
     use testcontainers::ImageExt;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -194,27 +210,53 @@ async fn connect(url: &str) -> AsyncPgConnection {
         .expect("connect to the database")
 }
 
-/// Creates and migrates a uniquely-named database. Returns its name and URL.
-async fn create_fresh_db(admin_url: &str, prefix: &str) -> (String, String) {
+/// The admin URL with its database name replaced. A query string stays.
+fn arm_url(admin_url: &str, name: &str) -> String {
+    let (base, query) = admin_url
+        .split_once('?')
+        .map_or((admin_url, None), |(b, q)| (b, Some(q)));
+    let (prefix, _) = base.rsplit_once('/').expect("the URL has a db segment");
+    query.map_or_else(
+        || format!("{prefix}/{name}"),
+        |q| format!("{prefix}/{name}?{q}"),
+    )
+}
+
+/// A uniquely-named, migrated database for one arm.
+struct ArmDb {
+    name: String,
+    url: String,
+}
+
+async fn create_fresh_db(admin_url: &str, prefix: &str, stats: Stats) -> ArmDb {
     let name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
     let mut admin = connect(admin_url).await;
     admin
         .batch_execute(&format!("CREATE DATABASE \"{name}\""))
         .await
         .expect("create the arm database");
-    let (base, _) = admin_url.rsplit_once('/').expect("the URL has a db segment");
-    let url = format!("{base}/{name}");
+    let url = arm_url(admin_url, &name);
     let mut conn = connect(&url).await;
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply the migration bundle");
-    let _ = conn
-        .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
-        .await;
-    conn.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_walinspect")
+    if stats == Stats::On {
+        conn.batch_execute(
+            "CREATE EXTENSION IF NOT EXISTS pg_stat_statements; \
+             CREATE EXTENSION IF NOT EXISTS pg_walinspect;",
+        )
         .await
-        .expect("pg_walinspect needs a superuser role");
-    (name, url)
+        .expect("the capture needs a superuser and a preloaded pg_stat_statements");
+    }
+    ArmDb { name, url }
+}
+
+async fn drop_db(admin_url: &str, name: &str) {
+    connect(admin_url)
+        .await
+        .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+        .await
+        .expect("drop the arm database");
 }
 
 #[derive(diesel::QueryableByName)]
@@ -276,15 +318,15 @@ struct Text {
     v: String,
 }
 
-async fn wal_lsn(conn: &mut AsyncPgConnection) -> String {
-    diesel::sql_query("SELECT pg_current_wal_lsn()::text AS v")
+async fn text(conn: &mut AsyncPgConnection, sql: &str) -> String {
+    diesel::sql_query(format!("{HARNESS}{sql}"))
         .get_result::<Text>(conn)
         .await
-        .expect("read the WAL position")
+        .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
         .v
 }
 
-#[derive(diesel::QueryableByName)]
+#[derive(diesel::QueryableByName, Default)]
 struct Wal {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     data: i64,
@@ -297,8 +339,24 @@ struct Wal {
 /// The cluster WAL also holds autovacuum, catalog upkeep and other
 /// databases. A block reference names `tablespace/database/filenode`, so
 /// the filter keeps only records on this arm's own tables and indexes.
-/// Full-page images depend on checkpoint timing, so they count apart.
+/// Records with no block reference, such as a commit, drop out. Full-page
+/// images depend on checkpoint timing, so the harness counts them
+/// separately.
 async fn wal_since(conn: &mut AsyncPgConnection, start: &str) -> Wal {
+    let end = text(conn, "SELECT pg_current_wal_flush_lsn()::text AS v").await;
+    // `pg_get_wal_records_info` fails on a range with no record in it.
+    let span = diesel::sql_query(format!(
+        "{HARNESS}SELECT ($1::pg_lsn - $2::pg_lsn)::bigint AS v"
+    ))
+    .bind::<diesel::sql_types::Text, _>(&end)
+    .bind::<diesel::sql_types::Text, _>(start)
+    .get_result::<Int>(conn)
+    .await
+    .expect("compare WAL positions")
+    .v;
+    if span <= 0 {
+        return Wal::default();
+    }
     diesel::sql_query(format!(
         "{HARNESS}WITH rels AS ( \
              SELECT '/' || (SELECT oid FROM pg_database WHERE datname = current_database()) \
@@ -307,10 +365,11 @@ async fn wal_since(conn: &mut AsyncPgConnection, start: &str) -> Wal {
              WHERE n.nspname = 'public' AND pg_relation_filenode(c.oid) IS NOT NULL) \
          SELECT COALESCE(SUM(r.record_length - r.fpi_length), 0)::bigint AS data, \
                 COALESCE(SUM(r.fpi_length), 0)::bigint AS fpi \
-         FROM pg_get_wal_records_info($1::pg_lsn, pg_current_wal_flush_lsn()) r \
+         FROM pg_get_wal_records_info($1::pg_lsn, $2::pg_lsn) r \
          WHERE EXISTS (SELECT 1 FROM rels WHERE r.block_ref ~ rels.pattern)"
     ))
     .bind::<diesel::sql_types::Text, _>(start)
+    .bind::<diesel::sql_types::Text, _>(&end)
     .get_result(conn)
     .await
     .expect("read the arm's WAL records")
@@ -344,7 +403,6 @@ async fn statements(conn: &mut AsyncPgConnection) -> Vec<Statement> {
          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
            AND query NOT ILIKE '%pg_stat%' \
            AND query NOT LIKE '%/* harness */%' \
-           AND query NOT ILIKE '%pg_current_wal_lsn%' \
          ORDER BY calls DESC, query",
     )
     .load(conn)
@@ -354,39 +412,73 @@ async fn statements(conn: &mut AsyncPgConnection) -> Vec<Statement> {
 
 // ── measurement ──────────────────────────────────────────────────────────────
 
-/// What one arm costs, summed over all its jobs.
-#[derive(Debug)]
-struct Measurement {
-    jobs: usize,
-    /// Per-job events, task rows and claims. Each job must match the first.
-    events: Vec<i64>,
-    task_rows: Vec<i64>,
-    claims: Vec<i64>,
+/// The counters an arm reads when its window closes.
+struct Figures {
     writes: Vec<TableWrites>,
-    /// WAL record bytes on this arm's tables, without full-page images.
-    wal_bytes: i64,
-    /// Full-page image bytes on this arm's tables.
-    fpi_bytes: i64,
+    wal: Wal,
     statements: Vec<Statement>,
     window: Duration,
 }
 
+/// What one arm costs, summed over all its jobs.
+struct Measurement {
+    jobs: usize,
+    /// Per-job events, task rows and claims, one entry per job.
+    events: Vec<i64>,
+    task_rows: Vec<i64>,
+    claims: Vec<i64>,
+    figures: Figures,
+}
+
 impl Measurement {
+    /// Joins the per-job rows to the figures. Every requested job must
+    /// have a row.
+    fn new(jobs: usize, figures: Figures, rows: &[JobRow]) -> Self {
+        assert_eq!(rows.len(), jobs, "every requested job must leave a row");
+        Self {
+            jobs,
+            events: rows.iter().map(|j| j.events).collect(),
+            task_rows: rows.iter().map(|j| j.task_rows).collect(),
+            claims: rows.iter().map(|j| j.claims).collect(),
+            figures,
+        }
+    }
+
     fn rows_written(&self) -> i64 {
-        self.writes.iter().map(|w| w.ins + w.upd + w.del).sum()
+        self.figures
+            .writes
+            .iter()
+            .map(|w| w.ins + w.upd + w.del)
+            .sum()
+    }
+
+    const fn wal_bytes(&self) -> i64 {
+        self.figures.wal.data
     }
 
     fn calls(&self) -> i64 {
-        self.statements.iter().map(|s| s.calls).sum()
+        self.figures.statements.iter().map(|s| s.calls).sum()
     }
 
     fn per_job(&self, total: i64) -> f64 {
         total as f64 / self.jobs as f64
     }
 
-    /// Asserts that every job has the structure `arm` states.
+    /// Rows written and WAL bytes per job, without the worker's own writes.
+    ///
+    /// A stopping worker updates its `harvest_workers` row. That cost is
+    /// fixed per stop, not per job. The idle control pays exactly the same
+    /// writes, so the arms with a worker subtract them.
+    fn deciders(&self, idle: Option<&Self>) -> (f64, f64) {
+        let (rows, wal) = idle.map_or((0, 0), |i| (i.rows_written(), i.wal_bytes()));
+        (
+            self.per_job(self.rows_written() - rows),
+            self.per_job(self.wal_bytes() - wal),
+        )
+    }
+
+    /// Asserts that every job equals the counts that `arm` states.
     fn assert_structure(&self, arm: Arm) {
-        assert_eq!(self.events.len(), self.jobs, "arm {}: one row per job", arm.label);
         for (what, got, want) in [
             ("events", &self.events, arm.events),
             ("task rows", &self.task_rows, arm.task_rows),
@@ -411,8 +503,8 @@ struct JobRow {
     claims: i64,
 }
 
-/// Per-job structure for the workflow arms, one row per execution.
-async fn workflow_jobs(conn: &mut AsyncPgConnection) -> Vec<JobRow> {
+/// Per-job structure for the arms with an execution row.
+async fn execution_jobs(conn: &mut AsyncPgConnection) -> Vec<JobRow> {
     diesel::sql_query(format!(
         "{HARNESS}SELECT \
              (SELECT COUNT(*) FROM harvest_events ev WHERE ev.workflow_exec_id = e.id) AS events, \
@@ -427,12 +519,13 @@ async fn workflow_jobs(conn: &mut AsyncPgConnection) -> Vec<JobRow> {
     .expect("read the per-job structure")
 }
 
-/// Per-job structure for the bare arm, one row per task.
+/// Per-job structure for the bare arm. A job is one `activity_id`. Its
+/// event count is every event in the database, which must be zero.
 async fn bare_jobs(conn: &mut AsyncPgConnection) -> Vec<JobRow> {
     diesel::sql_query(format!(
-        "{HARNESS}SELECT 0::bigint AS events, 1::bigint AS task_rows, \
-             attempt::bigint AS claims \
-         FROM harvest_task_queue WHERE state = 'COMPLETED' ORDER BY created_at"
+        "{HARNESS}SELECT (SELECT COUNT(*) FROM harvest_events) AS events, \
+             COUNT(*) AS task_rows, SUM(attempt)::bigint AS claims \
+         FROM harvest_task_queue GROUP BY activity_id ORDER BY MIN(created_at)"
     ))
     .load(conn)
     .await
@@ -502,36 +595,82 @@ fn worker(worker_id: &str) -> Arc<Worker> {
     Arc::new(Worker::new(config, registry()).expect("the worker builds"))
 }
 
-/// Gives backends time to publish their table counters after they exit.
-async fn settle_stats() {
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-}
-
-/// Opens the measured window on a fresh database.
-async fn open_window(conn: &mut AsyncPgConnection) -> (Vec<TableWrites>, String, Instant) {
-    reset_statements(conn).await;
-    (table_writes(conn).await, wal_lsn(conn).await, Instant::now())
-}
-
-/// Closes the measured window and collects the figures.
-async fn close_window(
+/// Stops the worker and waits until its connections close.
+///
+/// A backend publishes its table counters when it exits. The capture reads
+/// the counters only after every worker backend is gone.
+async fn stop_worker(
+    worker: &Worker,
+    handle: tokio::task::JoinHandle<()>,
+    pool: DbPool,
     conn: &mut AsyncPgConnection,
-    opened: (Vec<TableWrites>, String, Instant),
-    jobs: Vec<JobRow>,
-) -> Measurement {
-    let window = opened.2.elapsed();
-    settle_stats().await;
-    let wal = wal_since(conn, &opened.1).await;
-    let writes = writes_delta(&opened.0, &table_writes(conn).await);
-    let statements = statements(conn).await;
-    Measurement {
-        jobs: jobs.len(),
-        events: jobs.iter().map(|j| j.events).collect(),
-        task_rows: jobs.iter().map(|j| j.task_rows).collect(),
-        claims: jobs.iter().map(|j| j.claims).collect(),
+) {
+    worker.shutdown();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the worker stops within 30 s")
+        .expect("the worker task ends cleanly");
+    drop(pool);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let others = int(
+            conn,
+            "SELECT COUNT(*) AS v FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid()",
+        )
+        .await;
+        if others == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{others} worker connections stay open after shutdown"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Where a measured window starts.
+struct Window {
+    writes: Vec<TableWrites>,
+    wal_start: Option<String>,
+    started: Instant,
+}
+
+async fn open_window(conn: &mut AsyncPgConnection, stats: Stats) -> Window {
+    let wal_start = if stats == Stats::On {
+        reset_statements(conn).await;
+        Some(text(conn, "SELECT pg_current_wal_insert_lsn()::text AS v").await)
+    } else {
+        None
+    };
+    Window {
+        writes: table_writes(conn).await,
+        wal_start,
+        started: Instant::now(),
+    }
+}
+
+/// Reads the counters. `window` is the time the jobs took.
+async fn close_window(conn: &mut AsyncPgConnection, opened: Window, window: Duration) -> Figures {
+    // This backend wrote the bare arms' rows. Publish its own counters now.
+    conn.batch_execute("SELECT pg_stat_force_next_flush()")
+        .await
+        .expect("flush this backend's counters");
+    let stats = opened.wal_start.is_some();
+    let statements = if stats {
+        statements(conn).await
+    } else {
+        Vec::new()
+    };
+    let writes = writes_delta(&opened.writes, &table_writes(conn).await);
+    let wal = match &opened.wal_start {
+        Some(start) => wal_since(conn, start).await,
+        None => Wal::default(),
+    };
+    Figures {
         writes,
-        wal_bytes: wal.data,
-        fpi_bytes: wal.fpi,
+        wal,
         statements,
         window,
     }
@@ -542,15 +681,17 @@ async fn measure_workflow_arm(
     admin_url: &str,
     workflow_name: &'static str,
     jobs: usize,
+    stats: Stats,
 ) -> Measurement {
-    let (_, url) = create_fresh_db(admin_url, workflow_name).await;
-    let mut conn = connect(&url).await;
-    let pool = build_test_pool(&url);
-    let handle = spawn_test_worker(worker(&format!("{workflow_name}-worker")), pool.clone());
+    let db = create_fresh_db(admin_url, workflow_name, stats).await;
+    let mut conn = connect(&db.url).await;
+    let pool = build_test_pool(&db.url);
+    let worker = worker(&format!("{workflow_name}-worker"));
+    let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
     // Let the worker finish its start-up writes before the window opens.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let opened = open_window(&mut conn).await;
+    let opened = open_window(&mut conn, stats).await;
     for n in 0..jobs {
         start_one(&mut conn, workflow_name, n).await;
     }
@@ -571,20 +712,22 @@ async fn measure_workflow_arm(
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    handle.abort();
-    let _ = handle.await;
-    drop(pool);
-    let rows = workflow_jobs(&mut conn).await;
-    close_window(&mut conn, opened, rows).await
+    let window = opened.started.elapsed();
+    stop_worker(&worker, handle, pool, &mut conn).await;
+    let figures = close_window(&mut conn, opened, window).await;
+    let rows = execution_jobs(&mut conn).await;
+    drop(conn);
+    drop_db(admin_url, &db.name).await;
+    Measurement::new(jobs, figures, &rows)
 }
 
 /// Arm C: enqueue `jobs` bare task rows, then claim, run and complete each.
-async fn measure_bare_arm(admin_url: &str, jobs: usize) -> Measurement {
-    let (_, url) = create_fresh_db(admin_url, "bare_floor").await;
-    let mut conn = connect(&url).await;
+async fn measure_bare_arm(admin_url: &str, jobs: usize, stats: Stats) -> Measurement {
+    let db = create_fresh_db(admin_url, "bare_floor", stats).await;
+    let mut conn = connect(&db.url).await;
     let queues = vec![QUEUE.to_string()];
 
-    let opened = open_window(&mut conn).await;
+    let opened = open_window(&mut conn, stats).await;
     for n in 0..jobs {
         let mut params = EnqueueParams::new(QUEUE, TaskType::Activity, job_input(n));
         params.activity_name = Some(JOB.to_string());
@@ -598,31 +741,144 @@ async fn measure_bare_arm(admin_url: &str, jobs: usize) -> Measurement {
             .await
             .expect("claim a bare task")
             .expect("a bare task is pending");
-        let output = job_body(item.input.clone()).expect("the job body succeeds");
+        let output = job_body(item.input.clone());
         let claim = TaskClaim::new(item.id, BARE_WORKER, item.attempt);
         let write = queue::complete_claimed_task(&mut conn, &claim, output)
             .await
             .expect("complete the bare task");
-        assert_eq!(write, queue::ClaimWrite::Applied, "the bare claim is current");
+        assert_eq!(
+            write,
+            queue::ClaimWrite::Applied,
+            "the bare claim is current"
+        );
     }
+    let window = opened.started.elapsed();
+    let figures = close_window(&mut conn, opened, window).await;
     let rows = bare_jobs(&mut conn).await;
-    close_window(&mut conn, opened, rows).await
+    drop(conn);
+    drop_db(admin_url, &db.name).await;
+    Measurement::new(jobs, figures, &rows)
+}
+
+/// Arm D, start: the job record and its task row, in one transaction.
+async fn start_record_job(conn: &mut AsyncPgConnection, n: usize) {
+    conn.transaction::<_, diesel::result::Error, _>(async |conn| {
+        #[derive(diesel::QueryableByName)]
+        struct Id {
+            #[diesel(sql_type = diesel::sql_types::Uuid)]
+            id: uuid::Uuid,
+        }
+        let record: Id = diesel::sql_query(
+            "INSERT INTO harvest_workflow_executions \
+                     (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+                      queue_name, started_at, created_at) \
+                 VALUES (gen_random_uuid(), $1, $2, gen_random_uuid(), 0, 'RUNNING', $3, $4, \
+                         NOW(), NOW()) \
+                 RETURNING id",
+        )
+        .bind::<diesel::sql_types::Text, _>(RECORD_NAME)
+        .bind::<diesel::sql_types::Text, _>(format!("{RECORD_NAME}-{n}"))
+        .bind::<diesel::sql_types::Jsonb, _>(job_input(n))
+        .bind::<diesel::sql_types::Text, _>(QUEUE)
+        .get_result(conn)
+        .await?;
+        let mut params = EnqueueParams::new(QUEUE, TaskType::Activity, job_input(n));
+        params.workflow_exec_id = Some(record.id);
+        params.activity_name = Some(JOB.to_string());
+        params.activity_id = Some(uuid::Uuid::new_v4());
+        queue::enqueue(conn, &params)
+            .await
+            .expect("enqueue the record job's task");
+        Ok(())
+    })
+    .await
+    .expect("start a record job");
+}
+
+/// Arm D, run: claim, mark the handler start, then complete the task and
+/// the record in one transaction.
+async fn run_record_job(conn: &mut AsyncPgConnection, queues: &[String]) {
+    let item = queue::claim_task(conn, queues, BARE_WORKER, "", None, &[], &[])
+        .await
+        .expect("claim a record task")
+        .expect("a record task is pending");
+    // The statement that `queue::mark_claim_handler_started` issues.
+    let marked = diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET handler_started_attempt = $3, handler_started_at = clock_timestamp() \
+         WHERE id = $1 AND worker_id = $2 AND attempt = $3 AND state = 'RUNNING'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(item.id)
+    .bind::<diesel::sql_types::Text, _>(BARE_WORKER)
+    .bind::<diesel::sql_types::Integer, _>(item.attempt)
+    .execute(conn)
+    .await
+    .expect("mark the handler start");
+    assert_eq!(marked, 1, "the record claim is current");
+    let output = job_body(item.input.clone());
+    let record = item.workflow_exec_id.expect("a record task has a record");
+    let claim = TaskClaim::new(item.id, BARE_WORKER, item.attempt);
+    conn.transaction::<_, diesel::result::Error, _>(async |conn| {
+        let write = queue::complete_claimed_task(conn, &claim, output.clone())
+            .await
+            .expect("complete the record task");
+        assert_eq!(
+            write,
+            queue::ClaimWrite::Applied,
+            "the record claim is current"
+        );
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions \
+                 SET state = 'COMPLETED', output = $2, completed_at = NOW() WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(record)
+        .bind::<diesel::sql_types::Jsonb, _>(output)
+        .execute(conn)
+        .await?;
+        Ok(())
+    })
+    .await
+    .expect("complete a record job");
+}
+
+/// Arm D: start `jobs` record jobs, then claim, run and complete each.
+async fn measure_record_arm(admin_url: &str, jobs: usize, stats: Stats) -> Measurement {
+    let db = create_fresh_db(admin_url, "record_floor", stats).await;
+    let mut conn = connect(&db.url).await;
+    let queues = vec![QUEUE.to_string()];
+
+    let opened = open_window(&mut conn, stats).await;
+    for n in 0..jobs {
+        start_record_job(&mut conn, n).await;
+    }
+    for _ in 0..jobs {
+        run_record_job(&mut conn, &queues).await;
+    }
+    let window = opened.started.elapsed();
+    let figures = close_window(&mut conn, opened, window).await;
+    let rows = execution_jobs(&mut conn).await;
+    drop(conn);
+    drop_db(admin_url, &db.name).await;
+    Measurement::new(jobs, figures, &rows)
 }
 
 /// The control: a worker with no work, open for `window`.
 async fn measure_idle_control(admin_url: &str, window: Duration) -> Measurement {
-    let (_, url) = create_fresh_db(admin_url, "idle_control").await;
-    let mut conn = connect(&url).await;
-    let pool = build_test_pool(&url);
-    let handle = spawn_test_worker(worker("idle-control-worker"), pool.clone());
+    let db = create_fresh_db(admin_url, "idle_control", Stats::On).await;
+    let mut conn = connect(&db.url).await;
+    let pool = build_test_pool(&db.url);
+    let worker = worker("idle-control-worker");
+    let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let opened = open_window(&mut conn).await;
+    let opened = open_window(&mut conn, Stats::On).await;
     tokio::time::sleep(window).await;
-    handle.abort();
-    let _ = handle.await;
-    drop(pool);
-    close_window(&mut conn, opened, Vec::new()).await
+    let window = opened.started.elapsed();
+    stop_worker(&worker, handle, pool, &mut conn).await;
+    let figures = close_window(&mut conn, opened, window).await;
+    drop(conn);
+    drop_db(admin_url, &db.name).await;
+    Measurement::new(0, figures, &[])
 }
 
 // ── structural tests ─────────────────────────────────────────────────────────
@@ -630,7 +886,7 @@ async fn measure_idle_control(admin_url: &str, window: Duration) -> Measurement 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn arm_a_structural_counts() {
     let (admin, _guard) = setup_server().await;
-    measure_workflow_arm(&admin, WF_REGULAR, STRUCTURAL_JOBS)
+    measure_workflow_arm(&admin, WF_REGULAR, STRUCTURAL_JOBS, Stats::Off)
         .await
         .assert_structure(ARM_A);
 }
@@ -638,7 +894,7 @@ async fn arm_a_structural_counts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn arm_b_structural_counts() {
     let (admin, _guard) = setup_server().await;
-    measure_workflow_arm(&admin, WF_LOCAL, STRUCTURAL_JOBS)
+    measure_workflow_arm(&admin, WF_LOCAL, STRUCTURAL_JOBS, Stats::Off)
         .await
         .assert_structure(ARM_B);
 }
@@ -646,51 +902,68 @@ async fn arm_b_structural_counts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn arm_c_structural_counts() {
     let (admin, _guard) = setup_server().await;
-    measure_bare_arm(&admin, STRUCTURAL_JOBS)
+    measure_bare_arm(&admin, STRUCTURAL_JOBS, Stats::Off)
         .await
         .assert_structure(ARM_C);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arm_d_structural_counts() {
+    let (admin, _guard) = setup_server().await;
+    measure_record_arm(&admin, STRUCTURAL_JOBS, Stats::Off)
+        .await
+        .assert_structure(ARM_D);
 }
 
 // ── evidence ─────────────────────────────────────────────────────────────────
 
 /// Calls per job after the idle worker's call rate over the same window.
 fn net_calls_per_job(m: &Measurement, idle: &Measurement) -> f64 {
-    let idle_rate = idle.calls() as f64 / idle.window.as_secs_f64();
-    let net = m.calls() as f64 - idle_rate * m.window.as_secs_f64();
+    let idle_rate = idle.calls() as f64 / idle.figures.window.as_secs_f64();
+    let net = idle_rate.mul_add(-m.figures.window.as_secs_f64(), m.calls() as f64);
     net / m.jobs as f64
 }
 
 fn cost_row(label: &str, m: &Measurement, idle: Option<&Measurement>) -> String {
+    let (rows, wal) = m.deciders(idle);
     format!(
-        "| {label} | {:.2} | {:.0} | {:.2} | {:.2} |",
-        m.per_job(m.rows_written()),
-        m.per_job(m.wal_bytes),
+        "| {label} | {rows:.2} | {wal:.0} | {:.2} | {:.2} |",
         m.per_job(m.calls()),
-        idle.map_or(m.per_job(m.calls()), |idle| net_calls_per_job(m, idle)),
+        idle.map_or_else(|| m.per_job(m.calls()), |idle| net_calls_per_job(m, idle)),
     )
 }
 
+/// The verdict at [`BUILD_LINE`] for the two ratios against a floor.
+fn verdict(rows: f64, wal: f64) -> &'static str {
+    if rows <= BUILD_LINE && wal <= BUILD_LINE {
+        VERDICT_DOCUMENT
+    } else {
+        VERDICT_BUILD
+    }
+}
+
 fn detail(out: &mut String, label: &str, m: &Measurement) {
+    let f = &m.figures;
     let _ = writeln!(
         out,
         "\n## Arm {label}: {} jobs, window {} ms\n",
         m.jobs,
-        m.window.as_millis()
+        f.window.as_millis()
     );
     let _ = writeln!(
         out,
         "rows written {}, WAL bytes {}, full-page image bytes {}, calls {}",
         m.rows_written(),
-        m.wal_bytes,
-        m.fpi_bytes,
+        f.wal.data,
+        f.wal.fpi,
         m.calls()
     );
     let _ = writeln!(out, "\n| table | ins | upd | del |\n|---|--:|--:|--:|");
-    for w in &m.writes {
+    for w in &f.writes {
         let _ = writeln!(out, "| {} | {} | {} | {} |", w.relname, w.ins, w.upd, w.del);
     }
     let _ = writeln!(out, "\n| calls | rows | statement |\n|--:|--:|---|");
-    for s in &m.statements {
+    for s in &f.statements {
         let query: String = s.query.split_whitespace().collect::<Vec<_>>().join(" ");
         let query: String = query.chars().take(140).collect();
         let _ = writeln!(out, "| {} | {} | `{query}` |", s.calls, s.rows);
@@ -702,55 +975,67 @@ fn detail(out: &mut String, label: &str, m: &Measurement) {
 #[ignore = "evidence capture: run by hand, see docs/performance-standalone-activity-overhead.md"]
 async fn zz_capture_standalone_activity_overhead_evidence() {
     let (admin, _guard) = setup_server().await;
-    let a = measure_workflow_arm(&admin, WF_REGULAR, JOBS_PER_ARM).await;
-    let b = measure_workflow_arm(&admin, WF_LOCAL, JOBS_PER_ARM).await;
-    let c = measure_bare_arm(&admin, JOBS_PER_ARM).await;
+    let a = measure_workflow_arm(&admin, WF_REGULAR, JOBS_PER_ARM, Stats::On).await;
+    let b = measure_workflow_arm(&admin, WF_LOCAL, JOBS_PER_ARM, Stats::On).await;
+    let c = measure_bare_arm(&admin, JOBS_PER_ARM, Stats::On).await;
+    let d = measure_record_arm(&admin, JOBS_PER_ARM, Stats::On).await;
     a.assert_structure(ARM_A);
     b.assert_structure(ARM_B);
     c.assert_structure(ARM_C);
-    let idle = measure_idle_control(&admin, a.window.max(b.window)).await;
+    d.assert_structure(ARM_D);
+    let idle = measure_idle_control(&admin, a.figures.window.max(b.figures.window)).await;
 
-    let ratio = |x: &Measurement, total: fn(&Measurement) -> i64| {
-        x.per_job(total(x)) / c.per_job(total(&c))
-    };
-    let rows = |m: &Measurement| m.rows_written();
-    let wal = |m: &Measurement| m.wal_bytes;
-    let verdict = if ratio(&b, rows) <= BUILD_LINE && ratio(&b, wal) <= BUILD_LINE {
-        VERDICT_DOCUMENT
-    } else {
-        VERDICT_BUILD
+    // Arms C and D run no worker, so they have no worker writes to remove.
+    let ratio = |x: &Measurement, floor: &Measurement| {
+        let (rows, wal) = x.deciders(Some(&idle));
+        let (floor_rows, floor_wal) = floor.deciders(None);
+        (rows / floor_rows, wal / floor_wal)
     };
 
     let mut out = String::new();
-    let _ = writeln!(out, "# Standalone-activity overhead capture (issue #1987)\n");
+    let _ = writeln!(
+        out,
+        "# Standalone-activity overhead capture (issue #1987)\n"
+    );
     let _ = writeln!(
         out,
         "| Arm | Rows written | WAL bytes | Statement calls | Calls net of idle |"
     );
     let _ = writeln!(out, "|---|--:|--:|--:|--:|");
-    // Arm C runs no worker, so it has no idle noise to remove.
-    for (label, m, idle) in [("A", &a, Some(&idle)), ("B", &b, Some(&idle)), ("C", &c, None)] {
+    for (label, m, idle) in [
+        ("A", &a, Some(&idle)),
+        ("B", &b, Some(&idle)),
+        ("C", &c, None),
+        ("D", &d, None),
+    ] {
         let _ = writeln!(out, "{}", cost_row(label, m, idle));
     }
     let _ = writeln!(out, "\n| Ratio | Rows written | WAL bytes |\n|---|--:|--:|");
-    for (label, m) in [("A / C", &a), ("B / C", &b)] {
-        let _ = writeln!(
-            out,
-            "| {label} | {:.2}x | {:.2}x |",
-            ratio(m, rows),
-            ratio(m, wal)
-        );
+    for (label, x, floor) in [("A / C", &a, &c), ("B / C", &b, &c), ("B / D", &b, &d)] {
+        let (rows, wal) = ratio(x, floor);
+        let _ = writeln!(out, "| {label} | {rows:.2}x | {wal:.2}x |");
     }
     let _ = writeln!(
         out,
         "\nIdle control over {} ms: rows written {}, WAL bytes {}, calls {}",
-        idle.window.as_millis(),
+        idle.figures.window.as_millis(),
         idle.rows_written(),
-        idle.wal_bytes,
+        idle.wal_bytes(),
         idle.calls()
     );
-    let _ = writeln!(out, "\nVerdict at the {BUILD_LINE:.1}x line: {verdict}");
-    for (label, m) in [("A", &a), ("B", &b), ("C", &c), ("idle", &idle)] {
+    let against_c = ratio(&b, &c);
+    let against_d = ratio(&b, &d);
+    let _ = writeln!(
+        out,
+        "\nVerdict at the {BUILD_LINE:.1}x line against arm C (§0.4): {}",
+        verdict(against_c.0, against_c.1)
+    );
+    let _ = writeln!(
+        out,
+        "Verdict at the {BUILD_LINE:.1}x line against arm D (§0.6, decides): {}",
+        verdict(against_d.0, against_d.1)
+    );
+    for (label, m) in [("A", &a), ("B", &b), ("C", &c), ("D", &d), ("idle", &idle)] {
         detail(&mut out, label, m);
     }
 

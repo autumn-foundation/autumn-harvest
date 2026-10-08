@@ -2026,5 +2026,5 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-standalone-activity-overhead.md`](performance-standalone-activity-overhead.md)
   — the cost of a one-step workflow against a bare activity (issue #1987).
   Rows per job: 17 with a regular activity, 10 with a local activity, 3
-  for the bare floor. [ADR 0006](adr/0006-standalone-activity.md) records
-  the decision.
+  for a bare task row and 6 for a modelled standalone job.
+  [ADR 0006](adr/0006-standalone-activity.md) records the decision.
