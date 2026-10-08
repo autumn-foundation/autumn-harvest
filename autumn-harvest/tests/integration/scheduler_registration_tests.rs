@@ -1199,3 +1199,89 @@ async fn a_repeated_failed_collection_stays_suppressed_across_ticks() {
         "the stale row is still there across both passes"
     );
 }
+
+/// A `RegisteredDag` with no schedule and no tasks.
+fn unscheduled_dag(name: &str) -> autumn_harvest::scheduler::RegisteredDag {
+    autumn_harvest::scheduler::RegisteredDag {
+        name: name.to_string(),
+        module: "tests".to_string(),
+        schedule: None,
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: None,
+        is_unified: true,
+        definition: autumn_harvest::dag::DagBuilder::new()
+            .build()
+            .expect("an empty DAG is a valid graph"),
+        jitter: std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::policy::OverlapPolicy::Skip,
+        buffer_all_max: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+    }
+}
+
+/// Waits until a session blocks on a lock while it writes `harvest_schedules`.
+async fn wait_for_blocked_schedule_insert(conn: &mut AsyncPgConnection) {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    for _ in 0..200 {
+        let blocked = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query ILIKE '%harvest_schedules%'",
+        )
+        .get_result::<Count>(conn)
+        .await
+        .expect("read pg_stat_activity")
+        .n;
+        if blocked > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the second registration never blocked on the first row");
+}
+
+/// Issue #1959: a manual DAG trigger calls `ensure_dag_schedule` while the
+/// scheduler registers the same DAG. Both find no row, and both insert. The
+/// second insert must use the first row. It must not fail on
+/// `harvest_schedules_dag_name_key`, which the trigger route returns as 503.
+#[tokio::test]
+async fn a_concurrent_dag_registration_uses_the_first_row() {
+    use autumn_harvest::scheduler::ensure_dag_schedule;
+
+    let (mut first, db) = setup_db().await;
+    let mut second = AsyncPgConnection::establish(&db.url)
+        .await
+        .expect("connect");
+    let mut observer = AsyncPgConnection::establish(&db.url)
+        .await
+        .expect("connect");
+    let dag = unscheduled_dag("raced_dag");
+
+    // The first registration inserts its row and holds the transaction open.
+    first.batch_execute("BEGIN").await.expect("begin");
+    let first_row = ensure_dag_schedule(&mut first, &dag)
+        .await
+        .expect("first registration");
+
+    // The second registration sees no committed row, so it inserts too. Its
+    // insert waits on the first row's unique key.
+    let racer = tokio::spawn({
+        let dag = dag.clone();
+        async move { ensure_dag_schedule(&mut second, &dag).await }
+    });
+    wait_for_blocked_schedule_insert(&mut observer).await;
+    first.batch_execute("COMMIT").await.expect("commit");
+
+    let second_row = racer
+        .await
+        .expect("join")
+        .expect("a concurrent registration must use the committed row");
+    assert_eq!(second_row.id, first_row.id);
+    assert_eq!(schedule_count(&mut first).await, 1);
+}
