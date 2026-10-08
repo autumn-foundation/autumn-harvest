@@ -402,7 +402,13 @@ impl<F: Future> Future for ScopeRun<'_, F> {
                 return Poll::Ready(Err(err));
             }
         }
-        this.shared.lock().waker = Some(cx.waker().clone());
+        // A cancel that is pending before this poll wins over a body that
+        // completes in it. Replay sees the same flag, so both take one path.
+        let cancel_pending = {
+            let mut inner = this.shared.lock();
+            inner.waker = Some(cx.waker().clone());
+            inner.cancel_requested
+        };
 
         let ctx = this.ctx;
         let horizon = this.replay.as_ref().map(|marker| marker.horizon);
@@ -413,11 +419,11 @@ impl<F: Future> Future for ScopeRun<'_, F> {
                 None => body.as_mut().poll(cx),
             });
             if let Poll::Ready(value) = polled {
-                if horizon.is_none() {
+                if horizon.is_none() && !cancel_pending {
                     this.finish();
                     return Poll::Ready(Ok(value));
                 }
-                // On replay the live body did not complete before the cancel.
+                // The cancel came first, live or on replay.
                 this.body = None;
             }
         }
@@ -829,6 +835,57 @@ mod tests {
             0,
             "{commands:?}"
         );
+    }
+
+    /// A cancel before the first poll wins over a body that is ready at once.
+    #[tokio::test]
+    async fn scope_cancelled_before_its_first_poll_beats_a_ready_body() {
+        let ctx = WorkflowContext::new_test();
+        let scope = ctx.cancellation_scope();
+        scope.cancel();
+
+        let result = bounded(scope.run(async { 7 })).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        assert!(
+            marker(&ctx.drain_commands(), "cancel_scope:1").is_some(),
+            "the cancel is recorded, so replay takes the same path"
+        );
+    }
+
+    /// Replay of the history above takes the same path.
+    #[tokio::test]
+    async fn replay_of_a_cancel_before_a_ready_body_is_deterministic() {
+        let live = WorkflowContext::new_test();
+        let scope = live.cancellation_scope();
+        scope.cancel();
+        let _ = bounded(scope.run(async { 7 })).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details,
+                },
+            ],
+        );
+        let scope = ctx.cancellation_scope();
+        scope.cancel();
+        let result = bounded(scope.run(async { 7 })).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        assert!(ctx.take_nd_details().is_none());
+        assert!(ctx.drain_commands().is_empty());
+        assert!(!ctx.history_has_unconsumed_events());
     }
 
     #[tokio::test]
