@@ -16,7 +16,7 @@ use super::{MemoryBackend, ObjectBackend, ObjectHistoryArchiver, ObjectPayloadSt
 
 const MARKER: &str = "PLAINTEXT-MARKER-1983";
 
-pub(crate) fn sample_doc(execution_id: ExecutionId) -> HistoryExportDocument {
+fn sample_doc(execution_id: ExecutionId) -> HistoryExportDocument {
     export_history(HistoryExportRequest {
         workflow_name: "archived_wf".to_string(),
         workflow_id: Some(format!("wf-{MARKER}")),
@@ -38,7 +38,7 @@ pub(crate) fn sample_doc(execution_id: ExecutionId) -> HistoryExportDocument {
     .unwrap()
 }
 
-pub(crate) fn aead_codecs(key_id: &str) -> PayloadCodecs {
+fn aead_codecs(key_id: &str) -> PayloadCodecs {
     let codecs = PayloadCodecs::default();
     let codec = AeadCodec::new(key_id, &DataKey::generate()).unwrap();
     codecs.register_key(key_id, Arc::new(codec)).unwrap();

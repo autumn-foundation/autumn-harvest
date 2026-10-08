@@ -189,6 +189,7 @@ impl GcsTokenSource for GceMetadataToken {
             let margin = TOKEN_EXPIRY_MARGIN.min(lifetime / 2);
             let usable_until = Instant::now() + lifetime.saturating_sub(margin);
             *cached = Some((fresh.access_token.clone(), usable_until));
+            drop(cached);
             Ok(Some(fresh.access_token))
         })
     }

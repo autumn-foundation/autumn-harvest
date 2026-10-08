@@ -2,7 +2,7 @@
 //!
 //! The module re-exports [`aws_sdk_s3`]. An application still needs
 //! `aws-config` to load credentials. Any S3-compatible store works, for
-//! example MinIO.
+//! example `MinIO`.
 //!
 //! Grant `s3:ListBucket` as well as `s3:GetObject`. Without it, AWS answers a
 //! read of a missing key with 403, and the backend reports an error, not a

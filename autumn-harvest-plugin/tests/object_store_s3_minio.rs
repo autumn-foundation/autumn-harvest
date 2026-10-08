@@ -1,7 +1,7 @@
-//! S3 adapters against a MinIO emulator (issue #1983).
+//! S3 adapters against a `MinIO` emulator (issue #1983).
 //!
 //! Needs Docker. The suite starts `pgsty/minio`, the maintained community
-//! build of MinIO. The official MinIO images are no longer published.
+//! build of `MinIO`. The official `MinIO` images are no longer published.
 //!
 //! ```sh
 //! cargo test -p autumn-harvest-plugin --features s3 --test object_store_s3_minio
@@ -29,7 +29,7 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-/// The MinIO image. CI pre-pulls this exact tag.
+/// The `MinIO` image. CI pre-pulls this exact tag.
 const MINIO_IMAGE: &str = "pgsty/minio";
 const MINIO_TAG: &str = "RELEASE.2026-08-04T00-00-00Z";
 const USER: &str = "harvest";

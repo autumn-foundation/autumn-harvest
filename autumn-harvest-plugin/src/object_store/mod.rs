@@ -246,7 +246,7 @@ pub struct ObjectHistoryArchiver<B> {
 impl<B: ObjectBackend> ObjectHistoryArchiver<B> {
     /// Create an archiver with no key prefix and no document codec.
     #[must_use]
-    pub fn new(backend: Arc<B>) -> Self {
+    pub const fn new(backend: Arc<B>) -> Self {
         Self {
             backend,
             prefix: String::new(),
