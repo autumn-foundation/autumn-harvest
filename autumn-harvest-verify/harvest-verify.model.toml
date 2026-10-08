@@ -1521,7 +1521,7 @@ reason = "context.rs:4069; workflow-execution identity metadata, fixed at start 
 [[non_sink]]
 path = "publish_durable_progress"
 receiver = "WorkflowContext"
-reason = "context.rs:13825. Issue #1974. The chunk goes to a side table and is never replayed. On replay the call pushes no command."
+reason = "context.rs:13842. Issue #1974. The chunk goes to a side table and is never replayed. On replay the call pushes no command."
 [[non_sink]]
 path = "publish_progress"
 receiver = "WorkflowContext"
