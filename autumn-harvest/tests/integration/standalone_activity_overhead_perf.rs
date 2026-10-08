@@ -12,11 +12,12 @@
 //!   row, so arm C is the least that a durable job can cost here.
 //!
 //! The structural tests assert events, task rows and claims per job. Those
-//! counts are exact. The ignored capture measures rows written and WAL
-//! bytes, which are the deciders. An idle claim poll changes no row and
-//! writes no WAL, so the deciders do not depend on poll timing. Statement
-//! calls and latency are context only. An idle-worker control measures the
-//! noise in them.
+//! counts are exact. The ignored capture measures the two deciders: rows
+//! written and WAL bytes. The harness turns off scanner election, which
+//! renews a lease row on a timer. It counts only WAL records on the arm's
+//! own tables. An idle-worker control then writes no row and no WAL.
+//! Statement calls are context only, because idle polls add calls. The
+//! capture removes the idle call rate from them.
 //!
 //! Each arm gets a fresh, migrated database. `HARVEST_TEST_DATABASE_URL`
 //! is an admin URL. Without it the harness starts a Postgres container.
@@ -54,6 +55,10 @@ const JOB_LOCAL: &str = "standalone_job_local";
 const WF_REGULAR: &str = "one_step_regular";
 const WF_LOCAL: &str = "one_step_local";
 const BARE_WORKER: &str = "standalone-bare";
+
+/// Opens every harness query, so the statement capture can drop them.
+/// `pg_stat_statements` keeps the comment in the stored query text.
+const HARNESS: &str = "/* harness */ ";
 
 /// Jobs per arm in the structural tests. Small, because the counts are exact.
 const STRUCTURAL_JOBS: usize = 3;
@@ -206,6 +211,9 @@ async fn create_fresh_db(admin_url: &str, prefix: &str) -> (String, String) {
     let _ = conn
         .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .await;
+    conn.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_walinspect")
+        .await
+        .expect("pg_walinspect needs a superuser role");
     (name, url)
 }
 
@@ -216,7 +224,7 @@ struct Int {
 }
 
 async fn int(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
-    diesel::sql_query(sql)
+    diesel::sql_query(format!("{HARNESS}{sql}"))
         .get_result::<Int>(conn)
         .await
         .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
@@ -262,12 +270,50 @@ fn writes_delta(before: &[TableWrites], after: &[TableWrites]) -> Vec<TableWrite
         .collect()
 }
 
-async fn wal_lsn(conn: &mut AsyncPgConnection) -> i64 {
-    int(
-        conn,
-        "SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint AS v",
-    )
+#[derive(diesel::QueryableByName)]
+struct Text {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    v: String,
+}
+
+async fn wal_lsn(conn: &mut AsyncPgConnection) -> String {
+    diesel::sql_query("SELECT pg_current_wal_lsn()::text AS v")
+        .get_result::<Text>(conn)
+        .await
+        .expect("read the WAL position")
+        .v
+}
+
+#[derive(diesel::QueryableByName)]
+struct Wal {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    data: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    fpi: i64,
+}
+
+/// WAL since `start` that touches this database's `public` relations.
+///
+/// The cluster WAL also holds autovacuum, catalog upkeep and other
+/// databases. A block reference names `tablespace/database/filenode`, so
+/// the filter keeps only records on this arm's own tables and indexes.
+/// Full-page images depend on checkpoint timing, so they count apart.
+async fn wal_since(conn: &mut AsyncPgConnection, start: &str) -> Wal {
+    diesel::sql_query(format!(
+        "{HARNESS}WITH rels AS ( \
+             SELECT '/' || (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                 || '/' || pg_relation_filenode(c.oid) || '([^0-9]|$)' AS pattern \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND pg_relation_filenode(c.oid) IS NOT NULL) \
+         SELECT COALESCE(SUM(r.record_length - r.fpi_length), 0)::bigint AS data, \
+                COALESCE(SUM(r.fpi_length), 0)::bigint AS fpi \
+         FROM pg_get_wal_records_info($1::pg_lsn, pg_current_wal_flush_lsn()) r \
+         WHERE EXISTS (SELECT 1 FROM rels WHERE r.block_ref ~ rels.pattern)"
+    ))
+    .bind::<diesel::sql_types::Text, _>(start)
+    .get_result(conn)
     .await
+    .expect("read the arm's WAL records")
 }
 
 async fn reset_statements(conn: &mut AsyncPgConnection) {
@@ -297,6 +343,7 @@ async fn statements(conn: &mut AsyncPgConnection) -> Vec<Statement> {
         "SELECT query, calls, rows FROM pg_stat_statements \
          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
            AND query NOT ILIKE '%pg_stat%' \
+           AND query NOT LIKE '%/* harness */%' \
            AND query NOT ILIKE '%pg_current_wal_lsn%' \
          ORDER BY calls DESC, query",
     )
@@ -316,9 +363,11 @@ struct Measurement {
     task_rows: Vec<i64>,
     claims: Vec<i64>,
     writes: Vec<TableWrites>,
+    /// WAL record bytes on this arm's tables, without full-page images.
     wal_bytes: i64,
+    /// Full-page image bytes on this arm's tables.
+    fpi_bytes: i64,
     statements: Vec<Statement>,
-    latency_ms: Vec<f64>,
     window: Duration,
 }
 
@@ -333,12 +382,6 @@ impl Measurement {
 
     fn per_job(&self, total: i64) -> f64 {
         total as f64 / self.jobs as f64
-    }
-
-    fn p50_latency_ms(&self) -> f64 {
-        let mut v = self.latency_ms.clone();
-        v.sort_by(f64::total_cmp);
-        v.get(v.len() / 2).copied().unwrap_or(0.0)
     }
 
     /// Asserts that every job has the structure `arm` states.
@@ -366,22 +409,19 @@ struct JobRow {
     task_rows: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     claims: i64,
-    #[diesel(sql_type = diesel::sql_types::Double)]
-    latency_ms: f64,
 }
 
 /// Per-job structure for the workflow arms, one row per execution.
 async fn workflow_jobs(conn: &mut AsyncPgConnection) -> Vec<JobRow> {
-    diesel::sql_query(
-        "SELECT \
+    diesel::sql_query(format!(
+        "{HARNESS}SELECT \
              (SELECT COUNT(*) FROM harvest_events ev WHERE ev.workflow_exec_id = e.id) AS events, \
              (SELECT COUNT(*) FROM harvest_task_queue t WHERE t.workflow_exec_id = e.id) \
                  AS task_rows, \
              (SELECT COALESCE(SUM(t.attempt), 0)::bigint FROM harvest_task_queue t \
-              WHERE t.workflow_exec_id = e.id) AS claims, \
-             (EXTRACT(EPOCH FROM (e.completed_at - e.created_at)) * 1000)::float8 AS latency_ms \
-         FROM harvest_workflow_executions e ORDER BY e.created_at",
-    )
+              WHERE t.workflow_exec_id = e.id) AS claims \
+         FROM harvest_workflow_executions e ORDER BY e.created_at"
+    ))
     .load(conn)
     .await
     .expect("read the per-job structure")
@@ -389,11 +429,11 @@ async fn workflow_jobs(conn: &mut AsyncPgConnection) -> Vec<JobRow> {
 
 /// Per-job structure for the bare arm, one row per task.
 async fn bare_jobs(conn: &mut AsyncPgConnection) -> Vec<JobRow> {
-    diesel::sql_query(
-        "SELECT 0::bigint AS events, 1::bigint AS task_rows, attempt::bigint AS claims, \
-             (EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000)::float8 AS latency_ms \
-         FROM harvest_task_queue WHERE state = 'COMPLETED' ORDER BY created_at",
-    )
+    diesel::sql_query(format!(
+        "{HARNESS}SELECT 0::bigint AS events, 1::bigint AS task_rows, \
+             attempt::bigint AS claims \
+         FROM harvest_task_queue WHERE state = 'COMPLETED' ORDER BY created_at"
+    ))
     .load(conn)
     .await
     .expect("read the per-task structure")
@@ -454,6 +494,11 @@ async fn start_one(conn: &mut AsyncPgConnection, workflow_name: &'static str, n:
 fn worker(worker_id: &str) -> Arc<Worker> {
     let mut config = runtime_config(worker_id, 4, 4, Duration::from_secs(30));
     config.queues = vec![QUEUE.to_string()];
+    // Scanner election and the worker heartbeat write rows on a timer.
+    // Those writes are fleet upkeep, not job cost, so the harness keeps
+    // them out of the measured window.
+    config.scanner.elect = false;
+    config.worker_heartbeat_interval = Duration::from_secs(600);
     Arc::new(Worker::new(config, registry()).expect("the worker builds"))
 }
 
@@ -463,7 +508,7 @@ async fn settle_stats() {
 }
 
 /// Opens the measured window on a fresh database.
-async fn open_window(conn: &mut AsyncPgConnection) -> (Vec<TableWrites>, i64, Instant) {
+async fn open_window(conn: &mut AsyncPgConnection) -> (Vec<TableWrites>, String, Instant) {
     reset_statements(conn).await;
     (table_writes(conn).await, wal_lsn(conn).await, Instant::now())
 }
@@ -471,12 +516,12 @@ async fn open_window(conn: &mut AsyncPgConnection) -> (Vec<TableWrites>, i64, In
 /// Closes the measured window and collects the figures.
 async fn close_window(
     conn: &mut AsyncPgConnection,
-    opened: (Vec<TableWrites>, i64, Instant),
+    opened: (Vec<TableWrites>, String, Instant),
     jobs: Vec<JobRow>,
 ) -> Measurement {
     let window = opened.2.elapsed();
     settle_stats().await;
-    let wal_bytes = wal_lsn(conn).await - opened.1;
+    let wal = wal_since(conn, &opened.1).await;
     let writes = writes_delta(&opened.0, &table_writes(conn).await);
     let statements = statements(conn).await;
     Measurement {
@@ -485,9 +530,9 @@ async fn close_window(
         task_rows: jobs.iter().map(|j| j.task_rows).collect(),
         claims: jobs.iter().map(|j| j.claims).collect(),
         writes,
-        wal_bytes,
+        wal_bytes: wal.data,
+        fpi_bytes: wal.fpi,
         statements,
-        latency_ms: jobs.iter().map(|j| j.latency_ms).collect(),
         window,
     }
 }
@@ -555,9 +600,10 @@ async fn measure_bare_arm(admin_url: &str, jobs: usize) -> Measurement {
             .expect("a bare task is pending");
         let output = job_body(item.input.clone()).expect("the job body succeeds");
         let claim = TaskClaim::new(item.id, BARE_WORKER, item.attempt);
-        queue::complete_claimed_task(&mut conn, &claim, output)
+        let write = queue::complete_claimed_task(&mut conn, &claim, output)
             .await
             .expect("complete the bare task");
+        assert_eq!(write, queue::ClaimWrite::Applied, "the bare claim is current");
     }
     let rows = bare_jobs(&mut conn).await;
     close_window(&mut conn, opened, rows).await
@@ -607,13 +653,20 @@ async fn arm_c_structural_counts() {
 
 // ── evidence ─────────────────────────────────────────────────────────────────
 
-fn cost_row(label: &str, m: &Measurement) -> String {
+/// Calls per job after the idle worker's call rate over the same window.
+fn net_calls_per_job(m: &Measurement, idle: &Measurement) -> f64 {
+    let idle_rate = idle.calls() as f64 / idle.window.as_secs_f64();
+    let net = m.calls() as f64 - idle_rate * m.window.as_secs_f64();
+    net / m.jobs as f64
+}
+
+fn cost_row(label: &str, m: &Measurement, idle: Option<&Measurement>) -> String {
     format!(
-        "| {label} | {:.2} | {:.0} | {:.2} | {:.1} |",
+        "| {label} | {:.2} | {:.0} | {:.2} | {:.2} |",
         m.per_job(m.rows_written()),
         m.per_job(m.wal_bytes),
         m.per_job(m.calls()),
-        m.p50_latency_ms(),
+        idle.map_or(m.per_job(m.calls()), |idle| net_calls_per_job(m, idle)),
     )
 }
 
@@ -626,9 +679,10 @@ fn detail(out: &mut String, label: &str, m: &Measurement) {
     );
     let _ = writeln!(
         out,
-        "rows written {}, WAL bytes {}, calls {}",
+        "rows written {}, WAL bytes {}, full-page image bytes {}, calls {}",
         m.rows_written(),
         m.wal_bytes,
+        m.fpi_bytes,
         m.calls()
     );
     let _ = writeln!(out, "\n| table | ins | upd | del |\n|---|--:|--:|--:|");
@@ -671,11 +725,12 @@ async fn zz_capture_standalone_activity_overhead_evidence() {
     let _ = writeln!(out, "# Standalone-activity overhead capture (issue #1987)\n");
     let _ = writeln!(
         out,
-        "| Arm | Rows written | WAL bytes | Statement calls | p50 latency (ms) |"
+        "| Arm | Rows written | WAL bytes | Statement calls | Calls net of idle |"
     );
     let _ = writeln!(out, "|---|--:|--:|--:|--:|");
-    for (label, m) in [("A", &a), ("B", &b), ("C", &c)] {
-        let _ = writeln!(out, "{}", cost_row(label, m));
+    // Arm C runs no worker, so it has no idle noise to remove.
+    for (label, m, idle) in [("A", &a, Some(&idle)), ("B", &b, Some(&idle)), ("C", &c, None)] {
+        let _ = writeln!(out, "{}", cost_row(label, m, idle));
     }
     let _ = writeln!(out, "\n| Ratio | Rows written | WAL bytes |\n|---|--:|--:|");
     for (label, m) in [("A / C", &a), ("B / C", &b)] {

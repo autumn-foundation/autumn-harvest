@@ -201,3 +201,63 @@ Each interceptor implements the `ActivityInterceptor` trait and calls
 calling it short-circuits. Interceptors wrap both regular and local activities;
 an interceptor `Err`/panic is contained exactly like a handler failure. See
 `examples/activity_interceptor.rs`.
+
+## Run one durable job
+
+Harvest has no standalone-activity start path yet.
+[ADR 0006](../adr/0006-standalone-activity.md) records the decision to
+build one. Until it ships, wrap the job in a one-step workflow:
+
+```rust
+use std::time::Duration;
+
+use autumn_harvest::prelude::*;
+
+#[activity(start_to_close = "5m", retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
+async fn render_invoice(
+    _ctx: &ActivityContext,
+    input: serde_json::Value,
+) -> HarvestResult<serde_json::Value> {
+    Ok(serde_json::json!({ "invoice": input["order_id"] }))
+}
+
+#[workflow]
+async fn render_invoice_job(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> HarvestResult<serde_json::Value> {
+    ctx.execute_activity_raw("render_invoice", input, "default").await
+}
+```
+
+Use the job id as the `workflow_id`. A second start with the same id then
+returns the first run, so the job runs once. The run result is the job
+result.
+
+For short in-process work, use a local activity. The job then has one task
+row and one claim, not two rows and three claims:
+
+```rust
+#[activity(local = true, start_to_close = "5s")]
+async fn checksum(_ctx: &ActivityContext, input: serde_json::Value) -> HarvestResult<String> {
+    Ok(format!("{:x}", input.to_string().len()))
+}
+
+#[workflow]
+async fn checksum_job(ctx: &WorkflowContext, input: serde_json::Value) -> HarvestResult<String> {
+    ctx.execute_local_activity(&checksum_info(), input).await
+}
+```
+
+A local activity cannot heartbeat, cannot use another queue, and is capped
+by `max_local_activity_start_to_close`. Use the regular form when the job
+needs any of these.
+
+Cost per job, from
+[One-step workflow overhead against a bare activity](../performance-standalone-activity-overhead.md):
+
+| Pattern | Events | Task rows | Claims | Rows written |
+|---|--:|--:|--:|--:|
+| One-step workflow, regular activity | 5 | 2 | 3 | 17 |
+| One-step workflow, local activity | 4 | 1 | 1 | 10 |
+| Bare task row (no worker path runs it) | 0 | 1 | 1 | 3 |

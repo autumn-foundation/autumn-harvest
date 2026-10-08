@@ -2023,3 +2023,8 @@ standalone note rather than part of the claim-path attribution table above:
   `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
   replaced by a manual impl that writes one 128-bit value (instructions
   -8.3%, callgrind).
+* [`docs/performance-standalone-activity-overhead.md`](performance-standalone-activity-overhead.md)
+  — the cost of a one-step workflow against a bare activity (issue #1987).
+  Rows per job: 17 with a regular activity, 10 with a local activity, 3
+  for the bare floor. [ADR 0006](adr/0006-standalone-activity.md) records
+  the decision.

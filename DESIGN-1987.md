@@ -69,6 +69,29 @@ per job. Arm B is the best existing one-step pattern. Arm C is the floor.
 Arm A against arm C is the overhead that issue #1987 asks for. It has no
 line. It is reported in full.
 
+### 0.5 Corrections after the first measurement
+
+The rule in §0.4 did not change. Three method claims in §0.1 and §0.2 were
+wrong. Each fix removed noise from the deciders. None moved a figure across
+the line.
+
+1. **"An idle worker writes no row."** False. Scanner election renews a
+   `harvest_scanner_leases` row on a timer, and the worker heartbeat
+   writes `harvest_workers` and `harvest_worker_task_stats`. The harness
+   now turns election off and sets a 10-minute heartbeat. The idle
+   control then writes 0 rows.
+2. **"An idle worker writes no WAL."** The cluster WAL position also
+   holds autovacuum, catalog upkeep and other databases. The idle
+   control wrote 110 KB of it. The harness now sums only WAL records on
+   the arm database's `public` relations, through `pg_walinspect`,
+   without full-page images. The idle control then writes 0 WAL bytes.
+3. **Latency.** Each arm enqueues all its jobs and then drains them. A
+   start-to-completion time measures the queue, not the job. The harness
+   no longer reports it.
+
+Before the fixes, the first capture read B/C 3.58x on rows and 4.22x on
+WAL. After them, it reads 3.33x and 3.39x. The verdict is the same.
+
 ---
 
 ## 1. Design
@@ -85,16 +108,16 @@ All arms run the same handler on the same input.
 
 ### 1.2 Figures
 
-Per job: events, task rows, claims, rows written (INSERT, UPDATE and DELETE
-rows from `pg_stat_statements`), WAL bytes, statement calls and
-start-to-completion latency. Calls and latency are context, not deciders.
+Per job: events, task rows, claims, rows written (from
+`pg_stat_user_tables`), WAL bytes (from `pg_walinspect`) and statement
+calls (from `pg_stat_statements`). Calls are context, not a decider.
 
 ### 1.3 Outputs
 
 - `docs/performance-standalone-activity-overhead.md`: the measurement.
 - `docs/adr/0006-standalone-activity.md`: the decision.
-- `docs/getting-started/activities.md`: the pattern, if the decision is
-  "document".
+- `docs/getting-started/activities.md`: the pattern, as the interim
+  answer until a built API ships.
 - A changelog fragment.
 
 ## 2. Tests
