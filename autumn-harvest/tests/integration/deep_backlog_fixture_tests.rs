@@ -22,7 +22,7 @@ const CI_LIVE_ROWS: u64 = 20_000;
 /// the sample covers the whole table, so the estimate is close.
 const DEAD_RATIO_TOLERANCE: f64 = 0.02;
 
-fn ci_spec(seed: u64) -> FixtureSpec {
+const fn ci_spec(seed: u64) -> FixtureSpec {
     FixtureSpec::ledger(seed).at_scale(CI_LIVE_ROWS)
 }
 
@@ -30,8 +30,8 @@ fn ci_spec(seed: u64) -> FixtureSpec {
 
 #[test]
 fn the_ledger_spec_seeds_at_least_one_million_live_task_rows() {
+    const _: () = assert!(LEDGER_LIVE_ROWS >= 1_000_000);
     let spec = FixtureSpec::ledger(1956);
-    assert!(LEDGER_LIVE_ROWS >= 1_000_000);
     assert_eq!(spec.live_rows, LEDGER_LIVE_ROWS);
     spec.validate().expect("the Ledger spec is valid");
 }
@@ -369,9 +369,9 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
     let db = server.create_database().await;
     let name = db.name().to_string();
     let spec = ci_spec(5);
-    {
+    let seeded = {
         let mut conn = fixture::connect(&db.url()).await;
-        fixture::seed(&mut conn, &spec).await;
+        let seeded = fixture::seed(&mut conn, &spec).await;
         if let Err(e) = stats::reset_statements(&mut conn).await {
             // CI's container preloads the extension. A developer server may not.
             assert!(
@@ -381,7 +381,8 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
             eprintln!("SKIP the snapshot test: {e}");
             return;
         }
-    }
+        seeded
+    };
     let workload = fixture::drive_claims(
         &db.url(),
         &spec,
@@ -396,6 +397,7 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
         workload.claims > 0,
         "the workload claims tasks: {workload:?}"
     );
+    assert_eq!(workload.errors, 0, "the workload fails: {workload:?}");
 
     let snapshot = db.snapshot_and_drop().await;
     assert!(
@@ -408,8 +410,23 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
         .iter()
         .find(|t| t.relname == "harvest_task_queue")
         .expect("the snapshot holds the task queue");
+    // The seed also updates rows, so compare with the counters it left.
+    let delta = stats::table_deltas(&seeded.tables, &snapshot.tables);
+    let tq_delta = delta
+        .iter()
+        .find(|t| t.relname == "harvest_task_queue")
+        .expect("the delta holds the task queue");
+    #[allow(clippy::cast_possible_wrap)]
+    let claims = workload.claims as i64;
+    assert!(
+        tq_delta.n_tup_upd >= 2 * claims,
+        "each claim and completion shows as an update after the seed: {tq_delta:?}"
+    );
+    assert!(
+        tq_delta.n_tup_ins >= claims,
+        "each replacement shows as an insert after the seed: {tq_delta:?}"
+    );
     assert!(tq.n_live_tup > 0, "table stats come from the live database");
-    assert!(tq.n_tup_upd > 0, "the claims show as updates: {tq:?}");
     let Statements::Captured(rows) = &snapshot.statements else {
         panic!("statements were not captured: {:?}", snapshot.statements);
     };

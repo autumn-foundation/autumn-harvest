@@ -98,6 +98,7 @@ const LIVE_DB_TOKENS: &[&str] = &[
     "testcontainers",
     "setup_test_database_url(",
     "setup_test_database_url_or_env(",
+    "FixtureServer::start(",
 ];
 
 /// Drop whole-line comments (`//`, `///`, `//!`) so container tokens that

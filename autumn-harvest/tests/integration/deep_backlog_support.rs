@@ -1094,12 +1094,16 @@ async fn server_settings(conn: &mut AsyncPgConnection) -> String {
 
 /// Seed `spec`, drive `workload`, snapshot, drop, and write the artifacts.
 ///
+/// One function, so a reader sees the whole run in order. It is long because
+/// the summary has many lines.
+///
 /// Returns the summary text for `fixture-summary.txt` and the workload
 /// report, so the caller can reject a run that measured nothing.
 ///
 /// # Panics
 /// Panics when seeding fails or an artifact cannot be written.
 #[allow(clippy::cast_precision_loss)]
+#[allow(clippy::too_many_lines)]
 pub async fn capture_run(
     server: &FixtureServer,
     label: &str,
@@ -1202,7 +1206,7 @@ pub async fn capture_run(
     let _ = writeln!(
         s,
         "pg_stat_statements reset: {}",
-        reset.as_ref().map_or_else(|e| e.as_str(), |()| "ok")
+        reset.as_ref().map_or_else(String::as_str, |()| "ok")
     );
     let _ = writeln!(
         s,

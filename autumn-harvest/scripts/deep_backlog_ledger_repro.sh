@@ -35,8 +35,11 @@ TEST_FILTER="deep_backlog_fixture_tests::zz_capture_deep_backlog_ledger_evidence
 LOG="$(mktemp -t deep_backlog_ledger.XXXXXX.log)"
 
 echo "== capturing via ${TEST_FILTER}; log in ${LOG} =="
-cargo test -p autumn-harvest --test integration -- \
-  --ignored --nocapture --exact "$TEST_FILTER" 2>&1 | tee "$LOG"
+if ! cargo test -p autumn-harvest --test integration -- \
+  --ignored --nocapture --exact "$TEST_FILTER" 2>&1 | tee "$LOG"; then
+  echo "FATAL: the capture test failed. See ${LOG}." >&2
+  exit 1
+fi
 
 if ! grep -q "^== capture complete: artifacts in " "$LOG"; then
   echo "FATAL: the capture did not complete. The test failed, or it skipped" \
