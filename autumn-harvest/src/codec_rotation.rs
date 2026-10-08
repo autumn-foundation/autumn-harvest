@@ -1253,10 +1253,12 @@ mod db {
         unresolved: i64,
     }
 
-    /// Column cursors by database identity and shard id.
+    /// Column cursors by database identity, schema and shard id.
     ///
     /// One process can host several runtimes on different databases, so the
-    /// shard id alone is not a unique scope.
+    /// shard id alone is not a unique scope. Runtimes on one database can
+    /// also select different schemas through `search_path`, so the scope
+    /// names the schema where the codec tables resolve.
     static COLUMN_CURSORS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, ColumnCursor>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
@@ -1266,7 +1268,7 @@ mod db {
         scope: String,
     }
 
-    /// The cursor key for this connection's database and `shard_id`.
+    /// The cursor key for this connection's database, schema and `shard_id`.
     async fn column_cursor_scope(
         conn: &mut AsyncPgConnection,
         shard_id: i32,
@@ -1274,7 +1276,11 @@ mod db {
         let row: CursorScope = diesel::sql_query(
             "SELECT current_database() || '@' \
                  || COALESCE(host(inet_server_addr()), 'local') || ':' \
-                 || COALESCE(inet_server_port()::TEXT, '') AS scope",
+                 || COALESCE(inet_server_port()::TEXT, '') || '/' \
+                 || COALESCE(( \
+                     SELECT relnamespace::regnamespace::TEXT FROM pg_class \
+                     WHERE oid = to_regclass('harvest_workflow_executions') \
+                 ), '') AS scope",
         )
         .get_result(conn)
         .await

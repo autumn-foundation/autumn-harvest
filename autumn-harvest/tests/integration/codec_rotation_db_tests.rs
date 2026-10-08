@@ -4192,3 +4192,42 @@ async fn two_databases_in_one_process_keep_separate_column_cursors() {
     assert_eq!(total_a, 16, "database a converts every cell");
     assert_eq!(total_b, 16, "database b converts every cell");
 }
+
+/// Two runtimes can share one database and select different schemas through
+/// `search_path`. Their column cursors must stay separate too.
+#[tokio::test]
+async fn two_schemas_in_one_database_keep_separate_column_cursors() {
+    let (url, _container) = setup_isolated_db().await;
+    let mut admin = connect(&url).await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA tenant_b; SET search_path = tenant_b; {} RESET search_path;",
+            autumn_harvest::full_migrations_sql()
+        ))
+        .await
+        .expect("migrate the second schema");
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let url_b = format!("{url}{sep}options=-c%20search_path%3Dtenant_b");
+    let mut conn_a = connect(&url).await;
+    let mut conn_b = connect(&url_b).await;
+    let codecs = two_key_registry();
+    for conn in [&mut conn_a, &mut conn_b] {
+        seed_codec_columns(conn, &codecs, "k1").await;
+        seed_codec_columns(conn, &codecs, "k1").await;
+    }
+    codecs.set_active_key("k2").expect("flip");
+
+    // Each schema holds 16 cells. At 3 per tick, 6 ticks each convert them
+    // all when neither sweep reuses the cursor of the other.
+    let (mut total_a, mut total_b) = (0, 0);
+    for _ in 0..6 {
+        total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs, 3, &NoOpMetrics)
+            .await
+            .expect("sweep a");
+        total_b += sweep_codec_reencryption_once(&mut conn_b, 0, &codecs, 3, &NoOpMetrics)
+            .await
+            .expect("sweep b");
+    }
+    assert_eq!(total_a, 16, "schema public converts every cell");
+    assert_eq!(total_b, 16, "schema tenant_b converts every cell");
+}
